@@ -1,0 +1,142 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия без префикса v"
+        required: true
+        type: string
+      release_notes:
+        description: "Описание релиза"
+        required: false
+        type: string
+      critical:
+        description: "Критическое обновление"
+        required: false
+        default: false
+        type: boolean
+      minimum_supported:
+        description: "Минимально поддерживаемая версия"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}-${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            architecture: x86_64
+            package_kind: appimage
+            runner: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+          - platform: windows
+            architecture: x86_64
+            package_kind: nsis
+            runner: windows-2022
+            rust_target: x86_64-pc-windows-msvc
+          - platform: macos
+            architecture: x86_64
+            package_kind: app
+            runner: macos-13
+            rust_target: x86_64-apple-darwin
+          - platform: macos
+            architecture: aarch64
+            package_kind: app
+            runner: macos-14
+            rust_target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+          targets: ${{ matrix.rust_target }}
+      - name: Установить зависимости Linux
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - run: npm ci
+      - name: Установить версию релиза
+        shell: bash
+        run: python scripts/set-release-version.py "${RELEASE_VERSION#v}"
+      - name: Собрать подписанный пакет
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
+        run: npm run tauri build -- --target "${{ matrix.rust_target }}"
+      - name: Собрать артефакт релиза
+        shell: bash
+        run: |
+          python scripts/collect-release-artifact.py \
+            --search-root "src-tauri/target/${{ matrix.rust_target }}/release/bundle" \
+            --output-dir release-output \
+            --version "${RELEASE_VERSION#v}" \
+            --platform "${{ matrix.platform }}" \
+            --architecture "${{ matrix.architecture }}" \
+            --package-kind "${{ matrix.package_kind }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.architecture }}
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install "cryptography>=45,<46"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-input
+      - name: Сформировать и подписать манифест
+        env:
+          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: ${{ secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 }}
+          RELEASE_NOTES: ${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || '' }}
+          RELEASE_CRITICAL: ${{ github.event_name == 'workflow_dispatch' && inputs.critical || 'false' }}
+          RELEASE_MINIMUM_SUPPORTED: ${{ github.event_name == 'workflow_dispatch' && inputs.minimum_supported || 'false' }}
+          MINIMUM_PANEL_API_VERSION: "1"
+          MINIMUM_AGENT_CONTRACT_VERSION: "1"
+        run: |
+          python scripts/build-release-manifest.py \
+            --input-dir release-input \
+            --output-dir release-publish \
+            --version "${RELEASE_VERSION#v}"
+      - name: Опубликовать стабильный GitHub-релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${RELEASE_VERSION#v}"
+          gh release create "$tag" release-publish/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Nelomai ${RELEASE_VERSION#v}" \
+            --notes "${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || format('Nelomai {0}', github.ref_name) }}"

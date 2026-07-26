@@ -65,4 +65,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - run: python -m pip install "cryptography>=45,<46"
       - run: python contracts/python/validate_fixtures.py
+      - run: python scripts/release-workflow-check.py

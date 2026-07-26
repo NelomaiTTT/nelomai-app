@@ -45,9 +45,20 @@ because the package signing certificate has not been provisioned yet.
 
 ## Release gates
 
-- Generate and securely store the Tauri signing private key.
+- Generate and securely store the Tauri signing private key in
+  `TAURI_SIGNING_PRIVATE_KEY` and its password secret.
 - Embed the matching public key through `NELOMAI_UPDATER_PUBLIC_KEY`.
-- Implement the two authenticated panel update endpoints.
+- Store a separate raw 32-byte Ed25519 seed in
+  `NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64`; configure the matching public key
+  on the panel as `CLIENT_RELEASE_MANIFEST_PUBLIC_KEY_B64`.
+- The `release` GitHub Actions workflow builds Linux x86_64, Windows x86_64,
+  macOS x86_64, and macOS aarch64 updater artifacts for a stable `v*` tag or a
+  manual version. It publishes only after every matrix job succeeds.
+- The workflow publishes a deterministic JSON manifest, its detached Ed25519
+  signature, and Tauri-signed packages. Draft and prerelease GitHub releases
+  are not consumed by the panel.
+- The panel verifies the manifest signature, artifact size, and SHA-256 before
+  atomically publishing the release. It retains current and previous versions.
 - Exercise a signed update on Windows, macOS, and Linux.
 - Provision the Android package signing certificate before implementing the
   native APK installer.

@@ -13,15 +13,24 @@ endpoints.
 | Expired access and critical update blocks | Core runtime and frontend tests |
 | Offline start with a valid saved Stray | Core runtime tests |
 | Concurrent start and stop single-flight behavior | Core runtime tests |
-| Current, previous, critical, and tampered updates | Updater tests and release workflow |
+| Current, previous, and tampered updates | Panel API and signed-release synchronization tests |
+| Critical update policy | Core runtime and frontend tests |
 | Secret-free logs and frontend DTOs | Core, command, contract, and helper tests |
 
-The following scenarios require the isolated panel and agent test environment
-and are not simulated by the client repository:
+The panel repository now runs these scenarios against an isolated database and
+fake persistent agent; no production user, peer, endpoint, or artifact is used:
 
-- 100 concurrent application sessions and 50 simultaneous starts;
-- panel worker restart during every lease transition;
-- agent restart with ready, leased, warm, and pinned peers;
-- automatic refill of a 30-peer test pool;
-- app-bound peer key rotation after unbind;
+- 100 authenticated application sessions through four FastAPI instances;
+- 50 simultaneous HTTP starts through those application instances;
+- application-instance recreation while leases remain active;
+- agent restart and reconciliation with ready, leased, warm, and pinned peers;
+- injected agent failure and safe failed-lease state;
+- automatic refill to a 30-ready-peer target;
+- current/previous rotation, invalid manifest signature, and tampered artifact;
 - ten simultaneous downloads of one update artifact.
+
+The following scenarios remain platform or later lifecycle checks:
+
+- app-bound peer key rotation after unbind;
+- a real signed installer update on Windows, macOS, and Linux;
+- Android package installation after its signing certificate is provisioned.
