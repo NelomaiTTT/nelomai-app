@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/client-api",
+    "crates/client-storage",
     "crates/contracts",
     "plugins/tunnel-android",
     "spikes/desktop-helper",
