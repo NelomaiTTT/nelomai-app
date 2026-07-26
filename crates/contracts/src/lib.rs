@@ -33,6 +33,13 @@ pub enum ConnectionMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TicConnectionMode {
+    Personal,
+    Dynamic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RouteMode {
     Standalone,
     ViaTak,
@@ -128,10 +135,14 @@ pub struct Bootstrap {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PeerOption {
     pub id: String,
+    pub interface_id: String,
+    pub interface_name: String,
+    pub slot: u32,
     pub name: String,
     pub comment: Option<String>,
     pub last_handshake_at: Option<String>,
     pub bound_to_app: bool,
+    pub bound_to_this_device: bool,
     pub selectable: bool,
 }
 
@@ -140,6 +151,34 @@ pub struct PeerOptions {
     pub api_version: ApiVersion,
     pub request_id: String,
     pub peers: Vec<PeerOption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BindPeerRequest {
+    pub peer_id: String,
+    pub preferred_layer: Layer,
+    pub tic_connection_mode: TicConnectionMode,
+    pub route_mode: RouteMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PeerBinding {
+    pub id: String,
+    pub peer_id: String,
+    pub interface_id: String,
+    pub interface_name: String,
+    pub slot: u32,
+    pub preferred_layer: Layer,
+    pub tic_connection_mode: TicConnectionMode,
+    pub route_mode: RouteMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PeerBindingResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub binding: Option<PeerBinding>,
+    pub configuration: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

@@ -1,4 +1,7 @@
-use nelomai_contracts::{Access, ApiVersion, ErrorPayload, Platform, API_PREFIX};
+use nelomai_contracts::{
+    Access, ApiVersion, BindPeerRequest, ErrorPayload, PeerBindingResponse, PeerOptions, Platform,
+    API_PREFIX,
+};
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -125,6 +128,41 @@ impl ClientApi {
         self.send_json(
             self.http
                 .post(self.endpoint("auth/logout-all")?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn peer_options(&self, access_token: &str) -> Result<PeerOptions, ClientApiError> {
+        self.send_json(
+            self.http
+                .get(self.endpoint("peer-options")?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn bind_peer(
+        &self,
+        access_token: &str,
+        request: &BindPeerRequest,
+    ) -> Result<PeerBindingResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("device/bind-peer")?)
+                .bearer_auth(access_token)
+                .json(request),
+        )
+        .await
+    }
+
+    pub async fn unbind_peer(
+        &self,
+        access_token: &str,
+    ) -> Result<PeerBindingResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("device/unbind-peer")?)
                 .bearer_auth(access_token),
         )
         .await

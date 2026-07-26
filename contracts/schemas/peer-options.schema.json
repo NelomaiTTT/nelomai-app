@@ -10,13 +10,17 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "name", "comment", "last_handshake_at", "bound_to_app", "selectable"],
+        "required": ["id", "interface_id", "interface_name", "slot", "name", "comment", "last_handshake_at", "bound_to_app", "bound_to_this_device", "selectable"],
         "properties": {
           "id": { "$ref": "common.schema.json#/$defs/id" },
-          "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "interface_id": { "$ref": "common.schema.json#/$defs/id" },
+          "interface_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "slot": { "type": "integer", "minimum": 1 },
+          "name": { "type": "string", "minLength": 1, "maxLength": 160 },
           "comment": { "type": ["string", "null"], "maxLength": 500 },
           "last_handshake_at": { "anyOf": [{ "$ref": "common.schema.json#/$defs/timestamp" }, { "type": "null" }] },
           "bound_to_app": { "type": "boolean" },
+          "bound_to_this_device": { "type": "boolean" },
           "selectable": { "type": "boolean" }
         },
         "additionalProperties": true
@@ -25,4 +29,3 @@
   },
   "additionalProperties": true
 }
-

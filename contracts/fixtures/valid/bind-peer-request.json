@@ -1,0 +1,6 @@
+{
+  "peer_id": "3",
+  "preferred_layer": "tic",
+  "tic_connection_mode": "personal",
+  "route_mode": "via_tak"
+}

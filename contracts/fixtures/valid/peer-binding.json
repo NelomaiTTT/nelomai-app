@@ -1,0 +1,15 @@
+{
+  "api_version": "1",
+  "request_id": "req_binding_01",
+  "binding": {
+    "id": "1",
+    "peer_id": "3",
+    "interface_id": "1",
+    "interface_name": "Основной",
+    "slot": 3,
+    "preferred_layer": "tic",
+    "tic_connection_mode": "personal",
+    "route_mode": "via_tak"
+  },
+  "configuration": "# client configuration\n"
+}

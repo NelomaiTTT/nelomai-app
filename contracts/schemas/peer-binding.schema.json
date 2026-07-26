@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/peer-binding.schema.json",
+  "type": "object",
+  "required": ["api_version", "request_id", "binding", "configuration"],
+  "properties": {
+    "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+    "request_id": { "$ref": "common.schema.json#/$defs/id" },
+    "binding": {
+      "anyOf": [
+        {
+          "type": "object",
+          "required": ["id", "peer_id", "interface_id", "interface_name", "slot", "preferred_layer", "tic_connection_mode", "route_mode"],
+          "properties": {
+            "id": { "$ref": "common.schema.json#/$defs/id" },
+            "peer_id": { "$ref": "common.schema.json#/$defs/id" },
+            "interface_id": { "$ref": "common.schema.json#/$defs/id" },
+            "interface_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+            "slot": { "type": "integer", "minimum": 1 },
+            "preferred_layer": { "$ref": "common.schema.json#/$defs/layer" },
+            "tic_connection_mode": { "enum": ["personal", "dynamic"] },
+            "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" }
+          },
+          "additionalProperties": true
+        },
+        { "type": "null" }
+      ]
+    },
+    "configuration": { "type": ["string", "null"] }
+  },
+  "additionalProperties": true
+}

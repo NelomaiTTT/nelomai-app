@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf};
 
 use nelomai_contracts::{
-    Bootstrap, ConnectionStart, ConnectionState, ErrorPayload, PeerOptions, ProbeResults,
-    UpdateManifest,
+    BindPeerRequest, Bootstrap, ConnectionStart, ConnectionState, ErrorPayload,
+    PeerBindingResponse, PeerOptions, ProbeResults, UpdateManifest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -46,6 +46,11 @@ fn check<T: DeserializeOwned>(fixture_name: &str, schema_name: &str) {
 fn shared_valid_fixtures_match_schemas_and_rust_types() {
     check::<Bootstrap>("valid/bootstrap.json", "bootstrap.schema.json");
     check::<PeerOptions>("valid/peer-options.json", "peer-options.schema.json");
+    check::<PeerBindingResponse>("valid/peer-binding.json", "peer-binding.schema.json");
+    check::<BindPeerRequest>(
+        "valid/bind-peer-request.json",
+        "bind-peer-request.schema.json",
+    );
     check::<ProbeResults>("valid/probe-results.json", "probe-results.schema.json");
     check::<ConnectionStart>(
         "valid/connection-start.json",
