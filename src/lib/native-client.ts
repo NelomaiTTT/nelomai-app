@@ -26,7 +26,7 @@ export interface LoginRequest {
 }
 
 export interface SafePeerBindingResponse {
-  apiVersion: "v1";
+  apiVersion: "1";
   requestId: string;
   binding: PeerBinding | null;
 }

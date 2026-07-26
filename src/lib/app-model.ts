@@ -55,7 +55,13 @@ export interface Connection {
   layer: Layer;
   tic_connection_mode: TicConnectionMode;
   route_mode: RouteMode;
-  status: "reserved" | "connecting" | "connected" | "stopped" | "expired";
+  status:
+    | "allocating"
+    | "issued"
+    | "connected"
+    | "warm"
+    | "released"
+    | "failed";
   pinned: boolean;
   stopped_at: string | null;
 }
@@ -75,7 +81,7 @@ export interface UpdateState {
 }
 
 export interface Bootstrap {
-  api_version: "v1";
+  api_version: "1";
   request_id: string;
   access: Access;
   device: Device;
@@ -100,7 +106,7 @@ export interface PeerOption {
 }
 
 export interface PeerOptions {
-  api_version: "v1";
+  api_version: "1";
   request_id: string;
   peers: PeerOption[];
 }
@@ -166,4 +172,11 @@ export function bindingRequest(
     tic_connection_mode: bootstrap.defaults.tic_connection_mode,
     route_mode: bootstrap.defaults.route_mode,
   };
+}
+
+export function requiresServerProbes(
+  layer: Layer,
+  ticConnectionMode: TicConnectionMode,
+): boolean {
+  return layer !== "tic" || ticConnectionMode !== "personal";
 }

@@ -244,6 +244,30 @@ async fn connection_uses_native_probe_cache_instead_of_webview_values() {
 }
 
 #[tokio::test]
+async fn personal_tic_connection_skips_server_candidates() {
+    let (application, api) = application();
+
+    application
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_800_000_000,
+        )
+        .await
+        .unwrap();
+
+    let request = api.start_request.lock().unwrap().clone().unwrap();
+    assert!(request.probes.is_empty());
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.probe_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn probe_tokens_are_not_reused_after_logout() {
     let (application, _) = application();
     application

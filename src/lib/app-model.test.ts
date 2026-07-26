@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import {
   bindingRequest,
+  requiresServerProbes,
   viewForPhase,
   type Bootstrap,
   type BootstrapDefaults,
+  type Connection,
 } from "./app-model";
 
 const defaults: BootstrapDefaults = {
@@ -37,5 +39,30 @@ describe("bindingRequest", () => {
       tic_connection_mode: "dynamic",
       route_mode: "standalone",
     });
+  });
+});
+
+describe("panel contract", () => {
+  it("uses the exact API version and lease statuses returned by the panel", () => {
+    const apiVersion: Bootstrap["api_version"] = "1";
+    const statuses: Connection["status"][] = [
+      "allocating",
+      "issued",
+      "connected",
+      "warm",
+      "released",
+      "failed",
+    ];
+
+    expect(apiVersion).toBe("1");
+    expect(statuses).toHaveLength(6);
+  });
+});
+
+describe("requiresServerProbes", () => {
+  it("skips measurements only for a fixed personal Tic peer", () => {
+    expect(requiresServerProbes("tic", "personal")).toBe(false);
+    expect(requiresServerProbes("tic", "dynamic")).toBe(true);
+    expect(requiresServerProbes("stray", "dynamic")).toBe(true);
   });
 });

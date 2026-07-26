@@ -8,7 +8,7 @@ use nelomai_client_storage::{SecretStore, StoredAuth};
 use nelomai_client_tunnel::TunnelController;
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBindingResponse, PeerOptions, Platform,
-    ProbeResult, ProbeResults, ServerCandidatesResponse,
+    ProbeResult, ProbeResults, ServerCandidatesResponse, TicConnectionMode,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
@@ -255,12 +255,18 @@ where
         mut options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
-        options.probes = match self.refresh_probes(options.layer, now_unix).await {
-            Ok(results) => results.probes,
-            Err(_) => self
-                .cached_probes(options.layer, now_unix)
-                .map(|results| results.probes)
-                .unwrap_or_default(),
+        options.probes = if options.layer == Layer::Tic
+            && options.tic_connection_mode == TicConnectionMode::Personal
+        {
+            Vec::new()
+        } else {
+            match self.refresh_probes(options.layer, now_unix).await {
+                Ok(results) => results.probes,
+                Err(_) => self
+                    .cached_probes(options.layer, now_unix)
+                    .map(|results| results.probes)
+                    .unwrap_or_default(),
+            }
         };
         self.core.start(options, now_unix).await.map_err(Into::into)
     }

@@ -6,7 +6,7 @@ const executablePath =
   "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge";
 
 const bootstrap = {
-  api_version: "v1",
+  api_version: "1",
   request_id: "preview-bootstrap",
   access: {
     state: "active",
@@ -46,7 +46,7 @@ const bootstrap = {
 };
 
 const peers = {
-  api_version: "v1",
+  api_version: "1",
   request_id: "preview-peers",
   peers: [
     {
@@ -85,6 +85,7 @@ try {
   await capture("sign-in", { width: 390, height: 844 }, "signed_out");
   await capture("peers-mobile", { width: 390, height: 844 }, "peers");
   await capture("connection-mobile", { width: 390, height: 844 }, "connection");
+  await capture("personal-tic-mobile", { width: 390, height: 844 }, "personal-tic");
   await capture("connection-desktop", { width: 1280, height: 800 }, "connection");
 } finally {
   await browser.close();
@@ -113,6 +114,22 @@ async function capture(name, viewport, scenario) {
             }
             if (currentScenario === "peers") {
               return { ...fixture, binding: null };
+            }
+            if (currentScenario === "personal-tic") {
+              return {
+                ...fixture,
+                binding: {
+                  ...fixture.binding,
+                  preferred_layer: "tic",
+                  tic_connection_mode: "personal",
+                  route_mode: "via_tak",
+                },
+                defaults: {
+                  layer: "tic",
+                  tic_connection_mode: "personal",
+                  route_mode: "via_tak",
+                },
+              };
             }
             return fixture;
           }
@@ -167,6 +184,12 @@ async function capture(name, viewport, scenario) {
     const bindingCall = await lastCall(page, "app_bind_peer");
     if (bindingCall?.args?.request?.peer_id !== "unused-peer") {
       throw new Error("the peer selected by default was not passed to app_bind_peer");
+    }
+  } else if (scenario === "personal-tic") {
+    await page.getByText("Личный пир", { exact: true }).waitFor();
+    const refresh = await lastCall(page, "app_refresh_probes");
+    if (refresh) {
+      throw new Error("personal Tic mode unexpectedly requested server probes");
     }
   } else {
     const start = page.getByRole("button", { name: /Старт/ });

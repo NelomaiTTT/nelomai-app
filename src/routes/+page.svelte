@@ -3,6 +3,7 @@
 
   import {
     bindingRequest,
+    requiresServerProbes,
     viewForPhase,
     type AppView,
     type Bootstrap,
@@ -204,6 +205,10 @@
   }
 
   async function refreshProbes() {
+    if (!requiresServerProbes(selectedLayer, ticConnectionMode)) {
+      availableCandidates = 0;
+      return;
+    }
     if (
       probeBusy ||
       !bootstrap?.binding ||
@@ -432,7 +437,11 @@
           {#if selectedLayer === "tic"}
             <label class="select-field">
               <span>Режим</span>
-              <select bind:value={ticConnectionMode} disabled={busy || phase === "connected"}>
+              <select
+                bind:value={ticConnectionMode}
+                onchange={refreshProbes}
+                disabled={busy || phase === "connected"}
+              >
                 <option value="personal">Постоянный пир</option>
                 <option value="dynamic">Динамический</option>
               </select>
@@ -454,7 +463,13 @@
           {/if}
           <div class="binding-summary">
             <span>Доступные серверы</span>
-            <strong>{probeBusy ? "Проверяем" : availableCandidates}</strong>
+            <strong>
+              {requiresServerProbes(selectedLayer, ticConnectionMode)
+                ? probeBusy
+                  ? "Проверяем"
+                  : availableCandidates
+                : "Личный пир"}
+            </strong>
           </div>
         </aside>
       </div>

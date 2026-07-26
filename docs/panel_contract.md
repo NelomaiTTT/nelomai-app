@@ -29,12 +29,19 @@ authorization header. At most four probes run concurrently and each request
 has a three-second timeout. Results are cached independently for Tic and Stray
 for no longer than five minutes or the earliest candidate expiry, whichever
 comes first. The cache is cleared on login, logout, and peer rebinding.
+Personal Tic mode uses the already bound user peer and therefore performs no
+candidate request or latency probe.
 
 The webview can request a refresh and display its progress, but cannot supply
 probe results to a connection command. The native application replaces any
 caller-provided values with its own current measurements before
 `connections/start`. If a measurement is unavailable, the panel remains the
 only authority allowed to select an alternate server.
+
+The isolated HTTP flow test in `crates/client-application/tests/http_flow.rs`
+exercises login, peer binding, candidate measurement, dynamic Stray start,
+stop, warm reconnect, and logout through the real `ClientApi` serialization
+boundary. It never uses production accounts, peers, or endpoints.
 
 WireGuard configuration is a privileged native payload. It must pass directly
 from the authenticated API layer to `TunnelController`; frontend state, common
