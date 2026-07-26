@@ -1,0 +1,477 @@
+mod backend;
+mod config;
+mod socket;
+
+use async_trait::async_trait;
+pub use backend::PlatformBackend;
+pub use config::{
+    parse_configuration, ConfigurationError, Endpoint, ParsedConfiguration, ParsedPeer, SecretKey,
+};
+use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use serde::{Deserialize, Serialize};
+pub use socket::{
+    bind_listener, peer_uid, prepare_runtime_directory, serve_one, UnixSocketTransport,
+};
+use std::fmt;
+use thiserror::Error;
+use zeroize::Zeroizing;
+
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const MAX_FRAME_SIZE: usize = 64 * 1024;
+pub const DEFAULT_SOCKET_PATH: &str = "/var/run/nelomai/tunnel.sock";
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTunnelState {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Failed,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Response {
+    pub protocol_version: u16,
+    pub ok: bool,
+    pub state: Option<ServiceTunnelState>,
+    pub service_version: Option<String>,
+    pub error_code: Option<String>,
+}
+
+impl Response {
+    pub fn success(state: Option<ServiceTunnelState>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            ok: true,
+            state,
+            service_version: None,
+            error_code: None,
+        }
+    }
+
+    pub fn failure(error_code: impl Into<String>) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            ok: false,
+            state: None,
+            service_version: None,
+            error_code: Some(error_code.into()),
+        }
+    }
+}
+
+pub enum Request {
+    Start {
+        protocol_version: u16,
+        configuration: Zeroizing<String>,
+    },
+    Stop {
+        protocol_version: u16,
+    },
+    Status {
+        protocol_version: u16,
+    },
+    Version {
+        protocol_version: u16,
+    },
+}
+
+impl Request {
+    pub fn start(configuration: String) -> Self {
+        Self::Start {
+            protocol_version: PROTOCOL_VERSION,
+            configuration: Zeroizing::new(configuration),
+        }
+    }
+
+    pub fn stop() -> Self {
+        Self::Stop {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn status() -> Self {
+        Self::Status {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn version() -> Self {
+        Self::Version {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn protocol_version(&self) -> u16 {
+        match self {
+            Self::Start {
+                protocol_version, ..
+            }
+            | Self::Stop { protocol_version }
+            | Self::Status { protocol_version }
+            | Self::Version { protocol_version } => *protocol_version,
+        }
+    }
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start {
+                protocol_version, ..
+            } => formatter
+                .debug_struct("Start")
+                .field("protocol_version", protocol_version)
+                .field("configuration", &"<redacted>")
+                .finish(),
+            Self::Stop { protocol_version } => formatter
+                .debug_struct("Stop")
+                .field("protocol_version", protocol_version)
+                .finish(),
+            Self::Status { protocol_version } => formatter
+                .debug_struct("Status")
+                .field("protocol_version", protocol_version)
+                .finish(),
+            Self::Version { protocol_version } => formatter
+                .debug_struct("Version")
+                .field("protocol_version", protocol_version)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+enum RequestRef<'a> {
+    Start {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+        configuration: &'a str,
+    },
+    Stop {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    Status {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    Version {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+}
+
+impl Serialize for Request {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Start {
+                protocol_version,
+                configuration,
+            } => RequestRef::Start {
+                protocol_version: *protocol_version,
+                configuration,
+            },
+            Self::Stop { protocol_version } => RequestRef::Stop {
+                protocol_version: *protocol_version,
+            },
+            Self::Status { protocol_version } => RequestRef::Status {
+                protocol_version: *protocol_version,
+            },
+            Self::Version { protocol_version } => RequestRef::Version {
+                protocol_version: *protocol_version,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+enum RequestOwned {
+    Start {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+        configuration: String,
+    },
+    Stop {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    Status {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    Version {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match RequestOwned::deserialize(deserializer)? {
+            RequestOwned::Start {
+                protocol_version,
+                configuration,
+            } => Self::Start {
+                protocol_version,
+                configuration: Zeroizing::new(configuration),
+            },
+            RequestOwned::Stop { protocol_version } => Self::Stop { protocol_version },
+            RequestOwned::Status { protocol_version } => Self::Status { protocol_version },
+            RequestOwned::Version { protocol_version } => Self::Version { protocol_version },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientIdentity {
+    pub uid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientPolicy {
+    pub owner_uid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ServiceError {
+    #[error("IPC frame exceeds the configured limit")]
+    FrameTooLarge,
+    #[error("IPC frame is truncated")]
+    TruncatedFrame,
+    #[error("IPC request is invalid")]
+    InvalidRequest,
+    #[error("IPC client is not authorized")]
+    UnauthorizedClient,
+    #[error("service protocol version is unsupported")]
+    UnsupportedProtocol,
+    #[error("WireGuard configuration is invalid")]
+    InvalidConfiguration,
+    #[error("tunnel helper is unavailable: {0}")]
+    Backend(String),
+}
+
+impl ServiceError {
+    pub fn code(&self) -> &str {
+        match self {
+            Self::FrameTooLarge => "frame_too_large",
+            Self::TruncatedFrame => "truncated_frame",
+            Self::InvalidRequest => "invalid_request",
+            Self::UnauthorizedClient => "unauthorized_client",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::InvalidConfiguration => "invalid_configuration",
+            Self::Backend(_) => "service_unavailable",
+        }
+    }
+}
+
+pub fn authorize_peer(
+    policy: &ClientPolicy,
+    identity: &ClientIdentity,
+) -> Result<(), ServiceError> {
+    if policy.owner_uid == identity.uid {
+        Ok(())
+    } else {
+        Err(ServiceError::UnauthorizedClient)
+    }
+}
+
+pub trait ServiceTunnelBackend {
+    fn start(
+        &mut self,
+        configuration: &ParsedConfiguration,
+    ) -> Result<ServiceTunnelState, ServiceError>;
+    fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError>;
+    fn status(&self) -> Result<ServiceTunnelState, ServiceError>;
+}
+
+pub struct TunnelRequestHandler<B> {
+    backend: B,
+    service_version: String,
+}
+
+impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
+    pub fn new(backend: B, service_version: impl Into<String>) -> Self {
+        Self {
+            backend,
+            service_version: service_version.into(),
+        }
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn handle(&mut self, request: Request) -> Response {
+        if request.protocol_version() != PROTOCOL_VERSION {
+            return Response::failure(ServiceError::UnsupportedProtocol.code());
+        }
+
+        let result = match request {
+            Request::Start { configuration, .. } => parse_configuration(&configuration)
+                .map_err(|_| ServiceError::InvalidConfiguration)
+                .and_then(|configuration| self.backend.start(&configuration))
+                .map(|state| Response::success(Some(state))),
+            Request::Stop { .. } => self
+                .backend
+                .stop()
+                .map(|state| Response::success(Some(state))),
+            Request::Status { .. } => self
+                .backend
+                .status()
+                .map(|state| Response::success(Some(state))),
+            Request::Version { .. } => {
+                let mut response = Response::success(None);
+                response.service_version = Some(self.service_version.clone());
+                Ok(response)
+            }
+        };
+
+        result.unwrap_or_else(|error| Response::failure(error.code()))
+    }
+}
+
+#[async_trait]
+pub trait ServiceTransport: Send + Sync {
+    async fn exchange(&self, request: Request) -> Result<Response, ServiceError>;
+}
+
+pub struct UnixTunnelController<T> {
+    transport: T,
+}
+
+impl<T> UnixTunnelController<T> {
+    pub fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+}
+
+#[async_trait]
+impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
+    async fn start(&self, configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::start(configuration.expose().to_string()))
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Running)
+    }
+
+    async fn stop(&self) -> Result<(), TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::stop())
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Stopped)
+    }
+
+    async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::status())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        match response.state {
+            Some(ServiceTunnelState::Stopped) => Ok(TunnelStatus::Stopped),
+            Some(ServiceTunnelState::Starting) => Ok(TunnelStatus::Starting),
+            Some(ServiceTunnelState::Running) => Ok(TunnelStatus::Running),
+            Some(ServiceTunnelState::Stopping) => Ok(TunnelStatus::Stopping),
+            Some(ServiceTunnelState::Failed) => Ok(TunnelStatus::Failed),
+            None => Err(TunnelError::Backend(
+                "missing_tunnel_service_state".to_string(),
+            )),
+        }
+    }
+}
+
+fn require_state(response: Response, expected: ServiceTunnelState) -> Result<(), TunnelError> {
+    validate_response(&response)?;
+    if response.state == Some(expected) {
+        Ok(())
+    } else {
+        Err(TunnelError::Backend(
+            "unexpected_tunnel_service_state".to_string(),
+        ))
+    }
+}
+
+fn validate_response(response: &Response) -> Result<(), TunnelError> {
+    if response.protocol_version != PROTOCOL_VERSION {
+        return Err(TunnelError::Backend("unsupported_protocol".to_string()));
+    }
+    if !response.ok {
+        return Err(TunnelError::Backend(
+            response
+                .error_code
+                .clone()
+                .unwrap_or_else(|| "service_unavailable".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+fn to_tunnel_error(error: ServiceError) -> TunnelError {
+    TunnelError::Backend(error.code().to_string())
+}
+
+pub fn encode_request(request: &Request) -> Result<Vec<u8>, ServiceError> {
+    encode_frame(request)
+}
+
+pub fn decode_request(frame: &[u8]) -> Result<Request, ServiceError> {
+    decode_frame(frame)
+}
+
+pub fn encode_response(response: &Response) -> Result<Vec<u8>, ServiceError> {
+    encode_frame(response)
+}
+
+pub fn decode_response(frame: &[u8]) -> Result<Response, ServiceError> {
+    decode_frame(frame)
+}
+
+fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, ServiceError> {
+    let body = serde_json::to_vec(value).map_err(|_| ServiceError::InvalidRequest)?;
+    if body.len() > MAX_FRAME_SIZE {
+        return Err(ServiceError::FrameTooLarge);
+    }
+
+    let mut frame = Vec::with_capacity(body.len() + 4);
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+fn decode_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T, ServiceError> {
+    let length_bytes: [u8; 4] = frame
+        .get(..4)
+        .ok_or(ServiceError::TruncatedFrame)?
+        .try_into()
+        .map_err(|_| ServiceError::TruncatedFrame)?;
+    let body_length = u32::from_le_bytes(length_bytes) as usize;
+    if body_length > MAX_FRAME_SIZE {
+        return Err(ServiceError::FrameTooLarge);
+    }
+    if frame.len() != body_length + 4 {
+        return Err(ServiceError::TruncatedFrame);
+    }
+
+    serde_json::from_slice(&frame[4..]).map_err(|_| ServiceError::InvalidRequest)
+}

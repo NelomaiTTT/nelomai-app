@@ -5,6 +5,7 @@ members = [
     "crates/client-storage",
     "crates/client-tunnel",
     "crates/contracts",
+    "crates/unix-service",
     "crates/windows-service",
     "plugins/tunnel-android",
     "spikes/desktop-helper",

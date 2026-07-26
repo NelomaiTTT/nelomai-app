@@ -27,3 +27,6 @@ serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 nelomai-windows-service = { path = "../crates/windows-service" }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nelomai-unix-service = { path = "../crates/unix-service" }

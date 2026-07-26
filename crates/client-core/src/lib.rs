@@ -222,6 +222,14 @@ impl ConnectOptions {
     }
 
     pub fn windows_default() -> Self {
+        Self::desktop_default()
+    }
+
+    pub fn unix_desktop_default() -> Self {
+        Self::desktop_default()
+    }
+
+    fn desktop_default() -> Self {
         Self {
             layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Dynamic,
@@ -250,6 +258,17 @@ mod platform_default_tests {
     #[test]
     fn windows_defaults_to_dynamic_stray() {
         let options = ConnectOptions::windows_default();
+
+        assert_eq!(options.layer, Layer::Stray);
+        assert_eq!(options.tic_connection_mode, TicConnectionMode::Dynamic);
+        assert_eq!(options.route_mode, RouteMode::Standalone);
+        assert!(options.probes.is_empty());
+        assert!(options.allow_alternate);
+    }
+
+    #[test]
+    fn unix_desktop_defaults_to_dynamic_stray() {
+        let options = ConnectOptions::unix_desktop_default();
 
         assert_eq!(options.layer, Layer::Stray);
         assert_eq!(options.tic_connection_mode, TicConnectionMode::Dynamic);

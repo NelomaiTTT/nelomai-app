@@ -1,4 +1,4 @@
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 mod platform;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -9,6 +9,9 @@ pub fn run() {
 
     #[cfg(windows)]
     let builder = builder.manage(platform::windows::tunnel_controller());
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let builder = builder.manage(platform::unix::tunnel_controller());
 
     builder
         .run(tauri::generate_context!())
