@@ -1,0 +1,32 @@
+{
+  "api_version": "1",
+  "request_id": "req_bootstrap_future",
+  "access": {
+    "state": "active",
+    "can_login": true,
+    "can_connect": true,
+    "expires_at": null,
+    "future_notice": "ignored"
+  },
+  "device": {
+    "id": "device_01",
+    "binding_peer_id": null
+  },
+  "defaults": {
+    "layer": "tic",
+    "mode": "fixed",
+    "route_mode": "via_tak",
+    "probe_refresh_seconds": 300
+  },
+  "update": {
+    "requirement": "none",
+    "latest_version": "0.1.0",
+    "minimum_version": "0.1.0"
+  },
+  "capabilities": {
+    "pin_stray": true,
+    "split_tunnel": false
+  },
+  "future_optional": { "value": true }
+}
+

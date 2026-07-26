@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-request-vpn-permission"
+description = "Enables the request_vpn_permission command without any pre-configured scope."
+commands.allow = ["request_vpn_permission"]
+
+[[permission]]
+identifier = "deny-request-vpn-permission"
+description = "Denies the request_vpn_permission command without any pre-configured scope."
+commands.deny = ["request_vpn_permission"]

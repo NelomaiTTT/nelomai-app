@@ -1,0 +1,9 @@
+{
+  "api_version": "1",
+  "operation_id": "connect_bad",
+  "layer": "tic",
+  "mode": "fixed",
+  "route_mode": "automatic",
+  "candidate_id": null
+}
+

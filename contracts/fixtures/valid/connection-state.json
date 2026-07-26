@@ -1,0 +1,13 @@
+{
+  "api_version": "1",
+  "request_id": "req_state_01",
+  "status": "connected",
+  "operation_id": "connect_01",
+  "layer": "stray",
+  "mode": "dynamic",
+  "route_mode": "via_tak",
+  "changed_at": "2026-07-26T09:00:05Z",
+  "can_retry": false,
+  "error": null
+}
+

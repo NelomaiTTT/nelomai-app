@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/probe-results.schema.json",
+  "type": "object",
+  "required": ["api_version", "operation_id", "measured_at", "results"],
+  "properties": {
+    "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+    "operation_id": { "$ref": "common.schema.json#/$defs/id" },
+    "measured_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "results": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "required": ["candidate_id", "latency_ms", "reachable"],
+        "properties": {
+          "candidate_id": { "$ref": "common.schema.json#/$defs/id" },
+          "latency_ms": { "type": ["integer", "null"], "minimum": 0, "maximum": 60000 },
+          "reachable": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}
+

@@ -1,0 +1,8 @@
+{
+  "request_id": "req_error_bad",
+  "code": "connection_failed",
+  "message": "Не удалось подключиться.",
+  "private_key": "must-never-be-here",
+  "config": "[Interface]"
+}
+

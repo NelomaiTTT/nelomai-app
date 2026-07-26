@@ -1,0 +1,23 @@
+{
+  "api_version": "1",
+  "request_id": "req_peers_01",
+  "peers": [
+    {
+      "id": "peer_03",
+      "name": "Пир 3",
+      "comment": "Ноутбук",
+      "last_handshake_at": null,
+      "bound_to_app": false,
+      "selectable": true
+    },
+    {
+      "id": "peer_05",
+      "name": "Пир 5",
+      "comment": null,
+      "last_handshake_at": "2026-07-26T08:40:00Z",
+      "bound_to_app": true,
+      "selectable": false
+    }
+  ]
+}
+

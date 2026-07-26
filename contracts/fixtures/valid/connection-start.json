@@ -1,0 +1,9 @@
+{
+  "api_version": "1",
+  "operation_id": "connect_01",
+  "layer": "stray",
+  "mode": "dynamic",
+  "route_mode": "via_tak",
+  "candidate_id": "candidate_a"
+}
+

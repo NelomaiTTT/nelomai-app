@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/connection-start.schema.json",
+  "type": "object",
+  "required": ["api_version", "operation_id", "layer", "mode", "route_mode", "candidate_id"],
+  "properties": {
+    "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+    "operation_id": { "$ref": "common.schema.json#/$defs/id" },
+    "layer": { "$ref": "common.schema.json#/$defs/layer" },
+    "mode": { "$ref": "common.schema.json#/$defs/mode" },
+    "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" },
+    "candidate_id": { "anyOf": [{ "$ref": "common.schema.json#/$defs/id" }, { "type": "null" }] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "enum": ["dynamic", "pinned"] } } },
+      "then": { "properties": { "candidate_id": { "$ref": "common.schema.json#/$defs/id" } } }
+    },
+    {
+      "if": { "properties": { "layer": { "const": "stray" } } },
+      "then": { "properties": { "mode": { "enum": ["dynamic", "pinned"] } } }
+    }
+  ],
+  "additionalProperties": true
+}
+

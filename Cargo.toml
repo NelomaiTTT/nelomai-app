@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/contracts",
+    "plugins/tunnel-android",
+    "spikes/desktop-helper",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"

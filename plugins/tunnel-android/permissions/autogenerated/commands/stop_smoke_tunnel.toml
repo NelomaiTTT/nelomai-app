@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-stop-smoke-tunnel"
+description = "Enables the stop_smoke_tunnel command without any pre-configured scope."
+commands.allow = ["stop_smoke_tunnel"]
+
+[[permission]]
+identifier = "deny-stop-smoke-tunnel"
+description = "Denies the stop_smoke_tunnel command without any pre-configured scope."
+commands.deny = ["stop_smoke_tunnel"]

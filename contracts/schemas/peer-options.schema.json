@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/peer-options.schema.json",
+  "type": "object",
+  "required": ["api_version", "request_id", "peers"],
+  "properties": {
+    "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+    "request_id": { "$ref": "common.schema.json#/$defs/id" },
+    "peers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "comment", "last_handshake_at", "bound_to_app", "selectable"],
+        "properties": {
+          "id": { "$ref": "common.schema.json#/$defs/id" },
+          "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+          "comment": { "type": ["string", "null"], "maxLength": 500 },
+          "last_handshake_at": { "anyOf": [{ "$ref": "common.schema.json#/$defs/timestamp" }, { "type": "null" }] },
+          "bound_to_app": { "type": "boolean" },
+          "selectable": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}
+

@@ -1,0 +1,10 @@
+{
+  "api_version": "1",
+  "operation_id": "probe_01",
+  "measured_at": "2026-07-26T09:00:00Z",
+  "results": [
+    { "candidate_id": "candidate_a", "latency_ms": 34, "reachable": true },
+    { "candidate_id": "candidate_b", "latency_ms": null, "reachable": false }
+  ]
+}
+

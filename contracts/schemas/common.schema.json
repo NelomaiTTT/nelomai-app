@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/common.schema.json",
+  "$defs": {
+    "apiVersion": { "const": "1" },
+    "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "layer": { "enum": ["tic", "stray"] },
+    "mode": { "enum": ["fixed", "dynamic", "pinned"] },
+    "routeMode": { "enum": ["standalone", "via_tak"] },
+    "platform": { "enum": ["android", "windows", "macos", "linux"] },
+    "safeError": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z0-9_]+$", "maxLength": 80 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 500 }
+      },
+      "additionalProperties": false
+    }
+  }
+}
+
