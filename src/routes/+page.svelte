@@ -27,6 +27,8 @@
   let ticConnectionMode = $state<TicConnectionMode>("dynamic");
   let routeMode = $state<RouteMode>("standalone");
   let busy = $state(false);
+  let probeBusy = $state(false);
+  let availableCandidates = $state(0);
   let error = $state<string | null>(null);
 
   let login = $state("");
@@ -48,7 +50,20 @@
     error: "Что-то пошло не так",
   };
 
-  onMount(restore);
+  onMount(() => {
+    void restore();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshProbes();
+    }, 300_000);
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") void refreshProbes();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  });
 
   async function restore() {
     busy = true;
@@ -103,6 +118,7 @@
     const state = await nativeClient.state();
     phase = state.phase;
     view = viewForPhase(state.phase);
+    if (state.phase === "ready") void refreshProbes();
   }
 
   async function submitLogin(event: SubmitEvent) {
@@ -174,7 +190,6 @@
           layer: selectedLayer,
           ticConnectionMode,
           routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
-          probes: [],
           allowAlternate: true,
         });
         phase = "connected";
@@ -185,6 +200,33 @@
       error = commandMessage(reason);
     } finally {
       busy = false;
+    }
+  }
+
+  async function refreshProbes() {
+    if (
+      probeBusy ||
+      !bootstrap?.binding ||
+      phase === "connected" ||
+      phase === "connecting" ||
+      phase === "stopping"
+    ) {
+      return;
+    }
+    probeBusy = true;
+    const measuredLayer = selectedLayer;
+    if (phase === "ready") phase = "measuring";
+    try {
+      const results = await nativeClient.refreshProbes(measuredLayer);
+      if (results.layer === selectedLayer) {
+        availableCandidates = results.probes.length;
+      }
+    } catch {
+      availableCandidates = 0;
+    } finally {
+      probeBusy = false;
+      if (phase === "measuring") phase = "ready";
+      if (measuredLayer !== selectedLayer) void refreshProbes();
     }
   }
 
@@ -367,11 +409,21 @@
             <legend>Система</legend>
             <div class="segmented">
               <label>
-                <input type="radio" value="tic" bind:group={selectedLayer} />
+                <input
+                  type="radio"
+                  value="tic"
+                  bind:group={selectedLayer}
+                  onchange={refreshProbes}
+                />
                 <span>Tic / Tak</span>
               </label>
               <label>
-                <input type="radio" value="stray" bind:group={selectedLayer} />
+                <input
+                  type="radio"
+                  value="stray"
+                  bind:group={selectedLayer}
+                  onchange={refreshProbes}
+                />
                 <span>Stray</span>
               </label>
             </div>
@@ -400,6 +452,10 @@
               <strong>{bootstrap.binding.interface_name} · {bootstrap.binding.slot}</strong>
             </div>
           {/if}
+          <div class="binding-summary">
+            <span>Доступные серверы</span>
+            <strong>{probeBusy ? "Проверяем" : availableCandidates}</strong>
+          </div>
         </aside>
       </div>
     {:else if view === "access_expired"}

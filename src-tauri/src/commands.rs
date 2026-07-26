@@ -3,7 +3,7 @@ use nelomai_client_application::{ApplicationError, LoginParameters};
 use nelomai_client_core::{ConnectOptions, CoreApiError, CoreError, CoreState, Phase};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
-    Platform, ProbeResult, RouteMode, TicConnectionMode,
+    Platform, ProbeResults, RouteMode, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -24,6 +24,9 @@ impl From<ApplicationError> for CommandError {
                 "storage_unavailable",
                 "Защищённое хранилище временно недоступно",
             ),
+            ApplicationError::Clock => {
+                Self::new("clock_unavailable", "Не удалось определить текущее время")
+            }
             ApplicationError::Api(error) => Self::from_api(error),
             ApplicationError::Core(error) => Self::from_core(error),
         }
@@ -120,8 +123,6 @@ pub struct StartCommandRequest {
     layer: Layer,
     tic_connection_mode: TicConnectionMode,
     route_mode: RouteMode,
-    #[serde(default)]
-    probes: Vec<ProbeResult>,
     #[serde(default = "default_true")]
     allow_alternate: bool,
 }
@@ -204,6 +205,17 @@ pub async fn app_bind_peer(
 }
 
 #[tauri::command]
+pub async fn app_refresh_probes(
+    application: State<'_, Arc<NativeApplication>>,
+    layer: Layer,
+) -> Result<ProbeResults, CommandError> {
+    application
+        .refresh_probes(layer, now_unix())
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn app_start(
     application: State<'_, Arc<NativeApplication>>,
     request: StartCommandRequest,
@@ -214,7 +226,7 @@ pub async fn app_start(
                 layer: request.layer,
                 tic_connection_mode: request.tic_connection_mode,
                 route_mode: request.route_mode,
-                probes: request.probes,
+                probes: Vec::new(),
                 allow_alternate: request.allow_alternate,
             },
             now_unix(),

@@ -8,6 +8,8 @@ import type {
   NativeCommandError,
   PeerBinding,
   PeerOptions,
+  ProbeResults,
+  Layer,
   StartCommandRequest,
 } from "./app-model";
 
@@ -40,6 +42,8 @@ export function createNativeClient(
     peerOptions: () => invoke("app_peer_options") as Promise<PeerOptions>,
     bindPeer: (request: BindPeerRequest) =>
       invoke("app_bind_peer", { request }) as Promise<SafePeerBindingResponse>,
+    refreshProbes: (layer: Layer) =>
+      invoke("app_refresh_probes", { layer }) as Promise<ProbeResults>,
     start: (request: StartCommandRequest) =>
       invoke("app_start", { request }) as Promise<Connection>,
     startSavedStray: () =>

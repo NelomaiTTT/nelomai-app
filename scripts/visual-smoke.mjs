@@ -122,6 +122,18 @@ async function capture(name, viewport, scenario) {
           if (command === "app_peer_options") {
             return peerFixture;
           }
+          if (command === "app_refresh_probes") {
+            return {
+              layer: args.layer,
+              probes: [
+                {
+                  candidate_id: "preview-candidate",
+                  latency_ms: 24.5,
+                  measured_at: "2026-07-26T12:00:00Z",
+                },
+              ],
+            };
+          }
           return {};
         },
       };

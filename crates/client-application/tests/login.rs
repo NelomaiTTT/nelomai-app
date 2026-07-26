@@ -11,7 +11,7 @@ use nelomai_contracts::{
     Access, AccessState, ApiVersion, BindPeerRequest, Bootstrap, BootstrapDefaults,
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
     ConnectionStartResponse, Device, Layer, PeerBinding, PeerBindingResponse, PeerOption,
-    PeerOptions, Platform, RouteMode, TicConnectionMode,
+    PeerOptions, Platform, RouteMode, ServerCandidatesResponse, TicConnectionMode,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -84,6 +84,18 @@ impl ApplicationApi for FakeApi {
     ) -> Result<PeerBindingResponse, CoreApiError> {
         *self.bind_request.lock().unwrap() = Some(request.clone());
         Ok(binding_response(request))
+    }
+
+    async fn server_candidates(
+        &self,
+        _access_token: &str,
+        _layer: Layer,
+    ) -> Result<ServerCandidatesResponse, CoreApiError> {
+        unreachable!("server candidates are not used by this test")
+    }
+
+    async fn probe_latency_ms(&self, _probe_url: &str) -> Option<f64> {
+        unreachable!("server probes are not used by this test")
     }
 
     async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {

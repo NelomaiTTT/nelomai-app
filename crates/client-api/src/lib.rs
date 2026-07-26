@@ -7,6 +7,7 @@ use nelomai_contracts::{
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -247,6 +248,29 @@ impl ClientApi {
                 .json(request),
         )
         .await
+    }
+
+    pub async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
+        let endpoint = Url::parse(probe_url).ok()?;
+        let scheme_allowed =
+            endpoint.scheme() == "https" || (cfg!(debug_assertions) && endpoint.scheme() == "http");
+        if !scheme_allowed {
+            return None;
+        }
+
+        let started = Instant::now();
+        let response = self
+            .http
+            .get(endpoint)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .ok()?;
+        response
+            .status()
+            .is_success()
+            .then(|| started.elapsed().as_secs_f64() * 1_000.0)
     }
 
     pub async fn start_connection(

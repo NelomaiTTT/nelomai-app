@@ -38,4 +38,29 @@ describe("native client", () => {
 
     expect(invoke).toHaveBeenCalledWith("app_bind_peer", { request });
   });
+
+  it("keeps probe measurements in the native layer", async () => {
+    const invoke = vi.fn().mockResolvedValue({ layer: "stray", probes: [] });
+    const client = createNativeClient(invoke);
+
+    await client.refreshProbes("stray");
+    await client.start({
+      layer: "stray",
+      ticConnectionMode: "dynamic",
+      routeMode: "standalone",
+      allowAlternate: true,
+    });
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "app_refresh_probes", {
+      layer: "stray",
+    });
+    expect(invoke).toHaveBeenNthCalledWith(2, "app_start", {
+      request: {
+        layer: "stray",
+        ticConnectionMode: "dynamic",
+        routeMode: "standalone",
+        allowAlternate: true,
+      },
+    });
+  });
 });

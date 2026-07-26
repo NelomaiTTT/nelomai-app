@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, ErrorPayload, PeerBindingResponse, PeerOptions,
+    ConnectionStartResponse, ErrorPayload, PeerBindingResponse, PeerOptions, ProbeResults,
     ServerCandidatesResponse, ServerSelectionRequest, UpdateManifest,
 };
 use serde::de::DeserializeOwned;
@@ -53,6 +53,7 @@ fn shared_valid_fixtures_match_schemas_and_rust_types() {
         "bind-peer-request.schema.json",
     );
     check::<ServerSelectionRequest>("valid/probe-results.json", "probe-results.schema.json");
+    check::<ProbeResults>("valid/probe-results.json", "probe-results.schema.json");
     check::<ServerCandidatesResponse>(
         "valid/server-candidates.json",
         "server-candidates.schema.json",

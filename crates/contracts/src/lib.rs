@@ -161,6 +161,12 @@ pub struct ProbeResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProbeResults {
+    pub layer: Layer,
+    pub probes: Vec<ProbeResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerSelectionRequest {
     pub layer: Layer,
     pub probes: Vec<ProbeResult>,

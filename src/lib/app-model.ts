@@ -121,12 +121,16 @@ export interface StartCommandRequest {
   layer: Layer;
   ticConnectionMode: TicConnectionMode;
   routeMode: RouteMode;
+  allowAlternate: boolean;
+}
+
+export interface ProbeResults {
+  layer: Layer;
   probes: Array<{
     candidate_id: string;
     latency_ms: number;
     measured_at: string;
   }>;
-  allowAlternate: boolean;
 }
 
 export interface NativeCommandError {

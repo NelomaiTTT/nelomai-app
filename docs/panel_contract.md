@@ -23,6 +23,19 @@ inventory, agent credentials, SSH details, or internal server IDs. Probe
 results are advisory; the panel validates freshness and makes the final server
 selection.
 
+After an authenticated bootstrap, the native layer requests candidates for the
+selected layer and measures their HTTPS probe endpoints without an
+authorization header. At most four probes run concurrently and each request
+has a three-second timeout. Results are cached independently for Tic and Stray
+for no longer than five minutes or the earliest candidate expiry, whichever
+comes first. The cache is cleared on login, logout, and peer rebinding.
+
+The webview can request a refresh and display its progress, but cannot supply
+probe results to a connection command. The native application replaces any
+caller-provided values with its own current measurements before
+`connections/start`. If a measurement is unavailable, the panel remains the
+only authority allowed to select an alternate server.
+
 WireGuard configuration is a privileged native payload. It must pass directly
 from the authenticated API layer to `TunnelController`; frontend state, common
 error payloads, analytics, audit events, and application logs must never
