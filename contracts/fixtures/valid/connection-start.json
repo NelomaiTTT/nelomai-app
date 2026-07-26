@@ -1,9 +1,14 @@
 {
-  "api_version": "1",
-  "operation_id": "connect_01",
+  "operation_id": "11111111-1111-4111-8111-111111111111",
   "layer": "stray",
-  "mode": "dynamic",
-  "route_mode": "via_tak",
-  "candidate_id": "candidate_a"
+  "tic_connection_mode": "dynamic",
+  "route_mode": "standalone",
+  "probes": [
+    {
+      "candidate_id": "opaque-candidate-token-a",
+      "latency_ms": 34.5,
+      "measured_at": "2026-07-26T09:00:00Z"
+    }
+  ],
+  "allow_alternate": false
 }
-

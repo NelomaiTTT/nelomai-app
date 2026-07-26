@@ -4,20 +4,78 @@
   "$defs": {
     "apiVersion": { "const": "1" },
     "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
     "timestamp": { "type": "string", "format": "date-time" },
     "layer": { "enum": ["tic", "stray"] },
-    "mode": { "enum": ["fixed", "dynamic", "pinned"] },
+    "ticConnectionMode": { "enum": ["personal", "dynamic"] },
     "routeMode": { "enum": ["standalone", "via_tak"] },
     "platform": { "enum": ["android", "windows", "macos", "linux"] },
-    "safeError": {
+    "leaseStatus": {
+      "enum": ["allocating", "issued", "connected", "warm", "released", "failed"]
+    },
+    "connection": {
       "type": "object",
-      "required": ["code", "message"],
+      "required": [
+        "lease_id",
+        "layer",
+        "tic_connection_mode",
+        "route_mode",
+        "status",
+        "pinned",
+        "stopped_at"
+      ],
       "properties": {
-        "code": { "type": "string", "pattern": "^[a-z0-9_]+$", "maxLength": 80 },
-        "message": { "type": "string", "minLength": 1, "maxLength": 500 }
+        "lease_id": { "$ref": "#/$defs/uuid" },
+        "layer": { "$ref": "#/$defs/layer" },
+        "tic_connection_mode": { "$ref": "#/$defs/ticConnectionMode" },
+        "route_mode": { "$ref": "#/$defs/routeMode" },
+        "status": { "$ref": "#/$defs/leaseStatus" },
+        "pinned": { "type": "boolean" },
+        "stopped_at": {
+          "anyOf": [
+            { "$ref": "#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "peerBinding": {
+      "type": "object",
+      "required": [
+        "id",
+        "peer_id",
+        "interface_id",
+        "interface_name",
+        "slot",
+        "preferred_layer",
+        "tic_connection_mode",
+        "route_mode"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "peer_id": { "$ref": "#/$defs/id" },
+        "interface_id": { "$ref": "#/$defs/id" },
+        "interface_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "slot": { "type": "integer", "minimum": 1 },
+        "preferred_layer": { "$ref": "#/$defs/layer" },
+        "tic_connection_mode": { "$ref": "#/$defs/ticConnectionMode" },
+        "route_mode": { "$ref": "#/$defs/routeMode" }
+      },
+      "additionalProperties": true
+    },
+    "probe": {
+      "type": "object",
+      "required": ["candidate_id", "latency_ms", "measured_at"],
+      "properties": {
+        "candidate_id": { "type": "string", "minLength": 20, "maxLength": 4096 },
+        "latency_ms": { "type": "number", "exclusiveMinimum": 0, "maximum": 10000 },
+        "measured_at": { "$ref": "#/$defs/timestamp" }
       },
       "additionalProperties": false
     }
   }
 }
-

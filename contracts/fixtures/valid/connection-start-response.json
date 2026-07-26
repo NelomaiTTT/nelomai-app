@@ -1,0 +1,15 @@
+{
+  "api_version": "1",
+  "request_id": "req_start_01",
+  "connection": {
+    "lease_id": "11111111-1111-4111-8111-111111111111",
+    "layer": "stray",
+    "tic_connection_mode": "dynamic",
+    "route_mode": "standalone",
+    "status": "issued",
+    "pinned": false,
+    "stopped_at": null
+  },
+  "configuration": "[Interface]\nPrivateKey = delivered-only-to-core\n",
+  "reused": false
+}

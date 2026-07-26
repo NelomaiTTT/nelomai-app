@@ -1,7 +1,12 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+pub use nelomai_contracts::{
+    Layer as StoredLayer, RouteMode as StoredRouteMode,
+    TicConnectionMode as StoredTicConnectionMode,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,11 +14,74 @@ use thiserror::Error;
 
 const SERVICE_NAME: &str = "ru.nelomai.app";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredConnectionKind {
+    Fixed,
+    DynamicWarm,
+    Pinned,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredConnection {
+    pub lease_id: String,
+    pub layer: StoredLayer,
+    pub tic_connection_mode: StoredTicConnectionMode,
+    pub route_mode: StoredRouteMode,
+    pub kind: StoredConnectionKind,
+    pub configuration: String,
+    pub valid_until_unix: Option<i64>,
+}
+
+impl fmt::Debug for StoredConnection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredConnection")
+            .field("lease_id", &self.lease_id)
+            .field("layer", &self.layer)
+            .field("tic_connection_mode", &self.tic_connection_mode)
+            .field("route_mode", &self.route_mode)
+            .field("kind", &self.kind)
+            .field("configuration", &"<redacted>")
+            .field("valid_until_unix", &self.valid_until_unix)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredCompatibility {
+    pub update_required: bool,
+    pub observed_at_unix: i64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredAuth {
     pub install_secret: String,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub saved_connection: Option<StoredConnection>,
+    #[serde(default)]
+    pub compatibility: Option<StoredCompatibility>,
+}
+
+impl fmt::Debug for StoredAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredAuth")
+            .field("install_secret", &"<redacted>")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("saved_connection", &self.saved_connection)
+            .field("compatibility", &self.compatibility)
+            .finish()
+    }
 }
 
 impl StoredAuth {
@@ -24,11 +92,13 @@ impl StoredAuth {
             install_secret: URL_SAFE_NO_PAD.encode(bytes),
             access_token: None,
             refresh_token: None,
+            saved_connection: None,
+            compatibility: None,
         }
     }
 }
 
-pub trait SecretStore {
+pub trait SecretStore: Send + Sync {
     fn load(&self) -> Result<Option<StoredAuth>, StorageError>;
     fn save(&self, auth: &StoredAuth) -> Result<(), StorageError>;
     fn delete(&self) -> Result<(), StorageError>;
@@ -317,6 +387,7 @@ fn write_protected_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn install_secret_has_expected_entropy_and_url_safe_shape() {
@@ -328,6 +399,67 @@ mod tests {
             .install_secret
             .chars()
             .all(|value| value.is_ascii_alphanumeric() || value == '_' || value == '-'));
+    }
+
+    #[test]
+    fn legacy_credentials_load_with_empty_connection_state() {
+        let legacy = json!({
+            "install_secret": "legacy-install-secret",
+            "access_token": "access-secret",
+            "refresh_token": "refresh-secret"
+        });
+        let stored: StoredAuth = serde_json::from_value(legacy).unwrap();
+        assert!(stored.saved_connection.is_none());
+        assert!(stored.compatibility.is_none());
+    }
+
+    #[test]
+    fn debug_output_redacts_every_secret() {
+        let mut stored = StoredAuth::new_install();
+        stored.access_token = Some("access-secret".to_string());
+        stored.refresh_token = Some("refresh-secret".to_string());
+        stored.saved_connection = Some(StoredConnection {
+            lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            layer: StoredLayer::Stray,
+            tic_connection_mode: StoredTicConnectionMode::Dynamic,
+            route_mode: StoredRouteMode::Standalone,
+            kind: StoredConnectionKind::Pinned,
+            configuration: "PrivateKey = tunnel-secret".to_string(),
+            valid_until_unix: None,
+        });
+
+        let debug = format!("{stored:?}");
+        for secret in [
+            &stored.install_secret,
+            "access-secret",
+            "refresh-secret",
+            "tunnel-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn saved_connection_survives_serialization_without_losing_lease_expiry() {
+        let mut stored = StoredAuth::new_install();
+        stored.saved_connection = Some(StoredConnection {
+            lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            layer: StoredLayer::Stray,
+            tic_connection_mode: StoredTicConnectionMode::Dynamic,
+            route_mode: StoredRouteMode::Standalone,
+            kind: StoredConnectionKind::DynamicWarm,
+            configuration: "[Interface]\nPrivateKey = secret\n".to_string(),
+            valid_until_unix: Some(1_800_000_000),
+        });
+        stored.compatibility = Some(StoredCompatibility {
+            update_required: false,
+            observed_at_unix: 1_700_000_000,
+        });
+
+        let round_trip: StoredAuth =
+            serde_json::from_slice(&SystemSecretStore::serialized(&stored).unwrap()).unwrap();
+        assert_eq!(round_trip, stored);
     }
 
     #[test]

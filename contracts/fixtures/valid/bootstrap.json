@@ -9,22 +9,39 @@
   },
   "device": {
     "id": "device_01",
-    "binding_peer_id": "peer_05"
+    "name": "Рабочий Mac",
+    "platform": "macos"
   },
+  "binding": {
+    "id": "1",
+    "peer_id": "3",
+    "interface_id": "1",
+    "interface_name": "Основной",
+    "slot": 3,
+    "preferred_layer": "stray",
+    "tic_connection_mode": "dynamic",
+    "route_mode": "standalone"
+  },
+  "connection": {
+    "lease_id": "11111111-1111-4111-8111-111111111111",
+    "layer": "stray",
+    "tic_connection_mode": "dynamic",
+    "route_mode": "standalone",
+    "status": "warm",
+    "pinned": false,
+    "stopped_at": "2026-07-26T08:50:00Z"
+  },
+  "pinned_stray": null,
   "defaults": {
-    "layer": "tic",
-    "mode": "fixed",
-    "route_mode": "via_tak",
-    "probe_refresh_seconds": 300
+    "layer": "stray",
+    "tic_connection_mode": "dynamic",
+    "route_mode": "standalone"
   },
   "update": {
-    "requirement": "none",
-    "latest_version": "0.1.0",
-    "minimum_version": "0.1.0"
-  },
-  "capabilities": {
-    "pin_stray": true,
-    "split_tunnel": false
+    "current_version": "0.1.0",
+    "minimum_version": null,
+    "update_available": false,
+    "required": false,
+    "release_notes": null
   }
 }
-

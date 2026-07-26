@@ -1,0 +1,20 @@
+[package]
+name = "nelomai-client-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+nelomai-client-api = { path = "../client-api" }
+nelomai-client-storage = { path = "../client-storage" }
+nelomai-client-tunnel = { path = "../client-tunnel" }
+nelomai-contracts = { path = "../contracts" }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

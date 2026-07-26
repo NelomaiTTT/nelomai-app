@@ -1,8 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use nelomai_contracts::{
-    BindPeerRequest, Bootstrap, ConnectionStart, ConnectionState, ErrorPayload,
-    PeerBindingResponse, PeerOptions, ProbeResults, UpdateManifest,
+    BindPeerRequest, Bootstrap, ConnectionOperationResponse, ConnectionStartRequest,
+    ConnectionStartResponse, ErrorPayload, PeerBindingResponse, PeerOptions,
+    ServerCandidatesResponse, ServerSelectionRequest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -51,16 +52,23 @@ fn shared_valid_fixtures_match_schemas_and_rust_types() {
         "valid/bind-peer-request.json",
         "bind-peer-request.schema.json",
     );
-    check::<ProbeResults>("valid/probe-results.json", "probe-results.schema.json");
-    check::<ConnectionStart>(
+    check::<ServerSelectionRequest>("valid/probe-results.json", "probe-results.schema.json");
+    check::<ServerCandidatesResponse>(
+        "valid/server-candidates.json",
+        "server-candidates.schema.json",
+    );
+    check::<ConnectionStartRequest>(
         "valid/connection-start.json",
         "connection-start.schema.json",
     );
-    check::<ConnectionState>(
-        "valid/connection-state.json",
-        "connection-state.schema.json",
+    check::<ConnectionStartResponse>(
+        "valid/connection-start-response.json",
+        "connection-start-response.schema.json",
     );
-    check::<UpdateManifest>("valid/update-manifest.json", "update-manifest.schema.json");
+    check::<ConnectionOperationResponse>(
+        "valid/connection-operation.json",
+        "connection-operation.schema.json",
+    );
     check::<ErrorPayload>("valid/error.json", "error.schema.json");
 }
 
@@ -71,7 +79,7 @@ fn unknown_optional_fields_are_ignored_by_an_older_client() {
 
 #[test]
 fn unknown_route_enum_is_rejected() {
-    assert!(serde_json::from_str::<ConnectionStart>(&fixture(
+    assert!(serde_json::from_str::<ConnectionStartRequest>(&fixture(
         "invalid/connection-start-unknown-route.json"
     ))
     .is_err());
@@ -90,4 +98,17 @@ fn common_error_payload_rejects_secret_fields() {
     assert!(serde_json::from_str::<ErrorPayload>(&raw).is_err());
     let value: Value = serde_json::from_str(&raw).unwrap();
     assert!(!schema_is_valid("error.schema.json", &value));
+}
+
+#[test]
+fn wireguard_configuration_is_redacted_from_debug_output() {
+    let response: ConnectionStartResponse =
+        serde_json::from_str(&fixture("valid/connection-start-response.json")).unwrap();
+    let debug = format!("{response:?}");
+    assert!(!debug.contains("delivered-only-to-core"));
+    assert!(debug.contains("<redacted>"));
+
+    let binding: PeerBindingResponse =
+        serde_json::from_str(&fixture("valid/peer-binding.json")).unwrap();
+    assert!(!format!("{binding:?}").contains("# client configuration"));
 }

@@ -1,12 +1,15 @@
 use nelomai_contracts::{
-    Access, ApiVersion, BindPeerRequest, ErrorPayload, PeerBindingResponse, PeerOptions, Platform,
-    API_PREFIX,
+    Access, ApiVersion, BindPeerRequest, Bootstrap, ConnectionOperationRequest,
+    ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, ErrorPayload,
+    Layer, PeerBindingResponse, PeerOptions, Platform, ServerCandidatesResponse,
+    ServerSelectionRequest, ServerSelectionResponse, API_PREFIX,
 };
 use reqwest::{Client as HttpClient, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct LoginRequest {
     pub login: String,
     pub password: String,
@@ -18,9 +21,34 @@ pub struct LoginRequest {
     pub app_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+impl fmt::Debug for LoginRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoginRequest")
+            .field("login", &self.login)
+            .field("password", &"<redacted>")
+            .field("install_secret", &"<redacted>")
+            .field("device_name", &self.device_name)
+            .field("platform", &self.platform)
+            .field("platform_version", &self.platform_version)
+            .field("architecture", &self.architecture)
+            .field("app_version", &self.app_version)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
+}
+
+impl fmt::Debug for RefreshRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RefreshRequest")
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -30,7 +58,7 @@ pub struct AuthDevice {
     pub platform: Platform,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct TokenResponse {
     pub api_version: ApiVersion,
     pub request_id: String,
@@ -41,6 +69,23 @@ pub struct TokenResponse {
     pub refresh_expires_in: u64,
     pub access: Access,
     pub device: AuthDevice,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenResponse")
+            .field("api_version", &self.api_version)
+            .field("request_id", &self.request_id)
+            .field("token_type", &self.token_type)
+            .field("access_token", &"<redacted>")
+            .field("access_expires_in", &self.access_expires_in)
+            .field("refresh_token", &"<redacted>")
+            .field("refresh_expires_in", &self.refresh_expires_in)
+            .field("access", &self.access)
+            .field("device", &self.device)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -168,6 +213,110 @@ impl ClientApi {
         .await
     }
 
+    pub async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, ClientApiError> {
+        self.send_json(
+            self.http
+                .get(self.endpoint("bootstrap")?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn server_candidates(
+        &self,
+        access_token: &str,
+        layer: Layer,
+    ) -> Result<ServerCandidatesResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .get(self.server_candidates_endpoint(layer)?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn select_server(
+        &self,
+        access_token: &str,
+        request: &ServerSelectionRequest,
+    ) -> Result<ServerSelectionResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("server-selection")?)
+                .bearer_auth(access_token)
+                .json(request),
+        )
+        .await
+    }
+
+    pub async fn start_connection(
+        &self,
+        access_token: &str,
+        request: &ConnectionStartRequest,
+    ) -> Result<ConnectionStartResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("connections/start")?)
+                .bearer_auth(access_token)
+                .json(request),
+        )
+        .await
+    }
+
+    pub async fn stop_connection(
+        &self,
+        access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, ClientApiError> {
+        self.connection_operation(access_token, "connections/stop", request)
+            .await
+    }
+
+    pub async fn pin_stray(
+        &self,
+        access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, ClientApiError> {
+        self.connection_operation(access_token, "connections/pin-stray", request)
+            .await
+    }
+
+    pub async fn unpin_stray(
+        &self,
+        access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, ClientApiError> {
+        self.connection_operation(access_token, "connections/unpin-stray", request)
+            .await
+    }
+
+    async fn connection_operation(
+        &self,
+        access_token: &str,
+        path: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint(path)?)
+                .bearer_auth(access_token)
+                .json(request),
+        )
+        .await
+    }
+
+    fn server_candidates_endpoint(&self, layer: Layer) -> Result<Url, ClientApiError> {
+        let mut endpoint = self.endpoint("server-candidates")?;
+        endpoint.query_pairs_mut().append_pair(
+            "layer",
+            match layer {
+                Layer::Tic => "tic",
+                Layer::Stray => "stray",
+            },
+        );
+        Ok(endpoint)
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, ClientApiError> {
         self.api_base
             .join(path)
@@ -199,6 +348,9 @@ impl ClientApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nelomai_contracts::{
+        ConnectionOperationRequest, ConnectionStartRequest, Layer, RouteMode, TicConnectionMode,
+    };
 
     #[test]
     fn builds_versioned_endpoint_without_browser_cookie_state() {
@@ -212,5 +364,110 @@ mod tests {
     #[test]
     fn rejects_non_http_urls() {
         assert!(ClientApi::new("not a URL").is_err());
+    }
+
+    #[test]
+    fn builds_every_connection_endpoint_from_the_v1_base() {
+        let client = ClientApi::new("https://nelomai.ru").unwrap();
+        assert_eq!(
+            client.endpoint("bootstrap").unwrap().path(),
+            "/api/client/v1/bootstrap"
+        );
+        assert_eq!(
+            client
+                .server_candidates_endpoint(Layer::Stray)
+                .unwrap()
+                .as_str(),
+            "https://nelomai.ru/api/client/v1/server-candidates?layer=stray"
+        );
+        for path in [
+            "server-selection",
+            "connections/start",
+            "connections/stop",
+            "connections/pin-stray",
+            "connections/unpin-stray",
+        ] {
+            assert_eq!(
+                client.endpoint(path).unwrap().path(),
+                format!("/api/client/v1/{path}")
+            );
+        }
+    }
+
+    #[test]
+    fn serializes_start_and_operation_requests_exactly_as_the_panel_contract() {
+        let start = ConnectionStartRequest {
+            operation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            probes: Vec::new(),
+            allow_alternate: false,
+        };
+        let value = serde_json::to_value(start).unwrap();
+        assert_eq!(value["tic_connection_mode"], "dynamic");
+        assert!(value.get("mode").is_none());
+        assert!(value.get("api_version").is_none());
+
+        let operation = ConnectionOperationRequest {
+            operation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(operation).unwrap(),
+            serde_json::json!({
+                "operation_id": "11111111-1111-4111-8111-111111111111",
+                "lease_id": "22222222-2222-4222-8222-222222222222"
+            })
+        );
+    }
+
+    #[test]
+    fn auth_debug_output_redacts_password_install_secret_and_tokens() {
+        let login = LoginRequest {
+            login: "user".to_string(),
+            password: "password-secret".to_string(),
+            install_secret: "install-secret".to_string(),
+            device_name: "Mac".to_string(),
+            platform: Platform::Macos,
+            platform_version: None,
+            architecture: "aarch64".to_string(),
+            app_version: "0.1.0".to_string(),
+        };
+        let refresh = RefreshRequest {
+            refresh_token: "refresh-secret".to_string(),
+        };
+        let response = TokenResponse {
+            api_version: ApiVersion::V1,
+            request_id: "req-auth".to_string(),
+            token_type: "bearer".to_string(),
+            access_token: "access-secret".to_string(),
+            access_expires_in: 900,
+            refresh_token: "response-refresh-secret".to_string(),
+            refresh_expires_in: 7_776_000,
+            access: Access {
+                state: nelomai_contracts::AccessState::Active,
+                can_login: true,
+                can_connect: true,
+                expires_at: None,
+            },
+            device: AuthDevice {
+                id: "device".to_string(),
+                name: "Mac".to_string(),
+                platform: Platform::Macos,
+            },
+        };
+
+        let debug = format!("{login:?} {refresh:?} {response:?}");
+        for secret in [
+            "password-secret",
+            "install-secret",
+            "refresh-secret",
+            "access-secret",
+            "response-refresh-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("<redacted>"));
     }
 }

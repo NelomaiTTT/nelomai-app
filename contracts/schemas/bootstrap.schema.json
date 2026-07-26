@@ -2,7 +2,17 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nelomai.ru/schemas/client/v1/bootstrap.schema.json",
   "type": "object",
-  "required": ["api_version", "request_id", "access", "device", "defaults", "update", "capabilities"],
+  "required": [
+    "api_version",
+    "request_id",
+    "access",
+    "device",
+    "binding",
+    "connection",
+    "pinned_stray",
+    "defaults",
+    "update"
+  ],
   "properties": {
     "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
     "request_id": { "$ref": "common.schema.json#/$defs/id" },
@@ -13,50 +23,71 @@
         "state": { "enum": ["active", "expired"] },
         "can_login": { "type": "boolean" },
         "can_connect": { "type": "boolean" },
-        "expires_at": { "anyOf": [{ "$ref": "common.schema.json#/$defs/timestamp" }, { "type": "null" }] }
+        "expires_at": {
+          "anyOf": [
+            { "$ref": "common.schema.json#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        }
       },
       "additionalProperties": true
     },
     "device": {
       "type": "object",
-      "required": ["id", "binding_peer_id"],
+      "required": ["id", "name", "platform"],
       "properties": {
         "id": { "$ref": "common.schema.json#/$defs/id" },
-        "binding_peer_id": { "anyOf": [{ "$ref": "common.schema.json#/$defs/id" }, { "type": "null" }] }
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "platform": { "$ref": "common.schema.json#/$defs/platform" }
       },
       "additionalProperties": true
     },
+    "binding": {
+      "anyOf": [
+        { "$ref": "common.schema.json#/$defs/peerBinding" },
+        { "type": "null" }
+      ]
+    },
+    "connection": {
+      "anyOf": [
+        { "$ref": "common.schema.json#/$defs/connection" },
+        { "type": "null" }
+      ]
+    },
+    "pinned_stray": {
+      "anyOf": [
+        { "$ref": "common.schema.json#/$defs/connection" },
+        { "type": "null" }
+      ]
+    },
     "defaults": {
       "type": "object",
-      "required": ["layer", "mode", "route_mode", "probe_refresh_seconds"],
+      "required": ["layer", "tic_connection_mode", "route_mode"],
       "properties": {
         "layer": { "$ref": "common.schema.json#/$defs/layer" },
-        "mode": { "$ref": "common.schema.json#/$defs/mode" },
-        "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" },
-        "probe_refresh_seconds": { "type": "integer", "minimum": 60, "maximum": 3600 }
+        "tic_connection_mode": { "$ref": "common.schema.json#/$defs/ticConnectionMode" },
+        "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" }
       },
       "additionalProperties": true
     },
     "update": {
       "type": "object",
-      "required": ["requirement", "latest_version", "minimum_version"],
+      "required": [
+        "current_version",
+        "minimum_version",
+        "update_available",
+        "required",
+        "release_notes"
+      ],
       "properties": {
-        "requirement": { "enum": ["none", "available", "required"] },
-        "latest_version": { "type": "string", "minLength": 1 },
-        "minimum_version": { "type": "string", "minLength": 1 }
-      },
-      "additionalProperties": true
-    },
-    "capabilities": {
-      "type": "object",
-      "required": ["pin_stray", "split_tunnel"],
-      "properties": {
-        "pin_stray": { "type": "boolean" },
-        "split_tunnel": { "type": "boolean" }
+        "current_version": { "type": ["string", "null"], "maxLength": 64 },
+        "minimum_version": { "type": ["string", "null"], "maxLength": 64 },
+        "update_available": { "type": "boolean" },
+        "required": { "type": "boolean" },
+        "release_notes": { "type": ["string", "null"], "maxLength": 10000 }
       },
       "additionalProperties": true
     }
   },
   "additionalProperties": true
 }
-

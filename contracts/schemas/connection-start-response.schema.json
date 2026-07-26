@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/connection-start-response.schema.json",
+  "type": "object",
+  "required": ["api_version", "request_id", "connection", "configuration", "reused"],
+  "properties": {
+    "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+    "request_id": { "$ref": "common.schema.json#/$defs/id" },
+    "connection": { "$ref": "common.schema.json#/$defs/connection" },
+    "configuration": { "type": "string", "minLength": 1 },
+    "reused": { "type": "boolean" }
+  },
+  "additionalProperties": true
+}

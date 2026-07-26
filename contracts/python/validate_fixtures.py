@@ -14,7 +14,8 @@ INVALID = ROOT / "fixtures" / "invalid"
 SAFE_ERROR_KEYS = {"request_id", "code", "message"}
 ROUTES = {"standalone", "via_tak"}
 LAYERS = {"tic", "stray"}
-MODES = {"fixed", "dynamic", "pinned"}
+TIC_MODES = {"personal", "dynamic"}
+LEASE_STATUSES = {"allocating", "issued", "connected", "warm", "released", "failed"}
 
 
 def load(path: Path) -> dict:
@@ -28,13 +29,15 @@ def main() -> None:
     fixtures = {path.stem: load(path) for path in sorted(VALID.glob("*.json"))}
     assert fixtures["bootstrap"]["api_version"] == "1"
     assert fixtures["peer-options"]["peers"]
-    assert fixtures["probe-results"]["results"]
+    assert fixtures["probe-results"]["probes"]
+    assert fixtures["server-candidates"]["candidates"]
     start = fixtures["connection-start"]
     assert start["layer"] in LAYERS
-    assert start["mode"] in MODES
+    assert start["tic_connection_mode"] in TIC_MODES
     assert start["route_mode"] in ROUTES
-    assert fixtures["connection-state"]["status"] == "connected"
-    assert fixtures["update-manifest"]["channel"] == "stable"
+    assert start["operation_id"]
+    assert fixtures["connection-start-response"]["connection"]["status"] in LEASE_STATUSES
+    assert fixtures["connection-operation"]["connection"]["status"] in LEASE_STATUSES
     assert set(fixtures["error"]) == SAFE_ERROR_KEYS
 
     future = load(COMPAT / "bootstrap-extra-optional.json")
@@ -50,4 +53,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
