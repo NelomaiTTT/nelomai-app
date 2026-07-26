@@ -4143,10 +4143,14 @@ dependencies = [
 name = "tauri-plugin-tunnel-android"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "nelomai-client-tunnel",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.19",
+ "zeroize",
 ]
 
 [[package]]

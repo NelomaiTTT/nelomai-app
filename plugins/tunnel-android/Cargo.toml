@@ -12,6 +12,12 @@ links = "tauri-plugin-tunnel-android"
 tauri = { version = "2.11.3" }
 serde = "1.0"
 thiserror = "2"
+zeroize = "1"
+nelomai-client-tunnel = { path = "../../crates/client-tunnel" }
+async-trait = "0.1"
+
+[dev-dependencies]
+serde_json = "1"
 
 [build-dependencies]
 tauri-plugin = { version = "2.6.3", features = ["build"] }

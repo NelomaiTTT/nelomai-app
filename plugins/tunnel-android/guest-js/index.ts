@@ -8,9 +8,10 @@ export interface TunnelProbe {
   error: string | null;
 }
 
-export interface SmokeResult {
-  state: "up" | "down" | "unsupported";
+export interface TunnelStatus {
+  state: "stopped" | "starting" | "running" | "stopping" | "failed" | "unsupported";
   durationMillis: number;
+  errorCode: string | null;
 }
 
 export async function probe(): Promise<TunnelProbe> {
@@ -24,14 +25,6 @@ export async function requestVpnPermission(): Promise<boolean> {
   return result.permissionGranted;
 }
 
-export async function startSmokeTunnel(): Promise<SmokeResult> {
-  return invoke<SmokeResult>("plugin:tunnel-android|start_smoke_tunnel");
-}
-
-export async function stopSmokeTunnel(): Promise<SmokeResult> {
-  return invoke<SmokeResult>("plugin:tunnel-android|stop_smoke_tunnel");
-}
-
-export async function smokeTunnelStatus(): Promise<SmokeResult> {
-  return invoke<SmokeResult>("plugin:tunnel-android|smoke_tunnel_status");
+export async function tunnelStatus(): Promise<TunnelStatus> {
+  return invoke<TunnelStatus>("plugin:tunnel-android|tunnel_status");
 }

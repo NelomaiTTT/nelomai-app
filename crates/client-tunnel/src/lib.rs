@@ -13,6 +13,10 @@ impl TunnelConfiguration {
     pub fn expose(&self) -> &str {
         self.0.as_str()
     }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 
 impl fmt::Debug for TunnelConfiguration {
@@ -21,19 +25,14 @@ impl fmt::Debug for TunnelConfiguration {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TunnelStatus {
+    #[default]
     Stopped,
     Starting,
     Running,
     Stopping,
     Failed,
-}
-
-impl Default for TunnelStatus {
-    fn default() -> Self {
-        Self::Stopped
-    }
 }
 
 #[derive(Debug, Error)]

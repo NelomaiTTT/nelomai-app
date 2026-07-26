@@ -3,7 +3,5 @@ description = "Default permissions for the plugin"
 permissions = [
     "allow-probe",
     "allow-request-vpn-permission",
-    "allow-start-smoke-tunnel",
-    "allow-stop-smoke-tunnel",
-    "allow-smoke-tunnel-status",
+    "allow-tunnel-status",
 ]

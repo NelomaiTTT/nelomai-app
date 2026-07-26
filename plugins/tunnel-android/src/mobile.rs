@@ -37,21 +37,34 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
-    pub fn start_smoke_tunnel(&self) -> crate::Result<SmokeResponse> {
+    pub fn start_tunnel(
+        &self,
+        request: StartTunnelRequest,
+    ) -> crate::Result<TunnelOperationResponse> {
         self.0
-            .run_mobile_plugin("startSmokeTunnel", SmokeRequest::default())
+            .run_mobile_plugin("startTunnel", request)
             .map_err(Into::into)
     }
 
-    pub fn stop_smoke_tunnel(&self) -> crate::Result<SmokeResponse> {
+    pub fn stop_tunnel(&self) -> crate::Result<TunnelOperationResponse> {
         self.0
-            .run_mobile_plugin("stopSmokeTunnel", SmokeRequest::default())
+            .run_mobile_plugin(
+                "stopTunnel",
+                StopTunnelRequest {
+                    api_version: TUNNEL_API_VERSION,
+                },
+            )
             .map_err(Into::into)
     }
 
-    pub fn smoke_tunnel_status(&self) -> crate::Result<SmokeResponse> {
+    pub fn tunnel_status(&self) -> crate::Result<TunnelOperationResponse> {
         self.0
-            .run_mobile_plugin("smokeTunnelStatus", SmokeRequest::default())
+            .run_mobile_plugin(
+                "tunnelStatus",
+                TunnelStatusRequest {
+                    api_version: TUNNEL_API_VERSION,
+                },
+            )
             .map_err(Into::into)
     }
 }

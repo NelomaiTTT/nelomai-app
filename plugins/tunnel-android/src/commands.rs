@@ -17,16 +17,8 @@ pub(crate) async fn request_vpn_permission<R: Runtime>(
 }
 
 #[command]
-pub(crate) async fn start_smoke_tunnel<R: Runtime>(app: AppHandle<R>) -> Result<SmokeResponse> {
-    app.tunnel_android().start_smoke_tunnel()
-}
-
-#[command]
-pub(crate) async fn stop_smoke_tunnel<R: Runtime>(app: AppHandle<R>) -> Result<SmokeResponse> {
-    app.tunnel_android().stop_smoke_tunnel()
-}
-
-#[command]
-pub(crate) async fn smoke_tunnel_status<R: Runtime>(app: AppHandle<R>) -> Result<SmokeResponse> {
-    app.tunnel_android().smoke_tunnel_status()
+pub(crate) async fn tunnel_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<TunnelOperationResponse> {
+    app.tunnel_android().tunnel_status()
 }

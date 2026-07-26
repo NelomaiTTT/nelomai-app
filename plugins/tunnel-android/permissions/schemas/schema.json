@@ -319,46 +319,22 @@
           "markdownDescription": "Denies the request_vpn_permission command without any pre-configured scope."
         },
         {
-          "description": "Enables the smoke_tunnel_status command without any pre-configured scope.",
+          "description": "Enables the tunnel_status command without any pre-configured scope.",
           "type": "string",
-          "const": "allow-smoke-tunnel-status",
-          "markdownDescription": "Enables the smoke_tunnel_status command without any pre-configured scope."
+          "const": "allow-tunnel-status",
+          "markdownDescription": "Enables the tunnel_status command without any pre-configured scope."
         },
         {
-          "description": "Denies the smoke_tunnel_status command without any pre-configured scope.",
+          "description": "Denies the tunnel_status command without any pre-configured scope.",
           "type": "string",
-          "const": "deny-smoke-tunnel-status",
-          "markdownDescription": "Denies the smoke_tunnel_status command without any pre-configured scope."
+          "const": "deny-tunnel-status",
+          "markdownDescription": "Denies the tunnel_status command without any pre-configured scope."
         },
         {
-          "description": "Enables the start_smoke_tunnel command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-start-smoke-tunnel",
-          "markdownDescription": "Enables the start_smoke_tunnel command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the start_smoke_tunnel command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-start-smoke-tunnel",
-          "markdownDescription": "Denies the start_smoke_tunnel command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the stop_smoke_tunnel command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-stop-smoke-tunnel",
-          "markdownDescription": "Enables the stop_smoke_tunnel command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the stop_smoke_tunnel command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-stop-smoke-tunnel",
-          "markdownDescription": "Denies the stop_smoke_tunnel command without any pre-configured scope."
-        },
-        {
-          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-start-smoke-tunnel`\n- `allow-stop-smoke-tunnel`\n- `allow-smoke-tunnel-status`",
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-tunnel-status`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-start-smoke-tunnel`\n- `allow-stop-smoke-tunnel`\n- `allow-smoke-tunnel-status`"
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-tunnel-status`"
         }
       ]
     }

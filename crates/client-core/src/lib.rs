@@ -210,6 +210,34 @@ pub struct ConnectOptions {
     pub allow_alternate: bool,
 }
 
+impl ConnectOptions {
+    pub fn android_default() -> Self {
+        Self {
+            layer: Layer::Tic,
+            tic_connection_mode: TicConnectionMode::Personal,
+            route_mode: RouteMode::ViaTak,
+            probes: Vec::new(),
+            allow_alternate: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod platform_default_tests {
+    use super::*;
+
+    #[test]
+    fn android_defaults_to_personal_tic_via_tak() {
+        let options = ConnectOptions::android_default();
+
+        assert_eq!(options.layer, Layer::Tic);
+        assert_eq!(options.tic_connection_mode, TicConnectionMode::Personal);
+        assert_eq!(options.route_mode, RouteMode::ViaTak);
+        assert!(options.probes.is_empty());
+        assert!(options.allow_alternate);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CoreApiError {
     #[error("авторизация истекла")]

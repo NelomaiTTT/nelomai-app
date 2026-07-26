@@ -6,9 +6,7 @@ Default permissions for the plugin
 
 - `allow-probe`
 - `allow-request-vpn-permission`
-- `allow-start-smoke-tunnel`
-- `allow-stop-smoke-tunnel`
-- `allow-smoke-tunnel-status`
+- `allow-tunnel-status`
 
 ## Permission Table
 
@@ -74,25 +72,12 @@ Denies the request_vpn_permission command without any pre-configured scope.
 <tr>
 <td>
 
-`tunnel-android:allow-smoke-tunnel-status`
+`tunnel-android:allow-tunnel-status`
 
 </td>
 <td>
 
-Enables the smoke_tunnel_status command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`tunnel-android:deny-smoke-tunnel-status`
-
-</td>
-<td>
-
-Denies the smoke_tunnel_status command without any pre-configured scope.
+Enables the tunnel_status command without any pre-configured scope.
 
 </td>
 </tr>
@@ -100,51 +85,12 @@ Denies the smoke_tunnel_status command without any pre-configured scope.
 <tr>
 <td>
 
-`tunnel-android:allow-start-smoke-tunnel`
+`tunnel-android:deny-tunnel-status`
 
 </td>
 <td>
 
-Enables the start_smoke_tunnel command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`tunnel-android:deny-start-smoke-tunnel`
-
-</td>
-<td>
-
-Denies the start_smoke_tunnel command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`tunnel-android:allow-stop-smoke-tunnel`
-
-</td>
-<td>
-
-Enables the stop_smoke_tunnel command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`tunnel-android:deny-stop-smoke-tunnel`
-
-</td>
-<td>
-
-Denies the stop_smoke_tunnel command without any pre-configured scope.
+Denies the tunnel_status command without any pre-configured scope.
 
 </td>
 </tr>

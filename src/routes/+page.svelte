@@ -10,13 +10,14 @@
     error: string | null;
   }
 
-  interface SmokeResult {
-    state: "up" | "down" | "unsupported";
+  interface TunnelStatus {
+    state: "stopped" | "starting" | "running" | "stopping" | "failed" | "unsupported";
     durationMillis: number;
+    errorCode: string | null;
   }
 
   let probe = $state<TunnelProbe | null>(null);
-  let smoke = $state<SmokeResult | null>(null);
+  let tunnel = $state<TunnelStatus | null>(null);
   let error = $state<string | null>(null);
   let requestingPermission = $state(false);
 
@@ -24,6 +25,9 @@
     error = null;
     try {
       probe = await invoke<TunnelProbe>("plugin:tunnel-android|probe");
+      if (probe.platform === "android") {
+        tunnel = await invoke<TunnelStatus>("plugin:tunnel-android|tunnel_status");
+      }
     } catch (reason) {
       error = String(reason);
     }
@@ -39,15 +43,6 @@
       error = String(reason);
     } finally {
       requestingPermission = false;
-    }
-  }
-
-  async function runSmoke(command: "start_smoke_tunnel" | "stop_smoke_tunnel") {
-    error = null;
-    try {
-      smoke = await invoke<SmokeResult>(`plugin:tunnel-android|${command}`);
-    } catch (reason) {
-      error = String(reason);
     }
   }
 
@@ -88,17 +83,8 @@
       </button>
     {/if}
 
-    {#if probe.permissionGranted && probe.platform === "android"}
-      <div class="actions">
-        <button onclick={() => runSmoke("start_smoke_tunnel")}>Start smoke tunnel</button>
-        <button class="secondary" onclick={() => runSmoke("stop_smoke_tunnel")}>
-          Stop smoke tunnel
-        </button>
-      </div>
-    {/if}
-
-    {#if smoke}
-      <p>Smoke tunnel: {smoke.state} ({smoke.durationMillis} ms)</p>
+    {#if tunnel}
+      <p>Tunnel state: {tunnel.state}</p>
     {/if}
 
     {#if probe.error}
@@ -182,18 +168,6 @@
     cursor: wait;
     opacity: 0.6;
   }
-
-  .actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-  }
-
-  .secondary {
-    color: #f5f7fa;
-    background: transparent;
-  }
-
   .error {
     color: #ff8585;
   }

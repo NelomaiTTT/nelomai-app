@@ -30,18 +30,26 @@ impl<R: Runtime> TunnelAndroid<R> {
         })
     }
 
-    pub fn start_smoke_tunnel(&self) -> crate::Result<SmokeResponse> {
-        Ok(SmokeResponse {
-            state: "unsupported".to_string(),
-            duration_millis: 0,
-        })
+    pub fn start_tunnel(
+        &self,
+        _request: StartTunnelRequest,
+    ) -> crate::Result<TunnelOperationResponse> {
+        Ok(unsupported_response())
     }
 
-    pub fn stop_smoke_tunnel(&self) -> crate::Result<SmokeResponse> {
-        self.start_smoke_tunnel()
+    pub fn stop_tunnel(&self) -> crate::Result<TunnelOperationResponse> {
+        Ok(unsupported_response())
     }
 
-    pub fn smoke_tunnel_status(&self) -> crate::Result<SmokeResponse> {
-        self.start_smoke_tunnel()
+    pub fn tunnel_status(&self) -> crate::Result<TunnelOperationResponse> {
+        Ok(unsupported_response())
+    }
+}
+
+fn unsupported_response() -> TunnelOperationResponse {
+    TunnelOperationResponse {
+        state: "unsupported".to_string(),
+        duration_millis: 0,
+        error_code: Some("android_tunnel_unavailable".to_string()),
     }
 }
