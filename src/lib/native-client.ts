@@ -42,6 +42,8 @@ export function createNativeClient(
     peerOptions: () => invoke("app_peer_options") as Promise<PeerOptions>,
     bindPeer: (request: BindPeerRequest) =>
       invoke("app_bind_peer", { request }) as Promise<SafePeerBindingResponse>,
+    unbindPeer: () =>
+      invoke("app_unbind_peer") as Promise<SafePeerBindingResponse>,
     refreshProbes: (layer: Layer) =>
       invoke("app_refresh_probes", { layer }) as Promise<ProbeResults>,
     start: (request: StartCommandRequest) =>
@@ -49,6 +51,11 @@ export function createNativeClient(
     startSavedStray: () =>
       invoke("app_start_saved_stray") as Promise<string>,
     stop: () => invoke("app_stop") as Promise<Connection>,
+    pinStray: () => invoke("app_pin_stray") as Promise<Connection>,
+    unpinStray: (leaseId: string) =>
+      invoke("app_unpin_stray", {
+        request: { leaseId },
+      }) as Promise<Connection>,
     logout: () => invoke("app_logout") as Promise<void>,
   };
 }

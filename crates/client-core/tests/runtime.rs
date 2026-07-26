@@ -92,6 +92,10 @@ struct MockApi {
     reject_stale_start: AtomicBool,
     reject_stale_stop: AtomicBool,
     pinned_start: AtomicBool,
+    start_lease_override: Mutex<Option<String>>,
+    pin_calls: AtomicUsize,
+    unpin_calls: AtomicUsize,
+    pin_fails: AtomicBool,
 }
 
 impl MockApi {
@@ -109,6 +113,10 @@ impl MockApi {
             reject_stale_start: AtomicBool::new(false),
             reject_stale_stop: AtomicBool::new(false),
             pinned_start: AtomicBool::new(false),
+            start_lease_override: Mutex::new(None),
+            pin_calls: AtomicUsize::new(0),
+            unpin_calls: AtomicUsize::new(0),
+            pin_fails: AtomicBool::new(false),
         }
     }
 }
@@ -154,7 +162,13 @@ impl CoreApi for MockApi {
             return Err(CoreApiError::Retryable);
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let mut response = start_response(&request.operation_id);
+        let lease_id = self
+            .start_lease_override
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| request.operation_id.clone());
+        let mut response = start_response(&lease_id);
         response.connection.layer = request.layer;
         response.connection.tic_connection_mode = request.tic_connection_mode;
         response.connection.route_mode = request.route_mode;
@@ -190,6 +204,44 @@ impl CoreApi for MockApi {
             request_id: "req-stop".to_string(),
             connection: Connection {
                 lease_id: request.lease_id.clone(),
+                status: LeaseStatus::Warm,
+                stopped_at: Some("2026-07-26T10:00:00Z".to_string()),
+                ..connection(&request.lease_id)
+            },
+        })
+    }
+
+    async fn pin_stray(
+        &self,
+        _access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        self.pin_calls.fetch_add(1, Ordering::SeqCst);
+        if self.pin_fails.load(Ordering::SeqCst) {
+            return Err(CoreApiError::Rejected {
+                code: "connection_not_pinnable".to_string(),
+            });
+        }
+        Ok(ConnectionOperationResponse {
+            api_version: ApiVersion::V1,
+            request_id: "req-pin".to_string(),
+            connection: Connection {
+                pinned: true,
+                ..connection(&request.lease_id)
+            },
+        })
+    }
+
+    async fn unpin_stray(
+        &self,
+        _access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        self.unpin_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectionOperationResponse {
+            api_version: ApiVersion::V1,
+            request_id: "req-unpin".to_string(),
+            connection: Connection {
                 status: LeaseStatus::Warm,
                 stopped_at: Some("2026-07-26T10:00:00Z".to_string()),
                 ..connection(&request.lease_id)
@@ -587,9 +639,10 @@ async fn offline_bootstrap_can_fall_back_to_a_valid_saved_stray() {
     });
     let api = Arc::new(MockApi::new(0));
     api.bootstrap_fails.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(stored));
     let core = ClientCore::new(
         api,
-        Arc::new(MemoryStore::new(stored)),
+        store.clone(),
         Arc::new(MemoryTunnel::default()),
         Arc::new(MemoryLogger::default()),
     );
@@ -598,6 +651,12 @@ async fn offline_bootstrap_can_fall_back_to_a_valid_saved_stray() {
     assert_eq!(core.state().await.phase, Phase::ServerUnavailable);
     assert_eq!(
         core.start_saved_stray_offline(1_700_000_000).await.unwrap(),
+        "11111111-1111-4111-8111-111111111111"
+    );
+    let migrated = store.load().unwrap().unwrap();
+    assert!(migrated.saved_connection.is_none());
+    assert_eq!(
+        migrated.pinned_connection.unwrap().lease_id,
         "11111111-1111-4111-8111-111111111111"
     );
 }
@@ -618,7 +677,7 @@ async fn pinned_and_fixed_configurations_are_kept_without_a_synthetic_expiry() {
         .load()
         .unwrap()
         .unwrap()
-        .saved_connection
+        .pinned_connection
         .unwrap();
     assert_eq!(pinned.kind, StoredConnectionKind::Pinned);
     assert_eq!(pinned.valid_until_unix, None);
@@ -651,4 +710,133 @@ async fn pinned_and_fixed_configurations_are_kept_without_a_synthetic_expiry() {
         .unwrap();
     assert_eq!(fixed.kind, StoredConnectionKind::Fixed);
     assert_eq!(fixed.valid_until_unix, None);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pin_and_unpin_move_the_configuration_between_separate_slots() {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let started = core.start(options(), 1_700_000_000).await.unwrap();
+    let pinned = core.pin_stray().await.unwrap();
+    assert_eq!(pinned.lease_id, started.lease_id);
+    assert!(pinned.pinned);
+    let stored = store.load().unwrap().unwrap();
+    assert!(stored.saved_connection.is_none());
+    assert_eq!(
+        stored.pinned_connection.as_ref().unwrap().kind,
+        StoredConnectionKind::Pinned
+    );
+
+    let unpinned = core
+        .unpin_stray(&pinned.lease_id, 1_700_000_100)
+        .await
+        .unwrap();
+    assert!(!unpinned.pinned);
+    let stored = store.load().unwrap().unwrap();
+    assert!(stored.pinned_connection.is_none());
+    let warm = stored.saved_connection.unwrap();
+    assert_eq!(warm.kind, StoredConnectionKind::DynamicWarm);
+    assert_eq!(warm.valid_until_unix, Some(1_700_003_700));
+    assert_eq!(api.pin_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.unpin_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rejected_pin_keeps_the_active_tunnel_and_saved_configuration() {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let started = core.start(options(), 1_700_000_000).await.unwrap();
+    api.pin_fails.store(true, Ordering::SeqCst);
+
+    assert!(core.pin_stray().await.is_err());
+
+    assert_eq!(core.state().await.phase, Phase::Connected);
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Running);
+    let stored = store.load().unwrap().unwrap();
+    assert_eq!(stored.saved_connection.unwrap().lease_id, started.lease_id);
+    assert!(stored.pinned_connection.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn alternate_stray_does_not_overwrite_the_saved_pin() {
+    let api = Arc::new(MockApi::new(0));
+    let mut stored = auth();
+    stored.pinned_connection = Some(StoredConnection {
+        lease_id: "pinned-lease".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        kind: StoredConnectionKind::Pinned,
+        configuration: "PrivateKey = pinned-secret".to_string(),
+        valid_until_unix: None,
+    });
+    *api.start_lease_override.lock().unwrap() = Some("alternate-lease".to_string());
+    let store = Arc::new(MemoryStore::new(stored));
+    let core = ClientCore::new(
+        api,
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(connection.lease_id, "alternate-lease");
+    let stored = store.load().unwrap().unwrap();
+    assert_eq!(stored.pinned_connection.unwrap().lease_id, "pinned-lease");
+    assert_eq!(stored.saved_connection.unwrap().lease_id, "alternate-lease");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unbind_clears_dynamic_and_pinned_connections() {
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "alternate-lease".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: "PrivateKey = alternate-secret".to_string(),
+        valid_until_unix: Some(1_700_003_600),
+    });
+    stored.pinned_connection = Some(StoredConnection {
+        lease_id: "pinned-lease".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        kind: StoredConnectionKind::Pinned,
+        configuration: "PrivateKey = pinned-secret".to_string(),
+        valid_until_unix: None,
+    });
+    let store = Arc::new(MemoryStore::new(stored));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.complete_unbind().await.unwrap();
+
+    let stored = store.load().unwrap().unwrap();
+    assert!(stored.saved_connection.is_none());
+    assert!(stored.pinned_connection.is_none());
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(core.state().await.phase, Phase::NeedsPeerBinding);
 }

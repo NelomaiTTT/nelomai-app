@@ -23,6 +23,7 @@ struct FakeApi {
     bind_request: Mutex<Option<BindPeerRequest>>,
     bootstrap: Bootstrap,
     logout_fails: bool,
+    unbind_fails: bool,
 }
 
 #[async_trait]
@@ -49,6 +50,22 @@ impl CoreApi for FakeApi {
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("stop is not used by this test")
+    }
+
+    async fn pin_stray(
+        &self,
+        _access_token: &str,
+        _request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        unreachable!("pin is not used by this test")
+    }
+
+    async fn unpin_stray(
+        &self,
+        _access_token: &str,
+        _request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        unreachable!("unpin is not used by this test")
     }
 }
 
@@ -84,6 +101,18 @@ impl ApplicationApi for FakeApi {
     ) -> Result<PeerBindingResponse, CoreApiError> {
         *self.bind_request.lock().unwrap() = Some(request.clone());
         Ok(binding_response(request))
+    }
+
+    async fn unbind_peer(&self, _access_token: &str) -> Result<PeerBindingResponse, CoreApiError> {
+        if self.unbind_fails {
+            return Err(CoreApiError::Retryable);
+        }
+        Ok(PeerBindingResponse {
+            api_version: ApiVersion::V1,
+            request_id: "unbind-request".to_string(),
+            binding: None,
+            configuration: None,
+        })
     }
 
     async fn server_candidates(
@@ -173,6 +202,7 @@ async fn login_preserves_install_identity_but_drops_previous_account_state() {
         bind_request: Mutex::new(None),
         bootstrap: bootstrap(),
         logout_fails: false,
+        unbind_fails: false,
     });
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
@@ -225,6 +255,7 @@ async fn peer_selection_lists_unused_peers_first_and_preserves_comments() {
         bind_request: Mutex::new(None),
         bootstrap: bootstrap(),
         logout_fails: false,
+        unbind_fails: false,
     });
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
@@ -254,6 +285,7 @@ async fn binding_uses_the_peer_selected_by_the_user() {
         bind_request: Mutex::new(None),
         bootstrap: bootstrap(),
         logout_fails: false,
+        unbind_fails: false,
     });
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
@@ -283,12 +315,41 @@ async fn binding_uses_the_peer_selected_by_the_user() {
 }
 
 #[tokio::test]
+async fn failed_unbind_keeps_the_local_tunnel_and_saved_configuration() {
+    let api = Arc::new(FakeApi {
+        login_request: Mutex::new(None),
+        bind_request: Mutex::new(None),
+        bootstrap: bootstrap(),
+        logout_fails: false,
+        unbind_fails: true,
+    });
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let tunnel = Arc::new(TrackingTunnel::default());
+    let application =
+        ClientApplication::new(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
+
+    assert!(application.unbind_peer().await.is_err());
+
+    assert_eq!(tunnel.stop_calls.load(Ordering::SeqCst), 0);
+    assert!(store
+        .value
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .saved_connection
+        .is_some());
+}
+
+#[tokio::test]
 async fn logout_clears_account_and_stops_tunnel_when_server_is_unavailable() {
     let api = Arc::new(FakeApi {
         login_request: Mutex::new(None),
         bind_request: Mutex::new(None),
         bootstrap: bootstrap(),
         logout_fails: true,
+        unbind_fails: false,
     });
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
@@ -304,6 +365,7 @@ async fn logout_clears_account_and_stops_tunnel_when_server_is_unavailable() {
     assert!(stored.access_token.is_none());
     assert!(stored.refresh_token.is_none());
     assert!(stored.saved_connection.is_none());
+    assert!(stored.pinned_connection.is_none());
     assert!(stored.compatibility.is_none());
     assert_eq!(
         application.state().await.phase,
@@ -325,6 +387,7 @@ fn previous_account() -> StoredAuth {
             configuration: "PrivateKey = old-account-secret".to_string(),
             valid_until_unix: None,
         }),
+        pinned_connection: None,
         compatibility: Some(StoredCompatibility {
             update_required: true,
             observed_at_unix: 1_700_000_000,

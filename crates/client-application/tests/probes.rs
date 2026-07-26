@@ -61,6 +61,22 @@ impl CoreApi for ProbeApi {
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("stop is not used by this test")
     }
+
+    async fn pin_stray(
+        &self,
+        _access_token: &str,
+        _request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        unreachable!("pin is not used by this test")
+    }
+
+    async fn unpin_stray(
+        &self,
+        _access_token: &str,
+        _request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        unreachable!("unpin is not used by this test")
+    }
 }
 
 #[async_trait]
@@ -79,6 +95,10 @@ impl ApplicationApi for ProbeApi {
         _request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError> {
         unreachable!("peer binding is not used by this test")
+    }
+
+    async fn unbind_peer(&self, _access_token: &str) -> Result<PeerBindingResponse, CoreApiError> {
+        unreachable!("peer unbinding is not used by this test")
     }
 
     async fn server_candidates(

@@ -62,6 +62,8 @@ pub struct StoredAuth {
     #[serde(default)]
     pub saved_connection: Option<StoredConnection>,
     #[serde(default)]
+    pub pinned_connection: Option<StoredConnection>,
+    #[serde(default)]
     pub compatibility: Option<StoredCompatibility>,
 }
 
@@ -79,6 +81,7 @@ impl fmt::Debug for StoredAuth {
                 &self.refresh_token.as_ref().map(|_| "<redacted>"),
             )
             .field("saved_connection", &self.saved_connection)
+            .field("pinned_connection", &self.pinned_connection)
             .field("compatibility", &self.compatibility)
             .finish()
     }
@@ -93,6 +96,7 @@ impl StoredAuth {
             access_token: None,
             refresh_token: None,
             saved_connection: None,
+            pinned_connection: None,
             compatibility: None,
         }
     }
@@ -410,6 +414,7 @@ mod tests {
         });
         let stored: StoredAuth = serde_json::from_value(legacy).unwrap();
         assert!(stored.saved_connection.is_none());
+        assert!(stored.pinned_connection.is_none());
         assert!(stored.compatibility.is_none());
     }
 
@@ -451,6 +456,15 @@ mod tests {
             kind: StoredConnectionKind::DynamicWarm,
             configuration: "[Interface]\nPrivateKey = secret\n".to_string(),
             valid_until_unix: Some(1_800_000_000),
+        });
+        stored.pinned_connection = Some(StoredConnection {
+            lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            layer: StoredLayer::Stray,
+            tic_connection_mode: StoredTicConnectionMode::Dynamic,
+            route_mode: StoredRouteMode::Standalone,
+            kind: StoredConnectionKind::Pinned,
+            configuration: "[Interface]\nPrivateKey = pinned-secret\n".to_string(),
+            valid_until_unix: None,
         });
         stored.compatibility = Some(StoredCompatibility {
             update_required: false,

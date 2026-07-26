@@ -40,8 +40,14 @@ only authority allowed to select an alternate server.
 
 The isolated HTTP flow test in `crates/client-application/tests/http_flow.rs`
 exercises login, peer binding, candidate measurement, dynamic Stray start,
-stop, warm reconnect, and logout through the real `ClientApi` serialization
-boundary. It never uses production accounts, peers, or endpoints.
+pin, stop, warm reconnect, unpin, peer unbinding, and logout through the real
+`ClientApi` serialization boundary. It never uses production accounts, peers,
+or endpoints.
+
+A pinned Stray configuration and a temporary alternate lease are stored in
+separate protected slots. Starting an alternate connection must never replace
+the pinned configuration. Unbinding stops the local tunnel and clears both
+slots only after the panel confirms the operation.
 
 WireGuard configuration is a privileged native payload. It must pass directly
 from the authenticated API layer to `TunnelController`; frontend state, common

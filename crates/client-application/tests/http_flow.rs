@@ -31,6 +31,7 @@ struct MockPanelState {
     candidate_requests: AtomicUsize,
     probe_requests: AtomicUsize,
     start_operations: Mutex<Vec<String>>,
+    pinned: AtomicBool,
 }
 
 #[derive(Default)]
@@ -88,9 +89,12 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
         .route("/api/client/v1/bootstrap", get(bootstrap))
         .route("/api/client/v1/peer-options", get(peer_options))
         .route("/api/client/v1/device/bind-peer", post(bind_peer))
+        .route("/api/client/v1/device/unbind-peer", post(unbind_peer))
         .route("/api/client/v1/server-candidates", get(server_candidates))
         .route("/api/client/v1/connections/start", post(start_connection))
         .route("/api/client/v1/connections/stop", post(stop_connection))
+        .route("/api/client/v1/connections/pin-stray", post(pin_stray))
+        .route("/api/client/v1/connections/unpin-stray", post(unpin_stray))
         .route("/probe/stray", get(probe))
         .with_state(panel_state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -151,6 +155,9 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     let first = application.start(options.clone(), NOW).await.unwrap();
     assert_eq!(first.lease_id, LEASE_ID);
     assert_eq!(application.state().await.phase, Phase::Connected);
+    let pinned = application.pin_stray().await.unwrap();
+    assert!(pinned.pinned);
+    assert!(store.load().unwrap().unwrap().pinned_connection.is_some());
 
     let stopped = application.stop().await.unwrap();
     assert_eq!(stopped.lease_id, LEASE_ID);
@@ -158,6 +165,9 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
 
     let second = application.start(options, NOW + 30).await.unwrap();
     assert_eq!(second.lease_id, LEASE_ID);
+    assert!(second.pinned);
+    let unpinned = application.unpin_stray(LEASE_ID, NOW + 30).await.unwrap();
+    assert!(!unpinned.pinned);
     assert_eq!(
         tunnel.configurations.lock().unwrap().as_slice(),
         [CONFIGURATION, CONFIGURATION]
@@ -169,6 +179,13 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
         LEASE_ID,
         "warm reconnect must reuse the panel lease id"
     );
+
+    let unbound = application.unbind_peer().await.unwrap();
+    assert!(unbound.binding.is_none());
+    assert_eq!(application.state().await.phase, Phase::NeedsPeerBinding);
+    let stored = store.load().unwrap().unwrap();
+    assert!(stored.saved_connection.is_none());
+    assert!(stored.pinned_connection.is_none());
 
     application.logout().await.unwrap();
     let stored = store.load().unwrap().unwrap();
@@ -293,6 +310,18 @@ async fn bind_peer(
     }))
 }
 
+async fn unbind_peer(State(state): State<Arc<MockPanelState>>, headers: HeaderMap) -> Json<Value> {
+    assert_authenticated(&headers);
+    state.bound.store(false, Ordering::SeqCst);
+    state.pinned.store(false, Ordering::SeqCst);
+    Json(json!({
+        "api_version": "1",
+        "request_id": "unbind-request",
+        "binding": null,
+        "configuration": null
+    }))
+}
+
 async fn server_candidates(
     State(state): State<Arc<MockPanelState>>,
     headers: HeaderMap,
@@ -341,22 +370,58 @@ async fn start_connection(
     let mut operations = state.start_operations.lock().unwrap();
     let reused = !operations.is_empty();
     operations.push(operation_id);
+    let pinned = state.pinned.load(Ordering::SeqCst);
     Json(json!({
         "api_version": "1",
         "request_id": "start-request",
-        "connection": connection("issued"),
+        "connection": connection("issued", pinned),
         "configuration": CONFIGURATION,
         "reused": reused
     }))
 }
 
-async fn stop_connection(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
+async fn stop_connection(
+    State(state): State<Arc<MockPanelState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
     assert_authenticated(&headers);
     assert_eq!(body["lease_id"], LEASE_ID);
+    let pinned = state.pinned.load(Ordering::SeqCst);
     Json(json!({
         "api_version": "1",
         "request_id": "stop-request",
-        "connection": connection("warm")
+        "connection": connection("warm", pinned)
+    }))
+}
+
+async fn pin_stray(
+    State(state): State<Arc<MockPanelState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_authenticated(&headers);
+    assert_eq!(body["lease_id"], LEASE_ID);
+    state.pinned.store(true, Ordering::SeqCst);
+    Json(json!({
+        "api_version": "1",
+        "request_id": "pin-request",
+        "connection": connection("connected", true)
+    }))
+}
+
+async fn unpin_stray(
+    State(state): State<Arc<MockPanelState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_authenticated(&headers);
+    assert_eq!(body["lease_id"], LEASE_ID);
+    state.pinned.store(false, Ordering::SeqCst);
+    Json(json!({
+        "api_version": "1",
+        "request_id": "unpin-request",
+        "connection": connection("connected", false)
     }))
 }
 
@@ -382,14 +447,14 @@ fn binding() -> Value {
     })
 }
 
-fn connection(status: &str) -> Value {
+fn connection(status: &str, pinned: bool) -> Value {
     json!({
         "lease_id": LEASE_ID,
         "layer": "stray",
         "tic_connection_mode": "dynamic",
         "route_mode": "standalone",
         "status": status,
-        "pinned": false,
+        "pinned": pinned,
         "stopped_at": (status == "warm").then_some("2027-01-15T08:00:30Z")
     })
 }

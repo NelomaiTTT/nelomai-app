@@ -127,6 +127,12 @@ pub struct StartCommandRequest {
     allow_alternate: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseCommandRequest {
+    lease_id: String,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -205,6 +211,17 @@ pub async fn app_bind_peer(
 }
 
 #[tauri::command]
+pub async fn app_unbind_peer(
+    application: State<'_, Arc<NativeApplication>>,
+) -> Result<SafePeerBindingResponse, CommandError> {
+    application
+        .unbind_peer()
+        .await
+        .map(Into::into)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn app_refresh_probes(
     application: State<'_, Arc<NativeApplication>>,
     layer: Layer,
@@ -250,6 +267,24 @@ pub async fn app_stop(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<Connection, CommandError> {
     application.stop().await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn app_pin_stray(
+    application: State<'_, Arc<NativeApplication>>,
+) -> Result<Connection, CommandError> {
+    application.pin_stray().await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn app_unpin_stray(
+    application: State<'_, Arc<NativeApplication>>,
+    request: LeaseCommandRequest,
+) -> Result<Connection, CommandError> {
+    application
+        .unpin_stray(&request.lease_id, now_unix())
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]

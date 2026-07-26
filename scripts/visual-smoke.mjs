@@ -86,6 +86,7 @@ try {
   await capture("peers-mobile", { width: 390, height: 844 }, "peers");
   await capture("connection-mobile", { width: 390, height: 844 }, "connection");
   await capture("personal-tic-mobile", { width: 390, height: 844 }, "personal-tic");
+  await capture("pinned-stray-mobile", { width: 390, height: 844 }, "pinned-stray");
   await capture("connection-desktop", { width: 1280, height: 800 }, "connection");
 } finally {
   await browser.close();
@@ -128,6 +129,20 @@ async function capture(name, viewport, scenario) {
                   layer: "tic",
                   tic_connection_mode: "personal",
                   route_mode: "via_tak",
+                },
+              };
+            }
+            if (currentScenario === "pinned-stray") {
+              return {
+                ...fixture,
+                pinned_stray: {
+                  lease_id: "pinned-lease",
+                  layer: "stray",
+                  tic_connection_mode: "dynamic",
+                  route_mode: "standalone",
+                  status: "warm",
+                  pinned: true,
+                  stopped_at: "2026-07-26T12:00:00Z",
                 },
               };
             }
@@ -191,6 +206,14 @@ async function capture(name, viewport, scenario) {
     if (refresh) {
       throw new Error("personal Tic mode unexpectedly requested server probes");
     }
+  } else if (scenario === "pinned-stray") {
+    const unpin = page.getByRole("button", { name: "Отменить сохранение Stray" });
+    await unpin.waitFor();
+    await unpin.click();
+    const call = await lastCall(page, "app_unpin_stray");
+    if (call?.args?.request?.leaseId !== "pinned-lease") {
+      throw new Error("saved Stray action did not pass the pinned lease id");
+    }
   } else {
     const start = page.getByRole("button", { name: /Старт/ });
     await start.waitFor();
@@ -199,6 +222,12 @@ async function capture(name, viewport, scenario) {
     await page.getByRole("button", { name: /Стоп/ }).waitFor();
     if (!(await lastCall(page, "app_start"))) {
       throw new Error("start button did not call app_start");
+    }
+    const pin = page.getByRole("button", { name: "Сохранить подключение" });
+    await pin.waitFor();
+    await pin.click();
+    if (!(await lastCall(page, "app_pin_stray"))) {
+      throw new Error("saved Stray action did not call app_pin_stray");
     }
   }
 

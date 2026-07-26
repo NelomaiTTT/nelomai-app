@@ -7,6 +7,7 @@
     viewForPhase,
     type AppView,
     type Bootstrap,
+    type Connection,
     type Layer,
     type PeerOption,
     type Phase,
@@ -30,6 +31,8 @@
   let busy = $state(false);
   let probeBusy = $state(false);
   let availableCandidates = $state(0);
+  let connection = $state<Connection | null>(null);
+  let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
 
   let login = $state("");
@@ -95,6 +98,7 @@
 
   async function applyBootstrap(response: Bootstrap) {
     bootstrap = response;
+    pinnedStray = response.pinned_stray;
     selectedLayer = response.defaults.layer;
     ticConnectionMode = response.defaults.tic_connection_mode;
     routeMode = response.defaults.route_mode;
@@ -118,6 +122,7 @@
 
     const state = await nativeClient.state();
     phase = state.phase;
+    connection = state.connection;
     view = viewForPhase(state.phase);
     if (state.phase === "ready") void refreshProbes();
   }
@@ -183,11 +188,11 @@
     error = null;
     try {
       if (phase === "connected") {
-        await nativeClient.stop();
+        connection = await nativeClient.stop();
         phase = "ready";
       } else {
         phase = "connecting";
-        await nativeClient.start({
+        connection = await nativeClient.start({
           layer: selectedLayer,
           ticConnectionMode,
           routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
@@ -198,6 +203,52 @@
       view = "connection";
     } catch (reason) {
       phase = "error";
+      error = commandMessage(reason);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function toggleSavedStray() {
+    if (busy) return;
+    const leaseId =
+      pinnedStray?.lease_id ??
+      (connection?.layer === "stray" && connection.pinned
+        ? connection.lease_id
+        : null);
+    busy = true;
+    error = null;
+    try {
+      if (leaseId) {
+        const updated = await nativeClient.unpinStray(leaseId);
+        if (connection?.lease_id === leaseId) connection = updated;
+        pinnedStray = null;
+      } else {
+        connection = await nativeClient.pinStray();
+        pinnedStray = connection;
+      }
+    } catch (reason) {
+      error = commandMessage(reason);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function unbindPeer() {
+    if (busy) return;
+    busy = true;
+    error = null;
+    try {
+      await nativeClient.unbindPeer();
+      connection = null;
+      pinnedStray = null;
+      bootstrap = bootstrap
+        ? { ...bootstrap, binding: null, connection: null, pinned_stray: null }
+        : null;
+      phase = "needs_peer_binding";
+      view = "peer_selection";
+      await loadPeers();
+    } catch (reason) {
       error = commandMessage(reason);
     } finally {
       busy = false;
@@ -242,6 +293,8 @@
     try {
       await nativeClient.logout();
       bootstrap = null;
+      connection = null;
+      pinnedStray = null;
       peers = [];
       selectedPeerId = "";
       password = "";
@@ -471,6 +524,26 @@
                 : "Личный пир"}
             </strong>
           </div>
+          {#if pinnedStray || (selectedLayer === "stray" && phase === "connected")}
+            <button
+              class="secondary-button"
+              type="button"
+              onclick={toggleSavedStray}
+              disabled={busy}
+            >
+              {pinnedStray || connection?.pinned
+                ? "Отменить сохранение Stray"
+                : "Сохранить подключение"}
+            </button>
+          {/if}
+          <button
+            class="quiet-button binding-action"
+            type="button"
+            onclick={unbindPeer}
+            disabled={busy}
+          >
+            Выбрать другой пир
+          </button>
         </aside>
       </div>
     {:else if view === "access_expired"}
@@ -718,6 +791,10 @@
     color: #d1d7dc;
     border: 1px solid #343c44;
     background: transparent;
+  }
+
+  .binding-action {
+    width: 100%;
   }
 
   .error-message {

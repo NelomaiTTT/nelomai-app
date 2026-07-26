@@ -324,6 +324,16 @@ pub trait CoreApi: Send + Sync {
         access_token: &str,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError>;
+    async fn pin_stray(
+        &self,
+        access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError>;
+    async fn unpin_stray(
+        &self,
+        access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError>;
 }
 
 #[async_trait]
@@ -359,6 +369,33 @@ impl CoreApi for ClientApi {
             .await
             .map_err(Into::into)
     }
+
+    async fn pin_stray(
+        &self,
+        access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        ClientApi::pin_stray(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn unpin_stray(
+        &self,
+        access_token: &str,
+        request: &ConnectionOperationRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        ClientApi::unpin_stray(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionOperation {
+    Stop,
+    PinStray,
+    UnpinStray,
 }
 
 #[derive(Debug, Error)]
@@ -448,6 +485,7 @@ where
                 access_token: None,
                 refresh_token: None,
                 saved_connection: None,
+                pinned_connection: None,
                 compatibility: None,
             })
             .map_err(|_| CoreError::Storage)?;
@@ -582,7 +620,7 @@ where
             StoredConnectionKind::DynamicWarm => Some(now_unix.saturating_add(3_600)),
             StoredConnectionKind::Fixed | StoredConnectionKind::Pinned => None,
         };
-        stored.saved_connection = Some(StoredConnection {
+        let saved_connection = StoredConnection {
             lease_id: response.connection.lease_id.clone(),
             layer: response.connection.layer,
             tic_connection_mode: response.connection.tic_connection_mode,
@@ -590,7 +628,13 @@ where
             kind,
             configuration: response.configuration.clone(),
             valid_until_unix,
-        });
+        };
+        if kind == StoredConnectionKind::Pinned {
+            stored.pinned_connection = Some(saved_connection);
+            stored.saved_connection = None;
+        } else {
+            stored.saved_connection = Some(saved_connection);
+        }
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         self.tunnel
             .start(TunnelConfiguration::new(response.configuration))
@@ -625,7 +669,9 @@ where
             operation_id: Uuid::new_v4().to_string(),
             lease_id: current.lease_id,
         };
-        let response = self.retry_stop(&access_token, &request).await?;
+        let response = self
+            .retry_operation(&access_token, &request, ConnectionOperation::Stop)
+            .await?;
         *self.state.lock().await = CoreState {
             phase: Phase::Ready,
             connection: Some(response.connection.clone()),
@@ -637,6 +683,115 @@ where
             code: None,
         });
         Ok(response.connection)
+    }
+
+    pub async fn pin_stray(&self) -> Result<Connection, CoreError> {
+        let _guard = self.connection_gate.lock().await;
+        let current_state = self.state.lock().await.clone();
+        let current = current_state
+            .connection
+            .filter(|connection| {
+                current_state.phase == Phase::Connected
+                    && connection.layer == Layer::Stray
+                    && !connection.pinned
+            })
+            .ok_or(CoreError::SavedConnectionUnavailable)?;
+        let mut stored = self.load_auth()?;
+        let saved = stored
+            .saved_connection
+            .take()
+            .filter(|saved| saved.lease_id == current.lease_id)
+            .ok_or(CoreError::SavedConnectionUnavailable)?;
+        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let request = ConnectionOperationRequest {
+            operation_id: Uuid::new_v4().to_string(),
+            lease_id: current.lease_id,
+        };
+        let response = self
+            .retry_operation(&access_token, &request, ConnectionOperation::PinStray)
+            .await?;
+        stored.pinned_connection = Some(StoredConnection {
+            kind: StoredConnectionKind::Pinned,
+            valid_until_unix: None,
+            ..saved
+        });
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        *self.state.lock().await = CoreState {
+            phase: Phase::Connected,
+            connection: Some(response.connection.clone()),
+        };
+        self.logger.record(CoreLogEvent {
+            kind: "connection.pinned",
+            operation_id: Some(request.operation_id),
+            request_id: Some(response.request_id),
+            code: None,
+        });
+        Ok(response.connection)
+    }
+
+    pub async fn unpin_stray(
+        &self,
+        lease_id: &str,
+        now_unix: i64,
+    ) -> Result<Connection, CoreError> {
+        let _guard = self.connection_gate.lock().await;
+        let mut stored = self.load_auth()?;
+        let saved = stored
+            .pinned_connection
+            .take()
+            .filter(|saved| saved.lease_id == lease_id)
+            .ok_or(CoreError::SavedConnectionUnavailable)?;
+        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let request = ConnectionOperationRequest {
+            operation_id: Uuid::new_v4().to_string(),
+            lease_id: lease_id.to_string(),
+        };
+        let response = self
+            .retry_operation(&access_token, &request, ConnectionOperation::UnpinStray)
+            .await?;
+        if stored.saved_connection.is_none() {
+            stored.saved_connection = Some(StoredConnection {
+                kind: StoredConnectionKind::DynamicWarm,
+                valid_until_unix: Some(now_unix.saturating_add(3_600)),
+                ..saved
+            });
+        }
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        let mut state = self.state.lock().await;
+        if state
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.lease_id == lease_id)
+        {
+            state.connection = Some(response.connection.clone());
+        }
+        self.logger.record(CoreLogEvent {
+            kind: "connection.unpinned",
+            operation_id: Some(request.operation_id),
+            request_id: Some(response.request_id),
+            code: None,
+        });
+        Ok(response.connection)
+    }
+
+    pub async fn complete_unbind(&self) -> Result<(), CoreError> {
+        let _guard = self.connection_gate.lock().await;
+        self.tunnel.stop().await?;
+        let mut stored = self.load_auth()?;
+        stored.saved_connection = None;
+        stored.pinned_connection = None;
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        *self.state.lock().await = CoreState {
+            phase: Phase::NeedsPeerBinding,
+            connection: None,
+        };
+        self.logger.record(CoreLogEvent {
+            kind: "device.peer_unbound",
+            operation_id: None,
+            request_id: None,
+            code: None,
+        });
+        Ok(())
     }
 
     pub async fn start_saved_stray_offline(&self, now_unix: i64) -> Result<String, CoreError> {
@@ -660,6 +815,11 @@ where
                             .is_some_and(|expiry| expiry > now_unix),
                         StoredConnectionKind::Fixed => false,
                     }
+            })
+            .or_else(|| {
+                stored
+                    .pinned_connection
+                    .filter(|connection| connection.layer == Layer::Stray)
             })
             .ok_or(CoreError::SavedConnectionUnavailable)?;
         self.tunnel
@@ -688,10 +848,21 @@ where
     }
 
     fn load_auth(&self) -> Result<nelomai_client_storage::StoredAuth, CoreError> {
-        self.store
+        let mut stored = self
+            .store
             .load()
             .map_err(|_| CoreError::Storage)?
-            .ok_or(CoreError::SignedOut)
+            .ok_or(CoreError::SignedOut)?;
+        if stored.pinned_connection.is_none()
+            && stored
+                .saved_connection
+                .as_ref()
+                .is_some_and(|connection| connection.kind == StoredConnectionKind::Pinned)
+        {
+            stored.pinned_connection = stored.saved_connection.take();
+            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        }
+        Ok(stored)
     }
 
     async fn connected_connection(&self) -> Option<Connection> {
@@ -736,17 +907,25 @@ where
         }
     }
 
-    async fn retry_stop(
+    async fn retry_operation(
         &self,
         access_token: &str,
         request: &ConnectionOperationRequest,
+        operation: ConnectionOperation,
     ) -> Result<ConnectionOperationResponse, CoreError> {
         let delays = self.retry_policy.delays_millis();
         let mut retry_index = 0;
         let mut access_token = access_token.to_string();
         let mut refreshed = false;
         loop {
-            match self.api.stop_connection(&access_token, request).await {
+            let result = match operation {
+                ConnectionOperation::Stop => self.api.stop_connection(&access_token, request).await,
+                ConnectionOperation::PinStray => self.api.pin_stray(&access_token, request).await,
+                ConnectionOperation::UnpinStray => {
+                    self.api.unpin_stray(&access_token, request).await
+                }
+            };
+            match result {
                 Ok(response) => return Ok(response),
                 Err(CoreApiError::Unauthorized) if !refreshed => {
                     access_token = self.refresh_access_token(&access_token).await?;
@@ -760,7 +939,9 @@ where
                     }
                 }
                 Err(error) => {
-                    self.set_phase(phase_for_api_error(&error)).await;
+                    if matches!(operation, ConnectionOperation::Stop) {
+                        self.set_phase(phase_for_api_error(&error)).await;
+                    }
                     return Err(error.into());
                 }
             }
@@ -786,6 +967,13 @@ fn reusable_operation_id(
                         .valid_until_unix
                         .is_some_and(|expiry| expiry > now_unix),
                 }
+        })
+        .or_else(|| {
+            stored.pinned_connection.as_ref().filter(|saved| {
+                saved.layer == options.layer
+                    && saved.tic_connection_mode == options.tic_connection_mode
+                    && saved.route_mode == options.route_mode
+            })
         })
         .map(|saved| saved.lease_id.clone())
 }

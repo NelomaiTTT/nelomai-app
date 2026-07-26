@@ -55,10 +55,13 @@ pub fn run() {
             commands::app_bootstrap,
             commands::app_peer_options,
             commands::app_bind_peer,
+            commands::app_unbind_peer,
             commands::app_refresh_probes,
             commands::app_start,
             commands::app_start_saved_stray,
             commands::app_stop,
+            commands::app_pin_stray,
+            commands::app_unpin_stray,
             commands::app_logout,
         ])
         .run(tauri::generate_context!())

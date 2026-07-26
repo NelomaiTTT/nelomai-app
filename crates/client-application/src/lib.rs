@@ -37,6 +37,7 @@ pub trait ApplicationApi: CoreApi {
         access_token: &str,
         request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError>;
+    async fn unbind_peer(&self, access_token: &str) -> Result<PeerBindingResponse, CoreApiError>;
     async fn server_candidates(
         &self,
         access_token: &str,
@@ -64,6 +65,12 @@ impl ApplicationApi for ClientApi {
         request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError> {
         ClientApi::bind_peer(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn unbind_peer(&self, access_token: &str) -> Result<PeerBindingResponse, CoreApiError> {
+        ClientApi::unbind_peer(self, access_token)
             .await
             .map_err(Into::into)
     }
@@ -136,6 +143,7 @@ pub struct ClientApplication<A, S, T, L> {
     store: Arc<S>,
     tunnel: Arc<T>,
     core: ClientCore<A, S, T, L>,
+    lifecycle_gate: AsyncMutex<()>,
     probe_gate: AsyncMutex<()>,
     probe_cache: StdMutex<ProbeCache>,
 }
@@ -154,6 +162,7 @@ where
             store,
             tunnel,
             core,
+            lifecycle_gate: AsyncMutex::new(()),
             probe_gate: AsyncMutex::new(()),
             probe_cache: StdMutex::new(ProbeCache::default()),
         }
@@ -164,6 +173,7 @@ where
         parameters: LoginParameters,
         now_unix: i64,
     ) -> Result<Bootstrap, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let install_secret = self
             .store
             .load()
@@ -192,6 +202,7 @@ where
                 access_token: Some(response.access_token),
                 refresh_token: Some(response.refresh_token),
                 saved_connection: None,
+                pinned_connection: None,
                 compatibility: None,
             })
             .map_err(|_| ApplicationError::Storage)?;
@@ -218,6 +229,7 @@ where
         &self,
         request: BindPeerRequest,
     ) -> Result<PeerBindingResponse, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let access_token = self.access_token()?;
         let _probe_guard = self.probe_gate.lock().await;
         let response = match self.api.bind_peer(&access_token, &request).await {
@@ -232,7 +244,25 @@ where
         Ok(response)
     }
 
+    pub async fn unbind_peer(&self) -> Result<PeerBindingResponse, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let _probe_guard = self.probe_gate.lock().await;
+        let access_token = self.access_token()?;
+        let response = match self.api.unbind_peer(&access_token).await {
+            Ok(response) => response,
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api.unbind_peer(&access_token).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.core.complete_unbind().await?;
+        self.clear_probe_cache()?;
+        Ok(response)
+    }
+
     pub async fn logout(&self) -> Result<(), ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let _probe_guard = self.probe_gate.lock().await;
         if let Ok(access_token) = self.access_token() {
             let _ = self.api.logout(&access_token).await;
@@ -247,6 +277,7 @@ where
     }
 
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.bootstrap(now_unix).await.map_err(Into::into)
     }
 
@@ -255,6 +286,7 @@ where
         mut options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         options.probes = if options.layer == Layer::Tic
             && options.tic_connection_mode == TicConnectionMode::Personal
         {
@@ -349,7 +381,25 @@ where
     }
 
     pub async fn stop(&self) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.stop().await.map_err(Into::into)
+    }
+
+    pub async fn pin_stray(&self) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core.pin_stray().await.map_err(Into::into)
+    }
+
+    pub async fn unpin_stray(
+        &self,
+        lease_id: &str,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core
+            .unpin_stray(lease_id, now_unix)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn start_saved_stray_offline(

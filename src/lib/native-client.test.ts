@@ -63,4 +63,19 @@ describe("native client", () => {
       },
     });
   });
+
+  it("routes pin, unpin, and peer replacement through native commands", async () => {
+    const invoke = vi.fn().mockResolvedValue({});
+    const client = createNativeClient(invoke);
+
+    await client.pinStray();
+    await client.unpinStray("lease-1");
+    await client.unbindPeer();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "app_pin_stray");
+    expect(invoke).toHaveBeenNthCalledWith(2, "app_unpin_stray", {
+      request: { leaseId: "lease-1" },
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "app_unbind_peer");
+  });
 });
