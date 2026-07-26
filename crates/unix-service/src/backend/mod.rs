@@ -6,7 +6,9 @@ mod macos;
 use crate::{ParsedConfiguration, ServiceError};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration};
-use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(target_os = "macos")]
+use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as PlatformBackend;
@@ -15,12 +17,14 @@ pub use macos::MacosBackend as PlatformBackend;
 
 pub(crate) struct BackendConfiguration {
     pub interface: InterfaceConfiguration,
+    #[cfg(target_os = "macos")]
     pub endpoints: Vec<SocketAddr>,
 }
 
 pub(crate) fn build_backend_configuration(
     configuration: &ParsedConfiguration,
 ) -> Result<BackendConfiguration, ServiceError> {
+    #[cfg(target_os = "macos")]
     let mut endpoints = Vec::with_capacity(configuration.peers.len());
     let mut peers = Vec::with_capacity(configuration.peers.len());
 
@@ -30,6 +34,7 @@ pub(crate) fn build_backend_configuration(
             .map_err(|_| ServiceError::InvalidConfiguration)?
             .next()
             .ok_or(ServiceError::InvalidConfiguration)?;
+        #[cfg(target_os = "macos")]
         endpoints.push(endpoint);
 
         let mut peer = Peer::new(Key::new(source.public_key));
@@ -61,6 +66,7 @@ pub(crate) fn build_backend_configuration(
             mtu: configuration.mtu,
             fwmark: None,
         },
+        #[cfg(target_os = "macos")]
         endpoints,
     })
 }
@@ -98,7 +104,7 @@ PersistentKeepalive = 21
         assert_eq!(native.interface.mtu, Some(1280));
         assert_eq!(
             native.interface.peers[0].endpoint,
-            Some(native.endpoints[0])
+            Some("127.0.0.1:10001".parse().expect("endpoint"))
         );
         assert_eq!(
             native.interface.peers[0].allowed_ips[0].to_string(),
