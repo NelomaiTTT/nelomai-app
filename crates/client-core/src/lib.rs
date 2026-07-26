@@ -484,20 +484,33 @@ where
     }
 
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {
-        let mut stored = self.load_auth()?;
+        let stored = self.load_auth()?;
         let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
         let response = match self.api.bootstrap(&access_token).await {
             Ok(response) => response,
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.refresh_access_token(&access_token).await?;
+                match self.api.bootstrap(&access_token).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.set_phase(phase_for_api_error(&error)).await;
+                        return Err(error.into());
+                    }
+                }
+            }
             Err(error) => {
                 self.set_phase(phase_for_api_error(&error)).await;
                 return Err(error.into());
             }
         };
-        stored.compatibility = Some(StoredCompatibility {
+        let mut current_stored = self.load_auth()?;
+        current_stored.compatibility = Some(StoredCompatibility {
             update_required: response.update.required,
             observed_at_unix: now_unix,
         });
-        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        self.store
+            .save(&current_stored)
+            .map_err(|_| CoreError::Storage)?;
         let tunnel_status = self.tunnel.status().await?;
         let phase = recover_phase(
             self.state.lock().await.phase,
@@ -699,9 +712,15 @@ where
     ) -> Result<ConnectionStartResponse, CoreError> {
         let delays = self.retry_policy.delays_millis();
         let mut retry_index = 0;
+        let mut access_token = access_token.to_string();
+        let mut refreshed = false;
         loop {
-            match self.api.start_connection(access_token, request).await {
+            match self.api.start_connection(&access_token, request).await {
                 Ok(response) => return Ok(response),
+                Err(CoreApiError::Unauthorized) if !refreshed => {
+                    access_token = self.refresh_access_token(&access_token).await?;
+                    refreshed = true;
+                }
                 Err(CoreApiError::Retryable) if retry_index < delays.len() => {
                     let delay = delays[retry_index];
                     retry_index += 1;
@@ -724,9 +743,15 @@ where
     ) -> Result<ConnectionOperationResponse, CoreError> {
         let delays = self.retry_policy.delays_millis();
         let mut retry_index = 0;
+        let mut access_token = access_token.to_string();
+        let mut refreshed = false;
         loop {
-            match self.api.stop_connection(access_token, request).await {
+            match self.api.stop_connection(&access_token, request).await {
                 Ok(response) => return Ok(response),
+                Err(CoreApiError::Unauthorized) if !refreshed => {
+                    access_token = self.refresh_access_token(&access_token).await?;
+                    refreshed = true;
+                }
                 Err(CoreApiError::Retryable) if retry_index < delays.len() => {
                     let delay = delays[retry_index];
                     retry_index += 1;

@@ -88,6 +88,9 @@ struct MockApi {
     stop_failures: AtomicUsize,
     stop_operation_ids: Mutex<Vec<String>>,
     bootstrap_fails: AtomicBool,
+    reject_stale_bootstrap: AtomicBool,
+    reject_stale_start: AtomicBool,
+    reject_stale_stop: AtomicBool,
     pinned_start: AtomicBool,
 }
 
@@ -102,6 +105,9 @@ impl MockApi {
             stop_failures: AtomicUsize::new(0),
             stop_operation_ids: Mutex::new(Vec::new()),
             bootstrap_fails: AtomicBool::new(false),
+            reject_stale_bootstrap: AtomicBool::new(false),
+            reject_stale_start: AtomicBool::new(false),
+            reject_stale_stop: AtomicBool::new(false),
             pinned_start: AtomicBool::new(false),
         }
     }
@@ -115,7 +121,10 @@ impl CoreApi for MockApi {
         Ok(token_response("fresh-access", "fresh-refresh"))
     }
 
-    async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
+    async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, CoreApiError> {
+        if self.reject_stale_bootstrap.load(Ordering::SeqCst) && access_token == "stale-access" {
+            return Err(CoreApiError::Unauthorized);
+        }
         if self.bootstrap_fails.load(Ordering::SeqCst) {
             return Err(CoreApiError::Retryable);
         }
@@ -124,7 +133,7 @@ impl CoreApi for MockApi {
 
     async fn start_connection(
         &self,
-        _access_token: &str,
+        access_token: &str,
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
@@ -132,6 +141,9 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.operation_id.clone());
+        if self.reject_stale_start.load(Ordering::SeqCst) && access_token == "stale-access" {
+            return Err(CoreApiError::Unauthorized);
+        }
         if self
             .start_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -152,7 +164,7 @@ impl CoreApi for MockApi {
 
     async fn stop_connection(
         &self,
-        _access_token: &str,
+        access_token: &str,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         self.stop_calls.fetch_add(1, Ordering::SeqCst);
@@ -160,6 +172,9 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.operation_id.clone());
+        if self.reject_stale_stop.load(Ordering::SeqCst) && access_token == "stale-access" {
+            return Err(CoreApiError::Unauthorized);
+        }
         if self
             .stop_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -298,6 +313,72 @@ async fn refresh_is_single_flight_and_rotates_tokens_once() {
     assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
     let stored = store.load().unwrap().unwrap();
     assert_eq!(stored.refresh_token.as_deref(), Some("fresh-refresh"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_refreshes_an_expired_access_token_without_signing_out() {
+    let api = Arc::new(MockApi::new(0));
+    api.reject_stale_bootstrap.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let response = core.bootstrap(1_700_000_000).await.unwrap();
+
+    assert_eq!(response.request_id, "req-bootstrap");
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store.load().unwrap().unwrap().access_token.as_deref(),
+        Some("fresh-access")
+    );
+    assert_ne!(core.state().await.phase, Phase::SignedOut);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_refreshes_once_and_reuses_the_same_operation() {
+    let api = Arc::new(MockApi::new(0));
+    api.reject_stale_start.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    let operation_ids = api.operation_ids.lock().unwrap();
+    assert_eq!(operation_ids.len(), 2);
+    assert_eq!(operation_ids[0], operation_ids[1]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_refreshes_once_after_the_local_tunnel_is_stopped() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    api.reject_stale_stop.store(true, Ordering::SeqCst);
+
+    core.stop().await.unwrap();
+
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    {
+        let operation_ids = api.stop_operation_ids.lock().unwrap();
+        assert_eq!(operation_ids.len(), 2);
+        assert_eq!(operation_ids[0], operation_ids[1]);
+    }
+    assert_eq!(core.state().await.phase, Phase::Ready);
 }
 
 #[tokio::test(flavor = "current_thread")]

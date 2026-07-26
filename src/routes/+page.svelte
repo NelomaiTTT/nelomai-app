@@ -1,102 +1,437 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
 
-  interface TunnelProbe {
-    platform: string;
-    backendAvailable: boolean;
-    permissionGranted: boolean;
-    backendVersion: string | null;
-    error: string | null;
-  }
+  import {
+    bindingRequest,
+    viewForPhase,
+    type AppView,
+    type Bootstrap,
+    type Layer,
+    type PeerOption,
+    type Phase,
+    type RouteMode,
+    type TicConnectionMode,
+  } from "$lib/app-model";
+  import {
+    commandMessage,
+    nativeClient,
+    type LoginRequest,
+  } from "$lib/native-client";
 
-  interface TunnelStatus {
-    state: "stopped" | "starting" | "running" | "stopping" | "failed" | "unsupported";
-    durationMillis: number;
-    errorCode: string | null;
-  }
-
-  let probe = $state<TunnelProbe | null>(null);
-  let tunnel = $state<TunnelStatus | null>(null);
+  let view = $state<AppView>("loading");
+  let phase = $state<Phase>("signed_out");
+  let bootstrap = $state<Bootstrap | null>(null);
+  let peers = $state<PeerOption[]>([]);
+  let selectedPeerId = $state("");
+  let selectedLayer = $state<Layer>("stray");
+  let ticConnectionMode = $state<TicConnectionMode>("dynamic");
+  let routeMode = $state<RouteMode>("standalone");
+  let busy = $state(false);
   let error = $state<string | null>(null);
-  let requestingPermission = $state(false);
 
-  async function loadProbe() {
+  let login = $state("");
+  let password = $state("");
+  let deviceName = $state("Это устройство");
+
+  const phaseLabels: Record<Phase, string> = {
+    signed_out: "Вход не выполнен",
+    authenticating: "Входим",
+    needs_peer_binding: "Нужно выбрать пир",
+    access_expired: "Доступ истёк",
+    ready: "Готово к подключению",
+    measuring: "Проверяем серверы",
+    connecting: "Подключаемся",
+    connected: "Подключено",
+    stopping: "Отключаемся",
+    update_required: "Требуется обновление",
+    server_unavailable: "Сервер недоступен",
+    error: "Что-то пошло не так",
+  };
+
+  onMount(restore);
+
+  async function restore() {
+    busy = true;
     error = null;
     try {
-      probe = await invoke<TunnelProbe>("plugin:tunnel-android|probe");
-      if (probe.platform === "android") {
-        tunnel = await invoke<TunnelStatus>("plugin:tunnel-android|tunnel_status");
+      const response = await nativeClient.bootstrap();
+      await applyBootstrap(response);
+    } catch (reason) {
+      const code = commandCode(reason);
+      if (code === "signed_out") {
+        phase = "signed_out";
+        view = "sign_in";
+      } else if (code === "access_expired") {
+        phase = "access_expired";
+        view = "access_expired";
+      } else if (code === "update_required") {
+        phase = "update_required";
+        view = "update_required";
+      } else {
+        phase = "server_unavailable";
+        view = "unavailable";
+        error = commandMessage(reason);
       }
-    } catch (reason) {
-      error = String(reason);
+    } finally {
+      busy = false;
     }
   }
 
-  async function requestPermission() {
-    requestingPermission = true;
+  async function applyBootstrap(response: Bootstrap) {
+    bootstrap = response;
+    selectedLayer = response.defaults.layer;
+    ticConnectionMode = response.defaults.tic_connection_mode;
+    routeMode = response.defaults.route_mode;
+
+    if (response.update.required) {
+      phase = "update_required";
+      view = "update_required";
+      return;
+    }
+    if (!response.access.can_connect || response.access.state === "expired") {
+      phase = "access_expired";
+      view = "access_expired";
+      return;
+    }
+    if (!response.binding) {
+      phase = "needs_peer_binding";
+      view = "peer_selection";
+      await loadPeers();
+      return;
+    }
+
+    const state = await nativeClient.state();
+    phase = state.phase;
+    view = viewForPhase(state.phase);
+  }
+
+  async function submitLogin(event: SubmitEvent) {
+    event.preventDefault();
+    if (busy) return;
+    busy = true;
+    error = null;
+    phase = "authenticating";
+    try {
+      const request: LoginRequest = {
+        login: login.trim(),
+        password,
+        deviceName: deviceName.trim() || "Это устройство",
+        platformVersion: null,
+      };
+      const response = await nativeClient.login(request);
+      password = "";
+      await applyBootstrap(response);
+    } catch (reason) {
+      phase = "signed_out";
+      view = "sign_in";
+      error = commandMessage(reason);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function loadPeers() {
     error = null;
     try {
-      await invoke("plugin:tunnel-android|request_vpn_permission");
-      await loadProbe();
+      const response = await nativeClient.peerOptions();
+      peers = response.peers;
+      selectedPeerId =
+        response.peers.find((peer) => peer.selectable)?.id ?? "";
     } catch (reason) {
-      error = String(reason);
-    } finally {
-      requestingPermission = false;
+      peers = [];
+      selectedPeerId = "";
+      error = commandMessage(reason);
     }
   }
 
-  onMount(loadProbe);
+  async function bindSelectedPeer() {
+    if (!bootstrap || !selectedPeerId || busy) return;
+    busy = true;
+    error = null;
+    try {
+      await nativeClient.bindPeer(
+        bindingRequest(selectedPeerId, bootstrap),
+      );
+      await restore();
+    } catch (reason) {
+      error = commandMessage(reason);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function toggleConnection() {
+    if (busy) return;
+    busy = true;
+    error = null;
+    try {
+      if (phase === "connected") {
+        await nativeClient.stop();
+        phase = "ready";
+      } else {
+        phase = "connecting";
+        await nativeClient.start({
+          layer: selectedLayer,
+          ticConnectionMode,
+          routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
+          probes: [],
+          allowAlternate: true,
+        });
+        phase = "connected";
+      }
+      view = "connection";
+    } catch (reason) {
+      phase = "error";
+      error = commandMessage(reason);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function logout() {
+    if (busy) return;
+    busy = true;
+    error = null;
+    try {
+      await nativeClient.logout();
+      bootstrap = null;
+      peers = [];
+      selectedPeerId = "";
+      password = "";
+      phase = "signed_out";
+      view = "sign_in";
+    } catch (reason) {
+      error = commandMessage(reason);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function commandCode(reason: unknown): string | null {
+    if (
+      typeof reason === "object" &&
+      reason !== null &&
+      "code" in reason &&
+      typeof reason.code === "string"
+    ) {
+      return reason.code;
+    }
+    return null;
+  }
 </script>
 
 <svelte:head>
-  <title>Nelomai platform spike</title>
+  <title>Nelomai</title>
 </svelte:head>
 
-<main>
-  <p class="eyebrow">Platform feasibility spike</p>
-  <h1>Nelomai</h1>
+<main class="app-shell">
+  <header>
+    <a class="brand" href="/" aria-label="Nelomai">
+      <span class="brand-mark" aria-hidden="true">✦</span>
+      <span>Nelomai</span>
+    </a>
+    <div class="header-actions">
+      <span class="status" data-phase={phase}>
+        <span aria-hidden="true"></span>
+        {phaseLabels[phase]}
+      </span>
+      {#if view !== "loading" && view !== "sign_in"}
+        <button class="quiet-button" type="button" onclick={logout} disabled={busy}>
+          Выйти
+        </button>
+      {/if}
+    </div>
+  </header>
 
-  {#if probe}
-    <dl>
-      <div>
-        <dt>Platform</dt>
-        <dd>{probe.platform}</dd>
+  <section class="workspace" aria-live="polite">
+    {#if view === "loading"}
+      <div class="center-state">
+        <div class="loader" aria-hidden="true"></div>
+        <h1>Открываем приложение</h1>
       </div>
-      <div>
-        <dt>WireGuard backend</dt>
-        <dd>{probe.backendAvailable ? "available" : "unavailable"}</dd>
-      </div>
-      <div>
-        <dt>Backend version</dt>
-        <dd>{probe.backendVersion ?? "n/a"}</dd>
-      </div>
-      <div>
-        <dt>VPN permission</dt>
-        <dd>{probe.permissionGranted ? "granted" : "required"}</dd>
-      </div>
-    </dl>
+    {:else if view === "sign_in"}
+      <form class="panel sign-in" onsubmit={submitLogin}>
+        <div>
+          <p class="eyebrow">Личный аккаунт</p>
+          <h1>Вход в Nelomai</h1>
+        </div>
+        <label>
+          <span>Логин</span>
+          <input
+            bind:value={login}
+            autocomplete="username"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          <span>Пароль</span>
+          <input
+            bind:value={password}
+            type="password"
+            autocomplete="current-password"
+            required
+          />
+        </label>
+        <label>
+          <span>Название устройства</span>
+          <input bind:value={deviceName} maxlength="80" required />
+        </label>
+        {#if error}<p class="error-message">{error}</p>{/if}
+        <button class="primary-button" type="submit" disabled={busy}>
+          {busy ? "Входим…" : "Войти"}
+        </button>
+      </form>
+    {:else if view === "peer_selection"}
+      <div class="panel peer-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Это устройство</p>
+            <h1>Выберите пир</h1>
+          </div>
+          <span class="counter">{peers.length}</span>
+        </div>
 
-    {#if !probe.permissionGranted && probe.platform === "android"}
-      <button onclick={requestPermission} disabled={requestingPermission}>
-        {requestingPermission ? "Waiting for Android..." : "Request VPN permission"}
-      </button>
+        {#if peers.length}
+          <div class="peer-list">
+            {#each peers as peer}
+              <label class:disabled={!peer.selectable} class="peer-row">
+                <input
+                  type="radio"
+                  name="peer"
+                  value={peer.id}
+                  bind:group={selectedPeerId}
+                  disabled={!peer.selectable}
+                />
+                <span class="peer-copy">
+                  <strong>{peer.name}</strong>
+                  <span>{peer.interface_name} · пир {peer.slot}</span>
+                  <span class="peer-comment">
+                    {peer.comment || "Комментария ещё нет"}
+                  </span>
+                </span>
+                <span class="peer-state">
+                  {peer.last_handshake_at ? "Использовался" : "Свободен"}
+                </span>
+              </label>
+            {/each}
+          </div>
+          {#if error}<p class="error-message">{error}</p>{/if}
+          <button
+            class="primary-button"
+            type="button"
+            onclick={bindSelectedPeer}
+            disabled={!selectedPeerId || busy}
+          >
+            {busy ? "Сохраняем…" : "Использовать этот пир"}
+          </button>
+        {:else}
+          <div class="empty-state">
+            <h2>Нет доступных пиров</h2>
+            {#if error}<p class="error-message">{error}</p>{/if}
+            <button class="secondary-button" type="button" onclick={loadPeers}>
+              Проверить ещё раз
+            </button>
+          </div>
+        {/if}
+      </div>
+    {:else if view === "connection"}
+      <div class="connection-layout">
+        <section class="panel connection-panel">
+          <div>
+            <p class="eyebrow">Подключение</p>
+            <h1>{phase === "connected" ? "Интернет защищён" : "Готово к запуску"}</h1>
+          </div>
+
+          <button
+            class:stop={phase === "connected"}
+            class="connect-button"
+            type="button"
+            onclick={toggleConnection}
+            disabled={busy}
+          >
+            <span>{phase === "connected" ? "Стоп" : "Старт"}</span>
+            <small>{busy ? phaseLabels[phase] : "Нажмите для переключения"}</small>
+          </button>
+
+          {#if error}<p class="error-message">{error}</p>{/if}
+        </section>
+
+        <aside class="panel settings-panel">
+          <div>
+            <p class="eyebrow">Маршрут</p>
+            <h2>Параметры подключения</h2>
+          </div>
+
+          <fieldset disabled={busy || phase === "connected"}>
+            <legend>Система</legend>
+            <div class="segmented">
+              <label>
+                <input type="radio" value="tic" bind:group={selectedLayer} />
+                <span>Tic / Tak</span>
+              </label>
+              <label>
+                <input type="radio" value="stray" bind:group={selectedLayer} />
+                <span>Stray</span>
+              </label>
+            </div>
+          </fieldset>
+
+          {#if selectedLayer === "tic"}
+            <label class="select-field">
+              <span>Режим</span>
+              <select bind:value={ticConnectionMode} disabled={busy || phase === "connected"}>
+                <option value="personal">Постоянный пир</option>
+                <option value="dynamic">Динамический</option>
+              </select>
+            </label>
+            <label class="select-field">
+              <span>Маршрут</span>
+              <select bind:value={routeMode} disabled={busy || phase === "connected"}>
+                <option value="via_tak">Через Tak</option>
+                <option value="standalone">Напрямую</option>
+              </select>
+            </label>
+          {/if}
+
+          {#if bootstrap?.binding}
+            <div class="binding-summary">
+              <span>Используемый пир</span>
+              <strong>{bootstrap.binding.interface_name} · {bootstrap.binding.slot}</strong>
+            </div>
+          {/if}
+        </aside>
+      </div>
+    {:else if view === "access_expired"}
+      <div class="panel message-panel">
+        <p class="eyebrow">Доступ</p>
+        <h1>Подключение пока недоступно</h1>
+        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
+          Проверить снова
+        </button>
+      </div>
+    {:else if view === "update_required"}
+      <div class="panel message-panel">
+        <p class="eyebrow">Обновление</p>
+        <h1>Нужно обновить Nelomai</h1>
+        {#if bootstrap?.update.release_notes}
+          <p>{bootstrap.update.release_notes}</p>
+        {/if}
+        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
+          Проверить снова
+        </button>
+      </div>
+    {:else}
+      <div class="panel message-panel">
+        <p class="eyebrow">Подключение к панели</p>
+        <h1>Сейчас сервис недоступен</h1>
+        {#if error}<p class="error-message">{error}</p>{/if}
+        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
+          {busy ? "Проверяем…" : "Повторить"}
+        </button>
+      </div>
     {/if}
-
-    {#if tunnel}
-      <p>Tunnel state: {tunnel.state}</p>
-    {/if}
-
-    {#if probe.error}
-      <p class="error">{probe.error}</p>
-    {/if}
-  {:else if !error}
-    <p>Loading native backend...</p>
-  {/if}
-
-  {#if error}
-    <p class="error">{error}</p>
-  {/if}
+  </section>
 </main>
 
 <style>
@@ -104,71 +439,529 @@
     box-sizing: border-box;
   }
 
+  :global(html) {
+    min-width: 320px;
+    min-height: 100%;
+    color-scheme: dark;
+  }
+
   :global(body) {
     margin: 0;
     min-width: 320px;
     min-height: 100vh;
-    color: #f5f7fa;
-    background: #090b0d;
-    font-family: system-ui, sans-serif;
+    color: #f5f6f8;
+    background:
+      linear-gradient(180deg, rgba(12, 35, 43, 0.34), transparent 42%),
+      #080a0d;
+    font-family:
+      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+      sans-serif;
   }
 
-  main {
-    width: min(680px, calc(100% - 40px));
+  :global(button),
+  :global(input),
+  :global(select) {
+    font: inherit;
+  }
+
+  :global(button) {
+    letter-spacing: 0;
+  }
+
+  .app-shell {
+    min-height: 100vh;
+    display: grid;
+    grid-template-rows: auto 1fr;
+  }
+
+  header {
+    width: min(1180px, calc(100% - 40px));
+    min-height: 72px;
     margin: 0 auto;
-    padding: 48px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    border-bottom: 1px solid #242a30;
   }
 
-  .eyebrow {
-    margin: 0 0 8px;
-    color: #63c7b7;
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: #fff;
+    font-size: 21px;
+    font-weight: 720;
+    text-decoration: none;
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+    display: grid;
+    place-items: center;
+    color: #071011;
+    background: #f4f6f7;
+    border-radius: 7px;
+    font-size: 21px;
+  }
+
+  .header-actions,
+  .status {
+    display: flex;
+    align-items: center;
+  }
+
+  .header-actions {
+    gap: 16px;
+  }
+
+  .status {
+    gap: 8px;
+    color: #aeb6bd;
     font-size: 13px;
-    text-transform: uppercase;
+  }
+
+  .status > span {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #85909a;
+  }
+
+  .status[data-phase="ready"] > span,
+  .status[data-phase="connected"] > span {
+    background: #59d6bd;
+  }
+
+  .status[data-phase="error"] > span,
+  .status[data-phase="server_unavailable"] > span,
+  .status[data-phase="access_expired"] > span {
+    background: #e97171;
+  }
+
+  .workspace {
+    width: min(1180px, calc(100% - 40px));
+    margin: 0 auto;
+    padding: 48px 0 64px;
+    display: grid;
+    place-items: center;
+  }
+
+  .panel {
+    width: 100%;
+    border: 1px solid #303841;
+    border-radius: 8px;
+    background: rgba(16, 20, 24, 0.94);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.22);
+  }
+
+  .sign-in {
+    width: min(440px, 100%);
+    padding: 32px;
+    display: grid;
+    gap: 20px;
+  }
+
+  h1,
+  h2,
+  p {
+    margin-top: 0;
   }
 
   h1 {
-    margin: 0 0 32px;
-    font-size: 36px;
+    margin-bottom: 0;
+    font-size: clamp(28px, 4vw, 40px);
+    line-height: 1.08;
+    letter-spacing: 0;
   }
 
-  dl {
-    margin: 0 0 24px;
-    border-top: 1px solid #31363b;
+  h2 {
+    margin-bottom: 0;
+    font-size: 20px;
+    letter-spacing: 0;
   }
 
-  dl div {
+  .eyebrow {
+    margin-bottom: 7px;
+    color: #68cfc0;
+    font-size: 12px;
+    font-weight: 720;
+    text-transform: uppercase;
+  }
+
+  label {
     display: grid;
-    grid-template-columns: minmax(140px, 1fr) 1fr;
-    gap: 24px;
-    padding: 14px 0;
-    border-bottom: 1px solid #31363b;
+    gap: 8px;
+    color: #cbd1d6;
+    font-size: 13px;
   }
 
-  dt {
-    color: #9aa2aa;
+  input,
+  select {
+    width: 100%;
+    min-height: 44px;
+    padding: 0 12px;
+    color: #fff;
+    border: 1px solid #3a444d;
+    border-radius: 6px;
+    outline: none;
+    background: #0c1014;
   }
 
-  dd {
-    margin: 0;
-    overflow-wrap: anywhere;
+  input:focus,
+  select:focus {
+    border-color: #67d5c4;
+    box-shadow: 0 0 0 3px rgba(103, 213, 196, 0.14);
   }
 
   button {
-    min-height: 44px;
-    padding: 0 18px;
-    border: 1px solid #7be0d0;
+    min-height: 42px;
+    border: 0;
     border-radius: 6px;
-    color: #07110f;
-    background: #7be0d0;
-    font: inherit;
     cursor: pointer;
   }
 
   button:disabled {
     cursor: wait;
-    opacity: 0.6;
+    opacity: 0.58;
   }
-  .error {
-    color: #ff8585;
+
+  .primary-button,
+  .secondary-button {
+    padding: 0 18px;
+    color: #06110f;
+    background: #67d5c4;
+    font-weight: 740;
+  }
+
+  .secondary-button {
+    color: #effaf8;
+    border: 1px solid #3a8075;
+    background: #173d38;
+  }
+
+  .quiet-button {
+    min-height: 34px;
+    padding: 0 12px;
+    color: #d1d7dc;
+    border: 1px solid #343c44;
+    background: transparent;
+  }
+
+  .error-message {
+    margin: 0;
+    color: #ff9999;
+    font-size: 13px;
+  }
+
+  .center-state {
+    display: grid;
+    justify-items: center;
+    gap: 18px;
+    text-align: center;
+  }
+
+  .loader {
+    width: 30px;
+    height: 30px;
+    border: 3px solid #2d393d;
+    border-top-color: #67d5c4;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  .peer-panel {
+    max-width: 780px;
+    padding: 28px;
+    display: grid;
+    gap: 24px;
+  }
+
+  .panel-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+  }
+
+  .counter {
+    min-width: 38px;
+    height: 30px;
+    padding: 0 10px;
+    display: grid;
+    place-items: center;
+    color: #9ee5da;
+    border: 1px solid #326a62;
+    border-radius: 15px;
+    font-size: 13px;
+  }
+
+  .peer-list {
+    display: grid;
+    border-top: 1px solid #2a3036;
+  }
+
+  .peer-row {
+    min-height: 86px;
+    padding: 14px 4px;
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 14px;
+    border-bottom: 1px solid #2a3036;
+    cursor: pointer;
+  }
+
+  .peer-row.disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .peer-row input {
+    width: 18px;
+    min-height: 18px;
+    accent-color: #67d5c4;
+  }
+
+  .peer-copy {
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+  }
+
+  .peer-copy strong,
+  .peer-copy span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .peer-copy strong {
+    color: #fff;
+    font-size: 16px;
+  }
+
+  .peer-copy span {
+    color: #909aa3;
+  }
+
+  .peer-comment {
+    color: #c5ccd2 !important;
+  }
+
+  .peer-state {
+    color: #9ca6af;
+    font-size: 12px;
+  }
+
+  .connection-layout {
+    width: 100%;
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.75fr);
+    gap: 20px;
+  }
+
+  .connection-panel,
+  .settings-panel {
+    padding: 30px;
+  }
+
+  .connection-panel {
+    min-height: 450px;
+    display: grid;
+    align-content: space-between;
+    gap: 36px;
+  }
+
+  .connect-button {
+    width: min(250px, 64vw);
+    aspect-ratio: 1;
+    min-height: 0;
+    justify-self: center;
+    display: grid;
+    place-content: center;
+    gap: 6px;
+    color: #07110f;
+    border: 10px solid rgba(130, 236, 218, 0.32);
+    border-radius: 50%;
+    background: #67d5c4;
+    box-shadow: 0 0 40px rgba(103, 213, 196, 0.17);
+  }
+
+  .connect-button.stop {
+    color: #fff;
+    border-color: rgba(229, 105, 105, 0.28);
+    background: #a52931;
+    box-shadow: 0 0 40px rgba(229, 105, 105, 0.15);
+  }
+
+  .connect-button span {
+    font-size: 32px;
+    font-weight: 780;
+  }
+
+  .connect-button small {
+    font-size: 11px;
+  }
+
+  .settings-panel {
+    display: grid;
+    align-content: start;
+    gap: 28px;
+  }
+
+  fieldset {
+    margin: 0;
+    padding: 0;
+    border: 0;
+  }
+
+  legend,
+  .select-field > span,
+  .binding-summary > span {
+    margin-bottom: 8px;
+    color: #9ca5ad;
+    font-size: 12px;
+  }
+
+  .segmented {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+    padding: 4px;
+    border: 1px solid #333b43;
+    border-radius: 7px;
+    background: #0c1014;
+  }
+
+  .segmented label {
+    position: relative;
+  }
+
+  .segmented input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .segmented span {
+    min-height: 38px;
+    display: grid;
+    place-items: center;
+    border-radius: 5px;
+  }
+
+  .segmented input:checked + span {
+    color: #eafffb;
+    background: #225d55;
+  }
+
+  .select-field {
+    gap: 0;
+  }
+
+  .binding-summary {
+    padding-top: 18px;
+    display: grid;
+    gap: 4px;
+    border-top: 1px solid #2a3036;
+  }
+
+  .message-panel {
+    max-width: 600px;
+    padding: 36px;
+    display: grid;
+    justify-items: start;
+    gap: 20px;
+  }
+
+  .message-panel p:not(.eyebrow) {
+    margin-bottom: 0;
+    color: #aeb6bd;
+    line-height: 1.55;
+  }
+
+  .empty-state {
+    min-height: 220px;
+    display: grid;
+    place-content: center;
+    justify-items: center;
+    gap: 20px;
+    text-align: center;
+  }
+
+  @media (max-width: 760px) {
+    header,
+    .workspace {
+      width: min(100% - 28px, 620px);
+    }
+
+    header {
+      min-height: 64px;
+    }
+
+    .status {
+      display: none;
+    }
+
+    .workspace {
+      padding: 24px 0 36px;
+      align-items: start;
+    }
+
+    .sign-in,
+    .peer-panel,
+    .connection-panel,
+    .settings-panel,
+    .message-panel {
+      padding: 22px;
+    }
+
+    .connection-layout {
+      grid-template-columns: 1fr;
+    }
+
+    .connection-panel {
+      min-height: 390px;
+    }
+
+    .settings-panel {
+      order: 2;
+    }
+
+    .peer-row {
+      grid-template-columns: 20px minmax(0, 1fr);
+    }
+
+    .peer-state {
+      grid-column: 2;
+    }
+  }
+
+  @media (max-width: 420px) {
+    .brand {
+      font-size: 19px;
+    }
+
+    h1 {
+      font-size: 29px;
+    }
+
+    .connect-button {
+      width: min(230px, 70vw);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .loader {
+      animation-duration: 1.8s;
+    }
   }
 </style>
