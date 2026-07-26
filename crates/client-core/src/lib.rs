@@ -435,6 +435,32 @@ where
         self.state.lock().await.clone()
     }
 
+    pub async fn sign_out(&self) -> Result<(), CoreError> {
+        let tunnel_result = self.tunnel.stop().await;
+        let stored = self
+            .store
+            .load()
+            .map_err(|_| CoreError::Storage)?
+            .unwrap_or_else(nelomai_client_storage::StoredAuth::new_install);
+        self.store
+            .save(&nelomai_client_storage::StoredAuth {
+                install_secret: stored.install_secret,
+                access_token: None,
+                refresh_token: None,
+                saved_connection: None,
+                compatibility: None,
+            })
+            .map_err(|_| CoreError::Storage)?;
+        *self.state.lock().await = CoreState::default();
+        self.logger.record(CoreLogEvent {
+            kind: "auth.signed_out",
+            operation_id: None,
+            request_id: None,
+            code: None,
+        });
+        tunnel_result.map_err(Into::into)
+    }
+
     pub async fn refresh_access_token(&self, stale_access: &str) -> Result<String, CoreError> {
         let _guard = self.refresh_gate.lock().await;
         let mut stored = self.load_auth()?;

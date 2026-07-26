@@ -2649,7 +2649,12 @@ name = "nelomai-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "nelomai-client-api",
+ "nelomai-client-application",
+ "nelomai-client-core",
+ "nelomai-client-storage",
  "nelomai-client-updater",
+ "nelomai-contracts",
  "nelomai-unix-service",
  "nelomai-windows-service",
  "serde",
@@ -2670,6 +2675,20 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "nelomai-client-application"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "nelomai-client-api",
+ "nelomai-client-core",
+ "nelomai-client-storage",
+ "nelomai-client-tunnel",
+ "nelomai-contracts",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
