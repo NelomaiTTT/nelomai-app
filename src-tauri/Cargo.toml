@@ -24,3 +24,6 @@ tauri-plugin-opener = "2"
 tauri-plugin-tunnel-android = { path = "../plugins/tunnel-android" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+nelomai-windows-service = { path = "../crates/windows-service" }

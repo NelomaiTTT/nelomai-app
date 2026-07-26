@@ -18,6 +18,8 @@ Actual measurements, limitations, and the platform decision are recorded in
 [`docs/adr/0001-platform-feasibility.md`](docs/adr/0001-platform-feasibility.md).
 The panel boundary is documented in
 [`docs/panel_contract.md`](docs/panel_contract.md).
+The Windows service boundary and the deferred runtime smoke are documented in
+[`docs/windows-tunnel-service.md`](docs/windows-tunnel-service.md).
 
 ## Local checks
 

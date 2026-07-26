@@ -33,6 +33,18 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - run: cargo check -p nelomai-windows-service --all-targets
+      - run: cargo check -p nelomai-app
+      - run: cargo test -p nelomai-windows-service
+
   contracts-python:
     runs-on: ubuntu-latest
     steps:

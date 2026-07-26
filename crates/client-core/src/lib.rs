@@ -220,6 +220,16 @@ impl ConnectOptions {
             allow_alternate: true,
         }
     }
+
+    pub fn windows_default() -> Self {
+        Self {
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            probes: Vec::new(),
+            allow_alternate: true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +243,17 @@ mod platform_default_tests {
         assert_eq!(options.layer, Layer::Tic);
         assert_eq!(options.tic_connection_mode, TicConnectionMode::Personal);
         assert_eq!(options.route_mode, RouteMode::ViaTak);
+        assert!(options.probes.is_empty());
+        assert!(options.allow_alternate);
+    }
+
+    #[test]
+    fn windows_defaults_to_dynamic_stray() {
+        let options = ConnectOptions::windows_default();
+
+        assert_eq!(options.layer, Layer::Stray);
+        assert_eq!(options.tic_connection_mode, TicConnectionMode::Dynamic);
+        assert_eq!(options.route_mode, RouteMode::Standalone);
         assert!(options.probes.is_empty());
         assert!(options.allow_alternate);
     }

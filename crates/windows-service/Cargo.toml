@@ -1,0 +1,38 @@
+[package]
+name = "nelomai-windows-service"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+nelomai-client-tunnel = { path = "../client-tunnel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+tokio = { version = "1", features = ["rt"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
+[[bin]]
+name = "nelomai-windows-service"
+path = "src/main.rs"
