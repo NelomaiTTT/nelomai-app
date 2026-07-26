@@ -43,6 +43,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo check -p nelomai-windows-service --all-targets
       - run: cargo check -p nelomai-app
+      - run: cargo test -p nelomai-client-updater
       - run: cargo test -p nelomai-windows-service
 
   macos:

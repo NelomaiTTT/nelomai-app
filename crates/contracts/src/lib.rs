@@ -205,6 +205,15 @@ pub struct UpdateState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct UpdateManifest {
+    pub version: String,
+    pub notes: Option<String>,
+    pub pub_date: Option<String>,
+    pub url: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Bootstrap {
     pub api_version: ApiVersion,
     pub request_id: String,

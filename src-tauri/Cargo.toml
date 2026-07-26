@@ -19,9 +19,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+async-trait = "0.1"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-tunnel-android = { path = "../plugins/tunnel-android" }
+nelomai-client-updater = { path = "../crates/client-updater" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -30,3 +32,6 @@ nelomai-windows-service = { path = "../crates/windows-service" }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 nelomai-unix-service = { path = "../crates/unix-service" }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+tauri-plugin-updater = "=2.10.1"

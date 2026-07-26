@@ -1,0 +1,7 @@
+{
+  "version": "0.2.0",
+  "notes": "Исправлена работа туннеля.",
+  "pub_date": "2026-07-26T12:00:00Z",
+  "url": "https://nelomai.ru/api/client/v1/updates/artifacts/desktop-0.2.0",
+  "signature": "trusted-tauri-signature"
+}

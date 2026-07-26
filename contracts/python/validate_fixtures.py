@@ -38,6 +38,10 @@ def main() -> None:
     assert start["operation_id"]
     assert fixtures["connection-start-response"]["connection"]["status"] in LEASE_STATUSES
     assert fixtures["connection-operation"]["connection"]["status"] in LEASE_STATUSES
+    assert fixtures["update-manifest"]["url"].startswith(
+        "https://nelomai.ru/api/client/v1/updates/artifacts/"
+    )
+    assert fixtures["update-manifest"]["signature"]
     assert set(fixtures["error"]) == SAFE_ERROR_KEYS
 
     future = load(COMPAT / "bootstrap-extra-optional.json")

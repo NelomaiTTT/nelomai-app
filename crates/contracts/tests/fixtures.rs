@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, ConnectionOperationResponse, ConnectionStartRequest,
     ConnectionStartResponse, ErrorPayload, PeerBindingResponse, PeerOptions,
-    ServerCandidatesResponse, ServerSelectionRequest,
+    ServerCandidatesResponse, ServerSelectionRequest, UpdateManifest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -70,6 +70,7 @@ fn shared_valid_fixtures_match_schemas_and_rust_types() {
         "connection-operation.schema.json",
     );
     check::<ErrorPayload>("valid/error.json", "error.schema.json");
+    check::<UpdateManifest>("valid/update-manifest.json", "update-manifest.schema.json");
 }
 
 #[test]

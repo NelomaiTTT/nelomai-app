@@ -37,3 +37,29 @@ contain it. Common errors contain exactly `request_id`, `code`, and `message`.
 - `operation_id` makes connection mutations idempotent.
 - Artifact downloads stay on authenticated relative `/api/client/v1` URLs.
 
+## Application updates
+
+Bootstrap remains the source of update policy. `update_available` tells the
+client to display an offer, while `required` blocks new tunnel connections
+until a compatible version is installed. Disabling automatic updates does not
+hide that offer and does not bypass a required update.
+
+Desktop clients request a dynamic updater manifest from:
+
+```text
+GET /api/client/v1/updates/manifest/{target}/{current_version}
+Authorization: Bearer <access token>
+```
+
+The panel returns `204` when no update is available. Otherwise it returns the
+signed manifest described by `update-manifest.schema.json`. Its artifact URL
+must remain under:
+
+```text
+https://nelomai.ru/api/client/v1/updates/artifacts/{artifact}
+```
+
+The same bearer header is used for the artifact request. The client rejects a
+different origin, credentials embedded in the URL, query strings, fragments,
+and paths outside this prefix before sending the token. The Tauri updater then
+verifies the artifact signature using the public key embedded at build time.

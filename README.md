@@ -2,17 +2,20 @@
 
 Native Nelomai client for Android, Windows, macOS, and Linux.
 
-Task 0 proved the platform approach. Task 1 establishes the versioned shared
-contracts. The UI remains a temporary diagnostic surface and is not the
-product design.
+The repository contains the shared application core, versioned panel
+contracts, platform tunnel adapters, privileged desktop services, and the
+signed update boundary. The UI remains a temporary diagnostic surface and is
+not the product design.
 
-## Current spike
+## Current architecture
 
 - Tauri 2 with Svelte and TypeScript for the shared application shell.
 - Rust for shared native logic and desktop integration.
 - Android plugin backed by the official
   `com.wireguard.android:tunnel` library.
-- Unix privileged-helper prototype with kernel-authenticated peer UID.
+- Privileged tunnel services for Windows, macOS, and Linux.
+- Signed automatic updates for desktop platforms; Android installation stays a
+  separate native boundary.
 
 Actual measurements, limitations, and the platform decision are recorded in
 [`docs/adr/0001-platform-feasibility.md`](docs/adr/0001-platform-feasibility.md).
@@ -20,6 +23,10 @@ The panel boundary is documented in
 [`docs/panel_contract.md`](docs/panel_contract.md).
 The Windows service boundary and the deferred runtime smoke are documented in
 [`docs/windows-tunnel-service.md`](docs/windows-tunnel-service.md).
+The Unix service boundary is documented in
+[`docs/unix-tunnel-helper.md`](docs/unix-tunnel-helper.md).
+Application update policy and release gates are documented in
+[`docs/application-updates.md`](docs/application-updates.md).
 
 ## Local checks
 

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/update-manifest.schema.json",
+  "title": "Nelomai signed update manifest",
+  "type": "object",
+  "required": ["version", "notes", "pub_date", "url", "signature"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$",
+      "maxLength": 64
+    },
+    "notes": { "type": ["string", "null"], "maxLength": 10000 },
+    "pub_date": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "maxLength": 64
+    },
+    "url": {
+      "type": "string",
+      "pattern": "^https://nelomai\\.ru/api/client/v1/updates/artifacts/",
+      "maxLength": 2048
+    },
+    "signature": { "type": "string", "minLength": 1, "maxLength": 4096 }
+  },
+  "additionalProperties": true
+}

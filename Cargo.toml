@@ -4,6 +4,7 @@ members = [
     "crates/client-core",
     "crates/client-storage",
     "crates/client-tunnel",
+    "crates/client-updater",
     "crates/contracts",
     "crates/unix-service",
     "crates/windows-service",
