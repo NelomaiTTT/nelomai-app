@@ -2711,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "libc",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-unix-service"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2859,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-windows-service"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "nelomai-client-tunnel",

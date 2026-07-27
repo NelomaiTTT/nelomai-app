@@ -98,7 +98,15 @@ impl PipeServer {
 
         let result = (|| {
             let identity = identity_for_pipe_client(pipe)?;
-            authorize_client(&self.policy, &identity)?;
+            authorize_client(&self.policy, &identity).map_err(|_| {
+                ServiceError::Backend(format!(
+                    "authorize pipe client: actual SID {}, expected SID {}, actual path {}, expected path {}",
+                    identity.sid,
+                    self.policy.owner_sid,
+                    identity.process_path.display(),
+                    self.policy.installed_client_path.display()
+                ))
+            })?;
             let frame = read_frame(pipe)?;
             let request = decode_request(&frame)?;
             Ok(Some((request, pipe)))

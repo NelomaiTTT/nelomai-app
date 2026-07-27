@@ -1,5 +1,5 @@
 use super::backend::WindowsServiceBackend;
-use super::install::load_policy;
+use super::install::{load_policy, record_service_diagnostic};
 use super::ipc::{finish_request, wake_server, PipeServer};
 use super::{platform_error, wide};
 use crate::{ServiceError, TunnelRequestHandler, MANAGER_SERVICE_NAME};
@@ -28,7 +28,9 @@ pub fn run_manager_service() -> Result<(), ServiceError> {
 }
 
 fn manager_service_entry(_arguments: Vec<OsString>) {
-    let _ = manager_service_loop();
+    if let Err(error) = manager_service_loop() {
+        record_service_diagnostic("manager service stopped", &error);
+    }
 }
 
 fn manager_service_loop() -> Result<(), ServiceError> {
@@ -67,11 +69,16 @@ fn manager_service_loop() -> Result<(), ServiceError> {
                     break;
                 }
                 let response = handler.handle(request);
-                let _ = finish_request(pipe, &response);
+                if let Err(error) = finish_request(pipe, &response) {
+                    record_service_diagnostic("send pipe response", &error);
+                }
             }
             Ok(None) => {}
             Err(_) if stopping.load(Ordering::Acquire) => break,
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => {
+                record_service_diagnostic("accept pipe request", &error);
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
     }
     set_status(

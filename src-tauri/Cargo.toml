@@ -1,6 +1,6 @@
 [package]
 name = "nelomai-app"
-version = "0.1.1"
+version = "0.1.2"
 description = "Native Nelomai client"
 authors = ["Nelomai"]
 edition = "2021"

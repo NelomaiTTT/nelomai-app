@@ -7,9 +7,11 @@ use crate::{
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_service::service::{
     Service, ServiceAccess, ServiceDependency, ServiceErrorControl, ServiceInfo, ServiceSidType,
     ServiceStartType, ServiceState, ServiceType,
@@ -28,6 +30,8 @@ use windows_sys::Win32::Security::{
 
 const POLICY_FILE: &str = "client-policy.json";
 const TUNNEL_CONFIG_FILE: &str = "nelomai.conf";
+const DIAGNOSTIC_LOG_FILE: &str = "service-diagnostics.log";
+const MAX_DIAGNOSTIC_LOG_SIZE: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
@@ -88,6 +92,30 @@ pub(crate) fn load_policy() -> Result<ClientPolicy, ServiceError> {
 
 pub(crate) fn tunnel_config_path() -> Result<PathBuf, ServiceError> {
     Ok(state_directory()?.join(TUNNEL_CONFIG_FILE))
+}
+
+pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
+    let Ok(root) = state_directory() else {
+        return;
+    };
+    let path = root.join(DIAGNOSTIC_LOG_FILE);
+    let truncate = fs::metadata(&path)
+        .map(|metadata| metadata.len() >= MAX_DIAGNOSTIC_LOG_SIZE)
+        .unwrap_or(false);
+    let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(!truncate)
+        .truncate(truncate)
+        .open(path)
+    else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let _ = writeln!(log, "{timestamp} {context}: {error}");
 }
 
 pub(crate) fn create_or_replace_tunnel_service(
