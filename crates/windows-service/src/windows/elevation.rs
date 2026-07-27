@@ -55,7 +55,7 @@ fn install_parameters(owner_sid: &str, client_executable: &Path) -> Result<Strin
     ))
 }
 
-fn current_process_sid() -> Result<String, RepairError> {
+pub(crate) fn current_process_sid() -> Result<String, RepairError> {
     let token = {
         let mut token = null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {

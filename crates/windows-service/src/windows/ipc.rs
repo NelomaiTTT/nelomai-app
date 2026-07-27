@@ -97,6 +97,9 @@ impl PipeServer {
         }
 
         let result = (|| {
+            // Windows exposes the pipe client's impersonation token only after
+            // the server has read data from that client.
+            let frame = read_frame(pipe)?;
             let identity = identity_for_pipe_client(pipe)?;
             authorize_client(&self.policy, &identity).map_err(|_| {
                 ServiceError::Backend(format!(
@@ -107,7 +110,6 @@ impl PipeServer {
                     self.policy.installed_client_path.display()
                 ))
             })?;
-            let frame = read_frame(pipe)?;
             let request = decode_request(&frame)?;
             Ok(Some((request, pipe)))
         })();
@@ -388,4 +390,38 @@ impl Drop for RevertGuard {
 
 fn last_error(context: &str) -> ServiceError {
     platform_error(context, io::Error::last_os_error())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::elevation::current_process_sid;
+    use super::{exchange_blocking, finish_request, PipeServer};
+    use crate::{ClientPolicy, Request, Response};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn named_pipe_round_trip_reads_before_impersonation() {
+        let policy = ClientPolicy {
+            owner_sid: current_process_sid().expect("read current process SID"),
+            installed_client_path: std::env::current_exe().expect("resolve test executable"),
+        };
+        let server = PipeServer::new(policy);
+        let server_thread = thread::spawn(move || {
+            let (request, pipe) = server
+                .accept()
+                .expect("accept pipe request")
+                .expect("receive pipe request");
+            assert!(matches!(request, Request::Version { .. }));
+            let mut response = Response::success(None);
+            response.service_version = Some("test".to_string());
+            finish_request(pipe, &response).expect("send pipe response");
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        let response =
+            exchange_blocking(Request::version()).expect("complete named pipe round trip");
+        assert_eq!(response.service_version.as_deref(), Some("test"));
+        server_thread.join().expect("join pipe server");
+    }
 }

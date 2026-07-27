@@ -50,6 +50,7 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
     fs::create_dir_all(&root)
         .map_err(|error| platform_error("create service state directory", error))?;
     apply_private_acl(&root)?;
+    let _ = fs::remove_file(root.join(DIAGNOSTIC_LOG_FILE));
     let policy = ClientPolicy {
         owner_sid: options.owner_sid,
         installed_client_path,
@@ -102,6 +103,7 @@ pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
     let truncate = fs::metadata(&path)
         .map(|metadata| metadata.len() >= MAX_DIAGNOSTIC_LOG_SIZE)
         .unwrap_or(false);
+    let write_bom = truncate || !path.exists();
     let Ok(mut log) = OpenOptions::new()
         .create(true)
         .write(true)
@@ -111,6 +113,9 @@ pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
     else {
         return;
     };
+    if write_bom {
+        let _ = log.write_all(&[0xEF, 0xBB, 0xBF]);
+    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
