@@ -117,12 +117,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
-        run: npm run tauri build -- --target "${{ matrix.rust_target }}"
+        run: |
+          npm run tauri build -- \
+            --target "${{ matrix.rust_target }}" \
+            --bundles "${{ matrix.package_kind }}"
       - name: Собрать артефакт релиза
         shell: bash
         run: |
           python scripts/collect-release-artifact.py \
-            --search-root "src-tauri/target/${{ matrix.rust_target }}/release/bundle" \
+            --search-root "target/${{ matrix.rust_target }}/release/bundle" \
             --output-dir release-output \
             --version "${RELEASE_VERSION#v}" \
             --platform "${{ matrix.platform }}" \

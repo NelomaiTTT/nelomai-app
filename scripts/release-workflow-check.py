@@ -30,6 +30,8 @@ def run() -> None:
         "TAURI_SIGNING_PRIVATE_KEY",
         "NELOMAI_UPDATER_PUBLIC_KEY",
         "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64",
+        '--bundles "${{ matrix.package_kind }}"',
+        'target/${{ matrix.rust_target }}/release/bundle',
         "ubuntu-22.04",
         "windows-2022",
         "macos-13",
@@ -38,6 +40,23 @@ def run() -> None:
     ):
         if token not in workflow:
             raise RuntimeError(f"release workflow misses {token}")
+
+    tauri_config = json.loads(
+        (ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8")
+    )
+    updater_public_key = (
+        tauri_config.get("plugins", {}).get("updater", {}).get("pubkey", "")
+    )
+    if not isinstance(updater_public_key, str) or not updater_public_key.strip():
+        raise RuntimeError("Tauri updater public key is missing")
+    try:
+        decoded_updater_key = base64.b64decode(
+            updater_public_key, validate=True
+        )
+    except ValueError as exc:
+        raise RuntimeError("Tauri updater public key is not valid base64") from exc
+    if b"minisign public key" not in decoded_updater_key:
+        raise RuntimeError("Tauri updater public key has an invalid format")
 
     private_key = Ed25519PrivateKey.generate()
     seed = private_key.private_bytes_raw()
