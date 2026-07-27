@@ -192,6 +192,7 @@
         phase = "ready";
       } else {
         phase = "connecting";
+        await syncBindingPreferences();
         connection = await nativeClient.start({
           layer: selectedLayer,
           ticConnectionMode,
@@ -206,6 +207,39 @@
       error = commandMessage(reason);
     } finally {
       busy = false;
+    }
+  }
+
+  async function syncBindingPreferences() {
+    const binding = bootstrap?.binding;
+    if (!binding) return;
+    const desiredMode =
+      selectedLayer === "stray" ? "dynamic" : ticConnectionMode;
+    const desiredRoute =
+      selectedLayer === "stray" ? "standalone" : routeMode;
+    if (
+      binding.preferred_layer === selectedLayer &&
+      binding.tic_connection_mode === desiredMode &&
+      binding.route_mode === desiredRoute
+    ) {
+      return;
+    }
+    const response = await nativeClient.bindPeer({
+      peer_id: binding.peer_id,
+      preferred_layer: selectedLayer,
+      tic_connection_mode: desiredMode,
+      route_mode: desiredRoute,
+    });
+    if (response.binding && bootstrap) {
+      bootstrap = {
+        ...bootstrap,
+        binding: response.binding,
+        defaults: {
+          layer: selectedLayer,
+          tic_connection_mode: desiredMode,
+          route_mode: desiredRoute,
+        },
+      };
     }
   }
 

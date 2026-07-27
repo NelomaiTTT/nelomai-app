@@ -220,6 +220,7 @@ impl CoreApi for MockApi {
         if self.pin_fails.load(Ordering::SeqCst) {
             return Err(CoreApiError::Rejected {
                 code: "connection_not_pinnable".to_string(),
+                message: "Подключение нельзя закрепить.".to_string(),
             });
         }
         Ok(ConnectionOperationResponse {

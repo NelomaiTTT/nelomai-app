@@ -286,8 +286,8 @@ pub enum CoreApiError {
     AccessExpired,
     #[error("временная ошибка сети")]
     Retryable,
-    #[error("панель отклонила запрос: {code}")]
-    Rejected { code: String },
+    #[error("панель отклонила запрос: {code}: {message}")]
+    Rejected { code: String, message: String },
 }
 
 impl From<ClientApiError> for CoreApiError {
@@ -297,13 +297,14 @@ impl From<ClientApiError> for CoreApiError {
             ClientApiError::Api { status, .. } if status.as_u16() == 401 => Self::Unauthorized,
             ClientApiError::Api { code, .. } if code == "access_expired" => Self::AccessExpired,
             ClientApiError::Api { status, .. } if status.is_server_error() => Self::Retryable,
-            ClientApiError::Api { code, .. } => Self::Rejected { code },
+            ClientApiError::Api { code, message, .. } => Self::Rejected { code, message },
             ClientApiError::InvalidErrorResponse { status } if status.is_server_error() => {
                 Self::Retryable
             }
             ClientApiError::InvalidBaseUrl(_) | ClientApiError::InvalidErrorResponse { .. } => {
                 Self::Rejected {
                     code: "invalid_client_api_response".to_string(),
+                    message: "Панель вернула некорректный ответ.".to_string(),
                 }
             }
         }
@@ -1148,5 +1149,22 @@ mod tests {
             message: "expired".to_string(),
         };
         assert_eq!(CoreApiError::from(error), CoreApiError::AccessExpired);
+    }
+
+    #[test]
+    fn rejected_request_keeps_the_panel_message() {
+        let error = ClientApiError::Api {
+            status: reqwest::StatusCode::CONFLICT,
+            request_id: "req".to_string(),
+            code: "connection_active".to_string(),
+            message: "Сначала остановите текущее подключение.".to_string(),
+        };
+        assert_eq!(
+            CoreApiError::from(error),
+            CoreApiError::Rejected {
+                code: "connection_active".to_string(),
+                message: "Сначала остановите текущее подключение.".to_string(),
+            },
+        );
     }
 }

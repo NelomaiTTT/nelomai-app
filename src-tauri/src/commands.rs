@@ -13,8 +13,8 @@ use tauri::State;
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
-    code: &'static str,
-    message: &'static str,
+    code: String,
+    message: String,
 }
 
 impl From<ApplicationError> for CommandError {
@@ -34,8 +34,11 @@ impl From<ApplicationError> for CommandError {
 }
 
 impl CommandError {
-    fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
     }
 
     fn from_api(error: CoreApiError) -> Self {
@@ -45,9 +48,7 @@ impl CommandError {
             CoreApiError::Retryable => {
                 Self::new("temporarily_unavailable", "Не удалось связаться с панелью")
             }
-            CoreApiError::Rejected { .. } => {
-                Self::new("request_rejected", "Панель не приняла запрос")
-            }
+            CoreApiError::Rejected { code, message } => Self::new(code, message),
         }
     }
 
