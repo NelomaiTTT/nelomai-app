@@ -91,6 +91,32 @@ def run() -> None:
             ],
             check=True,
         )
+        windows_updater = bundle / "Nelomai_1.2.3_x64-setup.exe"
+        windows_updater_payload = b"signed-windows-updater" * 131_072
+        windows_updater.write_bytes(windows_updater_payload)
+        (bundle / "Nelomai_1.2.3_x64-setup.exe.sig").write_text(
+            "tauri-windows-signature",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "collect-release-artifact.py"),
+                "--search-root",
+                str(bundle),
+                "--output-dir",
+                str(collected),
+                "--version",
+                "1.2.3",
+                "--platform",
+                "windows",
+                "--architecture",
+                "x86_64",
+                "--package-kind",
+                "nsis",
+            ],
+            check=True,
+        )
         published = root / "published"
         environment = {
             **os.environ,
@@ -122,9 +148,13 @@ def run() -> None:
         )
         private_key.public_key().verify(signature, manifest_bytes)
         manifest = json.loads(manifest_bytes)
-        if manifest["version"] != "1.2.3" or len(manifest["artifacts"]) != 1:
+        if manifest["version"] != "1.2.3" or len(manifest["artifacts"]) != 2:
             raise RuntimeError("release manifest content is invalid")
-        artifact = manifest["artifacts"][0]
+        artifacts = {
+            artifact["package_kind"]: artifact
+            for artifact in manifest["artifacts"]
+        }
+        artifact = artifacts["appimage"]
         if artifact["package_kind"] != "appimage":
             raise RuntimeError("release artifact type is invalid")
         published_artifact = published / artifact["asset_name"]
@@ -134,6 +164,16 @@ def run() -> None:
             raise RuntimeError("release artifact size is invalid")
         if artifact["sha256"] != hashlib.sha256(updater_payload).hexdigest():
             raise RuntimeError("release artifact hash is invalid")
+        windows_artifact = artifacts["nsis"]
+        published_windows_artifact = published / windows_artifact["asset_name"]
+        if not published_windows_artifact.is_file():
+            raise RuntimeError("published Windows updater artifact is missing")
+        if windows_artifact["size_bytes"] != len(windows_updater_payload):
+            raise RuntimeError("Windows release artifact size is invalid")
+        if windows_artifact["sha256"] != hashlib.sha256(
+            windows_updater_payload
+        ).hexdigest():
+            raise RuntimeError("Windows release artifact hash is invalid")
     print("OK: release workflow check passed")
 
 

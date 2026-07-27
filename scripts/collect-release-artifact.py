@@ -10,7 +10,7 @@ import shutil
 SIGNATURE_SUFFIXES = {
     "app": ".app.tar.gz.sig",
     "appimage": ".AppImage.tar.gz.sig",
-    "nsis": ".nsis.zip.sig",
+    "nsis": ".exe.sig",
 }
 
 
@@ -44,7 +44,7 @@ def main() -> None:
             {
                 "app": ".app.tar.gz",
                 "appimage": ".appimage.tar.gz",
-                "nsis": ".nsis.zip",
+                "nsis": ".exe",
             }[args.package_kind]
         ) :
     ]
