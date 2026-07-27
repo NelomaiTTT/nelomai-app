@@ -1,6 +1,6 @@
 [package]
 name = "nelomai-app"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native Nelomai client"
 authors = ["Nelomai"]
 edition = "2021"
@@ -33,7 +33,7 @@ nelomai-contracts = { path = "../crates/contracts" }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["rt", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 nelomai-windows-service = { path = "../crates/windows-service" }

@@ -90,7 +90,10 @@ impl CommandError {
                 "tunnel_backend_unavailable",
                 "Система подключения недоступна на этом устройстве",
             ),
-            "service_unavailable" | "service_outdated" => Self::new(
+            "service_unavailable"
+            | "service_outdated"
+            | "unauthorized_client"
+            | "truncated_frame" => Self::new(
                 "tunnel_service_unavailable",
                 "Компоненты подключения не установлены или устарели. Переустановите приложение",
             ),

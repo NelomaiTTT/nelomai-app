@@ -1,8 +1,10 @@
 mod backend;
+mod elevation;
 mod install;
 mod ipc;
 mod service;
 
+pub use elevation::{repair_installation, RepairError};
 pub use install::{install, uninstall, InstallOptions};
 pub use ipc::NamedPipeTransport;
 pub use service::{run_manager_service, run_wireguard_service};

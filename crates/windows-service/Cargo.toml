@@ -1,6 +1,6 @@
 [package]
 name = "nelomai-windows-service"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
@@ -29,8 +29,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_RemoteDesktop",
+    "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [[bin]]
