@@ -24,26 +24,18 @@ Windows build or release process and `wireguard.dll` from the official
 WireGuardNT download source. It records the source version and SHA-256 of both
 files. Neither DLL is downloaded at tunnel start.
 
-## One-time installation
+## Installation
 
-The installer invokes:
+The NSIS release is a per-machine installer. It places the application,
+service, and official WireGuard libraries in the same protected directory,
+records the signed-in desktop user's SID, and starts the automatic
+`NelomaiTunnelManager` service. Windows shows a UAC prompt during installation
+and updates. Runtime start, stop, and status operations do not require
+elevation.
 
-```powershell
-.\scripts\windows\install-tunnel-service.ps1 `
-  -ServiceExecutable "C:\Program Files\Nelomai\nelomai-windows-service.exe" `
-  -ClientExecutable "C:\Program Files\Nelomai\Nelomai.exe"
-```
-
-Windows shows one UAC prompt. The script records the current user's SID before
-elevation and installs the automatic `NelomaiTunnelManager` service. Runtime
-start, stop, and status operations do not require elevation.
-
-Uninstall with:
-
-```powershell
-.\scripts\windows\uninstall-tunnel-service.ps1 `
-  -ServiceExecutable "C:\Program Files\Nelomai\nelomai-windows-service.exe"
-```
+The uninstaller stops and removes both Nelomai services and their private
+runtime state. Manual service scripts remain available for development and
+recovery, but users do not need them for a release installation.
 
 ## Security boundary
 

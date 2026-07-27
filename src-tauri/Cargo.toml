@@ -30,13 +30,16 @@ nelomai-client-storage = { path = "../crates/client-storage" }
 nelomai-client-tunnel = { path = "../crates/client-tunnel" }
 nelomai-client-updater = { path = "../crates/client-updater" }
 nelomai-contracts = { path = "../crates/contracts" }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["time"] }
 
 [target.'cfg(windows)'.dependencies]
 nelomai-windows-service = { path = "../crates/windows-service" }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
 nelomai-unix-service = { path = "../crates/unix-service" }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]

@@ -117,6 +117,28 @@ async fn controller_maps_service_response_to_shared_tunnel_contract() {
 }
 
 #[tokio::test]
+async fn controller_reads_installed_service_version() {
+    let mut response = Response::success(None);
+    response.service_version = Some("1.2.3".to_string());
+    let controller = WindowsTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    assert_eq!(
+        controller
+            .service_version()
+            .await
+            .expect("read service version"),
+        "1.2.3"
+    );
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["version"]
+    );
+}
+
+#[tokio::test]
 async fn controller_rejects_failed_service_response() {
     let transport = RecordingTransport {
         requests: Mutex::new(Vec::new()),

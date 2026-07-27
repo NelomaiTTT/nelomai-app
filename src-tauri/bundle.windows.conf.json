@@ -1,0 +1,18 @@
+{
+  "bundle": {
+    "resources": {
+      "../target/x86_64-pc-windows-msvc/release/nelomai-windows-service.exe": "nelomai-windows-service.exe",
+      "windows/runtime/tunnel.dll": "tunnel.dll",
+      "windows/runtime/wireguard.dll": "wireguard.dll",
+      "windows/runtime/WIREGUARD-WINDOWS-LICENSE.txt": "licenses/WIREGUARD-WINDOWS-LICENSE.txt",
+      "windows/runtime/WIREGUARD-NT-LICENSE.txt": "licenses/WIREGUARD-NT-LICENSE.txt",
+      "windows/runtime/windows-runtime.json": "licenses/windows-runtime.json"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "./windows/hooks.nsh"
+      }
+    }
+  }
+}

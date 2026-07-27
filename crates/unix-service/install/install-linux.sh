@@ -7,13 +7,19 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 2 ]; then
-  echo "Использование: install-linux.sh <пользователь> <путь-к-helper>" >&2
+  echo "Использование: install-linux.sh <uid-пользователя> <путь-к-helper>" >&2
   exit 1
 fi
 
-OWNER_NAME=$1
+OWNER_UID=$1
 SOURCE_BINARY=$2
-OWNER_UID=$(id -u "$OWNER_NAME")
+
+case "$OWNER_UID" in
+  ''|*[!0-9]*)
+    echo "UID пользователя должен быть числом." >&2
+    exit 1
+    ;;
+esac
 
 if [ "$OWNER_UID" -eq 0 ]; then
   echo "Helper нельзя привязать к root." >&2
@@ -54,4 +60,5 @@ EOF
 
 chmod 0644 "$UNIT_PATH"
 systemctl daemon-reload
-systemctl enable --now nelomai-tunnel.service
+systemctl enable nelomai-tunnel.service
+systemctl restart nelomai-tunnel.service

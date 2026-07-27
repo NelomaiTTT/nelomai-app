@@ -5,7 +5,7 @@ use nelomai_client_core::{
     ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogger, CoreState,
 };
 use nelomai_client_storage::{SecretStore, StoredAuth};
-use nelomai_client_tunnel::TunnelController;
+use nelomai_client_tunnel::{TunnelController, TunnelError};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBindingResponse, PeerOptions, Platform,
     ProbeResult, ProbeResults, ServerCandidatesResponse, TicConnectionMode,
@@ -194,7 +194,10 @@ where
             })
             .await?;
         let _probe_guard = self.probe_gate.lock().await;
-        self.tunnel.stop().await.map_err(CoreError::from)?;
+        if let Err(TunnelError::Backend(code)) = self.tunnel.stop().await {
+            self.core
+                .record_tunnel_unavailable("tunnel.stop_before_login.unavailable", code);
+        }
         self.clear_probe_cache()?;
         self.store
             .save(&StoredAuth {

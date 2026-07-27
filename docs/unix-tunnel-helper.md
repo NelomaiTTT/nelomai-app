@@ -20,12 +20,17 @@ Linux uses the kernel WireGuard implementation and netlink. The runtime path
 does not invoke the `wg` command. The helper owns interface `nlm-wg0`, routing,
 fwmark rules, and resolver changes.
 
-Build and install for the desktop user:
+The AppImage contains the matching helper. On the first connection after an
+install or update, the application opens the system authorization dialog and
+installs or updates the root-owned service through `pkexec`. Runtime
+connections do not require elevation.
+
+Manual development installation:
 
 ```sh
 cargo build --release -p nelomai-unix-service
 sudo crates/unix-service/install/install-linux.sh \
-  "$USER" \
+  "$(id -u)" \
   target/release/nelomai-unix-service
 ```
 
@@ -34,14 +39,18 @@ needed after the one-time installation.
 
 ## macOS
 
-macOS uses the official `wireguard-go` userspace implementation. The installer
-copies both binaries to a root-owned directory and registers launch daemon
+macOS uses the official `wireguard-go` userspace implementation. On the first
+connection after an install or update, the application opens the native
+administrator authorization dialog. Its bundled installer copies both
+binaries to a root-owned directory and registers launch daemon
 `ru.nelomai.tunnel`.
+
+Manual development installation:
 
 ```sh
 cargo build --release -p nelomai-unix-service
 sudo crates/unix-service/install/install-macos.sh \
-  "$USER" \
+  "$(id -u)" \
   target/release/nelomai-unix-service \
   "$(command -v wireguard-go)"
 ```

@@ -45,6 +45,8 @@ def main() -> None:
     update_json(ROOT / "package.json", version)
     update_json(ROOT / "src-tauri" / "tauri.conf.json", version)
     update_cargo(ROOT / "src-tauri" / "Cargo.toml", version)
+    update_cargo(ROOT / "crates" / "unix-service" / "Cargo.toml", version)
+    update_cargo(ROOT / "crates" / "windows-service" / "Cargo.toml", version)
 
 
 if __name__ == "__main__":

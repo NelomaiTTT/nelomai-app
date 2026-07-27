@@ -69,9 +69,13 @@ impl CommandError {
                 "Защищённое хранилище временно недоступно",
             ),
             CoreError::Api(error) => Self::from_api(error),
-            CoreError::Tunnel => {
-                Self::new("tunnel_failed", "Не удалось изменить состояние подключения")
-            }
+            CoreError::Tunnel(code) => match code.as_str() {
+                "service_unavailable" => Self::new(
+                    "tunnel_service_unavailable",
+                    "Служба подключения не установлена или не запущена. Переустановите приложение",
+                ),
+                _ => Self::new("tunnel_failed", "Не удалось изменить состояние подключения"),
+            },
         }
     }
 
@@ -85,6 +89,21 @@ impl CommandError {
             "tunnel_backend_unavailable" => Self::new(
                 "tunnel_backend_unavailable",
                 "Система подключения недоступна на этом устройстве",
+            ),
+            "service_unavailable" | "service_outdated" => Self::new(
+                "tunnel_service_unavailable",
+                "Компоненты подключения не установлены или устарели. Переустановите приложение",
+            ),
+            "helper_install_cancelled" => {
+                Self::new("helper_install_cancelled", "Настройка подключения отменена")
+            }
+            "helper_authorization_unavailable" => Self::new(
+                "helper_authorization_unavailable",
+                "Не удалось открыть системный запрос прав администратора",
+            ),
+            "helper_resources_unavailable" => Self::new(
+                "helper_resources_unavailable",
+                "В установленном приложении отсутствуют компоненты подключения",
             ),
             _ => Self::new(
                 "tunnel_failed",
@@ -253,7 +272,9 @@ pub async fn app_refresh_probes(
 
 #[tauri::command]
 pub async fn app_prepare_tunnel(app: AppHandle) -> Result<(), CommandError> {
-    crate::platform::prepare_tunnel(app).map_err(CommandError::from_tunnel)
+    crate::platform::prepare_tunnel(app)
+        .await
+        .map_err(CommandError::from_tunnel)
 }
 
 #[tauri::command]

@@ -4,6 +4,8 @@ target/
 /build
 /.svelte-kit
 /package
+/src-tauri/platform-runtime/
+/src-tauri/windows/runtime/
 .env
 .env.*
 !.env.example

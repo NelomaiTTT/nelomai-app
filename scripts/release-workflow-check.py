@@ -20,6 +20,9 @@ def run() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
+    windows_workflow = (
+        ROOT / ".github" / "workflows" / "windows-build.yml"
+    ).read_text(encoding="utf-8")
     for token in (
         "verify:",
         "needs: verify",
@@ -30,6 +33,10 @@ def run() -> None:
         "TAURI_SIGNING_PRIVATE_KEY",
         "NELOMAI_UPDATER_PUBLIC_KEY",
         "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64",
+        "prepare-runtime.ps1",
+        "prepare-runtime.sh",
+        "nelomai-windows-service",
+        "nelomai-unix-service",
         '--bundles "${{ matrix.package_kind }}"',
         'target/${{ matrix.rust_target }}/release/bundle',
         "ubuntu-22.04",
@@ -40,6 +47,24 @@ def run() -> None:
     ):
         if token not in workflow:
             raise RuntimeError(f"release workflow misses {token}")
+
+    for token in (
+        "workflow_dispatch:",
+        "windows-2022",
+        "cargo test --target x86_64-pc-windows-msvc",
+        "prepare-runtime.ps1",
+        "bundle.windows.conf.json",
+        "actions/upload-artifact@v4",
+    ):
+        if token not in windows_workflow:
+            raise RuntimeError(f"Windows build workflow misses {token}")
+
+    version_script = (ROOT / "scripts" / "set-release-version.py").read_text(
+        encoding="utf-8"
+    )
+    for helper in ("unix-service", "windows-service"):
+        if f'"{helper}" / "Cargo.toml"' not in version_script:
+            raise RuntimeError(f"release version misses {helper}")
 
     tauri_config = json.loads(
         (ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8")
@@ -57,6 +82,44 @@ def run() -> None:
         raise RuntimeError("Tauri updater public key is not valid base64") from exc
     if b"minisign public key" not in decoded_updater_key:
         raise RuntimeError("Tauri updater public key has an invalid format")
+
+    windows_config = json.loads(
+        (ROOT / "src-tauri" / "bundle.windows.conf.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    windows_bundle = windows_config.get("bundle", {})
+    windows_resources = windows_bundle.get("resources", {})
+    for resource in (
+        "nelomai-windows-service.exe",
+        "tunnel.dll",
+        "wireguard.dll",
+    ):
+        if resource not in windows_resources.values():
+            raise RuntimeError(f"Windows bundle misses {resource}")
+    nsis = windows_bundle.get("windows", {}).get("nsis", {})
+    if nsis.get("installMode") != "perMachine":
+        raise RuntimeError("Windows tunnel service requires a per-machine installer")
+    if not nsis.get("installerHooks"):
+        raise RuntimeError("Windows service installer hooks are missing")
+
+    macos_resources = json.loads(
+        (ROOT / "src-tauri" / "bundle.macos.conf.json").read_text(
+            encoding="utf-8"
+        )
+    ).get("bundle", {}).get("resources", {})
+    for resource in ("nelomai-unix-service", "wireguard-go", "install-macos.sh"):
+        if resource not in macos_resources.values():
+            raise RuntimeError(f"macOS bundle misses {resource}")
+
+    linux_resources = json.loads(
+        (ROOT / "src-tauri" / "bundle.linux.conf.json").read_text(
+            encoding="utf-8"
+        )
+    ).get("bundle", {}).get("resources", {})
+    for resource in ("nelomai-unix-service", "install-linux.sh"):
+        if resource not in linux_resources.values():
+            raise RuntimeError(f"Linux bundle misses {resource}")
 
     private_key = Ed25519PrivateKey.generate()
     seed = private_key.private_bytes_raw()

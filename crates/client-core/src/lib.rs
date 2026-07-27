@@ -413,13 +413,14 @@ pub enum CoreError {
     Storage,
     #[error(transparent)]
     Api(CoreApiError),
-    #[error("не удалось изменить состояние туннеля")]
-    Tunnel,
+    #[error("не удалось изменить состояние туннеля: {0}")]
+    Tunnel(String),
 }
 
 impl From<TunnelError> for CoreError {
-    fn from(_error: TunnelError) -> Self {
-        Self::Tunnel
+    fn from(error: TunnelError) -> Self {
+        let TunnelError::Backend(code) = error;
+        Self::Tunnel(code)
     }
 }
 
@@ -471,6 +472,15 @@ where
 
     pub async fn state(&self) -> CoreState {
         self.state.lock().await.clone()
+    }
+
+    pub fn record_tunnel_unavailable(&self, kind: &'static str, code: String) {
+        self.logger.record(CoreLogEvent {
+            kind,
+            operation_id: None,
+            request_id: None,
+            code: Some(code),
+        });
     }
 
     pub async fn sign_out(&self) -> Result<(), CoreError> {
@@ -550,7 +560,18 @@ where
         self.store
             .save(&current_stored)
             .map_err(|_| CoreError::Storage)?;
-        let tunnel_status = self.tunnel.status().await?;
+        let tunnel_status = match self.tunnel.status().await {
+            Ok(status) => status,
+            Err(TunnelError::Backend(code)) => {
+                self.logger.record(CoreLogEvent {
+                    kind: "tunnel.status.unavailable",
+                    operation_id: None,
+                    request_id: Some(response.request_id.clone()),
+                    code: Some(code),
+                });
+                TunnelStatus::Stopped
+            }
+        };
         let phase = recover_phase(
             self.state.lock().await.phase,
             RecoveryFacts {

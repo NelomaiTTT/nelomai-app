@@ -174,6 +174,23 @@ impl TunnelController for StoppedTunnel {
     }
 }
 
+struct UnavailableTunnel;
+
+#[async_trait]
+impl TunnelController for UnavailableTunnel {
+    async fn start(&self, _configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+        Err(TunnelError::Backend("service_unavailable".to_string()))
+    }
+
+    async fn stop(&self) -> Result<(), TunnelError> {
+        Err(TunnelError::Backend("service_unavailable".to_string()))
+    }
+
+    async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        Err(TunnelError::Backend("service_unavailable".to_string()))
+    }
+}
+
 #[derive(Default)]
 struct TrackingTunnel {
     stop_calls: AtomicUsize,
@@ -245,6 +262,51 @@ async fn login_preserves_install_identity_but_drops_previous_account_state() {
             update_required: false,
             observed_at_unix: 1_800_000_000,
         })
+    );
+}
+
+#[tokio::test]
+async fn unavailable_tunnel_service_does_not_block_login() {
+    let api = Arc::new(FakeApi {
+        login_request: Mutex::new(None),
+        bind_request: Mutex::new(None),
+        bootstrap: bootstrap(),
+        logout_fails: false,
+        unbind_fails: false,
+    });
+    let store = Arc::new(MemoryStore::default());
+    let application = ClientApplication::new(
+        api,
+        store.clone(),
+        Arc::new(UnavailableTunnel),
+        Arc::new(NoopLogger),
+    );
+
+    let response = application
+        .login(
+            LoginParameters {
+                login: "windows-user".to_string(),
+                password: "password-secret".to_string(),
+                device_name: "Windows PC".to_string(),
+                platform: Platform::Windows,
+                platform_version: Some("11".to_string()),
+                architecture: "x86_64".to_string(),
+                app_version: "0.1.0".to_string(),
+            },
+            1_800_000_000,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.request_id, "bootstrap-request");
+    assert_eq!(
+        store
+            .value
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|stored| stored.access_token.as_deref()),
+        Some("new-access")
     );
 }
 

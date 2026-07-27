@@ -29,7 +29,7 @@ pub fn tunnel_controller(_app: tauri::AppHandle<tauri::Wry>) -> PlatformTunnelCo
 }
 
 #[cfg(target_os = "android")]
-pub fn prepare_tunnel(
+pub async fn prepare_tunnel(
     app: tauri::AppHandle<tauri::Wry>,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
     use tauri_plugin_tunnel_android::TunnelAndroidExt;
@@ -63,8 +63,16 @@ pub fn prepare_tunnel(
 }
 
 #[cfg(not(target_os = "android"))]
-pub fn prepare_tunnel(
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub async fn prepare_tunnel(
+    app: tauri::AppHandle<tauri::Wry>,
+) -> Result<(), nelomai_client_tunnel::TunnelError> {
+    unix::prepare_tunnel(app).await
+}
+
+#[cfg(windows)]
+pub async fn prepare_tunnel(
     _app: tauri::AppHandle<tauri::Wry>,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    Ok(())
+    windows::prepare_tunnel().await
 }

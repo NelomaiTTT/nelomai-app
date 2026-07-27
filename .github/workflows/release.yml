@@ -102,6 +102,10 @@ jobs:
         with:
           toolchain: 1.88.0
           targets: ${{ matrix.rust_target }}
+      - uses: actions/setup-go@v5
+        if: matrix.platform == 'macos'
+        with:
+          go-version: '1.24.x'
       - name: Установить зависимости Linux
         if: matrix.platform == 'linux'
         run: |
@@ -111,6 +115,18 @@ jobs:
       - name: Установить версию релиза
         shell: bash
         run: python scripts/set-release-version.py "${RELEASE_VERSION#v}"
+      - name: Подготовить системную часть Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cargo build --release --target "${{ matrix.rust_target }}" -p nelomai-windows-service
+          ./scripts/windows/prepare-runtime.ps1
+      - name: Подготовить системную часть Unix
+        if: matrix.platform == 'linux' || matrix.platform == 'macos'
+        shell: bash
+        run: |
+          cargo build --release --target "${{ matrix.rust_target }}" -p nelomai-unix-service
+          scripts/unix/prepare-runtime.sh "${{ matrix.platform }}" "${{ matrix.rust_target }}"
       - name: Собрать подписанный пакет
         shell: bash
         env:
@@ -120,6 +136,7 @@ jobs:
         run: |
           npm run tauri build -- \
             --target "${{ matrix.rust_target }}" \
+            --config "src-tauri/bundle.${{ matrix.platform }}.conf.json" \
             --bundles "${{ matrix.package_kind }}"
       - name: Собрать артефакт релиза
         shell: bash

@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": {
+      "platform-runtime/nelomai-unix-service": "nelomai-unix-service",
+      "../crates/unix-service/install/install-linux.sh": "install-linux.sh"
+    }
+  }
+}

@@ -7,14 +7,20 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 if [ "$#" -ne 3 ]; then
-  echo "Использование: install-macos.sh <пользователь> <путь-к-helper> <путь-к-wireguard-go>" >&2
+  echo "Использование: install-macos.sh <uid-пользователя> <путь-к-helper> <путь-к-wireguard-go>" >&2
   exit 1
 fi
 
-OWNER_NAME=$1
+OWNER_UID=$1
 SOURCE_HELPER=$2
 SOURCE_WIREGUARD_GO=$3
-OWNER_UID=$(id -u "$OWNER_NAME")
+
+case "$OWNER_UID" in
+  ''|*[!0-9]*)
+    echo "UID пользователя должен быть числом." >&2
+    exit 1
+    ;;
+esac
 
 if [ "$OWNER_UID" -eq 0 ]; then
   echo "Helper нельзя привязать к root." >&2

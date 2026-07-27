@@ -361,6 +361,20 @@ impl<T> UnixTunnelController<T> {
     }
 }
 
+impl<T: ServiceTransport> UnixTunnelController<T> {
+    pub async fn service_version(&self) -> Result<String, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::version())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        response
+            .service_version
+            .ok_or_else(|| TunnelError::Backend("missing_service_version".to_string()))
+    }
+}
+
 #[async_trait]
 impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
     async fn start(&self, configuration: TunnelConfiguration) -> Result<(), TunnelError> {

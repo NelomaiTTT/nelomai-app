@@ -2714,6 +2714,7 @@ name = "nelomai-app"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "libc",
  "nelomai-client-api",
  "nelomai-client-application",
  "nelomai-client-core",
@@ -2723,6 +2724,7 @@ dependencies = [
  "nelomai-contracts",
  "nelomai-unix-service",
  "nelomai-windows-service",
+ "semver",
  "serde",
  "serde_json",
  "tauri",
@@ -2730,6 +2732,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-tunnel-android",
  "tauri-plugin-updater",
+ "tokio",
 ]
 
 [[package]]

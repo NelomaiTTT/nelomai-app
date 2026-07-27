@@ -1,0 +1,54 @@
+name: Windows build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x86_64
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+      - run: npm ci
+      - name: Проверить интерфейс приложения
+        run: npm test
+      - name: Проверить Windows-службу
+        run: cargo test --target x86_64-pc-windows-msvc -p nelomai-windows-service
+      - name: Подготовить системную часть
+        shell: pwsh
+        run: |
+          cargo build --release --target x86_64-pc-windows-msvc -p nelomai-windows-service
+          ./scripts/windows/prepare-runtime.ps1
+      - name: Собрать NSIS
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
+        run: |
+          npm run tauri build -- \
+            --target x86_64-pc-windows-msvc \
+            --config src-tauri/bundle.windows.conf.json \
+            --bundles nsis
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nelomai-windows-x86_64
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig
+          if-no-files-found: error
+          retention-days: 3

@@ -195,6 +195,25 @@ async fn controller_maps_helper_responses_to_shared_tunnel_contract() {
 }
 
 #[tokio::test]
+async fn controller_reads_the_installed_helper_version() {
+    let mut response = Response::success(None);
+    response.service_version = Some("1.2.3".to_string());
+    let controller = UnixTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    assert_eq!(
+        controller.service_version().await.expect("read version"),
+        "1.2.3"
+    );
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["version"]
+    );
+}
+
+#[tokio::test]
 async fn controller_propagates_stable_helper_error_codes() {
     let controller = UnixTunnelController::new(RecordingTransport {
         requests: Mutex::new(Vec::new()),
