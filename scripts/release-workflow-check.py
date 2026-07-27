@@ -34,7 +34,7 @@ def run() -> None:
         'target/${{ matrix.rust_target }}/release/bundle',
         "ubuntu-22.04",
         "windows-2022",
-        "macos-13",
+        "macos-15-intel",
         "macos-14",
         "gh release create",
     ):
