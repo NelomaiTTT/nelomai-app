@@ -64,10 +64,10 @@ def run() -> None:
         root = Path(temporary)
         bundle = root / "bundle"
         bundle.mkdir()
-        updater = bundle / "Nelomai.AppImage.tar.gz"
+        updater = bundle / "Nelomai.AppImage"
         updater_payload = b"signed-updater-artifact" * 131_072
         updater.write_bytes(updater_payload)
-        (bundle / "Nelomai.AppImage.tar.gz.sig").write_text(
+        (bundle / "Nelomai.AppImage.sig").write_text(
             "tauri-signature",
             encoding="utf-8",
         )

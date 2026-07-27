@@ -9,7 +9,7 @@ import shutil
 
 SIGNATURE_SUFFIXES = {
     "app": ".app.tar.gz.sig",
-    "appimage": ".AppImage.tar.gz.sig",
+    "appimage": ".AppImage.sig",
     "nsis": ".exe.sig",
 }
 
@@ -43,7 +43,7 @@ def main() -> None:
         source_artifact.name.lower().find(
             {
                 "app": ".app.tar.gz",
-                "appimage": ".appimage.tar.gz",
+                "appimage": ".appimage",
                 "nsis": ".exe",
             }[args.package_kind]
         ) :
