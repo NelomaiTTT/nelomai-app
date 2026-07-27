@@ -64,6 +64,15 @@ describe("native client", () => {
     });
   });
 
+  it("routes VPN preparation through the native layer", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createNativeClient(invoke);
+
+    await client.prepareTunnel();
+
+    expect(invoke).toHaveBeenCalledWith("app_prepare_tunnel");
+  });
+
   it("routes pin, unpin, and peer replacement through native commands", async () => {
     const invoke = vi.fn().mockResolvedValue({});
     const client = createNativeClient(invoke);

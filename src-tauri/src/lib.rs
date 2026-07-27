@@ -57,6 +57,7 @@ pub fn run() {
             commands::app_bind_peer,
             commands::app_unbind_peer,
             commands::app_refresh_probes,
+            commands::app_prepare_tunnel,
             commands::app_start,
             commands::app_start_saved_stray,
             commands::app_stop,

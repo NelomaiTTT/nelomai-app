@@ -192,6 +192,7 @@
         phase = "ready";
       } else {
         phase = "connecting";
+        await nativeClient.prepareTunnel();
         await syncBindingPreferences();
         connection = await nativeClient.start({
           layer: selectedLayer,

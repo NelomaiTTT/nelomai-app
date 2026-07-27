@@ -2718,6 +2718,7 @@ dependencies = [
  "nelomai-client-application",
  "nelomai-client-core",
  "nelomai-client-storage",
+ "nelomai-client-tunnel",
  "nelomai-client-updater",
  "nelomai-contracts",
  "nelomai-unix-service",

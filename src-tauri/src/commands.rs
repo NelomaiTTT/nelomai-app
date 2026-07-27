@@ -8,7 +8,7 @@ use nelomai_contracts::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::State;
+use tauri::{AppHandle, State};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +72,24 @@ impl CommandError {
             CoreError::Tunnel => {
                 Self::new("tunnel_failed", "Не удалось изменить состояние подключения")
             }
+        }
+    }
+
+    fn from_tunnel(error: nelomai_client_tunnel::TunnelError) -> Self {
+        let nelomai_client_tunnel::TunnelError::Backend(code) = error;
+        match code.as_str() {
+            "vpn_permission_denied" => Self::new(
+                "vpn_permission_denied",
+                "Без разрешения Android подключение невозможно",
+            ),
+            "tunnel_backend_unavailable" => Self::new(
+                "tunnel_backend_unavailable",
+                "Система подключения недоступна на этом устройстве",
+            ),
+            _ => Self::new(
+                "tunnel_failed",
+                "Не удалось запустить подключение на устройстве",
+            ),
         }
     }
 }
@@ -231,6 +249,11 @@ pub async fn app_refresh_probes(
         .refresh_probes(layer, now_unix())
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn app_prepare_tunnel(app: AppHandle) -> Result<(), CommandError> {
+    crate::platform::prepare_tunnel(app).map_err(CommandError::from_tunnel)
 }
 
 #[tauri::command]

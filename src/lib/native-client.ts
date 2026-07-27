@@ -46,6 +46,7 @@ export function createNativeClient(
       invoke("app_unbind_peer") as Promise<SafePeerBindingResponse>,
     refreshProbes: (layer: Layer) =>
       invoke("app_refresh_probes", { layer }) as Promise<ProbeResults>,
+    prepareTunnel: () => invoke("app_prepare_tunnel") as Promise<void>,
     start: (request: StartCommandRequest) =>
       invoke("app_start", { request }) as Promise<Connection>,
     startSavedStray: () =>

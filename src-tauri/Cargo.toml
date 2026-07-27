@@ -27,6 +27,7 @@ nelomai-client-api = { path = "../crates/client-api" }
 nelomai-client-application = { path = "../crates/client-application" }
 nelomai-client-core = { path = "../crates/client-core" }
 nelomai-client-storage = { path = "../crates/client-storage" }
+nelomai-client-tunnel = { path = "../crates/client-tunnel" }
 nelomai-client-updater = { path = "../crates/client-updater" }
 nelomai-contracts = { path = "../crates/contracts" }
 serde = { version = "1", features = ["derive"] }
