@@ -16,10 +16,24 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 VERSION_PATTERN = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
 )
+COPY_CHUNK_BYTES = 1024 * 1024
 
 
 def env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def copy_and_hash(source: Path, destination: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size_bytes = 0
+    with source.open("rb") as source_file, destination.open("xb") as output:
+        while chunk := source_file.read(COPY_CHUNK_BYTES):
+            output.write(chunk)
+            digest.update(chunk)
+            size_bytes += len(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    return size_bytes, digest.hexdigest()
 
 
 def main() -> None:
@@ -34,6 +48,7 @@ def main() -> None:
 
     artifacts = []
     targets: set[tuple[str, str, str]] = set()
+    asset_names: set[str] = set()
     metadata_files = sorted(args.input_dir.rglob("*.artifact.json"))
     if not metadata_files:
         raise SystemExit("release artifact metadata is missing")
@@ -51,14 +66,16 @@ def main() -> None:
         source = metadata_path.parent / str(metadata["asset_name"])
         if not source.is_file():
             raise SystemExit(f"release artifact is missing: {source}")
+        if source.name in asset_names:
+            raise SystemExit(f"duplicate release asset name: {source.name}")
+        asset_names.add(source.name)
         destination = args.output_dir / source.name
-        destination.write_bytes(source.read_bytes())
-        payload = destination.read_bytes()
+        size_bytes, sha256 = copy_and_hash(source, destination)
         artifacts.append(
             {
                 **metadata,
-                "size_bytes": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size_bytes": size_bytes,
+                "sha256": sha256,
             }
         )
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,12 @@ def run() -> None:
         encoding="utf-8"
     )
     for token in (
+        "verify:",
+        "needs: verify",
+        "needs: [verify, build]",
+        "npm test",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo test --workspace",
         "TAURI_SIGNING_PRIVATE_KEY",
         "NELOMAI_UPDATER_PUBLIC_KEY",
         "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64",
@@ -39,7 +46,8 @@ def run() -> None:
         bundle = root / "bundle"
         bundle.mkdir()
         updater = bundle / "Nelomai.AppImage.tar.gz"
-        updater.write_bytes(b"signed-updater-artifact")
+        updater_payload = b"signed-updater-artifact" * 131_072
+        updater.write_bytes(updater_payload)
         (bundle / "Nelomai.AppImage.tar.gz.sig").write_text(
             "tauri-signature",
             encoding="utf-8",
@@ -100,8 +108,13 @@ def run() -> None:
         artifact = manifest["artifacts"][0]
         if artifact["package_kind"] != "appimage":
             raise RuntimeError("release artifact type is invalid")
-        if not (published / artifact["asset_name"]).is_file():
+        published_artifact = published / artifact["asset_name"]
+        if not published_artifact.is_file():
             raise RuntimeError("published updater artifact is missing")
+        if artifact["size_bytes"] != len(updater_payload):
+            raise RuntimeError("release artifact size is invalid")
+        if artifact["sha256"] != hashlib.sha256(updater_payload).hexdigest():
+            raise RuntimeError("release artifact hash is invalid")
     print("OK: release workflow check passed")
 
 
