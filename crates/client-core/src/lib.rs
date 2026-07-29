@@ -301,12 +301,12 @@ impl From<ClientApiError> for CoreApiError {
             ClientApiError::InvalidErrorResponse { status } if status.is_server_error() => {
                 Self::Retryable
             }
-            ClientApiError::InvalidBaseUrl(_) | ClientApiError::InvalidErrorResponse { .. } => {
-                Self::Rejected {
-                    code: "invalid_client_api_response".to_string(),
-                    message: "Панель вернула некорректный ответ.".to_string(),
-                }
-            }
+            ClientApiError::InvalidBaseUrl(_)
+            | ClientApiError::InvalidAppVersion(_)
+            | ClientApiError::InvalidErrorResponse { .. } => Self::Rejected {
+                code: "invalid_client_api_response".to_string(),
+                message: "Панель вернула некорректный ответ.".to_string(),
+            },
         }
     }
 }
@@ -984,7 +984,8 @@ fn reusable_operation_id(
                 && saved.tic_connection_mode == options.tic_connection_mode
                 && saved.route_mode == options.route_mode
                 && match saved.kind {
-                    StoredConnectionKind::Pinned | StoredConnectionKind::Fixed => true,
+                    StoredConnectionKind::Pinned => true,
+                    StoredConnectionKind::Fixed => false,
                     StoredConnectionKind::DynamicWarm => saved
                         .valid_until_unix
                         .is_some_and(|expiry| expiry > now_unix),

@@ -80,6 +80,25 @@ export interface UpdateState {
   release_notes: string | null;
 }
 
+export type UpdatePhase =
+  | "idle"
+  | "available"
+  | "downloading"
+  | "ready_to_restart"
+  | "failed";
+
+export interface UpdateStatus {
+  supported: boolean;
+  automatic: boolean;
+  phase: UpdatePhase;
+  version: string | null;
+  notes: string | null;
+  required: boolean;
+  downloaded: number;
+  total: number | null;
+  errorCode: string | null;
+}
+
 export interface Bootstrap {
   api_version: "1";
   request_id: string;

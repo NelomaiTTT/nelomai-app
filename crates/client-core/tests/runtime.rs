@@ -714,6 +714,32 @@ async fn pinned_and_fixed_configurations_are_kept_without_a_synthetic_expiry() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fixed_connection_uses_a_new_operation_after_stop() {
+    let api = Arc::new(MockApi::new(0));
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let options = ConnectOptions {
+        layer: Layer::Tic,
+        tic_connection_mode: TicConnectionMode::Personal,
+        route_mode: RouteMode::ViaTak,
+        probes: Vec::new(),
+        allow_alternate: false,
+    };
+
+    core.start(options.clone(), 1_700_000_000).await.unwrap();
+    core.stop().await.unwrap();
+    core.start(options, 1_700_000_100).await.unwrap();
+
+    let operation_ids = api.operation_ids.lock().unwrap();
+    assert_eq!(operation_ids.len(), 2);
+    assert_ne!(operation_ids[0], operation_ids[1]);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn pin_and_unpin_move_the_configuration_between_separate_slots() {
     let api = Arc::new(MockApi::new(0));
     let store = Arc::new(MemoryStore::new(auth()));

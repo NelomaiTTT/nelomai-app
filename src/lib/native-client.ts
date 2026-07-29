@@ -11,6 +11,7 @@ import type {
   ProbeResults,
   Layer,
   StartCommandRequest,
+  UpdateStatus,
 } from "./app-model";
 
 type Invoke = (
@@ -29,6 +30,13 @@ export interface SafePeerBindingResponse {
   apiVersion: "1";
   requestId: string;
   binding: PeerBinding | null;
+}
+
+export interface DiagnosticUploadResponse {
+  api_version: "1";
+  request_id: string;
+  report_id: string;
+  received_bytes: number;
 }
 
 export function createNativeClient(
@@ -57,6 +65,16 @@ export function createNativeClient(
       invoke("app_unpin_stray", {
         request: { leaseId },
       }) as Promise<Connection>,
+    sendDiagnostics: () =>
+      invoke("app_send_diagnostics") as Promise<DiagnosticUploadResponse>,
+    updateStatus: () =>
+      invoke("app_update_status") as Promise<UpdateStatus>,
+    setAutomaticUpdates: (enabled: boolean) =>
+      invoke("app_update_set_automatic", { enabled }) as Promise<UpdateStatus>,
+    installUpdate: () =>
+      invoke("app_update_install") as Promise<UpdateStatus>,
+    restartForUpdate: () =>
+      invoke("app_update_restart") as Promise<void>,
     logout: () => invoke("app_logout") as Promise<void>,
   };
 }

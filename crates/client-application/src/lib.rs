@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
-use nelomai_client_api::{ClientApi, LoginRequest, TokenResponse};
+use nelomai_client_api::{
+    ClientApi, DiagnosticUploadRequest, DiagnosticUploadResponse, LoginRequest, TokenResponse,
+};
 use nelomai_client_core::{
     ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogger, CoreState,
 };
@@ -45,6 +47,13 @@ pub trait ApplicationApi: CoreApi {
     ) -> Result<ServerCandidatesResponse, CoreApiError>;
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64>;
     async fn logout(&self, access_token: &str) -> Result<(), CoreApiError>;
+    async fn upload_diagnostics(
+        &self,
+        _access_token: &str,
+        _request: &DiagnosticUploadRequest,
+    ) -> Result<DiagnosticUploadResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
 }
 
 #[async_trait]
@@ -93,6 +102,16 @@ impl ApplicationApi for ClientApi {
         ClientApi::logout(self, access_token)
             .await
             .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    async fn upload_diagnostics(
+        &self,
+        access_token: &str,
+        request: &DiagnosticUploadRequest,
+    ) -> Result<DiagnosticUploadResponse, CoreApiError> {
+        ClientApi::upload_diagnostics(self, access_token, request)
+            .await
             .map_err(Into::into)
     }
 }
@@ -275,6 +294,24 @@ where
         result.map_err(Into::into)
     }
 
+    pub async fn upload_diagnostics(
+        &self,
+        request: &DiagnosticUploadRequest,
+    ) -> Result<DiagnosticUploadResponse, ApplicationError> {
+        let access_token = self.access_token()?;
+        match self.api.upload_diagnostics(&access_token, request).await {
+            Ok(response) => Ok(response),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .upload_diagnostics(&access_token, request)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn state(&self) -> CoreState {
         self.core.state().await
     }
@@ -415,12 +452,16 @@ where
             .map_err(Into::into)
     }
 
-    fn access_token(&self) -> Result<String, ApplicationError> {
+    pub fn current_access_token(&self) -> Result<String, ApplicationError> {
         self.store
             .load()
             .map_err(|_| ApplicationError::Storage)?
             .and_then(|stored| stored.access_token)
             .ok_or(ApplicationError::Core(CoreError::SignedOut))
+    }
+
+    fn access_token(&self) -> Result<String, ApplicationError> {
+        self.current_access_token()
     }
 
     async fn load_server_candidates(

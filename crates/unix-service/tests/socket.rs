@@ -33,6 +33,8 @@ impl ServiceTunnelBackend for MemoryBackend {
 #[tokio::test]
 async fn unix_socket_round_trip_is_owner_only_and_bounded() {
     let directory = tempdir().expect("create temporary directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("protect temporary directory");
     let socket_path = directory.path().join("tunnel.sock");
     let uid = unsafe { libc::geteuid() };
     let listener = bind_listener(&socket_path, uid).expect("bind helper socket");

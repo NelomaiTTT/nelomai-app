@@ -13,6 +13,7 @@
     type Phase,
     type RouteMode,
     type TicConnectionMode,
+    type UpdateStatus,
   } from "$lib/app-model";
   import {
     commandMessage,
@@ -34,6 +35,11 @@
   let connection = $state<Connection | null>(null);
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
+  let diagnosticsBusy = $state(false);
+  let diagnosticsStatus = $state<string | null>(null);
+  let updateStatus = $state<UpdateStatus | null>(null);
+  let updateBusy = $state(false);
+  let updateTimer: number | null = null;
 
   let login = $state("");
   let password = $state("");
@@ -66,12 +72,14 @@
     return () => {
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", handleVisibility);
+      clearUpdateTimer();
     };
   });
 
   async function restore() {
     busy = true;
     error = null;
+    diagnosticsStatus = null;
     try {
       const response = await nativeClient.bootstrap();
       await applyBootstrap(response);
@@ -102,6 +110,7 @@
     selectedLayer = response.defaults.layer;
     ticConnectionMode = response.defaults.tic_connection_mode;
     routeMode = response.defaults.route_mode;
+    void refreshUpdateStatus();
 
     if (response.update.required) {
       phase = "update_required";
@@ -132,6 +141,7 @@
     if (busy) return;
     busy = true;
     error = null;
+    diagnosticsStatus = null;
     phase = "authenticating";
     try {
       const request: LoginRequest = {
@@ -311,6 +321,7 @@
       const results = await nativeClient.refreshProbes(measuredLayer);
       if (results.layer === selectedLayer) {
         availableCandidates = results.probes.length;
+        error = null;
       }
     } catch {
       availableCandidates = 0;
@@ -333,6 +344,9 @@
       peers = [];
       selectedPeerId = "";
       password = "";
+      diagnosticsStatus = null;
+      updateStatus = null;
+      clearUpdateTimer();
       phase = "signed_out";
       view = "sign_in";
     } catch (reason) {
@@ -340,6 +354,99 @@
     } finally {
       busy = false;
     }
+  }
+
+  async function sendDiagnostics() {
+    if (diagnosticsBusy) return;
+    diagnosticsBusy = true;
+    diagnosticsStatus = null;
+    try {
+      const response = await nativeClient.sendDiagnostics();
+      diagnosticsStatus = `Отчёт ${response.report_id.slice(0, 8)} отправлен`;
+    } catch (reason) {
+      diagnosticsStatus = commandMessage(reason);
+    } finally {
+      diagnosticsBusy = false;
+    }
+  }
+
+  async function refreshUpdateStatus() {
+    clearUpdateTimer();
+    try {
+      updateStatus = await nativeClient.updateStatus();
+      if (
+        updateStatus.phase === "downloading" ||
+        (updateStatus.supported &&
+          updateStatus.automatic &&
+          updateStatus.phase === "available")
+      ) {
+        updateTimer = window.setTimeout(refreshUpdateStatus, 500);
+      }
+    } catch {
+      updateStatus = null;
+    }
+  }
+
+  async function installUpdate() {
+    if (updateBusy) return;
+    updateBusy = true;
+    error = null;
+    updateTimer = window.setTimeout(refreshUpdateStatus, 100);
+    try {
+      updateStatus = await nativeClient.installUpdate();
+    } catch (reason) {
+      error = commandMessage(reason);
+      await refreshUpdateStatus();
+    } finally {
+      updateBusy = false;
+    }
+  }
+
+  async function setAutomaticUpdates(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    try {
+      updateStatus = await nativeClient.setAutomaticUpdates(input.checked);
+      if (input.checked) {
+        updateTimer = window.setTimeout(refreshUpdateStatus, 100);
+      }
+    } catch (reason) {
+      input.checked = !input.checked;
+      error = commandMessage(reason);
+    }
+  }
+
+  async function restartForUpdate() {
+    if (updateBusy) return;
+    updateBusy = true;
+    try {
+      await nativeClient.restartForUpdate();
+    } catch (reason) {
+      error = commandMessage(reason);
+      updateBusy = false;
+    }
+  }
+
+  function clearUpdateTimer() {
+    if (updateTimer !== null) {
+      window.clearTimeout(updateTimer);
+      updateTimer = null;
+    }
+  }
+
+  function updateProgress(status: UpdateStatus): string {
+    if (!status.total || status.total <= 0) {
+      return formatBytes(status.downloaded);
+    }
+    const percent = Math.min(
+      100,
+      Math.round((status.downloaded / status.total) * 100),
+    );
+    return `${percent}%`;
+  }
+
+  function formatBytes(value: number): string {
+    if (value < 1024 * 1024) return `${Math.round(value / 1024)} КБ`;
+    return `${(value / (1024 * 1024)).toFixed(1)} МБ`;
   }
 
   function commandCode(reason: unknown): string | null {
@@ -371,12 +478,66 @@
         {phaseLabels[phase]}
       </span>
       {#if view !== "loading" && view !== "sign_in"}
+        <button
+          class="quiet-button"
+          type="button"
+          onclick={sendDiagnostics}
+          disabled={diagnosticsBusy}
+        >
+          {diagnosticsBusy ? "Отправляем…" : "Отправить логи"}
+        </button>
         <button class="quiet-button" type="button" onclick={logout} disabled={busy}>
           Выйти
         </button>
       {/if}
     </div>
   </header>
+  {#if diagnosticsStatus}
+    <p class="diagnostics-status" aria-live="polite">{diagnosticsStatus}</p>
+  {/if}
+  {#if updateStatus && updateStatus.phase !== "idle" && view !== "sign_in"}
+    <section class="update-banner" aria-live="polite">
+      <div>
+        <p class="eyebrow">Обновление</p>
+        {#if updateStatus.phase === "downloading"}
+          <strong>Загружаем Nelomai {updateStatus.version}</strong>
+          <span>{updateProgress(updateStatus)}</span>
+        {:else if updateStatus.phase === "ready_to_restart"}
+          <strong>Nelomai {updateStatus.version} готов к запуску</strong>
+          <span>Перезапустите приложение, чтобы завершить обновление.</span>
+        {:else if updateStatus.phase === "failed"}
+          <strong>Не удалось установить Nelomai {updateStatus.version}</strong>
+          <span>Можно повторить загрузку сейчас.</span>
+        {:else}
+          <strong>Доступна версия {updateStatus.version}</strong>
+          <span>
+            {updateStatus.supported
+              ? updateStatus.notes || "Обновление готово к загрузке."
+              : "Эту версию необходимо установить вручную."}
+          </span>
+        {/if}
+      </div>
+      {#if updateStatus.phase === "ready_to_restart"}
+        <button
+          class="primary-button update-action"
+          type="button"
+          onclick={restartForUpdate}
+          disabled={updateBusy}
+        >
+          Перезапустить
+        </button>
+      {:else if updateStatus.supported && updateStatus.phase !== "downloading"}
+        <button
+          class="secondary-button update-action"
+          type="button"
+          onclick={installUpdate}
+          disabled={updateBusy}
+        >
+          {updateBusy ? "Начинаем…" : "Обновить"}
+        </button>
+      {/if}
+    </section>
+  {/if}
 
   <section class="workspace" aria-live="polite">
     {#if view === "loading"}
@@ -559,6 +720,19 @@
                 : "Личный пир"}
             </strong>
           </div>
+          {#if updateStatus?.supported}
+            <label class="update-preference">
+              <span>
+                <strong>Автоматические обновления</strong>
+                <small>Загружать новые версии в фоне</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={updateStatus.automatic}
+                onchange={setAutomaticUpdates}
+              />
+            </label>
+          {/if}
           {#if pinnedStray || (selectedLayer === "stray" && phase === "connected")}
             <button
               class="secondary-button"
@@ -596,9 +770,29 @@
         {#if bootstrap?.update.release_notes}
           <p>{bootstrap.update.release_notes}</p>
         {/if}
-        <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
-          Проверить снова
-        </button>
+        {#if updateStatus?.supported}
+          {#if updateStatus.phase === "ready_to_restart"}
+            <button
+              class="primary-button"
+              type="button"
+              onclick={restartForUpdate}
+              disabled={updateBusy}
+            >
+              Перезапустить
+            </button>
+          {:else if updateStatus.phase !== "downloading"}
+            <button
+              class="primary-button"
+              type="button"
+              onclick={installUpdate}
+              disabled={updateBusy}
+            >
+              {updateBusy ? "Начинаем…" : "Обновить"}
+            </button>
+          {/if}
+        {:else}
+          <p>Установите новую версию приложения вручную.</p>
+        {/if}
       </div>
     {:else}
       <div class="panel message-panel">
@@ -725,6 +919,51 @@
     padding: 48px 0 64px;
     display: grid;
     place-items: center;
+  }
+
+  .diagnostics-status {
+    width: min(1180px, calc(100% - 40px));
+    margin: 10px auto 0;
+    color: #aeb6bd;
+    font-size: 13px;
+    text-align: right;
+  }
+
+  .update-banner {
+    width: min(1180px, calc(100% - 40px));
+    margin: 14px auto 0;
+    padding: 16px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    border: 1px solid #32675f;
+    border-radius: 8px;
+    background: #102923;
+  }
+
+  .update-banner > div {
+    min-width: 0;
+    display: grid;
+    gap: 4px;
+  }
+
+  .update-banner .eyebrow {
+    margin: 0;
+  }
+
+  .update-banner strong,
+  .update-banner span {
+    overflow-wrap: anywhere;
+  }
+
+  .update-banner span {
+    color: #b7c7c3;
+    font-size: 13px;
+  }
+
+  .update-action {
+    flex: 0 0 auto;
   }
 
   .panel {
@@ -1057,6 +1296,32 @@
     border-top: 1px solid #2a3036;
   }
 
+  .update-preference {
+    padding-top: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    border-top: 1px solid #2a3036;
+  }
+
+  .update-preference > span {
+    display: grid;
+    gap: 4px;
+  }
+
+  .update-preference small {
+    color: #9ca5ad;
+    font-size: 12px;
+  }
+
+  .update-preference input {
+    width: 44px;
+    min-height: 24px;
+    margin: 0;
+    accent-color: #67d5c4;
+  }
+
   .message-panel {
     max-width: 600px;
     padding: 36px;
@@ -1082,7 +1347,8 @@
 
   @media (max-width: 760px) {
     header,
-    .workspace {
+    .workspace,
+    .update-banner {
       width: min(100% - 28px, 620px);
     }
 
@@ -1117,6 +1383,15 @@
 
     .settings-panel {
       order: 2;
+    }
+
+    .update-banner {
+      align-items: stretch;
+      flex-direction: column;
+    }
+
+    .update-action {
+      width: 100%;
     }
 
     .peer-row {

@@ -1,16 +1,21 @@
 mod commands;
+mod diagnostics;
 mod platform;
+mod updates;
 
 use nelomai_client_api::ClientApi;
 use nelomai_client_application::ClientApplication;
-use nelomai_client_core::NoopLogger;
 use nelomai_client_storage::SystemSecretStore;
 use std::sync::Arc;
 
 const PANEL_BASE: &str = "https://nelomai.ru";
 
-type NativeApplication =
-    ClientApplication<ClientApi, SystemSecretStore, platform::PlatformTunnelController, NoopLogger>;
+type NativeApplication = ClientApplication<
+    ClientApi,
+    SystemSecretStore,
+    platform::PlatformTunnelController,
+    diagnostics::AppDiagnostics,
+>;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,27 +29,26 @@ pub fn run() {
     let builder = builder.setup(|app| {
         use tauri::Manager;
 
-        #[cfg(desktop)]
-        if let Ok(updater) =
-            platform::updater::DesktopUpdateBackend::from_build(app.handle().clone())
-        {
-            app.manage(updater);
-        }
-
         #[cfg(target_os = "linux")]
         let fallback = Some(app.path().app_data_dir()?.join("credentials"));
         #[cfg(not(target_os = "linux"))]
         let fallback = None;
 
-        let api =
-            ClientApi::new(PANEL_BASE).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let api = ClientApi::new(PANEL_BASE)
+            .and_then(|api| api.with_app_version(env!("CARGO_PKG_VERSION")))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
+            app.path().app_data_dir()?.join("diagnostics"),
+        )?);
         let application = ClientApplication::new(
             Arc::new(api),
             Arc::new(SystemSecretStore::new("primary", fallback)),
             Arc::new(platform::tunnel_controller(app.handle().clone())),
-            Arc::new(NoopLogger),
+            diagnostics.clone(),
         );
+        app.manage(diagnostics);
         app.manage(Arc::new(application));
+        app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
         Ok(())
     });
 
@@ -63,6 +67,11 @@ pub fn run() {
             commands::app_stop,
             commands::app_pin_stray,
             commands::app_unpin_stray,
+            commands::app_send_diagnostics,
+            commands::app_update_status,
+            commands::app_update_set_automatic,
+            commands::app_update_install,
+            commands::app_update_restart,
             commands::app_logout,
         ])
         .run(tauri::generate_context!())

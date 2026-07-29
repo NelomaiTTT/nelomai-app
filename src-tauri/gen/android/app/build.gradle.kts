@@ -19,6 +19,22 @@ val keystoreProperties = Properties().apply {
         FileInputStream(keystorePropertiesFile).use { load(it) }
     }
 }
+val releaseKeyAlias = System.getenv("ANDROID_KEY_ALIAS")
+    ?: keystoreProperties.getProperty("keyAlias")
+val releaseStorePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+    ?: keystoreProperties.getProperty("storePassword")
+    ?: keystoreProperties.getProperty("password")
+val releaseKeyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+    ?: keystoreProperties.getProperty("keyPassword")
+    ?: keystoreProperties.getProperty("password")
+val releaseStoreFile = System.getenv("ANDROID_KEYSTORE_PATH")
+    ?: keystoreProperties.getProperty("storeFile")
+val releaseSigningConfigured = listOf(
+    releaseKeyAlias,
+    releaseStorePassword,
+    releaseKeyPassword,
+    releaseStoreFile,
+).all { !it.isNullOrBlank() }
 
 android {
     compileSdk = 36
@@ -32,12 +48,12 @@ android {
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
     signingConfigs {
-        if (keystorePropertiesFile.exists()) {
+        if (releaseSigningConfigured) {
             create("release") {
-                keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("password")
-                storeFile = file(keystoreProperties.getProperty("storeFile"))
-                storePassword = keystoreProperties.getProperty("password")
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
             }
         }
     }
@@ -54,7 +70,7 @@ android {
             }
         }
         getByName("release") {
-            if (keystorePropertiesFile.exists()) {
+            if (releaseSigningConfigured) {
                 signingConfig = signingConfigs.getByName("release")
             }
             isMinifyEnabled = true

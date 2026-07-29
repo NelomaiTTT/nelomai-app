@@ -87,4 +87,35 @@ describe("native client", () => {
     });
     expect(invoke).toHaveBeenNthCalledWith(3, "app_unbind_peer");
   });
+
+  it("requests diagnostic upload without exposing report contents to the UI", async () => {
+    const invoke = vi.fn().mockResolvedValue({
+      request_id: "request-1",
+      report_id: "report-1",
+      received_bytes: 1024,
+    });
+    const client = createNativeClient(invoke);
+
+    const response = await client.sendDiagnostics();
+
+    expect(invoke).toHaveBeenCalledWith("app_send_diagnostics");
+    expect(response.report_id).toBe("report-1");
+  });
+
+  it("keeps update authorization and artifacts inside native commands", async () => {
+    const invoke = vi.fn().mockResolvedValue({ phase: "available" });
+    const client = createNativeClient(invoke);
+
+    await client.updateStatus();
+    await client.setAutomaticUpdates(false);
+    await client.installUpdate();
+    await client.restartForUpdate();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "app_update_status");
+    expect(invoke).toHaveBeenNthCalledWith(2, "app_update_set_automatic", {
+      enabled: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "app_update_install");
+    expect(invoke).toHaveBeenNthCalledWith(4, "app_update_restart");
+  });
 });

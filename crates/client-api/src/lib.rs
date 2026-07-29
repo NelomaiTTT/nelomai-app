@@ -4,7 +4,10 @@ use nelomai_contracts::{
     Layer, PeerBindingResponse, PeerOptions, Platform, ServerCandidatesResponse,
     ServerSelectionRequest, ServerSelectionResponse, API_PREFIX,
 };
-use reqwest::{Client as HttpClient, StatusCode, Url};
+use reqwest::{
+    header::{HeaderValue, InvalidHeaderValue},
+    Client as HttpClient, RequestBuilder, StatusCode, Url,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -96,12 +99,49 @@ pub struct SuccessResponse {
     pub ok: bool,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticUploadRequest {
+    pub generated_at_unix: i64,
+    pub app_version: String,
+    pub platform_version: Option<String>,
+    pub architecture: String,
+    pub application_log: String,
+    pub helper_log: Option<String>,
+}
+
+impl fmt::Debug for DiagnosticUploadRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiagnosticUploadRequest")
+            .field("generated_at_unix", &self.generated_at_unix)
+            .field("app_version", &self.app_version)
+            .field("platform_version", &self.platform_version)
+            .field("architecture", &self.architecture)
+            .field("application_log", &"<redacted>")
+            .field(
+                "helper_log",
+                &self.helper_log.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticUploadResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub report_id: String,
+    pub received_bytes: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum ClientApiError {
     #[error("invalid panel URL: {0}")]
     InvalidBaseUrl(String),
     #[error("request failed: {0}")]
     Transport(#[from] reqwest::Error),
+    #[error("invalid application version header")]
+    InvalidAppVersion(#[from] InvalidHeaderValue),
     #[error("{code}: {message}")]
     Api {
         status: StatusCode,
@@ -117,6 +157,7 @@ pub enum ClientApiError {
 pub struct ClientApi {
     http: HttpClient,
     api_base: Url,
+    app_version: Option<HeaderValue>,
 }
 
 impl ClientApi {
@@ -139,7 +180,13 @@ impl ClientApi {
             // Reqwest has no cookie jar unless its optional `cookies` feature is enabled.
             http: HttpClient::builder().build()?,
             api_base,
+            app_version: None,
         })
+    }
+
+    pub fn with_app_version(mut self, app_version: &str) -> Result<Self, ClientApiError> {
+        self.app_version = Some(HeaderValue::from_str(app_version)?);
+        Ok(self)
     }
 
     pub async fn login(&self, request: &LoginRequest) -> Result<TokenResponse, ClientApiError> {
@@ -188,6 +235,20 @@ impl ClientApi {
         .await
     }
 
+    pub async fn upload_diagnostics(
+        &self,
+        access_token: &str,
+        request: &DiagnosticUploadRequest,
+    ) -> Result<DiagnosticUploadResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("diagnostics")?)
+                .bearer_auth(access_token)
+                .json(request),
+        )
+        .await
+    }
+
     pub async fn bind_peer(
         &self,
         access_token: &str,
@@ -215,12 +276,7 @@ impl ClientApi {
     }
 
     pub async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, ClientApiError> {
-        self.send_json(
-            self.http
-                .get(self.endpoint("bootstrap")?)
-                .bearer_auth(access_token),
-        )
-        .await
+        self.send_json(self.bootstrap_request(access_token)?).await
     }
 
     pub async fn server_candidates(
@@ -347,6 +403,17 @@ impl ClientApi {
             .map_err(|error| ClientApiError::InvalidBaseUrl(error.to_string()))
     }
 
+    fn bootstrap_request(&self, access_token: &str) -> Result<RequestBuilder, ClientApiError> {
+        let request = self
+            .http
+            .get(self.endpoint("bootstrap")?)
+            .bearer_auth(access_token);
+        Ok(match &self.app_version {
+            Some(app_version) => request.header("X-Nelomai-App-Version", app_version),
+            None => request,
+        })
+    }
+
     async fn send_json<T: for<'de> Deserialize<'de>>(
         &self,
         request: reqwest::RequestBuilder,
@@ -382,6 +449,34 @@ mod tests {
         assert_eq!(
             client.endpoint("auth/login").unwrap().as_str(),
             "https://nelomai.ru/api/client/v1/auth/login"
+        );
+    }
+
+    #[test]
+    fn bootstrap_reports_the_running_application_version() {
+        let client = ClientApi::new("https://nelomai.ru")
+            .unwrap()
+            .with_app_version("0.1.4")
+            .unwrap();
+        let request = client
+            .bootstrap_request("access-secret")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("X-Nelomai-App-Version")
+                .and_then(|value| value.to_str().ok()),
+            Some("0.1.4")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer access-secret")
         );
     }
 
@@ -492,6 +587,24 @@ mod tests {
         ] {
             assert!(!debug.contains(secret));
         }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn diagnostics_debug_output_redacts_both_logs() {
+        let request = DiagnosticUploadRequest {
+            generated_at_unix: 1,
+            app_version: "0.1.0".to_string(),
+            platform_version: Some("test".to_string()),
+            architecture: "x86_64".to_string(),
+            application_log: "application-secret".to_string(),
+            helper_log: Some("helper-secret".to_string()),
+        };
+
+        let debug = format!("{request:?}");
+
+        assert!(!debug.contains("application-secret"));
+        assert!(!debug.contains("helper-secret"));
         assert!(debug.contains("<redacted>"));
     }
 }

@@ -26,12 +26,13 @@ def run() -> None:
     for token in (
         "verify:",
         "needs: verify",
-        "needs: [verify, build]",
+        "needs: [verify, build, build-android]",
         "npm test",
         "cargo clippy --workspace --all-targets -- -D warnings",
         "cargo test --workspace",
         "TAURI_SIGNING_PRIVATE_KEY",
         "NELOMAI_UPDATER_PUBLIC_KEY",
+        'test -n "$NELOMAI_UPDATER_PUBLIC_KEY"',
         "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64",
         "prepare-runtime.ps1",
         "prepare-runtime.sh",
@@ -41,12 +42,38 @@ def run() -> None:
         'target/${{ matrix.rust_target }}/release/bundle',
         "ubuntu-22.04",
         "windows-2022",
-        "macos-15-intel",
         "macos-14",
+        "build-android:",
+        "aarch64-linux-android",
+        "ndk;28.2.13676358",
+        "ANDROID_KEYSTORE_BASE64",
+        "ANDROID_KEYSTORE_PASSWORD",
+        "ANDROID_KEY_PASSWORD",
+        "ANDROID_KEY_ALIAS",
+        "android build --ci --apk --target aarch64",
+        "app/build/outputs/apk/universal/release/app-universal-release.apk",
+        "apksigner",
+        "release-android-aarch64/*.apk",
         "gh release create",
     ):
         if token not in workflow:
             raise RuntimeError(f"release workflow misses {token}")
+    for forbidden in ("macos-15-intel", "x86_64-apple-darwin"):
+        if forbidden in workflow:
+            raise RuntimeError(f"release workflow still contains {forbidden}")
+
+    android_gradle = (
+        ROOT / "src-tauri" / "gen" / "android" / "app" / "build.gradle.kts"
+    ).read_text(encoding="utf-8")
+    for token in (
+        "ANDROID_KEYSTORE_PATH",
+        "ANDROID_KEYSTORE_PASSWORD",
+        "ANDROID_KEY_PASSWORD",
+        "ANDROID_KEY_ALIAS",
+        "releaseSigningConfigured",
+    ):
+        if token not in android_gradle:
+            raise RuntimeError(f"Android release signing misses {token}")
 
     for token in (
         "workflow_dispatch:",
@@ -83,6 +110,23 @@ def run() -> None:
     if b"minisign public key" not in decoded_updater_key:
         raise RuntimeError("Tauri updater public key has an invalid format")
 
+    app_entrypoint = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(
+        encoding="utf-8"
+    )
+    for command in (
+        "app_update_status",
+        "app_update_set_automatic",
+        "app_update_install",
+        "app_update_restart",
+    ):
+        if command not in app_entrypoint:
+            raise RuntimeError(f"native updater command is not registered: {command}")
+    client_api = (ROOT / "crates" / "client-api" / "src" / "lib.rs").read_text(
+        encoding="utf-8"
+    )
+    if "X-Nelomai-App-Version" not in client_api:
+        raise RuntimeError("bootstrap does not report the running app version")
+
     windows_config = json.loads(
         (ROOT / "src-tauri" / "bundle.windows.conf.json").read_text(
             encoding="utf-8"
@@ -117,9 +161,24 @@ def run() -> None:
             encoding="utf-8"
         )
     ).get("bundle", {}).get("resources", {})
-    for resource in ("nelomai-unix-service", "install-linux.sh"):
+    for resource in (
+        "nelomai-unix-service",
+        "install-linux.sh",
+        "resolvconf-linux.sh",
+    ):
         if resource not in linux_resources.values():
             raise RuntimeError(f"Linux bundle misses {resource}")
+    linux_installer = (
+        ROOT / "crates" / "unix-service" / "install" / "install-linux.sh"
+    ).read_text(encoding="utf-8")
+    if "CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW" not in linux_installer:
+        raise RuntimeError("Linux helper cannot assign its socket to the app user")
+    for token in (
+        "resolvconf-linux.sh",
+        "Environment=PATH=$INSTALL_DIR:",
+    ):
+        if token not in linux_installer:
+            raise RuntimeError(f"Linux helper DNS integration misses {token}")
 
     private_key = Ed25519PrivateKey.generate()
     seed = private_key.private_bytes_raw()

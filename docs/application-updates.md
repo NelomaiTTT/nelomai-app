@@ -25,6 +25,18 @@ The app sends its bearer token only to the panel manifest and artifact
 endpoints. A manifest that announces another origin or another panel path is
 rejected before download.
 
+Every successful login and bootstrap observes the panel offer in the native
+update coordinator. Automatic installation starts in the background by
+default. The webview can read only the safe phase, version, release notes, and
+byte progress; it never receives the bearer token, manifest signature, or
+artifact URL. Manual and automatic attempts share one serialized native
+operation. Once the signed package is installed, the UI asks the user to
+restart the application.
+
+The bootstrap request sends `X-Nelomai-App-Version` so the panel records the
+version that is actually running after a self-update. Older clients omit the
+header and remain compatible.
+
 ## Android boundary
 
 The Tauri updater does not support Android. Android installation therefore
@@ -40,11 +52,15 @@ stays a separate native adapter with the same `UpdateBackend` contract:
 
 The Android adapter must not use shared external storage, request silent
 installation privileges, or accept an APK signed with another certificate.
-Its implementation and device smoke test remain a separate platform task
-because the package signing certificate has not been provisioned yet.
+The package signing certificate is provisioned in GitHub Secrets. Implementing
+the installer and running its device smoke test remain a separate platform
+task.
 
 ## Release gates
 
+- Version `0.1.4` is the one-time updater bridge and must be installed manually
+  over older builds. It must not be marked critical or minimum-supported.
+  Desktop releases after `0.1.4` can be delivered through the panel.
 - Generate and securely store the Tauri signing private key in
   `TAURI_SIGNING_PRIVATE_KEY` and its password secret.
 - Embed the matching public key through `NELOMAI_UPDATER_PUBLIC_KEY`.
@@ -52,13 +68,17 @@ because the package signing certificate has not been provisioned yet.
   `NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64`; configure the matching public key
   on the panel as `CLIENT_RELEASE_MANIFEST_PUBLIC_KEY_B64`.
 - The `release` GitHub Actions workflow builds Linux x86_64, Windows x86_64,
-  macOS x86_64, and macOS aarch64 updater artifacts for a stable `v*` tag or a
-  manual version. It publishes only after every matrix job succeeds.
+  and macOS aarch64 updater artifacts, plus a signed Android aarch64 APK, for a
+  stable `v*` tag or a manual version. Intel macOS builds are not published.
+  It publishes only after every build job succeeds.
 - The workflow publishes a deterministic JSON manifest, its detached Ed25519
   signature, and Tauri-signed packages. Draft and prerelease GitHub releases
   are not consumed by the panel.
+- The Android APK is attached directly to the GitHub release and intentionally
+  remains outside the desktop update manifest until the panel and native
+  Android installer support APK delivery.
 - The panel verifies the manifest signature, artifact size, and SHA-256 before
   atomically publishing the release. It retains current and previous versions.
 - Exercise a signed update on Windows, macOS, and Linux.
-- Provision the Android package signing certificate before implementing the
-  native APK installer.
+- Verify that the GitHub-built Android APK is signed by the same certificate
+  as the locally tested build before implementing the native APK installer.

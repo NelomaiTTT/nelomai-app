@@ -87,12 +87,12 @@ pub fn bind_listener(path: &Path, socket_owner_uid: u32) -> io::Result<UnixListe
     }
 
     let listener = UnixListener::bind(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     if unsafe { libc::chown(path_to_c_string(path)?.as_ptr(), socket_owner_uid, u32::MAX) } != 0 {
         let error = io::Error::last_os_error();
         let _ = fs::remove_file(path);
         return Err(error);
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 

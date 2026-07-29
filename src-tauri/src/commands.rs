@@ -1,4 +1,7 @@
+use crate::diagnostics::AppDiagnostics;
+use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::NativeApplication;
+use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
 use nelomai_client_core::{ConnectOptions, CoreApiError, CoreError, CoreState, Phase};
 use nelomai_contracts::{
@@ -206,9 +209,10 @@ pub async fn app_state(
 #[tauri::command]
 pub async fn app_login(
     application: State<'_, Arc<NativeApplication>>,
+    updater: State<'_, Arc<NativeUpdater>>,
     request: LoginCommandRequest,
 ) -> Result<Bootstrap, CommandError> {
-    application
+    let response = application
         .login(
             LoginParameters {
                 login: request.login,
@@ -222,14 +226,30 @@ pub async fn app_login(
             now_unix(),
         )
         .await
-        .map_err(Into::into)
+        .map_err(CommandError::from)?;
+    observe_and_schedule_update(
+        application.inner().clone(),
+        updater.inner().clone(),
+        &response,
+    );
+    Ok(response)
 }
 
 #[tauri::command]
 pub async fn app_bootstrap(
     application: State<'_, Arc<NativeApplication>>,
+    updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<Bootstrap, CommandError> {
-    application.bootstrap(now_unix()).await.map_err(Into::into)
+    let response = application
+        .bootstrap(now_unix())
+        .await
+        .map_err(CommandError::from)?;
+    observe_and_schedule_update(
+        application.inner().clone(),
+        updater.inner().clone(),
+        &response,
+    );
+    Ok(response)
 }
 
 #[tauri::command]
@@ -274,10 +294,26 @@ pub async fn app_refresh_probes(
 }
 
 #[tauri::command]
-pub async fn app_prepare_tunnel(app: AppHandle) -> Result<(), CommandError> {
-    crate::platform::prepare_tunnel(app)
-        .await
-        .map_err(CommandError::from_tunnel)
+pub async fn app_prepare_tunnel(
+    app: AppHandle,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<(), CommandError> {
+    match crate::platform::prepare_tunnel(app).await {
+        Ok(()) => {
+            diagnostics.record_named("tunnel.prepare_succeeded", None, None, None);
+            Ok(())
+        }
+        Err(error) => {
+            let command_error = CommandError::from_tunnel(error);
+            diagnostics.record_named(
+                "tunnel.prepare_failed",
+                None,
+                None,
+                Some(&command_error.code),
+            );
+            Err(command_error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -336,10 +372,133 @@ pub async fn app_unpin_stray(
 }
 
 #[tauri::command]
+pub async fn app_send_diagnostics(
+    application: State<'_, Arc<NativeApplication>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<DiagnosticUploadResponse, CommandError> {
+    let report = diagnostics.build_report().map_err(|_| {
+        CommandError::new(
+            "diagnostics_unavailable",
+            "Не удалось подготовить диагностический отчёт",
+        )
+    })?;
+    match application.upload_diagnostics(&report).await {
+        Ok(response) => {
+            diagnostics.record_named(
+                "diagnostics.uploaded",
+                None,
+                Some(&response.request_id),
+                None,
+            );
+            Ok(response)
+        }
+        Err(error) => {
+            diagnostics.record_named(
+                "diagnostics.upload_failed",
+                None,
+                None,
+                Some("upload_failed"),
+            );
+            Err(error.into())
+        }
+    }
+}
+
+#[tauri::command]
+pub fn app_update_status(
+    updater: State<'_, Arc<NativeUpdater>>,
+) -> Result<UpdateStatusResponse, CommandError> {
+    updater.status().map_err(update_command_error)
+}
+
+#[tauri::command]
+pub fn app_update_set_automatic(
+    application: State<'_, Arc<NativeApplication>>,
+    updater: State<'_, Arc<NativeUpdater>>,
+    enabled: bool,
+) -> Result<UpdateStatusResponse, CommandError> {
+    let response = updater
+        .set_automatic(enabled)
+        .map_err(update_command_error)?;
+    if enabled {
+        schedule_automatic_update(application.inner().clone(), updater.inner().clone());
+    }
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn app_update_install(
+    application: State<'_, Arc<NativeApplication>>,
+    updater: State<'_, Arc<NativeUpdater>>,
+) -> Result<UpdateStatusResponse, CommandError> {
+    let bootstrap = application
+        .bootstrap(now_unix())
+        .await
+        .map_err(CommandError::from)?;
+    updater
+        .observe(&bootstrap.update)
+        .map_err(update_command_error)?;
+    let access_token = application
+        .current_access_token()
+        .map_err(CommandError::from)?;
+    updater
+        .install_now(&access_token)
+        .await
+        .map_err(update_command_error)
+}
+
+#[tauri::command]
+pub fn app_update_restart(
+    app: AppHandle,
+    updater: State<'_, Arc<NativeUpdater>>,
+) -> Result<(), CommandError> {
+    if !updater.ready_to_restart() {
+        return Err(CommandError::new(
+            "update_not_ready",
+            "Обновление ещё не готово к перезапуску",
+        ));
+    }
+    app.restart();
+}
+
+#[tauri::command]
 pub async fn app_logout(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<(), CommandError> {
     application.logout().await.map_err(Into::into)
+}
+
+fn observe_and_schedule_update(
+    application: Arc<NativeApplication>,
+    updater: Arc<NativeUpdater>,
+    bootstrap: &Bootstrap,
+) {
+    if updater.observe(&bootstrap.update).is_ok() {
+        schedule_automatic_update(application, updater);
+    }
+}
+
+fn schedule_automatic_update(application: Arc<NativeApplication>, updater: Arc<NativeUpdater>) {
+    tauri::async_runtime::spawn(async move {
+        let Ok(access_token) = application.current_access_token() else {
+            return;
+        };
+        let _ = updater.install_automatically(&access_token).await;
+    });
+}
+
+fn update_command_error(error: String) -> CommandError {
+    CommandError::new("update_failed", update_error_message(&error))
+}
+
+fn update_error_message(error: &str) -> &'static str {
+    if error.contains("backend is unavailable") {
+        "На этом устройстве обновление устанавливается вручную"
+    } else if error.contains("preference") {
+        "Не удалось сохранить настройки обновлений"
+    } else {
+        "Не удалось установить обновление"
+    }
 }
 
 fn now_unix() -> i64 {

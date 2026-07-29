@@ -13,6 +13,8 @@ fi
 
 OWNER_UID=$1
 SOURCE_BINARY=$2
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+RESOLVCONF_SOURCE=$SCRIPT_DIR/resolvconf-linux.sh
 
 case "$OWNER_UID" in
   ''|*[!0-9]*)
@@ -28,10 +30,12 @@ fi
 
 INSTALL_DIR=/usr/local/libexec/nelomai
 INSTALL_BINARY=$INSTALL_DIR/nelomai-unix-service
+INSTALL_RESOLVCONF=$INSTALL_DIR/resolvconf
 UNIT_PATH=/etc/systemd/system/nelomai-tunnel.service
 
 install -d -o root -g root -m 0755 "$INSTALL_DIR"
 install -o root -g root -m 0755 "$SOURCE_BINARY" "$INSTALL_BINARY"
+install -o root -g root -m 0755 "$RESOLVCONF_SOURCE" "$INSTALL_RESOLVCONF"
 
 cat >"$UNIT_PATH" <<EOF
 [Unit]
@@ -47,11 +51,12 @@ RestartSec=2
 User=root
 Group=root
 UMask=0077
+Environment=PATH=$INSTALL_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=full
 PrivateTmp=true
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
 [Install]

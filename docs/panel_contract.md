@@ -54,6 +54,24 @@ from the authenticated API layer to `TunnelController`; frontend state, common
 error payloads, analytics, audit events, and application logs must never
 contain it. Common errors contain exactly `request_id`, `code`, and `message`.
 
+## Diagnostic reports
+
+An authenticated device can explicitly send a bounded diagnostic report to:
+
+```text
+POST /api/client/v1/diagnostics
+Authorization: Bearer <access token>
+Content-Type: application/json
+```
+
+The native layer assembles the report; the webview never receives log contents.
+Reports contain structured application events and, when readable, the bounded
+tail of the privileged tunnel helper log. Passwords, session tokens, and
+WireGuard configuration must never be logged. The panel applies a second
+redaction pass, accepts at most 512 KiB once per minute per device, keeps five
+reports per device for no longer than 30 days, and exposes them only to an
+administrator.
+
 ## Compatibility
 
 - Unknown optional object fields are ignored by v1 clients.
@@ -69,6 +87,16 @@ Bootstrap remains the source of update policy. `update_available` tells the
 client to display an offer, while `required` blocks new tunnel connections
 until a compatible version is installed. Disabling automatic updates does not
 hide that offer and does not bypass a required update.
+
+Authenticated bootstrap requests from update-capable clients include:
+
+```text
+X-Nelomai-App-Version: <running semantic version>
+```
+
+The panel records this value before calculating compatibility. The header is
+optional for older clients and never replaces the signed manifest version
+check performed by the updater.
 
 Desktop clients request a dynamic updater manifest from:
 
