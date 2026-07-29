@@ -21,7 +21,8 @@ type NativeApplication = ClientApplication<
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_tunnel_android::init());
+        .plugin(tauri_plugin_tunnel_android::init())
+        .plugin(tauri_plugin_updater_android::init());
 
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());

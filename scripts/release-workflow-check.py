@@ -53,7 +53,9 @@ def run() -> None:
         "android build --ci --apk --target aarch64",
         "app/build/outputs/apk/universal/release/app-universal-release.apk",
         "apksigner",
-        "release-android-aarch64/*.apk",
+        "collect-android-release-artifact.py",
+        "Signer #1 certificate SHA-256 digest",
+        "path: release-android/",
         "gh release create",
     ):
         if token not in workflow:
@@ -213,6 +215,24 @@ def run() -> None:
             ],
             check=True,
         )
+        android_apk = bundle / "nelomai.apk"
+        android_payload = b"signed-android-apk" * 131_072
+        android_apk.write_bytes(android_payload)
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts" / "collect-android-release-artifact.py"),
+                "--apk",
+                str(android_apk),
+                "--output-dir",
+                str(collected),
+                "--version",
+                "1.2.3",
+                "--signer-sha256",
+                "ab:" * 31 + "ab",
+            ],
+            check=True,
+        )
         windows_updater = bundle / "Nelomai_1.2.3_x64-setup.exe"
         windows_updater_payload = b"signed-windows-updater" * 131_072
         windows_updater.write_bytes(windows_updater_payload)
@@ -270,7 +290,7 @@ def run() -> None:
         )
         private_key.public_key().verify(signature, manifest_bytes)
         manifest = json.loads(manifest_bytes)
-        if manifest["version"] != "1.2.3" or len(manifest["artifacts"]) != 2:
+        if manifest["version"] != "1.2.3" or len(manifest["artifacts"]) != 3:
             raise RuntimeError("release manifest content is invalid")
         artifacts = {
             artifact["package_kind"]: artifact
@@ -296,6 +316,18 @@ def run() -> None:
             windows_updater_payload
         ).hexdigest():
             raise RuntimeError("Windows release artifact hash is invalid")
+        android_artifact = artifacts["apk"]
+        if android_artifact["platform"] != "android":
+            raise RuntimeError("Android release platform is invalid")
+        if android_artifact["signature"] != "ab" * 32:
+            raise RuntimeError("Android signer fingerprint is invalid")
+        published_android_artifact = published / android_artifact["asset_name"]
+        if not published_android_artifact.is_file():
+            raise RuntimeError("published Android APK is missing")
+        if android_artifact["sha256"] != hashlib.sha256(
+            android_payload
+        ).hexdigest():
+            raise RuntimeError("Android APK hash is invalid")
     print("OK: release workflow check passed")
 
 

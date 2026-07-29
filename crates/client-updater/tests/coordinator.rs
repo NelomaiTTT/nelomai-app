@@ -14,6 +14,7 @@ struct RecordingBackend {
     delay: Duration,
     expected_versions: Mutex<Vec<String>>,
     installed_version: Option<String>,
+    opens_installer: bool,
 }
 
 impl RecordingBackend {
@@ -23,6 +24,7 @@ impl RecordingBackend {
             delay,
             expected_versions: Mutex::new(Vec::new()),
             installed_version: None,
+            opens_installer: false,
         }
     }
 
@@ -32,6 +34,17 @@ impl RecordingBackend {
             delay: Duration::ZERO,
             expected_versions: Mutex::new(Vec::new()),
             installed_version: Some(version.to_string()),
+            opens_installer: false,
+        }
+    }
+
+    fn opening_installer() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            expected_versions: Mutex::new(Vec::new()),
+            installed_version: None,
+            opens_installer: true,
         }
     }
 }
@@ -54,12 +67,17 @@ impl UpdateBackend for RecordingBackend {
             total: Some(128),
         });
         tokio::time::sleep(self.delay).await;
-        Ok(InstallResult::Installed(InstalledUpdate {
+        let installed = InstalledUpdate {
             version: self
                 .installed_version
                 .clone()
                 .unwrap_or_else(|| expected_version.to_string()),
-        }))
+        };
+        Ok(if self.opens_installer {
+            InstallResult::InstallerOpened(installed)
+        } else {
+            InstallResult::Installed(installed)
+        })
     }
 }
 
@@ -181,4 +199,36 @@ async fn backend_cannot_mark_an_unexpected_version_as_installed() {
             code: "installed_update_version_mismatch".to_string(),
         }
     );
+}
+
+#[tokio::test]
+async fn android_installer_state_is_stable_until_the_app_is_replaced() {
+    let backend = Arc::new(RecordingBackend::opening_installer());
+    let coordinator = UpdateCoordinator::new(backend.clone());
+    coordinator.observe(Some(offer()));
+
+    let phase = coordinator.install_now("access-secret").await.unwrap();
+
+    assert_eq!(
+        phase,
+        UpdatePhase::AwaitingInstallation {
+            version: "0.2.0".to_string()
+        }
+    );
+    coordinator.observe(Some(offer()));
+    assert_eq!(coordinator.phase(), phase);
+    assert_eq!(
+        coordinator
+            .install_automatically("access-secret", UpdatePreferences::default())
+            .await
+            .unwrap(),
+        phase
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        coordinator.install_now("access-secret").await.unwrap(),
+        phase
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
 }

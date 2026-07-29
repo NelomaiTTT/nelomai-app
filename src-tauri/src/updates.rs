@@ -14,6 +14,8 @@ pub struct NativeUpdater {
     observed_offer: Mutex<Option<UpdateOffer>>,
     #[cfg(desktop)]
     coordinator: Option<UpdateCoordinator<platform::updater::DesktopUpdateBackend<Wry>>>,
+    #[cfg(target_os = "android")]
+    coordinator: Option<UpdateCoordinator<platform::android_updater::AndroidUpdateBackend<Wry>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -43,12 +45,16 @@ impl NativeUpdater {
         let coordinator = platform::updater::DesktopUpdateBackend::from_build(app.clone())
             .ok()
             .map(|backend| UpdateCoordinator::new(Arc::new(backend)));
+        #[cfg(target_os = "android")]
+        let coordinator = platform::android_updater::AndroidUpdateBackend::from_build(app.clone())
+            .ok()
+            .map(|backend| UpdateCoordinator::new(Arc::new(backend)));
 
         Ok(Self {
             preferences,
             current_preferences: Mutex::new(current_preferences),
             observed_offer: Mutex::new(None),
-            #[cfg(desktop)]
+            #[cfg(any(desktop, target_os = "android"))]
             coordinator,
         })
     }
@@ -60,6 +66,10 @@ impl NativeUpdater {
             .lock()
             .map_err(|_| "update offer lock poisoned".to_string())? = offer.clone();
         #[cfg(desktop)]
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.observe(offer);
+        }
+        #[cfg(target_os = "android")]
         if let Some(coordinator) = &self.coordinator {
             coordinator.observe(offer);
         }
@@ -78,6 +88,15 @@ impl NativeUpdater {
             .clone();
 
         #[cfg(desktop)]
+        if let Some(coordinator) = &self.coordinator {
+            return Ok(status_from_phase(
+                true,
+                preferences,
+                coordinator.phase(),
+                observed_offer,
+            ));
+        }
+        #[cfg(target_os = "android")]
         if let Some(coordinator) = &self.coordinator {
             return Ok(status_from_phase(
                 true,
@@ -125,11 +144,26 @@ impl NativeUpdater {
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        #[cfg(target_os = "android")]
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .install_automatically(access_token, preferences)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         self.status()
     }
 
     pub async fn install_now(&self, access_token: &str) -> Result<UpdateStatusResponse, String> {
         #[cfg(desktop)]
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .install_now(access_token)
+                .await
+                .map_err(|error| error.to_string())?;
+            return self.status();
+        }
+        #[cfg(target_os = "android")]
         if let Some(coordinator) = &self.coordinator {
             coordinator
                 .install_now(access_token)
@@ -167,6 +201,9 @@ fn status_from_phase(
         } => ("downloading", Some(version), downloaded, total, None),
         UpdatePhase::ReadyToRestart { version } => {
             ("ready_to_restart", Some(version), 0, None, None)
+        }
+        UpdatePhase::AwaitingInstallation { version } => {
+            ("awaiting_installation", Some(version), 0, None, None)
         }
         UpdatePhase::Failed { version, code } => ("failed", Some(version), 0, None, Some(code)),
     };

@@ -200,13 +200,19 @@ jobs:
         run: |
           apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
           test -f "$apk"
-          "${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner" verify --verbose "$apk"
-          mkdir -p release-android
-          cp "$apk" "release-android/nelomai-${RELEASE_VERSION#v}-android-aarch64.apk"
+          apksigner="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
+          "$apksigner" verify --verbose "$apk"
+          signer_sha256="$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1)"
+          test -n "$signer_sha256"
+          python scripts/collect-android-release-artifact.py \
+            --apk "$apk" \
+            --output-dir release-android \
+            --version "${RELEASE_VERSION#v}" \
+            --signer-sha256 "$signer_sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: release-android-aarch64
-          path: release-android/*.apk
+          path: release-android/
           if-no-files-found: error
           retention-days: 3
 
@@ -241,7 +247,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${RELEASE_VERSION#v}"
-          gh release create "$tag" release-publish/* release-input/release-android-aarch64/*.apk \
+          gh release create "$tag" release-publish/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "Nelomai ${RELEASE_VERSION#v}" \
             --notes "${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || format('Nelomai {0}', github.ref_name) }}"

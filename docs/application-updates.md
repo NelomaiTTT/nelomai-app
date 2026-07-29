@@ -9,7 +9,8 @@ version and can start it manually.
 
 The coordinator serializes installation attempts. Repeated button presses or
 simultaneous background/manual starts share one backend operation. Observable
-states are idle, available, downloading, ready to restart, and failed.
+states are idle, available, downloading, ready to restart, awaiting Android
+installation, and failed.
 Critical compatibility remains controlled by the bootstrap `required` flag;
 the existing client core refuses new connections while it is set.
 
@@ -45,16 +46,20 @@ stays a separate native adapter with the same `UpdateBackend` contract:
 1. Download the APK from the authenticated panel endpoint into app-private
    cache.
 2. Compare the announced version with the bootstrap offer.
-3. Hand the APK to Android `PackageInstaller`.
-4. Let Android verify that the APK is signed by the same application
-   certificate and request confirmation from the user.
-5. Delete the cached APK after success, rejection, or failure.
+3. Verify SHA-256, package name, version, the release signer fingerprint, and
+   equality with the certificate of the installed application.
+4. Share only the private `cache/updates` file through `FileProvider` and open
+   the system package installer.
+5. Ask the user for Android's per-application install permission and final
+   installation confirmation when required.
+6. Reuse the verified cached APK after a cancelled prompt and remove stale APKs
+   before downloading another release.
 
 The Android adapter must not use shared external storage, request silent
 installation privileges, or accept an APK signed with another certificate.
-The package signing certificate is provisioned in GitHub Secrets. Implementing
-the installer and running its device smoke test remain a separate platform
-task.
+The package signing certificate is provisioned in GitHub Secrets. Its SHA-256
+fingerprint is authenticated by the signed release manifest; it is not trusted
+from the APK alone.
 
 ## Release gates
 
@@ -74,11 +79,11 @@ task.
 - The workflow publishes a deterministic JSON manifest, its detached Ed25519
   signature, and Tauri-signed packages. Draft and prerelease GitHub releases
   are not consumed by the panel.
-- The Android APK is attached directly to the GitHub release and intentionally
-  remains outside the desktop update manifest until the panel and native
-  Android installer support APK delivery.
+- The Android APK and its signing-certificate fingerprint are included in the
+  signed release manifest. The panel stores the APK privately and serves it
+  only to authenticated application sessions.
 - The panel verifies the manifest signature, artifact size, and SHA-256 before
   atomically publishing the release. It retains current and previous versions.
-- Exercise a signed update on Windows, macOS, and Linux.
-- Verify that the GitHub-built Android APK is signed by the same certificate
-  as the locally tested build before implementing the native APK installer.
+- Exercise a signed update on Windows, macOS, Linux, and a physical Android
+  device. Android must show its system confirmation UI; silent installation is
+  neither requested nor supported.

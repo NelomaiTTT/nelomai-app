@@ -2711,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-app"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "libc",
@@ -2724,14 +2724,17 @@ dependencies = [
  "nelomai-contracts",
  "nelomai-unix-service",
  "nelomai-windows-service",
+ "reqwest 0.12.28",
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-tunnel-android",
  "tauri-plugin-updater",
+ "tauri-plugin-updater-android",
  "tokio",
 ]
 
@@ -2840,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-unix-service"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2859,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-windows-service"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "nelomai-client-tunnel",
@@ -4964,6 +4967,16 @@ dependencies = [
  "url",
  "windows-sys 0.60.2",
  "zip",
+]
+
+[[package]]
+name = "tauri-plugin-updater-android"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

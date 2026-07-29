@@ -85,6 +85,7 @@ export type UpdatePhase =
   | "available"
   | "downloading"
   | "ready_to_restart"
+  | "awaiting_installation"
   | "failed";
 
 export interface UpdateStatus {

@@ -512,6 +512,9 @@
         {:else if updateStatus.phase === "ready_to_restart"}
           <strong>Nelomai {updateStatus.version} готов к запуску</strong>
           <span>Перезапустите приложение, чтобы завершить обновление.</span>
+        {:else if updateStatus.phase === "awaiting_installation"}
+          <strong>Подтвердите установку Nelomai {updateStatus.version}</strong>
+          <span>Завершите обновление в системном окне Android.</span>
         {:else if updateStatus.phase === "failed"}
           <strong>Не удалось установить Nelomai {updateStatus.version}</strong>
           <span>Можно повторить загрузку сейчас.</span>
@@ -540,7 +543,11 @@
           onclick={installUpdate}
           disabled={updateBusy}
         >
-          {updateBusy ? "Начинаем…" : "Обновить"}
+          {updateBusy
+            ? "Начинаем…"
+            : updateStatus.phase === "awaiting_installation"
+              ? "Открыть снова"
+              : "Обновить"}
         </button>
       {/if}
     </section>
@@ -786,6 +793,16 @@
               disabled={updateBusy}
             >
               Перезапустить
+            </button>
+          {:else if updateStatus.phase === "awaiting_installation"}
+            <p>Завершите обновление в системном окне Android.</p>
+            <button
+              class="primary-button"
+              type="button"
+              onclick={installUpdate}
+              disabled={updateBusy}
+            >
+              {updateBusy ? "Открываем…" : "Открыть снова"}
             </button>
           {:else if updateStatus.phase !== "downloading"}
             <button

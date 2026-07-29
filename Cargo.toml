@@ -10,6 +10,7 @@ members = [
     "crates/unix-service",
     "crates/windows-service",
     "plugins/tunnel-android",
+    "plugins/updater-android",
     "spikes/desktop-helper",
     "src-tauri",
 ]

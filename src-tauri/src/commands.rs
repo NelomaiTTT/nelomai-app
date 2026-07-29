@@ -494,6 +494,8 @@ fn update_command_error(error: String) -> CommandError {
 fn update_error_message(error: &str) -> &'static str {
     if error.contains("backend is unavailable") {
         "На этом устройстве обновление устанавливается вручную"
+    } else if error.contains("install_permission_denied") {
+        "Разрешите Nelomai устанавливать обновления и повторите попытку"
     } else if error.contains("preference") {
         "Не удалось сохранить настройки обновлений"
     } else {

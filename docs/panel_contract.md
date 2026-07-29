@@ -98,7 +98,7 @@ The panel records this value before calculating compatibility. The header is
 optional for older clients and never replaces the signed manifest version
 check performed by the updater.
 
-Desktop clients request a dynamic updater manifest from:
+Native clients request a dynamic updater manifest from:
 
 ```text
 GET /api/client/v1/updates/manifest/{target}/{current_version}
@@ -115,5 +115,8 @@ https://nelomai.ru/api/client/v1/updates/artifacts/{artifact}
 
 The same bearer header is used for the artifact request. The client rejects a
 different origin, credentials embedded in the URL, query strings, fragments,
-and paths outside this prefix before sending the token. The Tauri updater then
-verifies the artifact signature using the public key embedded at build time.
+and paths outside this prefix before sending the token. Desktop packages are
+verified by the Tauri updater using its embedded public key. An Android
+manifest additionally contains `sha256` and `size_bytes`; its `signature`
+field is the SHA-256 fingerprint of the APK signing certificate. Android
+checks all three values before opening the system installer.

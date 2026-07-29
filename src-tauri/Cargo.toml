@@ -1,6 +1,6 @@
 [package]
 name = "nelomai-app"
-version = "0.1.5"
+version = "0.1.6"
 description = "Native Nelomai client"
 authors = ["Nelomai"]
 edition = "2021"
@@ -23,6 +23,7 @@ async-trait = "0.1"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-tunnel-android = { path = "../plugins/tunnel-android" }
+tauri-plugin-updater-android = { path = "../plugins/updater-android" }
 nelomai-client-api = { path = "../crates/client-api" }
 nelomai-client-application = { path = "../crates/client-application" }
 nelomai-client-core = { path = "../crates/client-core" }
@@ -34,6 +35,11 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "time"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "io-util"] }
 
 [target.'cfg(windows)'.dependencies]
 nelomai-windows-service = { path = "../crates/windows-service" }

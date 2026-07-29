@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+pub mod android_updater;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod unix;
 #[cfg(desktop)]
