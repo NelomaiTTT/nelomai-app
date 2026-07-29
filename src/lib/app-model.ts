@@ -199,3 +199,7 @@ export function requiresServerProbes(
 ): boolean {
   return layer !== "tic" || ticConnectionMode !== "personal";
 }
+
+export function defaultRouteModeForLayer(layer: Layer): RouteMode {
+  return layer === "tic" ? "via_tak" : "standalone";
+}

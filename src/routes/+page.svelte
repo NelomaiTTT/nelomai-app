@@ -3,6 +3,7 @@
 
   import {
     bindingRequest,
+    defaultRouteModeForLayer,
     requiresServerProbes,
     viewForPhase,
     type AppView,
@@ -174,6 +175,12 @@
       selectedPeerId = "";
       error = commandMessage(reason);
     }
+  }
+
+  function changeLayer(event: Event) {
+    selectedLayer = (event.currentTarget as HTMLInputElement).value as Layer;
+    routeMode = defaultRouteModeForLayer(selectedLayer);
+    void refreshProbes();
   }
 
   async function bindSelectedPeer() {
@@ -667,7 +674,7 @@
                   type="radio"
                   value="tic"
                   bind:group={selectedLayer}
-                  onchange={refreshProbes}
+                  onchange={changeLayer}
                 />
                 <span>Tic / Tak</span>
               </label>
@@ -676,7 +683,7 @@
                   type="radio"
                   value="stray"
                   bind:group={selectedLayer}
-                  onchange={refreshProbes}
+                  onchange={changeLayer}
                 />
                 <span>Stray</span>
               </label>

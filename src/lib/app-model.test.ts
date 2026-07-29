@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   bindingRequest,
+  defaultRouteModeForLayer,
   requiresServerProbes,
   viewForPhase,
   type Bootstrap,
@@ -64,5 +65,12 @@ describe("requiresServerProbes", () => {
     expect(requiresServerProbes("tic", "personal")).toBe(false);
     expect(requiresServerProbes("tic", "dynamic")).toBe(true);
     expect(requiresServerProbes("stray", "dynamic")).toBe(true);
+  });
+});
+
+describe("defaultRouteModeForLayer", () => {
+  it("routes Tic through Tak and keeps Stray standalone", () => {
+    expect(defaultRouteModeForLayer("tic")).toBe("via_tak");
+    expect(defaultRouteModeForLayer("stray")).toBe("standalone");
   });
 });
