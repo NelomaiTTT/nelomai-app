@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{
+    TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest, TunnelStatus,
+};
 use nelomai_windows_service::{
     Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
     TunnelRequestHandler, WindowsTunnelController, PROTOCOL_VERSION,
@@ -100,9 +102,9 @@ async fn controller_maps_service_response_to_shared_tunnel_contract() {
     let controller = WindowsTunnelController::new(RecordingTransport::running());
 
     controller
-        .start(TunnelConfiguration::new(
+        .start(TunnelStartRequest::full_tunnel(TunnelConfiguration::new(
             "PrivateKey = client-only".to_string(),
-        ))
+        )))
         .await
         .expect("start tunnel");
     assert_eq!(

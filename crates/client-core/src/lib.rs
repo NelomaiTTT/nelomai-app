@@ -3,7 +3,10 @@ use nelomai_client_api::{ClientApi, ClientApiError, TokenResponse};
 use nelomai_client_storage::{
     SecretStore, StoredCompatibility, StoredConnection, StoredConnectionKind,
 };
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{
+    TunnelConfiguration, TunnelController, TunnelError, TunnelOptions, TunnelStartRequest,
+    TunnelStatus,
+};
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
     ConnectionStartRequest, ConnectionStartResponse, Layer, ProbeResult, RouteMode,
@@ -13,6 +16,12 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+mod split_tunnel;
+
+pub use split_tunnel::{
+    split_tunnel_active, EffectiveSplitTunnelPolicy, SplitTunnelContext, SplitTunnelPolicyError,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -424,8 +433,10 @@ pub enum CoreError {
 
 impl From<TunnelError> for CoreError {
     fn from(error: TunnelError) -> Self {
-        let TunnelError::Backend(code) = error;
-        Self::Tunnel(code)
+        match error {
+            TunnelError::Backend(code) => Self::Tunnel(code),
+            TunnelError::InvalidOptions { code } => Self::Tunnel(code.to_string()),
+        }
     }
 }
 
@@ -576,6 +587,15 @@ where
                 });
                 TunnelStatus::Stopped
             }
+            Err(TunnelError::InvalidOptions { code }) => {
+                self.logger.record(CoreLogEvent {
+                    kind: "tunnel.status.unavailable",
+                    operation_id: None,
+                    request_id: Some(response.request_id.clone()),
+                    code: Some(code.to_string()),
+                });
+                TunnelStatus::Stopped
+            }
         };
         let phase = recover_phase(
             self.state.lock().await.phase,
@@ -664,7 +684,10 @@ where
         }
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         self.tunnel
-            .start(TunnelConfiguration::new(response.configuration))
+            .start(TunnelStartRequest {
+                configuration: TunnelConfiguration::new(response.configuration),
+                options: TunnelOptions::default(),
+            })
             .await?;
         *self.state.lock().await = CoreState {
             phase: Phase::Connected,
@@ -850,7 +873,10 @@ where
             })
             .ok_or(CoreError::SavedConnectionUnavailable)?;
         self.tunnel
-            .start(TunnelConfiguration::new(saved.configuration))
+            .start(TunnelStartRequest {
+                configuration: TunnelConfiguration::new(saved.configuration),
+                options: TunnelOptions::default(),
+            })
             .await?;
         let connection = Connection {
             lease_id: saved.lease_id.clone(),

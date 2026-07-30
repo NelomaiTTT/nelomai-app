@@ -7,7 +7,7 @@ use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
     StoredConnectionKind,
 };
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
@@ -62,9 +62,9 @@ struct MemoryTunnel {
 
 #[async_trait]
 impl TunnelController for MemoryTunnel {
-    async fn start(&self, configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+    async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
-        *self.configuration.lock().unwrap() = Some(configuration.expose().to_string());
+        *self.configuration.lock().unwrap() = Some(request.configuration.expose().to_string());
         *self.status.lock().unwrap() = TunnelStatus::Running;
         Ok(())
     }

@@ -3,6 +3,7 @@ package ru.nelomai.tunnel
 import android.app.Activity
 import android.content.Context
 import android.net.VpnService
+import android.os.Build
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -26,9 +27,13 @@ class TunnelOptionsArgs {
     var excludedPackages: ArrayList<String> = arrayListOf()
     var includedPackages: ArrayList<String> = arrayListOf()
     var splitTunnelRoutes: ArrayList<String> = arrayListOf()
+    var excludeLocalNetworks: Boolean = false
 
     fun isEmpty(): Boolean =
-        excludedPackages.isEmpty() && includedPackages.isEmpty() && splitTunnelRoutes.isEmpty()
+        excludedPackages.isEmpty() &&
+            includedPackages.isEmpty() &&
+            splitTunnelRoutes.isEmpty() &&
+            !excludeLocalNetworks
 }
 
 @InvokeArg
@@ -282,6 +287,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     fun probe(invoke: Invoke) {
         val response = JSObject()
         response.put("platform", "android")
+        response.put("androidApiLevel", Build.VERSION.SDK_INT)
         response.put("permissionGranted", VpnService.prepare(activity.applicationContext) == null)
 
         try {

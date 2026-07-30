@@ -7,5 +7,6 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
+nelomai-contracts = { path = "../contracts" }
 thiserror = "2"
 zeroize = "1"

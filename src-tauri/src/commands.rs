@@ -83,7 +83,10 @@ impl CommandError {
     }
 
     fn from_tunnel(error: nelomai_client_tunnel::TunnelError) -> Self {
-        let nelomai_client_tunnel::TunnelError::Backend(code) = error;
+        let code = match error {
+            nelomai_client_tunnel::TunnelError::Backend(code) => code,
+            nelomai_client_tunnel::TunnelError::InvalidOptions { code } => code.to_string(),
+        };
         match code.as_str() {
             "vpn_permission_denied" => Self::new(
                 "vpn_permission_denied",

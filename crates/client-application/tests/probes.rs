@@ -3,7 +3,7 @@ use nelomai_client_api::{LoginRequest, TokenResponse};
 use nelomai_client_application::{ApplicationApi, ApplicationError, ClientApplication};
 use nelomai_client_core::{ConnectOptions, CoreApi, CoreApiError, CoreError, NoopLogger};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth, StoredCompatibility};
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     ApiVersion, BindPeerRequest, Bootstrap, Connection, ConnectionOperationRequest,
     ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, Layer,
@@ -150,7 +150,7 @@ struct StoppedTunnel;
 
 #[async_trait]
 impl TunnelController for StoppedTunnel {
-    async fn start(&self, _configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+    async fn start(&self, _request: TunnelStartRequest) -> Result<(), TunnelError> {
         Ok(())
     }
 

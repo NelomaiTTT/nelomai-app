@@ -2805,6 +2805,7 @@ name = "nelomai-client-tunnel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "nelomai-contracts",
  "thiserror 2.0.19",
  "zeroize",
 ]
@@ -4934,6 +4935,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "nelomai-client-tunnel",
+ "nelomai-contracts",
  "serde",
  "serde_json",
  "tauri",

@@ -6,7 +6,7 @@ use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
     StoredConnectionKind,
 };
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, BindPeerRequest, Bootstrap, BootstrapDefaults,
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
@@ -161,7 +161,7 @@ struct StoppedTunnel;
 
 #[async_trait]
 impl TunnelController for StoppedTunnel {
-    async fn start(&self, _configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+    async fn start(&self, _request: TunnelStartRequest) -> Result<(), TunnelError> {
         Ok(())
     }
 
@@ -178,7 +178,7 @@ struct UnavailableTunnel;
 
 #[async_trait]
 impl TunnelController for UnavailableTunnel {
-    async fn start(&self, _configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+    async fn start(&self, _request: TunnelStartRequest) -> Result<(), TunnelError> {
         Err(TunnelError::Backend("service_unavailable".to_string()))
     }
 
@@ -198,7 +198,7 @@ struct TrackingTunnel {
 
 #[async_trait]
 impl TunnelController for TrackingTunnel {
-    async fn start(&self, _configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+    async fn start(&self, _request: TunnelStartRequest) -> Result<(), TunnelError> {
         Ok(())
     }
 

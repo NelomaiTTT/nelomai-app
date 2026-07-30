@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{
+    TunnelCapabilities, TunnelController, TunnelError, TunnelPlatform, TunnelStartRequest,
+    TunnelStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -422,10 +425,16 @@ impl<T: ServiceTransport> WindowsTunnelController<T> {
 
 #[async_trait]
 impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
-    async fn start(&self, configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+    async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
+        request
+            .options
+            .validate()
+            .map_err(|error| TunnelError::InvalidOptions {
+                code: error.stable_code(),
+            })?;
         let response = self
             .transport
-            .exchange(Request::start(configuration.expose().to_string()))
+            .exchange(Request::start(request.configuration.expose().to_string()))
             .await
             .map_err(to_tunnel_error)?;
         require_state(response, ServiceTunnelState::Running)
@@ -457,6 +466,15 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
                 "missing_tunnel_service_state".to_string(),
             )),
         }
+    }
+
+    async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
+        Ok(TunnelCapabilities {
+            platform: TunnelPlatform::Windows,
+            android_api_level: None,
+            address_split_tunnel: true,
+            application_split_tunnel: false,
+        })
     }
 }
 

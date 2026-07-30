@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{
+    TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest, TunnelStatus,
+};
 use nelomai_unix_service::{
     authorize_peer, decode_request, encode_request, parse_configuration, ClientIdentity,
     ClientPolicy, Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend,
@@ -181,7 +183,9 @@ async fn controller_maps_helper_responses_to_shared_tunnel_contract() {
     });
 
     controller
-        .start(TunnelConfiguration::new(valid_configuration()))
+        .start(TunnelStartRequest::full_tunnel(TunnelConfiguration::new(
+            valid_configuration(),
+        )))
         .await
         .expect("start tunnel");
     assert_eq!(

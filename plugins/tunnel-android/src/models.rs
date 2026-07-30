@@ -10,6 +10,7 @@ pub struct ProbeRequest {}
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResponse {
     pub platform: String,
+    pub android_api_level: Option<u32>,
     pub backend_available: bool,
     pub permission_granted: bool,
     pub backend_version: Option<String>,
@@ -28,12 +29,25 @@ pub struct PermissionResponse {
 
 pub const TUNNEL_API_VERSION: u16 = 1;
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelOptions {
     pub excluded_packages: Vec<String>,
     pub included_packages: Vec<String>,
     pub split_tunnel_routes: Vec<String>,
+    pub exclude_local_networks: bool,
+}
+
+impl fmt::Debug for TunnelOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TunnelOptions")
+            .field("excluded_packages_count", &self.excluded_packages.len())
+            .field("included_packages_count", &self.included_packages.len())
+            .field("split_tunnel_routes_count", &self.split_tunnel_routes.len())
+            .field("exclude_local_networks", &self.exclude_local_networks)
+            .finish()
+    }
 }
 
 pub struct StartTunnelRequest {
@@ -128,5 +142,6 @@ mod tests {
         assert_eq!(value["options"]["excludedPackages"], serde_json::json!([]));
         assert_eq!(value["options"]["includedPackages"], serde_json::json!([]));
         assert_eq!(value["options"]["splitTunnelRoutes"], serde_json::json!([]));
+        assert_eq!(value["options"]["excludeLocalNetworks"], false);
     }
 }

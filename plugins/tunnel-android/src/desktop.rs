@@ -17,6 +17,7 @@ impl<R: Runtime> TunnelAndroid<R> {
     pub fn probe(&self) -> crate::Result<ProbeResponse> {
         Ok(ProbeResponse {
             platform: std::env::consts::OS.to_string(),
+            android_api_level: None,
             backend_available: false,
             permission_granted: false,
             backend_version: None,

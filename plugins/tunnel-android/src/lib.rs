@@ -1,5 +1,9 @@
 use async_trait::async_trait;
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{
+    TunnelCapabilities, TunnelController, TunnelError, TunnelPlatform, TunnelStartRequest,
+    TunnelStatus,
+};
+use nelomai_contracts::SplitTunnelMode;
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
@@ -65,14 +69,30 @@ impl<R: Runtime> AndroidTunnelController<R> {
 
 #[async_trait]
 impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
-    async fn start(
-        &self,
-        configuration: TunnelConfiguration,
-    ) -> std::result::Result<(), TunnelError> {
+    async fn start(&self, request: TunnelStartRequest) -> std::result::Result<(), TunnelError> {
+        request
+            .options
+            .validate()
+            .map_err(|error| TunnelError::InvalidOptions {
+                code: error.stable_code(),
+            })?;
+        let mut plugin_request = StartTunnelRequest::new(request.configuration.as_bytes());
+        match request.options.application_mode {
+            Some(SplitTunnelMode::ExcludeSelected) => {
+                plugin_request.options.excluded_packages = request.options.package_ids;
+            }
+            Some(SplitTunnelMode::IncludeSelected) => {
+                plugin_request.options.included_packages = request.options.package_ids;
+            }
+            None => {}
+        }
+        plugin_request.options.split_tunnel_routes = request.options.excluded_ipv4_cidrs;
+        plugin_request.options.exclude_local_networks = request.options.exclude_local_networks;
+
         let response = self
             .app
             .tunnel_android()
-            .start_tunnel(StartTunnelRequest::new(configuration.as_bytes()))
+            .start_tunnel(plugin_request)
             .map_err(to_tunnel_error)?;
         require_state(response, "running")
     }
@@ -102,6 +122,16 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                 "unknown Android tunnel state: {state}"
             ))),
         }
+    }
+
+    async fn capabilities(&self) -> std::result::Result<TunnelCapabilities, TunnelError> {
+        let probe = self.app.tunnel_android().probe().map_err(to_tunnel_error)?;
+        Ok(TunnelCapabilities {
+            platform: TunnelPlatform::Android,
+            android_api_level: probe.android_api_level,
+            address_split_tunnel: probe.android_api_level.is_some_and(|level| level >= 33),
+            application_split_tunnel: probe.android_api_level.is_some_and(|level| level >= 33),
+        })
     }
 }
 

@@ -9,7 +9,7 @@ use nelomai_client_api::ClientApi;
 use nelomai_client_application::{ClientApplication, LoginParameters};
 use nelomai_client_core::{ConnectOptions, NoopLogger, Phase};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth};
-use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
+use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     BindPeerRequest, Layer, Platform, RouteMode, SplitTunnelApplyResult, SplitTunnelApplyStatus,
     SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
@@ -66,11 +66,11 @@ struct RecordingTunnel {
 
 #[async_trait]
 impl TunnelController for RecordingTunnel {
-    async fn start(&self, configuration: TunnelConfiguration) -> Result<(), TunnelError> {
+    async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.configurations
             .lock()
             .unwrap()
-            .push(configuration.expose().to_string());
+            .push(request.configuration.expose().to_string());
         *self.status.lock().unwrap() = TunnelStatus::Running;
         Ok(())
     }

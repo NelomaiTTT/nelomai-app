@@ -259,8 +259,8 @@ git commit -m "Добавить локальное хранилище split-tunn
 - Create: `crates/client-core/tests/split_tunnel.rs`
 - Modify: `crates/client-tunnel/src/lib.rs`
 
-- [ ] Add failing table-driven tests for activation by platform, Android API, layer, and route.
-- [ ] Encode the exact activation rule:
+- [x] Add failing table-driven tests for activation by platform, Android API, layer, and route.
+- [x] Encode the exact activation rule:
 
 ```rust
 pub fn split_tunnel_active(context: SplitTunnelContext) -> bool {
@@ -281,19 +281,19 @@ pub fn split_tunnel_active(context: SplitTunnelContext) -> bool {
 }
 ```
 
-- [ ] Add tests proving Android API 24–32 can start every connection mode with `TunnelOptions::default()`.
-- [ ] Add tests proving API 33+ uses split for `Tic + via_tak` and Stray but not `Tic + standalone`.
-- [ ] Add tests for precedence:
+- [x] Add tests proving Android API 24–32 can start every connection mode with `TunnelOptions::default()`.
+- [x] Add tests proving API 33+ uses split for `Tic + via_tak` and Stray but not `Tic + standalone`.
+- [x] Add tests for precedence:
   - mandatory package ID is always excluded;
   - a mandatory package is removed from suggestions;
   - display-name matching is Unicode case-insensitive;
   - unavailable packages are removed from the active selection but not panel history.
-- [ ] Reject policies with more than 512 mandatory package IDs, 128 name suggestions, 512 selected package IDs, or 16,384 compact CIDRs before application.
-- [ ] Add tests for include-only mode:
+- [x] Reject policies with more than 512 mandatory package IDs, 128 name suggestions, 512 selected package IDs, or 16,384 compact CIDRs before application.
+- [x] Add tests for include-only mode:
   - empty effective selection blocks Start only when split is active;
   - mandatory exclusions are not presented as selectable includes;
   - Android 12 and older do not block Start because split is inactive.
-- [ ] Replace the tunnel start signature with a versioned request:
+- [x] Replace the tunnel start signature with a versioned request:
 
 ```rust
 #[derive(Debug)]
@@ -340,23 +340,23 @@ pub trait TunnelController: Send + Sync {
 }
 ```
 
-- [ ] Keep `TunnelStartRequest` debug output redacted and validate package IDs/CIDRs before crossing into a helper or plugin.
-- [ ] Make Android capabilities come from the plugin probe and `Build.VERSION.SDK_INT`; desktop controllers report address support and no application support. Keep the trait default so existing test controllers compile unchanged.
-- [ ] Implement `EffectiveSplitTunnelPolicy::build(...)` in `client-core`, returning default options whenever split is inactive.
-- [ ] Run focused tests:
+- [x] Keep `TunnelStartRequest` debug output redacted and validate package IDs/CIDRs before crossing into a helper or plugin.
+- [x] Make Android capabilities come from the plugin probe and `Build.VERSION.SDK_INT`; desktop controllers report address support and no application support. Keep the trait default so existing test controllers compile unchanged.
+- [x] Implement `EffectiveSplitTunnelPolicy::build(...)` in `client-core`, returning default options whenever split is inactive.
+- [x] Run focused tests:
 
 ```bash
 cargo test -p nelomai-client-core --test split_tunnel -- --nocapture
 cargo test -p nelomai-client-tunnel
 ```
 
-- [ ] Run all core tests:
+- [x] Run all core tests:
 
 ```bash
 cargo test -p nelomai-client-core
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add crates/client-core crates/client-tunnel
