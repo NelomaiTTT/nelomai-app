@@ -201,8 +201,8 @@ git commit -m "Подключить API политики split-tunnel"
 - Modify: `crates/client-storage/Cargo.toml`
 - Create: `crates/client-storage/tests/split_tunnel.rs`
 
-- [ ] Add failing tests for an atomic file-backed `SplitTunnelStore`.
-- [ ] Define persisted state:
+- [x] Add failing tests for an atomic file-backed `SplitTunnelStore`.
+- [x] Define persisted state:
 
 ```rust
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,25 +223,25 @@ pub trait SplitTunnelStore: Send + Sync {
 }
 ```
 
-- [ ] Use `<app_data>/split-tunnel/state.json`; keep credentials and WireGuard keys out of this file.
-- [ ] Add `MemorySplitTunnelStore` for deterministic unit tests and for the backward-compatible constructors used by existing tests.
-- [ ] Enforce a `1 MiB` read/write limit and reject malformed state without silently truncating it.
-- [ ] Write to a sibling temporary file, `fsync`, set mode `0600` on Unix, rename atomically, and `fsync` the directory.
-- [ ] Keep at most 32 pending apply results, dropping oldest successful entries before failed entries.
-- [ ] Ensure `Debug` for persisted state omits selected package IDs and CIDRs.
-- [ ] Run focused tests:
+- [x] Use `<app_data>/split-tunnel/state.json`; keep credentials and WireGuard keys out of this file.
+- [x] Add `MemorySplitTunnelStore` for deterministic unit tests and for the backward-compatible constructors used by existing tests.
+- [x] Enforce a `1 MiB` read/write limit and reject malformed state without silently truncating it.
+- [x] Write to a sibling temporary file, `fsync`, set mode `0600` on Unix, rename atomically, and `fsync` the directory.
+- [x] Keep at most 32 pending apply results, dropping oldest successful entries before failed entries.
+- [x] Ensure `Debug` for persisted state omits selected package IDs and CIDRs.
+- [x] Run focused tests:
 
 ```bash
 cargo test -p nelomai-client-storage --test split_tunnel -- --nocapture
 ```
 
-- [ ] Run all storage tests:
+- [x] Run all storage tests:
 
 ```bash
 cargo test -p nelomai-client-storage
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add crates/client-storage

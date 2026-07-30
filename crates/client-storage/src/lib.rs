@@ -12,6 +12,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+mod split_tunnel;
+
+pub use split_tunnel::{
+    FileSplitTunnelStore, MemorySplitTunnelStore, SplitTunnelStore, StoredSplitTunnelState,
+};
+
 const SERVICE_NAME: &str = "ru.nelomai.app";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +124,10 @@ pub enum StorageError {
     Io(#[from] io::Error),
     #[error("stored credentials are invalid: {0}")]
     InvalidData(#[from] serde_json::Error),
+    #[error("split-tunnel state exceeds the {limit_bytes}-byte limit")]
+    SplitTunnelStateTooLarge { limit_bytes: usize },
+    #[error("split-tunnel memory state is unavailable")]
+    SplitTunnelStateLock,
 }
 
 pub struct SystemSecretStore {
