@@ -11,6 +11,8 @@ pub struct ProbeRequest {}
 pub struct ProbeResponse {
     pub platform: String,
     pub android_api_level: Option<u32>,
+    pub address_split_tunnel: bool,
+    pub application_split_tunnel: bool,
     pub backend_available: bool,
     pub permission_granted: bool,
     pub backend_version: Option<String>,
@@ -54,7 +56,7 @@ impl fmt::Debug for InstalledApplicationsResponse {
     }
 }
 
-pub const TUNNEL_API_VERSION: u16 = 1;
+pub const TUNNEL_API_VERSION: u16 = 2;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

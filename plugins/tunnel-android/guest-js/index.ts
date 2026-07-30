@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 export interface TunnelProbe {
   platform: string;
+  androidApiLevel: number | null;
+  addressSplitTunnel: boolean;
+  applicationSplitTunnel: boolean;
   backendAvailable: boolean;
   permissionGranted: boolean;
   backendVersion: string | null;

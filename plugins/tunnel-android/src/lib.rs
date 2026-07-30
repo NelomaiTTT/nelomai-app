@@ -130,8 +130,8 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         Ok(TunnelCapabilities {
             platform: TunnelPlatform::Android,
             android_api_level: probe.android_api_level,
-            address_split_tunnel: probe.android_api_level.is_some_and(|level| level >= 33),
-            application_split_tunnel: probe.android_api_level.is_some_and(|level| level >= 33),
+            address_split_tunnel: probe.address_split_tunnel,
+            application_split_tunnel: probe.application_split_tunnel,
         })
     }
 }

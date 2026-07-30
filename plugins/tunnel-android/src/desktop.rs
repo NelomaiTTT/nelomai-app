@@ -18,6 +18,8 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(ProbeResponse {
             platform: std::env::consts::OS.to_string(),
             android_api_level: None,
+            address_split_tunnel: false,
+            application_split_tunnel: false,
             backend_available: false,
             permission_granted: false,
             backend_version: None,

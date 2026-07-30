@@ -2,4 +2,15 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- A VPN client needs the complete local app list for user-selected split tunneling. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <application>
+        <service
+            android:name=".NelomaiVpnService"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
+    </application>
 </manifest>

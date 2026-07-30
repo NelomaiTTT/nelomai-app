@@ -496,16 +496,16 @@ git commit -m "Добавить локальный список Android прил
 - Create: `plugins/tunnel-android/android/src/test/java/AndroidSplitTunnelTest.kt`
 - Modify: `plugins/tunnel-android/src/models.rs`
 
-- [ ] Add failing tests for tunnel-option validation:
+- [x] Add failing tests for tunnel-option validation:
   - included and excluded packages cannot both be non-empty;
   - package IDs are deduplicated and limited to 512;
   - IPv4 CIDRs are canonical, deduplicated, and limited to 16,384;
   - API 32 converts every option set to empty effective options;
   - API 33 preserves valid options.
-- [ ] Increment `TUNNEL_API_VERSION` to `2` in Rust and Kotlin.
-- [ ] Add `androidApiLevel`, `addressSplitTunnel`, and `applicationSplitTunnel` to the Android probe response; API 32 reports both split capabilities false, API 33+ reports both true.
-- [ ] Register `NelomaiVpnService` with `android.permission.BIND_VPN_SERVICE`, `exported="false"`, and the standard `android.net.VpnService` intent filter.
-- [ ] Implement the no-fork WireGuard hook:
+- [x] Increment `TUNNEL_API_VERSION` to `2` in Rust and Kotlin.
+- [x] Add `androidApiLevel`, `addressSplitTunnel`, and `applicationSplitTunnel` to the Android probe response; API 32 reports both split capabilities false, API 33+ reports both true.
+- [x] Register `NelomaiVpnService` with `android.permission.BIND_VPN_SERVICE`, `exported="false"`, and the standard `android.net.VpnService` intent filter.
+- [x] Implement the no-fork WireGuard hook:
 
 ```kotlin
 class NelomaiVpnService : GoBackend.VpnService() {
@@ -523,30 +523,30 @@ class NelomaiVpnService : GoBackend.VpnService() {
 }
 ```
 
-- [ ] Start `NelomaiVpnService` before constructing or calling `GoBackend`, so the inherited WireGuard service future resolves to the subclass.
-- [ ] Rebuild the parsed WireGuard `Config` through the dependency's structured API:
+- [x] Start `NelomaiVpnService` before constructing or calling `GoBackend`, so the inherited WireGuard service future resolves to the subclass.
+- [x] Rebuild the parsed WireGuard `Config` through the dependency's structured API:
   - copy addresses, DNS, search domains, key pair, optional listen port, and optional MTU from the original `Interface` into `Interface.Builder`;
   - `ExcludeSelected` calls `Interface.Builder.excludeApplications(packageIds)`;
   - `IncludeSelected` calls `Interface.Builder.includeApplications(packageIds)`;
   - do not copy an old included/excluded application set;
   - build the replacement `Interface`, then use `Config.Builder.setInterface(...)` and `addPeers(original.peers)`;
   - never use both application lists.
-- [ ] Feed compact IPv4 CIDRs to `AndroidSplitTunnel` immediately before `GoBackend.setState(UP, config)`.
-- [ ] On API 32 and older:
+- [x] Feed compact IPv4 CIDRs to `AndroidSplitTunnel` immediately before `GoBackend.setState(UP, config)`.
+- [x] On API 32 and older:
   - clear package and route options;
   - keep the original WireGuard config;
   - start every connection mode normally;
   - return a capability flag explaining that split requires Android 13.
-- [ ] Never place excluded routes into WireGuard `AllowedIPs`.
-- [ ] Clear route state and in-memory config references on Stop, failed Start, and plugin shutdown.
-- [ ] Run Kotlin and Rust tests:
+- [x] Never place excluded routes into WireGuard `AllowedIPs`.
+- [x] Clear route state and in-memory config references on Stop, failed Start, and plugin shutdown.
+- [x] Run Kotlin and Rust tests:
 
 ```bash
 ./src-tauri/gen/android/gradlew -p src-tauri/gen/android :tauri-plugin-tunnel-android:test
 cargo test -p tauri-plugin-tunnel-android
 ```
 
-- [ ] Build a debug APK and inspect its manifest:
+- [x] Build a debug APK and inspect its manifest:
 
 ```bash
 pnpm tauri android build --debug

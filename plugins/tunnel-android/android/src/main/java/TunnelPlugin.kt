@@ -17,10 +17,11 @@ import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import java.io.ByteArrayInputStream
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 
-private const val TUNNEL_API_VERSION = 1
+private const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
 
 @InvokeArg
@@ -152,15 +153,14 @@ private object TunnelRuntime {
     fun state(): SessionState = stateGate.current()
 
     fun start(
+        context: Context,
         args: StartTunnelArgs,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
     ) {
-        try {
+        val serviceReady = try {
             validateVersion(args.apiVersion)
-            if (!args.options.isEmpty()) {
-                throw TunnelOperationException("unsupported_tunnel_options")
-            }
+            NelomaiVpnService.ensureStarted(context)
         } catch (error: Throwable) {
             if (args.configurationInitialized) {
                 args.configuration.fill(0)
@@ -168,7 +168,6 @@ private object TunnelRuntime {
             onError(errorCode(error))
             return
         }
-
         when (stateGate.beginStart()) {
             TransitionDecision.ALREADY_COMPLETE -> {
                 args.configuration.fill(0)
@@ -186,9 +185,16 @@ private object TunnelRuntime {
         executor.execute {
             val startedAt = System.nanoTime()
             try {
-                val config = TunnelPayload.consume(args.configuration) { payload ->
+                serviceReady.get(5, TimeUnit.SECONDS)
+                val originalConfig = TunnelPayload.consume(args.configuration) { payload ->
                     Config.parse(ByteArrayInputStream(payload))
                 }
+                val options = AndroidSplitTunnel.resolveOptions(
+                    Build.VERSION.SDK_INT,
+                    args.options,
+                )
+                val config = AndroidSplitTunnel.applyOptions(originalConfig, options)
+                AndroidSplitTunnel.replaceExcludedRoutes(options.excludedRoutes)
 
                 val state = requireBackend().setState(tunnel, Tunnel.State.UP, config)
                 val resolved = if (state == Tunnel.State.UP) {
@@ -202,6 +208,7 @@ private object TunnelRuntime {
                 if (args.configurationInitialized) {
                     args.configuration.fill(0)
                 }
+                AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
                 onError(errorCode(error))
             }
@@ -236,6 +243,7 @@ private object TunnelRuntime {
             val startedAt = System.nanoTime()
             try {
                 val state = requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                AndroidSplitTunnel.clear()
                 val resolved = if (state == Tunnel.State.DOWN) {
                     SessionState.STOPPED
                 } else {
@@ -244,6 +252,7 @@ private object TunnelRuntime {
                 stateGate.complete(resolved)
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
+                AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
                 onError(errorCode(error))
             }
@@ -261,6 +270,7 @@ private object TunnelRuntime {
 
     private fun errorCode(error: Throwable): String = when (error) {
         is TunnelOperationException -> error.code
+        is AndroidSplitTunnelException -> error.code
         else -> "tunnel_backend_error"
     }
 
@@ -289,6 +299,11 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         val response = JSObject()
         response.put("platform", "android")
         response.put("androidApiLevel", Build.VERSION.SDK_INT)
+        response.put("addressSplitTunnel", Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+        response.put(
+            "applicationSplitTunnel",
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+        )
         response.put("permissionGranted", VpnService.prepare(activity.applicationContext) == null)
 
         try {
@@ -352,6 +367,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         TunnelRuntime.start(
+            activity.applicationContext,
             args,
             { state, duration -> resolveOperation(invoke, state, duration) },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
@@ -395,6 +411,12 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         val granted = result.resultCode == Activity.RESULT_OK &&
             VpnService.prepare(activity.applicationContext) == null
         resolvePermission(invoke, granted)
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
+    override fun onDestroy() {
+        AndroidSplitTunnel.clear()
+        super.onDestroy()
     }
 
     private fun resolvePermission(invoke: Invoke, granted: Boolean) {
