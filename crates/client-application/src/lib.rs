@@ -252,6 +252,7 @@ where
                 compatibility: None,
             })
             .map_err(|_| ApplicationError::Storage)?;
+        self.core.reset_split_tunnel_state().await?;
         self.core.bootstrap(now_unix).await.map_err(Into::into)
     }
 
@@ -299,6 +300,31 @@ where
 
     pub async fn split_tunnel_warning(&self) -> Option<String> {
         self.core.split_tunnel_warning().await
+    }
+
+    pub fn cached_split_tunnel_policy(
+        &self,
+    ) -> Result<Option<SplitTunnelPolicy>, ApplicationError> {
+        self.core.cached_split_tunnel_policy().map_err(Into::into)
+    }
+
+    pub async fn split_tunnel_capabilities(
+        &self,
+    ) -> Result<nelomai_client_tunnel::TunnelCapabilities, ApplicationError> {
+        self.core
+            .split_tunnel_capabilities()
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn split_tunnel_settings_require_reconnect(
+        &self,
+        request: &SplitTunnelSettingsUpdate,
+    ) -> Result<bool, ApplicationError> {
+        self.core
+            .split_tunnel_settings_require_reconnect(request)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn bind_peer(

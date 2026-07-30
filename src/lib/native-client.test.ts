@@ -118,4 +118,35 @@ describe("native client", () => {
     expect(invoke).toHaveBeenNthCalledWith(3, "app_update_install");
     expect(invoke).toHaveBeenNthCalledWith(4, "app_update_restart");
   });
+
+  it("routes split-tunnel state, inventory, save, and refresh through native commands", async () => {
+    const invoke = vi.fn().mockResolvedValue({});
+    const client = createNativeClient(invoke);
+    const request = {
+      mode: "exclude_selected" as const,
+      excludeLocalNetworks: true,
+      selectedPackages: [
+        {
+          packageId: "com.example.browser",
+          displayName: "Browser",
+        },
+      ],
+    };
+
+    await client.splitTunnelState();
+    await client.splitTunnelInstalledApplications();
+    await client.saveSplitTunnel(request, true);
+    await client.refreshSplitTunnel();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "app_split_tunnel_state");
+    expect(invoke).toHaveBeenNthCalledWith(
+      2,
+      "app_split_tunnel_installed_applications",
+    );
+    expect(invoke).toHaveBeenNthCalledWith(3, "app_split_tunnel_save", {
+      request,
+      confirmReconnect: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, "app_split_tunnel_refresh");
+  });
 });

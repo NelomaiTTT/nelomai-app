@@ -624,6 +624,65 @@ async fn inactive_split_modes_sync_without_reconnect() {
 }
 
 #[tokio::test]
+async fn settings_confirmation_depends_on_the_effective_connected_policy() {
+    let changed_request = SplitTunnelSettingsUpdate {
+        mode: SplitTunnelMode::ExcludeSelected,
+        exclude_local_networks: true,
+        selected_packages: vec![SplitTunnelSelectedPackage {
+            package_id: "com.example.chat".to_string(),
+            display_name: "Chat".to_string(),
+        }],
+    };
+
+    let active = coordinator_fixture(android_35_capabilities());
+    active.core.set_split_tunnel_installed_packages(installed());
+    active
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    active
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+    assert!(active
+        .core
+        .split_tunnel_settings_require_reconnect(&changed_request)
+        .await
+        .unwrap());
+
+    let standalone = coordinator_fixture(android_35_capabilities());
+    standalone
+        .core
+        .set_split_tunnel_installed_packages(installed());
+    standalone
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    standalone
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::Standalone,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_010,
+        )
+        .await
+        .unwrap();
+    assert!(!standalone
+        .core
+        .split_tunnel_settings_require_reconnect(&changed_request)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
 async fn settings_save_updates_cache_and_unknown_format_keeps_the_working_policy() {
     let fixture = coordinator_fixture(android_35_capabilities());
     fixture

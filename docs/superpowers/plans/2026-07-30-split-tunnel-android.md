@@ -613,19 +613,19 @@ git commit -m "Добавить исключение локальных сете
 - Create: `src/lib/SplitTunnelSettings.test.ts`
 - Modify: `src/routes/+page.svelte`
 
-- [ ] Add failing command and model tests for:
+- [x] Add failing command and model tests for:
   - reading effective settings and capability;
   - scanning installed Android applications;
   - saving mode, local-network toggle, and selected applications;
   - forcing a local refresh;
   - confirming reconnect when effective policy changes.
-- [ ] Construct `FileSplitTunnelStore` from `<app_data>/split-tunnel` in `src-tauri/src/lib.rs` and initialize production through `ClientApplication::with_split_tunnel_store(...)`.
-- [ ] Start one scheduler per process:
+- [x] Construct `FileSplitTunnelStore` from `<app_data>/split-tunnel` in `src-tauri/src/lib.rs` and initialize production through `ClientApplication::with_split_tunnel_store(...)`.
+- [x] Start one scheduler per process:
   - revision check every five minutes while authenticated and running;
   - full refresh no more often than 24 hours unless force revision or local save requires it;
   - no overlapping requests through a Tokio mutex;
   - suspend ordinary polling while signed out.
-- [ ] Add Tauri commands:
+- [x] Add Tauri commands:
 
 ```rust
 app_split_tunnel_state
@@ -634,7 +634,7 @@ app_split_tunnel_save
 app_split_tunnel_refresh
 ```
 
-- [ ] Build the settings view with:
+- [x] Build the settings view with:
   - mode selector;
   - `Исключить локальные адреса` toggle, on by default;
   - regular applications shown first;
@@ -643,18 +643,18 @@ app_split_tunnel_refresh
   - locked mandatory exclusions;
   - suggestions from case-insensitive display-name fragments;
   - no suggestion when package ID is already mandatory.
-- [ ] On Android 12 and older, keep settings readable/savable but show `Split-tunnel доступен на Android 13 и новее`; do not disable Start or hide connection modes.
-- [ ] In include-only mode with no effective selected app, disable Start with `Выберите хотя бы одно приложение для подключения через VPN`.
-- [ ] While connected, ask for confirmation only when the effective policy hash changes; `Tic + standalone` saves without reconnect.
-- [ ] Surface cached/offline state as a warning and never block Start.
-- [ ] Run frontend tests:
+- [x] On Android 12 and older, keep settings readable/savable but show `Split-tunnel доступен на Android 13 и новее`; do not disable Start or hide connection modes.
+- [x] In include-only mode with no effective selected app, disable Start with `Выберите хотя бы одно приложение для подключения через VPN`.
+- [x] While connected, ask for confirmation only when the effective policy hash changes; `Tic + standalone` saves without reconnect.
+- [x] Surface cached/offline state as a warning and never block Start.
+- [x] Run frontend tests:
 
 ```bash
 pnpm test -- --run
 pnpm check
 ```
 
-- [ ] Run Tauri and Rust tests:
+- [x] Run Tauri and Rust tests:
 
 ```bash
 cargo test --workspace

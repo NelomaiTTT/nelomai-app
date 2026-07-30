@@ -13,6 +13,12 @@ import type {
   StartCommandRequest,
   UpdateStatus,
 } from "./app-model";
+import type {
+  InstalledApplication,
+  SplitTunnelSaveResult,
+  SplitTunnelSettingsUpdate,
+  SplitTunnelState,
+} from "./split-tunnel";
 
 type Invoke = (
   command: string,
@@ -75,6 +81,22 @@ export function createNativeClient(
       invoke("app_update_install") as Promise<UpdateStatus>,
     restartForUpdate: () =>
       invoke("app_update_restart") as Promise<void>,
+    splitTunnelState: () =>
+      invoke("app_split_tunnel_state") as Promise<SplitTunnelState>,
+    splitTunnelInstalledApplications: () =>
+      invoke(
+        "app_split_tunnel_installed_applications",
+      ) as Promise<InstalledApplication[]>,
+    saveSplitTunnel: (
+      request: SplitTunnelSettingsUpdate,
+      confirmReconnect: boolean,
+    ) =>
+      invoke("app_split_tunnel_save", {
+        request,
+        confirmReconnect,
+      }) as Promise<SplitTunnelSaveResult>,
+    refreshSplitTunnel: () =>
+      invoke("app_split_tunnel_refresh") as Promise<SplitTunnelState>,
     logout: () => invoke("app_logout") as Promise<void>,
   };
 }

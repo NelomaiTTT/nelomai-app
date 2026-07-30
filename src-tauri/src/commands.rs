@@ -1,17 +1,20 @@
 use crate::diagnostics::AppDiagnostics;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
-use crate::NativeApplication;
+use crate::{NativeApplication, SplitTunnelScheduler};
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
 use nelomai_client_core::{ConnectOptions, CoreApiError, CoreError, CoreState, Phase};
+use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
-    Platform, ProbeResults, RouteMode, TicConnectionMode,
+    Platform, ProbeResults, RouteMode, SplitTunnelMode, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, State};
+use tauri_plugin_tunnel_android::TunnelAndroidExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,7 +224,9 @@ pub async fn app_state(
 
 #[tauri::command]
 pub async fn app_login(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
     request: LoginCommandRequest,
 ) -> Result<Bootstrap, CommandError> {
@@ -240,19 +245,27 @@ pub async fn app_login(
         )
         .await
         .map_err(CommandError::from)?;
+    refresh_installed_applications(&app, &application)?;
     observe_and_schedule_update(
         application.inner().clone(),
         updater.inner().clone(),
         &response,
+    );
+    schedule_split_tunnel_sync(
+        application.inner().clone(),
+        split_tunnel_scheduler.inner().clone(),
     );
     Ok(response)
 }
 
 #[tauri::command]
 pub async fn app_bootstrap(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<Bootstrap, CommandError> {
+    refresh_installed_applications(&app, &application)?;
     let response = application
         .bootstrap(now_unix())
         .await
@@ -261,6 +274,10 @@ pub async fn app_bootstrap(
         application.inner().clone(),
         updater.inner().clone(),
         &response,
+    );
+    schedule_split_tunnel_sync(
+        application.inner().clone(),
+        split_tunnel_scheduler.inner().clone(),
     );
     Ok(response)
 }
@@ -331,9 +348,11 @@ pub async fn app_prepare_tunnel(
 
 #[tauri::command]
 pub async fn app_start(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     request: StartCommandRequest,
 ) -> Result<Connection, CommandError> {
+    refresh_installed_applications(&app, &application)?;
     application
         .start(
             ConnectOptions {
@@ -474,6 +493,138 @@ pub fn app_update_restart(
     app.restart();
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitTunnelCapabilitiesResponse {
+    platform: &'static str,
+    android_api_level: Option<u32>,
+    address_split_tunnel: bool,
+    application_split_tunnel: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitTunnelStateResponse {
+    available: bool,
+    enabled: bool,
+    mode: SplitTunnelMode,
+    exclude_local_networks: bool,
+    mandatory_excluded_packages: Vec<String>,
+    suggested_name_fragments: Vec<String>,
+    selected_packages: Vec<String>,
+    warning: Option<String>,
+    capabilities: SplitTunnelCapabilitiesResponse,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApplicationResponse {
+    package_id: String,
+    display_name: String,
+    system: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitTunnelSelectedPackageRequest {
+    package_id: String,
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitTunnelSaveRequest {
+    mode: SplitTunnelMode,
+    exclude_local_networks: bool,
+    selected_packages: Vec<SplitTunnelSelectedPackageRequest>,
+}
+
+impl From<SplitTunnelSaveRequest> for SplitTunnelSettingsUpdate {
+    fn from(request: SplitTunnelSaveRequest) -> Self {
+        Self {
+            mode: request.mode,
+            exclude_local_networks: request.exclude_local_networks,
+            selected_packages: request
+                .selected_packages
+                .into_iter()
+                .map(|package| SplitTunnelSelectedPackage {
+                    package_id: package.package_id,
+                    display_name: package.display_name,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitTunnelSaveResponse {
+    saved: bool,
+    requires_reconnect_confirmation: bool,
+    state: SplitTunnelStateResponse,
+}
+
+#[tauri::command]
+pub async fn app_split_tunnel_state(
+    application: State<'_, Arc<NativeApplication>>,
+    split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
+) -> Result<SplitTunnelStateResponse, CommandError> {
+    let _ = split_tunnel_scheduler
+        .synchronize(&application, false)
+        .await;
+    split_tunnel_state(&application).await
+}
+
+#[tauri::command]
+pub fn app_split_tunnel_installed_applications(
+    app: AppHandle,
+    application: State<'_, Arc<NativeApplication>>,
+) -> Result<Vec<InstalledApplicationResponse>, CommandError> {
+    refresh_installed_applications(&app, &application)
+}
+
+#[tauri::command]
+pub async fn app_split_tunnel_save(
+    application: State<'_, Arc<NativeApplication>>,
+    request: SplitTunnelSaveRequest,
+    confirm_reconnect: bool,
+) -> Result<SplitTunnelSaveResponse, CommandError> {
+    let request = SplitTunnelSettingsUpdate::from(request);
+    let reconnect = application
+        .split_tunnel_settings_require_reconnect(&request)
+        .await
+        .map_err(CommandError::from)?;
+    if reconnect && !confirm_reconnect {
+        return Ok(SplitTunnelSaveResponse {
+            saved: false,
+            requires_reconnect_confirmation: true,
+            state: split_tunnel_state(&application).await?,
+        });
+    }
+    application
+        .save_split_tunnel_settings(&request, now_unix())
+        .await
+        .map_err(CommandError::from)?;
+    Ok(SplitTunnelSaveResponse {
+        saved: true,
+        requires_reconnect_confirmation: false,
+        state: split_tunnel_state(&application).await?,
+    })
+}
+
+#[tauri::command]
+pub async fn app_split_tunnel_refresh(
+    app: AppHandle,
+    application: State<'_, Arc<NativeApplication>>,
+    split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
+) -> Result<SplitTunnelStateResponse, CommandError> {
+    refresh_installed_applications(&app, &application)?;
+    split_tunnel_scheduler
+        .synchronize(&application, true)
+        .await?;
+    split_tunnel_state(&application).await
+}
+
 #[tauri::command]
 pub async fn app_logout(
     application: State<'_, Arc<NativeApplication>>,
@@ -498,6 +649,100 @@ fn schedule_automatic_update(application: Arc<NativeApplication>, updater: Arc<N
         };
         let _ = updater.install_automatically(&access_token).await;
     });
+}
+
+fn schedule_split_tunnel_sync(
+    application: Arc<NativeApplication>,
+    scheduler: Arc<SplitTunnelScheduler>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let _ = scheduler.synchronize(&application, false).await;
+    });
+}
+
+async fn split_tunnel_state(
+    application: &NativeApplication,
+) -> Result<SplitTunnelStateResponse, CommandError> {
+    let capabilities = application
+        .split_tunnel_capabilities()
+        .await
+        .map_err(CommandError::from)?;
+    let warning = application.split_tunnel_warning().await;
+    let policy = application
+        .cached_split_tunnel_policy()
+        .map_err(CommandError::from)?;
+    Ok(match policy {
+        Some(policy) => SplitTunnelStateResponse {
+            available: true,
+            enabled: policy.enabled,
+            mode: policy.mode,
+            exclude_local_networks: policy.exclude_local_networks,
+            mandatory_excluded_packages: policy.mandatory_excluded_packages,
+            suggested_name_fragments: policy.suggested_name_fragments,
+            selected_packages: policy.selected_packages,
+            warning,
+            capabilities: capabilities.into(),
+        },
+        None => SplitTunnelStateResponse {
+            available: false,
+            enabled: false,
+            mode: SplitTunnelMode::ExcludeSelected,
+            exclude_local_networks: true,
+            mandatory_excluded_packages: Vec::new(),
+            suggested_name_fragments: Vec::new(),
+            selected_packages: Vec::new(),
+            warning,
+            capabilities: capabilities.into(),
+        },
+    })
+}
+
+impl From<TunnelCapabilities> for SplitTunnelCapabilitiesResponse {
+    fn from(capabilities: TunnelCapabilities) -> Self {
+        Self {
+            platform: match capabilities.platform {
+                TunnelPlatform::Android => "android",
+                TunnelPlatform::Windows => "windows",
+                TunnelPlatform::Linux => "linux",
+                TunnelPlatform::Macos => "macos",
+                TunnelPlatform::Unknown => "unknown",
+            },
+            android_api_level: capabilities.android_api_level,
+            address_split_tunnel: capabilities.address_split_tunnel,
+            application_split_tunnel: capabilities.application_split_tunnel,
+        }
+    }
+}
+
+fn refresh_installed_applications(
+    app: &AppHandle,
+    application: &NativeApplication,
+) -> Result<Vec<InstalledApplicationResponse>, CommandError> {
+    let response = app.tunnel_android().installed_applications().map_err(|_| {
+        CommandError::new(
+            "installed_applications_unavailable",
+            "Не удалось получить список приложений",
+        )
+    })?;
+    application.set_split_tunnel_installed_packages(
+        response
+            .applications
+            .iter()
+            .map(|application| SplitTunnelSelectedPackage {
+                package_id: application.package_id.clone(),
+                display_name: application.display_name.clone(),
+            })
+            .collect(),
+    );
+    Ok(response
+        .applications
+        .into_iter()
+        .map(|application| InstalledApplicationResponse {
+            package_id: application.package_id,
+            display_name: application.display_name,
+            system: application.system,
+        })
+        .collect())
 }
 
 fn update_command_error(error: String) -> CommandError {
@@ -561,5 +806,34 @@ mod tests {
 
         assert!(!json.contains("PrivateKey"));
         assert!(!json.contains("configuration"));
+    }
+
+    #[test]
+    fn split_tunnel_command_models_use_camel_case_without_application_icons() {
+        let request: SplitTunnelSaveRequest = serde_json::from_value(serde_json::json!({
+            "mode": "exclude_selected",
+            "excludeLocalNetworks": true,
+            "selectedPackages": [{
+                "packageId": "com.example.browser",
+                "displayName": "Browser"
+            }]
+        }))
+        .unwrap();
+        let update = SplitTunnelSettingsUpdate::from(request);
+        assert_eq!(update.mode, SplitTunnelMode::ExcludeSelected);
+        assert!(update.exclude_local_networks);
+        assert_eq!(
+            update.selected_packages[0].package_id,
+            "com.example.browser"
+        );
+
+        let response = InstalledApplicationResponse {
+            package_id: "com.example.browser".to_string(),
+            display_name: "Browser".to_string(),
+            system: false,
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["packageId"], "com.example.browser");
+        assert!(value.get("icon").is_none());
     }
 }

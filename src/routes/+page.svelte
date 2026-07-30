@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
 
   import {
     bindingRequest,
@@ -21,6 +22,12 @@
     nativeClient,
     type LoginRequest,
   } from "$lib/native-client";
+  import {
+    emptyIncludeSelection,
+    type InstalledApplication,
+    type SplitTunnelSettingsUpdate,
+    type SplitTunnelState,
+  } from "$lib/split-tunnel";
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
@@ -41,6 +48,15 @@
   let updateStatus = $state<UpdateStatus | null>(null);
   let updateBusy = $state(false);
   let updateTimer: number | null = null;
+  let splitTunnelState = $state<SplitTunnelState | null>(null);
+  let splitTunnelApplications = $state<InstalledApplication[]>([]);
+  let splitTunnelOpen = $state(false);
+  let splitTunnelBusy = $state(false);
+  let splitTunnelLoaded = $state(false);
+  let splitTunnelBlocksStart = $derived(
+    splitTunnelState !== null &&
+      emptyIncludeSelection(splitTunnelState, splitTunnelApplications),
+  );
 
   let login = $state("");
   let password = $state("");
@@ -134,6 +150,7 @@
     phase = state.phase;
     connection = state.connection;
     view = viewForPhase(state.phase);
+    await loadSplitTunnel(false);
     if (state.phase === "ready") void refreshProbes();
   }
 
@@ -201,6 +218,10 @@
 
   async function toggleConnection() {
     if (busy) return;
+    if (phase !== "connected" && splitTunnelBlocksStart) {
+      splitTunnelOpen = true;
+      return;
+    }
     busy = true;
     error = null;
     try {
@@ -353,6 +374,10 @@
       password = "";
       diagnosticsStatus = null;
       updateStatus = null;
+      splitTunnelState = null;
+      splitTunnelApplications = [];
+      splitTunnelOpen = false;
+      splitTunnelLoaded = false;
       clearUpdateTimer();
       phase = "signed_out";
       view = "sign_in";
@@ -438,6 +463,43 @@
       window.clearTimeout(updateTimer);
       updateTimer = null;
     }
+  }
+
+  async function loadSplitTunnel(force: boolean) {
+    if (splitTunnelBusy) return;
+    splitTunnelBusy = true;
+    try {
+      splitTunnelApplications =
+        await nativeClient.splitTunnelInstalledApplications();
+      splitTunnelState = force
+        ? await nativeClient.refreshSplitTunnel()
+        : await nativeClient.splitTunnelState();
+    } catch {
+      if (force) throw new Error("split_tunnel_refresh_failed");
+    } finally {
+      splitTunnelLoaded = true;
+      splitTunnelBusy = false;
+    }
+  }
+
+  async function openSplitTunnel() {
+    await loadSplitTunnel(false);
+    if (splitTunnelState) splitTunnelOpen = true;
+  }
+
+  async function saveSplitTunnel(
+    request: SplitTunnelSettingsUpdate,
+  ): Promise<boolean> {
+    let response = await nativeClient.saveSplitTunnel(request, false);
+    if (response.requiresReconnectConfirmation) {
+      const confirmed = window.confirm(
+        "Чтобы применить настройки, текущее подключение будет кратковременно перезапущено. Продолжить?",
+      );
+      if (!confirmed) return false;
+      response = await nativeClient.saveSplitTunnel(request, true);
+    }
+    splitTunnelState = response.state;
+    return response.saved;
   }
 
   function updateProgress(status: UpdateStatus): string {
@@ -658,13 +720,18 @@
             class="connect-button"
             type="button"
             onclick={toggleConnection}
-            disabled={busy}
+            disabled={busy || (!splitTunnelLoaded && phase !== "connected") || splitTunnelBlocksStart}
           >
             <span>{phase === "connected" ? "Стоп" : "Старт"}</span>
             <small>{busy ? phaseLabels[phase] : "Нажмите для переключения"}</small>
           </button>
 
           {#if error}<p class="error-message">{error}</p>{/if}
+          {#if splitTunnelBlocksStart && phase !== "connected"}
+            <p class="error-message">
+              Выберите хотя бы одно приложение для подключения через VPN
+            </p>
+          {/if}
         </section>
 
         <aside class="panel settings-panel">
@@ -747,6 +814,14 @@
               />
             </label>
           {/if}
+          <button
+            class="secondary-button"
+            type="button"
+            onclick={openSplitTunnel}
+            disabled={busy || splitTunnelBusy}
+          >
+            {splitTunnelBusy ? "Открываем…" : "Split-tunnel"}
+          </button>
           {#if pinnedStray || (selectedLayer === "stray" && phase === "connected")}
             <button
               class="secondary-button"
@@ -830,6 +905,17 @@
     {/if}
   </section>
 </main>
+
+{#if splitTunnelOpen && splitTunnelState}
+  <SplitTunnelSettings
+    state={splitTunnelState}
+    applications={splitTunnelApplications}
+    busy={splitTunnelBusy}
+    onclose={() => (splitTunnelOpen = false)}
+    onsave={saveSplitTunnel}
+    onrefresh={() => loadSplitTunnel(true)}
+  />
+{/if}
 
 <style>
   :global(*) {

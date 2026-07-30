@@ -257,6 +257,76 @@ where
         self.split_tunnel_warning.lock().await.clone()
     }
 
+    pub fn cached_split_tunnel_policy(&self) -> Result<Option<SplitTunnelPolicy>, CoreError> {
+        self.cached_policy_for_start()
+    }
+
+    pub async fn split_tunnel_capabilities(&self) -> Result<TunnelCapabilities, CoreError> {
+        self.tunnel.capabilities().await.map_err(Into::into)
+    }
+
+    pub async fn split_tunnel_settings_require_reconnect(
+        &self,
+        request: &SplitTunnelSettingsUpdate,
+    ) -> Result<bool, CoreError> {
+        let current = {
+            let state = self.state.lock().await;
+            (state.phase == Phase::Connected)
+                .then(|| state.connection.clone())
+                .flatten()
+        };
+        let Some(connection) = current else {
+            return Ok(false);
+        };
+        let Some(policy) = self.cached_policy_for_start()? else {
+            return Ok(false);
+        };
+        let capabilities = self.tunnel.capabilities().await?;
+        let packages = self
+            .split_tunnel_packages
+            .read()
+            .map(|packages| packages.clone())
+            .unwrap_or_default();
+        let current = EffectiveSplitTunnelPolicy::build(
+            &policy,
+            &packages,
+            capabilities,
+            connection.layer,
+            connection.route_mode,
+        )
+        .map_err(|error| CoreError::SplitTunnel(error.stable_code().to_string()))?;
+        let mut proposed = policy;
+        proposed.mode = request.mode;
+        proposed.exclude_local_networks = request.exclude_local_networks;
+        proposed.selected_packages = request
+            .selected_packages
+            .iter()
+            .map(|package| package.package_id.clone())
+            .collect();
+        let proposed = EffectiveSplitTunnelPolicy::build(
+            &proposed,
+            &packages,
+            capabilities,
+            connection.layer,
+            connection.route_mode,
+        )
+        .map_err(|error| CoreError::SplitTunnel(error.stable_code().to_string()))?;
+        Ok(current.options != proposed.options)
+    }
+
+    pub async fn reset_split_tunnel_state(&self) -> Result<(), CoreError> {
+        let _guard = self.split_tunnel_gate.lock().await;
+        self.split_tunnel_store
+            .delete()
+            .map_err(|_| CoreError::Storage)?;
+        if let Ok(mut packages) = self.split_tunnel_packages.write() {
+            packages.clear();
+        }
+        *self.split_tunnel_options.lock().await = TunnelOptions::default();
+        *self.split_tunnel_warning.lock().await = None;
+        Ok(())
+    }
+
     pub async fn synchronize_split_tunnel(
         &self,
         now_unix: i64,

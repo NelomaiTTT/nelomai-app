@@ -614,6 +614,14 @@ where
                 compatibility: None,
             })
             .map_err(|_| CoreError::Storage)?;
+        self.split_tunnel_store
+            .delete()
+            .map_err(|_| CoreError::Storage)?;
+        if let Ok(mut packages) = self.split_tunnel_packages.write() {
+            packages.clear();
+        }
+        *self.split_tunnel_options.lock().await = TunnelOptions::default();
+        *self.split_tunnel_warning.lock().await = None;
         *self.state.lock().await = CoreState::default();
         self.logger.record(CoreLogEvent {
             kind: "auth.signed_out",
