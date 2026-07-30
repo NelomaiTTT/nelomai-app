@@ -16,7 +16,11 @@ struct RecordingBackend {
 }
 
 impl ServiceTunnelBackend for RecordingBackend {
-    fn start(&mut self, configuration: &str) -> Result<ServiceTunnelState, ServiceError> {
+    fn start(
+        &mut self,
+        configuration: &str,
+        _options: &nelomai_client_tunnel::DesktopTunnelOptions,
+    ) -> Result<ServiceTunnelState, ServiceError> {
         self.starts.push(configuration.to_string());
         self.state = ServiceTunnelState::Running;
         Ok(self.state)

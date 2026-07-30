@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use nelomai_client_api::TokenResponse;
 use nelomai_client_core::{
-    split_tunnel_active, ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreLogEvent,
-    CoreLogger, EffectiveSplitTunnelPolicy, Phase, SplitTunnelContext, SplitTunnelPolicyError,
-    SplitTunnelSyncOutcome,
+    split_tunnel_active, ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError,
+    CoreLogEvent, CoreLogger, EffectiveSplitTunnelPolicy, Phase, SplitTunnelContext,
+    SplitTunnelPolicyError, SplitTunnelSyncOutcome,
 };
 use nelomai_client_storage::{
     MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StorageError, StoredAuth,
+    StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
     TunnelCapabilities, TunnelController, TunnelError, TunnelOptions, TunnelPlatform,
@@ -573,6 +574,108 @@ async fn failed_reapply_and_failed_rollback_leave_the_tunnel_stopped() {
 }
 
 #[tokio::test]
+async fn settings_save_reports_apply_and_rollback_failures() {
+    for (failed_starts, expected_code, expected_phase) in [
+        (1, "split_tunnel_apply_failed", Phase::Connected),
+        (2, "split_tunnel_rollback_failed", Phase::Ready),
+    ] {
+        let fixture = coordinator_fixture(android_35_capabilities());
+        fixture
+            .core
+            .synchronize_split_tunnel(1_000, false)
+            .await
+            .unwrap();
+        fixture
+            .core
+            .start(ConnectOptions::android_default(), 1_010)
+            .await
+            .unwrap();
+
+        let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+        changed.revision = 8;
+        changed.policy_hash = format!("sha256:{}", "f".repeat(64));
+        changed.selected_packages = vec!["com.example.chat".to_string()];
+        fixture.api.set_policy(changed);
+        fixture
+            .tunnel
+            .fail_next_starts
+            .store(failed_starts, Ordering::SeqCst);
+
+        let error = fixture
+            .core
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: SplitTunnelMode::ExcludeSelected,
+                    exclude_local_networks: true,
+                    selected_packages: vec![SplitTunnelSelectedPackage {
+                        package_id: "com.example.chat".to_string(),
+                        display_name: "Chat".to_string(),
+                    }],
+                },
+                1_100,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoreError::SplitTunnel(ref code) if code == expected_code
+        ));
+        assert_eq!(fixture.core.state().await.phase, expected_phase);
+        assert_eq!(
+            fixture.core.split_tunnel_warning().await.as_deref(),
+            Some(expected_code)
+        );
+    }
+}
+
+#[tokio::test]
+async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
+    let api = Arc::new(CoordinatorApi::new());
+    let secret_store = Arc::new(TestSecretStore(Mutex::new(Some(StoredAuth {
+        install_secret: "install".to_string(),
+        access_token: Some("access".to_string()),
+        refresh_token: Some("refresh".to_string()),
+        saved_connection: None,
+        pinned_connection: None,
+        compatibility: None,
+    }))));
+    let tunnel = Arc::new(CoordinatorTunnel {
+        capabilities: android_35_capabilities(),
+        ..CoordinatorTunnel::default()
+    });
+    let split_store = Arc::new(FailingSplitTunnelStore::default());
+    let logger = Arc::new(TestLogger::default());
+    let core = ClientCore::with_split_tunnel_store(
+        api,
+        secret_store,
+        split_store.clone(),
+        tunnel.clone(),
+        logger.clone(),
+    );
+    core.set_split_tunnel_installed_packages(installed());
+    core.synchronize_split_tunnel(1_000, false).await.unwrap();
+    split_store.fail_saves.store(true, Ordering::SeqCst);
+
+    core.start(ConnectOptions::android_default(), 1_010)
+        .await
+        .expect("a bookkeeping failure must not turn a running tunnel into a failed start");
+
+    assert_eq!(core.state().await.phase, Phase::Connected);
+    assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Running);
+    assert_eq!(
+        core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_state_save_failed")
+    );
+    assert!(logger
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "split_tunnel.state_record_failed"));
+}
+
+#[tokio::test]
 async fn inactive_split_modes_sync_without_reconnect() {
     for (capabilities, options) in [
         (
@@ -875,6 +978,40 @@ impl SecretStore for TestSecretStore {
 
     fn delete(&self) -> Result<(), StorageError> {
         *self.0.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FailingSplitTunnelStore {
+    state: Mutex<StoredSplitTunnelState>,
+    fail_saves: AtomicBool,
+}
+
+impl SplitTunnelStore for FailingSplitTunnelStore {
+    fn load(&self) -> Result<StoredSplitTunnelState, StorageError> {
+        self.state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| StorageError::SplitTunnelStateLock)
+    }
+
+    fn save(&self, state: &StoredSplitTunnelState) -> Result<(), StorageError> {
+        if self.fail_saves.load(Ordering::SeqCst) {
+            return Err(StorageError::SplitTunnelStateLock);
+        }
+        *self
+            .state
+            .lock()
+            .map_err(|_| StorageError::SplitTunnelStateLock)? = state.clone();
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), StorageError> {
+        *self
+            .state
+            .lock()
+            .map_err(|_| StorageError::SplitTunnelStateLock)? = StoredSplitTunnelState::default();
         Ok(())
     }
 }

@@ -240,6 +240,28 @@ pub enum SplitTunnelSyncOutcome {
     UnsupportedPolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectedPolicyApplyOutcome {
+    Unchanged,
+    Applied,
+    RolledBack,
+    Failed,
+}
+
+impl ConnectedPolicyApplyOutcome {
+    fn reconnected(self) -> bool {
+        !matches!(self, Self::Unchanged)
+    }
+
+    fn error_code(self) -> Option<&'static str> {
+        match self {
+            Self::Unchanged | Self::Applied => None,
+            Self::RolledBack => Some("split_tunnel_apply_failed"),
+            Self::Failed => Some("split_tunnel_rollback_failed"),
+        }
+    }
+}
+
 impl<A, S, T, L> ClientCore<A, S, T, L>
 where
     A: CoreApi,
@@ -381,13 +403,15 @@ where
                 });
             if let Some(policy) = needs_retry.then(|| state.cached_policy.clone()).flatten() {
                 *self.split_tunnel_warning.lock().await = None;
-                let reconnected = self
+                let outcome = self
                     .apply_policy_if_connected(&policy, &mut state, &mut access_token, now_unix)
                     .await?;
                 self.split_tunnel_store
                     .save(&state)
                     .map_err(|_| CoreError::Storage)?;
-                return Ok(SplitTunnelSyncOutcome::Updated { reconnected });
+                return Ok(SplitTunnelSyncOutcome::Updated {
+                    reconnected: outcome.reconnected(),
+                });
             }
             self.split_tunnel_store
                 .save(&state)
@@ -429,16 +453,18 @@ where
         *self.split_tunnel_warning.lock().await = None;
         let needs_apply =
             changed || state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str());
-        let reconnected = if needs_apply {
+        let outcome = if needs_apply {
             self.apply_policy_if_connected(&policy, &mut state, &mut access_token, now_unix)
                 .await?
         } else {
-            false
+            ConnectedPolicyApplyOutcome::Unchanged
         };
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
-        Ok(SplitTunnelSyncOutcome::Updated { reconnected })
+        Ok(SplitTunnelSyncOutcome::Updated {
+            reconnected: outcome.reconnected(),
+        })
     }
 
     pub async fn save_split_tunnel_settings(
@@ -474,13 +500,18 @@ where
         *self.split_tunnel_warning.lock().await = None;
         let needs_apply =
             changed || state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str());
-        if needs_apply {
+        let outcome = if needs_apply {
             self.apply_policy_if_connected(&policy, &mut state, &mut access_token, now_unix)
-                .await?;
-        }
+                .await?
+        } else {
+            ConnectedPolicyApplyOutcome::Unchanged
+        };
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
+        if let Some(code) = outcome.error_code() {
+            return Err(CoreError::SplitTunnel(code.to_string()));
+        }
         Ok(policy)
     }
 
@@ -580,7 +611,7 @@ where
         state: &mut StoredSplitTunnelState,
         access_token: &mut String,
         now_unix: i64,
-    ) -> Result<bool, CoreError> {
+    ) -> Result<ConnectedPolicyApplyOutcome, CoreError> {
         let _connection_guard = self.connection_gate.lock().await;
         let current = {
             let current_state = self.state.lock().await;
@@ -589,7 +620,7 @@ where
                 .flatten()
         };
         let Some(connection) = current else {
-            return Ok(false);
+            return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         };
         let stored = self.load_auth()?;
         let configuration = stored
@@ -607,7 +638,7 @@ where
             Ok(options) => options,
             Err(CoreError::SplitTunnel(code)) => {
                 *self.split_tunnel_warning.lock().await = Some(code);
-                return Ok(false);
+                return Ok(ConnectedPolicyApplyOutcome::Unchanged);
             }
             Err(error) => return Err(error),
         };
@@ -625,7 +656,7 @@ where
             }
         }
         if new_options == previous_options {
-            return Ok(false);
+            return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         }
 
         self.tunnel.stop().await?;
@@ -639,14 +670,18 @@ where
                 options: new_options.clone(),
             })
             .await;
-        let (status, error_code) = if start_new.is_ok() {
+        let (outcome, status, error_code) = if start_new.is_ok() {
             *self.split_tunnel_options.lock().await = new_options;
             state.working_policy_hash = Some(policy.policy_hash.clone());
             *self.state.lock().await = crate::CoreState {
                 phase: Phase::Connected,
                 connection: Some(connection),
             };
-            (SplitTunnelApplyStatus::Applied, None)
+            (
+                ConnectedPolicyApplyOutcome::Applied,
+                SplitTunnelApplyStatus::Applied,
+                None,
+            )
         } else {
             let rollback = self
                 .tunnel
@@ -661,7 +696,10 @@ where
                     phase: Phase::Connected,
                     connection: Some(connection),
                 };
+                *self.split_tunnel_warning.lock().await =
+                    Some("split_tunnel_apply_failed".to_string());
                 (
+                    ConnectedPolicyApplyOutcome::RolledBack,
                     SplitTunnelApplyStatus::RolledBack,
                     Some("split_tunnel_apply_failed".to_string()),
                 )
@@ -671,7 +709,10 @@ where
                     phase: Phase::Ready,
                     connection: Some(connection),
                 };
+                *self.split_tunnel_warning.lock().await =
+                    Some("split_tunnel_rollback_failed".to_string());
                 (
+                    ConnectedPolicyApplyOutcome::Failed,
                     SplitTunnelApplyStatus::Failed,
                     Some("split_tunnel_rollback_failed".to_string()),
                 )
@@ -688,7 +729,7 @@ where
         };
         self.report_or_queue_apply_result(access_token, state, result)
             .await;
-        Ok(true)
+        Ok(outcome)
     }
 
     async fn request_split_tunnel_revision(

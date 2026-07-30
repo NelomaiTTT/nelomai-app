@@ -1,12 +1,18 @@
 use async_trait::async_trait;
 use nelomai_contracts::SplitTunnelMode;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::Ipv4Addr;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+mod routes;
+
+pub use routes::{Ipv4RoutePlan, RoutePlanError};
+
 const MAX_PACKAGE_IDS: usize = 512;
 const MAX_IPV4_CIDRS: usize = 16_384;
+const MAX_POLICY_HASH_LENGTH: usize = 128;
 
 pub struct TunnelConfiguration(Zeroizing<String>);
 
@@ -106,6 +112,69 @@ impl TunnelOptions {
             return Err(TunnelOptionsError::new("split_tunnel_invalid_ipv4_cidr"));
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopTunnelOptions {
+    pub excluded_ipv4_cidrs: Vec<String>,
+    pub exclude_local_networks: bool,
+    pub policy_hash: Option<String>,
+}
+
+impl DesktopTunnelOptions {
+    pub fn from_tunnel_options(options: &TunnelOptions) -> Self {
+        if options.policy_hash.is_none() {
+            return Self::default();
+        }
+        Self {
+            excluded_ipv4_cidrs: options.excluded_ipv4_cidrs.clone(),
+            exclude_local_networks: options.exclude_local_networks,
+            policy_hash: options.policy_hash.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), TunnelOptionsError> {
+        if self.excluded_ipv4_cidrs.len() > MAX_IPV4_CIDRS {
+            return Err(TunnelOptionsError::new("split_tunnel_cidrs_limit"));
+        }
+        if self.policy_hash.is_none()
+            && (self.exclude_local_networks || !self.excluded_ipv4_cidrs.is_empty())
+        {
+            return Err(TunnelOptionsError::new("split_tunnel_inactive_options"));
+        }
+        if self.policy_hash.as_ref().is_some_and(|value| {
+            value.is_empty() || value.len() > MAX_POLICY_HASH_LENGTH || !value.is_ascii()
+        }) {
+            return Err(TunnelOptionsError::new("split_tunnel_invalid_policy_hash"));
+        }
+        let mut normalized = std::collections::HashSet::new();
+        for value in &self.excluded_ipv4_cidrs {
+            let network = value
+                .parse::<ipnet::Ipv4Net>()
+                .map_err(|_| TunnelOptionsError::new("split_tunnel_invalid_ipv4_cidr"))?;
+            if network.addr() != network.network() || network.to_string() != *value {
+                return Err(TunnelOptionsError::new(
+                    "split_tunnel_noncanonical_ipv4_cidr",
+                ));
+            }
+            if !normalized.insert(network) {
+                return Err(TunnelOptionsError::new("split_tunnel_duplicate_ipv4_cidr"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for DesktopTunnelOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DesktopTunnelOptions")
+            .field("excluded_ipv4_cidrs_count", &self.excluded_ipv4_cidrs.len())
+            .field("exclude_local_networks", &self.exclude_local_networks)
+            .field("policy_hash_present", &self.policy_hash.is_some())
+            .finish()
     }
 }
 
@@ -260,6 +329,37 @@ mod tests {
         assert_eq!(
             invalid_cidr.validate().unwrap_err().stable_code(),
             "split_tunnel_invalid_ipv4_cidr"
+        );
+    }
+
+    #[test]
+    fn desktop_options_are_redacted_and_require_canonical_unique_cidrs() {
+        let options = DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
+            exclude_local_networks: true,
+            policy_hash: Some("sha256:secret-policy".to_string()),
+        };
+        assert!(options.validate().is_ok());
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("203.0.113.0"));
+        assert!(!debug.contains("secret-policy"));
+
+        let noncanonical = DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec!["203.0.113.1/24".to_string()],
+            ..options.clone()
+        };
+        assert_eq!(
+            noncanonical.validate().unwrap_err().stable_code(),
+            "split_tunnel_noncanonical_ipv4_cidr"
+        );
+
+        let duplicate = DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string(), "203.0.113.0/24".to_string()],
+            ..options
+        };
+        assert_eq!(
+            duplicate.validate().unwrap_err().stable_code(),
+            "split_tunnel_duplicate_ipv4_cidr"
         );
     }
 }

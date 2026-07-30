@@ -137,7 +137,7 @@ private data class ActiveTunnelSession(
     var observedNetworkFingerprint: String,
 )
 
-private object TunnelRuntime {
+internal object TunnelRuntime {
     private val executor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "nelomai-tunnel").apply { isDaemon = false }
     }
@@ -318,7 +318,8 @@ private object TunnelRuntime {
     private fun requireBackend(): GoBackend =
         backend ?: error("tunnel_backend_unavailable")
 
-    fun shutdown() {
+    fun serviceDestroyed() {
+        stateGate.complete(SessionState.STOPPED)
         clearActiveSession()
         AndroidSplitTunnel.clear()
     }
@@ -553,12 +554,6 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         val granted = result.resultCode == Activity.RESULT_OK &&
             VpnService.prepare(activity.applicationContext) == null
         resolvePermission(invoke, granted)
-    }
-
-    @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
-    override fun onDestroy() {
-        TunnelRuntime.shutdown()
-        super.onDestroy()
     }
 
     private fun resolvePermission(invoke: Invoke, granted: Boolean) {

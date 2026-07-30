@@ -490,16 +490,27 @@
   async function saveSplitTunnel(
     request: SplitTunnelSettingsUpdate,
   ): Promise<boolean> {
-    let response = await nativeClient.saveSplitTunnel(request, false);
-    if (response.requiresReconnectConfirmation) {
-      const confirmed = window.confirm(
-        "Чтобы применить настройки, текущее подключение будет кратковременно перезапущено. Продолжить?",
-      );
-      if (!confirmed) return false;
-      response = await nativeClient.saveSplitTunnel(request, true);
+    try {
+      let response = await nativeClient.saveSplitTunnel(request, false);
+      if (response.requiresReconnectConfirmation) {
+        const confirmed = window.confirm(
+          "Чтобы применить настройки, текущее подключение будет кратковременно перезапущено. Продолжить?",
+        );
+        if (!confirmed) return false;
+        response = await nativeClient.saveSplitTunnel(request, true);
+      }
+      splitTunnelState = response.state;
+      return response.saved;
+    } catch (reason) {
+      const current = await nativeClient.state().catch(() => null);
+      if (current) {
+        phase = current.phase;
+        connection = current.connection;
+        view = viewForPhase(current.phase);
+      }
+      await loadSplitTunnel(false);
+      throw reason;
     }
-    splitTunnelState = response.state;
-    return response.saved;
   }
 
   function updateProgress(status: UpdateStatus): string {

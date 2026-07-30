@@ -2,6 +2,7 @@ mod backend;
 mod elevation;
 mod install;
 mod ipc;
+mod routes;
 mod service;
 
 pub use elevation::{repair_installation, RepairError};

@@ -104,8 +104,8 @@ fn absolute_path(value: Option<String>, name: &str) -> Result<PathBuf, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn create_backend(_options: &Options) -> Result<PlatformBackend, String> {
-    PlatformBackend::new().map_err(|error| error.code().to_string())
+fn create_backend(options: &Options) -> Result<PlatformBackend, String> {
+    PlatformBackend::new(&options.runtime_directory).map_err(|error| error.code().to_string())
 }
 
 #[cfg(target_os = "macos")]

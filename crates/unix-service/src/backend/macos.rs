@@ -1,6 +1,8 @@
 use super::build_backend_configuration;
+use crate::routes::{RouteManager, SystemRouteBackend};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{Userspace, WGApi, WireguardInterfaceApi};
+use nelomai_client_tunnel::DesktopTunnelOptions;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -25,6 +27,7 @@ pub struct MacosBackend {
     api: Option<WGApi<Userspace>>,
     endpoints: Vec<SocketAddr>,
     dns_snapshot: Option<DnsSnapshot>,
+    routes: RouteManager<SystemRouteBackend>,
     state: ServiceTunnelState,
 }
 
@@ -35,8 +38,12 @@ impl MacosBackend {
     ) -> Result<Self, ServiceError> {
         let runtime_directory = runtime_directory.into();
         let wireguard_go = wireguard_go.into();
+        let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
         let dns_snapshot = load_dns_snapshot(&runtime_directory.join(DNS_STATE_FILE))?;
         let api = recover_api(&runtime_directory)?;
+        if api.is_none() {
+            routes.cleanup()?;
+        }
         let endpoints = if api.is_some() {
             load_endpoints(&runtime_directory.join(ENDPOINTS_STATE_FILE))?
         } else {
@@ -55,6 +62,7 @@ impl MacosBackend {
             api,
             endpoints,
             dns_snapshot,
+            routes,
             state,
         };
         if backend.api.is_none() && backend.dns_snapshot.is_some() {
@@ -63,14 +71,19 @@ impl MacosBackend {
         Ok(backend)
     }
 
-    fn start_inner(&mut self, configuration: &ParsedConfiguration) -> Result<(), ServiceError> {
-        if self.api.is_some() || self.dns_snapshot.is_some() {
+    fn start_inner(
+        &mut self,
+        configuration: &ParsedConfiguration,
+        options: &DesktopTunnelOptions,
+    ) -> Result<(), ServiceError> {
+        if self.api.is_some() || self.dns_snapshot.is_some() || self.routes.has_routes() {
             self.stop_inner()?;
         }
         validate_root_owned_binary(&self.wireguard_go)?;
         validate_runtime_directory(&self.runtime_directory)?;
 
         let mut native = build_backend_configuration(configuration)?;
+        self.routes.apply(options)?;
         self.capture_dns()?;
         let ifname = match launch_wireguard_go(&self.wireguard_go, &self.runtime_directory) {
             Ok(ifname) => ifname,
@@ -157,6 +170,9 @@ impl MacosBackend {
         {
             first_error.get_or_insert_with(|| backend_error(error));
         }
+        if let Err(error) = self.routes.cleanup() {
+            first_error.get_or_insert(error);
+        }
 
         first_error.map_or(Ok(()), Err)
     }
@@ -184,14 +200,16 @@ impl ServiceTunnelBackend for MacosBackend {
     fn start(
         &mut self,
         configuration: &ParsedConfiguration,
+        options: &DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.state = ServiceTunnelState::Starting;
-        match self.start_inner(configuration) {
+        match self.start_inner(configuration, options) {
             Ok(()) => {
                 self.state = ServiceTunnelState::Running;
                 Ok(self.state)
             }
             Err(error) => {
+                let _ = self.stop_inner();
                 self.state = ServiceTunnelState::Failed;
                 Err(error)
             }
@@ -217,6 +235,9 @@ impl ServiceTunnelBackend for MacosBackend {
             if api.read_interface_data().is_err() {
                 return Ok(ServiceTunnelState::Failed);
             }
+        }
+        if self.api.is_none() && self.routes.has_routes() {
+            return Ok(ServiceTunnelState::Failed);
         }
         Ok(self.state)
     }

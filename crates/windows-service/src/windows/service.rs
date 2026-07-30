@@ -55,7 +55,7 @@ fn manager_service_loop() -> Result<(), ServiceError> {
 
     let server = PipeServer::new(load_policy()?);
     let mut handler =
-        TunnelRequestHandler::new(WindowsServiceBackend::new(), env!("CARGO_PKG_VERSION"));
+        TunnelRequestHandler::new(WindowsServiceBackend::new()?, env!("CARGO_PKG_VERSION"));
     set_status(
         &status_handle,
         ServiceState::Running,

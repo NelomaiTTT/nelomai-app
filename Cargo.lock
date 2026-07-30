@@ -2806,7 +2806,9 @@ name = "nelomai-client-tunnel"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ipnet",
  "nelomai-contracts",
+ "serde",
  "thiserror 2.0.19",
  "zeroize",
 ]
@@ -2870,6 +2872,7 @@ name = "nelomai-windows-service"
 version = "0.1.6"
 dependencies = [
  "async-trait",
+ "ipnet",
  "nelomai-client-tunnel",
  "serde",
  "serde_json",

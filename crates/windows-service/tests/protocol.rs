@@ -14,9 +14,21 @@ fn start_request_is_framed_and_redacted() {
     assert_eq!(decoded, request);
     assert_eq!(
         format!("{request:?}"),
-        "Start { protocol_version: 1, configuration: \"<redacted>\" }"
+        "Start { protocol_version: 2, configuration: \"<redacted>\", options: DesktopTunnelOptions { excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false } }"
     );
     assert!(!format!("{request:?}").contains("never-log-this"));
+}
+
+#[test]
+fn old_start_request_decodes_for_an_explicit_protocol_rejection() {
+    let payload =
+        br#"{"command":"start","protocolVersion":1,"configuration":"PrivateKey = redacted"}"#;
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(payload);
+
+    let request = decode_request(&frame).expect("decode previous protocol request");
+
+    assert_eq!(request.protocol_version(), 1);
 }
 
 #[test]

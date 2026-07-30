@@ -89,6 +89,18 @@ fn protocol_rejects_unknown_commands_and_oversized_frames() {
 }
 
 #[test]
+fn old_start_request_decodes_for_an_explicit_protocol_rejection() {
+    let payload =
+        br#"{"command":"start","protocolVersion":1,"configuration":"PrivateKey = redacted"}"#;
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(payload);
+
+    let request = decode_request(&frame).expect("decode previous protocol request");
+
+    assert_eq!(request.protocol_version(), 1);
+}
+
+#[test]
 fn peer_authorization_requires_the_installed_owner_uid() {
     let policy = ClientPolicy { owner_uid: 501 };
 
@@ -110,6 +122,7 @@ impl ServiceTunnelBackend for RecordingBackend {
     fn start(
         &mut self,
         configuration: &nelomai_unix_service::ParsedConfiguration,
+        _options: &nelomai_client_tunnel::DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
         assert_eq!(configuration.peers.len(), 1);
         self.starts += 1;

@@ -1,3 +1,4 @@
+use super::routes::WindowsRouteManager;
 use super::{platform_error, wide};
 use crate::{
     manager_service_spec, pipe_security_descriptor, private_directory_security_descriptor,
@@ -77,6 +78,7 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
 pub fn uninstall() -> Result<(), ServiceError> {
     remove_service(TUNNEL_SERVICE_NAME)?;
     remove_service(MANAGER_SERVICE_NAME)?;
+    WindowsRouteManager::new()?.cleanup()?;
     let root = state_directory()?;
     if root.exists() {
         fs::remove_dir_all(&root)
@@ -285,7 +287,7 @@ fn service_manager(access: ServiceManagerAccess) -> Result<ServiceManager, Servi
         .map_err(|error| platform_error("open Windows service manager", error))
 }
 
-fn state_directory() -> Result<PathBuf, ServiceError> {
+pub(crate) fn state_directory() -> Result<PathBuf, ServiceError> {
     let program_data = env::var_os("ProgramData")
         .ok_or_else(|| ServiceError::Backend("ProgramData is unavailable".to_string()))?;
     Ok(PathBuf::from(program_data).join("Nelomai").join("Tunnel"))

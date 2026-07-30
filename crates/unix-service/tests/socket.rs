@@ -15,6 +15,7 @@ impl ServiceTunnelBackend for MemoryBackend {
     fn start(
         &mut self,
         _configuration: &nelomai_unix_service::ParsedConfiguration,
+        _options: &nelomai_client_tunnel::DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.state = ServiceTunnelState::Running;
         Ok(self.state)

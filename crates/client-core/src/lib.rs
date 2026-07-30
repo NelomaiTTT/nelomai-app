@@ -834,21 +834,32 @@ where
                 options: tunnel_options.clone(),
             })
             .await?;
-        if let Some(policy) = &split_policy {
-            self.record_started_split_tunnel_policy(
-                policy,
-                tunnel_options,
-                Some(&mut access_token),
-                now_unix,
-            )
-            .await?;
-        } else {
-            *self.split_tunnel_options.lock().await = TunnelOptions::default();
-        }
         *self.state.lock().await = CoreState {
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
         };
+        if let Some(policy) = &split_policy {
+            if let Err(record_error) = self
+                .record_started_split_tunnel_policy(
+                    policy,
+                    tunnel_options,
+                    Some(&mut access_token),
+                    now_unix,
+                )
+                .await
+            {
+                *self.split_tunnel_warning.lock().await =
+                    Some("split_tunnel_state_save_failed".to_string());
+                self.logger.record(CoreLogEvent {
+                    kind: "split_tunnel.state_record_failed",
+                    operation_id: Some(operation_id.clone()),
+                    request_id: Some(response.request_id.clone()),
+                    code: Some(record_error.to_string()),
+                });
+            }
+        } else {
+            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+        }
         self.logger.record(CoreLogEvent {
             kind: "connection.started",
             operation_id: Some(operation_id),
@@ -1051,12 +1062,6 @@ where
                 options: tunnel_options.clone(),
             })
             .await?;
-        if let Some(policy) = &split_policy {
-            self.record_started_split_tunnel_policy(policy, tunnel_options, None, now_unix)
-                .await?;
-        } else {
-            *self.split_tunnel_options.lock().await = TunnelOptions::default();
-        }
         let connection = Connection {
             lease_id: saved.lease_id.clone(),
             layer: saved.layer,
@@ -1070,6 +1075,23 @@ where
             phase: Phase::Connected,
             connection: Some(connection),
         };
+        if let Some(policy) = &split_policy {
+            if let Err(record_error) = self
+                .record_started_split_tunnel_policy(policy, tunnel_options, None, now_unix)
+                .await
+            {
+                *self.split_tunnel_warning.lock().await =
+                    Some("split_tunnel_state_save_failed".to_string());
+                self.logger.record(CoreLogEvent {
+                    kind: "split_tunnel.state_record_failed",
+                    operation_id: Some(saved.lease_id.clone()),
+                    request_id: None,
+                    code: Some(record_error.to_string()),
+                });
+            }
+        } else {
+            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+        }
         self.logger.record(CoreLogEvent {
             kind: "connection.started_offline",
             operation_id: Some(saved.lease_id.clone()),

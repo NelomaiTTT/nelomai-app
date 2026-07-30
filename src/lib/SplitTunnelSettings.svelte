@@ -7,6 +7,7 @@
     type SplitTunnelSettingsUpdate,
     type SplitTunnelState,
   } from "./split-tunnel";
+  import { commandMessage } from "./native-client";
 
   let {
     state: settings,
@@ -76,6 +77,19 @@
     selected = next;
   }
 
+  function warningMessage(code: string): string {
+    switch (code) {
+      case "split_tunnel_apply_failed":
+        return "Новые настройки не применились. Продолжаем использовать предыдущие.";
+      case "split_tunnel_rollback_failed":
+        return "Подключение не удалось восстановить. Запустите его снова.";
+      case "split_tunnel_state_save_failed":
+        return "Подключение работает, но его служебное состояние не удалось сохранить.";
+      default:
+        return "Используем сохранённые настройки. Панель временно недоступна.";
+    }
+  }
+
   async function save() {
     if (localBusy || busy) return;
     localBusy = true;
@@ -91,8 +105,8 @@
         ),
       );
       if (saved) onclose();
-    } catch {
-      localError = "Не удалось сохранить настройки";
+    } catch (reason) {
+      localError = commandMessage(reason);
     } finally {
       localBusy = false;
     }
@@ -143,7 +157,7 @@
     {/if}
     {#if settings.warning}
       <p class="warning">
-        Используем сохранённые настройки. Панель временно недоступна.
+        {warningMessage(settings.warning)}
       </p>
     {/if}
 

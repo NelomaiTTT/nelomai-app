@@ -25,6 +25,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     override fun onDestroy() {
+        TunnelRuntime.serviceDestroyed()
         AndroidSplitTunnel.clear()
         super.onDestroy()
         serviceReady = CompletableFuture()

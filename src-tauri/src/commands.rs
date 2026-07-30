@@ -87,6 +87,14 @@ impl CommandError {
                     "split_tunnel_empty_include_selection",
                     "Выберите хотя бы одно приложение для подключения через VPN",
                 ),
+                "split_tunnel_apply_failed" => Self::new(
+                    "split_tunnel_apply_failed",
+                    "Не удалось применить новые настройки. Предыдущее подключение восстановлено",
+                ),
+                "split_tunnel_rollback_failed" => Self::new(
+                    "split_tunnel_rollback_failed",
+                    "Не удалось восстановить подключение. Запустите его снова",
+                ),
                 _ => Self::new(
                     "split_tunnel_policy_unavailable",
                     "Настройки split-tunnel временно недоступны",

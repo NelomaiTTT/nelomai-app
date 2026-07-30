@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    TunnelCapabilities, TunnelController, TunnelError, TunnelPlatform, TunnelStartRequest,
-    TunnelStatus,
+    DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelPlatform,
+    TunnelStartRequest, TunnelStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -12,8 +12,8 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 pub mod windows;
 
-pub const PROTOCOL_VERSION: u16 = 1;
-pub const MAX_FRAME_SIZE: usize = 64 * 1024;
+pub const PROTOCOL_VERSION: u16 = 2;
+pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
 pub const PIPE_NAME: &str = r"\\.\pipe\NelomaiTunnelManager";
@@ -83,6 +83,7 @@ pub enum Request {
     Start {
         protocol_version: u16,
         configuration: Zeroizing<String>,
+        options: DesktopTunnelOptions,
     },
     Stop {
         protocol_version: u16,
@@ -97,9 +98,14 @@ pub enum Request {
 
 impl Request {
     pub fn start(configuration: String) -> Self {
+        Self::start_with_options(configuration, DesktopTunnelOptions::default())
+    }
+
+    pub fn start_with_options(configuration: String, options: DesktopTunnelOptions) -> Self {
         Self::Start {
             protocol_version: PROTOCOL_VERSION,
             configuration: Zeroizing::new(configuration),
+            options,
         }
     }
 
@@ -140,12 +146,18 @@ impl PartialEq for Request {
                 Self::Start {
                     protocol_version: left_version,
                     configuration: left_configuration,
+                    options: left_options,
                 },
                 Self::Start {
                     protocol_version: right_version,
                     configuration: right_configuration,
+                    options: right_options,
                 },
-            ) => left_version == right_version && left_configuration == right_configuration,
+            ) => {
+                left_version == right_version
+                    && left_configuration == right_configuration
+                    && left_options == right_options
+            }
             (
                 Self::Stop {
                     protocol_version: left,
@@ -181,11 +193,14 @@ impl fmt::Debug for Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Start {
-                protocol_version, ..
+                protocol_version,
+                options,
+                ..
             } => formatter
                 .debug_struct("Start")
                 .field("protocol_version", protocol_version)
                 .field("configuration", &"<redacted>")
+                .field("options", options)
                 .finish(),
             Self::Stop { protocol_version } => formatter
                 .debug_struct("Stop")
@@ -210,6 +225,7 @@ enum RequestRef<'a> {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
         configuration: &'a str,
+        options: &'a DesktopTunnelOptions,
     },
     Stop {
         #[serde(rename = "protocolVersion")]
@@ -234,9 +250,11 @@ impl Serialize for Request {
             Self::Start {
                 protocol_version,
                 configuration,
+                options,
             } => RequestRef::Start {
                 protocol_version: *protocol_version,
                 configuration,
+                options,
             },
             Self::Stop { protocol_version } => RequestRef::Stop {
                 protocol_version: *protocol_version,
@@ -259,6 +277,8 @@ enum RequestOwned {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
         configuration: String,
+        #[serde(default)]
+        options: DesktopTunnelOptions,
     },
     Stop {
         #[serde(rename = "protocolVersion")]
@@ -283,9 +303,11 @@ impl<'de> Deserialize<'de> for Request {
             RequestOwned::Start {
                 protocol_version,
                 configuration,
+                options,
             } => Self::Start {
                 protocol_version,
                 configuration: Zeroizing::new(configuration),
+                options,
             },
             RequestOwned::Stop { protocol_version } => Self::Stop { protocol_version },
             RequestOwned::Status { protocol_version } => Self::Status { protocol_version },
@@ -339,7 +361,11 @@ impl ServiceError {
 }
 
 pub trait ServiceTunnelBackend {
-    fn start(&mut self, configuration: &str) -> Result<ServiceTunnelState, ServiceError>;
+    fn start(
+        &mut self,
+        configuration: &str,
+        options: &DesktopTunnelOptions,
+    ) -> Result<ServiceTunnelState, ServiceError>;
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError>;
     fn status(&self) -> Result<ServiceTunnelState, ServiceError>;
 }
@@ -367,9 +393,14 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
         }
 
         let result = match request {
-            Request::Start { configuration, .. } => self
-                .backend
-                .start(configuration.as_str())
+            Request::Start {
+                configuration,
+                options,
+                ..
+            } => options
+                .validate()
+                .map_err(|_| ServiceError::InvalidRequest)
+                .and_then(|_| self.backend.start(configuration.as_str(), &options))
                 .map(|state| Response::success(Some(state))),
             Request::Stop { .. } => self
                 .backend
@@ -434,7 +465,10 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
             })?;
         let response = self
             .transport
-            .exchange(Request::start(request.configuration.expose().to_string()))
+            .exchange(Request::start_with_options(
+                request.configuration.expose().to_string(),
+                DesktopTunnelOptions::from_tunnel_options(&request.options),
+            ))
             .await
             .map_err(to_tunnel_error)?;
         require_state(response, ServiceTunnelState::Running)
