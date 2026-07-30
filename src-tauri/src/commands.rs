@@ -79,6 +79,16 @@ impl CommandError {
                 ),
                 _ => Self::new("tunnel_failed", "Не удалось изменить состояние подключения"),
             },
+            CoreError::SplitTunnel(code) => match code.as_str() {
+                "split_tunnel_empty_include_selection" => Self::new(
+                    "split_tunnel_empty_include_selection",
+                    "Выберите хотя бы одно приложение для подключения через VPN",
+                ),
+                _ => Self::new(
+                    "split_tunnel_policy_unavailable",
+                    "Настройки split-tunnel временно недоступны",
+                ),
+            },
         }
     }
 

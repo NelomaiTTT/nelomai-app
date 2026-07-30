@@ -375,7 +375,7 @@ git commit -m "Добавить движок политики split-tunnel"
 - Modify: `crates/client-core/tests/split_tunnel.rs`
 - Modify: `crates/client-core/tests/runtime.rs`
 
-- [ ] Add failing tests for a `SplitTunnelCoordinator` with:
+- [x] Add failing tests for a `SplitTunnelCoordinator` with:
   - revision poll interval of five minutes while the app is running;
   - full policy sync interval of 24 hours;
   - immediate full fetch when `force_revision` increases;
@@ -383,19 +383,19 @@ git commit -m "Добавить движок политики split-tunnel"
   - no reconnect when `policy_hash` is unchanged;
   - cached policy used indefinitely when the panel is unavailable;
   - no split-policy task or operation log emitted for routine revision polls.
-- [ ] Add failing runtime tests for policy application while connected:
+- [x] Add failing runtime tests for policy application while connected:
   1. remember current connection and effective options;
   2. stop the tunnel;
   3. start with the new policy;
   4. if that fails, start once with the prior working policy;
   5. if rollback succeeds, remain connected and report `rolled_back`;
   6. if rollback fails, remain stopped and report `failed`.
-- [ ] Prove `Tic + standalone` settings save without reconnect.
-- [ ] Prove Android API 32 settings save and synchronize but never trigger a split reapply.
-- [ ] Prove a newer unknown policy format preserves the previous working policy and returns a non-blocking update warning.
-- [ ] Add coordinator state to `ClientCore` without holding the main state mutex across HTTP or tunnel operations.
-- [ ] Extend `CoreApi` and its `ClientApi` implementation with revision, policy, settings, and apply-result methods so mocked core tests use the same boundary as production.
-- [ ] Store `Arc<dyn SplitTunnelStore>` inside `ClientCore` rather than adding a fifth generic parameter. Add:
+- [x] Prove `Tic + standalone` settings save without reconnect.
+- [x] Prove Android API 32 settings save and synchronize but never trigger a split reapply.
+- [x] Prove a newer unknown policy format preserves the previous working policy and returns a non-blocking update warning.
+- [x] Add coordinator state to `ClientCore` without holding the main state mutex across HTTP or tunnel operations.
+- [x] Extend `CoreApi` and its `ClientApi` implementation with revision, policy, settings, and apply-result methods so mocked core tests use the same boundary as production.
+- [x] Store `Arc<dyn SplitTunnelStore>` inside `ClientCore` rather than adding a fifth generic parameter. Add:
 
 ```rust
 pub fn with_split_tunnel_store(
@@ -411,25 +411,25 @@ Keep the existing `ClientCore::new(...)` signature and delegate it to
 `with_split_tunnel_store(...)` with a `MemorySplitTunnelStore`, so existing
 focused tests need no mechanical constructor churn.
 
-- [ ] Add the matching `ClientApplication::with_split_tunnel_store(...)` constructor and keep its existing `new(...)` as the same compatibility wrapper.
-- [ ] Queue failed apply-result uploads in `SplitTunnelStore` and retry after the next authenticated panel request.
-- [ ] Update `ClientCore::start` and `start_saved_stray_offline` to pass the computed `TunnelStartRequest`.
-- [ ] For offline saved Stray, use the cached policy; if no cached policy exists, start full tunnel and expose a warning rather than failing.
-- [ ] Run focused tests:
+- [x] Add the matching `ClientApplication::with_split_tunnel_store(...)` constructor and keep its existing `new(...)` as the same compatibility wrapper.
+- [x] Queue failed apply-result uploads in `SplitTunnelStore` and retry after the next authenticated panel request.
+- [x] Update `ClientCore::start` and `start_saved_stray_offline` to pass the computed `TunnelStartRequest`.
+- [x] For offline saved Stray, use the cached policy; if no cached policy exists, start full tunnel and expose a warning rather than failing.
+- [x] Run focused tests:
 
 ```bash
 cargo test -p nelomai-client-core split_tunnel -- --nocapture
 cargo test -p nelomai-client-application split_tunnel -- --nocapture
 ```
 
-- [ ] Run all affected crates:
+- [x] Run all affected crates:
 
 ```bash
 cargo test -p nelomai-client-core
 cargo test -p nelomai-client-application
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add crates/client-core crates/client-application

@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use nelomai_client_api::{ClientApi, ClientApiError, TokenResponse};
 use nelomai_client_storage::{
-    SecretStore, StoredCompatibility, StoredConnection, StoredConnectionKind,
+    MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredCompatibility, StoredConnection,
+    StoredConnectionKind,
 };
 use nelomai_client_tunnel::{
     TunnelConfiguration, TunnelController, TunnelError, TunnelOptions, TunnelStartRequest,
@@ -10,9 +11,10 @@ use nelomai_client_tunnel::{
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
     ConnectionStartRequest, ConnectionStartResponse, Layer, ProbeResult, RouteMode,
-    TicConnectionMode,
+    SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -20,7 +22,8 @@ use uuid::Uuid;
 mod split_tunnel;
 
 pub use split_tunnel::{
-    split_tunnel_active, EffectiveSplitTunnelPolicy, SplitTunnelContext, SplitTunnelPolicyError,
+    split_tunnel_active, validate_split_tunnel_policy, EffectiveSplitTunnelPolicy,
+    SplitTunnelContext, SplitTunnelPolicyError, SplitTunnelSyncOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +352,32 @@ pub trait CoreApi: Send + Sync {
         access_token: &str,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError>;
+    async fn split_tunnel_revision(
+        &self,
+        _access_token: &str,
+    ) -> Result<SplitTunnelRevision, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn split_tunnel_policy(
+        &self,
+        _access_token: &str,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn update_split_tunnel_settings(
+        &self,
+        _access_token: &str,
+        _request: &SplitTunnelSettingsUpdate,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn report_split_tunnel_apply_result(
+        &self,
+        _access_token: &str,
+        _request: &SplitTunnelApplyResult,
+    ) -> Result<(), CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
 }
 
 #[async_trait]
@@ -404,6 +433,45 @@ impl CoreApi for ClientApi {
             .await
             .map_err(Into::into)
     }
+
+    async fn split_tunnel_revision(
+        &self,
+        access_token: &str,
+    ) -> Result<SplitTunnelRevision, CoreApiError> {
+        ClientApi::split_tunnel_revision(self, access_token)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn split_tunnel_policy(
+        &self,
+        access_token: &str,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        ClientApi::split_tunnel_policy(self, access_token)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn update_split_tunnel_settings(
+        &self,
+        access_token: &str,
+        request: &SplitTunnelSettingsUpdate,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        ClientApi::update_split_tunnel_settings(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn report_split_tunnel_apply_result(
+        &self,
+        access_token: &str,
+        request: &SplitTunnelApplyResult,
+    ) -> Result<(), CoreApiError> {
+        ClientApi::report_split_tunnel_apply_result(self, access_token, request)
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +497,8 @@ pub enum CoreError {
     Api(CoreApiError),
     #[error("не удалось изменить состояние туннеля: {0}")]
     Tunnel(String),
+    #[error("не удалось применить политику split-tunnel: {0}")]
+    SplitTunnel(String),
 }
 
 impl From<TunnelError> for CoreError {
@@ -458,6 +528,11 @@ pub struct ClientCore<A, S, T, L> {
     state: Mutex<CoreState>,
     refresh_gate: Mutex<()>,
     connection_gate: Mutex<()>,
+    split_tunnel_store: Arc<dyn SplitTunnelStore>,
+    split_tunnel_gate: Mutex<()>,
+    split_tunnel_packages: RwLock<Vec<SplitTunnelSelectedPackage>>,
+    split_tunnel_options: Mutex<TunnelOptions>,
+    split_tunnel_warning: Mutex<Option<String>>,
     retry_policy: RetryPolicy,
 }
 
@@ -469,6 +544,22 @@ where
     L: CoreLogger,
 {
     pub fn new(api: Arc<A>, store: Arc<S>, tunnel: Arc<T>, logger: Arc<L>) -> Self {
+        Self::with_split_tunnel_store(
+            api,
+            store,
+            Arc::new(MemorySplitTunnelStore::default()),
+            tunnel,
+            logger,
+        )
+    }
+
+    pub fn with_split_tunnel_store(
+        api: Arc<A>,
+        store: Arc<S>,
+        split_tunnel_store: Arc<dyn SplitTunnelStore>,
+        tunnel: Arc<T>,
+        logger: Arc<L>,
+    ) -> Self {
         Self {
             api,
             store,
@@ -477,6 +568,11 @@ where
             state: Mutex::new(CoreState::default()),
             refresh_gate: Mutex::new(()),
             connection_gate: Mutex::new(()),
+            split_tunnel_store,
+            split_tunnel_gate: Mutex::new(()),
+            split_tunnel_packages: RwLock::new(Vec::new()),
+            split_tunnel_options: Mutex::new(TunnelOptions::default()),
+            split_tunnel_warning: Mutex::new(None),
             retry_policy: RetryPolicy::default(),
         }
     }
@@ -500,6 +596,8 @@ where
     }
 
     pub async fn sign_out(&self) -> Result<(), CoreError> {
+        let _split_guard = self.split_tunnel_gate.lock().await;
+        let _connection_guard = self.connection_gate.lock().await;
         let tunnel_result = self.tunnel.stop().await;
         let stored = self
             .store
@@ -612,12 +710,18 @@ where
             phase,
             connection: response.connection.clone(),
         };
+        if phase == Phase::Connected {
+            if let Some(connection) = &response.connection {
+                self.restore_running_split_tunnel_options(connection).await;
+            }
+        }
         self.logger.record(CoreLogEvent {
             kind: "bootstrap.completed",
             operation_id: None,
             request_id: Some(response.request_id.clone()),
             code: None,
         });
+        self.retry_pending_split_tunnel_results().await;
         Ok(response)
     }
 
@@ -626,6 +730,7 @@ where
         options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
+        let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         if let Some(connection) = self.connected_connection().await {
             return Ok(connection);
@@ -639,7 +744,15 @@ where
             self.set_phase(Phase::UpdateRequired).await;
             return Err(CoreError::UpdateRequired);
         }
-        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let split_policy = self.cached_policy_for_start()?;
+        let preflight_tunnel_options = match &split_policy {
+            Some(policy) => Some(
+                self.effective_tunnel_options(policy, options.layer, options.route_mode)
+                    .await?,
+            ),
+            None => None,
+        };
+        let mut access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
         let operation_id = reusable_operation_id(&stored, &options, now_unix)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         self.set_phase(Phase::Connecting).await;
@@ -683,12 +796,47 @@ where
             stored.saved_connection = Some(saved_connection);
         }
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        let tunnel_options = match &split_policy {
+            Some(_)
+                if response.connection.layer == options.layer
+                    && response.connection.route_mode == options.route_mode =>
+            {
+                preflight_tunnel_options.unwrap_or_default()
+            }
+            Some(policy) => {
+                self.effective_tunnel_options(
+                    policy,
+                    response.connection.layer,
+                    response.connection.route_mode,
+                )
+                .await?
+            }
+            None => {
+                *self.split_tunnel_warning.lock().await =
+                    Some("split_tunnel_policy_unavailable".to_string());
+                TunnelOptions::default()
+            }
+        };
+        if split_policy.is_some() {
+            *self.split_tunnel_warning.lock().await = None;
+        }
         self.tunnel
             .start(TunnelStartRequest {
                 configuration: TunnelConfiguration::new(response.configuration),
-                options: TunnelOptions::default(),
+                options: tunnel_options.clone(),
             })
             .await?;
+        if let Some(policy) = &split_policy {
+            self.record_started_split_tunnel_policy(
+                policy,
+                tunnel_options,
+                Some(&mut access_token),
+                now_unix,
+            )
+            .await?;
+        } else {
+            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+        }
         *self.state.lock().await = CoreState {
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
@@ -703,6 +851,7 @@ where
     }
 
     pub async fn stop(&self) -> Result<Connection, CoreError> {
+        let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         let current_state = self.state.lock().await.clone();
         let current = current_state
@@ -845,6 +994,7 @@ where
     }
 
     pub async fn start_saved_stray_offline(&self, now_unix: i64) -> Result<String, CoreError> {
+        let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         let stored = self.load_auth()?;
         if stored
@@ -872,12 +1022,33 @@ where
                     .filter(|connection| connection.layer == Layer::Stray)
             })
             .ok_or(CoreError::SavedConnectionUnavailable)?;
+        let split_policy = self.cached_policy_for_start()?;
+        let tunnel_options = match &split_policy {
+            Some(policy) => {
+                self.effective_tunnel_options(policy, saved.layer, saved.route_mode)
+                    .await?
+            }
+            None => {
+                *self.split_tunnel_warning.lock().await =
+                    Some("split_tunnel_policy_unavailable".to_string());
+                TunnelOptions::default()
+            }
+        };
+        if split_policy.is_some() {
+            *self.split_tunnel_warning.lock().await = None;
+        }
         self.tunnel
             .start(TunnelStartRequest {
                 configuration: TunnelConfiguration::new(saved.configuration),
-                options: TunnelOptions::default(),
+                options: tunnel_options.clone(),
             })
             .await?;
+        if let Some(policy) = &split_policy {
+            self.record_started_split_tunnel_policy(policy, tunnel_options, None, now_unix)
+                .await?;
+        } else {
+            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+        }
         let connection = Connection {
             lease_id: saved.lease_id.clone(),
             layer: saved.layer,

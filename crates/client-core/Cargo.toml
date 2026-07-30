@@ -12,6 +12,7 @@ nelomai-client-storage = { path = "../client-storage" }
 nelomai-client-tunnel = { path = "../client-tunnel" }
 nelomai-contracts = { path = "../contracts" }
 thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 

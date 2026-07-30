@@ -5,12 +5,14 @@ use nelomai_client_api::{
 };
 use nelomai_client_core::{
     ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogger, CoreState,
+    SplitTunnelSyncOutcome,
 };
-use nelomai_client_storage::{SecretStore, StoredAuth};
+use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBindingResponse, PeerOptions, Platform,
-    ProbeResult, ProbeResults, ServerCandidatesResponse, TicConnectionMode,
+    ProbeResult, ProbeResults, ServerCandidatesResponse, SplitTunnelPolicy,
+    SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
@@ -175,7 +177,29 @@ where
     L: CoreLogger,
 {
     pub fn new(api: Arc<A>, store: Arc<S>, tunnel: Arc<T>, logger: Arc<L>) -> Self {
-        let core = ClientCore::new(api.clone(), store.clone(), tunnel.clone(), logger);
+        Self::with_split_tunnel_store(
+            api,
+            store,
+            Arc::new(MemorySplitTunnelStore::default()),
+            tunnel,
+            logger,
+        )
+    }
+
+    pub fn with_split_tunnel_store(
+        api: Arc<A>,
+        store: Arc<S>,
+        split_tunnel_store: Arc<dyn SplitTunnelStore>,
+        tunnel: Arc<T>,
+        logger: Arc<L>,
+    ) -> Self {
+        let core = ClientCore::with_split_tunnel_store(
+            api.clone(),
+            store.clone(),
+            split_tunnel_store,
+            tunnel.clone(),
+            logger,
+        );
         Self {
             api,
             store,
@@ -245,6 +269,36 @@ where
             .peers
             .sort_by_key(|peer| peer.last_handshake_at.is_some());
         Ok(options)
+    }
+
+    pub fn set_split_tunnel_installed_packages(&self, packages: Vec<SplitTunnelSelectedPackage>) {
+        self.core.set_split_tunnel_installed_packages(packages);
+    }
+
+    pub async fn synchronize_split_tunnel(
+        &self,
+        now_unix: i64,
+        force_full: bool,
+    ) -> Result<SplitTunnelSyncOutcome, ApplicationError> {
+        self.core
+            .synchronize_split_tunnel(now_unix, force_full)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn save_split_tunnel_settings(
+        &self,
+        request: &SplitTunnelSettingsUpdate,
+        now_unix: i64,
+    ) -> Result<SplitTunnelPolicy, ApplicationError> {
+        self.core
+            .save_split_tunnel_settings(request, now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn split_tunnel_warning(&self) -> Option<String> {
+        self.core.split_tunnel_warning().await
     }
 
     pub async fn bind_peer(
