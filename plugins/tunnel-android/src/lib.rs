@@ -78,6 +78,7 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                 code: error.stable_code(),
             })?;
         let mut plugin_request = StartTunnelRequest::new(request.configuration.as_bytes());
+        plugin_request.options.split_active = request.options.policy_hash.is_some();
         match request.options.application_mode {
             Some(SplitTunnelMode::ExcludeSelected) => {
                 plugin_request.options.excluded_packages = request.options.package_ids;

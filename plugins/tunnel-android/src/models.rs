@@ -61,6 +61,7 @@ pub const TUNNEL_API_VERSION: u16 = 2;
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelOptions {
+    pub split_active: bool,
     pub excluded_packages: Vec<String>,
     pub included_packages: Vec<String>,
     pub split_tunnel_routes: Vec<String>,
@@ -71,6 +72,7 @@ impl fmt::Debug for TunnelOptions {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TunnelOptions")
+            .field("split_active", &self.split_active)
             .field("excluded_packages_count", &self.excluded_packages.len())
             .field("included_packages_count", &self.included_packages.len())
             .field("split_tunnel_routes_count", &self.split_tunnel_routes.len())
@@ -172,6 +174,7 @@ mod tests {
         assert_eq!(value["options"]["includedPackages"], serde_json::json!([]));
         assert_eq!(value["options"]["splitTunnelRoutes"], serde_json::json!([]));
         assert_eq!(value["options"]["excludeLocalNetworks"], false);
+        assert_eq!(value["options"]["splitActive"], false);
     }
 
     #[test]

@@ -18,6 +18,8 @@ import com.wireguard.config.Config
 import java.io.ByteArrayInputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 
@@ -26,13 +28,15 @@ private const val TUNNEL_NAME = "nelomai"
 
 @InvokeArg
 class TunnelOptionsArgs {
+    var splitActive: Boolean = false
     var excludedPackages: ArrayList<String> = arrayListOf()
     var includedPackages: ArrayList<String> = arrayListOf()
     var splitTunnelRoutes: ArrayList<String> = arrayListOf()
     var excludeLocalNetworks: Boolean = false
 
     fun isEmpty(): Boolean =
-        excludedPackages.isEmpty() &&
+        !splitActive &&
+            excludedPackages.isEmpty() &&
             includedPackages.isEmpty() &&
             splitTunnelRoutes.isEmpty() &&
             !excludeLocalNetworks
@@ -124,19 +128,35 @@ private class ManagedTunnel(
     }
 }
 
+private data class ActiveTunnelSession(
+    val generation: Long,
+    val config: Config,
+    val options: EffectiveAndroidTunnelOptions,
+    var monitor: PhysicalNetworks?,
+    var localRoutes: List<Ipv4Prefix>,
+    var observedNetworkFingerprint: String,
+)
+
 private object TunnelRuntime {
     private val executor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "nelomai-tunnel").apply { isDaemon = false }
     }
     private val stateGate = TunnelStateGate()
+    private val suppressBackendStateChanges = AtomicBoolean(false)
+    private val generation = AtomicLong(0)
     private val tunnel = ManagedTunnel { state ->
-        stateGate.complete(
-            if (state == Tunnel.State.UP) SessionState.RUNNING else SessionState.STOPPED,
-        )
+        if (!suppressBackendStateChanges.get()) {
+            stateGate.complete(
+                if (state == Tunnel.State.UP) SessionState.RUNNING else SessionState.STOPPED,
+            )
+        }
     }
 
     @Volatile
     private var backend: GoBackend? = null
+
+    @Volatile
+    private var activeSession: ActiveTunnelSession? = null
 
     fun initialize(context: Context) {
         if (backend == null) {
@@ -194,12 +214,46 @@ private object TunnelRuntime {
                     args.options,
                 )
                 val config = AndroidSplitTunnel.applyOptions(originalConfig, options)
-                AndroidSplitTunnel.replaceExcludedRoutes(options.excludedRoutes)
+                val monitor = if (options.splitSupported && options.excludeLocalNetworks) {
+                    PhysicalNetworks(context)
+                } else {
+                    null
+                }
+                val localRoutes = monitor
+                    ?.let { runCatching(it::snapshot).getOrDefault(emptyList()) }
+                    .orEmpty()
+                AndroidSplitTunnel.replaceExcludedRoutes(
+                    AndroidSplitTunnel.mergeExcludedRoutes(
+                        options.excludedRoutes,
+                        localRoutes,
+                    ),
+                )
 
                 val state = requireBackend().setState(tunnel, Tunnel.State.UP, config)
                 val resolved = if (state == Tunnel.State.UP) {
+                    val session = ActiveTunnelSession(
+                        generation = generation.incrementAndGet(),
+                        config = config,
+                        options = options,
+                        monitor = monitor,
+                        localRoutes = localRoutes,
+                        observedNetworkFingerprint = PhysicalNetworks.fingerprint(localRoutes),
+                    )
+                    activeSession = session
+                    if (monitor != null) {
+                        runCatching {
+                            monitor.start { networks ->
+                                reapplyPhysicalNetworks(session.generation, networks)
+                            }
+                        }.onFailure {
+                            monitor.stop()
+                            session.monitor = null
+                        }
+                    }
                     SessionState.RUNNING
                 } else {
+                    monitor?.stop()
+                    AndroidSplitTunnel.clear()
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
@@ -229,6 +283,7 @@ private object TunnelRuntime {
 
         when (stateGate.beginStop()) {
             TransitionDecision.ALREADY_COMPLETE -> {
+                clearActiveSession()
                 onSuccess(SessionState.STOPPED, 0)
                 return
             }
@@ -242,6 +297,7 @@ private object TunnelRuntime {
         executor.execute {
             val startedAt = System.nanoTime()
             try {
+                clearActiveSession()
                 val state = requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
                 AndroidSplitTunnel.clear()
                 val resolved = if (state == Tunnel.State.DOWN) {
@@ -261,6 +317,92 @@ private object TunnelRuntime {
 
     private fun requireBackend(): GoBackend =
         backend ?: error("tunnel_backend_unavailable")
+
+    fun shutdown() {
+        clearActiveSession()
+        AndroidSplitTunnel.clear()
+    }
+
+    private fun reapplyPhysicalNetworks(
+        sessionGeneration: Long,
+        localRoutes: List<Ipv4Prefix>,
+    ) {
+        executor.execute {
+            val session = activeSession
+                ?.takeIf { it.generation == sessionGeneration }
+                ?: return@execute
+            if (stateGate.current() != SessionState.RUNNING) {
+                return@execute
+            }
+
+            val fingerprint = PhysicalNetworks.fingerprint(localRoutes)
+            if (fingerprint == session.observedNetworkFingerprint) {
+                return@execute
+            }
+            session.observedNetworkFingerprint = fingerprint
+            val previousRoutes = session.localRoutes
+            stateGate.complete(SessionState.STARTING)
+            suppressBackendStateChanges.set(true)
+
+            try {
+                requireState(
+                    requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
+                    Tunnel.State.DOWN,
+                )
+                AndroidSplitTunnel.replaceExcludedRoutes(
+                    AndroidSplitTunnel.mergeExcludedRoutes(
+                        session.options.excludedRoutes,
+                        localRoutes,
+                    ),
+                )
+                requireState(
+                    requireBackend().setState(tunnel, Tunnel.State.UP, session.config),
+                    Tunnel.State.UP,
+                )
+                session.localRoutes = localRoutes
+                stateGate.complete(SessionState.RUNNING)
+            } catch (_: Throwable) {
+                val restored = runCatching {
+                    runCatching {
+                        requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                    }
+                    AndroidSplitTunnel.replaceExcludedRoutes(
+                        AndroidSplitTunnel.mergeExcludedRoutes(
+                            session.options.excludedRoutes,
+                            previousRoutes,
+                        ),
+                    )
+                    requireState(
+                        requireBackend().setState(tunnel, Tunnel.State.UP, session.config),
+                        Tunnel.State.UP,
+                    )
+                }.isSuccess
+                if (restored) {
+                    stateGate.complete(SessionState.RUNNING)
+                } else {
+                    activeSession = null
+                    session.monitor?.stop()
+                    AndroidSplitTunnel.clear()
+                    stateGate.complete(SessionState.FAILED)
+                }
+            } finally {
+                suppressBackendStateChanges.set(false)
+            }
+        }
+    }
+
+    private fun clearActiveSession() {
+        val session = activeSession
+        activeSession = null
+        generation.incrementAndGet()
+        session?.monitor?.stop()
+    }
+
+    private fun requireState(actual: Tunnel.State, expected: Tunnel.State) {
+        if (actual != expected) {
+            throw TunnelOperationException("unexpected_tunnel_state")
+        }
+    }
 
     private fun validateVersion(apiVersion: Int) {
         if (apiVersion != TUNNEL_API_VERSION) {
@@ -415,7 +557,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
     override fun onDestroy() {
-        AndroidSplitTunnel.clear()
+        TunnelRuntime.shutdown()
         super.onDestroy()
     }
 

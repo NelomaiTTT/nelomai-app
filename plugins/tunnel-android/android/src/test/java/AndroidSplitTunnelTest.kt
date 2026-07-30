@@ -11,6 +11,7 @@ class AndroidSplitTunnelTest {
     @Test
     fun api32DropsEverySplitOptionWithoutValidation() {
         val args = TunnelOptionsArgs().apply {
+            splitActive = true
             excludedPackages = ArrayList(List(513) { "bad package $it" })
             includedPackages = arrayListOf("also bad")
             splitTunnelRoutes = arrayListOf("not-a-cidr")
@@ -25,6 +26,7 @@ class AndroidSplitTunnelTest {
     @Test
     fun api33RejectsConflictingApplicationModes() {
         val args = TunnelOptionsArgs().apply {
+            splitActive = true
             excludedPackages = arrayListOf("com.example.excluded")
             includedPackages = arrayListOf("com.example.included")
         }
@@ -37,8 +39,20 @@ class AndroidSplitTunnelTest {
     }
 
     @Test
+    fun api33DropsOptionsWhenSplitIsInactive() {
+        val args = TunnelOptionsArgs().apply {
+            excludedPackages = arrayListOf("com.example.excluded")
+            splitTunnelRoutes = arrayListOf("203.0.113.0/24")
+            excludeLocalNetworks = true
+        }
+
+        assertTrue(AndroidSplitTunnel.resolveOptions(33, args).isEmpty())
+    }
+
+    @Test
     fun api33DeduplicatesPackagesAndEnforcesTheLimit() {
         val valid = TunnelOptionsArgs().apply {
+            splitActive = true
             excludedPackages = arrayListOf(
                 "com.example.first",
                 "com.example.first",
@@ -52,6 +66,7 @@ class AndroidSplitTunnelTest {
         )
 
         val oversized = TunnelOptionsArgs().apply {
+            splitActive = true
             excludedPackages = ArrayList(List(513) { "com.example.package$it" })
         }
         val error = runCatching {
@@ -63,6 +78,7 @@ class AndroidSplitTunnelTest {
     @Test
     fun api33CanonicalizesAndDeduplicatesIpv4Cidrs() {
         val args = TunnelOptionsArgs().apply {
+            splitActive = true
             splitTunnelRoutes = arrayListOf(
                 "203.0.113.17/24",
                 "203.0.113.0/24",
@@ -83,6 +99,7 @@ class AndroidSplitTunnelTest {
     @Test
     fun api33EnforcesTheIpv4CidrLimit() {
         val args = TunnelOptionsArgs().apply {
+            splitActive = true
             splitTunnelRoutes = ArrayList(
                 List(16_385) { index ->
                     val first = index ushr 16
@@ -98,6 +115,29 @@ class AndroidSplitTunnelTest {
         }.exceptionOrNull() as AndroidSplitTunnelException
 
         assertEquals("split_tunnel_routes_limit", error.code)
+    }
+
+    @Test
+    fun localNetworksAreMergedInMemoryWithoutChangingPanelRoutes() {
+        val panelRoutes = listOf(
+            prefix("203.0.113.0/24"),
+            prefix("192.168.1.0/24"),
+        )
+        val localRoutes = listOf(
+            prefix("192.168.1.0/24"),
+            prefix("10.0.0.0/8"),
+        )
+
+        val merged = AndroidSplitTunnel.mergeExcludedRoutes(panelRoutes, localRoutes)
+
+        assertEquals(
+            listOf("10.0.0.0/8", "192.168.1.0/24", "203.0.113.0/24"),
+            merged.map { it.canonical },
+        )
+        assertEquals(
+            listOf("203.0.113.0/24", "192.168.1.0/24"),
+            panelRoutes.map { it.canonical },
+        )
     }
 
     @Test
@@ -119,6 +159,7 @@ class AndroidSplitTunnelTest {
             """.trimIndent(),
         )
         val args = TunnelOptionsArgs().apply {
+            splitActive = true
             includedPackages = arrayListOf("com.example.selected")
             splitTunnelRoutes = arrayListOf("203.0.113.0/24")
         }
@@ -151,4 +192,12 @@ class AndroidSplitTunnelTest {
 
     private fun parseConfig(value: String): Config =
         Config.parse(ByteArrayInputStream(value.encodeToByteArray()))
+
+    private fun prefix(value: String): Ipv4Prefix {
+        val args = TunnelOptionsArgs().apply {
+            splitActive = true
+            splitTunnelRoutes = arrayListOf(value)
+        }
+        return AndroidSplitTunnel.resolveOptions(33, args).excludedRoutes.single()
+    }
 }

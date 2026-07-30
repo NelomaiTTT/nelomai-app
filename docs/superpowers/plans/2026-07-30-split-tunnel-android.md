@@ -570,21 +570,21 @@ git commit -m "Применить split-tunnel на Android"
 - Modify: `plugins/tunnel-android/android/src/main/java/TunnelPlugin.kt`
 - Create: `plugins/tunnel-android/android/src/test/java/PhysicalNetworksTest.kt`
 
-- [ ] Add failing tests for converting Android `LinkAddress` values into canonical physical-network CIDRs.
-- [ ] Include only active networks with Wi-Fi, cellular, or Ethernet transport.
-- [ ] Exclude VPN transports, loopback, multicast, link-local, and host-only `/32` addresses.
-- [ ] Do not substitute all RFC1918 ranges; use only actual on-link networks reported by `LinkProperties`.
-- [ ] When `exclude_local_networks` is enabled, merge detected local CIDRs with panel CIDRs in memory and pass them to `excludeRoute()`.
-- [ ] Register a `ConnectivityManager.NetworkCallback` only while a split-enabled tunnel is running.
-- [ ] Fingerprint canonical physical CIDRs. If the fingerprint changes:
+- [x] Add failing tests for converting Android `LinkAddress` values into canonical physical-network CIDRs.
+- [x] Include only active networks with Wi-Fi, cellular, or Ethernet transport.
+- [x] Exclude VPN transports, loopback, multicast, link-local, and host-only `/32` addresses.
+- [x] Do not substitute all RFC1918 ranges; use only actual on-link networks reported by `LinkProperties`.
+- [x] When `exclude_local_networks` is enabled, merge detected local CIDRs with panel CIDRs in memory and pass them to `excludeRoute()`.
+- [x] Register a `ConnectivityManager.NetworkCallback` only while a split-enabled tunnel is running.
+- [x] Fingerprint canonical physical CIDRs. If the fingerprint changes:
   - serialize the operation on the existing tunnel executor;
   - stop the current backend state;
   - apply the new local routes;
   - restart the same in-memory WireGuard config;
   - retry once with the previous local-route snapshot if restart fails.
-- [ ] Do not notify the panel about local CIDRs or include them in diagnostics.
-- [ ] On API 32 and older, do not register this split-specific callback.
-- [ ] Run tests:
+- [x] Do not notify the panel about local CIDRs or include them in diagnostics.
+- [x] On API 32 and older, do not register this split-specific callback.
+- [x] Run tests:
 
 ```bash
 ./src-tauri/gen/android/gradlew -p src-tauri/gen/android :tauri-plugin-tunnel-android:test

@@ -51,7 +51,7 @@ internal object AndroidSplitTunnel {
         androidApiLevel: Int,
         args: TunnelOptionsArgs,
     ): EffectiveAndroidTunnelOptions {
-        if (androidApiLevel < 33) {
+        if (androidApiLevel < 33 || !args.splitActive) {
             return EffectiveAndroidTunnelOptions()
         }
         if (args.excludedPackages.isNotEmpty() && args.includedPackages.isNotEmpty()) {
@@ -111,6 +111,23 @@ internal object AndroidSplitTunnel {
 
     fun replaceExcludedRoutes(routes: List<Ipv4Prefix>) {
         currentRoutes.set(routes.toList())
+    }
+
+    fun mergeExcludedRoutes(
+        panelRoutes: List<Ipv4Prefix>,
+        localRoutes: List<Ipv4Prefix>,
+    ): List<Ipv4Prefix> {
+        val routes = linkedMapOf<String, Ipv4Prefix>()
+        panelRoutes.forEach { routes.putIfAbsent(it.canonical, it) }
+        localRoutes.forEach { routes.putIfAbsent(it.canonical, it) }
+        return routes.values.sortedWith { first, second ->
+            val addressOrder = Integer.compareUnsigned(first.address, second.address)
+            if (addressOrder != 0) {
+                addressOrder
+            } else {
+                first.prefixLength.compareTo(second.prefixLength)
+            }
+        }
     }
 
     fun currentExcludedRoutes(): List<IpPrefix> =
