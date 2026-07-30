@@ -27,6 +27,9 @@ The Unix service boundary is documented in
 [`docs/unix-tunnel-helper.md`](docs/unix-tunnel-helper.md).
 Application update policy and release gates are documented in
 [`docs/application-updates.md`](docs/application-updates.md).
+Split-tunnel behavior, privacy boundaries, synchronization, and platform
+fallbacks are documented in
+[`docs/split-tunnel.md`](docs/split-tunnel.md).
 
 ## Local checks
 

@@ -677,35 +677,34 @@ git commit -m "Добавить настройки split-tunnel в прилож�
 - Create: `docs/split-tunnel.md`
 - Modify: `.github/workflows/ci.yml`
 
-- [ ] Document:
+- [x] Document:
   - supported connection combinations;
   - Android 13+ requirement for split behavior;
   - Android 12 and older full-tunnel fallback without connection restrictions;
   - local-only package inventory and local-network data;
   - five-minute revision and 24-hour full-sync cadence;
   - rollback behavior and panel-offline fallback.
-- [ ] Add CI jobs for Rust, frontend, and Android plugin unit tests without building every release artifact.
-- [ ] Run formatting:
+- [x] Add CI jobs for Rust, frontend, and Android plugin unit tests without building every release artifact.
+- [x] Run repository formatting and static-analysis gates:
 
 ```bash
 cargo fmt --all -- --check
-pnpm exec prettier --check "src/**/*.{ts,svelte}"
+npm run check
 ```
 
-- [ ] Run the complete local suite:
+- [x] Run the complete local suite:
 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-pnpm test -- --run
-pnpm check
-./src-tauri/gen/android/gradlew -p src-tauri/gen/android :tauri-plugin-tunnel-android:test
+npm test
+./src-tauri/gen/android/gradlew -p plugins/tunnel-android/android testDebugUnitTest
 ```
 
-- [ ] Build the APK locally:
+- [x] Build the APK locally:
 
 ```bash
-pnpm tauri android build --debug
+npm run tauri -- android build --debug
 ```
 
 - [ ] On an Android 13+ device verify:
@@ -717,8 +716,8 @@ pnpm tauri android build --debug
   - Wi-Fi change reapplies safely;
   - panel outage keeps cached behavior.
 - [ ] On an Android 12-or-older emulator/device verify all three connection combinations start as full tunnel and no split option blocks Start.
-- [ ] Confirm diagnostics contain no package inventory, local CIDRs, or WireGuard material.
-- [ ] Inspect the final diff for accidental generated APKs, secrets, and unrelated changes:
+- [x] Confirm diagnostics contain no package inventory, local CIDRs, or WireGuard material.
+- [x] Inspect the final diff for accidental generated APKs, secrets, and unrelated changes:
 
 ```bash
 git status --short
