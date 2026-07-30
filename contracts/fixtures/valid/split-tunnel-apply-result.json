@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "revision": 7,
+  "force_revision": 2,
+  "policy_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "status": "applied",
+  "error_code": null,
+  "applied_at": "2026-07-30T12:01:00Z"
+}

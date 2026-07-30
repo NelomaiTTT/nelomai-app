@@ -1,0 +1,10 @@
+{
+  "mode": "include_selected",
+  "exclude_local_networks": true,
+  "selected_packages": [
+    {
+      "package_id": "com.private.application",
+      "display_name": "Private App"
+    }
+  ]
+}

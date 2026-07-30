@@ -3,7 +3,9 @@ use std::{fs, path::PathBuf};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, ConnectionOperationResponse, ConnectionStartRequest,
     ConnectionStartResponse, ErrorPayload, PeerBindingResponse, PeerOptions, ProbeResults,
-    ServerCandidatesResponse, ServerSelectionRequest, UpdateManifest,
+    ServerCandidatesResponse, ServerSelectionRequest, SplitTunnelApplyResult,
+    SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy, SplitTunnelRevision,
+    SplitTunnelSettingsUpdate, UpdateManifest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -113,4 +115,85 @@ fn wireguard_configuration_is_redacted_from_debug_output() {
     let binding: PeerBindingResponse =
         serde_json::from_str(&fixture("valid/peer-binding.json")).unwrap();
     assert!(!format!("{binding:?}").contains("# client configuration"));
+}
+
+#[test]
+fn split_tunnel_wire_types_match_panel_json() {
+    let revision: SplitTunnelRevision =
+        serde_json::from_str(&fixture("valid/split-tunnel-revision.json")).unwrap();
+    assert!(revision.enabled);
+    assert_eq!(revision.revision, 7);
+    assert_eq!(revision.force_revision, 2);
+
+    let policy: SplitTunnelPolicy =
+        serde_json::from_str(&fixture("valid/split-tunnel-policy.json")).unwrap();
+    assert_eq!(policy.format_version, 1);
+    assert_eq!(policy.mode, SplitTunnelMode::ExcludeSelected);
+    policy.validate_timestamps().unwrap();
+
+    let settings: SplitTunnelSettingsUpdate =
+        serde_json::from_str(&fixture("valid/split-tunnel-settings.json")).unwrap();
+    assert_eq!(settings.mode, SplitTunnelMode::IncludeSelected);
+    assert_eq!(settings.selected_packages.len(), 1);
+
+    let apply: SplitTunnelApplyResult =
+        serde_json::from_str(&fixture("valid/split-tunnel-apply-result.json")).unwrap();
+    assert_eq!(apply.status, SplitTunnelApplyStatus::Applied);
+    apply.validate_timestamps().unwrap();
+}
+
+#[test]
+fn split_tunnel_enums_use_snake_case_and_payload_has_no_inventory() {
+    assert_eq!(
+        serde_json::to_string(&SplitTunnelMode::ExcludeSelected).unwrap(),
+        "\"exclude_selected\""
+    );
+    assert_eq!(
+        serde_json::to_string(&SplitTunnelApplyStatus::RolledBack).unwrap(),
+        "\"rolled_back\""
+    );
+
+    let settings: SplitTunnelSettingsUpdate =
+        serde_json::from_str(&fixture("valid/split-tunnel-settings.json")).unwrap();
+    let serialized = serde_json::to_string(&settings).unwrap();
+    assert!(!serialized.contains("icon"));
+    assert!(!serialized.contains("inventory"));
+    assert!(!serialized.contains("installed_packages"));
+}
+
+#[test]
+fn split_tunnel_transport_parses_unknown_format_but_validates_timestamps() {
+    let unknown = fixture("valid/split-tunnel-policy.json")
+        .replace("\"format_version\": 1", "\"format_version\": 9");
+    let policy: SplitTunnelPolicy = serde_json::from_str(&unknown).unwrap();
+    assert_eq!(policy.format_version, 9);
+
+    let invalid = fixture("valid/split-tunnel-policy.json")
+        .replace("2026-07-30T12:00:00Z", "not-a-timestamp");
+    let policy: SplitTunnelPolicy = serde_json::from_str(&invalid).unwrap();
+    assert!(policy.validate_timestamps().is_err());
+
+    let invalid_apply = fixture("valid/split-tunnel-apply-result.json")
+        .replace("2026-07-30T12:01:00Z", "yesterday");
+    let apply: SplitTunnelApplyResult = serde_json::from_str(&invalid_apply).unwrap();
+    assert!(apply.validate_timestamps().is_err());
+}
+
+#[test]
+fn split_tunnel_debug_omits_packages_names_and_cidrs() {
+    let policy: SplitTunnelPolicy =
+        serde_json::from_str(&fixture("valid/split-tunnel-policy.json")).unwrap();
+    let policy_debug = format!("{policy:?}");
+    assert!(policy_debug.contains("revision"));
+    assert!(policy_debug.contains("selected_packages_count"));
+    assert!(!policy_debug.contains("com.secret.application"));
+    assert!(!policy_debug.contains("Яндекс"));
+    assert!(!policy_debug.contains("203.0.113.0/24"));
+
+    let settings: SplitTunnelSettingsUpdate =
+        serde_json::from_str(&fixture("valid/split-tunnel-settings.json")).unwrap();
+    let settings_debug = format!("{settings:?}");
+    assert!(settings_debug.contains("selected_packages_count"));
+    assert!(!settings_debug.contains("com.private.application"));
+    assert!(!settings_debug.contains("Private App"));
 }

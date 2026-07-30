@@ -1,0 +1,24 @@
+{
+  "api_version": "1",
+  "request_id": "req_split_policy_01",
+  "format_version": 1,
+  "enabled": true,
+  "revision": 7,
+  "force_revision": 2,
+  "policy_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "mode": "exclude_selected",
+  "exclude_local_networks": true,
+  "mandatory_excluded_packages": [
+    "com.secret.application"
+  ],
+  "suggested_name_fragments": [
+    "Яндекс"
+  ],
+  "selected_packages": [
+    "com.example.selected"
+  ],
+  "excluded_ipv4_cidrs": [
+    "203.0.113.0/24"
+  ],
+  "generated_at": "2026-07-30T12:00:00Z"
+}

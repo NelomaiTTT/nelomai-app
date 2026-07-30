@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+mod split_tunnel;
+
+pub use split_tunnel::{
+    SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
+    SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
+    SplitTunnelTimestampError, SplitTunnelTimestampField,
+};
+
 pub const API_PREFIX: &str = "/api/client/v1";
 pub const CONTRACT_VERSION: &str = "1";
 
