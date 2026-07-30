@@ -1,17 +1,23 @@
+use futures_util::StreamExt;
 use nelomai_contracts::{
     Access, ApiVersion, BindPeerRequest, Bootstrap, ConnectionOperationRequest,
     ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, ErrorPayload,
     Layer, PeerBindingResponse, PeerOptions, Platform, ServerCandidatesResponse,
-    ServerSelectionRequest, ServerSelectionResponse, API_PREFIX,
+    ServerSelectionRequest, ServerSelectionResponse, SplitTunnelApplyResult, SplitTunnelPolicy,
+    SplitTunnelRevision, SplitTunnelSettingsUpdate, API_PREFIX,
 };
 use reqwest::{
-    header::{HeaderValue, InvalidHeaderValue},
-    Client as HttpClient, RequestBuilder, StatusCode, Url,
+    header::{HeaderValue, InvalidHeaderValue, CONTENT_TYPE},
+    Client as HttpClient, RequestBuilder, Response, StatusCode, Url,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+const SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT: usize = 1024 * 1024;
+const SPLIT_TUNNEL_SETTINGS_REQUEST_LIMIT: usize = 256 * 1024;
+const SPLIT_TUNNEL_SELECTED_PACKAGES_LIMIT: usize = 512;
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct LoginRequest {
@@ -151,6 +157,23 @@ pub enum ClientApiError {
     },
     #[error("panel returned an invalid error response ({status})")]
     InvalidErrorResponse { status: StatusCode },
+    #[error("{code}")]
+    InvalidPayload { code: &'static str },
+    #[error("{code}: payload exceeds the {limit_bytes}-byte limit")]
+    PayloadTooLarge {
+        code: &'static str,
+        limit_bytes: usize,
+    },
+}
+
+impl ClientApiError {
+    pub fn stable_code(&self) -> Option<&str> {
+        match self {
+            Self::Api { code, .. } => Some(code),
+            Self::InvalidPayload { code } | Self::PayloadTooLarge { code, .. } => Some(code),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -245,6 +268,80 @@ impl ClientApi {
                 .post(self.endpoint("diagnostics")?)
                 .bearer_auth(access_token)
                 .json(request),
+        )
+        .await
+    }
+
+    pub async fn split_tunnel_revision(
+        &self,
+        access_token: &str,
+    ) -> Result<SplitTunnelRevision, ClientApiError> {
+        self.send_json(
+            self.http
+                .get(self.endpoint("split-tunnel/revision")?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn split_tunnel_policy(
+        &self,
+        access_token: &str,
+    ) -> Result<SplitTunnelPolicy, ClientApiError> {
+        self.send_limited_json(
+            self.http
+                .get(self.endpoint("split-tunnel/policy")?)
+                .bearer_auth(access_token),
+            SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT,
+            "split_tunnel_policy_too_large",
+            "split_tunnel_policy_invalid",
+        )
+        .await
+    }
+
+    pub async fn update_split_tunnel_settings(
+        &self,
+        access_token: &str,
+        settings: &SplitTunnelSettingsUpdate,
+    ) -> Result<SplitTunnelPolicy, ClientApiError> {
+        if settings.selected_packages.len() > SPLIT_TUNNEL_SELECTED_PACKAGES_LIMIT {
+            return Err(ClientApiError::InvalidPayload {
+                code: "split_tunnel_selected_packages_limit",
+            });
+        }
+        let body = serde_json::to_vec(settings).map_err(|_| ClientApiError::InvalidPayload {
+            code: "split_tunnel_settings_invalid",
+        })?;
+        if body.len() > SPLIT_TUNNEL_SETTINGS_REQUEST_LIMIT {
+            return Err(ClientApiError::PayloadTooLarge {
+                code: "split_tunnel_settings_too_large",
+                limit_bytes: SPLIT_TUNNEL_SETTINGS_REQUEST_LIMIT,
+            });
+        }
+
+        self.send_limited_json(
+            self.http
+                .put(self.endpoint("split-tunnel/settings")?)
+                .bearer_auth(access_token)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body),
+            SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT,
+            "split_tunnel_policy_too_large",
+            "split_tunnel_policy_invalid",
+        )
+        .await
+    }
+
+    pub async fn report_split_tunnel_apply_result(
+        &self,
+        access_token: &str,
+        result: &SplitTunnelApplyResult,
+    ) -> Result<SuccessResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("split-tunnel/apply-result")?)
+                .bearer_auth(access_token)
+                .json(result),
         )
         .await
     }
@@ -423,16 +520,67 @@ impl ClientApi {
         if status.is_success() {
             return Ok(response.json().await?);
         }
+        Err(Self::api_error(response, status).await)
+    }
+
+    async fn send_limited_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        request: RequestBuilder,
+        limit_bytes: usize,
+        limit_code: &'static str,
+        invalid_code: &'static str,
+    ) -> Result<T, ClientApiError> {
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::api_error(response, status).await);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit_bytes as u64)
+        {
+            return Err(ClientApiError::PayloadTooLarge {
+                code: limit_code,
+                limit_bytes,
+            });
+        }
+
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(limit_bytes as u64) as usize,
+        );
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if body.len().saturating_add(chunk.len()) > limit_bytes {
+                return Err(ClientApiError::PayloadTooLarge {
+                    code: limit_code,
+                    limit_bytes,
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        serde_json::from_slice(&body)
+            .map_err(|_| ClientApiError::InvalidPayload { code: invalid_code })
+    }
+
+    async fn api_error(response: Response, status: StatusCode) -> ClientApiError {
         let payload = response
             .json::<ErrorPayload>()
             .await
-            .map_err(|_| ClientApiError::InvalidErrorResponse { status })?;
-        Err(ClientApiError::Api {
-            status,
-            request_id: payload.request_id,
-            code: payload.code,
-            message: payload.message,
-        })
+            .map_err(|_| ClientApiError::InvalidErrorResponse { status });
+        match payload {
+            Ok(payload) => ClientApiError::Api {
+                status,
+                request_id: payload.request_id,
+                code: payload.code,
+                message: payload.message,
+            },
+            Err(error) => error,
+        }
     }
 }
 

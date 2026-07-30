@@ -32,7 +32,7 @@
 - Modify: `crates/contracts/src/lib.rs`
 - Modify: `crates/contracts/tests/fixtures.rs`
 
-- [ ] Add failing JSON fixture tests for all wire types.
+- [x] Add failing JSON fixture tests for all wire types.
 
 Cover these exact shapes:
 
@@ -100,25 +100,25 @@ pub struct SplitTunnelApplyResult {
 }
 ```
 
-- [ ] Assert unknown `format_version` remains parseable at the transport boundary but is rejected by the core before application.
-- [ ] Assert API JSON uses `snake_case` enum values and never serializes an application icon or full inventory.
-- [ ] Treat `generated_at` and `applied_at` as RFC 3339 strings at the contract boundary and validate them with the existing `time` dependency before use.
-- [ ] Implement custom `Debug` for policy/settings that prints revision, mode, booleans, hash, and list counts but never package IDs, display names, or CIDRs.
-- [ ] Export the module types from `crates/contracts/src/lib.rs`.
-- [ ] Run the failing test and confirm the expected compile or assertion failure:
+- [x] Assert unknown `format_version` remains parseable at the transport boundary but is rejected by the core before application.
+- [x] Assert API JSON uses `snake_case` enum values and never serializes an application icon or full inventory.
+- [x] Treat `generated_at` and `applied_at` as RFC 3339 strings at the contract boundary and validate them with the existing `time` dependency before use.
+- [x] Implement custom `Debug` for policy/settings that prints revision, mode, booleans, hash, and list counts but never package IDs, display names, or CIDRs.
+- [x] Export the module types from `crates/contracts/src/lib.rs`.
+- [x] Run the failing test and confirm the expected compile or assertion failure:
 
 ```bash
 cargo test -p nelomai-contracts --test fixtures split_tunnel -- --nocapture
 ```
 
-- [ ] Implement the contracts and make the focused test pass.
-- [ ] Run all contracts tests:
+- [x] Implement the contracts and make the focused test pass.
+- [x] Run all contracts tests:
 
 ```bash
 cargo test -p nelomai-contracts
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add crates/contracts
@@ -134,16 +134,16 @@ git commit -m "Добавить контракты split-tunnel"
 - Modify: `crates/client-api/Cargo.toml`
 - Modify: `crates/client-application/tests/http_flow.rs`
 
-- [ ] Add failing mock-server tests for:
+- [x] Add failing mock-server tests for:
   - `GET /api/client/v1/split-tunnel/revision`;
   - `GET /api/client/v1/split-tunnel/policy`;
   - `PUT /api/client/v1/split-tunnel/settings`;
   - `POST /api/client/v1/split-tunnel/apply-result`.
-- [ ] Assert each request carries the existing bearer token and the panel's request ID behavior remains unchanged.
-- [ ] Assert a policy body above `1 MiB` is rejected before JSON deserialization with a stable `split_tunnel_policy_too_large` client error.
-- [ ] Assert settings with more than 512 selected packages are rejected locally.
-- [ ] Assert a serialized settings request above `256 KiB` is rejected locally before transmission.
-- [ ] Implement these methods on `ClientApi`:
+- [x] Assert each request carries the existing bearer token and the panel's request ID behavior remains unchanged.
+- [x] Assert a policy body above `1 MiB` is rejected before JSON deserialization with a stable `split_tunnel_policy_too_large` client error.
+- [x] Assert settings with more than 512 selected packages are rejected locally.
+- [x] Assert a serialized settings request above `256 KiB` is rejected locally before transmission.
+- [x] Implement these methods on `ClientApi`:
 
 ```rust
 pub async fn split_tunnel_revision(
@@ -169,22 +169,22 @@ pub async fn report_split_tunnel_apply_result(
 ) -> Result<SuccessResponse, ClientApiError>;
 ```
 
-- [ ] Reuse the current authenticated request and token refresh path; do not create a second HTTP client.
-- [ ] Redact policy bodies and selected package IDs from transport error text.
-- [ ] Run focused tests:
+- [x] Reuse the current authenticated request and token refresh path; do not create a second HTTP client.
+- [x] Redact policy bodies and selected package IDs from transport error text.
+- [x] Run focused tests:
 
 ```bash
 cargo test -p nelomai-client-application --test http_flow split_tunnel -- --nocapture
 ```
 
-- [ ] Run API and application tests:
+- [x] Run API and application tests:
 
 ```bash
 cargo test -p nelomai-client-api
 cargo test -p nelomai-client-application
 ```
 
-- [ ] Commit:
+- [x] Commit:
 
 ```bash
 git add crates/client-api crates/client-application

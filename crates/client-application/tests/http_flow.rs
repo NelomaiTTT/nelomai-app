@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use axum::{
     extract::{Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use nelomai_client_api::ClientApi;
@@ -10,7 +10,10 @@ use nelomai_client_application::{ClientApplication, LoginParameters};
 use nelomai_client_core::{ConnectOptions, NoopLogger, Phase};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth};
 use nelomai_client_tunnel::{TunnelConfiguration, TunnelController, TunnelError, TunnelStatus};
-use nelomai_contracts::{BindPeerRequest, Layer, Platform, RouteMode, TicConnectionMode};
+use nelomai_contracts::{
+    BindPeerRequest, Layer, Platform, RouteMode, SplitTunnelApplyResult, SplitTunnelApplyStatus,
+    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -32,6 +35,8 @@ struct MockPanelState {
     probe_requests: AtomicUsize,
     start_operations: Mutex<Vec<String>>,
     pinned: AtomicBool,
+    split_settings_requests: AtomicUsize,
+    split_apply_requests: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -197,6 +202,148 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_tunnel_api_uses_authenticated_versioned_routes() {
+    let panel_state = Arc::new(MockPanelState::default());
+    let router = Router::new()
+        .route(
+            "/api/client/v1/split-tunnel/revision",
+            get(split_tunnel_revision),
+        )
+        .route(
+            "/api/client/v1/split-tunnel/policy",
+            get(split_tunnel_policy),
+        )
+        .route(
+            "/api/client/v1/split-tunnel/settings",
+            put(split_tunnel_settings),
+        )
+        .route(
+            "/api/client/v1/split-tunnel/apply-result",
+            post(split_tunnel_apply_result),
+        )
+        .with_state(panel_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let api = ClientApi::new(&base_url).unwrap();
+
+    let revision = api.split_tunnel_revision("access-token").await.unwrap();
+    assert!(revision.enabled);
+    assert_eq!(revision.revision, 7);
+    let policy = api.split_tunnel_policy("access-token").await.unwrap();
+    assert_eq!(policy.policy_hash, split_policy_hash());
+
+    let settings = SplitTunnelSettingsUpdate {
+        mode: SplitTunnelMode::ExcludeSelected,
+        exclude_local_networks: true,
+        selected_packages: vec![SplitTunnelSelectedPackage {
+            package_id: "com.example.app".to_string(),
+            display_name: "Example".to_string(),
+        }],
+    };
+    let updated = api
+        .update_split_tunnel_settings("access-token", &settings)
+        .await
+        .unwrap();
+    assert_eq!(updated.selected_packages, ["com.example.app"]);
+
+    let result = SplitTunnelApplyResult {
+        format_version: 1,
+        revision: 7,
+        force_revision: 2,
+        policy_hash: split_policy_hash(),
+        status: SplitTunnelApplyStatus::Applied,
+        error_code: None,
+        applied_at: "2026-07-30T12:01:00Z".to_string(),
+    };
+    let accepted = api
+        .report_split_tunnel_apply_result("access-token", &result)
+        .await
+        .unwrap();
+    assert_eq!(accepted.request_id, "req-split-apply");
+    assert_eq!(
+        panel_state.split_settings_requests.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(panel_state.split_apply_requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_tunnel_policy_rejects_body_above_one_megabyte_before_json() {
+    let router = Router::new().route(
+        "/api/client/v1/split-tunnel/policy",
+        get(oversized_split_tunnel_policy),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let api = ClientApi::new(&base_url).unwrap();
+
+    let error = api.split_tunnel_policy("access-token").await.unwrap_err();
+    assert_eq!(error.stable_code(), Some("split_tunnel_policy_too_large"));
+    assert!(!format!("{error}").contains("com.secret"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_tunnel_settings_limits_are_enforced_before_transmission() {
+    let panel_state = Arc::new(MockPanelState::default());
+    let router = Router::new()
+        .route(
+            "/api/client/v1/split-tunnel/settings",
+            put(split_tunnel_settings),
+        )
+        .with_state(panel_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let api = ClientApi::new(&base_url).unwrap();
+    let package = SplitTunnelSelectedPackage {
+        package_id: "com.example.app".to_string(),
+        display_name: "Example".to_string(),
+    };
+    let too_many = SplitTunnelSettingsUpdate {
+        mode: SplitTunnelMode::ExcludeSelected,
+        exclude_local_networks: true,
+        selected_packages: vec![package; 513],
+    };
+    let error = api
+        .update_split_tunnel_settings("access-token", &too_many)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.stable_code(),
+        Some("split_tunnel_selected_packages_limit")
+    );
+
+    let too_large = SplitTunnelSettingsUpdate {
+        mode: SplitTunnelMode::ExcludeSelected,
+        exclude_local_networks: true,
+        selected_packages: vec![SplitTunnelSelectedPackage {
+            package_id: "com.example.large".to_string(),
+            display_name: "x".repeat(300_000),
+        }],
+    };
+    let error = api
+        .update_split_tunnel_settings("access-token", &too_large)
+        .await
+        .unwrap_err();
+    assert_eq!(error.stable_code(), Some("split_tunnel_settings_too_large"));
+    assert_eq!(
+        panel_state.split_settings_requests.load(Ordering::SeqCst),
+        0
+    );
+    server.abort();
+}
+
 async fn login(State(_state): State<Arc<MockPanelState>>, Json(body): Json<Value>) -> Json<Value> {
     assert_eq!(body["login"], "test");
     assert_eq!(body["password"], "password");
@@ -227,6 +374,81 @@ async fn logout(headers: HeaderMap) -> Json<Value> {
         "request_id": "logout-request",
         "ok": true
     }))
+}
+
+async fn split_tunnel_revision(headers: HeaderMap) -> Json<Value> {
+    assert_authenticated(&headers);
+    Json(json!({
+        "api_version": "1",
+        "request_id": "req-split-revision",
+        "enabled": true,
+        "revision": 7,
+        "force_revision": 2
+    }))
+}
+
+async fn split_tunnel_policy(headers: HeaderMap) -> Json<Value> {
+    assert_authenticated(&headers);
+    Json(split_tunnel_policy_json())
+}
+
+async fn split_tunnel_settings(
+    State(state): State<Arc<MockPanelState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_authenticated(&headers);
+    assert_eq!(body["mode"], "exclude_selected");
+    assert_eq!(
+        body["selected_packages"][0]["package_id"],
+        "com.example.app"
+    );
+    state.split_settings_requests.fetch_add(1, Ordering::SeqCst);
+    Json(split_tunnel_policy_json())
+}
+
+async fn split_tunnel_apply_result(
+    State(state): State<Arc<MockPanelState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_authenticated(&headers);
+    assert_eq!(body["status"], "applied");
+    assert_eq!(body["policy_hash"], split_policy_hash());
+    state.split_apply_requests.fetch_add(1, Ordering::SeqCst);
+    Json(json!({
+        "api_version": "1",
+        "request_id": "req-split-apply",
+        "ok": true
+    }))
+}
+
+async fn oversized_split_tunnel_policy(headers: HeaderMap) -> String {
+    assert_authenticated(&headers);
+    format!("{{\"com.secret\":\"{}\"}}", "x".repeat(1024 * 1024))
+}
+
+fn split_tunnel_policy_json() -> Value {
+    json!({
+        "api_version": "1",
+        "request_id": "req-split-policy",
+        "format_version": 1,
+        "enabled": true,
+        "revision": 7,
+        "force_revision": 2,
+        "policy_hash": split_policy_hash(),
+        "mode": "exclude_selected",
+        "exclude_local_networks": true,
+        "mandatory_excluded_packages": ["com.mandatory.app"],
+        "suggested_name_fragments": ["Яндекс"],
+        "selected_packages": ["com.example.app"],
+        "excluded_ipv4_cidrs": ["203.0.113.0/24"],
+        "generated_at": "2026-07-30T12:00:00Z"
+    })
+}
+
+fn split_policy_hash() -> String {
+    format!("sha256:{}", "a".repeat(64))
 }
 
 async fn bootstrap(State(state): State<Arc<MockPanelState>>, headers: HeaderMap) -> Json<Value> {

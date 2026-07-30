@@ -301,6 +301,11 @@ impl From<ClientApiError> for CoreApiError {
             ClientApiError::InvalidErrorResponse { status } if status.is_server_error() => {
                 Self::Retryable
             }
+            ClientApiError::InvalidPayload { code }
+            | ClientApiError::PayloadTooLarge { code, .. } => Self::Rejected {
+                code: code.to_string(),
+                message: "Панель вернула некорректные данные split-tunnel.".to_string(),
+            },
             ClientApiError::InvalidBaseUrl(_)
             | ClientApiError::InvalidAppVersion(_)
             | ClientApiError::InvalidErrorResponse { .. } => Self::Rejected {
