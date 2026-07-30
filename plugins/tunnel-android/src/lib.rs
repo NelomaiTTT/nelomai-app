@@ -44,6 +44,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
             commands::probe,
             commands::request_vpn_permission,
+            commands::installed_applications,
             commands::tunnel_status
         ])
         .setup(|app, api| {

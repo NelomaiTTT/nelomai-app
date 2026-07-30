@@ -27,6 +27,33 @@ pub struct PermissionResponse {
     pub permission_granted: bool,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApplicationsRequest {}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApplication {
+    pub package_id: String,
+    pub display_name: String,
+    pub system: bool,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledApplicationsResponse {
+    pub applications: Vec<InstalledApplication>,
+}
+
+impl fmt::Debug for InstalledApplicationsResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledApplicationsResponse")
+            .field("applications_count", &self.applications.len())
+            .finish()
+    }
+}
+
 pub const TUNNEL_API_VERSION: u16 = 1;
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -143,5 +170,33 @@ mod tests {
         assert_eq!(value["options"]["includedPackages"], serde_json::json!([]));
         assert_eq!(value["options"]["splitTunnelRoutes"], serde_json::json!([]));
         assert_eq!(value["options"]["excludeLocalNetworks"], false);
+    }
+
+    #[test]
+    fn installed_application_inventory_has_no_icons_and_redacts_debug_output() {
+        let response = InstalledApplicationsResponse {
+            applications: vec![InstalledApplication {
+                package_id: "com.example.private".to_string(),
+                display_name: "Private application".to_string(),
+                system: false,
+            }],
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "applications": [{
+                    "packageId": "com.example.private",
+                    "displayName": "Private application",
+                    "system": false
+                }]
+            })
+        );
+        assert!(value["applications"][0].get("icon").is_none());
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("com.example.private"));
+        assert!(!debug.contains("Private application"));
+        assert!(debug.contains("applications_count"));
     }
 }

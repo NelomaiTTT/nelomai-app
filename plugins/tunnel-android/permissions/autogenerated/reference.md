@@ -6,6 +6,7 @@ Default permissions for the plugin
 
 - `allow-probe`
 - `allow-request-vpn-permission`
+- `allow-installed-applications`
 - `allow-tunnel-status`
 
 ## Permission Table
@@ -16,6 +17,32 @@ Default permissions for the plugin
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`tunnel-android:allow-installed-applications`
+
+</td>
+<td>
+
+Enables the installed_applications command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tunnel-android:deny-installed-applications`
+
+</td>
+<td>
+
+Denies the installed_applications command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>

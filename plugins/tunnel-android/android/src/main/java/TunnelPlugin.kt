@@ -18,6 +18,7 @@ import com.wireguard.config.Config
 import java.io.ByteArrayInputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
+import org.json.JSONArray
 
 private const val TUNNEL_API_VERSION = 1
 private const val TUNNEL_NAME = "nelomai"
@@ -312,6 +313,25 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         startActivityForResult(invoke, intent, "vpnPermissionResult")
+    }
+
+    @Command
+    fun installedApplications(invoke: Invoke) {
+        try {
+            val applications = JSONArray()
+            InstalledApplications.query(activity.applicationContext).forEach { application ->
+                val item = JSObject()
+                item.put("packageId", application.packageId)
+                item.put("displayName", application.displayName)
+                item.put("system", application.system)
+                applications.put(item)
+            }
+            val response = JSObject()
+            response.put("applications", applications)
+            invoke.resolve(response)
+        } catch (_: Throwable) {
+            invoke.reject("installed_applications_unavailable")
+        }
     }
 
     @Command

@@ -1,4 +1,9 @@
-const COMMANDS: &[&str] = &["probe", "request_vpn_permission", "tunnel_status"];
+const COMMANDS: &[&str] = &[
+    "probe",
+    "request_vpn_permission",
+    "installed_applications",
+    "tunnel_status",
+];
 
 fn main() {
     tauri_plugin::Builder::new(COMMANDS)

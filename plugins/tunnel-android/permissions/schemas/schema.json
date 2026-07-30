@@ -295,6 +295,18 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the installed_applications command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-installed-applications",
+          "markdownDescription": "Enables the installed_applications command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the installed_applications command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-installed-applications",
+          "markdownDescription": "Denies the installed_applications command without any pre-configured scope."
+        },
+        {
           "description": "Enables the probe command without any pre-configured scope.",
           "type": "string",
           "const": "allow-probe",
@@ -331,10 +343,10 @@
           "markdownDescription": "Denies the tunnel_status command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-tunnel-status`",
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-installed-applications`\n- `allow-tunnel-status`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-tunnel-status`"
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-probe`\n- `allow-request-vpn-permission`\n- `allow-installed-applications`\n- `allow-tunnel-status`"
         }
       ]
     }

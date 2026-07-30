@@ -17,6 +17,13 @@ pub(crate) async fn request_vpn_permission<R: Runtime>(
 }
 
 #[command]
+pub(crate) async fn installed_applications<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<InstalledApplicationsResponse> {
+    app.tunnel_android().installed_applications()
+}
+
+#[command]
 pub(crate) async fn tunnel_status<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<TunnelOperationResponse> {

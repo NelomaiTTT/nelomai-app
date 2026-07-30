@@ -37,6 +37,15 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub fn installed_applications(&self) -> crate::Result<InstalledApplicationsResponse> {
+        self.0
+            .run_mobile_plugin(
+                "installedApplications",
+                InstalledApplicationsRequest::default(),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn start_tunnel(
         &self,
         request: StartTunnelRequest,

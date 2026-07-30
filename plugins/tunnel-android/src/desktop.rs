@@ -31,6 +31,10 @@ impl<R: Runtime> TunnelAndroid<R> {
         })
     }
 
+    pub fn installed_applications(&self) -> crate::Result<InstalledApplicationsResponse> {
+        Ok(InstalledApplicationsResponse::default())
+    }
+
     pub fn start_tunnel(
         &self,
         _request: StartTunnelRequest,

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-installed-applications"
+description = "Enables the installed_applications command without any pre-configured scope."
+commands.allow = ["installed_applications"]
+
+[[permission]]
+identifier = "deny-installed-applications"
+description = "Denies the installed_applications command without any pre-configured scope."
+commands.deny = ["installed_applications"]
