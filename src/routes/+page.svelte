@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
+  import NotificationsPanel from "$lib/NotificationsPanel.svelte";
+  import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
 
   import {
     bindingRequest,
@@ -20,6 +22,7 @@
   import {
     commandMessage,
     nativeClient,
+    type AppNotification,
     type LoginRequest,
   } from "$lib/native-client";
   import {
@@ -58,6 +61,13 @@
   let splitTunnelBusy = $state(false);
   let splitTunnelLoaded = $state(false);
   let runtimeWarning = $state<string | null>(null);
+  let notifications = $state<AppNotification[]>([]);
+  let notificationUnreadCount = $state(0);
+  let notificationNextCursor = $state<number | null>(null);
+  let notificationHistoryExpanded = $state(false);
+  let notificationsOpen = $state(false);
+  let notificationsBusy = $state(false);
+  let notificationsError = $state<string | null>(null);
   let splitTunnelBlocksStart = $derived(
     splitTunnelState !== null &&
       emptyIncludeSelection(splitTunnelState, splitTunnelApplications),
@@ -90,15 +100,22 @@
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
     }, 300_000);
+    const notificationTimer = window.setInterval(() => {
+      if (document.visibilityState === "visible" && bootstrap) {
+        void refreshNotifications(false, true);
+      }
+    }, 60_000);
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
         void synchronizeRuntimeState();
         void refreshProbes();
+        if (bootstrap) void refreshNotifications(false, true);
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
       window.clearInterval(timer);
+      window.clearInterval(notificationTimer);
       if (stateTimer !== null) window.clearInterval(stateTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
       clearUpdateTimer();
@@ -173,6 +190,7 @@
     ticConnectionMode = response.defaults.tic_connection_mode;
     routeMode = response.defaults.route_mode;
     void refreshUpdateStatus();
+    void refreshNotifications(false, true);
 
     if (response.update.required) {
       phase = "update_required";
@@ -430,6 +448,11 @@
       splitTunnelOpen = false;
       splitTunnelLoaded = false;
       runtimeWarning = null;
+      notifications = [];
+      notificationUnreadCount = 0;
+      notificationNextCursor = null;
+      notificationHistoryExpanded = false;
+      notificationsOpen = false;
       clearUpdateTimer();
       phase = "signed_out";
       view = "sign_in";
@@ -451,6 +474,79 @@
       diagnosticsStatus = commandMessage(reason);
     } finally {
       diagnosticsBusy = false;
+    }
+  }
+
+  async function refreshNotifications(append: boolean, silent = false) {
+    if (notificationsBusy || !bootstrap) return;
+    notificationsBusy = true;
+    if (!silent) notificationsError = null;
+    try {
+      const response = await nativeClient.notifications(
+        append ? notificationNextCursor : null,
+      );
+      if (append) {
+        notifications = appendNotificationPage(notifications, response.notifications);
+        notificationHistoryExpanded = true;
+        notificationNextCursor = response.next_cursor;
+      } else if (silent && notificationsOpen && notificationHistoryExpanded) {
+        notifications = mergeRefreshedNotifications(notifications, response.notifications);
+      } else {
+        notifications = response.notifications;
+        notificationHistoryExpanded = false;
+        notificationNextCursor = response.next_cursor;
+      }
+      notificationUnreadCount = response.unread_count;
+    } catch (reason) {
+      if (!silent || notificationsOpen) {
+        notificationsError = commandMessage(reason);
+      }
+    } finally {
+      notificationsBusy = false;
+    }
+  }
+
+  async function openNotifications() {
+    notificationsOpen = true;
+    await refreshNotifications(false);
+  }
+
+  async function markNotificationRead(messageId: number) {
+    if (notificationsBusy) return;
+    notificationsBusy = true;
+    notificationsError = null;
+    try {
+      const response = await nativeClient.markNotificationRead(messageId);
+      const readAt = new Date().toISOString();
+      notifications = notifications.map((notification) =>
+        notification.id === messageId
+          ? { ...notification, read_at: notification.read_at ?? readAt }
+          : notification,
+      );
+      notificationUnreadCount = response.unread_count;
+    } catch (reason) {
+      notificationsError = commandMessage(reason);
+    } finally {
+      notificationsBusy = false;
+    }
+  }
+
+  async function markAllNotificationsRead() {
+    if (notificationsBusy) return;
+    notificationsBusy = true;
+    notificationsError = null;
+    try {
+      const response = await nativeClient.markAllNotificationsRead();
+      const readAt = new Date().toISOString();
+      notifications = notifications.map((notification) => ({
+        ...notification,
+        read_at: notification.read_at ?? readAt,
+      }));
+      notificationUnreadCount = response.unread_count;
+    } catch (reason) {
+      notificationsError = commandMessage(reason);
+    } finally {
+      notificationsBusy = false;
     }
   }
 
@@ -627,6 +723,19 @@
         {phaseLabels[phase]}
       </span>
       {#if view !== "loading" && view !== "sign_in"}
+        <button
+          class="quiet-button notification-button"
+          type="button"
+          onclick={openNotifications}
+          aria-label={notificationUnreadCount
+            ? `Уведомления, непрочитанных: ${notificationUnreadCount}`
+            : "Уведомления"}
+        >
+          Уведомления
+          {#if notificationUnreadCount}
+            <span>{Math.min(notificationUnreadCount, 99)}</span>
+          {/if}
+        </button>
         <button
           class="quiet-button"
           type="button"
@@ -1050,6 +1159,20 @@
   />
 {/if}
 
+{#if notificationsOpen}
+  <NotificationsPanel
+    {notifications}
+    unreadCount={notificationUnreadCount}
+    nextCursor={notificationNextCursor}
+    busy={notificationsBusy}
+    error={notificationsError}
+    onclose={() => (notificationsOpen = false)}
+    onread={markNotificationRead}
+    onreadall={markAllNotificationsRead}
+    onloadmore={() => refreshNotifications(true)}
+  />
+{/if}
+
 <style>
   :global(*) {
     box-sizing: border-box;
@@ -1308,6 +1431,26 @@
     color: #d1d7dc;
     border: 1px solid #343c44;
     background: transparent;
+  }
+
+  .notification-button {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .notification-button > span {
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    display: grid;
+    place-items: center;
+    color: #06110f;
+    border-radius: 10px;
+    background: #67d5c4;
+    font-size: 11px;
+    font-weight: 760;
   }
 
   .binding-action {
@@ -1608,10 +1751,26 @@
 
     header {
       min-height: 64px;
+      padding: 12px 0;
+      flex-wrap: wrap;
     }
 
     .status {
       display: none;
+    }
+
+    .header-actions {
+      width: 100%;
+      order: 2;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .header-actions .quiet-button {
+      min-width: 0;
+      padding: 0 9px;
+      font-size: 12px;
     }
 
     .workspace {

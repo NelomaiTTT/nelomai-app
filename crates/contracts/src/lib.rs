@@ -104,6 +104,47 @@ pub struct PeerOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AppNotification {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub url: Option<String>,
+    pub created_at: String,
+    pub read_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AppNotificationList {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub notifications: Vec<AppNotification>,
+    pub unread_count: u32,
+    pub next_cursor: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AppNotificationReadResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub updated: u32,
+    pub unread_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PushRegistrationRequest {
+    pub provider: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PushRegistrationResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BindPeerRequest {
     pub peer_id: String,
     pub preferred_layer: Layer,

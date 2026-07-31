@@ -23,6 +23,7 @@ async-trait = "0.1"
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-tunnel-android = { path = "../plugins/tunnel-android" }
+tauri-plugin-push-android = { path = "../plugins/push-android" }
 tauri-plugin-updater-android = { path = "../plugins/updater-android" }
 nelomai-client-api = { path = "../crates/client-api" }
 nelomai-client-application = { path = "../crates/client-application" }

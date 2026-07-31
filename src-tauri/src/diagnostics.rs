@@ -25,6 +25,8 @@ struct LogRecord<'a> {
     operation_id: Option<&'a str>,
     request_id: Option<&'a str>,
     code: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
 }
 
 impl AppDiagnostics {
@@ -46,12 +48,24 @@ impl AppDiagnostics {
         request_id: Option<&str>,
         code: Option<&str>,
     ) {
+        self.record_with_duration(kind, operation_id, request_id, code, None);
+    }
+
+    fn record_with_duration(
+        &self,
+        kind: &str,
+        operation_id: Option<&str>,
+        request_id: Option<&str>,
+        code: Option<&str>,
+        duration_ms: Option<u64>,
+    ) {
         let record = LogRecord {
             timestamp_unix: now_unix(),
             kind,
             operation_id,
             request_id,
             code,
+            duration_ms,
         };
         let Ok(mut encoded) = serde_json::to_vec(&record) else {
             return;
@@ -99,12 +113,10 @@ impl AppDiagnostics {
         Ok(DiagnosticUploadRequest {
             generated_at_unix: now_unix(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            platform_version: None,
+            platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
-            helper_log: helper_log_path()
-                .and_then(|path| read_tail(&path, MAX_HELPER_REPORT_BYTES).ok())
-                .filter(|value| !value.is_empty()),
+            helper_log: helper_log().filter(|value| !value.is_empty()),
         })
     }
 }
@@ -116,6 +128,16 @@ impl CoreLogger for AppDiagnostics {
             event.operation_id.as_deref(),
             event.request_id.as_deref(),
             event.code.as_deref(),
+        );
+    }
+
+    fn record_timed(&self, event: CoreLogEvent, duration_ms: u64) {
+        self.record_with_duration(
+            event.kind,
+            event.operation_id.as_deref(),
+            event.request_id.as_deref(),
+            event.code.as_deref(),
+            Some(duration_ms),
         );
     }
 }
@@ -193,7 +215,55 @@ fn helper_log_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "android")]
-fn helper_log_path() -> Option<PathBuf> {
+fn helper_log() -> Option<String> {
+    use std::process::Command;
+
+    let pid = std::process::id().to_string();
+    let pid_filter = format!("--pid={pid}");
+    let output = Command::new("/system/bin/logcat")
+        .args([
+            "-d",
+            "-v",
+            "threadtime",
+            &pid_filter,
+            "-t",
+            "500",
+            "NelomaiTunnel:V",
+            "AndroidRuntime:E",
+            "libc:F",
+            "*:S",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let log = String::from_utf8_lossy(&output.stdout).replace('\0', "");
+    Some(tail_string(&log, MAX_HELPER_REPORT_BYTES))
+}
+
+#[cfg(not(target_os = "android"))]
+fn helper_log() -> Option<String> {
+    helper_log_path().and_then(|path| read_tail(&path, MAX_HELPER_REPORT_BYTES).ok())
+}
+
+#[cfg(target_os = "android")]
+fn platform_version() -> Option<String> {
+    use std::process::Command;
+
+    let output = Command::new("/system/bin/getprop")
+        .arg("ro.build.version.release")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(not(target_os = "android"))]
+fn platform_version() -> Option<String> {
     None
 }
 
@@ -240,6 +310,36 @@ mod tests {
         let tail = read_tail(&path, 1024).unwrap();
 
         assert_eq!(tail.len(), 1024);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn includes_stage_duration_when_available() {
+        let directory = std::env::temp_dir().join(format!(
+            "nelomai-diagnostics-duration-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let diagnostics = AppDiagnostics::new(directory.clone()).unwrap();
+        diagnostics.record_timed(
+            CoreLogEvent {
+                kind: "connection.local_start_succeeded",
+                operation_id: Some("operation-1".to_string()),
+                request_id: Some("request-1".to_string()),
+                code: None,
+            },
+            12_345,
+        );
+
+        let report = diagnostics.build_report().unwrap();
+        let record = report
+            .application_log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "connection.local_start_succeeded")
+            .unwrap();
+
+        assert_eq!(record["duration_ms"], 12_345);
         let _ = fs::remove_dir_all(directory);
     }
 }

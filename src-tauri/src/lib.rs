@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 const PANEL_BASE: &str = "https://nelomai.ru";
 const SPLIT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PHYSICAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const PUSH_REGISTRATION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 type NativeApplication = ClientApplication<
     ClientApi,
@@ -22,6 +23,10 @@ type NativeApplication = ClientApplication<
 >;
 
 pub(crate) struct SplitTunnelScheduler {
+    gate: Mutex<()>,
+}
+
+pub(crate) struct PushRegistrationScheduler {
     gate: Mutex<()>,
 }
 
@@ -44,6 +49,40 @@ impl SplitTunnelScheduler {
     }
 }
 
+impl PushRegistrationScheduler {
+    fn new() -> Self {
+        Self {
+            gate: Mutex::new(()),
+        }
+    }
+
+    pub(crate) async fn synchronize(
+        &self,
+        app: &tauri::AppHandle,
+        application: &NativeApplication,
+    ) {
+        let _guard = self.gate.lock().await;
+        register_android_push(app, application).await;
+    }
+
+    pub(crate) async fn logout(
+        &self,
+        app: &tauri::AppHandle,
+        application: &NativeApplication,
+    ) -> Result<(), ApplicationError> {
+        let _guard = self.gate.lock().await;
+        #[cfg(target_os = "android")]
+        {
+            use tauri_plugin_push_android::PushAndroidExt;
+
+            let _ = app.push_android().disable();
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = app;
+        application.logout().await
+    }
+}
+
 fn current_unix_time() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -55,6 +94,7 @@ fn current_unix_time() -> i64 {
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_push_android::init())
         .plugin(tauri_plugin_tunnel_android::init())
         .plugin(tauri_plugin_updater_android::init());
 
@@ -84,12 +124,19 @@ pub fn run() {
             diagnostics.clone(),
         ));
         let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
+        let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
         app.manage(diagnostics);
         app.manage(application.clone());
         app.manage(split_tunnel_scheduler.clone());
+        app.manage(push_registration_scheduler.clone());
         app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
         start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
-        start_physical_network_scheduler(application);
+        start_physical_network_scheduler(application.clone());
+        start_push_registration_scheduler(
+            app.handle().clone(),
+            application,
+            push_registration_scheduler,
+        );
         Ok(())
     });
 
@@ -119,6 +166,10 @@ pub fn run() {
             commands::app_split_tunnel_refresh,
             commands::app_split_tunnel_add_address_rule,
             commands::app_split_tunnel_remove_address_rule,
+            commands::app_notifications,
+            commands::app_notification_read,
+            commands::app_notifications_read_all,
+            commands::app_register_push_token,
             commands::app_logout,
         ])
         .run(tauri::generate_context!())
@@ -151,3 +202,42 @@ fn start_physical_network_scheduler(application: Arc<NativeApplication>) {
         }
     });
 }
+
+fn start_push_registration_scheduler(
+    app: tauri::AppHandle,
+    application: Arc<NativeApplication>,
+    scheduler: Arc<PushRegistrationScheduler>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(PUSH_REGISTRATION_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            scheduler.synchronize(&app, &application).await;
+        }
+    });
+}
+
+#[cfg(target_os = "android")]
+async fn register_android_push(app: &tauri::AppHandle, application: &NativeApplication) {
+    use tauri_plugin_push_android::PushAndroidExt;
+
+    if application.current_access_token().is_err() {
+        return;
+    }
+    if let Ok(response) = app.push_android().prepare() {
+        if !response.permission_granted {
+            let _ = application.unregister_push_token().await;
+        } else if !response.token.trim().is_empty()
+            && application
+                .register_push_token(&response.token)
+                .await
+                .is_ok()
+        {
+            let _ = app.push_android().confirm(&response.token);
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+async fn register_android_push(_app: &tauri::AppHandle, _application: &NativeApplication) {}

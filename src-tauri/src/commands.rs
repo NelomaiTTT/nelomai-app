@@ -1,6 +1,6 @@
 use crate::diagnostics::AppDiagnostics;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
-use crate::{NativeApplication, SplitTunnelScheduler};
+use crate::{NativeApplication, PushRegistrationScheduler, SplitTunnelScheduler};
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
 use nelomai_client_core::{
@@ -9,9 +9,10 @@ use nelomai_client_core::{
 };
 use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
-    BindPeerRequest, Bootstrap, Connection, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
-    Platform, ProbeResults, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
+    Layer, PeerBinding, PeerBindingResponse, PeerOptions, Platform, ProbeResults, RouteMode,
+    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelMode,
+    SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -292,6 +293,7 @@ pub async fn app_login(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
+    push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
     request: LoginCommandRequest,
 ) -> Result<Bootstrap, CommandError> {
@@ -320,6 +322,11 @@ pub async fn app_login(
         application.inner().clone(),
         split_tunnel_scheduler.inner().clone(),
     );
+    schedule_push_registration(
+        app,
+        application.inner().clone(),
+        push_registration_scheduler.inner().clone(),
+    );
     Ok(response)
 }
 
@@ -328,6 +335,7 @@ pub async fn app_bootstrap(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
+    push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<Bootstrap, CommandError> {
     let _ = refresh_installed_applications(&app, &application);
@@ -343,6 +351,11 @@ pub async fn app_bootstrap(
     schedule_split_tunnel_sync(
         application.inner().clone(),
         split_tunnel_scheduler.inner().clone(),
+    );
+    schedule_push_registration(
+        app,
+        application.inner().clone(),
+        push_registration_scheduler.inner().clone(),
     );
     Ok(response)
 }
@@ -753,10 +766,68 @@ pub async fn app_split_tunnel_remove_address_rule(
 }
 
 #[tauri::command]
-pub async fn app_logout(
+pub async fn app_notifications(
     application: State<'_, Arc<NativeApplication>>,
+    cursor: Option<i64>,
+) -> Result<AppNotificationList, CommandError> {
+    application
+        .notifications(cursor, 30)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn app_notification_read(
+    application: State<'_, Arc<NativeApplication>>,
+    message_id: i64,
+) -> Result<AppNotificationReadResponse, CommandError> {
+    application
+        .mark_notification_read(message_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn app_notifications_read_all(
+    application: State<'_, Arc<NativeApplication>>,
+) -> Result<AppNotificationReadResponse, CommandError> {
+    application
+        .mark_all_notifications_read()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn app_register_push_token(
+    app: AppHandle,
+    application: State<'_, Arc<NativeApplication>>,
+    token: String,
 ) -> Result<(), CommandError> {
-    application.logout().await.map_err(Into::into)
+    let result = application
+        .register_push_token(&token)
+        .await
+        .map_err(Into::into);
+    #[cfg(target_os = "android")]
+    if result.is_ok() {
+        use tauri_plugin_push_android::PushAndroidExt;
+
+        let _ = app.push_android().confirm(&token);
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+    result
+}
+
+#[tauri::command]
+pub async fn app_logout(
+    app: AppHandle,
+    application: State<'_, Arc<NativeApplication>>,
+    push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
+) -> Result<(), CommandError> {
+    push_registration_scheduler
+        .logout(&app, &application)
+        .await
+        .map_err(Into::into)
 }
 
 fn observe_and_schedule_update(
@@ -784,6 +855,16 @@ fn schedule_split_tunnel_sync(
 ) {
     tauri::async_runtime::spawn(async move {
         let _ = scheduler.synchronize(&application, false).await;
+    });
+}
+
+fn schedule_push_registration(
+    app: AppHandle,
+    application: Arc<NativeApplication>,
+    scheduler: Arc<PushRegistrationScheduler>,
+) {
+    tauri::async_runtime::spawn(async move {
+        scheduler.synchronize(&app, &application).await;
     });
 }
 

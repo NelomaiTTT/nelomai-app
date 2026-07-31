@@ -10,10 +10,10 @@ use nelomai_client_core::{
 use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError};
 use nelomai_contracts::{
-    BindPeerRequest, Bootstrap, Connection, Layer, PeerBindingResponse, PeerOptions, Platform,
-    ProbeResult, ProbeResults, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
-    SplitTunnelAddressRuleUpdate, SplitTunnelPolicy, SplitTunnelSelectedPackage,
-    SplitTunnelSettingsUpdate, TicConnectionMode,
+    AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
+    Layer, PeerBindingResponse, PeerOptions, Platform, ProbeResult, ProbeResults,
+    ServerCandidatesResponse, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
+    SplitTunnelPolicy, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
@@ -56,6 +56,37 @@ pub trait ApplicationApi: CoreApi {
         _request: &DiagnosticUploadRequest,
     ) -> Result<DiagnosticUploadResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
+    }
+    async fn notifications(
+        &self,
+        _access_token: &str,
+        _cursor: Option<i64>,
+        _limit: u32,
+    ) -> Result<AppNotificationList, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn mark_notification_read(
+        &self,
+        _access_token: &str,
+        _message_id: i64,
+    ) -> Result<AppNotificationReadResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn mark_all_notifications_read(
+        &self,
+        _access_token: &str,
+    ) -> Result<AppNotificationReadResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn register_push_token(
+        &self,
+        _access_token: &str,
+        _token: &str,
+    ) -> Result<(), CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn unregister_push_token(&self, _access_token: &str) -> Result<(), CoreApiError> {
+        Ok(())
     }
 }
 
@@ -115,6 +146,54 @@ impl ApplicationApi for ClientApi {
     ) -> Result<DiagnosticUploadResponse, CoreApiError> {
         ClientApi::upload_diagnostics(self, access_token, request)
             .await
+            .map_err(Into::into)
+    }
+
+    async fn notifications(
+        &self,
+        access_token: &str,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> Result<AppNotificationList, CoreApiError> {
+        ClientApi::notifications(self, access_token, cursor, limit)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_notification_read(
+        &self,
+        access_token: &str,
+        message_id: i64,
+    ) -> Result<AppNotificationReadResponse, CoreApiError> {
+        ClientApi::mark_notification_read(self, access_token, message_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn mark_all_notifications_read(
+        &self,
+        access_token: &str,
+    ) -> Result<AppNotificationReadResponse, CoreApiError> {
+        ClientApi::mark_all_notifications_read(self, access_token)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn register_push_token(
+        &self,
+        access_token: &str,
+        token: &str,
+    ) -> Result<(), CoreApiError> {
+        ClientApi::register_push_token(self, access_token, token)
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    async fn unregister_push_token(&self, access_token: &str) -> Result<(), CoreApiError> {
+        ClientApi::unregister_push_token(self, access_token)
+            .await
+            .map(|_| ())
             .map_err(Into::into)
     }
 }
@@ -401,6 +480,7 @@ where
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let _probe_guard = self.probe_gate.lock().await;
         if let Ok(access_token) = self.access_token() {
+            let _ = self.api.unregister_push_token(&access_token).await;
             let _ = self.api.logout(&access_token).await;
         }
         let result = self.core.sign_out().await;
@@ -419,6 +499,94 @@ where
                 let access_token = self.core.refresh_access_token(&access_token).await?;
                 self.api
                     .upload_diagnostics(&access_token, request)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn notifications(
+        &self,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> Result<AppNotificationList, ApplicationError> {
+        let access_token = self.access_token()?;
+        match self.api.notifications(&access_token, cursor, limit).await {
+            Ok(response) => Ok(response),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .notifications(&access_token, cursor, limit)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn mark_notification_read(
+        &self,
+        message_id: i64,
+    ) -> Result<AppNotificationReadResponse, ApplicationError> {
+        let access_token = self.access_token()?;
+        match self
+            .api
+            .mark_notification_read(&access_token, message_id)
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .mark_notification_read(&access_token, message_id)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn mark_all_notifications_read(
+        &self,
+    ) -> Result<AppNotificationReadResponse, ApplicationError> {
+        let access_token = self.access_token()?;
+        match self.api.mark_all_notifications_read(&access_token).await {
+            Ok(response) => Ok(response),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .mark_all_notifications_read(&access_token)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn register_push_token(&self, token: &str) -> Result<(), ApplicationError> {
+        let access_token = self.access_token()?;
+        match self.api.register_push_token(&access_token, token).await {
+            Ok(()) => Ok(()),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .register_push_token(&access_token, token)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn unregister_push_token(&self) -> Result<(), ApplicationError> {
+        let access_token = self.access_token()?;
+        match self.api.unregister_push_token(&access_token).await {
+            Ok(()) => Ok(()),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .unregister_push_token(&access_token)
                     .await
                     .map_err(Into::into)
             }

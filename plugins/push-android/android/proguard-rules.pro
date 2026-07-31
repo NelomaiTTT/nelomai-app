@@ -1,0 +1,1 @@
+-keep class ru.nelomai.push.** { *; }

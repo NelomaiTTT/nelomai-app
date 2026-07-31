@@ -16,6 +16,7 @@ use nelomai_contracts::{
     TicConnectionMode,
 };
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -263,12 +264,20 @@ pub struct CoreLogEvent {
 
 pub trait CoreLogger: Send + Sync {
     fn record(&self, event: CoreLogEvent);
+
+    fn record_timed(&self, event: CoreLogEvent, _duration_ms: u64) {
+        self.record(event);
+    }
 }
 
 pub struct NoopLogger;
 
 impl CoreLogger for NoopLogger {
     fn record(&self, _event: CoreLogEvent) {}
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -903,6 +912,7 @@ where
         options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
+        let total_started = Instant::now();
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         if let Some(connection) = self.connected_connection().await {
@@ -943,19 +953,32 @@ where
             probes: options.probes,
             allow_alternate: options.allow_alternate,
         };
+        let panel_started = Instant::now();
         let response = match self.retry_start(&access_token, &request).await {
             Ok(response) => response,
             Err(error) => {
-                self.logger.record(CoreLogEvent {
-                    kind: "connection.start_failed",
-                    operation_id: Some(operation_id.clone()),
-                    request_id: None,
-                    code: Some(error.to_string()),
-                });
+                self.logger.record_timed(
+                    CoreLogEvent {
+                        kind: "connection.start_failed",
+                        operation_id: Some(operation_id.clone()),
+                        request_id: None,
+                        code: Some(error.to_string()),
+                    },
+                    elapsed_millis(panel_started),
+                );
                 self.set_phase(phase_for_start_error(&error)).await;
                 return Err(error);
             }
         };
+        self.logger.record_timed(
+            CoreLogEvent {
+                kind: "connection.panel_ready",
+                operation_id: Some(operation_id.clone()),
+                request_id: Some(response.request_id.clone()),
+                code: None,
+            },
+            elapsed_millis(panel_started),
+        );
         let tunnel_options = match &split_policy {
             Some(_)
                 if response.connection.layer == options.layer
@@ -1033,6 +1056,7 @@ where
             .await;
             return Err(error);
         }
+        let local_start_started = Instant::now();
         if let Err(start_error) = self
             .tunnel
             .start(TunnelStartRequest {
@@ -1042,6 +1066,15 @@ where
             .await
         {
             let error = CoreError::from(start_error);
+            self.logger.record_timed(
+                CoreLogEvent {
+                    kind: "connection.local_start_rejected",
+                    operation_id: Some(operation_id.clone()),
+                    request_id: Some(response.request_id.clone()),
+                    code: Some(error.to_string()),
+                },
+                elapsed_millis(local_start_started),
+            );
             self.compensate_failed_start(
                 &access_token,
                 &response.connection,
@@ -1053,6 +1086,15 @@ where
             .await;
             return Err(error);
         }
+        self.logger.record_timed(
+            CoreLogEvent {
+                kind: "connection.local_start_succeeded",
+                operation_id: Some(operation_id.clone()),
+                request_id: Some(response.request_id.clone()),
+                code: None,
+            },
+            elapsed_millis(local_start_started),
+        );
         let applied_physical_network_fingerprint = self
             .initialize_physical_network_detector(&tunnel_options)
             .await;
@@ -1065,6 +1107,7 @@ where
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
             .await;
         if let Some(policy) = &split_policy {
+            let split_record_started = Instant::now();
             if let Err(record_error) = self
                 .record_started_split_tunnel_policy(
                     policy,
@@ -1080,13 +1123,25 @@ where
                     "split_tunnel_state_save_failed",
                 )
                 .await;
-                self.logger.record(CoreLogEvent {
-                    kind: "split_tunnel.state_record_failed",
-                    operation_id: Some(operation_id.clone()),
-                    request_id: Some(response.request_id.clone()),
-                    code: Some(record_error.to_string()),
-                });
+                self.logger.record_timed(
+                    CoreLogEvent {
+                        kind: "split_tunnel.state_record_failed",
+                        operation_id: Some(operation_id.clone()),
+                        request_id: Some(response.request_id.clone()),
+                        code: Some(record_error.to_string()),
+                    },
+                    elapsed_millis(split_record_started),
+                );
             } else {
+                self.logger.record_timed(
+                    CoreLogEvent {
+                        kind: "split_tunnel.state_recorded",
+                        operation_id: Some(operation_id.clone()),
+                        request_id: Some(response.request_id.clone()),
+                        code: None,
+                    },
+                    elapsed_millis(split_record_started),
+                );
                 self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
                     .await;
                 self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
@@ -1098,12 +1153,15 @@ where
             *self.split_tunnel_options.lock().await = TunnelOptions::default();
             self.clear_applied_physical_network_fingerprint();
         }
-        self.logger.record(CoreLogEvent {
-            kind: "connection.started",
-            operation_id: Some(operation_id),
-            request_id: Some(response.request_id),
-            code: None,
-        });
+        self.logger.record_timed(
+            CoreLogEvent {
+                kind: "connection.started",
+                operation_id: Some(operation_id),
+                request_id: Some(response.request_id),
+                code: None,
+            },
+            elapsed_millis(total_started),
+        );
         Ok(response.connection)
     }
 

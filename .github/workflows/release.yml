@@ -195,7 +195,14 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: npm run tauri -- android build --ci --apk --target aarch64
+          NELOMAI_FIREBASE_APPLICATION_ID: ${{ secrets.NELOMAI_FIREBASE_APPLICATION_ID }}
+          NELOMAI_FIREBASE_API_KEY: ${{ secrets.NELOMAI_FIREBASE_API_KEY }}
+          NELOMAI_FIREBASE_PROJECT_ID: ${{ secrets.NELOMAI_FIREBASE_PROJECT_ID }}
+        run: |
+          test -n "$NELOMAI_FIREBASE_APPLICATION_ID"
+          test -n "$NELOMAI_FIREBASE_API_KEY"
+          test -n "$NELOMAI_FIREBASE_PROJECT_ID"
+          npm run tauri -- android build --ci --apk --target aarch64
       - name: Проверить подпись и подготовить APK
         run: |
           apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"

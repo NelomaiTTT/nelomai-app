@@ -102,6 +102,25 @@ describe("native client", () => {
     expect(response.report_id).toBe("report-1");
   });
 
+  it("keeps notification inbox and push registration in native commands", async () => {
+    const invoke = vi.fn().mockResolvedValue({});
+    const client = createNativeClient(invoke);
+
+    await client.notifications(42);
+    await client.markNotificationRead(51);
+    await client.markAllNotificationsRead();
+    await client.registerPushToken("fcm-token");
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "app_notifications", { cursor: 42 });
+    expect(invoke).toHaveBeenNthCalledWith(2, "app_notification_read", {
+      messageId: 51,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "app_notifications_read_all");
+    expect(invoke).toHaveBeenNthCalledWith(4, "app_register_push_token", {
+      token: "fcm-token",
+    });
+  });
+
   it("keeps update authorization and artifacts inside native commands", async () => {
     const invoke = vi.fn().mockResolvedValue({ phase: "available" });
     const client = createNativeClient(invoke);

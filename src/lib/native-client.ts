@@ -46,6 +46,31 @@ export interface DiagnosticUploadResponse {
   received_bytes: number;
 }
 
+export interface AppNotification {
+  id: number;
+  kind: string;
+  title: string;
+  body: string;
+  url: string | null;
+  created_at: string;
+  read_at: string | null;
+}
+
+export interface AppNotificationList {
+  api_version: "1";
+  request_id: string;
+  notifications: AppNotification[];
+  unread_count: number;
+  next_cursor: number | null;
+}
+
+export interface AppNotificationReadResponse {
+  api_version: "1";
+  request_id: string;
+  updated: number;
+  unread_count: number;
+}
+
 export function createNativeClient(
   invoke: Invoke = (command, args) => tauriInvoke(command, args),
 ) {
@@ -74,6 +99,14 @@ export function createNativeClient(
       }) as Promise<Connection>,
     sendDiagnostics: () =>
       invoke("app_send_diagnostics") as Promise<DiagnosticUploadResponse>,
+    notifications: (cursor: number | null = null) =>
+      invoke("app_notifications", { cursor }) as Promise<AppNotificationList>,
+    markNotificationRead: (messageId: number) =>
+      invoke("app_notification_read", { messageId }) as Promise<AppNotificationReadResponse>,
+    markAllNotificationsRead: () =>
+      invoke("app_notifications_read_all") as Promise<AppNotificationReadResponse>,
+    registerPushToken: (token: string) =>
+      invoke("app_register_push_token", { token }) as Promise<void>,
     updateStatus: () =>
       invoke("app_update_status") as Promise<UpdateStatus>,
     setAutomaticUpdates: (enabled: boolean) =>

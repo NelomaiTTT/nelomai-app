@@ -60,6 +60,17 @@ jobs:
             src-tauri/gen/android/gradlew \
             -p plugins/tunnel-android/android \
             testDebugUnitTest
+      - name: Проверить Android push plugin
+        run: |
+          tauri_manifest="$(
+            cargo metadata --locked --format-version 1 |
+              jq -r '.packages[] | select(.name == "tauri") | .manifest_path'
+          )"
+          test -n "$tauri_manifest"
+          TAURI_ANDROID_PROJECT_DIR="$(dirname "$tauri_manifest")/mobile/android" \
+            src-tauri/gen/android/gradlew \
+            -p plugins/push-android/android \
+            testDebugUnitTest
 
   windows:
     runs-on: windows-latest

@@ -30,6 +30,8 @@ Application update policy and release gates are documented in
 Split-tunnel behavior, privacy boundaries, synchronization, and platform
 fallbacks are documented in
 [`docs/split-tunnel.md`](docs/split-tunnel.md).
+The synchronized inbox and Android push setup are documented in
+[`docs/notifications.md`](docs/notifications.md).
 
 ## Local checks
 

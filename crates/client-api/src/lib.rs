@@ -1,8 +1,9 @@
 use futures_util::StreamExt;
 use nelomai_contracts::{
-    Access, ApiVersion, BindPeerRequest, Bootstrap, ConnectionOperationRequest,
-    ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, ErrorPayload,
-    Layer, PeerBindingResponse, PeerOptions, Platform, ServerCandidatesResponse,
+    Access, ApiVersion, AppNotificationList, AppNotificationReadResponse, BindPeerRequest,
+    Bootstrap, ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
+    ConnectionStartResponse, ErrorPayload, Layer, PeerBindingResponse, PeerOptions, Platform,
+    PushRegistrationRequest, PushRegistrationResponse, ServerCandidatesResponse,
     ServerSelectionRequest, ServerSelectionResponse, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision,
     SplitTunnelSettingsUpdate, API_PREFIX,
@@ -254,6 +255,78 @@ impl ClientApi {
         self.send_json(
             self.http
                 .get(self.endpoint("peer-options")?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn notifications(
+        &self,
+        access_token: &str,
+        cursor: Option<i64>,
+        limit: u32,
+    ) -> Result<AppNotificationList, ClientApiError> {
+        let mut endpoint = self.endpoint("notifications")?;
+        {
+            let mut query = endpoint.query_pairs_mut();
+            query.append_pair("limit", &limit.clamp(1, 100).to_string());
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", &cursor.to_string());
+            }
+        }
+        self.send_json(self.http.get(endpoint).bearer_auth(access_token))
+            .await
+    }
+
+    pub async fn mark_notification_read(
+        &self,
+        access_token: &str,
+        message_id: i64,
+    ) -> Result<AppNotificationReadResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint(&format!("notifications/{message_id}/read"))?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn mark_all_notifications_read(
+        &self,
+        access_token: &str,
+    ) -> Result<AppNotificationReadResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("notifications/read-all")?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn register_push_token(
+        &self,
+        access_token: &str,
+        token: &str,
+    ) -> Result<PushRegistrationResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .put(self.endpoint("push-registration")?)
+                .bearer_auth(access_token)
+                .json(&PushRegistrationRequest {
+                    provider: "fcm".to_string(),
+                    token: token.to_string(),
+                }),
+        )
+        .await
+    }
+
+    pub async fn unregister_push_token(
+        &self,
+        access_token: &str,
+    ) -> Result<PushRegistrationResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .delete(self.endpoint("push-registration")?)
                 .bearer_auth(access_token),
         )
         .await

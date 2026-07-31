@@ -5,6 +5,7 @@ import android.content.Context
 import android.net.VpnService
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -26,6 +27,7 @@ import org.json.JSONArray
 
 private const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
+private const val TUNNEL_LOG_TAG = "NelomaiTunnel"
 private const val PHYSICAL_NETWORK_RETRY_MILLIS = 5 * 60 * 1_000L
 
 @InvokeArg
@@ -227,9 +229,16 @@ internal object TunnelRuntime {
 
         executor.execute {
             val startedAt = System.nanoTime()
+            Log.i(
+                TUNNEL_LOG_TAG,
+                "start.begin replace=$replaceExisting split=${args.options.splitActive}",
+            )
             try {
+                val serviceStartedAt = System.nanoTime()
                 serviceReady.get(5, TimeUnit.SECONDS)
+                logStage("start.service_ready", serviceStartedAt)
                 if (replaceExisting) {
+                    val replaceStartedAt = System.nanoTime()
                     clearActiveSession()
                     suppressBackendStateChanges.set(true)
                     try {
@@ -241,10 +250,14 @@ internal object TunnelRuntime {
                     } finally {
                         suppressBackendStateChanges.set(false)
                     }
+                    logStage("start.previous_tunnel_stopped", replaceStartedAt)
                 }
+                val parseStartedAt = System.nanoTime()
                 val originalConfig = TunnelPayload.consume(args.configuration) { payload ->
                     Config.parse(ByteArrayInputStream(payload))
                 }
+                logStage("start.configuration_parsed", parseStartedAt)
+                val optionsStartedAt = System.nanoTime()
                 val options = AndroidSplitTunnel.resolveOptions(
                     Build.VERSION.SDK_INT,
                     args.options,
@@ -264,8 +277,15 @@ internal object TunnelRuntime {
                         localRoutes,
                     ),
                 )
+                logStage(
+                    "start.options_ready",
+                    optionsStartedAt,
+                    "split_supported=${options.splitSupported} local_routes=${localRoutes.size}",
+                )
 
+                val backendStartedAt = System.nanoTime()
                 val state = requireBackend().setState(tunnel, Tunnel.State.UP, config)
+                logStage("start.backend_state_up", backendStartedAt)
                 val resolved = if (state == Tunnel.State.UP) {
                     val session = ActiveTunnelSession(
                         generation = generation.incrementAndGet(),
@@ -300,6 +320,7 @@ internal object TunnelRuntime {
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
+                logStage("start.completed", startedAt, "state=${resolved.wireName}")
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
                 if (args.configurationInitialized) {
@@ -307,7 +328,12 @@ internal object TunnelRuntime {
                 }
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
-                onError(errorCode(error))
+                val code = errorCode(error)
+                Log.w(
+                    TUNNEL_LOG_TAG,
+                    "start.failed code=$code duration_ms=${elapsedMillis(startedAt)}",
+                )
+                onError(code)
             }
         }
     }
@@ -340,6 +366,7 @@ internal object TunnelRuntime {
 
         executor.execute {
             val startedAt = System.nanoTime()
+            Log.i(TUNNEL_LOG_TAG, "stop.begin")
             try {
                 clearActiveSession()
                 val state = requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
@@ -350,11 +377,17 @@ internal object TunnelRuntime {
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
+                logStage("stop.completed", startedAt, "state=${resolved.wireName}")
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
-                onError(errorCode(error))
+                val code = errorCode(error)
+                Log.w(
+                    TUNNEL_LOG_TAG,
+                    "stop.failed code=$code duration_ms=${elapsedMillis(startedAt)}",
+                )
+                onError(code)
             }
         }
     }
@@ -472,6 +505,14 @@ internal object TunnelRuntime {
 
     private fun elapsedMillis(startedAt: Long): Long =
         (System.nanoTime() - startedAt) / 1_000_000
+
+    private fun logStage(stage: String, startedAt: Long, details: String? = null) {
+        val suffix = details?.let { " $it" }.orEmpty()
+        Log.i(
+            TUNNEL_LOG_TAG,
+            "$stage duration_ms=${elapsedMillis(startedAt)}$suffix",
+        )
+    }
 }
 
 private class TunnelOperationException(val code: String) : RuntimeException()
