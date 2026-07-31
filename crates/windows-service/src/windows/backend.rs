@@ -111,6 +111,10 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
             _ => ServiceTunnelState::Failed,
         })
     }
+
+    fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        self.routes.physical_network_fingerprint()
+    }
 }
 
 fn write_configuration_atomically(path: &Path, configuration: &str) -> Result<(), ServiceError> {

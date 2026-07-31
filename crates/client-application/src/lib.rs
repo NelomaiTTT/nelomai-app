@@ -5,7 +5,7 @@ use nelomai_client_api::{
 };
 use nelomai_client_core::{
     ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogger, CoreState,
-    SplitTunnelSyncOutcome,
+    PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
 };
 use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError};
@@ -300,6 +300,16 @@ where
 
     pub async fn split_tunnel_warning(&self) -> Option<String> {
         self.core.split_tunnel_warning().await
+    }
+
+    pub async fn poll_physical_network(
+        &self,
+        now_unix: i64,
+    ) -> Result<PhysicalNetworkPollOutcome, ApplicationError> {
+        self.core
+            .poll_physical_network(now_unix)
+            .await
+            .map_err(Into::into)
     }
 
     pub fn cached_split_tunnel_policy(

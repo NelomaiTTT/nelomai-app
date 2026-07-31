@@ -120,6 +120,10 @@ impl ServiceTunnelBackend for LinuxBackend {
             Ok(ServiceTunnelState::Failed)
         }
     }
+
+    fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        self.routes.physical_network_fingerprint()
+    }
 }
 
 fn backend_error(error: impl std::fmt::Display) -> ServiceError {

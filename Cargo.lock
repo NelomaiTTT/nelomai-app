@@ -2711,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "libc",
@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "nelomai-unix-service"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2861,6 +2861,7 @@ dependencies = [
  "nelomai-client-tunnel",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -2869,13 +2870,14 @@ dependencies = [
 
 [[package]]
 name = "nelomai-windows-service"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "ipnet",
  "nelomai-client-tunnel",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.19",
  "tokio",
  "windows-service",

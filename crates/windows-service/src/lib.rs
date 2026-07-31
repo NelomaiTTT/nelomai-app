@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 pub mod windows;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
@@ -54,6 +54,8 @@ pub struct Response {
     pub ok: bool,
     pub state: Option<ServiceTunnelState>,
     pub service_version: Option<String>,
+    #[serde(default)]
+    pub physical_network_fingerprint: Option<String>,
     pub error_code: Option<String>,
 }
 
@@ -64,6 +66,7 @@ impl Response {
             ok: true,
             state,
             service_version: None,
+            physical_network_fingerprint: None,
             error_code: None,
         }
     }
@@ -74,6 +77,7 @@ impl Response {
             ok: false,
             state: None,
             service_version: None,
+            physical_network_fingerprint: None,
             error_code: Some(error_code.into()),
         }
     }
@@ -92,6 +96,9 @@ pub enum Request {
         protocol_version: u16,
     },
     Version {
+        protocol_version: u16,
+    },
+    PhysicalNetworkFingerprint {
         protocol_version: u16,
     },
 }
@@ -127,6 +134,12 @@ impl Request {
         }
     }
 
+    pub fn physical_network_fingerprint() -> Self {
+        Self::PhysicalNetworkFingerprint {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
     pub fn protocol_version(&self) -> u16 {
         match self {
             Self::Start {
@@ -134,7 +147,8 @@ impl Request {
             }
             | Self::Stop { protocol_version }
             | Self::Status { protocol_version }
-            | Self::Version { protocol_version } => *protocol_version,
+            | Self::Version { protocol_version }
+            | Self::PhysicalNetworkFingerprint { protocol_version } => *protocol_version,
         }
     }
 }
@@ -181,6 +195,14 @@ impl PartialEq for Request {
                 Self::Version {
                     protocol_version: right,
                 },
+            )
+            | (
+                Self::PhysicalNetworkFingerprint {
+                    protocol_version: left,
+                },
+                Self::PhysicalNetworkFingerprint {
+                    protocol_version: right,
+                },
             ) => left == right,
             _ => false,
         }
@@ -214,6 +236,10 @@ impl fmt::Debug for Request {
                 .debug_struct("Version")
                 .field("protocol_version", protocol_version)
                 .finish(),
+            Self::PhysicalNetworkFingerprint { protocol_version } => formatter
+                .debug_struct("PhysicalNetworkFingerprint")
+                .field("protocol_version", protocol_version)
+                .finish(),
         }
     }
 }
@@ -236,6 +262,10 @@ enum RequestRef<'a> {
         protocol_version: u16,
     },
     Version {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    PhysicalNetworkFingerprint {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
@@ -265,6 +295,11 @@ impl Serialize for Request {
             Self::Version { protocol_version } => RequestRef::Version {
                 protocol_version: *protocol_version,
             },
+            Self::PhysicalNetworkFingerprint { protocol_version } => {
+                RequestRef::PhysicalNetworkFingerprint {
+                    protocol_version: *protocol_version,
+                }
+            }
         }
         .serialize(serializer)
     }
@@ -292,6 +327,10 @@ enum RequestOwned {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
+    PhysicalNetworkFingerprint {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
 }
 
 impl<'de> Deserialize<'de> for Request {
@@ -312,6 +351,9 @@ impl<'de> Deserialize<'de> for Request {
             RequestOwned::Stop { protocol_version } => Self::Stop { protocol_version },
             RequestOwned::Status { protocol_version } => Self::Status { protocol_version },
             RequestOwned::Version { protocol_version } => Self::Version { protocol_version },
+            RequestOwned::PhysicalNetworkFingerprint { protocol_version } => {
+                Self::PhysicalNetworkFingerprint { protocol_version }
+            }
         })
     }
 }
@@ -355,9 +397,33 @@ impl ServiceError {
             Self::UnauthorizedClient => "unauthorized_client",
             Self::UnsafePath => "unsafe_path",
             Self::UnsupportedProtocol => "unsupported_protocol",
-            Self::Backend(_) => "service_unavailable",
+            Self::Backend(code) => stable_route_error_code(code).unwrap_or("service_unavailable"),
         }
     }
+}
+
+fn stable_route_error_code(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "route_plan_too_large" => "route_plan_too_large",
+        "route_conflict" => "route_conflict",
+        "route_state_too_large" => "route_state_too_large",
+        "route_state_invalid" => "route_state_invalid",
+        "route_state_read_failed" => "route_state_read_failed",
+        "route_state_write_failed" => "route_state_write_failed",
+        "route_state_serialize_failed" => "route_state_serialize_failed",
+        "route_state_activate_failed" => "route_state_activate_failed",
+        "route_state_remove_failed" => "route_state_remove_failed",
+        "route_add_failed" => "route_add_failed",
+        "route_del_failed" => "route_del_failed",
+        "route_delete_failed" => "route_delete_failed",
+        "route_command_failed" => "route_command_failed",
+        "route_command_unavailable" => "route_command_unavailable",
+        "route_table_unavailable" => "route_table_unavailable",
+        "ip_command_unavailable" => "ip_command_unavailable",
+        "physical_egress_unavailable" => "physical_egress_unavailable",
+        "local_networks_unavailable" => "local_networks_unavailable",
+        _ => return None,
+    })
 }
 
 pub trait ServiceTunnelBackend {
@@ -368,6 +434,11 @@ pub trait ServiceTunnelBackend {
     ) -> Result<ServiceTunnelState, ServiceError>;
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError>;
     fn status(&self) -> Result<ServiceTunnelState, ServiceError>;
+    fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        Err(ServiceError::Backend(
+            "physical_network_fingerprint_unavailable".to_string(),
+        ))
+    }
 }
 
 pub struct TunnelRequestHandler<B> {
@@ -400,7 +471,11 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
             } => options
                 .validate()
                 .map_err(|_| ServiceError::InvalidRequest)
-                .and_then(|_| self.backend.start(configuration.as_str(), &options))
+                .and_then(|_| {
+                    let configuration =
+                        prepare_windows_wireguard_configuration(configuration.as_str(), &options);
+                    self.backend.start(configuration.as_str(), &options)
+                })
                 .map(|state| Response::success(Some(state))),
             Request::Stop { .. } => self
                 .backend
@@ -415,10 +490,80 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 response.service_version = Some(self.service_version.clone());
                 Ok(response)
             }
+            Request::PhysicalNetworkFingerprint { .. } => self
+                .backend
+                .physical_network_fingerprint()
+                .map(|fingerprint| {
+                    let mut response = Response::success(None);
+                    response.physical_network_fingerprint = Some(fingerprint);
+                    response
+                }),
         };
 
         result.unwrap_or_else(|error| Response::failure(error.code()))
     }
+}
+
+fn prepare_windows_wireguard_configuration(
+    configuration: &str,
+    options: &DesktopTunnelOptions,
+) -> Zeroizing<String> {
+    let address_split_active = options.policy_hash.is_some()
+        && (options.exclude_local_networks || !options.excluded_ipv4_cidrs.is_empty());
+    if !address_split_active {
+        return Zeroizing::new(configuration.to_string());
+    }
+
+    let mut in_peer = false;
+    let mut output = String::with_capacity(configuration.len() + 32);
+    for segment in configuration.split_inclusive('\n') {
+        let (line_with_optional_cr, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let (line, carriage_return) = line_with_optional_cr
+            .strip_suffix('\r')
+            .map_or((line_with_optional_cr, ""), |line| (line, "\r"));
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_peer = trimmed.eq_ignore_ascii_case("[Peer]");
+        }
+
+        if in_peer {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("AllowedIPs") {
+                    let mut changed = false;
+                    let mut values = Vec::new();
+                    for value in value.split(',').map(str::trim) {
+                        match value {
+                            "0.0.0.0/0" => {
+                                changed = true;
+                                values.extend(["0.0.0.0/1", "128.0.0.0/1"]);
+                            }
+                            "::/0" => {
+                                changed = true;
+                                values.extend(["::/1", "8000::/1"]);
+                            }
+                            value => values.push(value),
+                        }
+                    }
+                    if changed {
+                        output.push_str(key);
+                        output.push('=');
+                        output.push(' ');
+                        output.push_str(&values.join(", "));
+                        output.push_str(carriage_return);
+                        output.push_str(newline);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        output.push_str(line);
+        output.push_str(carriage_return);
+        output.push_str(newline);
+    }
+    Zeroizing::new(output)
 }
 
 #[async_trait]
@@ -502,6 +647,25 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
         }
     }
 
+    async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::physical_network_fingerprint())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        let fingerprint = response.physical_network_fingerprint.ok_or_else(|| {
+            TunnelError::Backend("missing_physical_network_fingerprint".to_string())
+        })?;
+        if valid_fingerprint(&fingerprint) {
+            Ok(Some(fingerprint))
+        } else {
+            Err(TunnelError::Backend(
+                "invalid_physical_network_fingerprint".to_string(),
+            ))
+        }
+    }
+
     async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
         Ok(TunnelCapabilities {
             platform: TunnelPlatform::Windows,
@@ -540,6 +704,13 @@ fn validate_response(response: &Response) -> Result<(), TunnelError> {
 
 fn to_tunnel_error(error: ServiceError) -> TunnelError {
     TunnelError::Backend(error.code().to_string())
+}
+
+fn valid_fingerprint(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 pub fn encode_request(request: &Request) -> Result<Vec<u8>, ServiceError> {
@@ -710,5 +881,22 @@ fn normalize_windows_path(path: &Path) -> String {
             .strip_prefix(r"\\?\")
             .unwrap_or(&normalized)
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod service_error_tests {
+    use super::ServiceError;
+
+    #[test]
+    fn exposes_only_allowlisted_backend_codes() {
+        assert_eq!(
+            ServiceError::Backend("route_conflict".to_string()).code(),
+            "route_conflict"
+        );
+        assert_eq!(
+            ServiceError::Backend("raw operating system error".to_string()).code(),
+            "service_unavailable"
+        );
     }
 }

@@ -33,21 +33,6 @@ impl Ipv4RoutePlan {
         })
     }
 
-    pub fn merged_with_local_networks(
-        &self,
-        local_networks: impl IntoIterator<Item = Ipv4Net>,
-    ) -> Result<Self, RoutePlanError> {
-        let mut networks = self.excluded_networks.clone();
-        if self.exclude_local_networks {
-            networks.extend(local_networks);
-        }
-        Ok(Self {
-            policy_hash: self.policy_hash.clone(),
-            excluded_networks: compact(networks)?,
-            exclude_local_networks: self.exclude_local_networks,
-        })
-    }
-
     pub fn active(&self) -> bool {
         self.policy_hash.is_some()
     }
@@ -103,16 +88,16 @@ mod tests {
 
     #[test]
     fn route_plan_compacts_covered_and_adjacent_networks() {
-        let plan = Ipv4RoutePlan {
-            policy_hash: Some("sha256:test".to_string()),
-            excluded_networks: vec!["10.0.0.0/9".parse().unwrap()],
+        let plan = Ipv4RoutePlan::from_options(&DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec![
+                "10.0.0.0/9".to_string(),
+                "10.128.0.0/9".to_string(),
+                "10.1.0.0/16".to_string(),
+                "203.0.113.0/24".to_string(),
+            ],
             exclude_local_networks: true,
-        }
-        .merged_with_local_networks([
-            "10.128.0.0/9".parse().unwrap(),
-            "10.1.0.0/16".parse().unwrap(),
-            "203.0.113.0/24".parse().unwrap(),
-        ])
+            policy_hash: Some("sha256:test".to_string()),
+        })
         .unwrap();
 
         assert_eq!(

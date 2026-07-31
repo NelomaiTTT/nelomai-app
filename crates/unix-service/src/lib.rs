@@ -20,7 +20,7 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/nelomai/tunnel.sock";
 
@@ -42,6 +42,8 @@ pub struct Response {
     pub ok: bool,
     pub state: Option<ServiceTunnelState>,
     pub service_version: Option<String>,
+    #[serde(default)]
+    pub physical_network_fingerprint: Option<String>,
     pub error_code: Option<String>,
 }
 
@@ -52,6 +54,7 @@ impl Response {
             ok: true,
             state,
             service_version: None,
+            physical_network_fingerprint: None,
             error_code: None,
         }
     }
@@ -62,6 +65,7 @@ impl Response {
             ok: false,
             state: None,
             service_version: None,
+            physical_network_fingerprint: None,
             error_code: Some(error_code.into()),
         }
     }
@@ -80,6 +84,9 @@ pub enum Request {
         protocol_version: u16,
     },
     Version {
+        protocol_version: u16,
+    },
+    PhysicalNetworkFingerprint {
         protocol_version: u16,
     },
 }
@@ -115,6 +122,12 @@ impl Request {
         }
     }
 
+    pub fn physical_network_fingerprint() -> Self {
+        Self::PhysicalNetworkFingerprint {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
     pub fn protocol_version(&self) -> u16 {
         match self {
             Self::Start {
@@ -122,7 +135,8 @@ impl Request {
             }
             | Self::Stop { protocol_version }
             | Self::Status { protocol_version }
-            | Self::Version { protocol_version } => *protocol_version,
+            | Self::Version { protocol_version }
+            | Self::PhysicalNetworkFingerprint { protocol_version } => *protocol_version,
         }
     }
 }
@@ -152,6 +166,10 @@ impl fmt::Debug for Request {
                 .debug_struct("Version")
                 .field("protocol_version", protocol_version)
                 .finish(),
+            Self::PhysicalNetworkFingerprint { protocol_version } => formatter
+                .debug_struct("PhysicalNetworkFingerprint")
+                .field("protocol_version", protocol_version)
+                .finish(),
         }
     }
 }
@@ -174,6 +192,10 @@ enum RequestRef<'a> {
         protocol_version: u16,
     },
     Version {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    PhysicalNetworkFingerprint {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
@@ -203,6 +225,11 @@ impl Serialize for Request {
             Self::Version { protocol_version } => RequestRef::Version {
                 protocol_version: *protocol_version,
             },
+            Self::PhysicalNetworkFingerprint { protocol_version } => {
+                RequestRef::PhysicalNetworkFingerprint {
+                    protocol_version: *protocol_version,
+                }
+            }
         }
         .serialize(serializer)
     }
@@ -230,6 +257,10 @@ enum RequestOwned {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
+    PhysicalNetworkFingerprint {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
 }
 
 impl<'de> Deserialize<'de> for Request {
@@ -250,6 +281,9 @@ impl<'de> Deserialize<'de> for Request {
             RequestOwned::Stop { protocol_version } => Self::Stop { protocol_version },
             RequestOwned::Status { protocol_version } => Self::Status { protocol_version },
             RequestOwned::Version { protocol_version } => Self::Version { protocol_version },
+            RequestOwned::PhysicalNetworkFingerprint { protocol_version } => {
+                Self::PhysicalNetworkFingerprint { protocol_version }
+            }
         })
     }
 }
@@ -291,9 +325,33 @@ impl ServiceError {
             Self::UnauthorizedClient => "unauthorized_client",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::InvalidConfiguration => "invalid_configuration",
-            Self::Backend(_) => "service_unavailable",
+            Self::Backend(code) => stable_route_error_code(code).unwrap_or("service_unavailable"),
         }
     }
+}
+
+fn stable_route_error_code(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "route_plan_too_large" => "route_plan_too_large",
+        "route_conflict" => "route_conflict",
+        "route_state_too_large" => "route_state_too_large",
+        "route_state_invalid" => "route_state_invalid",
+        "route_state_read_failed" => "route_state_read_failed",
+        "route_state_write_failed" => "route_state_write_failed",
+        "route_state_serialize_failed" => "route_state_serialize_failed",
+        "route_state_activate_failed" => "route_state_activate_failed",
+        "route_state_remove_failed" => "route_state_remove_failed",
+        "route_add_failed" => "route_add_failed",
+        "route_del_failed" => "route_del_failed",
+        "route_delete_failed" => "route_delete_failed",
+        "route_command_failed" => "route_command_failed",
+        "route_command_unavailable" => "route_command_unavailable",
+        "route_table_unavailable" => "route_table_unavailable",
+        "ip_command_unavailable" => "ip_command_unavailable",
+        "physical_egress_unavailable" => "physical_egress_unavailable",
+        "local_networks_unavailable" => "local_networks_unavailable",
+        _ => return None,
+    })
 }
 
 pub fn authorize_peer(
@@ -315,6 +373,11 @@ pub trait ServiceTunnelBackend {
     ) -> Result<ServiceTunnelState, ServiceError>;
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError>;
     fn status(&self) -> Result<ServiceTunnelState, ServiceError>;
+    fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        Err(ServiceError::Backend(
+            "physical_network_fingerprint_unavailable".to_string(),
+        ))
+    }
 }
 
 pub struct TunnelRequestHandler<B> {
@@ -366,6 +429,14 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 response.service_version = Some(self.service_version.clone());
                 Ok(response)
             }
+            Request::PhysicalNetworkFingerprint { .. } => self
+                .backend
+                .physical_network_fingerprint()
+                .map(|fingerprint| {
+                    let mut response = Response::success(None);
+                    response.physical_network_fingerprint = Some(fingerprint);
+                    response
+                }),
         };
 
         result.unwrap_or_else(|error| Response::failure(error.code()))
@@ -453,6 +524,25 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
         }
     }
 
+    async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::physical_network_fingerprint())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        let fingerprint = response.physical_network_fingerprint.ok_or_else(|| {
+            TunnelError::Backend("missing_physical_network_fingerprint".to_string())
+        })?;
+        if valid_fingerprint(&fingerprint) {
+            Ok(Some(fingerprint))
+        } else {
+            Err(TunnelError::Backend(
+                "invalid_physical_network_fingerprint".to_string(),
+            ))
+        }
+    }
+
     async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
         Ok(TunnelCapabilities {
             platform: if cfg!(target_os = "macos") {
@@ -495,6 +585,13 @@ fn validate_response(response: &Response) -> Result<(), TunnelError> {
 
 fn to_tunnel_error(error: ServiceError) -> TunnelError {
     TunnelError::Backend(error.code().to_string())
+}
+
+fn valid_fingerprint(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 pub fn encode_request(request: &Request) -> Result<Vec<u8>, ServiceError> {
@@ -540,4 +637,21 @@ fn decode_frame<T: for<'de> Deserialize<'de>>(frame: &[u8]) -> Result<T, Service
     }
 
     serde_json::from_slice(&frame[4..]).map_err(|_| ServiceError::InvalidRequest)
+}
+
+#[cfg(test)]
+mod service_error_tests {
+    use super::ServiceError;
+
+    #[test]
+    fn exposes_only_allowlisted_backend_codes() {
+        assert_eq!(
+            ServiceError::Backend("route_conflict".to_string()).code(),
+            "route_conflict"
+        );
+        assert_eq!(
+            ServiceError::Backend("raw operating system error".to_string()).code(),
+            "service_unavailable"
+        );
+    }
 }

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildApplicationRows,
   emptyIncludeSelection,
+  settingsUpdate,
+  splitTunnelWarningMessage,
   type InstalledApplication,
   type SplitTunnelState,
 } from "./split-tunnel";
@@ -48,6 +50,12 @@ const applications: InstalledApplication[] = [
 ];
 
 describe("split-tunnel application model", () => {
+  it("provides a user-facing message for runtime network failures", () => {
+    expect(
+      splitTunnelWarningMessage("split_tunnel_network_reconnect_failed"),
+    ).toContain("после смены сети");
+  });
+
   it("locks mandatory packages and never repeats them as suggestions", () => {
     const rows = buildApplicationRows(state, applications, "", true);
     const mandatory = rows.find(
@@ -65,6 +73,23 @@ describe("split-tunnel application model", () => {
     ).toMatchObject({
       suggested: true,
       locked: false,
+    });
+  });
+
+  it("shows mandatory exclusions outside the VPN in include-only mode", () => {
+    const rows = buildApplicationRows(
+      { ...state, mode: "include_selected" },
+      applications,
+      "",
+      true,
+    );
+
+    expect(
+      rows.find((row) => row.packageId === "com.example.mandatory"),
+    ).toMatchObject({
+      mandatory: true,
+      selected: false,
+      locked: true,
     });
   });
 
@@ -123,5 +148,51 @@ describe("split-tunnel application model", () => {
         applications,
       ),
     ).toBe(false);
+  });
+
+  it("keeps temporarily unavailable selected applications visible and selected", () => {
+    const rows = buildApplicationRows(
+      {
+        ...state,
+        selectedPackages: [
+          "com.example.selected",
+          "com.example.temporarily-missing",
+        ],
+      },
+      applications,
+      "",
+      false,
+    );
+
+    expect(
+      rows.find(
+        (row) => row.packageId === "com.example.temporarily-missing",
+      ),
+    ).toMatchObject({
+      available: false,
+      selected: true,
+      locked: false,
+    });
+  });
+
+  it("does not delete unavailable selections while saving other settings", () => {
+    expect(
+      settingsUpdate(
+        "exclude_selected",
+        true,
+        ["com.example.selected", "com.example.temporarily-missing"],
+        applications,
+        state.mandatoryExcludedPackages,
+      ).selectedPackages,
+    ).toEqual([
+      {
+        packageId: "com.example.selected",
+        displayName: "Selected",
+      },
+      {
+        packageId: "com.example.temporarily-missing",
+        displayName: "com.example.temporarily-missing",
+      },
+    ]);
   });
 });

@@ -146,9 +146,12 @@ fn populated_state() -> StoredSplitTunnelState {
         cached_policy: Some(policy.clone()),
         working_policy_hash: Some(policy.policy_hash.clone()),
         previous_working_policy: Some(policy),
+        applied_physical_network_fingerprint: Some("network-a".to_string()),
         last_full_sync_unix: Some(1_800_000_000),
         last_revision_check_unix: Some(1_800_000_100),
         last_seen_force_revision: 2,
+        failed_policy_hash: Some(format!("sha256:{}", "b".repeat(64))),
+        failed_policy_retry_after_unix: Some(1_800_003_600),
         pending_apply_results: Vec::new(),
     }
 }

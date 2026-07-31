@@ -4,21 +4,23 @@
 
 **Goal:** Apply compact IPv4 address exclusions on Windows, Linux, and macOS through privileged native routing while keeping WireGuard configurations small and preserving reliable stop, rollback, and crash recovery.
 
-**Architecture:** The shared core from the Android plan passes a `TunnelStartRequest` containing raw WireGuard configuration plus validated compact exclusions. Version-2 desktop helper protocols carry those options to the existing trusted helper/service. Each platform captures its physical egress before starting WireGuard, installs only Nelomai-owned direct routes, persists enough non-secret state for exact cleanup, and removes those routes during Stop or startup recovery. Desktop application-based split tunneling remains out of the first stage.
+**Architecture:** The shared core from the Android plan passes a `TunnelStartRequest` containing raw WireGuard configuration plus validated compact exclusions. Version-3 desktop helper protocols carry those options to the existing trusted helper/service and expose only an opaque physical-network fingerprint. Each platform captures its physical egress before starting WireGuard, installs only Nelomai-owned routes for panel exclusions, relies on existing on-link routes for local networks, and persists enough non-secret state for exact cleanup. Desktop application-based split tunneling remains out of the first stage.
 
-**Tech Stack:** Rust 1.88, Tokio, Serde, Tauri 2, `windows-sys` IP Helper API, `rtnetlink` on Linux, fixed-path `/sbin/route` and macOS System Configuration commands, WireGuardNT, `defguard-wireguard-rs`, wireguard-go.
+**Tech Stack:** Rust 1.88, Tokio, Serde, Tauri 2, `windows-sys` IP Helper API, fixed-path `ip` on Linux, fixed-path `/sbin/route` and macOS System Configuration commands, WireGuardNT, `defguard-wireguard-rs`, wireguard-go.
 
 ## Global Constraints
 
-- Keep native WireGuard `AllowedIPs = 0.0.0.0/0`.
+- Keep the full WireGuard address range. On Windows only, represent each `/0`
+  as two fixed `/1` entries while address split is active so WireGuardNT does
+  not enable its blocking firewall mode.
 - Never build an address complement and never pass one CIDR per allowed fragment.
-- Apply split rules only for `Tic + via_tak` and Stray. `Tic + standalone` gets no Nelomai direct routes.
+- Apply split rules for both Tic route modes and for Stray.
 - Stage one has address exclusions only on desktop. Do not expose non-functional per-application selectors.
 - Only the privileged helper may alter the route table.
 - Execute fixed trusted binaries directly; never invoke a shell or interpolate command strings.
 - Persist no WireGuard private keys, access tokens, or package lists. Local
-  network CIDRs may appear only inside the root/service-owned exact route state
-  required for crash cleanup; they never enter diagnostics or panel requests.
+  network CIDRs are used only in memory for an opaque network fingerprint; they
+  never enter route state, diagnostics, or panel requests.
 - A failed route operation must not leave a half-started tunnel or stale Nelomai routes.
 - Cleanup deletes only exact routes created by Nelomai.
 - Cached policy and panel unavailability behavior are owned by the shared-core plan.
@@ -39,7 +41,7 @@
 - Modify: `src-tauri/src/platform/unix.rs`
 - Modify: `src-tauri/src/platform/windows.rs`
 
-- [ ] Add failing serialization and compatibility tests for `PROTOCOL_VERSION = 2`.
+- [x] Add serialization and compatibility tests for the versioned helper protocol.
 - [ ] Change both `Request::Start` variants to:
 
 ```rust
@@ -399,7 +401,7 @@ Android returns `None` because its plugin owns the network callback.
   - no other tunnel operation is running.
 - [ ] Reuse the common atomic stop/start/rollback path from the Android/shared-core plan.
 - [ ] If fingerprint probing fails, keep the current tunnel and retry later; never disconnect solely because probing failed.
-- [ ] Suspend the watcher for `Tic + standalone` and when globally disabled.
+- [ ] Suspend the watcher when split-tunnel is globally disabled.
 - [ ] Ensure only one watcher exists and it exits on logout/application shutdown.
 - [ ] Run tests:
 
@@ -431,7 +433,7 @@ git commit -m "Добавить обновление маршрутов при �
 - Modify: `crates/unix-service/tests/helper.rs`
 - Modify: `crates/windows-service/tests/install.rs`
 
-- [ ] Add failing tests proving a protocol-1 helper is reported as outdated and a protocol-2 helper is accepted.
+- [x] Add tests proving a protocol-2 helper is reported as outdated and a protocol-3 helper is accepted.
 - [ ] Increment helper component versions and ensure installers replace the helper atomically.
 - [ ] Preserve existing owner UID/SID and installed-client-path authorization.
 - [ ] Ensure helper update/reinstall does not run on every connection after a successful installation.
@@ -466,7 +468,7 @@ git commit -m "Обновить установку компонентов split-
   - exact supported combinations;
   - route-state paths and cleanup behavior;
   - no desktop per-app support in stage one;
-  - helper protocol version 2;
+  - helper protocol version 3;
   - troubleshooting commands that do not reveal secrets.
 - [ ] Add Linux helper tests to CI.
 - [ ] Keep Windows compilation in a Windows-only workflow and macOS compilation in a macOS-only workflow; do not run privileged route mutations in shared CI.
@@ -488,7 +490,7 @@ pnpm check
 
 - [ ] On Linux VM verify:
   - `Tic + via_tak` excluded CIDR uses the physical gateway;
-  - `Tic + standalone` creates no Nelomai route;
+  - `Tic + standalone` applies the same compact address exclusions;
   - local LAN works when enabled;
   - Stop removes only Nelomai routes;
   - killing/restarting helper recovers stale routes.

@@ -83,6 +83,13 @@ impl fmt::Debug for TunnelOptions {
 }
 
 impl TunnelOptions {
+    pub fn has_same_effective_routes(&self, other: &Self) -> bool {
+        self.application_mode == other.application_mode
+            && self.package_ids == other.package_ids
+            && self.excluded_ipv4_cidrs == other.excluded_ipv4_cidrs
+            && self.exclude_local_networks == other.exclude_local_networks
+    }
+
     pub fn validate(&self) -> Result<(), TunnelOptionsError> {
         if self.package_ids.len() > MAX_PACKAGE_IDS {
             return Err(TunnelOptionsError::new(
@@ -103,6 +110,15 @@ impl TunnelOptions {
             .any(|value| !valid_package_id(value))
         {
             return Err(TunnelOptionsError::new("split_tunnel_invalid_package_id"));
+        }
+        if self
+            .package_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != self.package_ids.len()
+        {
+            return Err(TunnelOptionsError::new("split_tunnel_duplicate_package_id"));
         }
         if self
             .excluded_ipv4_cidrs
@@ -235,20 +251,38 @@ pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
     async fn status(&self) -> Result<TunnelStatus, TunnelError>;
+    async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
+        Ok(None)
+    }
     async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
         Ok(TunnelCapabilities::default())
     }
 }
 
 fn valid_package_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && !value.starts_with('.')
-        && !value.ends_with('.')
-        && !value.contains("..")
-        && value.bytes().all(|character| {
-            character.is_ascii_alphanumeric() || character == b'_' || character == b'.'
-        })
+    if value.is_empty() || value.len() > 255 {
+        return false;
+    }
+    let mut segments = value.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let Some(second) = segments.next() else {
+        return false;
+    };
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|character| character.is_ascii_alphanumeric() || character == b'_')
+    };
+    first
+        .bytes()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && valid_segment(first)
+        && valid_segment(second)
+        && segments.all(valid_segment)
 }
 
 fn valid_ipv4_cidr(value: &str) -> bool {
@@ -330,6 +364,28 @@ mod tests {
             invalid_cidr.validate().unwrap_err().stable_code(),
             "split_tunnel_invalid_ipv4_cidr"
         );
+    }
+
+    #[test]
+    fn policy_hash_does_not_change_effective_routes() {
+        let first = TunnelOptions {
+            application_mode: Some(SplitTunnelMode::ExcludeSelected),
+            package_ids: vec!["com.example.app".to_string()],
+            excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
+            exclude_local_networks: true,
+            policy_hash: Some("sha256:first".to_string()),
+        };
+        let second = TunnelOptions {
+            policy_hash: Some("sha256:second".to_string()),
+            ..first.clone()
+        };
+        let changed_route = TunnelOptions {
+            excluded_ipv4_cidrs: vec!["198.51.100.0/24".to_string()],
+            ..second.clone()
+        };
+
+        assert!(first.has_same_effective_routes(&second));
+        assert!(!first.has_same_effective_routes(&changed_route));
     }
 
     #[test]

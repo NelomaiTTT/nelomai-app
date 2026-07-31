@@ -14,7 +14,7 @@
 - Do not calculate or transfer an `AllowedIPs` complement.
 - Android address exclusions use `excludeRoute(IpPrefix)` only on API 33 and newer.
 - Android API 32 and older keep `Tic + via_tak`, `Tic + standalone`, and Stray operational as ordinary full tunnels; no split rule may block connection.
-- `Tic + standalone` never applies split rules on any platform.
+- Both Tic route modes apply split rules whenever the platform supports them.
 - Stray applies split rules whenever the platform supports them, even though its technical route mode is `standalone`.
 - The complete installed-application inventory and local physical networks remain on the device.
 - Do not log WireGuard configuration, package inventory, local networks, access tokens, or install secrets.
@@ -273,16 +273,14 @@ pub fn split_tunnel_active(context: SplitTunnelContext) -> bool {
         return false;
     }
     match (context.layer, context.route_mode) {
-        (Layer::Tic, RouteMode::ViaTak) => true,
-        (Layer::Tic, RouteMode::Standalone) => false,
+        (Layer::Tic, RouteMode::ViaTak | RouteMode::Standalone) => true,
         (Layer::Stray, _) => true,
-        _ => false,
     }
 }
 ```
 
 - [x] Add tests proving Android API 24–32 can start every connection mode with `TunnelOptions::default()`.
-- [x] Add tests proving API 33+ uses split for `Tic + via_tak` and Stray but not `Tic + standalone`.
+- [x] Add tests proving API 33+ uses split for both Tic route modes and Stray.
 - [x] Add tests for precedence:
   - mandatory package ID is always excluded;
   - a mandatory package is removed from suggestions;
@@ -390,7 +388,7 @@ git commit -m "Добавить движок политики split-tunnel"
   4. if that fails, start once with the prior working policy;
   5. if rollback succeeds, remain connected and report `rolled_back`;
   6. if rollback fails, remain stopped and report `failed`.
-- [x] Prove `Tic + standalone` settings save without reconnect.
+- [x] Prove `Tic + standalone` settings require reconnect when their effective routes change.
 - [x] Prove Android API 32 settings save and synchronize but never trigger a split reapply.
 - [x] Prove a newer unknown policy format preserves the previous working policy and returns a non-blocking update warning.
 - [x] Add coordinator state to `ClientCore` without holding the main state mutex across HTTP or tunnel operations.
@@ -645,7 +643,7 @@ app_split_tunnel_refresh
   - no suggestion when package ID is already mandatory.
 - [x] On Android 12 and older, keep settings readable/savable but show `Split-tunnel доступен на Android 13 и новее`; do not disable Start or hide connection modes.
 - [x] In include-only mode with no effective selected app, disable Start with `Выберите хотя бы одно приложение для подключения через VPN`.
-- [x] While connected, ask for confirmation only when the effective policy hash changes; `Tic + standalone` saves without reconnect.
+- [x] While connected, ask for confirmation when the effective routes change in either Tic route mode or Stray.
 - [x] Surface cached/offline state as a warning and never block Start.
 - [x] Run frontend tests:
 
@@ -710,7 +708,7 @@ npm run tauri -- android build --debug
 - [ ] On an Android 13+ device verify:
   - `Tic + via_tak` exclusion mode;
   - `Tic + via_tak` include-only mode;
-  - `Tic + standalone` remains full tunnel;
+  - `Tic + standalone` applies application and compact address exclusions;
   - compact address exclusions work without a large `AllowedIPs`;
   - local LAN remains reachable;
   - Wi-Fi change reapplies safely;

@@ -1,6 +1,10 @@
-use crate::{ClientCore, CoreApi, CoreApiError, CoreError, CoreLogger, Phase};
+use crate::{
+    ClientCore, CoreApi, CoreApiError, CoreError, CoreLogger, Phase, SplitTunnelWarningKind,
+};
 use nelomai_client_storage::{SecretStore, StoredSplitTunnelState};
-use nelomai_client_tunnel::{TunnelCapabilities, TunnelOptions, TunnelPlatform};
+use nelomai_client_tunnel::{
+    DesktopTunnelOptions, TunnelCapabilities, TunnelOptions, TunnelPlatform,
+};
 use nelomai_contracts::{
     Layer, RouteMode, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
@@ -19,6 +23,109 @@ const MAX_SELECTED_PACKAGES: usize = 512;
 const MAX_IPV4_CIDRS: usize = 16_384;
 const REVISION_POLL_SECONDS: i64 = 5 * 60;
 const FULL_SYNC_SECONDS: i64 = 24 * 60 * 60;
+const FAILED_POLICY_RETRY_SECONDS: i64 = 60 * 60;
+const PHYSICAL_NETWORK_RETRY_SECONDS: i64 = 5 * 60;
+const UNKNOWN_PHYSICAL_NETWORK: &str = "restore_requires_network_revalidation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalNetworkPollOutcome {
+    Skipped,
+    Busy,
+    BaselineRecorded,
+    ChangePending,
+    RetryDeferred,
+    Unchanged,
+    Reconnected,
+    ProbeFailed,
+    ReconnectFailed,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PhysicalNetworkChangeDetector {
+    applied: Option<String>,
+    candidate: Option<String>,
+    retry_after_unix: Option<i64>,
+    probe_failed: bool,
+    reconnect_failure_reported: bool,
+}
+
+impl PhysicalNetworkChangeDetector {
+    fn observe(&mut self, fingerprint: String, now_unix: i64) -> PhysicalNetworkObservation {
+        self.probe_failed = false;
+        let Some(applied) = self.applied.as_deref() else {
+            self.applied = Some(fingerprint);
+            self.candidate = None;
+            self.retry_after_unix = None;
+            return PhysicalNetworkObservation::BaselineRecorded;
+        };
+        if applied == fingerprint {
+            self.candidate = None;
+            self.retry_after_unix = None;
+            self.reconnect_failure_reported = false;
+            return PhysicalNetworkObservation::Unchanged;
+        }
+        if self.candidate.as_deref() == Some(fingerprint.as_str()) {
+            if self
+                .retry_after_unix
+                .is_some_and(|retry_after| now_unix < retry_after)
+            {
+                return PhysicalNetworkObservation::RetryDeferred;
+            }
+            self.retry_after_unix = None;
+            return PhysicalNetworkObservation::ConfirmedChange(fingerprint);
+        }
+        self.candidate = Some(fingerprint);
+        self.retry_after_unix = None;
+        self.reconnect_failure_reported = false;
+        PhysicalNetworkObservation::ChangePending
+    }
+
+    fn defer_retry(&mut self, now_unix: i64) -> bool {
+        self.retry_after_unix = Some(now_unix.saturating_add(PHYSICAL_NETWORK_RETRY_SECONDS));
+        let should_report = !self.reconnect_failure_reported;
+        self.reconnect_failure_reported = true;
+        should_report
+    }
+
+    fn mark_applied(&mut self, fingerprint: String) {
+        self.applied = Some(fingerprint);
+        self.candidate = None;
+        self.retry_after_unix = None;
+        self.probe_failed = false;
+        self.reconnect_failure_reported = false;
+    }
+
+    fn require_revalidation(&mut self) {
+        self.applied = Some(UNKNOWN_PHYSICAL_NETWORK.to_string());
+        self.candidate = None;
+        self.retry_after_unix = None;
+        self.probe_failed = false;
+        self.reconnect_failure_reported = false;
+    }
+
+    fn mark_probe_failed(&mut self) -> bool {
+        let first_failure = !self.probe_failed;
+        self.probe_failed = true;
+        first_failure
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.applied = None;
+        self.candidate = None;
+        self.retry_after_unix = None;
+        self.probe_failed = false;
+        self.reconnect_failure_reported = false;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PhysicalNetworkObservation {
+    BaselineRecorded,
+    ChangePending,
+    RetryDeferred,
+    Unchanged,
+    ConfirmedChange(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitTunnelContext {
@@ -39,8 +146,7 @@ pub fn split_tunnel_active(context: SplitTunnelContext) -> bool {
         return false;
     }
     match (context.layer, context.route_mode) {
-        (Layer::Tic, RouteMode::ViaTak) => true,
-        (Layer::Tic, RouteMode::Standalone) => false,
+        (Layer::Tic, RouteMode::ViaTak | RouteMode::Standalone) => true,
         (Layer::Stray, _) => true,
     }
 }
@@ -154,7 +260,11 @@ impl EffectiveSplitTunnelPolicy {
                 Vec::new()
             },
             exclude_local_networks: capabilities.address_split_tunnel
-                && policy.exclude_local_networks,
+                && (policy.exclude_local_networks
+                    || matches!(
+                        capabilities.platform,
+                        TunnelPlatform::Windows | TunnelPlatform::Linux | TunnelPlatform::Macos
+                    )),
             policy_hash: Some(policy.policy_hash.clone()),
         };
         options
@@ -228,6 +338,42 @@ pub fn validate_split_tunnel_policy(
     if policy.excluded_ipv4_cidrs.len() > MAX_IPV4_CIDRS {
         return Err(SplitTunnelPolicyError::CidrsLimit);
     }
+    let validate_packages = |mode, package_ids: &[String]| {
+        TunnelOptions {
+            application_mode: Some(mode),
+            package_ids: package_ids.to_vec(),
+            policy_hash: Some(policy.policy_hash.clone()),
+            ..TunnelOptions::default()
+        }
+        .validate()
+        .map_err(|error| SplitTunnelPolicyError::InvalidTunnelOptions {
+            code: error.stable_code(),
+        })
+    };
+    validate_packages(
+        SplitTunnelMode::ExcludeSelected,
+        &policy.mandatory_excluded_packages,
+    )?;
+    validate_packages(policy.mode, &policy.selected_packages)?;
+    if policy.mode == SplitTunnelMode::ExcludeSelected {
+        let effective_packages = policy
+            .mandatory_excluded_packages
+            .iter()
+            .chain(policy.selected_packages.iter())
+            .collect::<HashSet<_>>();
+        if effective_packages.len() > MAX_SELECTED_PACKAGES {
+            return Err(SplitTunnelPolicyError::SelectedPackagesLimit);
+        }
+    }
+    DesktopTunnelOptions {
+        excluded_ipv4_cidrs: policy.excluded_ipv4_cidrs.clone(),
+        exclude_local_networks: policy.exclude_local_networks,
+        policy_hash: Some(policy.policy_hash.clone()),
+    }
+    .validate()
+    .map_err(|error| SplitTunnelPolicyError::InvalidTunnelOptions {
+        code: error.stable_code(),
+    })?;
     Ok(())
 }
 
@@ -243,20 +389,25 @@ pub enum SplitTunnelSyncOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectedPolicyApplyOutcome {
     Unchanged,
+    ConfigurationUnavailable,
+    AppliedWithoutReconnect,
     Applied,
     RolledBack,
+    StopFailed,
     Failed,
 }
 
 impl ConnectedPolicyApplyOutcome {
     fn reconnected(self) -> bool {
-        !matches!(self, Self::Unchanged)
+        matches!(self, Self::Applied | Self::RolledBack | Self::Failed)
     }
 
     fn error_code(self) -> Option<&'static str> {
         match self {
-            Self::Unchanged | Self::Applied => None,
+            Self::Unchanged | Self::AppliedWithoutReconnect | Self::Applied => None,
+            Self::ConfigurationUnavailable => Some("split_tunnel_saved_connection_unavailable"),
             Self::RolledBack => Some("split_tunnel_apply_failed"),
+            Self::StopFailed => Some("split_tunnel_stop_failed"),
             Self::Failed => Some("split_tunnel_rollback_failed"),
         }
     }
@@ -276,7 +427,7 @@ where
     }
 
     pub async fn split_tunnel_warning(&self) -> Option<String> {
-        self.split_tunnel_warning.lock().await.clone()
+        self.split_tunnel_warning.lock().await.current()
     }
 
     pub fn cached_split_tunnel_policy(&self) -> Result<Option<SplitTunnelPolicy>, CoreError> {
@@ -285,6 +436,237 @@ where
 
     pub async fn split_tunnel_capabilities(&self) -> Result<TunnelCapabilities, CoreError> {
         self.tunnel.capabilities().await.map_err(Into::into)
+    }
+
+    pub(crate) async fn initialize_physical_network_detector(
+        &self,
+        options: &TunnelOptions,
+    ) -> Option<String> {
+        self.physical_network_change.lock().await.reset();
+        if !physical_network_tracking_active(options) {
+            return None;
+        }
+        if let Ok(Some(fingerprint)) = self.tunnel.physical_network_fingerprint().await {
+            self.physical_network_change
+                .lock()
+                .await
+                .mark_applied(fingerprint.clone());
+            return Some(fingerprint);
+        }
+        None
+    }
+
+    pub(crate) fn clear_applied_physical_network_fingerprint(&self) {
+        let Ok(mut state) = self.split_tunnel_store.load() else {
+            return;
+        };
+        state.applied_physical_network_fingerprint = None;
+        let _ = self.split_tunnel_store.save(&state);
+    }
+
+    pub async fn poll_physical_network(
+        &self,
+        now_unix: i64,
+    ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
+        let Ok(_split_guard) = self.split_tunnel_gate.try_lock() else {
+            return Ok(PhysicalNetworkPollOutcome::Busy);
+        };
+        let Ok(_connection_guard) = self.connection_gate.try_lock() else {
+            return Ok(PhysicalNetworkPollOutcome::Busy);
+        };
+        let current = {
+            let state = self.state.lock().await;
+            (state.phase == Phase::Connected)
+                .then(|| state.connection.clone())
+                .flatten()
+        };
+        let Some(connection) = current else {
+            self.physical_network_change.lock().await.reset();
+            return Ok(PhysicalNetworkPollOutcome::Skipped);
+        };
+        let options = self.split_tunnel_options.lock().await.clone();
+        if options.policy_hash.is_none()
+            || (!options.exclude_local_networks && options.excluded_ipv4_cidrs.is_empty())
+        {
+            self.physical_network_change.lock().await.reset();
+            return Ok(PhysicalNetworkPollOutcome::Skipped);
+        }
+        let fingerprint = match self.tunnel.physical_network_fingerprint().await {
+            Ok(Some(fingerprint)) => fingerprint,
+            Ok(None) => {
+                self.physical_network_change.lock().await.reset();
+                return Ok(PhysicalNetworkPollOutcome::Skipped);
+            }
+            Err(error) => {
+                if self
+                    .physical_network_change
+                    .lock()
+                    .await
+                    .mark_probe_failed()
+                {
+                    self.logger.record(crate::CoreLogEvent {
+                        kind: "split_tunnel.network_probe_failed",
+                        operation_id: None,
+                        request_id: None,
+                        code: Some(error.to_string()),
+                    });
+                }
+                return Ok(PhysicalNetworkPollOutcome::ProbeFailed);
+            }
+        };
+        let observation = self
+            .physical_network_change
+            .lock()
+            .await
+            .observe(fingerprint.clone(), now_unix);
+        match observation {
+            PhysicalNetworkObservation::BaselineRecorded => {
+                return Ok(PhysicalNetworkPollOutcome::BaselineRecorded);
+            }
+            PhysicalNetworkObservation::ChangePending => {
+                return Ok(PhysicalNetworkPollOutcome::ChangePending);
+            }
+            PhysicalNetworkObservation::RetryDeferred => {
+                return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+            }
+            PhysicalNetworkObservation::Unchanged => {
+                return Ok(PhysicalNetworkPollOutcome::Unchanged);
+            }
+            PhysicalNetworkObservation::ConfirmedChange(_) => {}
+        }
+
+        let stored = self.load_auth()?;
+        let configuration = stored
+            .saved_connection
+            .as_ref()
+            .into_iter()
+            .chain(stored.pinned_connection.as_ref())
+            .find(|saved| saved.lease_id == connection.lease_id)
+            .map(|saved| saved.configuration.clone());
+        let Some(configuration) = configuration else {
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Operation,
+                "split_tunnel_network_reconnect_failed",
+            )
+            .await;
+            let should_report = self
+                .physical_network_change
+                .lock()
+                .await
+                .defer_retry(now_unix);
+            if should_report {
+                self.logger.record(crate::CoreLogEvent {
+                    kind: "split_tunnel.network_reconnect_failed",
+                    operation_id: None,
+                    request_id: None,
+                    code: Some("saved_connection_unavailable".to_string()),
+                });
+            }
+            return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
+        };
+        if let Err(error) = self.tunnel.stop().await {
+            let tunnel_stopped = self
+                .tunnel
+                .status()
+                .await
+                .is_ok_and(|status| status != nelomai_client_tunnel::TunnelStatus::Running);
+            let should_report = if tunnel_stopped {
+                *self.state.lock().await = crate::CoreState {
+                    phase: Phase::Stopping,
+                    connection: Some(connection),
+                };
+                self.physical_network_change.lock().await.reset();
+                true
+            } else {
+                self.physical_network_change
+                    .lock()
+                    .await
+                    .defer_retry(now_unix)
+            };
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Operation,
+                "split_tunnel_network_reconnect_failed",
+            )
+            .await;
+            if should_report {
+                self.logger.record(crate::CoreLogEvent {
+                    kind: "split_tunnel.network_reconnect_failed",
+                    operation_id: None,
+                    request_id: None,
+                    code: Some(error.to_string()),
+                });
+            }
+            return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
+        }
+        self.set_phase(Phase::Connecting).await;
+        let start = |configuration: String, options: TunnelOptions| {
+            self.tunnel
+                .start(nelomai_client_tunnel::TunnelStartRequest {
+                    configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
+                    options,
+                })
+        };
+        let first = start(configuration.clone(), options.clone()).await;
+        if first.is_err() {
+            let second = start(configuration, options).await;
+            if let Err(error) = second {
+                *self.state.lock().await = crate::CoreState {
+                    phase: Phase::Stopping,
+                    connection: Some(connection),
+                };
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_network_reconnect_failed",
+                )
+                .await;
+                self.logger.record(crate::CoreLogEvent {
+                    kind: "split_tunnel.network_reconnect_failed",
+                    operation_id: None,
+                    request_id: None,
+                    code: Some(error.to_string()),
+                });
+                self.physical_network_change.lock().await.reset();
+                return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
+            }
+        }
+        *self.state.lock().await = crate::CoreState {
+            phase: Phase::Connected,
+            connection: Some(connection),
+        };
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
+        self.physical_network_change
+            .lock()
+            .await
+            .mark_applied(fingerprint.clone());
+        if let Ok(mut split_state) = self.split_tunnel_store.load() {
+            split_state.applied_physical_network_fingerprint = Some(fingerprint);
+            if self.split_tunnel_store.save(&split_state).is_err() {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Storage,
+                    "split_tunnel_state_save_failed",
+                )
+                .await;
+            } else {
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Storage)
+                    .await;
+            }
+        } else {
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Storage,
+                "split_tunnel_state_save_failed",
+            )
+            .await;
+        }
+        self.logger.record(crate::CoreLogEvent {
+            kind: "split_tunnel.network_reconnected",
+            operation_id: None,
+            request_id: None,
+            code: None,
+        });
+        Ok(PhysicalNetworkPollOutcome::Reconnected)
     }
 
     pub async fn split_tunnel_settings_require_reconnect(
@@ -333,7 +715,7 @@ where
             connection.route_mode,
         )
         .map_err(|error| CoreError::SplitTunnel(error.stable_code().to_string()))?;
-        Ok(current.options != proposed.options)
+        Ok(!current.options.has_same_effective_routes(&proposed.options))
     }
 
     pub async fn reset_split_tunnel_state(&self) -> Result<(), CoreError> {
@@ -345,7 +727,8 @@ where
             packages.clear();
         }
         *self.split_tunnel_options.lock().await = TunnelOptions::default();
-        *self.split_tunnel_warning.lock().await = None;
+        self.clear_all_split_tunnel_warnings().await;
+        self.physical_network_change.lock().await.reset();
         Ok(())
     }
 
@@ -377,8 +760,11 @@ where
                 self.split_tunnel_store
                     .save(&state)
                     .map_err(|_| CoreError::Storage)?;
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_cached_offline".to_string());
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Sync,
+                    "split_tunnel_cached_offline",
+                )
+                .await;
                 return Ok(SplitTunnelSyncOutcome::CachedOffline);
             }
             Err(error) => return Err(error),
@@ -395,14 +781,14 @@ where
             })
             || force_revision_changed;
         state.last_revision_check_unix = Some(now_unix);
-        state.last_seen_force_revision = revision.force_revision;
         if !full_sync_due {
+            state.last_seen_force_revision = revision.force_revision;
             let needs_retry = self.connected_connection().await.is_some()
                 && state.cached_policy.as_ref().is_some_and(|policy| {
                     state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str())
+                        && policy_retry_due(&state, policy, now_unix)
                 });
             if let Some(policy) = needs_retry.then(|| state.cached_policy.clone()).flatten() {
-                *self.split_tunnel_warning.lock().await = None;
                 let outcome = self
                     .apply_policy_if_connected(&policy, &mut state, &mut access_token, now_unix)
                     .await?;
@@ -416,7 +802,12 @@ where
             self.split_tunnel_store
                 .save(&state)
                 .map_err(|_| CoreError::Storage)?;
-            *self.split_tunnel_warning.lock().await = None;
+            if state.cached_policy.as_ref().is_none_or(|policy| {
+                state.working_policy_hash.as_deref() == Some(policy.policy_hash.as_str())
+            }) {
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
+                    .await;
+            }
             return Ok(SplitTunnelSyncOutcome::Unchanged);
         }
 
@@ -426,8 +817,11 @@ where
                 self.split_tunnel_store
                     .save(&state)
                     .map_err(|_| CoreError::Storage)?;
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_cached_offline".to_string());
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Sync,
+                    "split_tunnel_cached_offline",
+                )
+                .await;
                 return Ok(SplitTunnelSyncOutcome::CachedOffline);
             }
             Err(error) => return Err(error),
@@ -436,7 +830,8 @@ where
             self.split_tunnel_store
                 .save(&state)
                 .map_err(|_| CoreError::Storage)?;
-            *self.split_tunnel_warning.lock().await = Some(error.stable_code().to_string());
+            self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, error.stable_code())
+                .await;
             return Ok(SplitTunnelSyncOutcome::UnsupportedPolicy);
         }
 
@@ -445,14 +840,18 @@ where
             .as_ref()
             .is_none_or(|cached| cached.policy_hash != policy.policy_hash);
         remember_previous_working_policy(&mut state);
+        clear_stale_policy_failure(&mut state, &policy);
         state.cached_policy = Some(policy.clone());
         state.last_full_sync_unix = Some(now_unix);
+        state.last_seen_force_revision = revision.force_revision;
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
-        *self.split_tunnel_warning.lock().await = None;
-        let needs_apply =
-            changed || state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str());
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
+            .await;
+        let needs_apply = force_full
+            || changed
+            || state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str());
         let outcome = if needs_apply {
             self.apply_policy_if_connected(&policy, &mut state, &mut access_token, now_unix)
                 .await?
@@ -490,6 +889,7 @@ where
             .as_ref()
             .is_none_or(|cached| cached.policy_hash != policy.policy_hash);
         remember_previous_working_policy(&mut state);
+        clear_stale_policy_failure(&mut state, &policy);
         state.cached_policy = Some(policy.clone());
         state.last_full_sync_unix = Some(now_unix);
         state.last_revision_check_unix = Some(now_unix);
@@ -497,7 +897,8 @@ where
         self.split_tunnel_store
             .save(&state)
             .map_err(|_| CoreError::Storage)?;
-        *self.split_tunnel_warning.lock().await = None;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
+            .await;
         let needs_apply =
             changed || state.working_policy_hash.as_deref() != Some(policy.policy_hash.as_str());
         let outcome = if needs_apply {
@@ -536,19 +937,27 @@ where
         &self,
         policy: &SplitTunnelPolicy,
         options: TunnelOptions,
+        applied_physical_network_fingerprint: Option<String>,
         access_token: Option<&mut String>,
         now_unix: i64,
     ) -> Result<(), CoreError> {
         *self.split_tunnel_options.lock().await = options.clone();
-        if options.policy_hash.is_none() {
-            return Ok(());
-        }
         let mut state = self
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
+        state.applied_physical_network_fingerprint = applied_physical_network_fingerprint;
+        if options.policy_hash.is_none() {
+            return self
+                .split_tunnel_store
+                .save(&state)
+                .map_err(|_| CoreError::Storage);
+        }
         remember_previous_working_policy(&mut state);
         state.working_policy_hash = Some(policy.policy_hash.clone());
+        self.split_tunnel_store
+            .save(&state)
+            .map_err(|_| CoreError::Storage)?;
         let result = SplitTunnelApplyResult {
             format_version: SUPPORTED_FORMAT_VERSION,
             revision: policy.revision,
@@ -595,6 +1004,19 @@ where
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
+        let failed_cached_policy = state
+            .cached_policy
+            .as_ref()
+            .zip(state.failed_policy_hash.as_deref())
+            .is_some_and(|(policy, failed_hash)| policy.policy_hash == failed_hash);
+        if failed_cached_policy {
+            if let Some(policy) = working_policy(&state)
+                .filter(|policy| validate_split_tunnel_policy(policy).is_ok())
+                .cloned()
+            {
+                return Ok(Some(policy));
+            }
+        }
         Ok(state
             .cached_policy
             .filter(|policy| validate_split_tunnel_policy(policy).is_ok())
@@ -629,15 +1051,40 @@ where
             .into_iter()
             .chain(stored.pinned_connection.as_ref())
             .find(|saved| saved.lease_id == connection.lease_id)
-            .map(|saved| saved.configuration.clone())
-            .ok_or(CoreError::SavedConnectionUnavailable)?;
+            .map(|saved| saved.configuration.clone());
+        let Some(configuration) = configuration else {
+            const ERROR_CODE: &str = "split_tunnel_saved_connection_unavailable";
+            mark_policy_failure(state, policy, now_unix);
+            self.set_split_tunnel_warning(SplitTunnelWarningKind::Operation, ERROR_CODE)
+                .await;
+            self.logger.record(crate::CoreLogEvent {
+                kind: "split_tunnel.apply_failed",
+                operation_id: None,
+                request_id: None,
+                code: Some(ERROR_CODE.to_string()),
+            });
+            let result = SplitTunnelApplyResult {
+                format_version: SUPPORTED_FORMAT_VERSION,
+                revision: policy.revision,
+                force_revision: policy.force_revision,
+                policy_hash: policy.policy_hash.clone(),
+                status: SplitTunnelApplyStatus::Failed,
+                error_code: Some(ERROR_CODE.to_string()),
+                applied_at: rfc3339(now_unix)?,
+            };
+            self.report_or_queue_apply_result(access_token, state, result)
+                .await;
+            return Ok(ConnectedPolicyApplyOutcome::ConfigurationUnavailable);
+        };
         let new_options = match self
             .effective_tunnel_options(policy, connection.layer, connection.route_mode)
             .await
         {
             Ok(options) => options,
             Err(CoreError::SplitTunnel(code)) => {
-                *self.split_tunnel_warning.lock().await = Some(code);
+                self.set_split_tunnel_warning(SplitTunnelWarningKind::Sync, code)
+                    .await;
+                mark_policy_failure(state, policy, now_unix);
                 return Ok(ConnectedPolicyApplyOutcome::Unchanged);
             }
             Err(error) => return Err(error),
@@ -655,11 +1102,79 @@ where
                     .unwrap_or_default();
             }
         }
-        if new_options == previous_options {
-            return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+        if new_options.has_same_effective_routes(&previous_options) {
+            *self.split_tunnel_options.lock().await = new_options;
+            state.working_policy_hash = Some(policy.policy_hash.clone());
+            clear_policy_failure(state);
+            if self.split_tunnel_store.save(state).is_err() {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Storage,
+                    "split_tunnel_state_save_failed",
+                )
+                .await;
+            } else {
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Storage)
+                    .await;
+            }
+            self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+                .await;
+            let result = SplitTunnelApplyResult {
+                format_version: SUPPORTED_FORMAT_VERSION,
+                revision: policy.revision,
+                force_revision: policy.force_revision,
+                policy_hash: policy.policy_hash.clone(),
+                status: SplitTunnelApplyStatus::Applied,
+                error_code: None,
+                applied_at: rfc3339(now_unix)?,
+            };
+            self.report_or_queue_apply_result(access_token, state, result)
+                .await;
+            return Ok(ConnectedPolicyApplyOutcome::AppliedWithoutReconnect);
         }
 
-        self.tunnel.stop().await?;
+        if self.tunnel.stop().await.is_err() {
+            mark_policy_failure(state, policy, now_unix);
+            let phase = match self.tunnel.status().await {
+                Ok(
+                    nelomai_client_tunnel::TunnelStatus::Stopped
+                    | nelomai_client_tunnel::TunnelStatus::Stopping
+                    | nelomai_client_tunnel::TunnelStatus::Failed,
+                ) => Phase::Stopping,
+                Ok(
+                    nelomai_client_tunnel::TunnelStatus::Starting
+                    | nelomai_client_tunnel::TunnelStatus::Running,
+                )
+                | Err(_) => Phase::Connected,
+            };
+            *self.state.lock().await = crate::CoreState {
+                phase,
+                connection: Some(connection),
+            };
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Operation,
+                "split_tunnel_stop_failed",
+            )
+            .await;
+            let result = SplitTunnelApplyResult {
+                format_version: SUPPORTED_FORMAT_VERSION,
+                revision: policy.revision,
+                force_revision: policy.force_revision,
+                policy_hash: policy.policy_hash.clone(),
+                status: SplitTunnelApplyStatus::Failed,
+                error_code: Some("split_tunnel_stop_failed".to_string()),
+                applied_at: rfc3339(now_unix)?,
+            };
+            if self.split_tunnel_store.save(state).is_err() {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Storage,
+                    "split_tunnel_state_save_failed",
+                )
+                .await;
+            }
+            self.report_or_queue_apply_result(access_token, state, result)
+                .await;
+            return Ok(ConnectedPolicyApplyOutcome::StopFailed);
+        }
         self.set_phase(Phase::Connecting).await;
         let start_new = self
             .tunnel
@@ -671,8 +1186,16 @@ where
             })
             .await;
         let (outcome, status, error_code) = if start_new.is_ok() {
-            *self.split_tunnel_options.lock().await = new_options;
+            *self.split_tunnel_options.lock().await = new_options.clone();
+            state.applied_physical_network_fingerprint = self
+                .initialize_physical_network_detector(&new_options)
+                .await;
             state.working_policy_hash = Some(policy.policy_hash.clone());
+            clear_policy_failure(state);
+            self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+                .await;
+            self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+                .await;
             *self.state.lock().await = crate::CoreState {
                 phase: Phase::Connected,
                 connection: Some(connection),
@@ -691,26 +1214,39 @@ where
                 })
                 .await;
             if rollback.is_ok() {
-                *self.split_tunnel_options.lock().await = previous_options;
+                mark_policy_failure(state, policy, now_unix);
+                *self.split_tunnel_options.lock().await = previous_options.clone();
+                state.applied_physical_network_fingerprint = self
+                    .initialize_physical_network_detector(&previous_options)
+                    .await;
                 *self.state.lock().await = crate::CoreState {
                     phase: Phase::Connected,
                     connection: Some(connection),
                 };
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_apply_failed".to_string());
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_apply_failed",
+                )
+                .await;
                 (
                     ConnectedPolicyApplyOutcome::RolledBack,
                     SplitTunnelApplyStatus::RolledBack,
                     Some("split_tunnel_apply_failed".to_string()),
                 )
             } else {
+                mark_policy_failure(state, policy, now_unix);
                 *self.split_tunnel_options.lock().await = TunnelOptions::default();
+                self.physical_network_change.lock().await.reset();
+                state.applied_physical_network_fingerprint = None;
                 *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Ready,
+                    phase: Phase::Stopping,
                     connection: Some(connection),
                 };
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_rollback_failed".to_string());
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_rollback_failed",
+                )
+                .await;
                 (
                     ConnectedPolicyApplyOutcome::Failed,
                     SplitTunnelApplyStatus::Failed,
@@ -727,6 +1263,16 @@ where
             error_code,
             applied_at: rfc3339(now_unix)?,
         };
+        if self.split_tunnel_store.save(state).is_err() {
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Storage,
+                "split_tunnel_state_save_failed",
+            )
+            .await;
+        } else {
+            self.clear_split_tunnel_warning(SplitTunnelWarningKind::Storage)
+                .await;
+        }
         self.report_or_queue_apply_result(access_token, state, result)
             .await;
         Ok(outcome)
@@ -763,7 +1309,16 @@ where
             .effective_tunnel_options(policy, connection.layer, connection.route_mode)
             .await
         {
-            *self.split_tunnel_options.lock().await = options;
+            *self.split_tunnel_options.lock().await = options.clone();
+            let mut detector = self.physical_network_change.lock().await;
+            detector.reset();
+            if physical_network_tracking_active(&options) {
+                if let Some(fingerprint) = state.applied_physical_network_fingerprint {
+                    detector.mark_applied(fingerprint);
+                } else {
+                    detector.require_revalidation();
+                }
+            }
         }
     }
 
@@ -853,6 +1408,43 @@ where
     }
 }
 
+fn physical_network_tracking_active(options: &TunnelOptions) -> bool {
+    options.policy_hash.is_some()
+        && (options.exclude_local_networks || !options.excluded_ipv4_cidrs.is_empty())
+}
+
+fn policy_retry_due(
+    state: &StoredSplitTunnelState,
+    policy: &SplitTunnelPolicy,
+    now_unix: i64,
+) -> bool {
+    state.failed_policy_hash.as_deref() != Some(policy.policy_hash.as_str())
+        || state
+            .failed_policy_retry_after_unix
+            .is_none_or(|retry_after| now_unix >= retry_after)
+}
+
+fn mark_policy_failure(
+    state: &mut StoredSplitTunnelState,
+    policy: &SplitTunnelPolicy,
+    now_unix: i64,
+) {
+    state.failed_policy_hash = Some(policy.policy_hash.clone());
+    state.failed_policy_retry_after_unix =
+        Some(now_unix.saturating_add(FAILED_POLICY_RETRY_SECONDS));
+}
+
+fn clear_policy_failure(state: &mut StoredSplitTunnelState) {
+    state.failed_policy_hash = None;
+    state.failed_policy_retry_after_unix = None;
+}
+
+fn clear_stale_policy_failure(state: &mut StoredSplitTunnelState, policy: &SplitTunnelPolicy) {
+    if state.failed_policy_hash.as_deref() != Some(policy.policy_hash.as_str()) {
+        clear_policy_failure(state);
+    }
+}
+
 fn remember_previous_working_policy(state: &mut StoredSplitTunnelState) {
     if state
         .cached_policy
@@ -917,4 +1509,99 @@ fn suggested_packages(
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod physical_network_tests {
+    use super::*;
+
+    #[test]
+    fn network_change_requires_two_matching_observations() {
+        let mut detector = PhysicalNetworkChangeDetector::default();
+
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_000),
+            PhysicalNetworkObservation::BaselineRecorded
+        );
+        assert_eq!(
+            detector.observe("network-b".to_string(), 1_030),
+            PhysicalNetworkObservation::ChangePending
+        );
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_060),
+            PhysicalNetworkObservation::Unchanged
+        );
+        assert_eq!(
+            detector.observe("network-b".to_string(), 1_090),
+            PhysicalNetworkObservation::ChangePending
+        );
+        assert_eq!(
+            detector.observe("network-b".to_string(), 1_120),
+            PhysicalNetworkObservation::ConfirmedChange("network-b".to_string())
+        );
+        detector.mark_applied("network-b".to_string());
+        assert_eq!(
+            detector.observe("network-b".to_string(), 1_150),
+            PhysicalNetworkObservation::Unchanged
+        );
+    }
+
+    #[test]
+    fn reset_requires_a_new_baseline() {
+        let mut detector = PhysicalNetworkChangeDetector::default();
+        detector.observe("network-a".to_string(), 1_000);
+        detector.observe("network-b".to_string(), 1_030);
+        detector.reset();
+
+        assert_eq!(
+            detector.observe("network-b".to_string(), 1_060),
+            PhysicalNetworkObservation::BaselineRecorded
+        );
+    }
+
+    #[test]
+    fn repeated_probe_failures_are_reported_once_until_a_success() {
+        let mut detector = PhysicalNetworkChangeDetector::default();
+
+        assert!(detector.mark_probe_failed());
+        assert!(!detector.mark_probe_failed());
+        detector.observe("network-a".to_string(), 1_000);
+        assert!(detector.mark_probe_failed());
+    }
+
+    #[test]
+    fn restored_detector_requires_confirmation_when_no_baseline_was_persisted() {
+        let mut detector = PhysicalNetworkChangeDetector::default();
+        detector.require_revalidation();
+
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_000),
+            PhysicalNetworkObservation::ChangePending
+        );
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_030),
+            PhysicalNetworkObservation::ConfirmedChange("network-a".to_string())
+        );
+    }
+
+    #[test]
+    fn failed_reconnect_is_deferred_without_forgetting_the_network_change() {
+        let mut detector = PhysicalNetworkChangeDetector::default();
+        detector.observe("network-a".to_string(), 1_000);
+        detector.observe("network-b".to_string(), 1_030);
+        assert!(matches!(
+            detector.observe("network-b".to_string(), 1_060),
+            PhysicalNetworkObservation::ConfirmedChange(_)
+        ));
+        detector.defer_retry(1_060);
+
+        assert_eq!(
+            detector.observe("network-b".to_string(), 1_359),
+            PhysicalNetworkObservation::RetryDeferred
+        );
+        assert!(matches!(
+            detector.observe("network-b".to_string(), 1_360),
+            PhysicalNetworkObservation::ConfirmedChange(_)
+        ));
+    }
 }

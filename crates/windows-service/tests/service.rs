@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest, TunnelStatus,
+    DesktopTunnelOptions, TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest,
+    TunnelStatus,
 };
 use nelomai_windows_service::{
     Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
@@ -35,6 +36,10 @@ impl ServiceTunnelBackend for RecordingBackend {
     fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
         Ok(self.state)
     }
+
+    fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        Ok("ab".repeat(32))
+    }
 }
 
 #[test]
@@ -61,13 +66,74 @@ fn handler_executes_only_typed_tunnel_operations() {
     let status = handler.handle(Request::status());
     let stopped = handler.handle(Request::stop());
     let version = handler.handle(Request::version());
+    let fingerprint = handler.handle(Request::physical_network_fingerprint());
 
     assert_eq!(started.state, Some(ServiceTunnelState::Running));
     assert_eq!(status.state, Some(ServiceTunnelState::Running));
     assert_eq!(stopped.state, Some(ServiceTunnelState::Stopped));
     assert_eq!(version.service_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        fingerprint.physical_network_fingerprint.as_deref(),
+        Some("abababababababababababababababababababababababababababababababab")
+    );
     assert_eq!(handler.backend().starts, vec!["PrivateKey = transient"]);
     assert_eq!(handler.backend().stops, 1);
+}
+
+#[test]
+fn handler_avoids_windows_firewall_blocking_mode_for_address_split() {
+    let backend = RecordingBackend::default();
+    let mut handler = TunnelRequestHandler::new(backend, "1.2.3");
+    let configuration = "\
+[Interface]\r
+PrivateKey = transient\r
+\r
+[Peer]\r
+PublicKey = peer\r
+AllowedIPs = 0.0.0.0/0, ::/0\r
+";
+
+    let response = handler.handle(Request::start_with_options(
+        configuration.to_string(),
+        DesktopTunnelOptions {
+            excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
+            exclude_local_networks: true,
+            policy_hash: Some("sha256:test".to_string()),
+        },
+    ));
+
+    assert!(response.ok);
+    assert_eq!(
+        handler.backend().starts,
+        vec![
+            "\
+[Interface]\r
+PrivateKey = transient\r
+\r
+[Peer]\r
+PublicKey = peer\r
+AllowedIPs = 0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1\r
+"
+        ]
+    );
+}
+
+#[test]
+fn handler_preserves_full_range_allowed_ips_without_address_split() {
+    let backend = RecordingBackend::default();
+    let mut handler = TunnelRequestHandler::new(backend, "1.2.3");
+    let configuration = "\
+[Interface]
+PrivateKey = transient
+
+[Peer]
+AllowedIPs = 0.0.0.0/0, ::/0
+";
+
+    let response = handler.handle(Request::start(configuration.to_string()));
+
+    assert!(response.ok);
+    assert_eq!(handler.backend().starts, vec![configuration]);
 }
 
 struct RecordingTransport {
@@ -95,6 +161,7 @@ impl ServiceTransport for RecordingTransport {
             Request::Stop { .. } => "stop",
             Request::Status { .. } => "status",
             Request::Version { .. } => "version",
+            Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
         };
         self.requests.lock().unwrap().push(summary.to_string());
         Ok(self.response.clone())
@@ -141,6 +208,26 @@ async fn controller_reads_installed_service_version() {
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
         ["version"]
+    );
+}
+
+#[tokio::test]
+async fn controller_reads_only_the_opaque_physical_network_fingerprint() {
+    let mut response = Response::success(None);
+    response.physical_network_fingerprint = Some("cd".repeat(32));
+    let controller = WindowsTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    let fingerprint = controller
+        .physical_network_fingerprint()
+        .await
+        .expect("read fingerprint");
+    assert_eq!(fingerprint, Some("cd".repeat(32)));
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["fingerprint"]
     );
 }
 

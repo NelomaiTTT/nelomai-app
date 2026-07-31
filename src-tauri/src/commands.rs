@@ -3,7 +3,10 @@ use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{NativeApplication, SplitTunnelScheduler};
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
-use nelomai_client_core::{ConnectOptions, CoreApiError, CoreError, CoreState, Phase};
+use nelomai_client_core::{
+    split_tunnel_active, ConnectOptions, CoreApiError, CoreError, CoreState, Phase,
+    SplitTunnelContext,
+};
 use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
@@ -80,7 +83,13 @@ impl CommandError {
                     "tunnel_service_unavailable",
                     "Служба подключения не установлена или не запущена. Переустановите приложение",
                 ),
-                _ => Self::new("tunnel_failed", "Не удалось изменить состояние подключения"),
+                "physical_network_monitor_unavailable" => Self::new(
+                    "physical_network_monitor_unavailable",
+                    "Не удалось отслеживать смену сети на устройстве",
+                ),
+                _ => Self::from_route_error(&code).unwrap_or_else(|| {
+                    Self::new("tunnel_failed", "Не удалось изменить состояние подключения")
+                }),
             },
             CoreError::SplitTunnel(code) => match code.as_str() {
                 "split_tunnel_empty_include_selection" => Self::new(
@@ -90,6 +99,10 @@ impl CommandError {
                 "split_tunnel_apply_failed" => Self::new(
                     "split_tunnel_apply_failed",
                     "Не удалось применить новые настройки. Предыдущее подключение восстановлено",
+                ),
+                "split_tunnel_stop_failed" => Self::new(
+                    "split_tunnel_stop_failed",
+                    "Не удалось остановить подключение для применения новых настроек. Повторите позже",
                 ),
                 "split_tunnel_rollback_failed" => Self::new(
                     "split_tunnel_rollback_failed",
@@ -135,11 +148,47 @@ impl CommandError {
                 "helper_resources_unavailable",
                 "В установленном приложении отсутствуют компоненты подключения",
             ),
-            _ => Self::new(
-                "tunnel_failed",
-                "Не удалось запустить подключение на устройстве",
+            "physical_network_monitor_unavailable" => Self::new(
+                "physical_network_monitor_unavailable",
+                "Не удалось отслеживать смену сети на устройстве",
             ),
+            _ => Self::from_route_error(&code).unwrap_or_else(|| {
+                Self::new(
+                    "tunnel_failed",
+                    "Не удалось запустить подключение на устройстве",
+                )
+            }),
         }
+    }
+
+    fn from_route_error(code: &str) -> Option<Self> {
+        let message = match code {
+            "route_conflict" => {
+                "Не удалось применить split-tunnel: на устройстве уже существует такой маршрут"
+            }
+            "route_plan_too_large" | "route_state_too_large" => {
+                "Список адресов split-tunnel слишком большой"
+            }
+            "physical_egress_unavailable" => {
+                "Не удалось определить текущее подключение устройства к сети"
+            }
+            "local_networks_unavailable" => "Не удалось определить локальные сети этого устройства",
+            "route_state_invalid"
+            | "route_state_read_failed"
+            | "route_state_write_failed"
+            | "route_state_serialize_failed"
+            | "route_state_activate_failed"
+            | "route_state_remove_failed"
+            | "route_add_failed"
+            | "route_del_failed"
+            | "route_delete_failed"
+            | "route_command_failed"
+            | "route_command_unavailable"
+            | "route_table_unavailable"
+            | "ip_command_unavailable" => "Не удалось применить маршруты split-tunnel",
+            _ => return None,
+        };
+        Some(Self::new(code, message))
     }
 }
 
@@ -148,13 +197,15 @@ impl CommandError {
 pub struct AppStateResponse {
     phase: &'static str,
     connection: Option<Connection>,
+    warning: Option<String>,
 }
 
-impl From<CoreState> for AppStateResponse {
-    fn from(state: CoreState) -> Self {
+impl AppStateResponse {
+    fn new(state: CoreState, warning: Option<String>) -> Self {
         Self {
             phase: phase_name(state.phase),
             connection: state.connection,
+            warning,
         }
     }
 }
@@ -227,7 +278,9 @@ impl From<PeerBindingResponse> for SafePeerBindingResponse {
 pub async fn app_state(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<AppStateResponse, CommandError> {
-    Ok(application.state().await.into())
+    let state = application.state().await;
+    let warning = application.split_tunnel_warning().await;
+    Ok(AppStateResponse::new(state, warning))
 }
 
 #[tauri::command]
@@ -253,7 +306,7 @@ pub async fn app_login(
         )
         .await
         .map_err(CommandError::from)?;
-    refresh_installed_applications(&app, &application)?;
+    let _ = refresh_installed_applications(&app, &application);
     observe_and_schedule_update(
         application.inner().clone(),
         updater.inner().clone(),
@@ -273,7 +326,7 @@ pub async fn app_bootstrap(
     split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<Bootstrap, CommandError> {
-    refresh_installed_applications(&app, &application)?;
+    let _ = refresh_installed_applications(&app, &application);
     let response = application
         .bootstrap(now_unix())
         .await
@@ -360,7 +413,13 @@ pub async fn app_start(
     application: State<'_, Arc<NativeApplication>>,
     request: StartCommandRequest,
 ) -> Result<Connection, CommandError> {
-    refresh_installed_applications(&app, &application)?;
+    refresh_installed_applications_before_start(
+        &app,
+        &application,
+        request.layer,
+        request.route_mode,
+    )
+    .await?;
     application
         .start(
             ConnectOptions {
@@ -378,8 +437,16 @@ pub async fn app_start(
 
 #[tauri::command]
 pub async fn app_start_saved_stray(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<String, CommandError> {
+    refresh_installed_applications_before_start(
+        &app,
+        &application,
+        Layer::Stray,
+        RouteMode::Standalone,
+    )
+    .await?;
     application
         .start_saved_stray_offline(now_unix())
         .await
@@ -753,6 +820,42 @@ fn refresh_installed_applications(
         .collect())
 }
 
+async fn refresh_installed_applications_before_start(
+    app: &AppHandle,
+    application: &NativeApplication,
+    layer: Layer,
+    route_mode: RouteMode,
+) -> Result<(), CommandError> {
+    let capabilities = application
+        .split_tunnel_capabilities()
+        .await
+        .map_err(CommandError::from)?;
+    let policy = application
+        .cached_split_tunnel_policy()
+        .map_err(CommandError::from)?;
+    let inventory_required = capabilities.application_split_tunnel
+        && policy.as_ref().is_some_and(|policy| {
+            split_tunnel_active(SplitTunnelContext {
+                global_enabled: policy.enabled,
+                platform: capabilities.platform,
+                android_api_level: capabilities.android_api_level,
+                layer,
+                route_mode,
+            })
+        });
+    if inventory_required {
+        if refresh_installed_applications(app, application)?.is_empty() {
+            return Err(CommandError::new(
+                "installed_applications_unavailable",
+                "Не удалось получить список приложений",
+            ));
+        }
+    } else {
+        let _ = refresh_installed_applications(app, application);
+    }
+    Ok(())
+}
+
 fn update_command_error(error: String) -> CommandError {
     CommandError::new("update_failed", update_error_message(&error))
 }
@@ -843,5 +946,24 @@ mod tests {
         let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["packageId"], "com.example.browser");
         assert!(value.get("icon").is_none());
+    }
+
+    #[test]
+    fn route_errors_do_not_look_like_a_missing_tunnel_service() {
+        let error = CommandError::from_core(CoreError::Tunnel("route_conflict".to_string()));
+
+        assert_eq!(error.code, "route_conflict");
+        assert!(error.message.contains("маршрут"));
+        assert!(!error.message.contains("Переустановите"));
+    }
+
+    #[test]
+    fn split_tunnel_stop_failure_keeps_its_actionable_error() {
+        let error = CommandError::from_core(CoreError::SplitTunnel(
+            "split_tunnel_stop_failed".to_string(),
+        ));
+
+        assert_eq!(error.code, "split_tunnel_stop_failed");
+        assert!(error.message.contains("остановить подключение"));
     }
 }

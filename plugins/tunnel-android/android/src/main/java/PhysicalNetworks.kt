@@ -6,12 +6,14 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import java.net.Inet4Address
 import java.net.InetAddress
 
 private const val NETWORK_CHANGE_DEBOUNCE_MILLIS = 300L
+private const val NETWORK_SNAPSHOT_RETRY_MILLIS = 300_000L
 
 internal data class PhysicalLinkAddress(
     val address: InetAddress,
@@ -37,7 +39,14 @@ internal class PhysicalNetworks(context: Context) {
     private var listener: ((List<Ipv4Prefix>) -> Unit)? = null
     private val refresh = Runnable {
         val currentListener = synchronized(lock) { listener }
-        currentListener?.invoke(snapshot())
+        runCatching(::snapshot)
+            .onSuccess { currentListener?.invoke(it) }
+            .onFailure {
+                val active = synchronized(lock) { callback != null && listener != null }
+                if (active) {
+                    scheduleRetry(NETWORK_SNAPSHOT_RETRY_MILLIS)
+                }
+            }
     }
 
     @Suppress("DEPRECATION")
@@ -74,12 +83,20 @@ internal class PhysicalNetworks(context: Context) {
                 ) = scheduleRefresh()
             }
             callback = networkCallback
-            val request = NetworkRequest.Builder()
-                .clearCapabilities()
-                .build()
+            val requestBuilder = NetworkRequest.Builder()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                requestBuilder.clearCapabilities()
+            }
+            requestBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            val request = requestBuilder.build()
             connectivityManager.registerNetworkCallback(request, networkCallback)
         }
         scheduleRefresh()
+    }
+
+    fun scheduleRetry(delayMillis: Long) {
+        handler.removeCallbacks(refresh)
+        handler.postDelayed(refresh, delayMillis)
     }
 
     fun stop() {

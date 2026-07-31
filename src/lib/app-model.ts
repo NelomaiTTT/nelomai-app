@@ -134,6 +134,7 @@ export interface PeerOptions {
 export interface AppState {
   phase: Phase;
   connection: Connection | null;
+  warning: string | null;
 }
 
 export interface BindPeerRequest {

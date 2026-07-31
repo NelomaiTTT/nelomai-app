@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.net.VpnService
 import android.os.Build
+import android.os.SystemClock
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -25,6 +26,7 @@ import org.json.JSONArray
 
 private const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
+private const val PHYSICAL_NETWORK_RETRY_MILLIS = 5 * 60 * 1_000L
 
 @InvokeArg
 class TunnelOptionsArgs {
@@ -74,6 +76,7 @@ internal enum class SessionState(val wireName: String) {
 
 internal enum class TransitionDecision {
     PROCEED,
+    REPLACE,
     ALREADY_COMPLETE,
     BUSY,
 }
@@ -88,7 +91,11 @@ internal class TunnelStateGate(
     fun beginStart(): TransitionDecision {
         while (true) {
             when (val current = state.get()) {
-                SessionState.RUNNING -> return TransitionDecision.ALREADY_COMPLETE
+                SessionState.RUNNING -> {
+                    if (state.compareAndSet(current, SessionState.STARTING)) {
+                        return TransitionDecision.REPLACE
+                    }
+                }
                 SessionState.STARTING, SessionState.STOPPING -> return TransitionDecision.BUSY
                 SessionState.STOPPED, SessionState.FAILED -> {
                     if (state.compareAndSet(current, SessionState.STARTING)) {
@@ -118,6 +125,24 @@ internal class TunnelStateGate(
     }
 }
 
+internal class PhysicalNetworkRetryGate {
+    private var failedFingerprint: String? = null
+    private var retryAfterMillis: Long = 0
+
+    fun canAttempt(fingerprint: String, nowMillis: Long): Boolean =
+        failedFingerprint != fingerprint || nowMillis >= retryAfterMillis
+
+    fun defer(fingerprint: String, nowMillis: Long) {
+        failedFingerprint = fingerprint
+        retryAfterMillis = nowMillis + PHYSICAL_NETWORK_RETRY_MILLIS
+    }
+
+    fun clear() {
+        failedFingerprint = null
+        retryAfterMillis = 0
+    }
+}
+
 private class ManagedTunnel(
     private val onStateChange: (Tunnel.State) -> Unit,
 ) : Tunnel {
@@ -135,6 +160,7 @@ private data class ActiveTunnelSession(
     var monitor: PhysicalNetworks?,
     var localRoutes: List<Ipv4Prefix>,
     var observedNetworkFingerprint: String,
+    val networkRetry: PhysicalNetworkRetryGate = PhysicalNetworkRetryGate(),
 )
 
 internal object TunnelRuntime {
@@ -188,24 +214,34 @@ internal object TunnelRuntime {
             onError(errorCode(error))
             return
         }
-        when (stateGate.beginStart()) {
-            TransitionDecision.ALREADY_COMPLETE -> {
-                args.configuration.fill(0)
-                onSuccess(SessionState.RUNNING, 0)
-                return
-            }
+        val replaceExisting = when (stateGate.beginStart()) {
+            TransitionDecision.REPLACE -> true
             TransitionDecision.BUSY -> {
                 args.configuration.fill(0)
                 onError("tunnel_operation_in_progress")
                 return
             }
-            TransitionDecision.PROCEED -> Unit
+            TransitionDecision.PROCEED -> false
+            TransitionDecision.ALREADY_COMPLETE -> error("unreachable_start_transition")
         }
 
         executor.execute {
             val startedAt = System.nanoTime()
             try {
                 serviceReady.get(5, TimeUnit.SECONDS)
+                if (replaceExisting) {
+                    clearActiveSession()
+                    suppressBackendStateChanges.set(true)
+                    try {
+                        requireState(
+                            requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
+                            Tunnel.State.DOWN,
+                        )
+                        AndroidSplitTunnel.clear()
+                    } finally {
+                        suppressBackendStateChanges.set(false)
+                    }
+                }
                 val originalConfig = TunnelPayload.consume(args.configuration) { payload ->
                     Config.parse(ByteArrayInputStream(payload))
                 }
@@ -220,7 +256,7 @@ internal object TunnelRuntime {
                     null
                 }
                 val localRoutes = monitor
-                    ?.let { runCatching(it::snapshot).getOrDefault(emptyList()) }
+                    ?.snapshot()
                     .orEmpty()
                 AndroidSplitTunnel.replaceExcludedRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(
@@ -241,13 +277,20 @@ internal object TunnelRuntime {
                     )
                     activeSession = session
                     if (monitor != null) {
-                        runCatching {
+                        try {
                             monitor.start { networks ->
                                 reapplyPhysicalNetworks(session.generation, networks)
                             }
-                        }.onFailure {
+                        } catch (_: Throwable) {
+                            activeSession = null
                             monitor.stop()
-                            session.monitor = null
+                            runCatching {
+                                requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                            }
+                            AndroidSplitTunnel.clear()
+                            throw TunnelOperationException(
+                                "physical_network_monitor_unavailable",
+                            )
                         }
                     }
                     SessionState.RUNNING
@@ -292,6 +335,7 @@ internal object TunnelRuntime {
                 return
             }
             TransitionDecision.PROCEED -> Unit
+            TransitionDecision.REPLACE -> error("unreachable_stop_transition")
         }
 
         executor.execute {
@@ -340,6 +384,10 @@ internal object TunnelRuntime {
             if (fingerprint == session.observedNetworkFingerprint) {
                 return@execute
             }
+            val nowMillis = SystemClock.elapsedRealtime()
+            if (!session.networkRetry.canAttempt(fingerprint, nowMillis)) {
+                return@execute
+            }
             session.observedNetworkFingerprint = fingerprint
             val previousRoutes = session.localRoutes
             stateGate.complete(SessionState.STARTING)
@@ -361,6 +409,7 @@ internal object TunnelRuntime {
                     Tunnel.State.UP,
                 )
                 session.localRoutes = localRoutes
+                session.networkRetry.clear()
                 stateGate.complete(SessionState.RUNNING)
             } catch (_: Throwable) {
                 val restored = runCatching {
@@ -379,6 +428,10 @@ internal object TunnelRuntime {
                     )
                 }.isSuccess
                 if (restored) {
+                    session.observedNetworkFingerprint =
+                        PhysicalNetworks.fingerprint(previousRoutes)
+                    session.networkRetry.defer(fingerprint, nowMillis)
+                    session.monitor?.scheduleRetry(PHYSICAL_NETWORK_RETRY_MILLIS)
                     stateGate.complete(SessionState.RUNNING)
                 } else {
                     activeSession = null

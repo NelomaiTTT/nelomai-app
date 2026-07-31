@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 
 const PANEL_BASE: &str = "https://nelomai.ru";
 const SPLIT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const PHYSICAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 type NativeApplication = ClientApplication<
     ClientApi,
@@ -87,7 +88,8 @@ pub fn run() {
         app.manage(application.clone());
         app.manage(split_tunnel_scheduler.clone());
         app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
-        start_split_tunnel_scheduler(application, split_tunnel_scheduler);
+        start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
+        start_physical_network_scheduler(application);
         Ok(())
     });
 
@@ -133,6 +135,17 @@ fn start_split_tunnel_scheduler(
             if application.current_access_token().is_ok() {
                 let _ = scheduler.synchronize(&application, false).await;
             }
+        }
+    });
+}
+
+fn start_physical_network_scheduler(application: Arc<NativeApplication>) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(PHYSICAL_NETWORK_POLL_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = application.poll_physical_network(current_unix_time()).await;
         }
     });
 }

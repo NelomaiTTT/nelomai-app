@@ -1,6 +1,6 @@
 [package]
 name = "nelomai-windows-service"
-version = "0.1.6"
+version = "0.1.7"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
@@ -11,6 +11,7 @@ ipnet = "2"
 nelomai-client-tunnel = { path = "../client-tunnel" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 zeroize = "1"
 

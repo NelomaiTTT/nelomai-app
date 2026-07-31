@@ -1,21 +1,27 @@
 use super::install::state_directory;
+use super::wide;
 use crate::ServiceError;
 use ipnet::Ipv4Net;
 use nelomai_client_tunnel::{DesktopTunnelOptions, Ipv4RoutePlan};
 use serde::{Deserialize, Serialize};
-use std::fs;
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIfEntry2,
-    GetIpForwardTable2, InitializeIpForwardEntry, IF_TYPE_ETHERNET_CSMACD, IF_TYPE_IEEE80211,
-    IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADDRESS_PREFIX, MIB_IF_ROW2, MIB_IPFORWARD_ROW2,
-    MIB_IPFORWARD_TABLE2,
+    GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry, IF_TYPE_ETHERNET_CSMACD,
+    IF_TYPE_IEEE80211, IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADDRESS_PREFIX, MIB_IF_ROW2,
+    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::{NET_IF_OPER_STATUS_UP, TUNNEL_TYPE_NONE};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, IN_ADDR, IN_ADDR_0, MIB_IPPROTO_NETMGMT, SOCKADDR_IN, SOCKADDR_INET,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MOVE_FILE_FLAGS,
 };
 
 const ROUTE_STATE_FILE: &str = "routes-state.json";
@@ -37,12 +43,15 @@ struct OwnedRouteState {
     format_version: u16,
     policy_hash: Option<String>,
     routes: Vec<OwnedRoute>,
+    #[serde(default)]
+    pending_routes: Vec<OwnedRoute>,
 }
 
 #[derive(Clone, Copy)]
 struct WindowsEgress {
     interface_index: u32,
     gateway: Ipv4Addr,
+    source: Option<Ipv4Addr>,
 }
 
 pub(crate) struct WindowsRouteManager {
@@ -64,51 +73,56 @@ impl WindowsRouteManager {
         if !plan.active() {
             return Ok(());
         }
+        if plan.excluded_networks.is_empty() {
+            return Ok(());
+        }
         let egress = discover_egress()?;
-        let local = if plan.exclude_local_networks {
-            local_networks(egress.interface_index)?
-        } else {
-            Vec::new()
-        };
-        let plan = plan
-            .merged_with_local_networks(local)
-            .map_err(|error| stable_error(error.stable_code()))?;
-        self.state.policy_hash = plan.policy_hash;
-        self.persist()?;
-
-        for network in plan.excluded_networks {
-            let route = OwnedRoute {
+        let routes = plan
+            .excluded_networks
+            .into_iter()
+            .map(|network| OwnedRoute {
                 destination: network.to_string(),
                 interface_index: egress.interface_index,
                 gateway: egress.gateway.to_string(),
                 metric: ROUTE_METRIC,
-            };
-            self.state.routes.push(route.clone());
-            if let Err(error) = self.persist() {
-                let _ = self.cleanup();
-                return Err(error);
-            }
-            if let Err(error) = create_route(&route) {
-                self.state.routes.pop();
+            })
+            .collect::<Vec<_>>();
+        if routes_presence(&routes)?.into_iter().any(|exists| exists) {
+            return Err(stable_error("route_conflict"));
+        }
+        self.state.policy_hash = plan.policy_hash;
+        self.state.pending_routes = routes.clone();
+        self.persist()?;
+
+        let mut applied = Vec::with_capacity(routes.len());
+        for route in &routes {
+            if let Err(error) = create_route(route) {
+                self.state.routes = applied;
+                self.state.pending_routes.clear();
                 let _ = self.persist();
                 let _ = self.cleanup();
                 return Err(error);
             }
+            applied.push(route.clone());
+        }
+        self.state.routes = applied;
+        self.state.pending_routes.clear();
+        if let Err(error) = self.persist() {
+            let _ = self.cleanup();
+            return Err(error);
         }
         Ok(())
     }
 
     pub(crate) fn cleanup(&mut self) -> Result<(), ServiceError> {
         let mut first_error = None;
-        let mut retained = Vec::new();
-        for route in std::mem::take(&mut self.state.routes) {
-            if let Err(error) = delete_route(&route) {
-                first_error.get_or_insert(error);
-                retained.push(route);
-            }
-        }
-        self.state.routes = retained;
-        if self.state.routes.is_empty() {
+        self.state.routes =
+            remove_present_routes(std::mem::take(&mut self.state.routes), &mut first_error);
+        self.state.pending_routes = remove_present_routes(
+            std::mem::take(&mut self.state.pending_routes),
+            &mut first_error,
+        );
+        if self.state.routes.is_empty() && self.state.pending_routes.is_empty() {
             self.state.policy_hash = None;
             remove_state(&self.state_path)?;
         } else {
@@ -118,11 +132,40 @@ impl WindowsRouteManager {
     }
 
     pub(crate) fn has_routes(&self) -> bool {
-        !self.state.routes.is_empty()
+        !self.state.routes.is_empty() || !self.state.pending_routes.is_empty()
+    }
+
+    pub(crate) fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        let egress = discover_egress()?;
+        let mut networks = local_networks(egress.interface_index)?;
+        routes_dedup(&mut networks);
+        let networks = networks
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let material = format!(
+            "windows\0{}\0{}\0{}\0{}",
+            egress.interface_index,
+            egress.gateway,
+            egress
+                .source
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            networks
+        );
+        let digest = Sha256::digest(material.as_bytes());
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     fn persist(&self) -> Result<(), ServiceError> {
-        if self.state.routes.len() > MAX_ROUTES {
+        if self
+            .state
+            .routes
+            .len()
+            .saturating_add(self.state.pending_routes.len())
+            > MAX_ROUTES
+        {
             return Err(stable_error("route_state_too_large"));
         }
         let bytes = serde_json::to_vec(&self.state)
@@ -131,37 +174,106 @@ impl WindowsRouteManager {
             return Err(stable_error("route_state_too_large"));
         }
         let temporary = self.state_path.with_extension("json.new");
-        fs::write(&temporary, bytes).map_err(|_| stable_error("route_state_write_failed"))?;
-        fs::rename(&temporary, &self.state_path)
-            .map_err(|_| stable_error("route_state_activate_failed"))
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(stable_error("route_state_write_failed")),
+        }
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|_| stable_error("route_state_write_failed"))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| stable_error("route_state_write_failed"))?;
+        let flags: MOVE_FILE_FLAGS = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+        let activated = unsafe {
+            MoveFileExW(
+                wide(&temporary).as_ptr(),
+                wide(&self.state_path).as_ptr(),
+                flags,
+            )
+        };
+        if activated == 0 {
+            let _ = fs::remove_file(temporary);
+            Err(stable_error("route_state_activate_failed"))
+        } else {
+            Ok(())
+        }
     }
 }
 
-fn discover_egress() -> Result<WindowsEgress, ServiceError> {
-    let destination = sockaddr(Ipv4Addr::new(1, 1, 1, 1));
-    let mut route = MIB_IPFORWARD_ROW2::default();
-    let mut source = SOCKADDR_INET::default();
-    let result = unsafe {
-        GetBestRoute2(
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            &destination,
-            0,
-            &mut route,
-            &mut source,
-        )
+fn remove_present_routes(
+    routes: Vec<OwnedRoute>,
+    first_error: &mut Option<ServiceError>,
+) -> Vec<OwnedRoute> {
+    if routes.is_empty() {
+        return Vec::new();
+    }
+    let presence = match routes_presence(&routes) {
+        Ok(presence) if presence.len() == routes.len() => presence,
+        Ok(_) => {
+            first_error.get_or_insert_with(|| stable_error("route_table_unavailable"));
+            return routes;
+        }
+        Err(error) => {
+            first_error.get_or_insert(error);
+            return routes;
+        }
     };
-    if result != NO_ERROR {
+    let mut retained = Vec::new();
+    for (route, exists) in routes.into_iter().zip(presence) {
+        if exists {
+            if let Err(error) = delete_route(&route) {
+                first_error.get_or_insert(error);
+                retained.push(route);
+            }
+        }
+    }
+    retained
+}
+
+fn discover_egress() -> Result<WindowsEgress, ServiceError> {
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIpForwardTable2(AF_INET, &mut table) } != NO_ERROR || table.is_null() {
         return Err(stable_error("physical_egress_unavailable"));
     }
+    let routes = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
+    let selected = routes
+        .iter()
+        .filter(|route| route.DestinationPrefix.PrefixLength == 0)
+        .filter_map(|route| {
+            let gateway = ipv4_from_sockaddr(&route.NextHop)?;
+            let interface_metric = physical_interface_metric(route)?;
+            if gateway.is_unspecified() {
+                return None;
+            }
+            Some((
+                route.Metric.saturating_add(interface_metric),
+                route.InterfaceIndex,
+                WindowsEgress {
+                    interface_index: route.InterfaceIndex,
+                    gateway,
+                    source: source_for_interface(route.InterfaceIndex),
+                },
+            ))
+        })
+        .min_by_key(|(metric, interface_index, _)| (*metric, *interface_index))
+        .map(|(_, _, egress)| egress);
+    unsafe { FreeMibTable(table.cast()) };
+    selected.ok_or_else(|| stable_error("physical_egress_unavailable"))
+}
 
+fn physical_interface_metric(route: &MIB_IPFORWARD_ROW2) -> Option<u32> {
     let mut interface = MIB_IF_ROW2 {
         InterfaceLuid: route.InterfaceLuid,
         InterfaceIndex: route.InterfaceIndex,
         ..MIB_IF_ROW2::default()
     };
-    if unsafe { GetIfEntry2(&mut interface) } != NO_ERROR
+    if (unsafe { GetIfEntry2(&mut interface) }) != NO_ERROR
         || interface.OperStatus != NET_IF_OPER_STATUS_UP
         || interface.TunnelType != TUNNEL_TYPE_NONE
         || !matches!(
@@ -169,13 +281,38 @@ fn discover_egress() -> Result<WindowsEgress, ServiceError> {
             IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211 | IF_TYPE_WWANPP | IF_TYPE_WWANPP2
         )
     {
-        return Err(stable_error("physical_egress_unavailable"));
+        return None;
     }
-    Ok(WindowsEgress {
-        interface_index: route.InterfaceIndex,
-        gateway: ipv4_from_sockaddr(&route.NextHop)
-            .ok_or_else(|| stable_error("physical_egress_unavailable"))?,
-    })
+    let mut ip_interface = MIB_IPINTERFACE_ROW {
+        Family: AF_INET,
+        InterfaceLuid: route.InterfaceLuid,
+        InterfaceIndex: route.InterfaceIndex,
+        ..MIB_IPINTERFACE_ROW::default()
+    };
+    if unsafe { GetIpInterfaceEntry(&mut ip_interface) } != NO_ERROR {
+        return None;
+    }
+    Some(ip_interface.Metric)
+}
+
+fn source_for_interface(interface_index: u32) -> Option<Ipv4Addr> {
+    let destination = sockaddr(Ipv4Addr::new(1, 1, 1, 1));
+    let mut route = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    let result = unsafe {
+        GetBestRoute2(
+            std::ptr::null(),
+            interface_index,
+            std::ptr::null(),
+            &destination,
+            0,
+            &mut route,
+            &mut source,
+        )
+    };
+    (result == NO_ERROR)
+        .then(|| ipv4_from_sockaddr(&source))
+        .flatten()
 }
 
 fn local_networks(interface_index: u32) -> Result<Vec<Ipv4Net>, ServiceError> {
@@ -216,6 +353,40 @@ fn create_route(route: &OwnedRoute) -> Result<(), ServiceError> {
     } else {
         Err(stable_error("route_add_failed"))
     }
+}
+
+fn routes_presence(routes: &[OwnedRoute]) -> Result<Vec<bool>, ServiceError> {
+    let expected = routes
+        .iter()
+        .map(route_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIpForwardTable2(AF_INET, &mut table) } != NO_ERROR || table.is_null() {
+        return Err(stable_error("route_table_unavailable"));
+    }
+    let routes = unsafe {
+        std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize)
+    };
+    let presence = expected
+        .iter()
+        .map(|expected| {
+            routes
+                .iter()
+                .any(|candidate| route_rows_match(candidate, expected))
+        })
+        .collect();
+    unsafe { FreeMibTable(table.cast()) };
+    Ok(presence)
+}
+
+fn route_rows_match(candidate: &MIB_IPFORWARD_ROW2, expected: &MIB_IPFORWARD_ROW2) -> bool {
+    candidate.InterfaceIndex == expected.InterfaceIndex
+        && candidate.DestinationPrefix.PrefixLength == expected.DestinationPrefix.PrefixLength
+        && ipv4_from_sockaddr(&candidate.DestinationPrefix.Prefix)
+            == ipv4_from_sockaddr(&expected.DestinationPrefix.Prefix)
+        && ipv4_from_sockaddr(&candidate.NextHop) == ipv4_from_sockaddr(&expected.NextHop)
+        && candidate.Metric == expected.Metric
+        && candidate.Protocol == expected.Protocol
 }
 
 fn delete_route(route: &OwnedRoute) -> Result<(), ServiceError> {
@@ -298,7 +469,13 @@ fn load_state(path: &Path) -> Result<OwnedRouteState, ServiceError> {
     let bytes = fs::read(path).map_err(|_| stable_error("route_state_read_failed"))?;
     let state: OwnedRouteState =
         serde_json::from_slice(&bytes).map_err(|_| stable_error("route_state_invalid"))?;
-    if state.format_version != ROUTE_STATE_FORMAT || state.routes.len() > MAX_ROUTES {
+    if state.format_version != ROUTE_STATE_FORMAT
+        || state
+            .routes
+            .len()
+            .saturating_add(state.pending_routes.len())
+            > MAX_ROUTES
+    {
         return Err(stable_error("route_state_invalid"));
     }
     Ok(state)
@@ -340,5 +517,23 @@ mod tests {
             Some(Ipv4Addr::new(192, 168, 1, 1))
         );
         assert_eq!(row.Metric, ROUTE_METRIC);
+    }
+
+    #[test]
+    fn route_identity_rejects_metric_and_protocol_drift() {
+        let route = OwnedRoute {
+            destination: "203.0.113.0/24".to_string(),
+            interface_index: 12,
+            gateway: "192.168.1.1".to_string(),
+            metric: ROUTE_METRIC,
+        };
+        let expected = route_row(&route).unwrap();
+        let mut different_metric = expected;
+        different_metric.Metric += 1;
+        assert!(!route_rows_match(&different_metric, &expected));
+
+        let mut different_protocol = expected;
+        different_protocol.Protocol = windows_sys::Win32::Networking::WinSock::MIB_IPPROTO_OTHER;
+        assert!(!route_rows_match(&different_protocol, &expected));
     }
 }

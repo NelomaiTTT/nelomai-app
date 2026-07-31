@@ -3,10 +3,10 @@ use nelomai_client_tunnel::{
     TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest, TunnelStatus,
 };
 use nelomai_unix_service::{
-    authorize_peer, decode_request, encode_request, parse_configuration, ClientIdentity,
-    ClientPolicy, Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend,
-    ServiceTunnelState, TunnelRequestHandler, UnixTunnelController, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION,
+    authorize_peer, decode_request, decode_response, encode_request, parse_configuration,
+    ClientIdentity, ClientPolicy, Request, Response, ServiceError, ServiceTransport,
+    ServiceTunnelBackend, ServiceTunnelState, TunnelRequestHandler, UnixTunnelController,
+    MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::sync::Mutex;
 
@@ -91,13 +91,25 @@ fn protocol_rejects_unknown_commands_and_oversized_frames() {
 #[test]
 fn old_start_request_decodes_for_an_explicit_protocol_rejection() {
     let payload =
-        br#"{"command":"start","protocolVersion":1,"configuration":"PrivateKey = redacted"}"#;
+        br#"{"command":"start","protocolVersion":2,"configuration":"PrivateKey = redacted"}"#;
     let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(payload);
 
     let request = decode_request(&frame).expect("decode previous protocol request");
 
-    assert_eq!(request.protocol_version(), 1);
+    assert_eq!(request.protocol_version(), 2);
+}
+
+#[test]
+fn previous_helper_response_decodes_without_a_fingerprint_field() {
+    let payload = br#"{"protocolVersion":2,"ok":true,"state":"running","serviceVersion":"0.1.6","errorCode":null}"#;
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(payload);
+
+    let response = decode_response(&frame).expect("decode previous helper response");
+
+    assert_eq!(response.protocol_version, 2);
+    assert_eq!(response.physical_network_fingerprint, None);
 }
 
 #[test]
@@ -139,6 +151,10 @@ impl ServiceTunnelBackend for RecordingBackend {
     fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
         Ok(self.state)
     }
+
+    fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        Ok("ab".repeat(32))
+    }
 }
 
 #[test]
@@ -153,6 +169,7 @@ fn handler_validates_protocol_and_configuration_before_mutation() {
     let started = handler.handle(Request::start(valid_configuration()));
     let stopped = handler.handle(Request::stop());
     let version = handler.handle(Request::version());
+    let fingerprint = handler.handle(Request::physical_network_fingerprint());
 
     assert_eq!(
         bad_protocol.error_code.as_deref(),
@@ -165,6 +182,10 @@ fn handler_validates_protocol_and_configuration_before_mutation() {
     assert_eq!(started.state, Some(ServiceTunnelState::Running));
     assert_eq!(stopped.state, Some(ServiceTunnelState::Stopped));
     assert_eq!(version.service_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        fingerprint.physical_network_fingerprint.as_deref(),
+        Some("abababababababababababababababababababababababababababababababab")
+    );
     assert_eq!(handler.backend().starts, 1);
     assert_eq!(handler.backend().stops, 1);
 }
@@ -182,6 +203,7 @@ impl ServiceTransport for RecordingTransport {
             Request::Stop { .. } => "stop",
             Request::Status { .. } => "status",
             Request::Version { .. } => "version",
+            Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
         };
         self.requests.lock().unwrap().push(command);
         Ok(self.response.clone())
@@ -227,6 +249,26 @@ async fn controller_reads_the_installed_helper_version() {
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
         ["version"]
+    );
+}
+
+#[tokio::test]
+async fn controller_reads_only_the_opaque_physical_network_fingerprint() {
+    let mut response = Response::success(None);
+    response.physical_network_fingerprint = Some("cd".repeat(32));
+    let controller = UnixTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    let fingerprint = controller
+        .physical_network_fingerprint()
+        .await
+        .expect("read fingerprint");
+    assert_eq!(fingerprint, Some("cd".repeat(32)));
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["fingerprint"]
     );
 }
 

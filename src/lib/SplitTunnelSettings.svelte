@@ -2,6 +2,7 @@
   import {
     buildApplicationRows,
     settingsUpdate,
+    splitTunnelWarningMessage,
     type InstalledApplication,
     type SplitTunnelMode,
     type SplitTunnelSettingsUpdate,
@@ -51,6 +52,20 @@
     settings.capabilities.platform === "android" &&
       (settings.capabilities.androidApiLevel ?? 0) <= 32,
   );
+  let applicationSettingsVisible = $derived(
+    settings.capabilities.platform === "android" ||
+      settings.capabilities.applicationSplitTunnel,
+  );
+  let desktopLocalNetworksForced = $derived(
+    settings.capabilities.addressSplitTunnel &&
+      ["windows", "linux", "macos"].includes(
+        settings.capabilities.platform,
+      ),
+  );
+  let localNetworksEditable = $derived(
+    settings.capabilities.platform === "android" &&
+      (settings.capabilities.androidApiLevel ?? 0) >= 33,
+  );
 
   $effect(() => {
     mode = settings.mode;
@@ -75,19 +90,6 @@
     if (checked) next.add(packageId);
     else next.delete(packageId);
     selected = next;
-  }
-
-  function warningMessage(code: string): string {
-    switch (code) {
-      case "split_tunnel_apply_failed":
-        return "Новые настройки не применились. Продолжаем использовать предыдущие.";
-      case "split_tunnel_rollback_failed":
-        return "Подключение не удалось восстановить. Запустите его снова.";
-      case "split_tunnel_state_save_failed":
-        return "Подключение работает, но его служебное состояние не удалось сохранить.";
-      default:
-        return "Используем сохранённые настройки. Панель временно недоступна.";
-    }
   }
 
   async function save() {
@@ -157,86 +159,104 @@
     {/if}
     {#if settings.warning}
       <p class="warning">
-        {warningMessage(settings.warning)}
+        {splitTunnelWarningMessage(settings.warning)}
       </p>
     {/if}
 
-    <fieldset disabled={localBusy || busy}>
-      <legend>Режим приложений</legend>
-      <div class="segmented">
-        <label>
-          <input
-            type="radio"
-            value="exclude_selected"
-            bind:group={mode}
-          />
-          <span>Исключить выбранные</span>
-        </label>
-        <label>
-          <input
-            type="radio"
-            value="include_selected"
-            bind:group={mode}
-          />
-          <span>Только выбранные через VPN</span>
-        </label>
-      </div>
-    </fieldset>
+    {#if applicationSettingsVisible}
+      <fieldset disabled={localBusy || busy}>
+        <legend>Режим приложений</legend>
+        <div class="segmented">
+          <label>
+            <input
+              type="radio"
+              value="exclude_selected"
+              bind:group={mode}
+            />
+            <span>Исключить выбранные</span>
+          </label>
+          <label>
+            <input
+              type="radio"
+              value="include_selected"
+              bind:group={mode}
+            />
+            <span>Только выбранные через VPN</span>
+          </label>
+        </div>
+      </fieldset>
+    {/if}
 
     <label class="toggle-row">
       <span>
         <strong>Исключить локальные адреса</strong>
-        <small>Принтеры, роутеры и устройства в текущей сети</small>
+        <small>
+          {desktopLocalNetworksForced
+            ? "На компьютере локальная сеть всегда доступна напрямую"
+            : "Принтеры, роутеры и устройства в текущей сети"}
+        </small>
       </span>
       <input
         type="checkbox"
-        bind:checked={excludeLocalNetworks}
-        disabled={localBusy || busy}
+        checked={desktopLocalNetworksForced || excludeLocalNetworks}
+        onchange={(event) =>
+          (excludeLocalNetworks = (
+            event.currentTarget as HTMLInputElement
+          ).checked)}
+        disabled={localBusy || busy || !localNetworksEditable}
       />
     </label>
 
-    <div class="application-tools">
-      <label class="search-field">
-        <span>Поиск приложений</span>
-        <input
-          type="search"
-          bind:value={search}
-          placeholder="Название или package ID"
-        />
-      </label>
-      <label class="system-toggle">
-        <input type="checkbox" bind:checked={showSystem} />
-        <span>Показать системные</span>
-      </label>
-    </div>
-
-    <div class="application-list">
-      {#each rows as application (application.packageId)}
-        <label class:locked={application.locked} class="application-row">
+    {#if applicationSettingsVisible}
+      <div class="application-tools">
+        <label class="search-field">
+          <span>Поиск приложений</span>
           <input
-            type="checkbox"
-            checked={application.selected}
-            disabled={application.locked || localBusy || busy}
-            onchange={(event) =>
-              togglePackage(
-                application.packageId,
-                (event.currentTarget as HTMLInputElement).checked,
-              )}
+            type="search"
+            bind:value={search}
+            placeholder="Название или package ID"
           />
-          <span>
-            <strong>{application.displayName}</strong>
-            <small>{application.packageId}</small>
-          </span>
-          {#if application.mandatory}
-            <em>Обязательно</em>
-          {:else if application.suggested}
-            <em>Предлагаем</em>
-          {/if}
         </label>
-      {:else}
-        <p class="empty">Подходящих приложений не найдено</p>
-      {/each}
-    </div>
+        <label class="system-toggle">
+          <input type="checkbox" bind:checked={showSystem} />
+          <span>Показать системные</span>
+        </label>
+      </div>
+
+      <div class="application-list">
+        {#each rows as application (application.packageId)}
+          <label class:locked={application.locked} class="application-row">
+            <input
+              type="checkbox"
+              checked={application.selected}
+              disabled={application.locked || localBusy || busy}
+              onchange={(event) =>
+                togglePackage(
+                  application.packageId,
+                  (event.currentTarget as HTMLInputElement).checked,
+                )}
+            />
+            <span>
+              <strong>{application.displayName}</strong>
+              <small>{application.packageId}</small>
+            </span>
+            {#if application.mandatory}
+              <em>
+                {mode === "include_selected"
+                  ? "Всегда вне VPN"
+                  : "Обязательно"}
+              </em>
+            {:else if !application.available}
+              <em>Не установлено</em>
+            {:else if application.suggested}
+              <em>Предлагаем</em>
+            {/if}
+          </label>
+        {:else}
+          <p class="empty">Подходящих приложений не найдено</p>
+        {/each}
+      </div>
+    {/if}
 
     {#if localError}
       <p class="error" aria-live="polite">{localError}</p>

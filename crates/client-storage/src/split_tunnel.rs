@@ -18,9 +18,12 @@ pub struct StoredSplitTunnelState {
     pub cached_policy: Option<SplitTunnelPolicy>,
     pub working_policy_hash: Option<String>,
     pub previous_working_policy: Option<SplitTunnelPolicy>,
+    pub applied_physical_network_fingerprint: Option<String>,
     pub last_full_sync_unix: Option<i64>,
     pub last_revision_check_unix: Option<i64>,
     pub last_seen_force_revision: i64,
+    pub failed_policy_hash: Option<String>,
+    pub failed_policy_retry_after_unix: Option<i64>,
     pub pending_apply_results: Vec<SplitTunnelApplyResult>,
 }
 
@@ -40,9 +43,21 @@ impl fmt::Debug for StoredSplitTunnelState {
                     .as_ref()
                     .map(|policy| policy.revision),
             )
+            .field(
+                "applied_physical_network_fingerprint_present",
+                &self.applied_physical_network_fingerprint.is_some(),
+            )
             .field("last_full_sync_unix", &self.last_full_sync_unix)
             .field("last_revision_check_unix", &self.last_revision_check_unix)
             .field("last_seen_force_revision", &self.last_seen_force_revision)
+            .field(
+                "failed_policy_hash_present",
+                &self.failed_policy_hash.is_some(),
+            )
+            .field(
+                "failed_policy_retry_after_unix",
+                &self.failed_policy_retry_after_unix,
+            )
             .field(
                 "pending_apply_results_count",
                 &self.pending_apply_results.len(),

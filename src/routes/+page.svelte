@@ -24,6 +24,7 @@
   } from "$lib/native-client";
   import {
     emptyIncludeSelection,
+    splitTunnelWarningMessage,
     type InstalledApplication,
     type SplitTunnelSettingsUpdate,
     type SplitTunnelState,
@@ -48,11 +49,14 @@
   let updateStatus = $state<UpdateStatus | null>(null);
   let updateBusy = $state(false);
   let updateTimer: number | null = null;
+  let stateTimer: number | null = null;
+  let runtimeStateBusy = false;
   let splitTunnelState = $state<SplitTunnelState | null>(null);
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
   let splitTunnelOpen = $state(false);
   let splitTunnelBusy = $state(false);
   let splitTunnelLoaded = $state(false);
+  let runtimeWarning = $state<string | null>(null);
   let splitTunnelBlocksStart = $derived(
     splitTunnelState !== null &&
       emptyIncludeSelection(splitTunnelState, splitTunnelApplications),
@@ -79,19 +83,59 @@
 
   onMount(() => {
     void restore();
+    stateTimer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void synchronizeRuntimeState();
+    }, 5_000);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
     }, 300_000);
     const handleVisibility = () => {
-      if (document.visibilityState === "visible") void refreshProbes();
+      if (document.visibilityState === "visible") {
+        void synchronizeRuntimeState();
+        void refreshProbes();
+      }
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
       window.clearInterval(timer);
+      if (stateTimer !== null) window.clearInterval(stateTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
       clearUpdateTimer();
     };
   });
+
+  async function synchronizeRuntimeState() {
+    if (
+      busy ||
+      runtimeStateBusy ||
+      !bootstrap?.binding ||
+      !["ready", "connecting", "connected", "stopping"].includes(phase)
+    ) {
+      return;
+    }
+    runtimeStateBusy = true;
+    try {
+      const previous = phase;
+      const current = await nativeClient.state().catch(() => null);
+      if (!current) return;
+      runtimeWarning = current.warning;
+      if (current.phase === phase) return;
+      phase = current.phase;
+      connection = current.connection;
+      view = viewForPhase(current.phase);
+      if (
+        (previous === "connected" || previous === "connecting") &&
+        current.phase !== "connected" &&
+        current.phase !== "connecting" &&
+        current.phase !== "stopping"
+      ) {
+        error = "Подключение остановилось. Запустите его снова.";
+        await loadSplitTunnel(false);
+      }
+    } finally {
+      runtimeStateBusy = false;
+    }
+  }
 
   async function restore() {
     busy = true;
@@ -149,6 +193,7 @@
     const state = await nativeClient.state();
     phase = state.phase;
     connection = state.connection;
+    runtimeWarning = state.warning;
     view = viewForPhase(state.phase);
     await loadSplitTunnel(false);
     if (state.phase === "ready") void refreshProbes();
@@ -222,10 +267,11 @@
       splitTunnelOpen = true;
       return;
     }
+    const stopping = phase === "connected" || phase === "stopping";
     busy = true;
     error = null;
     try {
-      if (phase === "connected") {
+      if (stopping) {
         connection = await nativeClient.stop();
         phase = "ready";
       } else {
@@ -241,8 +287,12 @@
         phase = "connected";
       }
       view = "connection";
+      runtimeWarning = (await nativeClient.state()).warning;
     } catch (reason) {
-      phase = "error";
+      const current = await nativeClient.state().catch(() => null);
+      phase = current?.phase ?? (stopping ? "stopping" : "error");
+      connection = current?.connection ?? connection;
+      runtimeWarning = current?.warning ?? runtimeWarning;
       error = commandMessage(reason);
     } finally {
       busy = false;
@@ -378,6 +428,7 @@
       splitTunnelApplications = [];
       splitTunnelOpen = false;
       splitTunnelLoaded = false;
+      runtimeWarning = null;
       clearUpdateTimer();
       phase = "signed_out";
       view = "sign_in";
@@ -474,6 +525,7 @@
       splitTunnelState = force
         ? await nativeClient.refreshSplitTunnel()
         : await nativeClient.splitTunnelState();
+      runtimeWarning = splitTunnelState.warning;
     } catch {
       if (force) throw new Error("split_tunnel_refresh_failed");
     } finally {
@@ -723,22 +775,59 @@
         <section class="panel connection-panel">
           <div>
             <p class="eyebrow">Подключение</p>
-            <h1>{phase === "connected" ? "Интернет защищён" : "Готово к запуску"}</h1>
+            <h1>
+              {phase === "connected"
+                ? "Интернет защищён"
+                : phase === "connecting"
+                  ? "Восстанавливаем подключение"
+                : phase === "stopping"
+                  ? "Завершаем подключение"
+                  : "Готово к запуску"}
+            </h1>
           </div>
 
           <button
-            class:stop={phase === "connected"}
+            class:stop={phase === "connected" || phase === "stopping"}
             class="connect-button"
             type="button"
             onclick={toggleConnection}
-            disabled={busy || (!splitTunnelLoaded && phase !== "connected") || splitTunnelBlocksStart}
+            disabled={busy ||
+              phase === "connecting" ||
+              (!splitTunnelLoaded &&
+                phase !== "connected" &&
+                phase !== "stopping") ||
+              (splitTunnelBlocksStart &&
+                phase !== "connected" &&
+                phase !== "stopping")}
           >
-            <span>{phase === "connected" ? "Стоп" : "Старт"}</span>
-            <small>{busy ? phaseLabels[phase] : "Нажмите для переключения"}</small>
+            <span>
+              {phase === "connected"
+                ? "Стоп"
+                : phase === "connecting"
+                  ? "Подключаемся"
+                : phase === "stopping"
+                  ? "Повторить"
+                  : "Старт"}
+            </span>
+            <small>
+              {busy
+                ? phaseLabels[phase]
+                : phase === "stopping"
+                  ? "Завершить отключение"
+                  : "Нажмите для переключения"}
+            </small>
           </button>
 
           {#if error}<p class="error-message">{error}</p>{/if}
-          {#if splitTunnelBlocksStart && phase !== "connected"}
+          {#if runtimeWarning}
+            <p class="warning-message">
+              {splitTunnelWarningMessage(runtimeWarning)}
+            </p>
+          {/if}
+          {#if splitTunnelBlocksStart &&
+            phase !== "connecting" &&
+            phase !== "connected" &&
+            phase !== "stopping"}
             <p class="error-message">
               Выберите хотя бы одно приложение для подключения через VPN
             </p>
@@ -751,7 +840,12 @@
             <h2>Параметры подключения</h2>
           </div>
 
-          <fieldset disabled={busy || phase === "connected"}>
+          <fieldset
+            disabled={busy ||
+              phase === "connecting" ||
+              phase === "connected" ||
+              phase === "stopping"}
+          >
             <legend>Система</legend>
             <div class="segmented">
               <label>
@@ -781,7 +875,10 @@
               <select
                 bind:value={ticConnectionMode}
                 onchange={refreshProbes}
-                disabled={busy || phase === "connected"}
+                disabled={busy ||
+                  phase === "connecting" ||
+                  phase === "connected" ||
+                  phase === "stopping"}
               >
                 <option value="personal">Постоянный пир</option>
                 <option value="dynamic">Динамический</option>
@@ -789,7 +886,13 @@
             </label>
             <label class="select-field">
               <span>Маршрут</span>
-              <select bind:value={routeMode} disabled={busy || phase === "connected"}>
+              <select
+                bind:value={routeMode}
+                disabled={busy ||
+                  phase === "connecting" ||
+                  phase === "connected" ||
+                  phase === "stopping"}
+              >
                 <option value="via_tak">Через Tak</option>
                 <option value="standalone">Напрямую</option>
               </select>
@@ -1196,6 +1299,17 @@
     margin: 0;
     color: #ff9999;
     font-size: 13px;
+  }
+
+  .warning-message {
+    margin: 0;
+    padding: 10px 12px;
+    color: #ffe5ae;
+    border: 1px solid #6f562b;
+    border-radius: 6px;
+    background: #2a2112;
+    font-size: 13px;
+    line-height: 1.45;
   }
 
   .center-state {

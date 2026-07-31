@@ -26,6 +26,7 @@ export interface InstalledApplication {
 }
 
 export interface SplitTunnelApplicationRow extends InstalledApplication {
+  available: boolean;
   mandatory: boolean;
   suggested: boolean;
   selected: boolean;
@@ -49,6 +50,29 @@ export interface SplitTunnelSaveResult {
   state: SplitTunnelState;
 }
 
+export function splitTunnelWarningMessage(code: string): string {
+  switch (code) {
+    case "split_tunnel_apply_failed":
+      return "Новые настройки не применились. Продолжаем использовать предыдущие.";
+    case "split_tunnel_stop_failed":
+      return "Не удалось остановить подключение для применения новых настроек. Повторим позже.";
+    case "split_tunnel_rollback_failed":
+      return "Подключение не удалось восстановить. Завершите отключение и подключитесь снова.";
+    case "split_tunnel_state_save_failed":
+      return "Подключение работает, но его служебное состояние не удалось сохранить.";
+    case "split_tunnel_network_reconnect_failed":
+      return "Не удалось обновить подключение после смены сети. Повторите отключение и подключитесь снова.";
+    case "split_tunnel_saved_connection_unavailable":
+      return "Не удалось применить новые настройки к текущему подключению. Отключитесь и подключитесь снова.";
+    case "tunnel_runtime_stopped":
+      return "Подключение остановилось на устройстве. Завершите отключение и подключитесь снова.";
+    case "tunnel_status_unavailable":
+      return "Не удалось подтвердить работу подключения. Завершите отключение и проверьте системную службу.";
+    default:
+      return "Используем сохранённые настройки. Панель временно недоступна.";
+  }
+}
+
 export function buildApplicationRows(
   state: SplitTunnelState,
   applications: InstalledApplication[],
@@ -61,14 +85,32 @@ export function buildApplicationRows(
     .map(normalizeSearch)
     .filter(Boolean);
   const query = normalizeSearch(search);
+  const installedPackageIds = new Set(
+    applications.map((application) => application.packageId),
+  );
+  const unavailableSelected = state.selectedPackages
+    .filter(
+      (packageId) =>
+        !mandatory.has(packageId) && !installedPackageIds.has(packageId),
+    )
+    .map(
+      (packageId): InstalledApplication => ({
+        packageId,
+        displayName: packageId,
+        system: false,
+      }),
+    );
 
-  return applications
+  return [...applications, ...unavailableSelected]
     .map((application): SplitTunnelApplicationRow => {
       const isMandatory = mandatory.has(application.packageId);
-      const isSelected = isMandatory || selected.has(application.packageId);
+      const isSelected = isMandatory
+        ? state.mode === "exclude_selected"
+        : selected.has(application.packageId);
       const normalizedName = normalizeSearch(application.displayName);
       return {
         ...application,
+        available: installedPackageIds.has(application.packageId),
         mandatory: isMandatory,
         suggested:
           !isMandatory &&
@@ -133,18 +175,17 @@ export function settingsUpdate(
 ): SplitTunnelSettingsUpdate {
   const selected = new Set(selectedPackageIds);
   const mandatory = new Set(mandatoryPackageIds);
+  const applicationsById = new Map(
+    applications.map((application) => [application.packageId, application]),
+  );
   return {
     mode,
     excludeLocalNetworks,
-    selectedPackages: applications
-      .filter(
-        (application) =>
-          selected.has(application.packageId) &&
-          !mandatory.has(application.packageId),
-      )
-      .map((application) => ({
-        packageId: application.packageId,
-        displayName: application.displayName,
+    selectedPackages: [...selected]
+      .filter((packageId) => !mandatory.has(packageId))
+      .map((packageId) => ({
+        packageId,
+        displayName: applicationsById.get(packageId)?.displayName ?? packageId,
       })),
   };
 }

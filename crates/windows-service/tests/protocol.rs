@@ -14,7 +14,7 @@ fn start_request_is_framed_and_redacted() {
     assert_eq!(decoded, request);
     assert_eq!(
         format!("{request:?}"),
-        "Start { protocol_version: 2, configuration: \"<redacted>\", options: DesktopTunnelOptions { excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false } }"
+        "Start { protocol_version: 3, configuration: \"<redacted>\", options: DesktopTunnelOptions { excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false } }"
     );
     assert!(!format!("{request:?}").contains("never-log-this"));
 }
@@ -22,13 +22,25 @@ fn start_request_is_framed_and_redacted() {
 #[test]
 fn old_start_request_decodes_for_an_explicit_protocol_rejection() {
     let payload =
-        br#"{"command":"start","protocolVersion":1,"configuration":"PrivateKey = redacted"}"#;
+        br#"{"command":"start","protocolVersion":2,"configuration":"PrivateKey = redacted"}"#;
     let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(payload);
 
     let request = decode_request(&frame).expect("decode previous protocol request");
 
-    assert_eq!(request.protocol_version(), 1);
+    assert_eq!(request.protocol_version(), 2);
+}
+
+#[test]
+fn previous_helper_response_decodes_without_a_fingerprint_field() {
+    let payload = br#"{"protocolVersion":2,"ok":true,"state":"running","serviceVersion":"0.1.6","errorCode":null}"#;
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(payload);
+
+    let response = decode_response(&frame).expect("decode previous helper response");
+
+    assert_eq!(response.protocol_version, 2);
+    assert_eq!(response.physical_network_fingerprint, None);
 }
 
 #[test]
@@ -61,7 +73,7 @@ fn response_uses_the_same_bounded_frame_contract() {
 }
 
 #[test]
-fn protocol_is_limited_to_four_commands() {
+fn protocol_rejects_every_command_outside_the_typed_allowlist() {
     let unsupported = format!(r#"{{"protocolVersion":{PROTOCOL_VERSION},"command":"run_shell"}}"#);
     let mut frame = (unsupported.len() as u32).to_le_bytes().to_vec();
     frame.extend_from_slice(unsupported.as_bytes());

@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use nelomai_client_api::TokenResponse;
 use nelomai_client_core::{
     split_tunnel_active, ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError,
-    CoreLogEvent, CoreLogger, EffectiveSplitTunnelPolicy, Phase, SplitTunnelContext,
-    SplitTunnelPolicyError, SplitTunnelSyncOutcome,
+    CoreLogEvent, CoreLogger, EffectiveSplitTunnelPolicy, Phase, PhysicalNetworkPollOutcome,
+    SplitTunnelContext, SplitTunnelPolicyError, SplitTunnelSyncOutcome,
 };
 use nelomai_client_storage::{
     MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StorageError, StoredAuth,
@@ -19,9 +19,12 @@ use nelomai_contracts::{
     SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
     SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 #[test]
@@ -49,7 +52,7 @@ fn activation_rule_covers_platform_android_api_layer_and_route() {
             Some(35),
             Layer::Tic,
             RouteMode::Standalone,
-            false,
+            true,
         ),
         (
             true,
@@ -73,7 +76,7 @@ fn activation_rule_covers_platform_android_api_layer_and_route() {
             None,
             Layer::Tic,
             RouteMode::Standalone,
-            false,
+            true,
         ),
         (
             true,
@@ -130,7 +133,7 @@ fn android_24_through_32_keep_every_mode_as_an_ordinary_full_tunnel() {
 }
 
 #[test]
-fn android_33_uses_split_for_via_tak_and_stray_but_not_standalone_tic() {
+fn android_33_uses_split_for_every_connection_mode() {
     let policy = policy(SplitTunnelMode::ExcludeSelected);
     let installed = installed();
     let capabilities = capabilities(TunnelPlatform::Android, Some(33), true, true);
@@ -169,7 +172,42 @@ fn android_33_uses_split_for_via_tak_and_stray_but_not_standalone_tic() {
         RouteMode::Standalone,
     )
     .unwrap();
-    assert_eq!(standalone.options, TunnelOptions::default());
+    assert_eq!(
+        standalone.options.application_mode,
+        Some(SplitTunnelMode::ExcludeSelected)
+    );
+}
+
+#[test]
+fn desktop_local_networks_always_stay_outside_the_tunnel() {
+    let mut policy = policy(SplitTunnelMode::ExcludeSelected);
+    policy.exclude_local_networks = false;
+
+    for platform in [
+        TunnelPlatform::Windows,
+        TunnelPlatform::Linux,
+        TunnelPlatform::Macos,
+    ] {
+        let effective = EffectiveSplitTunnelPolicy::build(
+            &policy,
+            &[],
+            capabilities(platform, None, true, false),
+            Layer::Tic,
+            RouteMode::ViaTak,
+        )
+        .unwrap();
+        assert!(effective.options.exclude_local_networks);
+    }
+
+    let android = EffectiveSplitTunnelPolicy::build(
+        &policy,
+        &installed(),
+        capabilities(TunnelPlatform::Android, Some(35), true, true),
+        Layer::Tic,
+        RouteMode::ViaTak,
+    )
+    .unwrap();
+    assert!(!android.options.exclude_local_networks);
 }
 
 #[test]
@@ -263,6 +301,58 @@ fn policy_collection_limits_are_rejected_before_application() {
 }
 
 #[test]
+fn malformed_package_ids_and_cidrs_are_rejected_before_use() {
+    let cases = [
+        (
+            {
+                let mut value = policy(SplitTunnelMode::ExcludeSelected);
+                value.selected_packages = vec!["invalid".to_string()];
+                value
+            },
+            "split_tunnel_invalid_package_id",
+        ),
+        (
+            {
+                let mut value = policy(SplitTunnelMode::ExcludeSelected);
+                value.selected_packages =
+                    vec!["com.example.app".to_string(), "com.example.app".to_string()];
+                value
+            },
+            "split_tunnel_duplicate_package_id",
+        ),
+        (
+            {
+                let mut value = policy(SplitTunnelMode::ExcludeSelected);
+                value.excluded_ipv4_cidrs = vec!["203.0.113.7/24".to_string()];
+                value
+            },
+            "split_tunnel_noncanonical_ipv4_cidr",
+        ),
+        (
+            {
+                let mut value = policy(SplitTunnelMode::ExcludeSelected);
+                value.excluded_ipv4_cidrs =
+                    vec!["203.0.113.0/24".to_string(), "203.0.113.0/24".to_string()];
+                value
+            },
+            "split_tunnel_duplicate_ipv4_cidr",
+        ),
+    ];
+
+    for (policy, code) in cases {
+        let error = EffectiveSplitTunnelPolicy::build(
+            &policy,
+            &installed(),
+            capabilities(TunnelPlatform::Android, Some(35), true, true),
+            Layer::Tic,
+            RouteMode::ViaTak,
+        )
+        .unwrap_err();
+        assert_eq!(error.stable_code(), code);
+    }
+}
+
+#[test]
 fn include_only_empty_selection_blocks_only_when_application_split_is_active() {
     let policy = policy(SplitTunnelMode::IncludeSelected);
     let active = EffectiveSplitTunnelPolicy::build(
@@ -275,20 +365,25 @@ fn include_only_empty_selection_blocks_only_when_application_split_is_active() {
     .unwrap_err();
     assert_eq!(active, SplitTunnelPolicyError::EmptyIncludeSelection);
 
-    for (api, layer, route_mode) in [
-        (Some(32), Layer::Tic, RouteMode::ViaTak),
-        (Some(35), Layer::Tic, RouteMode::Standalone),
-    ] {
-        let inactive = EffectiveSplitTunnelPolicy::build(
-            &policy,
-            &[],
-            capabilities(TunnelPlatform::Android, api, true, true),
-            layer,
-            route_mode,
-        )
-        .unwrap();
-        assert_eq!(inactive.options, TunnelOptions::default());
-    }
+    let inactive = EffectiveSplitTunnelPolicy::build(
+        &policy,
+        &[],
+        capabilities(TunnelPlatform::Android, Some(32), true, true),
+        Layer::Tic,
+        RouteMode::ViaTak,
+    )
+    .unwrap();
+    assert_eq!(inactive.options, TunnelOptions::default());
+
+    let standalone = EffectiveSplitTunnelPolicy::build(
+        &policy,
+        &[],
+        capabilities(TunnelPlatform::Android, Some(35), true, true),
+        Layer::Tic,
+        RouteMode::Standalone,
+    )
+    .unwrap_err();
+    assert_eq!(standalone, SplitTunnelPolicyError::EmptyIncludeSelection);
 }
 
 #[test]
@@ -430,11 +525,40 @@ async fn force_revision_fetches_immediately_and_offline_cache_never_blocks() {
         .unwrap();
     assert_eq!(fixture.api.policy_calls.load(Ordering::SeqCst), 2);
 
-    fixture.api.online.store(false, Ordering::SeqCst);
+    fixture.api.set_revision(7, 4);
+    fixture.api.policy_online.store(false, Ordering::SeqCst);
     assert_eq!(
         fixture
             .core
             .synchronize_split_tunnel(1_600, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::CachedOffline
+    );
+    assert_eq!(
+        fixture.split_store.load().unwrap().last_seen_force_revision,
+        3
+    );
+
+    fixture.api.policy_online.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_900, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: false }
+    ));
+    assert_eq!(
+        fixture.split_store.load().unwrap().last_seen_force_revision,
+        4
+    );
+
+    fixture.api.online.store(false, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(2_200, false)
             .await
             .unwrap(),
         SplitTunnelSyncOutcome::CachedOffline
@@ -505,16 +629,236 @@ async fn unchanged_hash_does_not_reconnect_but_changed_policy_rolls_back_atomica
             .status,
         SplitTunnelApplyStatus::RolledBack
     );
+    let failed_state = fixture.split_store.load().unwrap();
+    assert_eq!(
+        failed_state.failed_policy_hash.as_deref(),
+        Some(format!("sha256:{}", "b".repeat(64)).as_str())
+    );
+    assert_eq!(failed_state.failed_policy_retry_after_unix, Some(5_200));
+    assert_eq!(
+        fixture
+            .core
+            .cached_split_tunnel_policy()
+            .unwrap()
+            .unwrap()
+            .policy_hash,
+        format!("sha256:{}", "a".repeat(64))
+    );
 
-    assert!(matches!(
+    assert_eq!(
         fixture
             .core
             .synchronize_split_tunnel(1_900, false)
             .await
             .unwrap(),
+        SplitTunnelSyncOutcome::Unchanged
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 3);
+
+    assert!(matches!(
+        fixture
+            .core
+            .synchronize_split_tunnel(5_200, false)
+            .await
+            .unwrap(),
         SplitTunnelSyncOutcome::Updated { reconnected: true }
     ));
     assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 4);
+    assert!(fixture
+        .split_store
+        .load()
+        .unwrap()
+        .failed_policy_hash
+        .is_none());
+    assert_eq!(
+        fixture
+            .api
+            .apply_results
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        SplitTunnelApplyStatus::Applied
+    );
+}
+
+#[tokio::test]
+async fn forced_sync_reapplies_an_unchanged_policy_when_android_inventory_changes() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    let mut current_policy = policy(SplitTunnelMode::ExcludeSelected);
+    current_policy.mandatory_excluded_packages = vec!["com.example.new".to_string()];
+    fixture.api.set_policy(current_policy);
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+    assert!(fixture
+        .tunnel
+        .options
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .package_ids
+        .is_empty());
+
+    let mut updated_inventory = installed();
+    updated_inventory.push(SplitTunnelSelectedPackage {
+        package_id: "com.example.new".to_string(),
+        display_name: "New".to_string(),
+    });
+    fixture
+        .core
+        .set_split_tunnel_installed_packages(updated_inventory);
+
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_300, true)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: true }
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fixture
+            .tunnel
+            .options
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .package_ids,
+        ["com.example.new"]
+    );
+}
+
+#[tokio::test]
+async fn failed_policy_stop_is_reported_and_respects_retry_cooldown() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 8;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.selected_packages = vec!["com.example.chat".to_string()];
+    fixture.api.set_policy(changed);
+    fixture.api.set_revision(8, 2);
+    fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    fixture
+        .tunnel
+        .keep_running_on_stop_failure
+        .store(true, Ordering::SeqCst);
+
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_300, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: false }
+    );
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    let failed_state = fixture.split_store.load().unwrap();
+    assert_eq!(
+        failed_state.failed_policy_hash.as_deref(),
+        Some(format!("sha256:{}", "b".repeat(64)).as_str())
+    );
+    assert_eq!(failed_state.failed_policy_retry_after_unix, Some(4_900));
+    let failed_result = fixture.api.apply_results.lock().unwrap().last().cloned();
+    assert_eq!(
+        failed_result.as_ref().map(|result| result.status),
+        Some(SplitTunnelApplyStatus::Failed)
+    );
+    assert_eq!(
+        failed_result.and_then(|result| result.error_code),
+        Some("split_tunnel_stop_failed".to_string())
+    );
+
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_600, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Unchanged
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(4_900, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: true }
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 2);
+    assert!(fixture
+        .split_store
+        .load()
+        .unwrap()
+        .failed_policy_hash
+        .is_none());
+}
+
+#[tokio::test]
+async fn changed_hash_with_identical_effective_routes_is_applied_without_reconnect() {
+    let fixture = coordinator_fixture(android_35_capabilities());
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 8;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    fixture.api.set_policy(changed.clone());
+    fixture.api.set_revision(8, 3);
+
+    assert!(matches!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_300, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: false }
+    ));
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .split_store
+            .load()
+            .unwrap()
+            .working_policy_hash
+            .as_deref(),
+        Some(changed.policy_hash.as_str())
+    );
     assert_eq!(
         fixture
             .api
@@ -555,7 +899,7 @@ async fn failed_reapply_and_failed_rollback_leave_the_tunnel_stopped() {
         .synchronize_split_tunnel(1_300, false)
         .await
         .unwrap();
-    assert_eq!(fixture.core.state().await.phase, Phase::Ready);
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
     assert_eq!(
         *fixture.tunnel.status.lock().unwrap(),
         TunnelStatus::Stopped
@@ -577,7 +921,7 @@ async fn failed_reapply_and_failed_rollback_leave_the_tunnel_stopped() {
 async fn settings_save_reports_apply_and_rollback_failures() {
     for (failed_starts, expected_code, expected_phase) in [
         (1, "split_tunnel_apply_failed", Phase::Connected),
-        (2, "split_tunnel_rollback_failed", Phase::Ready),
+        (2, "split_tunnel_rollback_failed", Phase::Stopping),
     ] {
         let fixture = coordinator_fixture(android_35_capabilities());
         fixture
@@ -676,54 +1020,41 @@ async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
 }
 
 #[tokio::test]
-async fn inactive_split_modes_sync_without_reconnect() {
-    for (capabilities, options) in [
-        (
-            android_35_capabilities(),
-            ConnectOptions {
-                layer: Layer::Tic,
-                tic_connection_mode: TicConnectionMode::Personal,
-                route_mode: RouteMode::Standalone,
-                probes: Vec::new(),
-                allow_alternate: true,
-            },
-        ),
-        (
-            TunnelCapabilities {
-                platform: TunnelPlatform::Android,
-                android_api_level: Some(32),
-                address_split_tunnel: false,
-                application_split_tunnel: false,
-            },
-            ConnectOptions::android_default(),
-        ),
-    ] {
-        let fixture = coordinator_fixture(capabilities);
-        fixture
-            .core
-            .synchronize_split_tunnel(1_000, false)
-            .await
-            .unwrap();
-        fixture.core.start(options, 1_010).await.unwrap();
-        let starts = fixture.tunnel.starts.load(Ordering::SeqCst);
+async fn android_32_syncs_split_policy_without_reconnect() {
+    let fixture = coordinator_fixture(TunnelCapabilities {
+        platform: TunnelPlatform::Android,
+        android_api_level: Some(32),
+        address_split_tunnel: false,
+        application_split_tunnel: false,
+    });
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1_010)
+        .await
+        .unwrap();
+    let starts = fixture.tunnel.starts.load(Ordering::SeqCst);
 
-        let mut changed = policy(SplitTunnelMode::ExcludeSelected);
-        changed.revision = 8;
-        changed.policy_hash = format!("sha256:{}", "d".repeat(64));
-        fixture.api.set_policy(changed);
-        fixture.api.set_revision(8, 2);
-        fixture
-            .core
-            .synchronize_split_tunnel(1_300, false)
-            .await
-            .unwrap();
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 8;
+    changed.policy_hash = format!("sha256:{}", "d".repeat(64));
+    fixture.api.set_policy(changed);
+    fixture.api.set_revision(8, 2);
+    fixture
+        .core
+        .synchronize_split_tunnel(1_300, false)
+        .await
+        .unwrap();
 
-        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), starts);
-        assert_eq!(
-            fixture.tunnel.options.lock().unwrap().last().unwrap(),
-            &TunnelOptions::default()
-        );
-    }
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), starts);
+    assert_eq!(
+        fixture.tunnel.options.lock().unwrap().last().unwrap(),
+        &TunnelOptions::default()
+    );
 }
 
 #[tokio::test]
@@ -778,7 +1109,7 @@ async fn settings_confirmation_depends_on_the_effective_connected_policy() {
         )
         .await
         .unwrap();
-    assert!(!standalone
+    assert!(standalone
         .core
         .split_tunnel_settings_require_reconnect(&changed_request)
         .await
@@ -838,6 +1169,31 @@ async fn settings_save_updates_cache_and_unknown_format_keeps_the_working_policy
             .unwrap(),
         SplitTunnelSyncOutcome::UnsupportedPolicy
     ));
+    assert_eq!(
+        fixture
+            .split_store
+            .load()
+            .unwrap()
+            .cached_policy
+            .unwrap()
+            .revision,
+        8
+    );
+
+    let mut invalid = fixture.api.policy.lock().unwrap().clone();
+    invalid.format_version = 1;
+    invalid.revision = 10;
+    invalid.excluded_ipv4_cidrs = vec!["203.0.113.7/24".to_string()];
+    fixture.api.set_policy(invalid);
+    fixture.api.set_revision(10, 4);
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_700, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::UnsupportedPolicy
+    );
     assert_eq!(
         fixture
             .split_store
@@ -914,12 +1270,353 @@ async fn empty_include_selection_is_rejected_before_requesting_a_connection() {
     assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn confirmed_desktop_network_change_restarts_only_the_local_tunnel() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Linux, None, true, false));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .tunnel
+        .set_fingerprints(["network-a", "network-b", "network-b"]);
+    fixture
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_010,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .split_store
+            .load()
+            .unwrap()
+            .applied_physical_network_fingerprint
+            .as_deref(),
+        Some("network-a")
+    );
+
+    assert_eq!(
+        fixture.core.poll_physical_network(1_100).await.unwrap(),
+        PhysicalNetworkPollOutcome::ChangePending
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.core.poll_physical_network(1_130).await.unwrap(),
+        PhysicalNetworkPollOutcome::Reconnected
+    );
+
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture
+            .split_store
+            .load()
+            .unwrap()
+            .applied_physical_network_fingerprint
+            .as_deref(),
+        Some("network-b")
+    );
+}
+
+#[tokio::test]
+async fn failed_network_restart_does_not_report_a_stopped_tunnel_as_connected() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Linux, None, true, false));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_010,
+        )
+        .await
+        .unwrap();
+    fixture
+        .tunnel
+        .set_fingerprints(["network-a", "network-b", "network-b"]);
+    fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+
+    assert_eq!(
+        fixture.core.poll_physical_network(1_100).await.unwrap(),
+        PhysicalNetworkPollOutcome::BaselineRecorded
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_130).await.unwrap(),
+        PhysicalNetworkPollOutcome::ChangePending
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_160).await.unwrap(),
+        PhysicalNetworkPollOutcome::ReconnectFailed
+    );
+
+    assert_eq!(fixture.core.state().await.phase, Phase::Stopping);
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_network_reconnect_failed")
+    );
+}
+
+#[tokio::test]
+async fn running_tunnel_stop_failures_use_network_reconnect_backoff() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Linux, None, true, false));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_010,
+        )
+        .await
+        .unwrap();
+    fixture
+        .tunnel
+        .set_fingerprints(["network-a", "network-b", "network-b"]);
+    fixture.tunnel.fail_next_stops.store(2, Ordering::SeqCst);
+    fixture
+        .tunnel
+        .keep_running_on_stop_failure
+        .store(true, Ordering::SeqCst);
+
+    assert_eq!(
+        fixture.core.poll_physical_network(1_100).await.unwrap(),
+        PhysicalNetworkPollOutcome::BaselineRecorded
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_130).await.unwrap(),
+        PhysicalNetworkPollOutcome::ChangePending
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_160).await.unwrap(),
+        PhysicalNetworkPollOutcome::ReconnectFailed
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_190).await.unwrap(),
+        PhysicalNetworkPollOutcome::RetryDeferred
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_network_reconnect_failed")
+    );
+    fixture
+        .core
+        .synchronize_split_tunnel(1_300, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_network_reconnect_failed")
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_460).await.unwrap(),
+        PhysicalNetworkPollOutcome::ReconnectFailed
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture
+            .logger
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "split_tunnel.network_reconnect_failed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn missing_saved_configuration_warns_and_uses_network_retry_backoff() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Linux, None, true, false));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_010,
+        )
+        .await
+        .unwrap();
+    let mut stored = fixture.secret_store.load().unwrap().unwrap();
+    stored.saved_connection = None;
+    stored.pinned_connection = None;
+    fixture.secret_store.save(&stored).unwrap();
+    fixture
+        .tunnel
+        .set_fingerprints(["network-a", "network-b", "network-b", "network-b"]);
+
+    assert_eq!(
+        fixture.core.poll_physical_network(1_100).await.unwrap(),
+        PhysicalNetworkPollOutcome::BaselineRecorded
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_130).await.unwrap(),
+        PhysicalNetworkPollOutcome::ChangePending
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_160).await.unwrap(),
+        PhysicalNetworkPollOutcome::ReconnectFailed
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_190).await.unwrap(),
+        PhysicalNetworkPollOutcome::RetryDeferred
+    );
+    assert_eq!(
+        fixture.core.poll_physical_network(1_460).await.unwrap(),
+        PhysicalNetworkPollOutcome::ReconnectFailed
+    );
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_network_reconnect_failed")
+    );
+    assert_eq!(
+        fixture
+            .logger
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "split_tunnel.network_reconnect_failed")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn missing_saved_configuration_marks_policy_failure_and_reports_it() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Linux, None, true, false));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_010,
+        )
+        .await
+        .unwrap();
+    let mut stored = fixture.secret_store.load().unwrap().unwrap();
+    stored.saved_connection = None;
+    stored.pinned_connection = None;
+    fixture.secret_store.save(&stored).unwrap();
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 8;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    fixture.api.set_policy(changed.clone());
+    fixture.api.set_revision(8, 2);
+
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_300, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: false }
+    );
+
+    let state = fixture.split_store.load().unwrap();
+    assert_eq!(
+        state.failed_policy_hash.as_deref(),
+        Some(changed.policy_hash.as_str())
+    );
+    assert_eq!(state.failed_policy_retry_after_unix, Some(4_900));
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_saved_connection_unavailable")
+    );
+    let result = fixture
+        .api
+        .apply_results
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(result.status, SplitTunnelApplyStatus::Failed);
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("split_tunnel_saved_connection_unavailable")
+    );
+    assert!(fixture.logger.events.lock().unwrap().iter().any(|event| {
+        event.kind == "split_tunnel.apply_failed"
+            && event.code.as_deref() == Some("split_tunnel_saved_connection_unavailable")
+    }));
+}
+
 struct CoordinatorFixture {
     core: ClientCore<CoordinatorApi, TestSecretStore, CoordinatorTunnel, TestLogger>,
     api: Arc<CoordinatorApi>,
     tunnel: Arc<CoordinatorTunnel>,
     split_store: Arc<MemorySplitTunnelStore>,
     logger: Arc<TestLogger>,
+    secret_store: Arc<TestSecretStore>,
 }
 
 fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
@@ -940,7 +1637,7 @@ fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
     let logger = Arc::new(TestLogger::default());
     let core = ClientCore::with_split_tunnel_store(
         api.clone(),
-        secret_store,
+        secret_store.clone(),
         split_store.clone(),
         tunnel.clone(),
         logger.clone(),
@@ -952,6 +1649,7 @@ fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
         tunnel,
         split_store,
         logger,
+        secret_store,
     }
 }
 
@@ -1033,8 +1731,20 @@ struct CoordinatorTunnel {
     starts: AtomicUsize,
     stops: AtomicUsize,
     fail_next_starts: AtomicUsize,
+    fail_next_stops: AtomicUsize,
+    keep_running_on_stop_failure: AtomicBool,
     options: Mutex<Vec<TunnelOptions>>,
     status: Mutex<TunnelStatus>,
+    fingerprints: Mutex<VecDeque<String>>,
+}
+
+impl CoordinatorTunnel {
+    fn set_fingerprints<'a>(&self, values: impl IntoIterator<Item = &'a str>) {
+        *self.fingerprints.lock().unwrap() = values
+            .into_iter()
+            .map(str::to_string)
+            .collect::<VecDeque<_>>();
+    }
 }
 
 #[async_trait]
@@ -1058,12 +1768,34 @@ impl TunnelController for CoordinatorTunnel {
 
     async fn stop(&self) -> Result<(), TunnelError> {
         self.stops.fetch_add(1, Ordering::SeqCst);
+        if self
+            .fail_next_stops
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            if !self.keep_running_on_stop_failure.load(Ordering::SeqCst) {
+                *self.status.lock().unwrap() = TunnelStatus::Stopped;
+            }
+            return Err(TunnelError::Backend("test_stop_failed".to_string()));
+        }
         *self.status.lock().unwrap() = TunnelStatus::Stopped;
         Ok(())
     }
 
     async fn status(&self) -> Result<TunnelStatus, TunnelError> {
         Ok(*self.status.lock().unwrap())
+    }
+
+    async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
+        let mut fingerprints = self.fingerprints.lock().unwrap();
+        let fingerprint = if fingerprints.len() > 1 {
+            fingerprints.pop_front()
+        } else {
+            fingerprints.front().cloned()
+        };
+        Ok(fingerprint)
     }
 
     async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
@@ -1073,6 +1805,7 @@ impl TunnelController for CoordinatorTunnel {
 
 struct CoordinatorApi {
     online: AtomicBool,
+    policy_online: AtomicBool,
     revision: Mutex<SplitTunnelRevision>,
     policy: Mutex<SplitTunnelPolicy>,
     revision_calls: AtomicUsize,
@@ -1087,6 +1820,7 @@ impl CoordinatorApi {
     fn new() -> Self {
         Self {
             online: AtomicBool::new(true),
+            policy_online: AtomicBool::new(true),
             revision: Mutex::new(SplitTunnelRevision {
                 enabled: true,
                 revision: 7,
@@ -1194,6 +1928,9 @@ impl CoreApi for CoordinatorApi {
         _access_token: &str,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         self.available()?;
+        if !self.policy_online.load(Ordering::SeqCst) {
+            return Err(CoreApiError::Retryable);
+        }
         self.policy_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.policy.lock().unwrap().clone())
     }

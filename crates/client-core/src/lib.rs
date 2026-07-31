@@ -23,7 +23,7 @@ mod split_tunnel;
 
 pub use split_tunnel::{
     split_tunnel_active, validate_split_tunnel_policy, EffectiveSplitTunnelPolicy,
-    SplitTunnelContext, SplitTunnelPolicyError, SplitTunnelSyncOutcome,
+    PhysicalNetworkPollOutcome, SplitTunnelContext, SplitTunnelPolicyError, SplitTunnelSyncOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,59 @@ impl Default for CoreState {
         Self {
             phase: Phase::SignedOut,
             connection: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SplitTunnelWarningKind {
+    Sync,
+    Operation,
+    Runtime,
+    Storage,
+}
+
+#[derive(Debug, Default)]
+struct SplitTunnelWarnings {
+    sync: Option<String>,
+    operation: Option<String>,
+    runtime: Option<String>,
+    storage: Option<String>,
+}
+
+impl SplitTunnelWarnings {
+    fn current(&self) -> Option<String> {
+        self.runtime
+            .as_ref()
+            .or(self.operation.as_ref())
+            .or(self.storage.as_ref())
+            .or(self.sync.as_ref())
+            .cloned()
+    }
+
+    fn set(&mut self, kind: SplitTunnelWarningKind, code: String) -> bool {
+        let slot = self.slot(kind);
+        if slot.as_deref() == Some(code.as_str()) {
+            return false;
+        }
+        *slot = Some(code);
+        true
+    }
+
+    fn clear(&mut self, kind: SplitTunnelWarningKind) {
+        *self.slot(kind) = None;
+    }
+
+    fn clear_all(&mut self) {
+        *self = Self::default();
+    }
+
+    fn slot(&mut self, kind: SplitTunnelWarningKind) -> &mut Option<String> {
+        match kind {
+            SplitTunnelWarningKind::Sync => &mut self.sync,
+            SplitTunnelWarningKind::Operation => &mut self.operation,
+            SplitTunnelWarningKind::Runtime => &mut self.runtime,
+            SplitTunnelWarningKind::Storage => &mut self.storage,
         }
     }
 }
@@ -532,7 +585,8 @@ pub struct ClientCore<A, S, T, L> {
     split_tunnel_gate: Mutex<()>,
     split_tunnel_packages: RwLock<Vec<SplitTunnelSelectedPackage>>,
     split_tunnel_options: Mutex<TunnelOptions>,
-    split_tunnel_warning: Mutex<Option<String>>,
+    split_tunnel_warning: Mutex<SplitTunnelWarnings>,
+    physical_network_change: Mutex<split_tunnel::PhysicalNetworkChangeDetector>,
     retry_policy: RetryPolicy,
 }
 
@@ -572,7 +626,10 @@ where
             split_tunnel_gate: Mutex::new(()),
             split_tunnel_packages: RwLock::new(Vec::new()),
             split_tunnel_options: Mutex::new(TunnelOptions::default()),
-            split_tunnel_warning: Mutex::new(None),
+            split_tunnel_warning: Mutex::new(SplitTunnelWarnings::default()),
+            physical_network_change: Mutex::new(
+                split_tunnel::PhysicalNetworkChangeDetector::default(),
+            ),
             retry_policy: RetryPolicy::default(),
         }
     }
@@ -582,8 +639,74 @@ where
         self
     }
 
+    async fn set_split_tunnel_warning(
+        &self,
+        kind: SplitTunnelWarningKind,
+        code: impl Into<String>,
+    ) -> bool {
+        self.split_tunnel_warning
+            .lock()
+            .await
+            .set(kind, code.into())
+    }
+
+    async fn clear_split_tunnel_warning(&self, kind: SplitTunnelWarningKind) {
+        self.split_tunnel_warning.lock().await.clear(kind);
+    }
+
+    async fn clear_all_split_tunnel_warnings(&self) {
+        self.split_tunnel_warning.lock().await.clear_all();
+    }
+
     pub async fn state(&self) -> CoreState {
-        self.state.lock().await.clone()
+        let current = self.state.lock().await.clone();
+        if current.phase != Phase::Connected {
+            return current;
+        }
+        match self.tunnel.status().await {
+            Ok(TunnelStatus::Stopped | TunnelStatus::Failed) => {
+                let (state, changed) = self.leave_unconfirmed_connected_state().await;
+                if changed {
+                    self.set_split_tunnel_warning(
+                        SplitTunnelWarningKind::Runtime,
+                        "tunnel_runtime_stopped",
+                    )
+                    .await;
+                }
+                state
+            }
+            Ok(_) => {
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+                    .await;
+                current
+            }
+            Err(error) => {
+                let changed = self
+                    .set_split_tunnel_warning(
+                        SplitTunnelWarningKind::Runtime,
+                        "tunnel_status_unavailable",
+                    )
+                    .await;
+                if changed {
+                    self.logger.record(CoreLogEvent {
+                        kind: "tunnel.status.unavailable",
+                        operation_id: None,
+                        request_id: None,
+                        code: Some(error.to_string()),
+                    });
+                }
+                current
+            }
+        }
+    }
+
+    async fn leave_unconfirmed_connected_state(&self) -> (CoreState, bool) {
+        let mut state = self.state.lock().await;
+        let changed = state.phase == Phase::Connected;
+        if changed {
+            state.phase = Phase::Stopping;
+        }
+        (state.clone(), changed)
     }
 
     pub fn record_tunnel_unavailable(&self, kind: &'static str, code: String) {
@@ -621,7 +744,8 @@ where
             packages.clear();
         }
         *self.split_tunnel_options.lock().await = TunnelOptions::default();
-        *self.split_tunnel_warning.lock().await = None;
+        self.clear_all_split_tunnel_warnings().await;
+        self.physical_network_change.lock().await.reset();
         *self.state.lock().await = CoreState::default();
         self.logger.record(CoreLogEvent {
             kind: "auth.signed_out",
@@ -772,17 +896,61 @@ where
             probes: options.probes,
             allow_alternate: options.allow_alternate,
         };
-        let response = self
-            .retry_start(&access_token, &request)
-            .await
-            .inspect_err(|error| {
+        let response = match self.retry_start(&access_token, &request).await {
+            Ok(response) => response,
+            Err(error) => {
                 self.logger.record(CoreLogEvent {
                     kind: "connection.start_failed",
                     operation_id: Some(operation_id.clone()),
                     request_id: None,
                     code: Some(error.to_string()),
                 });
-            })?;
+                self.set_phase(phase_for_start_error(&error)).await;
+                return Err(error);
+            }
+        };
+        let tunnel_options = match &split_policy {
+            Some(_)
+                if response.connection.layer == options.layer
+                    && response.connection.route_mode == options.route_mode =>
+            {
+                preflight_tunnel_options.unwrap_or_default()
+            }
+            Some(policy) => match self
+                .effective_tunnel_options(
+                    policy,
+                    response.connection.layer,
+                    response.connection.route_mode,
+                )
+                .await
+            {
+                Ok(options) => options,
+                Err(error) => {
+                    self.compensate_failed_start(
+                        &access_token,
+                        &response.connection,
+                        &response.request_id,
+                        &operation_id,
+                        "connection.start_preparation_failed",
+                        &error,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            },
+            None => {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Sync,
+                    "split_tunnel_policy_unavailable",
+                )
+                .await;
+                TunnelOptions::default()
+            }
+        };
+        if split_policy.is_some() {
+            self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
+                .await;
+        }
         let kind = stored_connection_kind(&response.connection);
         let valid_until_unix = match kind {
             StoredConnectionKind::DynamicWarm => Some(now_unix.saturating_add(3_600)),
@@ -803,62 +971,83 @@ where
         } else {
             stored.saved_connection = Some(saved_connection);
         }
-        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
-        let tunnel_options = match &split_policy {
-            Some(_)
-                if response.connection.layer == options.layer
-                    && response.connection.route_mode == options.route_mode =>
-            {
-                preflight_tunnel_options.unwrap_or_default()
-            }
-            Some(policy) => {
-                self.effective_tunnel_options(
-                    policy,
-                    response.connection.layer,
-                    response.connection.route_mode,
-                )
-                .await?
-            }
-            None => {
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_policy_unavailable".to_string());
-                TunnelOptions::default()
-            }
-        };
-        if split_policy.is_some() {
-            *self.split_tunnel_warning.lock().await = None;
+        if self.store.save(&stored).is_err() {
+            let error = CoreError::Storage;
+            self.compensate_failed_start(
+                &access_token,
+                &response.connection,
+                &response.request_id,
+                &operation_id,
+                "connection.start_storage_failed",
+                &error,
+            )
+            .await;
+            return Err(error);
         }
-        self.tunnel
+        if let Err(start_error) = self
+            .tunnel
             .start(TunnelStartRequest {
                 configuration: TunnelConfiguration::new(response.configuration),
                 options: tunnel_options.clone(),
             })
-            .await?;
+            .await
+        {
+            let error = CoreError::from(start_error);
+            self.compensate_failed_start(
+                &access_token,
+                &response.connection,
+                &response.request_id,
+                &operation_id,
+                "connection.local_start_failed",
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+        let applied_physical_network_fingerprint = self
+            .initialize_physical_network_detector(&tunnel_options)
+            .await;
         *self.state.lock().await = CoreState {
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
         };
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
         if let Some(policy) = &split_policy {
             if let Err(record_error) = self
                 .record_started_split_tunnel_policy(
                     policy,
                     tunnel_options,
+                    applied_physical_network_fingerprint,
                     Some(&mut access_token),
                     now_unix,
                 )
                 .await
             {
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_state_save_failed".to_string());
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Storage,
+                    "split_tunnel_state_save_failed",
+                )
+                .await;
                 self.logger.record(CoreLogEvent {
                     kind: "split_tunnel.state_record_failed",
                     operation_id: Some(operation_id.clone()),
                     request_id: Some(response.request_id.clone()),
                     code: Some(record_error.to_string()),
                 });
+            } else {
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+                    .await;
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+                    .await;
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Storage)
+                    .await;
             }
         } else {
             *self.split_tunnel_options.lock().await = TunnelOptions::default();
+            self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record(CoreLogEvent {
             kind: "connection.started",
@@ -876,20 +1065,72 @@ where
         let current = current_state
             .connection
             .ok_or(CoreError::SavedConnectionUnavailable)?;
-        if current_state.phase != Phase::Connected {
+        let panel_connection_finished = matches!(
+            current.status,
+            nelomai_contracts::LeaseStatus::Warm
+                | nelomai_contracts::LeaseStatus::Released
+                | nelomai_contracts::LeaseStatus::Failed
+        );
+        self.set_phase(Phase::Stopping).await;
+        let tunnel_status = self.tunnel.status().await.unwrap_or(TunnelStatus::Running);
+        if tunnel_status != TunnelStatus::Stopped {
+            if let Err(error) = self.tunnel.stop().await {
+                let phase = if self.tunnel.status().await.is_ok_and(|status| {
+                    matches!(status, TunnelStatus::Stopped | TunnelStatus::Failed)
+                }) {
+                    Phase::Stopping
+                } else {
+                    Phase::Connected
+                };
+                self.set_phase(phase).await;
+                return Err(error.into());
+            }
+        }
+        self.physical_network_change.lock().await.reset();
+        self.clear_applied_physical_network_fingerprint();
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
+        if panel_connection_finished {
+            *self.state.lock().await = CoreState {
+                phase: Phase::Ready,
+                connection: Some(current.clone()),
+            };
             return Ok(current);
         }
-        self.set_phase(Phase::Stopping).await;
-        self.tunnel.stop().await?;
         let stored = self.load_auth()?;
         let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
         let request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
-            lease_id: current.lease_id,
+            lease_id: current.lease_id.clone(),
         };
-        let response = self
+        let response = match self
             .retry_operation(&access_token, &request, ConnectionOperation::Stop)
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let phase = match &error {
+                    CoreError::SignedOut => Phase::SignedOut,
+                    CoreError::AccessExpired => Phase::AccessExpired,
+                    CoreError::UpdateRequired => Phase::UpdateRequired,
+                    _ if self.state.lock().await.phase == Phase::Error => Phase::Error,
+                    _ => Phase::Stopping,
+                };
+                *self.state.lock().await = CoreState {
+                    phase,
+                    connection: Some(current),
+                };
+                self.logger.record(CoreLogEvent {
+                    kind: "connection.stop_failed",
+                    operation_id: Some(request.operation_id),
+                    request_id: None,
+                    code: Some(error.to_string()),
+                });
+                return Err(error);
+            }
+        };
         *self.state.lock().await = CoreState {
             phase: Phase::Ready,
             connection: Some(response.connection.clone()),
@@ -1048,13 +1289,17 @@ where
                     .await?
             }
             None => {
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_policy_unavailable".to_string());
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Sync,
+                    "split_tunnel_policy_unavailable",
+                )
+                .await;
                 TunnelOptions::default()
             }
         };
         if split_policy.is_some() {
-            *self.split_tunnel_warning.lock().await = None;
+            self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
+                .await;
         }
         self.tunnel
             .start(TunnelStartRequest {
@@ -1062,6 +1307,9 @@ where
                 options: tunnel_options.clone(),
             })
             .await?;
+        let applied_physical_network_fingerprint = self
+            .initialize_physical_network_detector(&tunnel_options)
+            .await;
         let connection = Connection {
             lease_id: saved.lease_id.clone(),
             layer: saved.layer,
@@ -1075,22 +1323,43 @@ where
             phase: Phase::Connected,
             connection: Some(connection),
         };
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
         if let Some(policy) = &split_policy {
             if let Err(record_error) = self
-                .record_started_split_tunnel_policy(policy, tunnel_options, None, now_unix)
+                .record_started_split_tunnel_policy(
+                    policy,
+                    tunnel_options,
+                    applied_physical_network_fingerprint,
+                    None,
+                    now_unix,
+                )
                 .await
             {
-                *self.split_tunnel_warning.lock().await =
-                    Some("split_tunnel_state_save_failed".to_string());
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Storage,
+                    "split_tunnel_state_save_failed",
+                )
+                .await;
                 self.logger.record(CoreLogEvent {
                     kind: "split_tunnel.state_record_failed",
                     operation_id: Some(saved.lease_id.clone()),
                     request_id: None,
                     code: Some(record_error.to_string()),
                 });
+            } else {
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+                    .await;
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+                    .await;
+                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Storage)
+                    .await;
             }
         } else {
             *self.split_tunnel_options.lock().await = TunnelOptions::default();
+            self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record(CoreLogEvent {
             kind: "connection.started_offline",
@@ -1128,6 +1397,54 @@ where
 
     async fn set_phase(&self, phase: Phase) {
         self.state.lock().await.phase = phase;
+    }
+
+    async fn compensate_failed_start(
+        &self,
+        access_token: &str,
+        connection: &Connection,
+        request_id: &str,
+        operation_id: &str,
+        failure_kind: &'static str,
+        error: &CoreError,
+    ) {
+        self.physical_network_change.lock().await.reset();
+        let compensation_request = ConnectionOperationRequest {
+            operation_id: Uuid::new_v4().to_string(),
+            lease_id: connection.lease_id.clone(),
+        };
+        let (connection, phase) = match self
+            .retry_operation(
+                access_token,
+                &compensation_request,
+                ConnectionOperation::Stop,
+            )
+            .await
+        {
+            Ok(compensation) => (compensation.connection, phase_for_start_error(error)),
+            Err(compensation_error) => {
+                self.logger.record(CoreLogEvent {
+                    kind: "connection.start_compensation_failed",
+                    operation_id: Some(compensation_request.operation_id.clone()),
+                    request_id: None,
+                    code: Some(compensation_error.to_string()),
+                });
+                (
+                    connection.clone(),
+                    phase_for_start_error(&compensation_error),
+                )
+            }
+        };
+        *self.state.lock().await = CoreState {
+            phase,
+            connection: Some(connection),
+        };
+        self.logger.record(CoreLogEvent {
+            kind: failure_kind,
+            operation_id: Some(operation_id.to_string()),
+            request_id: Some(request_id.to_string()),
+            code: Some(error.to_string()),
+        });
     }
 
     async fn retry_start(
@@ -1251,6 +1568,22 @@ fn phase_for_api_error(error: &CoreApiError) -> Phase {
         CoreApiError::AccessExpired => Phase::AccessExpired,
         CoreApiError::Retryable => Phase::ServerUnavailable,
         CoreApiError::Rejected { .. } => Phase::Error,
+    }
+}
+
+fn phase_for_start_error(error: &CoreError) -> Phase {
+    match error {
+        CoreError::SignedOut | CoreError::Api(CoreApiError::Unauthorized) => Phase::SignedOut,
+        CoreError::AccessExpired | CoreError::Api(CoreApiError::AccessExpired) => {
+            Phase::AccessExpired
+        }
+        CoreError::UpdateRequired => Phase::UpdateRequired,
+        CoreError::Api(CoreApiError::Retryable) => Phase::ServerUnavailable,
+        CoreError::Api(CoreApiError::Rejected { .. }) => Phase::Error,
+        CoreError::SavedConnectionUnavailable
+        | CoreError::Storage
+        | CoreError::Tunnel(_)
+        | CoreError::SplitTunnel(_) => Phase::Ready,
     }
 }
 

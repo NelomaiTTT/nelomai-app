@@ -1,6 +1,8 @@
 package ru.nelomai.tunnel
 
 import android.net.IpPrefix
+import android.os.Build
+import androidx.annotation.RequiresApi
 import com.wireguard.config.Config
 import com.wireguard.config.Interface
 import java.net.InetAddress
@@ -19,6 +21,7 @@ internal data class Ipv4Prefix(
     val prefixLength: Int,
     val canonical: String,
 ) {
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     fun toIpPrefix(): IpPrefix {
         val bytes = byteArrayOf(
             (address ushr 24).toByte(),
@@ -130,6 +133,7 @@ internal object AndroidSplitTunnel {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     fun currentExcludedRoutes(): List<IpPrefix> =
         currentRoutes.get().map(Ipv4Prefix::toIpPrefix)
 

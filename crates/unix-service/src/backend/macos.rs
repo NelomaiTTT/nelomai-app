@@ -241,6 +241,10 @@ impl ServiceTunnelBackend for MacosBackend {
         }
         Ok(self.state)
     }
+
+    fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
+        self.routes.physical_network_fingerprint()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]

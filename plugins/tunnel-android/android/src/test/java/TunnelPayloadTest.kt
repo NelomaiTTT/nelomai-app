@@ -30,13 +30,14 @@ class TunnelPayloadTest {
     }
 
     @Test
-    fun duplicateStartCannotEnterTheNativeQueue() {
+    fun duplicateStartCannotEnterTheNativeQueueAndRunningTunnelIsReplaced() {
         val gate = TunnelStateGate()
 
         assertEquals(TransitionDecision.PROCEED, gate.beginStart())
         assertEquals(TransitionDecision.BUSY, gate.beginStart())
         gate.complete(SessionState.RUNNING)
-        assertEquals(TransitionDecision.ALREADY_COMPLETE, gate.beginStart())
+        assertEquals(TransitionDecision.REPLACE, gate.beginStart())
+        assertEquals(TransitionDecision.BUSY, gate.beginStart())
     }
 
     @Test
@@ -47,5 +48,20 @@ class TunnelPayloadTest {
         assertEquals(TransitionDecision.BUSY, gate.beginStop())
         gate.complete(SessionState.STOPPED)
         assertEquals(TransitionDecision.ALREADY_COMPLETE, gate.beginStop())
+    }
+
+    @Test
+    fun physicalNetworkRetryIsDeferredOnlyForTheFailedNetwork() {
+        val gate = PhysicalNetworkRetryGate()
+
+        assertTrue(gate.canAttempt("wifi-a", 1_000))
+        gate.defer("wifi-a", 1_000)
+
+        assertTrue(!gate.canAttempt("wifi-a", 1_000 + 299_999))
+        assertTrue(gate.canAttempt("wifi-a", 1_000 + 300_000))
+        assertTrue(gate.canAttempt("cellular-b", 1_001))
+
+        gate.clear()
+        assertTrue(gate.canAttempt("wifi-a", 1_002))
     }
 }
