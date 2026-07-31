@@ -3,8 +3,9 @@ use nelomai_contracts::{
     Access, ApiVersion, BindPeerRequest, Bootstrap, ConnectionOperationRequest,
     ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, ErrorPayload,
     Layer, PeerBindingResponse, PeerOptions, Platform, ServerCandidatesResponse,
-    ServerSelectionRequest, ServerSelectionResponse, SplitTunnelApplyResult, SplitTunnelPolicy,
-    SplitTunnelRevision, SplitTunnelSettingsUpdate, API_PREFIX,
+    ServerSelectionRequest, ServerSelectionResponse, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision,
+    SplitTunnelSettingsUpdate, API_PREFIX,
 };
 use reqwest::{
     header::{HeaderValue, InvalidHeaderValue, CONTENT_TYPE},
@@ -325,6 +326,45 @@ impl ClientApi {
                 .bearer_auth(access_token)
                 .header(CONTENT_TYPE, "application/json")
                 .body(body),
+            SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT,
+            "split_tunnel_policy_too_large",
+            "split_tunnel_policy_invalid",
+        )
+        .await
+    }
+
+    pub async fn add_split_tunnel_address_rule(
+        &self,
+        access_token: &str,
+        rule: &SplitTunnelAddressRuleUpdate,
+    ) -> Result<SplitTunnelPolicy, ClientApiError> {
+        self.send_limited_json(
+            self.http
+                .post(self.endpoint("split-tunnel/address-rules")?)
+                .bearer_auth(access_token)
+                .json(rule),
+            SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT,
+            "split_tunnel_policy_too_large",
+            "split_tunnel_policy_invalid",
+        )
+        .await
+    }
+
+    pub async fn remove_split_tunnel_address_rule(
+        &self,
+        access_token: &str,
+        rule_id: i64,
+        scope: SplitTunnelAddressRuleScope,
+    ) -> Result<SplitTunnelPolicy, ClientApiError> {
+        let scope = match scope {
+            SplitTunnelAddressRuleScope::ThisDevice => "this_device",
+            SplitTunnelAddressRuleScope::AllDevices => "all_devices",
+        };
+        self.send_limited_json(
+            self.http
+                .delete(self.endpoint(&format!("split-tunnel/address-rules/{rule_id}"))?)
+                .bearer_auth(access_token)
+                .query(&[("scope", scope)]),
             SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT,
             "split_tunnel_policy_too_large",
             "split_tunnel_policy_invalid",

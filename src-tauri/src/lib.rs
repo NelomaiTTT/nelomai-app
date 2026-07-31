@@ -117,6 +117,8 @@ pub fn run() {
             commands::app_split_tunnel_installed_applications,
             commands::app_split_tunnel_save,
             commands::app_split_tunnel_refresh,
+            commands::app_split_tunnel_add_address_rule,
+            commands::app_split_tunnel_remove_address_rule,
             commands::app_logout,
         ])
         .run(tauri::generate_context!())

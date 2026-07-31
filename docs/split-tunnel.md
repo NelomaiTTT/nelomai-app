@@ -48,6 +48,22 @@ The panel sends compact IPv4 CIDRs. Android passes them to `VpnService` route
 exclusion. Desktop helpers install direct routes through the physical gateway.
 Neither implementation produces a large inverse `AllowedIPs` list.
 
+The application also accepts personal IPv4 addresses, domain names, and full
+HTTP(S) URLs. For a URL the native core extracts its normalized hostname before
+the request; the panel validates the result and retains the same URL parsing as
+a defensive fallback for older clients. Path, port, query, and fragment do not
+affect routing. The two scopes are explicit:
+`Для этого устройства` applies only to the current application device, while
+`Для всех моих` is delivered to every application device of the same account.
+IPv4 values become `/32` direct routes. Domains are normalized by the panel and
+resolved to IPv4 on the device whenever the effective policy is applied; the
+normal 24-hour full-policy refresh resolves them again. Resolution is
+asynchronous, runs in a bounded parallel batch, and keeps the last successfully
+resolved addresses if DNS is temporarily unavailable. A domain without either
+a fresh result or a cached result is not silently omitted: the new policy
+remains pending and the existing connection keeps its last working routes. A
+domain never changes regular panel peer configuration.
+
 `Исключить локальные адреса` is enabled by default. On Android 13 and newer the
 user can change it. Desktop systems always keep real Wi-Fi and Ethernet
 networks outside the tunnel by using their existing on-link routes; the desktop
@@ -97,6 +113,14 @@ the UI shows a warning without blocking Start. An unsupported or invalid new
 policy does not replace the previous working policy. Android 13 and newer also
 require a successful local application inventory before starting an active
 split tunnel, so mandatory package exclusions cannot silently disappear.
+
+Policies without active personal address rules retain format 1 so already
+installed clients can continue using their last supported configuration. The
+panel emits format 2 as soon as at least one personal address rule is active.
+When split-tunnel is globally disabled, stored personal rules are omitted and
+the disabled policy uses format 1 so legacy clients can remove old routes. A
+client that does not support format 2 keeps the previous working policy and
+does not report the new policy as successfully applied.
 
 ## Apply and rollback
 

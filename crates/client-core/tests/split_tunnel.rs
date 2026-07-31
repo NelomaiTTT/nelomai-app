@@ -16,6 +16,7 @@ use nelomai_client_tunnel::{
 use nelomai_contracts::{
     ApiVersion, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
     ConnectionStartRequest, ConnectionStartResponse, Layer, LeaseStatus, RouteMode,
+    SplitTunnelAddressRule, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
     SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
     SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
@@ -426,6 +427,7 @@ fn policy(mode: SplitTunnelMode) -> SplitTunnelPolicy {
         enabled: true,
         revision: 7,
         force_revision: 2,
+        address_revision: 0,
         policy_hash: format!("sha256:{}", "a".repeat(64)),
         mode,
         exclude_local_networks: true,
@@ -433,8 +435,36 @@ fn policy(mode: SplitTunnelMode) -> SplitTunnelPolicy {
         suggested_name_fragments: Vec::new(),
         selected_packages: Vec::new(),
         excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
+        address_rules: Vec::new(),
         generated_at: "2026-07-30T12:00:00Z".to_string(),
     }
+}
+
+#[test]
+fn ipv4_address_rule_is_added_as_a_direct_route() {
+    let mut value = policy(SplitTunnelMode::ExcludeSelected);
+    value.format_version = 2;
+    value.address_revision = 1;
+    value.address_rules = vec![SplitTunnelAddressRule {
+        id: 1,
+        scope: SplitTunnelAddressRuleScope::ThisDevice,
+        kind: SplitTunnelAddressRuleKind::Ipv4,
+        value: "198.51.100.42".to_string(),
+    }];
+
+    let effective = EffectiveSplitTunnelPolicy::build(
+        &value,
+        &[],
+        capabilities(TunnelPlatform::Windows, None, true, false),
+        Layer::Tic,
+        RouteMode::ViaTak,
+    )
+    .unwrap();
+
+    assert!(effective
+        .options
+        .excluded_ipv4_cidrs
+        .contains(&"198.51.100.42/32".to_string()));
 }
 
 fn installed() -> Vec<SplitTunnelSelectedPackage> {
@@ -1157,7 +1187,7 @@ async fn settings_save_updates_cache_and_unknown_format_keeps_the_working_policy
     );
 
     let mut unsupported = updated;
-    unsupported.format_version = 2;
+    unsupported.format_version = 3;
     unsupported.revision = 9;
     fixture.api.set_policy(unsupported);
     fixture.api.set_revision(9, 3);
@@ -1825,6 +1855,7 @@ impl CoordinatorApi {
                 enabled: true,
                 revision: 7,
                 force_revision: 2,
+                address_revision: 0,
             }),
             policy: Mutex::new(policy(SplitTunnelMode::ExcludeSelected)),
             revision_calls: AtomicUsize::new(0),
@@ -1841,6 +1872,7 @@ impl CoordinatorApi {
             enabled: true,
             revision,
             force_revision,
+            address_revision: 0,
         };
     }
 

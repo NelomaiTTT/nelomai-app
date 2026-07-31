@@ -15,8 +15,16 @@ export interface SplitTunnelState {
   mandatoryExcludedPackages: string[];
   suggestedNameFragments: string[];
   selectedPackages: string[];
+  addressRules?: SplitTunnelAddressRule[];
   warning: string | null;
   capabilities: SplitTunnelCapabilities;
+}
+
+export interface SplitTunnelAddressRule {
+  id: number;
+  scope: "this_device" | "all_devices";
+  kind: "ipv4" | "domain";
+  value: string;
 }
 
 export interface InstalledApplication {
@@ -64,6 +72,10 @@ export function splitTunnelWarningMessage(code: string): string {
       return "Не удалось обновить подключение после смены сети. Повторите отключение и подключитесь снова.";
     case "split_tunnel_saved_connection_unavailable":
       return "Не удалось применить новые настройки к текущему подключению. Отключитесь и подключитесь снова.";
+    case "split_tunnel_domain_resolution_failed":
+      return "Не удалось обновить адрес домена. Используем последний рабочий адрес и повторим позже.";
+    case "split_tunnel_domain_resolution_unavailable":
+      return "Не удалось определить адрес домена. Проверьте подключение и повторите синхронизацию.";
     case "tunnel_runtime_stopped":
       return "Подключение остановилось на устройстве. Завершите отключение и подключитесь снова.";
     case "tunnel_status_unavailable":

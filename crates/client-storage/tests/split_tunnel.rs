@@ -1,6 +1,6 @@
 use nelomai_client_storage::{
     FileSplitTunnelStore, MemorySplitTunnelStore, SplitTunnelStore, StorageError,
-    StoredSplitTunnelState,
+    StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 use nelomai_contracts::{
     SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
@@ -61,6 +61,23 @@ fn malformed_and_oversized_state_are_rejected_without_partial_reads() {
         store.load(),
         Err(StorageError::SplitTunnelStateTooLarge { .. })
     ));
+}
+
+#[test]
+fn state_from_an_older_application_loads_with_address_defaults() {
+    let root = tempdir().unwrap();
+    let store = FileSplitTunnelStore::new(root.path());
+    fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+    fs::write(
+        store.path(),
+        br#"{"last_seen_force_revision":2,"pending_apply_results":[]}"#,
+    )
+    .unwrap();
+
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.last_seen_force_revision, 2);
+    assert_eq!(loaded.last_seen_address_revision, 0);
+    assert!(loaded.domain_resolutions.is_empty());
 }
 
 #[test]
@@ -133,6 +150,8 @@ fn debug_output_omits_packages_cidrs_and_apply_error_details() {
     for secret in [
         "com.example.secret",
         "203.0.113.0/24",
+        "private.example",
+        "198.51.100.10/32",
         "secret-package-com.example.bank",
     ] {
         assert!(!debug.contains(secret));
@@ -150,9 +169,15 @@ fn populated_state() -> StoredSplitTunnelState {
         last_full_sync_unix: Some(1_800_000_000),
         last_revision_check_unix: Some(1_800_000_100),
         last_seen_force_revision: 2,
+        last_seen_address_revision: 0,
         failed_policy_hash: Some(format!("sha256:{}", "b".repeat(64))),
         failed_policy_retry_after_unix: Some(1_800_003_600),
         pending_apply_results: Vec::new(),
+        domain_resolutions: vec![StoredSplitTunnelDomainResolution {
+            domain: "private.example".to_string(),
+            ipv4_cidrs: vec!["198.51.100.10/32".to_string()],
+            resolved_at_unix: 1_800_000_000,
+        }],
     }
 }
 
@@ -162,6 +187,7 @@ fn policy(revision: i64) -> SplitTunnelPolicy {
         enabled: true,
         revision,
         force_revision: 2,
+        address_revision: 0,
         policy_hash: format!("sha256:{}", "a".repeat(64)),
         mode: SplitTunnelMode::ExcludeSelected,
         exclude_local_networks: true,
@@ -169,6 +195,7 @@ fn policy(revision: i64) -> SplitTunnelPolicy {
         suggested_name_fragments: vec!["Example".to_string()],
         selected_packages: vec!["com.example.secret".to_string()],
         excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
+        address_rules: Vec::new(),
         generated_at: "2026-07-30T12:00:00Z".to_string(),
     }
 }
@@ -178,6 +205,7 @@ fn apply_result(revision: i64, status: SplitTunnelApplyStatus) -> SplitTunnelApp
         format_version: 1,
         revision,
         force_revision: 2,
+        address_revision: 0,
         policy_hash: format!("sha256:{}", "a".repeat(64)),
         status,
         error_code: (status != SplitTunnelApplyStatus::Applied).then(|| "apply_failed".to_string()),

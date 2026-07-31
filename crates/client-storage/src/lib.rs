@@ -15,7 +15,8 @@ use thiserror::Error;
 mod split_tunnel;
 
 pub use split_tunnel::{
-    FileSplitTunnelStore, MemorySplitTunnelStore, SplitTunnelStore, StoredSplitTunnelState,
+    FileSplitTunnelStore, MemorySplitTunnelStore, SplitTunnelStore,
+    StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 
 const SERVICE_NAME: &str = "ru.nelomai.app";

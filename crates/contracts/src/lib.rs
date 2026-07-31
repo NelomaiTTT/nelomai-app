@@ -4,8 +4,9 @@ use std::fmt;
 mod split_tunnel;
 
 pub use split_tunnel::{
-    SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
-    SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
+    SplitTunnelAddressRule, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
+    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
     SplitTunnelTimestampError, SplitTunnelTimestampField,
 };
 

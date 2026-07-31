@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use nelomai_client_api::ClientApi;
@@ -11,8 +11,9 @@ use nelomai_client_core::{ConnectOptions, NoopLogger, Phase};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
-    BindPeerRequest, Layer, Platform, RouteMode, SplitTunnelApplyResult, SplitTunnelApplyStatus,
-    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    BindPeerRequest, Layer, Platform, RouteMode, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
+    SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde_json::{json, Value};
 use std::{
@@ -37,6 +38,8 @@ struct MockPanelState {
     pinned: AtomicBool,
     split_settings_requests: AtomicUsize,
     split_apply_requests: AtomicUsize,
+    split_address_add_requests: AtomicUsize,
+    split_address_remove_requests: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -222,6 +225,14 @@ async fn split_tunnel_api_uses_authenticated_versioned_routes() {
             "/api/client/v1/split-tunnel/apply-result",
             post(split_tunnel_apply_result),
         )
+        .route(
+            "/api/client/v1/split-tunnel/address-rules",
+            post(split_tunnel_add_address_rule),
+        )
+        .route(
+            "/api/client/v1/split-tunnel/address-rules/{rule_id}",
+            delete(split_tunnel_remove_address_rule),
+        )
         .with_state(panel_state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
@@ -250,10 +261,33 @@ async fn split_tunnel_api_uses_authenticated_versioned_routes() {
         .unwrap();
     assert_eq!(updated.selected_packages, ["com.example.app"]);
 
+    let with_address = api
+        .add_split_tunnel_address_rule(
+            "access-token",
+            &SplitTunnelAddressRuleUpdate {
+                value: "example.com".to_string(),
+                scope: SplitTunnelAddressRuleScope::AllDevices,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_address.format_version, 2);
+    assert_eq!(with_address.address_rules[0].value, "example.com");
+    let without_address = api
+        .remove_split_tunnel_address_rule(
+            "access-token",
+            42,
+            SplitTunnelAddressRuleScope::AllDevices,
+        )
+        .await
+        .unwrap();
+    assert!(without_address.address_rules.is_empty());
+
     let result = SplitTunnelApplyResult {
         format_version: 1,
         revision: 7,
         force_revision: 2,
+        address_revision: 0,
         policy_hash: split_policy_hash(),
         status: SplitTunnelApplyStatus::Applied,
         error_code: None,
@@ -269,6 +303,18 @@ async fn split_tunnel_api_uses_authenticated_versioned_routes() {
         1
     );
     assert_eq!(panel_state.split_apply_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        panel_state
+            .split_address_add_requests
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        panel_state
+            .split_address_remove_requests
+            .load(Ordering::SeqCst),
+        1
+    );
     server.abort();
 }
 
@@ -421,6 +467,44 @@ async fn split_tunnel_apply_result(
         "request_id": "req-split-apply",
         "ok": true
     }))
+}
+
+async fn split_tunnel_add_address_rule(
+    State(state): State<Arc<MockPanelState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_authenticated(&headers);
+    assert_eq!(body["value"], "example.com");
+    assert_eq!(body["scope"], "all_devices");
+    state
+        .split_address_add_requests
+        .fetch_add(1, Ordering::SeqCst);
+    let mut policy = split_tunnel_policy_json();
+    policy["format_version"] = json!(2);
+    policy["address_revision"] = json!(1);
+    policy["address_rules"] = json!([{
+        "id": 42,
+        "scope": "all_devices",
+        "kind": "domain",
+        "value": "example.com"
+    }]);
+    Json(policy)
+}
+
+async fn split_tunnel_remove_address_rule(
+    State(state): State<Arc<MockPanelState>>,
+    Path(rule_id): Path<i64>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<Value> {
+    assert_authenticated(&headers);
+    assert_eq!(rule_id, 42);
+    assert_eq!(query.get("scope").map(String::as_str), Some("all_devices"));
+    state
+        .split_address_remove_requests
+        .fetch_add(1, Ordering::SeqCst);
+    Json(split_tunnel_policy_json())
 }
 
 async fn oversized_split_tunnel_policy(headers: HeaderMap) -> String {

@@ -9,11 +9,41 @@ pub enum SplitTunnelMode {
     IncludeSelected,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitTunnelAddressRuleScope {
+    ThisDevice,
+    AllDevices,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitTunnelAddressRuleKind {
+    Ipv4,
+    Domain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitTunnelAddressRule {
+    pub id: i64,
+    pub scope: SplitTunnelAddressRuleScope,
+    pub kind: SplitTunnelAddressRuleKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitTunnelAddressRuleUpdate {
+    pub value: String,
+    pub scope: SplitTunnelAddressRuleScope,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitTunnelRevision {
     pub enabled: bool,
     pub revision: i64,
     pub force_revision: i64,
+    #[serde(default)]
+    pub address_revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +58,8 @@ pub struct SplitTunnelPolicy {
     pub enabled: bool,
     pub revision: i64,
     pub force_revision: i64,
+    #[serde(default)]
+    pub address_revision: i64,
     pub policy_hash: String,
     pub mode: SplitTunnelMode,
     pub exclude_local_networks: bool,
@@ -35,6 +67,8 @@ pub struct SplitTunnelPolicy {
     pub suggested_name_fragments: Vec<String>,
     pub selected_packages: Vec<String>,
     pub excluded_ipv4_cidrs: Vec<String>,
+    #[serde(default)]
+    pub address_rules: Vec<SplitTunnelAddressRule>,
     pub generated_at: String,
 }
 
@@ -52,6 +86,7 @@ impl fmt::Debug for SplitTunnelPolicy {
             .field("enabled", &self.enabled)
             .field("revision", &self.revision)
             .field("force_revision", &self.force_revision)
+            .field("address_revision", &self.address_revision)
             .field("policy_hash", &self.policy_hash)
             .field("mode", &self.mode)
             .field("exclude_local_networks", &self.exclude_local_networks)
@@ -65,6 +100,7 @@ impl fmt::Debug for SplitTunnelPolicy {
             )
             .field("selected_packages_count", &self.selected_packages.len())
             .field("excluded_ipv4_cidrs_count", &self.excluded_ipv4_cidrs.len())
+            .field("address_rules_count", &self.address_rules.len())
             .finish()
     }
 }
@@ -100,6 +136,8 @@ pub struct SplitTunnelApplyResult {
     pub format_version: u16,
     pub revision: i64,
     pub force_revision: i64,
+    #[serde(default)]
+    pub address_revision: i64,
     pub policy_hash: String,
     pub status: SplitTunnelApplyStatus,
     pub error_code: Option<String>,

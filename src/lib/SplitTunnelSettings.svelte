@@ -7,6 +7,7 @@
     type SplitTunnelMode,
     type SplitTunnelSettingsUpdate,
     type SplitTunnelState,
+    type SplitTunnelAddressRule,
   } from "./split-tunnel";
   import { commandMessage } from "./native-client";
 
@@ -17,6 +18,8 @@
     onclose,
     onsave,
     onrefresh,
+    onaddaddressrule = undefined,
+    onremoveaddressrule = undefined,
   }: {
     state: SplitTunnelState;
     applications: InstalledApplication[];
@@ -24,6 +27,14 @@
     onclose: () => void;
     onsave: (request: SplitTunnelSettingsUpdate) => Promise<boolean>;
     onrefresh: () => Promise<void>;
+    onaddaddressrule?: (
+      value: string,
+      scope: SplitTunnelAddressRule["scope"],
+    ) => Promise<void>;
+    onremoveaddressrule?: (
+      ruleId: number,
+      scope: SplitTunnelAddressRule["scope"],
+    ) => Promise<void>;
   } = $props();
 
   let mode = $state<SplitTunnelMode>(initialMode());
@@ -33,6 +44,7 @@
   let showSystem = $state(false);
   let localBusy = $state(false);
   let localError = $state<string | null>(null);
+  let addressValue = $state("");
 
   let rows = $derived(
     buildApplicationRows(
@@ -47,6 +59,7 @@
       showSystem,
     ),
   );
+  let addressRules = $derived(settings.addressRules ?? []);
 
   let androidLegacy = $derived(
     settings.capabilities.platform === "android" &&
@@ -122,6 +135,34 @@
       await onrefresh();
     } catch {
       localError = "Не удалось обновить настройки";
+    } finally {
+      localBusy = false;
+    }
+  }
+
+  async function addAddressRule(scope: SplitTunnelAddressRule["scope"]) {
+    const value = addressValue.trim();
+    if (!value || !onaddaddressrule || localBusy || busy) return;
+    localBusy = true;
+    localError = null;
+    try {
+      await onaddaddressrule(value, scope);
+      addressValue = "";
+    } catch (reason) {
+      localError = commandMessage(reason);
+    } finally {
+      localBusy = false;
+    }
+  }
+
+  async function removeAddressRule(rule: SplitTunnelAddressRule) {
+    if (!onremoveaddressrule || localBusy || busy) return;
+    localBusy = true;
+    localError = null;
+    try {
+      await onremoveaddressrule(rule.id, rule.scope);
+    } catch (reason) {
+      localError = commandMessage(reason);
     } finally {
       localBusy = false;
     }
@@ -206,6 +247,64 @@
         disabled={localBusy || busy || !localNetworksEditable}
       />
     </label>
+
+    {#if settings.enabled && settings.capabilities.addressSplitTunnel}
+      <section class="address-rules" aria-labelledby="address-rules-title">
+        <div>
+          <p class="eyebrow">Адреса</p>
+          <h3 id="address-rules-title">Исключить ресурс из VPN</h3>
+          <p class="address-description">
+            IPv4-адрес, домен или ссылка будут открываться напрямую.
+          </p>
+        </div>
+        <div class="address-add">
+          <input
+            type="text"
+            bind:value={addressValue}
+            maxlength="2048"
+            placeholder="Например, example.com или https://example.com/page"
+            disabled={localBusy || busy}
+          />
+          <div class="address-actions">
+            <button
+              class="quiet-button"
+              type="button"
+              onclick={() => addAddressRule("this_device")}
+              disabled={!addressValue.trim() || localBusy || busy}
+            >Для этого устройства</button>
+            <button
+              class="quiet-button"
+              type="button"
+              onclick={() => addAddressRule("all_devices")}
+              disabled={!addressValue.trim() || localBusy || busy}
+            >Для всех моих</button>
+          </div>
+        </div>
+        {#if addressRules.length}
+          <ul class="address-rule-list">
+            {#each addressRules as rule (`${rule.scope}:${rule.id}`)}
+              <li>
+                <span>
+                  <strong>{rule.value}</strong>
+                  <small>
+                    {rule.scope === "all_devices"
+                      ? "Все мои устройства"
+                      : "Это устройство"}
+                  </small>
+                </span>
+                <button
+                  class="icon-button"
+                  type="button"
+                  aria-label={`Удалить ${rule.value}`}
+                  onclick={() => removeAddressRule(rule)}
+                  disabled={localBusy || busy}
+                >×</button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {/if}
 
     {#if applicationSettingsVisible}
       <div class="application-tools">
@@ -301,7 +400,8 @@
     padding: 26px;
     display: grid;
     gap: 22px;
-    overflow: hidden;
+    overflow-x: hidden;
+    overflow-y: auto;
     color: #f5f6f8;
     border: 1px solid #3a444d;
     border-radius: 8px;
@@ -324,6 +424,7 @@
   }
 
   h2,
+  h3,
   p {
     margin: 0;
   }
@@ -417,6 +518,79 @@
   .toggle-row {
     justify-content: space-between;
     gap: 18px;
+  }
+
+  .address-rules {
+    display: grid;
+    gap: 12px;
+    padding: 16px;
+    border: 1px solid #333b43;
+    border-radius: 7px;
+    background: #0c1014;
+  }
+
+  h3 {
+    margin: 0;
+    font-size: 17px;
+  }
+
+  .address-description,
+  .address-rule-list small {
+    color: #9ca5ad;
+    font-size: 13px;
+  }
+
+  .address-add {
+    display: grid;
+    gap: 8px;
+  }
+
+  .address-add input {
+    min-width: 0;
+    min-height: 42px;
+    padding: 10px 12px;
+    color: #f5f6f8;
+    border: 1px solid #3a444d;
+    border-radius: 6px;
+    background: #171c21;
+  }
+
+  .address-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .address-rule-list {
+    margin: 0;
+    padding: 0;
+    display: grid;
+    max-height: 220px;
+    gap: 6px;
+    overflow-y: auto;
+    list-style: none;
+  }
+
+  .address-rule-list li {
+    min-height: 44px;
+    padding: 8px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-top: 1px solid #283039;
+  }
+
+  .address-rule-list span {
+    min-width: 0;
+    display: grid;
+    gap: 3px;
+  }
+
+  .address-rule-list strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .toggle-row > span {

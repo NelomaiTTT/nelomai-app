@@ -11,8 +11,9 @@ use nelomai_client_tunnel::{
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
     ConnectionStartRequest, ConnectionStartResponse, Layer, ProbeResult, RouteMode,
-    SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage,
-    SplitTunnelSettingsUpdate, TicConnectionMode,
+    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
+    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
+    TicConnectionMode,
 };
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
@@ -60,6 +61,7 @@ impl Default for CoreState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SplitTunnelWarningKind {
     Sync,
+    Dns,
     Operation,
     Runtime,
     Storage,
@@ -68,6 +70,7 @@ pub(crate) enum SplitTunnelWarningKind {
 #[derive(Debug, Default)]
 struct SplitTunnelWarnings {
     sync: Option<String>,
+    dns: Option<String>,
     operation: Option<String>,
     runtime: Option<String>,
     storage: Option<String>,
@@ -79,6 +82,7 @@ impl SplitTunnelWarnings {
             .as_ref()
             .or(self.operation.as_ref())
             .or(self.storage.as_ref())
+            .or(self.dns.as_ref())
             .or(self.sync.as_ref())
             .cloned()
     }
@@ -103,6 +107,7 @@ impl SplitTunnelWarnings {
     fn slot(&mut self, kind: SplitTunnelWarningKind) -> &mut Option<String> {
         match kind {
             SplitTunnelWarningKind::Sync => &mut self.sync,
+            SplitTunnelWarningKind::Dns => &mut self.dns,
             SplitTunnelWarningKind::Operation => &mut self.operation,
             SplitTunnelWarningKind::Runtime => &mut self.runtime,
             SplitTunnelWarningKind::Storage => &mut self.storage,
@@ -424,6 +429,21 @@ pub trait CoreApi: Send + Sync {
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
+    async fn add_split_tunnel_address_rule(
+        &self,
+        _access_token: &str,
+        _request: &SplitTunnelAddressRuleUpdate,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn remove_split_tunnel_address_rule(
+        &self,
+        _access_token: &str,
+        _rule_id: i64,
+        _scope: SplitTunnelAddressRuleScope,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
     async fn report_split_tunnel_apply_result(
         &self,
         _access_token: &str,
@@ -511,6 +531,27 @@ impl CoreApi for ClientApi {
         request: &SplitTunnelSettingsUpdate,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         ClientApi::update_split_tunnel_settings(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn add_split_tunnel_address_rule(
+        &self,
+        access_token: &str,
+        request: &SplitTunnelAddressRuleUpdate,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        ClientApi::add_split_tunnel_address_rule(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn remove_split_tunnel_address_rule(
+        &self,
+        access_token: &str,
+        rule_id: i64,
+        scope: SplitTunnelAddressRuleScope,
+    ) -> Result<SplitTunnelPolicy, CoreApiError> {
+        ClientApi::remove_split_tunnel_address_rule(self, access_token, rule_id, scope)
             .await
             .map_err(Into::into)
     }
@@ -879,8 +920,14 @@ where
         let split_policy = self.cached_policy_for_start()?;
         let preflight_tunnel_options = match &split_policy {
             Some(policy) => Some(
-                self.effective_tunnel_options(policy, options.layer, options.route_mode)
-                    .await?,
+                self.effective_tunnel_options(
+                    policy,
+                    options.layer,
+                    options.route_mode,
+                    now_unix,
+                    true,
+                )
+                .await?,
             ),
             None => None,
         };
@@ -921,6 +968,8 @@ where
                     policy,
                     response.connection.layer,
                     response.connection.route_mode,
+                    now_unix,
+                    true,
                 )
                 .await
             {
@@ -1285,7 +1334,7 @@ where
         let split_policy = self.cached_policy_for_start()?;
         let tunnel_options = match &split_policy {
             Some(policy) => {
-                self.effective_tunnel_options(policy, saved.layer, saved.route_mode)
+                self.effective_tunnel_options(policy, saved.layer, saved.route_mode, now_unix, true)
                     .await?
             }
             None => {

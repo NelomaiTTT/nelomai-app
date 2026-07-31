@@ -7,13 +7,15 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
+futures = "0.3"
 nelomai-client-api = { path = "../client-api" }
 nelomai-client-storage = { path = "../client-storage" }
 nelomai-client-tunnel = { path = "../client-tunnel" }
 nelomai-contracts = { path = "../contracts" }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

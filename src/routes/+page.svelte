@@ -27,6 +27,7 @@
     splitTunnelWarningMessage,
     type InstalledApplication,
     type SplitTunnelSettingsUpdate,
+    type SplitTunnelAddressRule,
     type SplitTunnelState,
   } from "$lib/split-tunnel";
 
@@ -565,6 +566,22 @@
     }
   }
 
+  async function addSplitTunnelAddressRule(
+    value: string,
+    scope: SplitTunnelAddressRule["scope"],
+  ): Promise<void> {
+    splitTunnelState = await nativeClient.addSplitTunnelAddressRule(value, scope);
+    runtimeWarning = splitTunnelState.warning;
+  }
+
+  async function removeSplitTunnelAddressRule(
+    ruleId: number,
+    scope: SplitTunnelAddressRule["scope"],
+  ): Promise<void> {
+    splitTunnelState = await nativeClient.removeSplitTunnelAddressRule(ruleId, scope);
+    runtimeWarning = splitTunnelState.warning;
+  }
+
   function updateProgress(status: UpdateStatus): string {
     if (!status.total || status.total <= 0) {
       return formatBytes(status.downloaded);
@@ -1028,6 +1045,8 @@
     onclose={() => (splitTunnelOpen = false)}
     onsave={saveSplitTunnel}
     onrefresh={() => loadSplitTunnel(true)}
+    onaddaddressrule={addSplitTunnelAddressRule}
+    onremoveaddressrule={removeSplitTunnelAddressRule}
   />
 {/if}
 

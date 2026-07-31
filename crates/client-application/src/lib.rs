@@ -11,8 +11,9 @@ use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelSto
 use nelomai_client_tunnel::{TunnelController, TunnelError};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBindingResponse, PeerOptions, Platform,
-    ProbeResult, ProbeResults, ServerCandidatesResponse, SplitTunnelPolicy,
-    SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    ProbeResult, ProbeResults, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelPolicy, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
@@ -294,6 +295,29 @@ where
     ) -> Result<SplitTunnelPolicy, ApplicationError> {
         self.core
             .save_split_tunnel_settings(request, now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn add_split_tunnel_address_rule(
+        &self,
+        request: &SplitTunnelAddressRuleUpdate,
+        now_unix: i64,
+    ) -> Result<SplitTunnelPolicy, ApplicationError> {
+        self.core
+            .add_split_tunnel_address_rule(request, now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn remove_split_tunnel_address_rule(
+        &self,
+        rule_id: i64,
+        scope: SplitTunnelAddressRuleScope,
+        now_unix: i64,
+    ) -> Result<SplitTunnelPolicy, ApplicationError> {
+        self.core
+            .remove_split_tunnel_address_rule(rule_id, scope, now_unix)
             .await
             .map_err(Into::into)
     }

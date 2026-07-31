@@ -11,6 +11,25 @@ use std::{
 
 const STATE_LIMIT_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_APPLY_RESULTS: usize = 32;
+const MAX_DOMAIN_RESOLUTIONS: usize = 512;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSplitTunnelDomainResolution {
+    pub domain: String,
+    pub ipv4_cidrs: Vec<String>,
+    pub resolved_at_unix: i64,
+}
+
+impl fmt::Debug for StoredSplitTunnelDomainResolution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredSplitTunnelDomainResolution")
+            .field("domain_present", &!self.domain.is_empty())
+            .field("ipv4_cidrs_count", &self.ipv4_cidrs.len())
+            .field("resolved_at_unix", &self.resolved_at_unix)
+            .finish()
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -22,9 +41,11 @@ pub struct StoredSplitTunnelState {
     pub last_full_sync_unix: Option<i64>,
     pub last_revision_check_unix: Option<i64>,
     pub last_seen_force_revision: i64,
+    pub last_seen_address_revision: i64,
     pub failed_policy_hash: Option<String>,
     pub failed_policy_retry_after_unix: Option<i64>,
     pub pending_apply_results: Vec<SplitTunnelApplyResult>,
+    pub domain_resolutions: Vec<StoredSplitTunnelDomainResolution>,
 }
 
 impl fmt::Debug for StoredSplitTunnelState {
@@ -51,6 +72,10 @@ impl fmt::Debug for StoredSplitTunnelState {
             .field("last_revision_check_unix", &self.last_revision_check_unix)
             .field("last_seen_force_revision", &self.last_seen_force_revision)
             .field(
+                "last_seen_address_revision",
+                &self.last_seen_address_revision,
+            )
+            .field(
                 "failed_policy_hash_present",
                 &self.failed_policy_hash.is_some(),
             )
@@ -62,6 +87,7 @@ impl fmt::Debug for StoredSplitTunnelState {
                 "pending_apply_results_count",
                 &self.pending_apply_results.len(),
             )
+            .field("domain_resolutions_count", &self.domain_resolutions.len())
             .finish()
     }
 }
@@ -76,6 +102,11 @@ impl StoredSplitTunnelState {
                 .unwrap_or(0);
             self.pending_apply_results.remove(remove_at);
         }
+        self.domain_resolutions
+            .sort_by(|first, second| first.domain.cmp(&second.domain));
+        self.domain_resolutions
+            .dedup_by(|first, second| first.domain == second.domain);
+        self.domain_resolutions.truncate(MAX_DOMAIN_RESOLUTIONS);
         self
     }
 }

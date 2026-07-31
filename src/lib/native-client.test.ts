@@ -119,7 +119,7 @@ describe("native client", () => {
     expect(invoke).toHaveBeenNthCalledWith(4, "app_update_restart");
   });
 
-  it("routes split-tunnel state, inventory, save, and refresh through native commands", async () => {
+  it("routes every split-tunnel mutation through native commands", async () => {
     const invoke = vi.fn().mockResolvedValue({});
     const client = createNativeClient(invoke);
     const request = {
@@ -137,6 +137,8 @@ describe("native client", () => {
     await client.splitTunnelInstalledApplications();
     await client.saveSplitTunnel(request, true);
     await client.refreshSplitTunnel();
+    await client.addSplitTunnelAddressRule("example.com", "all_devices");
+    await client.removeSplitTunnelAddressRule(42, "all_devices");
 
     expect(invoke).toHaveBeenNthCalledWith(1, "app_split_tunnel_state");
     expect(invoke).toHaveBeenNthCalledWith(
@@ -148,5 +150,17 @@ describe("native client", () => {
       confirmReconnect: true,
     });
     expect(invoke).toHaveBeenNthCalledWith(4, "app_split_tunnel_refresh");
+    expect(invoke).toHaveBeenNthCalledWith(
+      5,
+      "app_split_tunnel_add_address_rule",
+      {
+        request: { value: "example.com", scope: "all_devices" },
+      },
+    );
+    expect(invoke).toHaveBeenNthCalledWith(
+      6,
+      "app_split_tunnel_remove_address_rule",
+      { ruleId: 42, scope: "all_devices" },
+    );
   });
 });

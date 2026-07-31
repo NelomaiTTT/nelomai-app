@@ -89,6 +89,14 @@ describe("SplitTunnelSettings", () => {
 
   it("shows only address settings on desktop", () => {
     const desktop = state(35);
+    desktop.addressRules = [
+      {
+        id: 42,
+        scope: "all_devices",
+        kind: "domain",
+        value: "example.com",
+      },
+    ];
     desktop.capabilities = {
       platform: "windows",
       androidApiLevel: null,
@@ -110,8 +118,38 @@ describe("SplitTunnelSettings", () => {
     expect(body).toContain(
       "На компьютере локальная сеть всегда доступна напрямую",
     );
+    expect(body).toContain("Исключить ресурс из VPN");
+    expect(body).toContain("example.com");
+    expect(body).toContain("Все мои устройства");
     expect(body).not.toContain("Режим приложений");
     expect(body).not.toContain("Browser");
+  });
+
+  it("hides personal address controls while split-tunnel is globally disabled", () => {
+    const disabled = state(35);
+    disabled.enabled = false;
+    disabled.addressRules = [
+      {
+        id: 42,
+        scope: "all_devices",
+        kind: "domain",
+        value: "example.com",
+      },
+    ];
+    const { body } = render(SplitTunnelSettings, {
+      props: {
+        state: disabled,
+        applications,
+        busy: false,
+        onclose: () => {},
+        onsave: async () => true,
+        onrefresh: async () => {},
+      },
+    });
+
+    expect(body).toContain("Функция пока выключена");
+    expect(body).not.toContain("Исключить ресурс из VPN");
+    expect(body).not.toContain("example.com");
   });
 
   it("explains a failed reconnect after the physical network changes", () => {

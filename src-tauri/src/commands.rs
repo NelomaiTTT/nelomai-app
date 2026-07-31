@@ -10,8 +10,8 @@ use nelomai_client_core::{
 use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, Connection, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
-    Platform, ProbeResults, RouteMode, SplitTunnelMode, SplitTunnelSelectedPackage,
-    SplitTunnelSettingsUpdate, TicConnectionMode,
+    Platform, ProbeResults, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
+    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -107,6 +107,10 @@ impl CommandError {
                 "split_tunnel_rollback_failed" => Self::new(
                     "split_tunnel_rollback_failed",
                     "Не удалось восстановить подключение. Запустите его снова",
+                ),
+                "split_tunnel_address_rule_invalid" => Self::new(
+                    "split_tunnel_address_rule_invalid",
+                    "Укажите корректный IPv4-адрес, домен или HTTP(S)-ссылку",
                 ),
                 _ => Self::new(
                     "split_tunnel_policy_unavailable",
@@ -587,8 +591,25 @@ pub struct SplitTunnelStateResponse {
     mandatory_excluded_packages: Vec<String>,
     suggested_name_fragments: Vec<String>,
     selected_packages: Vec<String>,
+    address_rules: Vec<SplitTunnelAddressRuleResponse>,
     warning: Option<String>,
     capabilities: SplitTunnelCapabilitiesResponse,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitTunnelAddressRuleResponse {
+    id: i64,
+    scope: &'static str,
+    kind: &'static str,
+    value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitTunnelAddressRuleRequest {
+    value: String,
+    scope: SplitTunnelAddressRuleScope,
 }
 
 #[derive(Clone, Serialize)]
@@ -701,6 +722,37 @@ pub async fn app_split_tunnel_refresh(
 }
 
 #[tauri::command]
+pub async fn app_split_tunnel_add_address_rule(
+    application: State<'_, Arc<NativeApplication>>,
+    request: SplitTunnelAddressRuleRequest,
+) -> Result<SplitTunnelStateResponse, CommandError> {
+    application
+        .add_split_tunnel_address_rule(
+            &SplitTunnelAddressRuleUpdate {
+                value: request.value,
+                scope: request.scope,
+            },
+            now_unix(),
+        )
+        .await
+        .map_err(CommandError::from)?;
+    split_tunnel_state(&application).await
+}
+
+#[tauri::command]
+pub async fn app_split_tunnel_remove_address_rule(
+    application: State<'_, Arc<NativeApplication>>,
+    rule_id: i64,
+    scope: SplitTunnelAddressRuleScope,
+) -> Result<SplitTunnelStateResponse, CommandError> {
+    application
+        .remove_split_tunnel_address_rule(rule_id, scope, now_unix())
+        .await
+        .map_err(CommandError::from)?;
+    split_tunnel_state(&application).await
+}
+
+#[tauri::command]
 pub async fn app_logout(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<(), CommandError> {
@@ -755,6 +807,22 @@ async fn split_tunnel_state(
             mandatory_excluded_packages: policy.mandatory_excluded_packages,
             suggested_name_fragments: policy.suggested_name_fragments,
             selected_packages: policy.selected_packages,
+            address_rules: policy
+                .address_rules
+                .into_iter()
+                .map(|rule| SplitTunnelAddressRuleResponse {
+                    id: rule.id,
+                    scope: match rule.scope {
+                        SplitTunnelAddressRuleScope::ThisDevice => "this_device",
+                        SplitTunnelAddressRuleScope::AllDevices => "all_devices",
+                    },
+                    kind: match rule.kind {
+                        nelomai_contracts::SplitTunnelAddressRuleKind::Ipv4 => "ipv4",
+                        nelomai_contracts::SplitTunnelAddressRuleKind::Domain => "domain",
+                    },
+                    value: rule.value,
+                })
+                .collect(),
             warning,
             capabilities: capabilities.into(),
         },
@@ -766,6 +834,7 @@ async fn split_tunnel_state(
             mandatory_excluded_packages: Vec::new(),
             suggested_name_fragments: Vec::new(),
             selected_packages: Vec::new(),
+            address_rules: Vec::new(),
             warning,
             capabilities: capabilities.into(),
         },
