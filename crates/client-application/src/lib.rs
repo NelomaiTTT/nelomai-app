@@ -352,6 +352,10 @@ where
         Ok(options)
     }
 
+    pub async fn probe_connection_latency_ms(&self, probe_url: &str) -> Option<f64> {
+        self.api.probe_latency_ms(probe_url).await
+    }
+
     pub fn set_split_tunnel_installed_packages(&self, packages: Vec<SplitTunnelSelectedPackage>) {
         self.core.set_split_tunnel_installed_packages(packages);
     }

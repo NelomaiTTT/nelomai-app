@@ -445,6 +445,7 @@ fn previous_account() -> StoredAuth {
             layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Dynamic,
             route_mode: RouteMode::Standalone,
+            probe_url: Some("https://5a.example.test/probe".to_string()),
             kind: StoredConnectionKind::Pinned,
             configuration: "PrivateKey = old-account-secret".to_string(),
             valid_until_unix: None,

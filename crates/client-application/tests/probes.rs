@@ -45,6 +45,7 @@ impl CoreApi for ProbeApi {
                 layer: request.layer,
                 tic_connection_mode: request.tic_connection_mode,
                 route_mode: request.route_mode,
+                probe_url: Some("https://1a.example.test/probe".to_string()),
                 status: LeaseStatus::Issued,
                 pinned: false,
                 stopped_at: None,

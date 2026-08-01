@@ -264,14 +264,15 @@ fn start_connection_metrics_scheduler(
                 continue;
             };
             let probe = tracker.should_probe(&connection.lease_id).await;
-            if let Ok(Some(sample)) = tunnel.metrics(probe).await {
+            if let Ok(Some(sample)) = tunnel.metrics(false).await {
                 let probe_result = if probe {
-                    if let Some(target) = sample.probe_target.clone() {
-                        tokio::task::spawn_blocking(move || {
-                            nelomai_client_tunnel::probe_host(&target)
-                        })
-                        .await
-                        .ok()
+                    if let Some(probe_url) = connection.probe_url.as_deref() {
+                        Some(
+                            application
+                                .probe_connection_latency_ms(probe_url)
+                                .await
+                                .map(|latency| latency.ceil().clamp(1.0, u32::MAX as f64) as u32),
+                        )
                     } else {
                         None
                     }

@@ -239,6 +239,8 @@ pub struct Connection {
     pub layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub probe_url: Option<String>,
     pub status: LeaseStatus,
     pub pinned: bool,
     pub stopped_at: Option<String>,

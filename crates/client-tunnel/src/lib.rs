@@ -6,10 +6,8 @@ use std::net::Ipv4Addr;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-mod probe;
 mod routes;
 
-pub use probe::probe_host;
 pub use routes::{Ipv4RoutePlan, RoutePlanError};
 
 const MAX_PACKAGE_IDS: usize = 512;

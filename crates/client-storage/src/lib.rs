@@ -35,6 +35,8 @@ pub struct StoredConnection {
     pub layer: StoredLayer,
     pub tic_connection_mode: StoredTicConnectionMode,
     pub route_mode: StoredRouteMode,
+    #[serde(default)]
+    pub probe_url: Option<String>,
     pub kind: StoredConnectionKind,
     pub configuration: String,
     pub valid_until_unix: Option<i64>,
@@ -48,6 +50,7 @@ impl fmt::Debug for StoredConnection {
             .field("layer", &self.layer)
             .field("tic_connection_mode", &self.tic_connection_mode)
             .field("route_mode", &self.route_mode)
+            .field("probe_url", &self.probe_url)
             .field("kind", &self.kind)
             .field("configuration", &"<redacted>")
             .field("valid_until_unix", &self.valid_until_unix)
@@ -439,6 +442,7 @@ mod tests {
             layer: StoredLayer::Stray,
             tic_connection_mode: StoredTicConnectionMode::Dynamic,
             route_mode: StoredRouteMode::Standalone,
+            probe_url: Some("https://5a.example.test/probe".to_string()),
             kind: StoredConnectionKind::Pinned,
             configuration: "PrivateKey = tunnel-secret".to_string(),
             valid_until_unix: None,
@@ -464,6 +468,7 @@ mod tests {
             layer: StoredLayer::Stray,
             tic_connection_mode: StoredTicConnectionMode::Dynamic,
             route_mode: StoredRouteMode::Standalone,
+            probe_url: Some("https://5a.example.test/probe".to_string()),
             kind: StoredConnectionKind::DynamicWarm,
             configuration: "[Interface]\nPrivateKey = secret\n".to_string(),
             valid_until_unix: Some(1_800_000_000),
@@ -473,6 +478,7 @@ mod tests {
             layer: StoredLayer::Stray,
             tic_connection_mode: StoredTicConnectionMode::Dynamic,
             route_mode: StoredRouteMode::Standalone,
+            probe_url: Some("https://5b.example.test/probe".to_string()),
             kind: StoredConnectionKind::Pinned,
             configuration: "[Interface]\nPrivateKey = pinned-secret\n".to_string(),
             valid_until_unix: None,
