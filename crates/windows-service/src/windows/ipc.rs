@@ -443,12 +443,17 @@ mod tests {
     use super::super::elevation::current_process_sid;
     use super::{exchange_blocking, finish_request, PipeServer};
     use crate::{ClientPolicy, Request, Response};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Mutex};
     use std::thread;
     use std::time::Duration;
 
+    static PIPE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn named_pipe_round_trip_reads_before_impersonation() {
+        let _pipe_test_guard = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let policy = ClientPolicy {
             owner_sid: current_process_sid().expect("read current process SID"),
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
@@ -474,6 +479,9 @@ mod tests {
 
     #[test]
     fn concurrent_client_waits_for_the_single_pipe_instance() {
+        let _pipe_test_guard = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let policy = ClientPolicy {
             owner_sid: current_process_sid().expect("read current process SID"),
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
