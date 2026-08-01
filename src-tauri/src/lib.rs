@@ -1,4 +1,5 @@
 mod commands;
+mod connection_metrics;
 #[cfg(desktop)]
 mod desktop;
 mod diagnostics;
@@ -18,6 +19,7 @@ const PANEL_BASE: &str = "https://nelomai.ru";
 const SPLIT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PHYSICAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PUSH_REGISTRATION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const CONNECTION_METRICS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 type NativeApplication = ClientApplication<
     ClientApi,
@@ -122,11 +124,12 @@ pub fn run() {
             app.path().app_data_dir()?.join("diagnostics"),
             resource_baseline,
         )?);
+        let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
         let application = Arc::new(ClientApplication::with_split_tunnel_store(
             Arc::new(api),
             Arc::new(SystemSecretStore::new("primary", fallback)),
             Arc::new(FileSplitTunnelStore::new(&app_data_directory)),
-            Arc::new(platform::tunnel_controller(app.handle().clone())),
+            tunnel.clone(),
             diagnostics.clone(),
         ));
         let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
@@ -134,16 +137,19 @@ pub fn run() {
         let preferences = Arc::new(preferences::AppPreferenceStore::new(
             app_data_directory.join("preferences.json"),
         ));
+        let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
         app.manage(diagnostics);
         app.manage(application.clone());
         app.manage(split_tunnel_scheduler.clone());
         app.manage(push_registration_scheduler.clone());
         app.manage(preferences);
+        app.manage(connection_metrics.clone());
         app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
         #[cfg(desktop)]
         desktop::setup_tray(app)?;
         start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
         start_physical_network_scheduler(application.clone());
+        start_connection_metrics_scheduler(application.clone(), tunnel, connection_metrics);
         start_push_registration_scheduler(
             app.handle().clone(),
             application,
@@ -230,6 +236,52 @@ fn start_physical_network_scheduler(application: Arc<NativeApplication>) {
         loop {
             interval.tick().await;
             let _ = application.poll_physical_network(current_unix_time()).await;
+        }
+    });
+}
+
+fn start_connection_metrics_scheduler(
+    application: Arc<NativeApplication>,
+    tunnel: Arc<platform::PlatformTunnelController>,
+    tracker: Arc<connection_metrics::ConnectionMetricsTracker>,
+) {
+    use nelomai_client_tunnel::TunnelController;
+
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(CONNECTION_METRICS_POLL_INTERVAL);
+        loop {
+            interval.tick().await;
+            if !tracker.is_observed().await {
+                tracker.clear().await;
+                continue;
+            }
+            let state = application.state().await;
+            let Some(connection) = state
+                .connection
+                .filter(|_| state.phase == nelomai_client_core::Phase::Connected)
+            else {
+                tracker.clear().await;
+                continue;
+            };
+            let probe = tracker.should_probe(&connection.lease_id).await;
+            if let Ok(Some(sample)) = tunnel.metrics(probe).await {
+                let probe_result = if probe {
+                    if let Some(target) = sample.probe_target.clone() {
+                        tokio::task::spawn_blocking(move || {
+                            nelomai_client_tunnel::probe_host(&target)
+                        })
+                        .await
+                        .ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                tracker
+                    .record(&connection.lease_id, sample, probe_result)
+                    .await;
+            }
         }
     });
 }

@@ -135,6 +135,14 @@ export interface AppState {
   phase: Phase;
   connection: Connection | null;
   warning: string | null;
+  metrics: ConnectionMetrics | null;
+}
+
+export interface ConnectionMetrics {
+  receivedBytes: number;
+  sentBytes: number;
+  latencyMs: number | null;
+  packetLossPercent: number | null;
 }
 
 export interface AppPreferences {

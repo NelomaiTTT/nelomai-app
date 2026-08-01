@@ -12,8 +12,9 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_CONNECTED,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -27,13 +28,15 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    ImpersonateNamedPipeClient, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_WAIT,
+    ImpersonateNamedPipeClient, WaitNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, OpenProcess, OpenThreadToken, QueryFullProcessImageNameW,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
+
+const PIPE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct NamedPipeTransport;
 
@@ -161,20 +164,7 @@ pub(crate) fn wake_server() {
 
 fn exchange_blocking(request: Request) -> Result<Response, ServiceError> {
     let pipe_name = wide(PIPE_NAME);
-    let pipe = unsafe {
-        CreateFileW(
-            pipe_name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            0,
-            null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut(),
-        )
-    };
-    if pipe == INVALID_HANDLE_VALUE {
-        return Err(last_error("open named pipe"));
-    }
+    let pipe = open_client_pipe(&pipe_name)?;
     let result = (|| {
         write_all(pipe, &encode_request(&request)?)?;
         decode_response(&read_frame(pipe)?)
@@ -183,6 +173,62 @@ fn exchange_blocking(request: Request) -> Result<Response, ServiceError> {
         CloseHandle(pipe);
     }
     result
+}
+
+fn open_client_pipe(pipe_name: &[u16]) -> Result<HANDLE, ServiceError> {
+    let deadline = std::time::Instant::now() + PIPE_CONNECT_TIMEOUT;
+    let mut observed_contention = false;
+    loop {
+        let pipe = unsafe {
+            CreateFileW(
+                pipe_name.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if pipe != INVALID_HANDLE_VALUE {
+            return Ok(pipe);
+        }
+        let error = unsafe { GetLastError() };
+        if error == ERROR_FILE_NOT_FOUND
+            && observed_contention
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        if error != ERROR_PIPE_BUSY {
+            return Err(platform_error(
+                "open named pipe",
+                io::Error::from_raw_os_error(error as i32),
+            ));
+        }
+        observed_contention = true;
+
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(platform_error(
+                "wait for named pipe",
+                io::Error::from_raw_os_error(ERROR_PIPE_BUSY as i32),
+            ));
+        }
+        let wait_millis = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+        if unsafe { WaitNamedPipeW(pipe_name.as_ptr(), wait_millis) } == 0 {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_FILE_NOT_FOUND && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            return Err(platform_error(
+                "wait for named pipe",
+                io::Error::from_raw_os_error(error as i32),
+            ));
+        }
+    }
 }
 
 fn read_frame(handle: HANDLE) -> Result<Vec<u8>, ServiceError> {
@@ -397,6 +443,7 @@ mod tests {
     use super::super::elevation::current_process_sid;
     use super::{exchange_blocking, finish_request, PipeServer};
     use crate::{ClientPolicy, Request, Response};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -422,6 +469,51 @@ mod tests {
         let response =
             exchange_blocking(Request::version()).expect("complete named pipe round trip");
         assert_eq!(response.service_version.as_deref(), Some("test"));
+        server_thread.join().expect("join pipe server");
+    }
+
+    #[test]
+    fn concurrent_client_waits_for_the_single_pipe_instance() {
+        let policy = ClientPolicy {
+            owner_sid: current_process_sid().expect("read current process SID"),
+            installed_client_path: std::env::current_exe().expect("resolve test executable"),
+        };
+        let server = PipeServer::new(policy);
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            for index in 0..2 {
+                let (request, pipe) = server
+                    .accept()
+                    .expect("accept pipe request")
+                    .expect("receive pipe request");
+                assert!(matches!(request, Request::Version { .. }));
+                if index == 0 {
+                    accepted_tx.send(()).expect("signal first request");
+                    thread::sleep(Duration::from_millis(250));
+                }
+                let mut response = Response::success(None);
+                response.service_version = Some(format!("test-{index}"));
+                finish_request(pipe, &response).expect("send pipe response");
+            }
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        let first = thread::spawn(|| exchange_blocking(Request::version()));
+        accepted_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first request accepted");
+        let second = exchange_blocking(Request::version()).expect("wait for the pipe instance");
+
+        assert_eq!(second.service_version.as_deref(), Some("test-1"));
+        assert_eq!(
+            first
+                .join()
+                .expect("join first client")
+                .expect("complete first request")
+                .service_version
+                .as_deref(),
+            Some("test-0")
+        );
         server_thread.join().expect("join pipe server");
     }
 }

@@ -87,7 +87,7 @@ pub fn quit_application(app: AppHandle) {
     }
     tauri::async_runtime::spawn(async move {
         let application = app.state::<Arc<NativeApplication>>().inner().clone();
-        let result = application.stop_for_shutdown().await.map(|_| ());
+        let result = commands::stop_for_shutdown(&app, application.as_ref()).await;
         match result {
             Ok(()) => app.exit(0),
             Err(error) => {
@@ -95,7 +95,10 @@ pub fn quit_application(app: AppHandle) {
                 show_window(&app);
                 let _ = app.emit(
                     "native-connection-changed",
-                    Some(format!("Не удалось завершить подключение: {error}")),
+                    Some(format!(
+                        "Не удалось завершить подключение: {}",
+                        error.message()
+                    )),
                 );
             }
         }

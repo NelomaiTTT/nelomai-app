@@ -4,14 +4,20 @@ use super::install::{
 };
 use super::routes::WindowsRouteManager;
 use crate::{ServiceError, ServiceTunnelBackend, ServiceTunnelState};
-use nelomai_client_tunnel::DesktopTunnelOptions;
+use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use windows_service::service::ServiceState;
+use windows_sys::Win32::Foundation::NO_ERROR;
+use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+
+const TUNNEL_INTERFACE_NAME: &str = "nelomai";
 
 pub(crate) struct WindowsServiceBackend {
     routes: WindowsRouteManager,
+    endpoint: Option<IpAddr>,
 }
 
 impl WindowsServiceBackend {
@@ -32,7 +38,10 @@ impl WindowsServiceBackend {
         if !tunnel_active {
             routes.cleanup()?;
         }
-        Ok(Self { routes })
+        let endpoint = tunnel_active
+            .then(|| tunnel_config_path().ok().and_then(read_endpoint_from_file))
+            .flatten();
+        Ok(Self { routes, endpoint })
     }
 }
 
@@ -43,6 +52,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         options: &DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.stop()?;
+        self.endpoint = resolve_endpoint(configuration);
         if let Err(error) = self.routes.apply(options) {
             let _ = self.routes.cleanup();
             return Err(error);
@@ -58,6 +68,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
             Ok::<_, ServiceError>(())
         })();
         if let Err(error) = result {
+            self.endpoint = None;
             let config_path = tunnel_config_path().ok();
             let _ = remove_tunnel_service();
             if let Some(config_path) = config_path {
@@ -70,6 +81,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
     }
 
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        self.endpoint = None;
         let mut first_error = remove_tunnel_service().err();
         match tunnel_config_path() {
             Ok(path) => {
@@ -115,6 +127,70 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
         self.routes.physical_network_fingerprint()
     }
+
+    fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
+        let (received_bytes, sent_bytes) = interface_counters()?;
+        Ok(TunnelMetrics {
+            received_bytes,
+            sent_bytes,
+            probe_target: probe
+                .then_some(self.endpoint)
+                .flatten()
+                .map(|target| target.to_string()),
+        })
+    }
+}
+
+fn read_endpoint_from_file(path: std::path::PathBuf) -> Option<IpAddr> {
+    let configuration = zeroize::Zeroizing::new(fs::read_to_string(path).ok()?);
+    resolve_endpoint(&configuration)
+}
+
+fn resolve_endpoint(configuration: &str) -> Option<IpAddr> {
+    let value = configuration.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("Endpoint")
+            .then(|| value.trim())
+    })?;
+    if let Ok(endpoint) = value.parse::<std::net::SocketAddr>() {
+        return Some(endpoint.ip());
+    }
+    let (host, port) = value.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    (host.trim_matches(['[', ']']), port)
+        .to_socket_addrs()
+        .ok()?
+        .next()
+        .map(|endpoint| endpoint.ip())
+}
+
+fn interface_counters() -> Result<(u64, u64), ServiceError> {
+    let mut table = std::ptr::null_mut::<MIB_IF_TABLE2>();
+    let result = unsafe { GetIfTable2(&mut table) };
+    if result != NO_ERROR || table.is_null() {
+        return Err(ServiceError::Backend(format!(
+            "read tunnel interface table: {result}"
+        )));
+    }
+    let counters = unsafe {
+        let entries =
+            std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        entries
+            .iter()
+            .find(|entry| wide_string(&entry.Alias).eq_ignore_ascii_case(TUNNEL_INTERFACE_NAME))
+            .map(|entry| (entry.InOctets, entry.OutOctets))
+    };
+    unsafe { FreeMibTable(table.cast()) };
+    counters.ok_or_else(|| ServiceError::Backend("tunnel interface not found".to_string()))
+}
+
+fn wide_string(value: &[u16]) -> String {
+    let length = value
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..length])
 }
 
 fn write_configuration_atomically(path: &Path, configuration: &str) -> Result<(), ServiceError> {

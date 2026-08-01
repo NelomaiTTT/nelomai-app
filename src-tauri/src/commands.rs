@@ -1,3 +1,4 @@
+use crate::connection_metrics::{ConnectionMetricsResponse, ConnectionMetricsTracker};
 use crate::diagnostics::AppDiagnostics;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{
@@ -20,7 +21,7 @@ use nelomai_contracts::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use tauri_plugin_tunnel_android::TunnelAndroidExt;
 
 #[derive(Serialize)]
@@ -87,9 +88,9 @@ impl CommandError {
             ),
             CoreError::Api(error) => Self::from_api(error),
             CoreError::Tunnel(code) => match code.as_str() {
-                "service_unavailable" => Self::new(
+                code if tunnel_service_error(code) => Self::new(
                     "tunnel_service_unavailable",
-                    "Служба подключения не установлена или не запущена. Переустановите приложение",
+                    "Служба подключения недоступна. Повторите действие и разрешите её восстановление",
                 ),
                 "physical_network_monitor_unavailable" => Self::new(
                     "physical_network_monitor_unavailable",
@@ -204,12 +205,77 @@ impl CommandError {
     }
 }
 
+fn tunnel_service_error(code: &str) -> bool {
+    matches!(
+        code,
+        "service_unavailable"
+            | "service_outdated"
+            | "service_stopping"
+            | "unsupported_protocol"
+            | "unauthorized_client"
+            | "truncated_frame"
+            | "missing_service_version"
+    )
+}
+
+fn repairable_stop_error(error: &ApplicationError) -> bool {
+    matches!(
+        error,
+        ApplicationError::Core(CoreError::Tunnel(code)) if tunnel_service_error(code)
+    )
+}
+
+async fn stop_connection(
+    app: &AppHandle,
+    application: &NativeApplication,
+) -> Result<Connection, CommandError> {
+    match application.stop().await {
+        Ok(connection) => Ok(connection),
+        Err(error) if repairable_stop_error(&error) => {
+            crate::platform::prepare_tunnel_for_stop(app.clone())
+                .await
+                .map_err(CommandError::from_tunnel)?;
+            application.stop().await.map_err(Into::into)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) async fn stop_for_shutdown(
+    app: &AppHandle,
+    application: &NativeApplication,
+) -> Result<(), CommandError> {
+    let state = application.state().await;
+    if !matches!(
+        state.phase,
+        Phase::Connected | Phase::Connecting | Phase::Stopping
+    ) {
+        return Ok(());
+    }
+
+    match application.stop_for_shutdown().await {
+        Ok(_) => Ok(()),
+        Err(error) if repairable_stop_error(&error) => {
+            crate::platform::prepare_tunnel_for_stop(app.clone())
+                .await
+                .map_err(CommandError::from_tunnel)?;
+            application
+                .stop_for_shutdown()
+                .await
+                .map(|_| ())
+                .map_err(Into::into)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStateResponse {
     phase: &'static str,
     connection: Option<Connection>,
     warning: Option<String>,
+    metrics: Option<ConnectionMetricsResponse>,
 }
 
 #[derive(Serialize)]
@@ -220,13 +286,41 @@ pub struct AppPreferencesResponse {
 }
 
 impl AppStateResponse {
-    fn new(state: CoreState, warning: Option<String>) -> Self {
+    fn new(
+        state: CoreState,
+        warning: Option<String>,
+        metrics: Option<ConnectionMetricsResponse>,
+    ) -> Self {
         Self {
             phase: phase_name(state.phase),
             connection: state.connection,
             warning,
+            metrics,
         }
     }
+}
+
+async fn current_connection_metrics(
+    tracker: &ConnectionMetricsTracker,
+    state: &CoreState,
+) -> Option<ConnectionMetricsResponse> {
+    if state.phase != Phase::Connected {
+        return None;
+    }
+    let lease_id = &state.connection.as_ref()?.lease_id;
+    tracker.snapshot(lease_id).await
+}
+
+#[cfg(desktop)]
+fn metrics_view_is_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("main").is_some_and(|window| {
+        window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false)
+    })
+}
+
+#[cfg(not(desktop))]
+fn metrics_view_is_visible(_app: &AppHandle) -> bool {
+    true
 }
 
 fn phase_name(phase: Phase) -> &'static str {
@@ -295,11 +389,17 @@ impl From<PeerBindingResponse> for SafePeerBindingResponse {
 
 #[tauri::command]
 pub async fn app_state(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    metrics: State<'_, Arc<ConnectionMetricsTracker>>,
 ) -> Result<AppStateResponse, CommandError> {
+    if metrics_view_is_visible(&app) {
+        metrics.mark_observed().await;
+    }
     let state = application.state().await;
     let warning = application.split_tunnel_warning().await;
-    Ok(AppStateResponse::new(state, warning))
+    let current_metrics = current_connection_metrics(&metrics, &state).await;
+    Ok(AppStateResponse::new(state, warning, current_metrics))
 }
 
 #[tauri::command]
@@ -352,7 +452,7 @@ pub(crate) async fn quick_toggle(
     let state = application.state().await;
     match state.phase {
         Phase::Connected => {
-            application.stop().await.map_err(CommandError::from)?;
+            stop_connection(app, application).await?;
         }
         Phase::Ready | Phase::Error | Phase::ServerUnavailable => {
             let bootstrap = application
@@ -433,7 +533,9 @@ pub(crate) async fn quick_toggle(
     }
     let state = application.state().await;
     let warning = application.split_tunnel_warning().await;
-    Ok(AppStateResponse::new(state, warning))
+    let metrics = app.state::<Arc<ConnectionMetricsTracker>>();
+    let current_metrics = current_connection_metrics(&metrics, &state).await;
+    Ok(AppStateResponse::new(state, warning, current_metrics))
 }
 
 #[tauri::command]
@@ -620,9 +722,10 @@ pub async fn app_start_saved_stray(
 
 #[tauri::command]
 pub async fn app_stop(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<Connection, CommandError> {
-    application.stop().await.map_err(Into::into)
+    stop_connection(&app, &application).await
 }
 
 #[tauri::command]
@@ -1265,5 +1368,23 @@ mod tests {
 
         assert_eq!(error.code, "split_tunnel_stop_failed");
         assert!(error.message.contains("остановить подключение"));
+    }
+
+    #[test]
+    fn tunnel_service_failures_are_repairable_before_stop_retry() {
+        for code in [
+            "service_unavailable",
+            "service_outdated",
+            "service_stopping",
+            "unsupported_protocol",
+            "unauthorized_client",
+            "truncated_frame",
+            "missing_service_version",
+        ] {
+            let error = ApplicationError::Core(CoreError::Tunnel(code.to_string()));
+            assert!(repairable_stop_error(&error), "{code}");
+        }
+        let route_error = ApplicationError::Core(CoreError::Tunnel("route_conflict".to_string()));
+        assert!(!repairable_stop_error(&route_error));
     }
 }

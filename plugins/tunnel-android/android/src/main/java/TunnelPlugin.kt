@@ -68,6 +68,12 @@ class VersionedTunnelArgs {
     var apiVersion: Int = 0
 }
 
+@InvokeArg
+class TunnelMetricsArgs {
+    var apiVersion: Int = 0
+    var probe: Boolean = false
+}
+
 internal object TunnelPayload {
     inline fun <T> consume(payload: ByteArray, action: (ByteArray) -> T): T {
         return try {
@@ -402,6 +408,36 @@ internal object TunnelRuntime {
         }
     }
 
+    fun metrics(
+        apiVersion: Int,
+        probe: Boolean,
+        onSuccess: (Long, Long, String?) -> Unit,
+        onError: (String) -> Unit,
+    ) {
+        try {
+            validateVersion(apiVersion)
+        } catch (error: Throwable) {
+            onError(errorCode(error))
+            return
+        }
+        executor.execute {
+            try {
+                val session = activeSession
+                    ?.takeIf { stateGate.current() == SessionState.RUNNING }
+                    ?: throw TunnelOperationException("tunnel_not_running")
+                val statistics = requireBackend().getStatistics(tunnel)
+                val target = if (probe) {
+                    session.config.peers.firstOrNull()?.endpoint?.orElse(null)?.host
+                } else {
+                    null
+                }
+                onSuccess(statistics.totalRx(), statistics.totalTx(), target)
+            } catch (error: Throwable) {
+                onError(errorCode(error))
+            }
+        }
+    }
+
     private fun requireBackend(): GoBackend =
         backend ?: error("tunnel_backend_unavailable")
 
@@ -523,6 +559,7 @@ internal object TunnelRuntime {
             "$stage duration_ms=${elapsedMillis(startedAt)}$suffix",
         )
     }
+
 }
 
 private class TunnelOperationException(val code: String) : RuntimeException()
@@ -780,6 +817,30 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         resolveOperation(invoke, TunnelRuntime.state(), 0)
+    }
+
+    @Command
+    fun tunnelMetrics(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(TunnelMetricsArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_tunnel_request")
+            return
+        }
+        TunnelRuntime.metrics(
+            args.apiVersion,
+            args.probe,
+            { received, sent, target ->
+                activity.runOnUiThread {
+                    val response = JSObject()
+                    response.put("receivedBytes", received)
+                    response.put("sentBytes", sent)
+                    response.put("probeTarget", target)
+                    invoke.resolve(response)
+                }
+            },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
     }
 
     @ActivityCallback

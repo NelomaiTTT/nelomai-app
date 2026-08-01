@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest, TunnelStatus,
+    TunnelConfiguration, TunnelController, TunnelError, TunnelMetrics, TunnelStartRequest,
+    TunnelStatus,
 };
 use nelomai_unix_service::{
     authorize_peer, decode_request, decode_response, encode_request, parse_configuration,
@@ -155,6 +156,14 @@ impl ServiceTunnelBackend for RecordingBackend {
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
         Ok("ab".repeat(32))
     }
+
+    fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
+        Ok(TunnelMetrics {
+            received_bytes: 120,
+            sent_bytes: 45,
+            probe_target: probe.then(|| "192.0.2.10".to_string()),
+        })
+    }
 }
 
 #[test]
@@ -170,6 +179,7 @@ fn handler_validates_protocol_and_configuration_before_mutation() {
     let stopped = handler.handle(Request::stop());
     let version = handler.handle(Request::version());
     let fingerprint = handler.handle(Request::physical_network_fingerprint());
+    let metrics = handler.handle(Request::metrics(true));
 
     assert_eq!(
         bad_protocol.error_code.as_deref(),
@@ -188,6 +198,41 @@ fn handler_validates_protocol_and_configuration_before_mutation() {
     );
     assert_eq!(handler.backend().starts, 1);
     assert_eq!(handler.backend().stops, 1);
+    assert_eq!(
+        metrics.metrics,
+        Some(TunnelMetrics {
+            received_bytes: 120,
+            sent_bytes: 45,
+            probe_target: Some("192.0.2.10".to_string()),
+        })
+    );
+}
+
+#[tokio::test]
+async fn controller_maps_helper_metrics_without_exposing_configuration() {
+    let mut response = Response::success(None);
+    response.metrics = Some(TunnelMetrics {
+        received_bytes: 512,
+        sent_bytes: 128,
+        probe_target: Some("192.0.2.23".to_string()),
+    });
+    let controller = UnixTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    assert_eq!(
+        controller.metrics(true).await.unwrap(),
+        Some(TunnelMetrics {
+            received_bytes: 512,
+            sent_bytes: 128,
+            probe_target: Some("192.0.2.23".to_string()),
+        })
+    );
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["metrics"]
+    );
 }
 
 struct RecordingTransport {
@@ -204,6 +249,7 @@ impl ServiceTransport for RecordingTransport {
             Request::Status { .. } => "status",
             Request::Version { .. } => "version",
             Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
+            Request::Metrics { .. } => "metrics",
         };
         self.requests.lock().unwrap().push(command);
         Ok(self.response.clone())

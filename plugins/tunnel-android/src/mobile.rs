@@ -6,6 +6,10 @@ use tauri::{
 
 use crate::models::*;
 
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmptyRequest {}
+
 #[cfg(target_os = "ios")]
 tauri::ios_plugin_binding!(init_plugin_tunnel_android);
 
@@ -91,6 +95,18 @@ impl<R: Runtime> TunnelAndroid<R> {
                 "tunnelStatus",
                 TunnelStatusRequest {
                     api_version: TUNNEL_API_VERSION,
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn tunnel_metrics(&self, probe: bool) -> crate::Result<TunnelMetricsResponse> {
+        self.0
+            .run_mobile_plugin(
+                "tunnelMetrics",
+                TunnelMetricsRequest {
+                    api_version: TUNNEL_API_VERSION,
+                    probe,
                 },
             )
             .map_err(Into::into)

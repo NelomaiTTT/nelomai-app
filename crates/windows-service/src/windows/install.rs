@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_service::service::{
-    Service, ServiceAccess, ServiceDependency, ServiceErrorControl, ServiceInfo, ServiceSidType,
-    ServiceStartType, ServiceState, ServiceType,
+    Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceDependency,
+    ServiceErrorControl, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo,
+    ServiceSidType, ServiceStartType, ServiceState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::LocalFree;
@@ -69,10 +70,42 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
     service
         .set_description("Controls Nelomai WireGuard tunnels for the installed desktop client.")
         .map_err(|error| platform_error("set manager service description", error))?;
+    configure_manager_recovery(&service)?;
     service
         .start(&[] as &[&str])
         .map_err(|error| platform_error("start manager service", error))?;
     wait_until_running(&service)
+}
+
+fn configure_manager_recovery(service: &Service) -> Result<(), ServiceError> {
+    service
+        .update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![
+                ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(1),
+                },
+                ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(5),
+                },
+                ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(30),
+                },
+                ServiceAction {
+                    action_type: ServiceActionType::None,
+                    delay: Duration::default(),
+                },
+            ]),
+        })
+        .map_err(|error| platform_error("configure manager service recovery", error))?;
+    service
+        .set_failure_actions_on_non_crash_failures(true)
+        .map_err(|error| platform_error("enable manager service recovery", error))
 }
 
 pub fn uninstall() -> Result<(), ServiceError> {

@@ -1,0 +1,245 @@
+use nelomai_client_tunnel::TunnelMetrics;
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const PROBE_WINDOW: usize = 12;
+const OBSERVATION_TTL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionMetricsResponse {
+    pub received_bytes: u64,
+    pub sent_bytes: u64,
+    pub latency_ms: Option<u32>,
+    pub packet_loss_percent: Option<u8>,
+}
+
+#[derive(Default)]
+struct SessionMetrics {
+    lease_id: String,
+    received_offset: u64,
+    sent_offset: u64,
+    previous_received: u64,
+    previous_sent: u64,
+    received_bytes: u64,
+    sent_bytes: u64,
+    probes: VecDeque<Option<u32>>,
+    last_probe_at: Option<Instant>,
+}
+
+pub struct ConnectionMetricsTracker {
+    session: Mutex<Option<SessionMetrics>>,
+    last_observed_at: Mutex<Option<Instant>>,
+}
+
+impl ConnectionMetricsTracker {
+    pub fn new() -> Self {
+        Self {
+            session: Mutex::new(None),
+            last_observed_at: Mutex::new(None),
+        }
+    }
+
+    pub async fn mark_observed(&self) {
+        *self.last_observed_at.lock().await = Some(Instant::now());
+    }
+
+    pub async fn is_observed(&self) -> bool {
+        self.last_observed_at
+            .lock()
+            .await
+            .is_some_and(|observed| observed.elapsed() <= OBSERVATION_TTL)
+    }
+
+    pub async fn should_probe(&self, lease_id: &str) -> bool {
+        let mut session = self.session.lock().await;
+        let current = session.get_or_insert_with(|| SessionMetrics {
+            lease_id: lease_id.to_string(),
+            ..SessionMetrics::default()
+        });
+        if current.lease_id != lease_id {
+            *current = SessionMetrics {
+                lease_id: lease_id.to_string(),
+                ..SessionMetrics::default()
+            };
+        }
+        let now = Instant::now();
+        let due = current
+            .last_probe_at
+            .is_none_or(|last| now.duration_since(last) >= PROBE_INTERVAL);
+        if due {
+            current.last_probe_at = Some(now);
+        }
+        due
+    }
+
+    pub async fn record(
+        &self,
+        lease_id: &str,
+        sample: TunnelMetrics,
+        probe_result: Option<Option<u32>>,
+    ) {
+        let mut session = self.session.lock().await;
+        let current = session.get_or_insert_with(|| SessionMetrics {
+            lease_id: lease_id.to_string(),
+            ..SessionMetrics::default()
+        });
+        if current.lease_id != lease_id {
+            *current = SessionMetrics {
+                lease_id: lease_id.to_string(),
+                ..SessionMetrics::default()
+            };
+        }
+
+        if sample.received_bytes < current.previous_received {
+            current.received_offset = current
+                .received_offset
+                .saturating_add(current.previous_received);
+        }
+        if sample.sent_bytes < current.previous_sent {
+            current.sent_offset = current.sent_offset.saturating_add(current.previous_sent);
+        }
+        current.previous_received = sample.received_bytes;
+        current.previous_sent = sample.sent_bytes;
+        current.received_bytes = current
+            .received_offset
+            .saturating_add(sample.received_bytes);
+        current.sent_bytes = current.sent_offset.saturating_add(sample.sent_bytes);
+
+        if let Some(latency_ms) = probe_result {
+            if current.probes.len() == PROBE_WINDOW {
+                current.probes.pop_front();
+            }
+            current.probes.push_back(latency_ms);
+        }
+    }
+
+    pub async fn snapshot(&self, lease_id: &str) -> Option<ConnectionMetricsResponse> {
+        let session = self.session.lock().await;
+        let current = session
+            .as_ref()
+            .filter(|session| session.lease_id == lease_id)?;
+        let successful = current.probes.iter().flatten().copied().collect::<Vec<_>>();
+        let latency_ms = (!successful.is_empty()).then(|| {
+            let total = successful
+                .iter()
+                .fold(0u64, |sum, value| sum.saturating_add(u64::from(*value)));
+            (total / successful.len() as u64).min(u64::from(u32::MAX)) as u32
+        });
+        let packet_loss_percent = (!successful.is_empty()).then(|| {
+            let lost = current
+                .probes
+                .iter()
+                .filter(|probe| probe.is_none())
+                .count();
+            ((lost * 100 + current.probes.len() / 2) / current.probes.len()).min(100) as u8
+        });
+        Some(ConnectionMetricsResponse {
+            received_bytes: current.received_bytes,
+            sent_bytes: current.sent_bytes,
+            latency_ms,
+            packet_loss_percent,
+        })
+    }
+
+    pub async fn clear(&self) {
+        *self.session.lock().await = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn aggregates_session_counters_restarts_and_probe_loss() {
+        let tracker = ConnectionMetricsTracker::new();
+        tracker
+            .record(
+                "lease",
+                TunnelMetrics {
+                    received_bytes: 100,
+                    sent_bytes: 40,
+                    probe_target: None,
+                },
+                Some(Some(20)),
+            )
+            .await;
+        tracker
+            .record(
+                "lease",
+                TunnelMetrics {
+                    received_bytes: 5,
+                    sent_bytes: 2,
+                    probe_target: None,
+                },
+                Some(None),
+            )
+            .await;
+
+        let metrics = tracker.snapshot("lease").await.expect("session metrics");
+        assert_eq!(metrics.received_bytes, 105);
+        assert_eq!(metrics.sent_bytes, 42);
+        assert_eq!(metrics.latency_ms, Some(20));
+        assert_eq!(metrics.packet_loss_percent, Some(50));
+    }
+
+    #[tokio::test]
+    async fn changing_lease_resets_the_session() {
+        let tracker = ConnectionMetricsTracker::new();
+        tracker
+            .record(
+                "first",
+                TunnelMetrics {
+                    received_bytes: 100,
+                    ..TunnelMetrics::default()
+                },
+                None,
+            )
+            .await;
+        tracker
+            .record(
+                "second",
+                TunnelMetrics {
+                    received_bytes: 3,
+                    ..TunnelMetrics::default()
+                },
+                None,
+            )
+            .await;
+
+        assert!(tracker.snapshot("first").await.is_none());
+        assert_eq!(tracker.snapshot("second").await.unwrap().received_bytes, 3);
+    }
+
+    #[tokio::test]
+    async fn reports_unavailable_loss_until_a_probe_succeeds() {
+        let tracker = ConnectionMetricsTracker::new();
+        tracker
+            .record(
+                "lease",
+                TunnelMetrics {
+                    ..TunnelMetrics::default()
+                },
+                Some(None),
+            )
+            .await;
+
+        let metrics = tracker.snapshot("lease").await.unwrap();
+        assert_eq!(metrics.latency_ms, None);
+        assert_eq!(metrics.packet_loss_percent, None);
+    }
+
+    #[tokio::test]
+    async fn collection_activity_expires_without_a_visible_client() {
+        let tracker = ConnectionMetricsTracker::new();
+        assert!(!tracker.is_observed().await);
+        tracker.mark_observed().await;
+        assert!(tracker.is_observed().await);
+        *tracker.last_observed_at.lock().await = Some(Instant::now() - OBSERVATION_TTL);
+        assert!(!tracker.is_observed().await);
+    }
+}

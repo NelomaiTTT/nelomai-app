@@ -16,6 +16,7 @@
     type AppPreferences,
     type Bootstrap,
     type Connection,
+    type ConnectionMetrics,
     type Layer,
     type PeerOption,
     type Phase,
@@ -50,6 +51,7 @@
   let probeBusy = $state(false);
   let availableCandidates = $state(0);
   let connection = $state<Connection | null>(null);
+  let connectionMetrics = $state<ConnectionMetrics | null>(null);
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
   let diagnosticsBusy = $state(false);
@@ -193,6 +195,7 @@
       const current = await nativeClient.quickToggle();
       phase = current.phase;
       connection = current.connection;
+      connectionMetrics = current.metrics;
       runtimeWarning = current.warning;
       view = viewForPhase(current.phase);
     } catch (reason) {
@@ -228,7 +231,11 @@
       const current = await nativeClient.state().catch(() => null);
       if (!current) return;
       runtimeWarning = current.warning;
-      if (current.phase === phase) return;
+      connectionMetrics = current.metrics;
+      if (current.phase === phase) {
+        connection = current.connection;
+        return;
+      }
       phase = current.phase;
       connection = current.connection;
       view = viewForPhase(current.phase);
@@ -304,6 +311,7 @@
     const state = await nativeClient.state();
     phase = state.phase;
     connection = state.connection;
+    connectionMetrics = state.metrics;
     runtimeWarning = state.warning;
     view = viewForPhase(state.phase);
     await loadSplitTunnel(false);
@@ -384,9 +392,11 @@
     try {
       if (stopping) {
         connection = await nativeClient.stop();
+        connectionMetrics = null;
         phase = "ready";
       } else {
         phase = "connecting";
+        connectionMetrics = null;
         await nativeClient.prepareTunnel();
         await syncBindingPreferences();
         connection = await nativeClient.start({
@@ -398,11 +408,14 @@
         phase = "connected";
       }
       view = "connection";
-      runtimeWarning = (await nativeClient.state()).warning;
+      const current = await nativeClient.state();
+      runtimeWarning = current.warning;
+      connectionMetrics = current.metrics;
     } catch (reason) {
       const current = await nativeClient.state().catch(() => null);
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
+      connectionMetrics = current?.metrics ?? connectionMetrics;
       runtimeWarning = current?.warning ?? runtimeWarning;
       error = commandMessage(reason);
     } finally {
@@ -747,6 +760,7 @@
       if (current) {
         phase = current.phase;
         connection = current.connection;
+        connectionMetrics = current.metrics;
         view = viewForPhase(current.phase);
       }
       await loadSplitTunnel(false);
@@ -783,6 +797,9 @@
 
   function formatBytes(value: number): string {
     if (value < 1024 * 1024) return `${Math.round(value / 1024)} КБ`;
+    if (value >= 1024 * 1024 * 1024) {
+      return `${(value / (1024 * 1024 * 1024)).toFixed(1)} ГБ`;
+    }
     return `${(value / (1024 * 1024)).toFixed(1)} МБ`;
   }
 
@@ -1035,6 +1052,34 @@
                   : "Нажмите для переключения"}
             </small>
           </button>
+
+          {#if phase === "connected"}
+            <dl class="connection-metrics" aria-label="Показатели подключения">
+              <div>
+                <dt>Трафик сессии</dt>
+                <dd>
+                  ↓ {formatBytes(connectionMetrics?.receivedBytes ?? 0)}
+                  <span>↑ {formatBytes(connectionMetrics?.sentBytes ?? 0)}</span>
+                </dd>
+              </div>
+              <div>
+                <dt>Пинг</dt>
+                <dd>
+                  {connectionMetrics?.latencyMs == null
+                    ? "—"
+                    : `${connectionMetrics.latencyMs} мс`}
+                </dd>
+              </div>
+              <div>
+                <dt>Потери</dt>
+                <dd>
+                  {connectionMetrics?.packetLossPercent == null
+                    ? "—"
+                    : `${connectionMetrics.packetLossPercent}%`}
+                </dd>
+              </div>
+            </dl>
+          {/if}
 
           {#if error}<p class="error-message">{error}</p>{/if}
           {#if runtimeWarning}
@@ -1735,6 +1780,39 @@
     font-size: 11px;
   }
 
+  .connection-metrics {
+    margin: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1.6fr) repeat(2, minmax(90px, 0.7fr));
+    gap: 8px;
+  }
+
+  .connection-metrics > div {
+    min-width: 0;
+    padding: 12px 14px;
+    border: 1px solid rgba(118, 137, 151, 0.3);
+    border-radius: 7px;
+    background: rgba(10, 15, 20, 0.72);
+  }
+
+  .connection-metrics dt {
+    color: #929da6;
+    font-size: 11px;
+  }
+
+  .connection-metrics dd {
+    margin: 5px 0 0;
+    color: #f4f7f8;
+    font-size: 15px;
+    font-weight: 720;
+    white-space: nowrap;
+  }
+
+  .connection-metrics dd span {
+    margin-left: 8px;
+    color: #aeb9c0;
+  }
+
   .settings-panel {
     display: grid;
     align-content: start;
@@ -1897,6 +1975,14 @@
 
     .connection-panel {
       min-height: 390px;
+    }
+
+    .connection-metrics {
+      grid-template-columns: 1fr 1fr;
+    }
+
+    .connection-metrics > div:first-child {
+      grid-column: 1 / -1;
     }
 
     .settings-panel {

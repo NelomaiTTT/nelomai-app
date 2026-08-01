@@ -2,7 +2,7 @@ use super::build_backend_configuration;
 use crate::routes::{RouteManager, SystemRouteBackend};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{Userspace, WGApi, WireguardInterfaceApi};
-use nelomai_client_tunnel::DesktopTunnelOptions;
+use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -244,6 +244,35 @@ impl ServiceTunnelBackend for MacosBackend {
 
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
         self.routes.physical_network_fingerprint()
+    }
+
+    fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
+        let host = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ServiceError::Backend("tunnel_not_running".to_string()))?
+            .read_interface_data()
+            .map_err(backend_error)?;
+        let received_bytes = host
+            .peers
+            .values()
+            .fold(0u64, |total, peer| total.saturating_add(peer.rx_bytes));
+        let sent_bytes = host
+            .peers
+            .values()
+            .fold(0u64, |total, peer| total.saturating_add(peer.tx_bytes));
+        let probe_target = probe
+            .then(|| {
+                host.peers
+                    .values()
+                    .find_map(|peer| peer.endpoint.map(|endpoint| endpoint.ip().to_string()))
+            })
+            .flatten();
+        Ok(TunnelMetrics {
+            received_bytes,
+            sent_bytes,
+            probe_target,
+        })
     }
 }
 

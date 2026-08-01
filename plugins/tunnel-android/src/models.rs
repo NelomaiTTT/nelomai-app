@@ -158,6 +158,21 @@ pub struct TunnelStatusRequest {
     pub api_version: u16,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelMetricsRequest {
+    pub api_version: u16,
+    pub probe: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelMetricsResponse {
+    pub received_bytes: u64,
+    pub sent_bytes: u64,
+    pub probe_target: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelOperationResponse {

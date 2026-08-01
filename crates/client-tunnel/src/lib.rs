@@ -6,8 +6,10 @@ use std::net::Ipv4Addr;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+mod probe;
 mod routes;
 
+pub use probe::probe_host;
 pub use routes::{Ipv4RoutePlan, RoutePlanError};
 
 const MAX_PACKAGE_IDS: usize = 512;
@@ -238,6 +240,14 @@ pub enum TunnelStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TunnelMetrics {
+    pub received_bytes: u64,
+    pub sent_bytes: u64,
+    pub probe_target: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum TunnelError {
     #[error("tunnel backend rejected the operation: {0}")]
@@ -251,6 +261,9 @@ pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
     async fn status(&self) -> Result<TunnelStatus, TunnelError>;
+    async fn metrics(&self, _probe: bool) -> Result<Option<TunnelMetrics>, TunnelError> {
+        Ok(None)
+    }
     async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
         Ok(None)
     }

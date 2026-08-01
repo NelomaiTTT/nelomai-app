@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    TunnelCapabilities, TunnelController, TunnelError, TunnelPlatform, TunnelStartRequest,
-    TunnelStatus,
+    TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics, TunnelPlatform,
+    TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::SplitTunnelMode;
 use tauri::{
@@ -124,6 +124,22 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                 "unknown Android tunnel state: {state}"
             ))),
         }
+    }
+
+    async fn metrics(
+        &self,
+        probe: bool,
+    ) -> std::result::Result<Option<TunnelMetrics>, TunnelError> {
+        let response = self
+            .app
+            .tunnel_android()
+            .tunnel_metrics(probe)
+            .map_err(to_tunnel_error)?;
+        Ok(Some(TunnelMetrics {
+            received_bytes: response.received_bytes,
+            sent_bytes: response.sent_bytes,
+            probe_target: response.probe_target,
+        }))
     }
 
     async fn capabilities(&self) -> std::result::Result<TunnelCapabilities, TunnelError> {

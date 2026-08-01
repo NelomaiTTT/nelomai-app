@@ -63,6 +63,9 @@ impl<R: Runtime> TunnelAndroid<R> {
     pub fn tunnel_status(&self) -> crate::Result<TunnelOperationResponse> {
         Ok(unsupported_response())
     }
+    pub fn tunnel_metrics(&self, _probe: bool) -> crate::Result<TunnelMetricsResponse> {
+        Ok(TunnelMetricsResponse::default())
+    }
 }
 
 fn unsupported_response() -> TunnelOperationResponse {

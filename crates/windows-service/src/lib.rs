@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelPlatform,
-    TunnelStartRequest, TunnelStatus,
+    DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
+    TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 pub mod windows;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
@@ -56,6 +56,8 @@ pub struct Response {
     pub service_version: Option<String>,
     #[serde(default)]
     pub physical_network_fingerprint: Option<String>,
+    #[serde(default)]
+    pub metrics: Option<TunnelMetrics>,
     pub error_code: Option<String>,
 }
 
@@ -67,6 +69,7 @@ impl Response {
             state,
             service_version: None,
             physical_network_fingerprint: None,
+            metrics: None,
             error_code: None,
         }
     }
@@ -78,6 +81,7 @@ impl Response {
             state: None,
             service_version: None,
             physical_network_fingerprint: None,
+            metrics: None,
             error_code: Some(error_code.into()),
         }
     }
@@ -100,6 +104,10 @@ pub enum Request {
     },
     PhysicalNetworkFingerprint {
         protocol_version: u16,
+    },
+    Metrics {
+        protocol_version: u16,
+        probe: bool,
     },
 }
 
@@ -140,6 +148,13 @@ impl Request {
         }
     }
 
+    pub fn metrics(probe: bool) -> Self {
+        Self::Metrics {
+            protocol_version: PROTOCOL_VERSION,
+            probe,
+        }
+    }
+
     pub fn protocol_version(&self) -> u16 {
         match self {
             Self::Start {
@@ -148,7 +163,10 @@ impl Request {
             | Self::Stop { protocol_version }
             | Self::Status { protocol_version }
             | Self::Version { protocol_version }
-            | Self::PhysicalNetworkFingerprint { protocol_version } => *protocol_version,
+            | Self::PhysicalNetworkFingerprint { protocol_version }
+            | Self::Metrics {
+                protocol_version, ..
+            } => *protocol_version,
         }
     }
 }
@@ -204,6 +222,16 @@ impl PartialEq for Request {
                     protocol_version: right,
                 },
             ) => left == right,
+            (
+                Self::Metrics {
+                    protocol_version: left_version,
+                    probe: left_probe,
+                },
+                Self::Metrics {
+                    protocol_version: right_version,
+                    probe: right_probe,
+                },
+            ) => left_version == right_version && left_probe == right_probe,
             _ => false,
         }
     }
@@ -240,6 +268,14 @@ impl fmt::Debug for Request {
                 .debug_struct("PhysicalNetworkFingerprint")
                 .field("protocol_version", protocol_version)
                 .finish(),
+            Self::Metrics {
+                protocol_version,
+                probe,
+            } => formatter
+                .debug_struct("Metrics")
+                .field("protocol_version", protocol_version)
+                .field("probe", probe)
+                .finish(),
         }
     }
 }
@@ -268,6 +304,11 @@ enum RequestRef<'a> {
     PhysicalNetworkFingerprint {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
+    },
+    Metrics {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+        probe: bool,
     },
 }
 
@@ -300,6 +341,13 @@ impl Serialize for Request {
                     protocol_version: *protocol_version,
                 }
             }
+            Self::Metrics {
+                protocol_version,
+                probe,
+            } => RequestRef::Metrics {
+                protocol_version: *protocol_version,
+                probe: *probe,
+            },
         }
         .serialize(serializer)
     }
@@ -331,6 +379,11 @@ enum RequestOwned {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
+    Metrics {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+        probe: bool,
+    },
 }
 
 impl<'de> Deserialize<'de> for Request {
@@ -354,6 +407,13 @@ impl<'de> Deserialize<'de> for Request {
             RequestOwned::PhysicalNetworkFingerprint { protocol_version } => {
                 Self::PhysicalNetworkFingerprint { protocol_version }
             }
+            RequestOwned::Metrics {
+                protocol_version,
+                probe,
+            } => Self::Metrics {
+                protocol_version,
+                probe,
+            },
         })
     }
 }
@@ -439,6 +499,9 @@ pub trait ServiceTunnelBackend {
             "physical_network_fingerprint_unavailable".to_string(),
         ))
     }
+    fn metrics(&self, _probe: bool) -> Result<TunnelMetrics, ServiceError> {
+        Err(ServiceError::Backend("metrics_unavailable".to_string()))
+    }
 }
 
 pub struct TunnelRequestHandler<B> {
@@ -498,6 +561,11 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                     response.physical_network_fingerprint = Some(fingerprint);
                     response
                 }),
+            Request::Metrics { probe, .. } => self.backend.metrics(probe).map(|metrics| {
+                let mut response = Response::success(None);
+                response.metrics = Some(metrics);
+                response
+            }),
         };
 
         result.unwrap_or_else(|error| Response::failure(error.code()))
@@ -664,6 +732,19 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
                 "invalid_physical_network_fingerprint".to_string(),
             ))
         }
+    }
+
+    async fn metrics(&self, probe: bool) -> Result<Option<TunnelMetrics>, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::metrics(probe))
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        response
+            .metrics
+            .map(Some)
+            .ok_or_else(|| TunnelError::Backend("missing_tunnel_metrics".to_string()))
     }
 
     async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {

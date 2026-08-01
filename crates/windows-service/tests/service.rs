@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    DesktopTunnelOptions, TunnelConfiguration, TunnelController, TunnelError, TunnelStartRequest,
-    TunnelStatus,
+    DesktopTunnelOptions, TunnelConfiguration, TunnelController, TunnelError, TunnelMetrics,
+    TunnelStartRequest, TunnelStatus,
 };
 use nelomai_windows_service::{
     Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
@@ -40,6 +40,14 @@ impl ServiceTunnelBackend for RecordingBackend {
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
         Ok("ab".repeat(32))
     }
+
+    fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
+        Ok(TunnelMetrics {
+            received_bytes: 120,
+            sent_bytes: 45,
+            probe_target: probe.then(|| "192.0.2.10".to_string()),
+        })
+    }
 }
 
 #[test]
@@ -67,6 +75,7 @@ fn handler_executes_only_typed_tunnel_operations() {
     let stopped = handler.handle(Request::stop());
     let version = handler.handle(Request::version());
     let fingerprint = handler.handle(Request::physical_network_fingerprint());
+    let metrics = handler.handle(Request::metrics(true));
 
     assert_eq!(started.state, Some(ServiceTunnelState::Running));
     assert_eq!(status.state, Some(ServiceTunnelState::Running));
@@ -78,6 +87,41 @@ fn handler_executes_only_typed_tunnel_operations() {
     );
     assert_eq!(handler.backend().starts, vec!["PrivateKey = transient"]);
     assert_eq!(handler.backend().stops, 1);
+    assert_eq!(
+        metrics.metrics,
+        Some(TunnelMetrics {
+            received_bytes: 120,
+            sent_bytes: 45,
+            probe_target: Some("192.0.2.10".to_string()),
+        })
+    );
+}
+
+#[tokio::test]
+async fn controller_maps_service_metrics_without_exposing_configuration() {
+    let mut response = Response::success(None);
+    response.metrics = Some(TunnelMetrics {
+        received_bytes: 512,
+        sent_bytes: 128,
+        probe_target: Some("192.0.2.23".to_string()),
+    });
+    let controller = WindowsTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    assert_eq!(
+        controller.metrics(true).await.unwrap(),
+        Some(TunnelMetrics {
+            received_bytes: 512,
+            sent_bytes: 128,
+            probe_target: Some("192.0.2.23".to_string()),
+        })
+    );
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["metrics"]
+    );
 }
 
 #[test]
@@ -162,6 +206,7 @@ impl ServiceTransport for RecordingTransport {
             Request::Status { .. } => "status",
             Request::Version { .. } => "version",
             Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
+            Request::Metrics { .. } => "metrics",
         };
         self.requests.lock().unwrap().push(summary.to_string());
         Ok(self.response.clone())

@@ -78,3 +78,24 @@ pub async fn prepare_tunnel(
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
     windows::prepare_tunnel().await
 }
+
+#[cfg(windows)]
+pub async fn prepare_tunnel_for_stop(
+    _app: tauri::AppHandle<tauri::Wry>,
+) -> Result<(), nelomai_client_tunnel::TunnelError> {
+    windows::prepare_tunnel().await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub async fn prepare_tunnel_for_stop(
+    app: tauri::AppHandle<tauri::Wry>,
+) -> Result<(), nelomai_client_tunnel::TunnelError> {
+    unix::prepare_tunnel(app).await
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+pub async fn prepare_tunnel_for_stop(
+    _app: tauri::AppHandle<tauri::Wry>,
+) -> Result<(), nelomai_client_tunnel::TunnelError> {
+    Ok(())
+}

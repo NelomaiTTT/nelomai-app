@@ -14,7 +14,7 @@ fn start_request_is_framed_and_redacted() {
     assert_eq!(decoded, request);
     assert_eq!(
         format!("{request:?}"),
-        "Start { protocol_version: 3, configuration: \"<redacted>\", options: DesktopTunnelOptions { excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false } }"
+        "Start { protocol_version: 4, configuration: \"<redacted>\", options: DesktopTunnelOptions { excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false } }"
     );
     assert!(!format!("{request:?}").contains("never-log-this"));
 }
