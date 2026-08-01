@@ -288,6 +288,34 @@ async fn personal_tic_connection_skips_server_candidates() {
 }
 
 #[tokio::test]
+async fn quick_connection_sends_no_probes_and_does_not_measure_candidates() {
+    let (application, api) = application();
+
+    application
+        .start_without_probe_refresh(
+            ConnectOptions {
+                layer: Layer::Stray,
+                tic_connection_mode: TicConnectionMode::Dynamic,
+                route_mode: RouteMode::Standalone,
+                probes: vec![ProbeResult {
+                    candidate_id: "must-be-discarded".to_string(),
+                    latency_ms: 1.0,
+                    measured_at: "2026-01-01T00:00:00Z".to_string(),
+                }],
+                allow_alternate: true,
+            },
+            1_800_000_000,
+        )
+        .await
+        .unwrap();
+
+    let request = api.start_request.lock().unwrap().clone().unwrap();
+    assert!(request.probes.is_empty());
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.probe_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn probe_tokens_are_not_reused_after_logout() {
     let (application, _) = application();
     application

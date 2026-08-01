@@ -37,6 +37,18 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(InstalledApplicationsResponse::default())
     }
 
+    pub fn resource_usage(&self) -> crate::Result<ResourceUsageResponse> {
+        Ok(ResourceUsageResponse::default())
+    }
+
+    pub fn take_quick_action(&self) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    pub fn refresh_quick_tile(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     pub fn start_tunnel(
         &self,
         _request: StartTunnelRequest,

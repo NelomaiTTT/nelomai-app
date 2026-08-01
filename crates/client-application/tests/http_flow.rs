@@ -167,9 +167,10 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     assert!(pinned.pinned);
     assert!(store.load().unwrap().unwrap().pinned_connection.is_some());
 
-    let stopped = application.stop().await.unwrap();
+    let stopped = application.stop_for_shutdown().await.unwrap().unwrap();
     assert_eq!(stopped.lease_id, LEASE_ID);
     assert_eq!(application.state().await.phase, Phase::Ready);
+    assert!(application.stop_for_shutdown().await.unwrap().is_none());
 
     let second = application.start(options, NOW + 30).await.unwrap();
     assert_eq!(second.lease_id, LEASE_ID);

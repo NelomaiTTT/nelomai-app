@@ -137,6 +137,11 @@ export interface AppState {
   warning: string | null;
 }
 
+export interface AppPreferences {
+  closeToTraySupported: boolean;
+  closeToTray: boolean;
+}
+
 export interface BindPeerRequest {
   peer_id: string;
   preferred_layer: Layer;

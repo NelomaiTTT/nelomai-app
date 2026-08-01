@@ -73,6 +73,23 @@ describe("native client", () => {
     expect(invoke).toHaveBeenCalledWith("app_prepare_tunnel");
   });
 
+  it("routes background controls and desktop preferences through native commands", async () => {
+    const invoke = vi.fn().mockResolvedValue({ closeToTray: true });
+    const client = createNativeClient(invoke);
+
+    await client.preferences();
+    await client.setCloseToTray(false);
+    await client.takeQuickAction();
+    await client.quickToggle();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "app_preferences");
+    expect(invoke).toHaveBeenNthCalledWith(2, "app_set_close_to_tray", {
+      enabled: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "app_take_quick_action");
+    expect(invoke).toHaveBeenNthCalledWith(4, "app_quick_toggle");
+  });
+
   it("routes pin, unpin, and peer replacement through native commands", async () => {
     const invoke = vi.fn().mockResolvedValue({});
     const client = createNativeClient(invoke);

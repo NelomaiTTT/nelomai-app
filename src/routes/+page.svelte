@@ -1,5 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { addPluginListener, type PluginListener } from "@tauri-apps/api/core";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
@@ -10,6 +13,7 @@
     requiresServerProbes,
     viewForPhase,
     type AppView,
+    type AppPreferences,
     type Bootstrap,
     type Connection,
     type Layer,
@@ -68,6 +72,12 @@
   let notificationsOpen = $state(false);
   let notificationsBusy = $state(false);
   let notificationsError = $state<string | null>(null);
+  let appPreferences = $state<AppPreferences | null>(null);
+  let quickActionBusy = false;
+  let quickActionQueued = false;
+  let quickActionRetryTimer: number | null = null;
+  let quickActionListener: PluginListener | null = null;
+  let nativeStateUnlisten: UnlistenFn | null = null;
   let splitTunnelBlocksStart = $derived(
     splitTunnelState !== null &&
       emptyIncludeSelection(splitTunnelState, splitTunnelApplications),
@@ -93,7 +103,23 @@
   };
 
   onMount(() => {
+    let disposed = false;
     void restore();
+    void loadAppPreferences();
+    void initializeQuickActions().then((listener) => {
+      if (disposed) {
+        void listener?.unregister();
+      } else {
+        quickActionListener = listener;
+      }
+    });
+    void listen<string | null>("native-connection-changed", (event) => {
+      if (event.payload) error = event.payload;
+      void synchronizeRuntimeState();
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else nativeStateUnlisten = unlisten;
+    });
     stateTimer = window.setInterval(() => {
       if (document.visibilityState === "visible") void synchronizeRuntimeState();
     }, 5_000);
@@ -114,13 +140,78 @@
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
+      disposed = true;
       window.clearInterval(timer);
       window.clearInterval(notificationTimer);
       if (stateTimer !== null) window.clearInterval(stateTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
       clearUpdateTimer();
+      if (quickActionRetryTimer !== null) window.clearTimeout(quickActionRetryTimer);
+      void quickActionListener?.unregister();
+      nativeStateUnlisten?.();
     };
   });
+
+  async function loadAppPreferences() {
+    appPreferences = await nativeClient.preferences().catch(() => null);
+  }
+
+  async function setCloseToTray(event: Event) {
+    const enabled = (event.currentTarget as HTMLInputElement).checked;
+    try {
+      appPreferences = await nativeClient.setCloseToTray(enabled);
+    } catch (reason) {
+      error = commandMessage(reason);
+    }
+  }
+
+  async function initializeQuickActions(): Promise<PluginListener | null> {
+    let listener: PluginListener | null = null;
+    try {
+      listener = await addPluginListener("tunnel-android", "quick-toggle", () => {
+        quickActionQueued = true;
+        void processQuickAction();
+      });
+      if (await nativeClient.takeQuickAction()) quickActionQueued = true;
+      void processQuickAction();
+    } catch {
+      // The Android quick-action bridge is intentionally absent on desktop.
+    }
+    return listener;
+  }
+
+  async function processQuickAction() {
+    if (!quickActionQueued) return;
+    if (quickActionBusy || busy) {
+      scheduleQuickAction();
+      return;
+    }
+    quickActionQueued = false;
+    quickActionBusy = true;
+    error = null;
+    try {
+      const current = await nativeClient.quickToggle();
+      phase = current.phase;
+      connection = current.connection;
+      runtimeWarning = current.warning;
+      view = viewForPhase(current.phase);
+    } catch (reason) {
+      error = commandMessage(reason);
+      await getCurrentWindow().show().catch(() => undefined);
+      await getCurrentWindow().setFocus().catch(() => undefined);
+    } finally {
+      quickActionBusy = false;
+      if (quickActionQueued) scheduleQuickAction();
+    }
+  }
+
+  function scheduleQuickAction() {
+    if (quickActionRetryTimer !== null) return;
+    quickActionRetryTimer = window.setTimeout(() => {
+      quickActionRetryTimer = null;
+      void processQuickAction();
+    }, 150);
+  }
 
   async function synchronizeRuntimeState() {
     if (
@@ -180,6 +271,7 @@
       }
     } finally {
       busy = false;
+      if (quickActionQueued) void processQuickAction();
     }
   }
 
@@ -1051,6 +1143,19 @@
                 type="checkbox"
                 checked={updateStatus.automatic}
                 onchange={setAutomaticUpdates}
+              />
+            </label>
+          {/if}
+          {#if appPreferences?.closeToTraySupported}
+            <label class="update-preference">
+              <span>
+                <strong>Крестик сворачивает в трей</strong>
+                <small>Приложение продолжит работать в фоне</small>
+              </span>
+              <input
+                type="checkbox"
+                checked={appPreferences.closeToTray}
+                onchange={setCloseToTray}
               />
             </label>
           {/if}

@@ -1,6 +1,10 @@
 mod commands;
+#[cfg(desktop)]
+mod desktop;
 mod diagnostics;
 mod platform;
+mod preferences;
+mod resource_usage;
 mod updates;
 
 use nelomai_client_api::ClientApi;
@@ -113,8 +117,10 @@ pub fn run() {
         let api = ClientApi::new(PANEL_BASE)
             .and_then(|api| api.with_app_version(env!("CARGO_PKG_VERSION")))
             .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let resource_baseline = resource_usage::ResourceSnapshot::capture(app.handle());
         let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
             app.path().app_data_dir()?.join("diagnostics"),
+            resource_baseline,
         )?);
         let application = Arc::new(ClientApplication::with_split_tunnel_store(
             Arc::new(api),
@@ -125,11 +131,17 @@ pub fn run() {
         ));
         let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
         let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
+        let preferences = Arc::new(preferences::AppPreferenceStore::new(
+            app_data_directory.join("preferences.json"),
+        ));
         app.manage(diagnostics);
         app.manage(application.clone());
         app.manage(split_tunnel_scheduler.clone());
         app.manage(push_registration_scheduler.clone());
+        app.manage(preferences);
         app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
+        #[cfg(desktop)]
+        desktop::setup_tray(app)?;
         start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
         start_physical_network_scheduler(application.clone());
         start_push_registration_scheduler(
@@ -143,6 +155,10 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             commands::app_state,
+            commands::app_preferences,
+            commands::app_set_close_to_tray,
+            commands::app_take_quick_action,
+            commands::app_quick_toggle,
             commands::app_login,
             commands::app_bootstrap,
             commands::app_peer_options,
@@ -172,6 +188,21 @@ pub fn run() {
             commands::app_register_push_token,
             commands::app_logout,
         ])
+        .on_window_event(|window, event| {
+            #[cfg(desktop)]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                use tauri::Manager;
+
+                let preferences = window.state::<Arc<preferences::AppPreferenceStore>>();
+                if preferences.get().close_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else {
+                    api.prevent_close();
+                    desktop::quit_application(window.app_handle().clone());
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

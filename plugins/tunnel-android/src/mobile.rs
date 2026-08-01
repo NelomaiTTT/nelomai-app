@@ -46,6 +46,25 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub fn resource_usage(&self) -> crate::Result<ResourceUsageResponse> {
+        self.0
+            .run_mobile_plugin("resourceUsage", ResourceUsageRequest::default())
+            .map_err(Into::into)
+    }
+
+    pub fn take_quick_action(&self) -> crate::Result<bool> {
+        self.0
+            .run_mobile_plugin::<QuickActionResponse>("takeQuickAction", EmptyRequest {})
+            .map(|response| response.pending)
+            .map_err(Into::into)
+    }
+
+    pub fn refresh_quick_tile(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("refreshQuickTile", EmptyRequest {})
+            .map_err(Into::into)
+    }
+
     pub fn start_tunnel(
         &self,
         request: StartTunnelRequest,

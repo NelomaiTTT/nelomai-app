@@ -2,6 +2,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 import type {
   AppState,
+  AppPreferences,
   BindPeerRequest,
   Bootstrap,
   Connection,
@@ -76,6 +77,11 @@ export function createNativeClient(
 ) {
   return {
     state: () => invoke("app_state") as Promise<AppState>,
+    preferences: () => invoke("app_preferences") as Promise<AppPreferences>,
+    setCloseToTray: (enabled: boolean) =>
+      invoke("app_set_close_to_tray", { enabled }) as Promise<AppPreferences>,
+    takeQuickAction: () => invoke("app_take_quick_action") as Promise<boolean>,
+    quickToggle: () => invoke("app_quick_toggle") as Promise<AppState>,
     login: (request: LoginRequest) =>
       invoke("app_login", { request }) as Promise<Bootstrap>,
     bootstrap: () => invoke("app_bootstrap") as Promise<Bootstrap>,

@@ -47,6 +47,22 @@ pub struct InstalledApplicationsResponse {
     pub applications: Vec<InstalledApplication>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceUsageRequest {}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceUsageResponse {
+    pub cpu_user_ms: Option<u64>,
+    pub cpu_system_ms: Option<u64>,
+    pub network_rx_bytes: Option<u64>,
+    pub network_tx_bytes: Option<u64>,
+    pub cpu_charge_milliamp_milliseconds: Option<u64>,
+    pub mobile_charge_milliamp_milliseconds: Option<u64>,
+    pub wifi_charge_milliamp_milliseconds: Option<u64>,
+}
+
 impl fmt::Debug for InstalledApplicationsResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -148,6 +164,12 @@ pub struct TunnelOperationResponse {
     pub state: String,
     pub duration_millis: u64,
     pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickActionResponse {
+    pub pending: bool,
 }
 
 #[cfg(test)]

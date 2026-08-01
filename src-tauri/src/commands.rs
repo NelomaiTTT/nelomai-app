@@ -1,6 +1,9 @@
 use crate::diagnostics::AppDiagnostics;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
-use crate::{NativeApplication, PushRegistrationScheduler, SplitTunnelScheduler};
+use crate::{
+    preferences::AppPreferenceStore, NativeApplication, PushRegistrationScheduler,
+    SplitTunnelScheduler,
+};
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
 use nelomai_client_core::{
@@ -49,6 +52,10 @@ impl CommandError {
             code: code.into(),
             message: message.into(),
         }
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 
     fn from_api(error: CoreApiError) -> Self {
@@ -205,6 +212,13 @@ pub struct AppStateResponse {
     warning: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppPreferencesResponse {
+    close_to_tray_supported: bool,
+    close_to_tray: bool,
+}
+
 impl AppStateResponse {
     fn new(state: CoreState, warning: Option<String>) -> Self {
         Self {
@@ -283,6 +297,140 @@ impl From<PeerBindingResponse> for SafePeerBindingResponse {
 pub async fn app_state(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<AppStateResponse, CommandError> {
+    let state = application.state().await;
+    let warning = application.split_tunnel_warning().await;
+    Ok(AppStateResponse::new(state, warning))
+}
+
+#[tauri::command]
+pub fn app_preferences(preferences: State<'_, Arc<AppPreferenceStore>>) -> AppPreferencesResponse {
+    AppPreferencesResponse {
+        close_to_tray_supported: cfg!(desktop),
+        close_to_tray: preferences.get().close_to_tray,
+    }
+}
+
+#[tauri::command]
+pub fn app_set_close_to_tray(
+    preferences: State<'_, Arc<AppPreferenceStore>>,
+    enabled: bool,
+) -> Result<AppPreferencesResponse, CommandError> {
+    let saved = preferences.set_close_to_tray(enabled).map_err(|_| {
+        CommandError::new(
+            "preferences_unavailable",
+            "Не удалось сохранить настройки приложения",
+        )
+    })?;
+    Ok(AppPreferencesResponse {
+        close_to_tray_supported: cfg!(desktop),
+        close_to_tray: saved.close_to_tray,
+    })
+}
+
+#[tauri::command]
+pub fn app_take_quick_action(app: AppHandle) -> Result<bool, CommandError> {
+    app.tunnel_android()
+        .take_quick_action()
+        .map_err(|_| CommandError::new("quick_action_unavailable", "Не удалось открыть действие"))
+}
+
+#[tauri::command]
+pub async fn app_quick_toggle(
+    app: AppHandle,
+    application: State<'_, Arc<NativeApplication>>,
+) -> Result<AppStateResponse, CommandError> {
+    let result = quick_toggle(&app, &application, cfg!(target_os = "android")).await;
+    let _ = app.tunnel_android().refresh_quick_tile();
+    result
+}
+
+pub(crate) async fn quick_toggle(
+    app: &AppHandle,
+    application: &NativeApplication,
+    skip_probe_refresh: bool,
+) -> Result<AppStateResponse, CommandError> {
+    let state = application.state().await;
+    match state.phase {
+        Phase::Connected => {
+            application.stop().await.map_err(CommandError::from)?;
+        }
+        Phase::Ready | Phase::Error | Phase::ServerUnavailable => {
+            let bootstrap = application
+                .bootstrap(now_unix())
+                .await
+                .map_err(CommandError::from)?;
+            if !bootstrap.access.can_connect {
+                return Err(CommandError::new(
+                    "access_expired",
+                    "Срок доступа уже истёк",
+                ));
+            }
+            if bootstrap.binding.is_none() {
+                return Err(CommandError::new(
+                    "peer_binding_required",
+                    "Сначала выберите пир в приложении",
+                ));
+            }
+            crate::platform::prepare_tunnel(app.clone())
+                .await
+                .map_err(CommandError::from_tunnel)?;
+            refresh_installed_applications_before_start(
+                app,
+                application,
+                bootstrap.defaults.layer,
+                bootstrap.defaults.route_mode,
+            )
+            .await?;
+            let options = ConnectOptions {
+                layer: bootstrap.defaults.layer,
+                tic_connection_mode: bootstrap.defaults.tic_connection_mode,
+                route_mode: bootstrap.defaults.route_mode,
+                probes: Vec::new(),
+                allow_alternate: true,
+            };
+            if skip_probe_refresh {
+                application
+                    .start_without_probe_refresh(options, now_unix())
+                    .await
+                    .map_err(CommandError::from)?;
+            } else {
+                application
+                    .start(options, now_unix())
+                    .await
+                    .map_err(CommandError::from)?;
+            }
+        }
+        Phase::Connecting | Phase::Stopping | Phase::Measuring | Phase::Authenticating => {
+            return Err(CommandError::new(
+                "connection_busy",
+                "Дождитесь завершения текущего действия",
+            ));
+        }
+        Phase::SignedOut => {
+            return Err(CommandError::new(
+                "signed_out",
+                "Нужно снова войти в приложение",
+            ));
+        }
+        Phase::NeedsPeerBinding => {
+            return Err(CommandError::new(
+                "peer_binding_required",
+                "Сначала выберите пир в приложении",
+            ));
+        }
+        Phase::AccessExpired => {
+            return Err(CommandError::new(
+                "access_expired",
+                "Срок доступа уже истёк",
+            ));
+        }
+        Phase::UpdateRequired => {
+            return Err(CommandError::new(
+                "update_required",
+                "Для продолжения необходимо обновить приложение",
+            ));
+        }
+    }
     let state = application.state().await;
     let warning = application.split_tunnel_warning().await;
     Ok(AppStateResponse::new(state, warning))
@@ -497,10 +645,12 @@ pub async fn app_unpin_stray(
 
 #[tauri::command]
 pub async fn app_send_diagnostics(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     diagnostics: State<'_, Arc<AppDiagnostics>>,
 ) -> Result<DiagnosticUploadResponse, CommandError> {
-    let report = diagnostics.build_report().map_err(|_| {
+    let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(&app);
+    let report = diagnostics.build_report(resource_snapshot).map_err(|_| {
         CommandError::new(
             "diagnostics_unavailable",
             "Не удалось подготовить диагностический отчёт",

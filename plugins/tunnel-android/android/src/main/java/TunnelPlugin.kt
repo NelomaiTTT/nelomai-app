@@ -1,10 +1,15 @@
 package ru.nelomai.tunnel
 
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Context
 import android.net.VpnService
 import android.os.Build
 import android.os.SystemClock
+import android.os.health.HealthStats
+import android.os.health.SystemHealthManager
+import android.os.health.UidHealthStats
+import android.service.quicksettings.TileService
 import android.util.Log
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
@@ -29,6 +34,11 @@ private const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
 private const val TUNNEL_LOG_TAG = "NelomaiTunnel"
 private const val PHYSICAL_NETWORK_RETRY_MILLIS = 5 * 60 * 1_000L
+private const val QUICK_ACTION_EVENT = "quick-toggle"
+private const val QUICK_ACTION_PREFERENCES = "nelomai-quick-actions"
+private const val QUICK_ACTION_PENDING = "toggle-pending"
+private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
+private const val QUICK_ACTION_STALE_MILLIS = 60_000L
 
 @InvokeArg
 class TunnelOptionsArgs {
@@ -525,10 +535,87 @@ private val StartTunnelArgs.configurationInitialized: Boolean
         false
     }
 
+private fun HealthStats.measurement(key: Int): Long? =
+    if (hasMeasurement(key)) getMeasurement(key).coerceAtLeast(0L) else null
+
+private fun HealthStats.sumMeasurements(vararg keys: Int): Long? {
+    var found = false
+    var total = 0L
+    for (key in keys) {
+        val value = measurement(key) ?: continue
+        found = true
+        total = if (Long.MAX_VALUE - total < value) Long.MAX_VALUE else total + value
+    }
+    return if (found) total else null
+}
+
 @TauriPlugin
 class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
+    companion object {
+        @Volatile
+        private var activeInstance: TunnelPlugin? = null
+        private val quickActionStartedAt = AtomicLong(0)
+
+        fun beginQuickToggle(): Boolean {
+            val now = SystemClock.elapsedRealtime()
+            while (true) {
+                val startedAt = quickActionStartedAt.get()
+                if (startedAt != 0L && now - startedAt < QUICK_ACTION_STALE_MILLIS) return false
+                if (quickActionStartedAt.compareAndSet(startedAt, now)) return true
+            }
+        }
+
+        fun dispatchQuickToggle(): Boolean {
+            val plugin = activeInstance ?: return false
+            if (!plugin.resumed.get()) return false
+            if (!plugin.hasListener(QUICK_ACTION_EVENT)) return false
+            if (VpnService.prepare(plugin.activity.applicationContext) != null) return false
+            plugin.trigger(QUICK_ACTION_EVENT, JSObject())
+            return true
+        }
+
+        fun queueQuickToggle(context: Context) {
+            context.getSharedPreferences(QUICK_ACTION_PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(QUICK_ACTION_PENDING, true)
+                .apply()
+        }
+
+        fun tunnelState(): String = TunnelRuntime.state().wireName
+
+        fun finishQuickToggle() {
+            quickActionStartedAt.set(0)
+        }
+
+        fun refreshQuickTile(context: Context) {
+            TileService.requestListeningState(
+                context,
+                ComponentName(context.packageName, QUICK_TILE_SERVICE),
+            )
+        }
+    }
+
+    private val resumed = AtomicBoolean(false)
+
     init {
         TunnelRuntime.initialize(activity.applicationContext)
+        activeInstance = this
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onDestroy() {
+        resumed.set(false)
+        if (activeInstance === this) activeInstance = null
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed.set(true)
+    }
+
+    override fun onPause() {
+        resumed.set(false)
+        super.onPause()
     }
 
     @Command
@@ -584,6 +671,58 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         } catch (_: Throwable) {
             invoke.reject("installed_applications_unavailable")
         }
+    }
+
+    @Suppress("DEPRECATION")
+    @Command
+    fun resourceUsage(invoke: Invoke) {
+        try {
+            val manager = activity.getSystemService(SystemHealthManager::class.java)
+            val stats = manager.takeMyUidSnapshot()
+            val response = JSObject()
+            response.put("cpuUserMs", stats.measurement(UidHealthStats.MEASUREMENT_USER_CPU_TIME_MS))
+            response.put("cpuSystemMs", stats.measurement(UidHealthStats.MEASUREMENT_SYSTEM_CPU_TIME_MS))
+            response.put(
+                "networkRxBytes",
+                stats.sumMeasurements(
+                    UidHealthStats.MEASUREMENT_MOBILE_RX_BYTES,
+                    UidHealthStats.MEASUREMENT_WIFI_RX_BYTES,
+                ),
+            )
+            response.put(
+                "networkTxBytes",
+                stats.sumMeasurements(
+                    UidHealthStats.MEASUREMENT_MOBILE_TX_BYTES,
+                    UidHealthStats.MEASUREMENT_WIFI_TX_BYTES,
+                ),
+            )
+            response.put("cpuChargeMilliampMilliseconds", stats.measurement(UidHealthStats.MEASUREMENT_CPU_POWER_MAMS))
+            response.put("mobileChargeMilliampMilliseconds", stats.measurement(UidHealthStats.MEASUREMENT_MOBILE_POWER_MAMS))
+            response.put("wifiChargeMilliampMilliseconds", stats.measurement(UidHealthStats.MEASUREMENT_WIFI_POWER_MAMS))
+            invoke.resolve(response)
+        } catch (_: Throwable) {
+            invoke.reject("resource_usage_unavailable")
+        }
+    }
+
+    @Command
+    fun takeQuickAction(invoke: Invoke) {
+        val preferences = activity.getSharedPreferences(
+            QUICK_ACTION_PREFERENCES,
+            Context.MODE_PRIVATE,
+        )
+        val pending = preferences.getBoolean(QUICK_ACTION_PENDING, false)
+        if (pending) preferences.edit().remove(QUICK_ACTION_PENDING).apply()
+        val response = JSObject()
+        response.put("pending", pending)
+        invoke.resolve(response)
+    }
+
+    @Command
+    fun refreshQuickTile(invoke: Invoke) {
+        finishQuickToggle()
+        refreshQuickTile(activity.applicationContext)
+        invoke.resolve()
     }
 
     @Command
@@ -663,6 +802,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             response.put("durationMillis", durationMillis)
             response.put("errorCode", null)
             invoke.resolve(response)
+            refreshQuickTile(activity.applicationContext)
         }
     }
 }

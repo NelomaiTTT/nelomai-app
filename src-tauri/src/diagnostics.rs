@@ -1,3 +1,4 @@
+use crate::resource_usage::ResourceSnapshot;
 use nelomai_client_api::DiagnosticUploadRequest;
 use nelomai_client_core::{CoreLogEvent, CoreLogger};
 use serde::Serialize;
@@ -16,6 +17,7 @@ const MAX_HELPER_REPORT_BYTES: usize = 64 * 1024;
 pub struct AppDiagnostics {
     directory: PathBuf,
     write_gate: Mutex<()>,
+    resource_baseline: ResourceSnapshot,
 }
 
 #[derive(Serialize)]
@@ -30,12 +32,13 @@ struct LogRecord<'a> {
 }
 
 impl AppDiagnostics {
-    pub fn new(directory: PathBuf) -> io::Result<Self> {
+    pub fn new(directory: PathBuf, resource_baseline: ResourceSnapshot) -> io::Result<Self> {
         fs::create_dir_all(&directory)?;
         restrict_directory_permissions(&directory)?;
         let diagnostics = Self {
             directory,
             write_gate: Mutex::new(()),
+            resource_baseline,
         };
         diagnostics.record_named("application.started", None, None, None);
         Ok(diagnostics)
@@ -89,7 +92,10 @@ impl AppDiagnostics {
         }
     }
 
-    pub fn build_report(&self) -> io::Result<DiagnosticUploadRequest> {
+    pub fn build_report(
+        &self,
+        resource_snapshot: ResourceSnapshot,
+    ) -> io::Result<DiagnosticUploadRequest> {
         let _guard = self
             .write_gate
             .lock()
@@ -117,6 +123,7 @@ impl AppDiagnostics {
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
             helper_log: helper_log().filter(|value| !value.is_empty()),
+            resource_usage: Some(self.resource_baseline.report(resource_snapshot)),
         })
     }
 }
@@ -283,7 +290,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("nelomai-diagnostics-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
-        let diagnostics = AppDiagnostics::new(directory.clone()).unwrap();
+        let baseline = ResourceSnapshot::capture_for_test();
+        let diagnostics = AppDiagnostics::new(directory.clone(), baseline).unwrap();
         for index in 0..10_000 {
             diagnostics.record_named(
                 "test.event",
@@ -292,7 +300,9 @@ mod tests {
                 Some("safe_code"),
             );
         }
-        let report = diagnostics.build_report().unwrap();
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
         assert!(report.application_log.len() <= MAX_APPLICATION_REPORT_BYTES);
         assert!(report.application_log.contains("test.event"));
         let _ = fs::remove_dir_all(directory);
@@ -320,7 +330,8 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&directory);
-        let diagnostics = AppDiagnostics::new(directory.clone()).unwrap();
+        let baseline = ResourceSnapshot::capture_for_test();
+        let diagnostics = AppDiagnostics::new(directory.clone(), baseline).unwrap();
         diagnostics.record_timed(
             CoreLogEvent {
                 kind: "connection.local_start_succeeded",
@@ -331,7 +342,9 @@ mod tests {
             12_345,
         );
 
-        let report = diagnostics.build_report().unwrap();
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
         let record = report
             .application_log
             .lines()

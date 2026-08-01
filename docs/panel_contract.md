@@ -70,7 +70,13 @@ tail of the privileged tunnel helper log. Passwords, session tokens, and
 WireGuard configuration must never be logged. The panel applies a second
 redaction pass, accepts at most 512 KiB once per minute per device, keeps five
 reports per device for no longer than 30 days, and exposes them only to an
-administrator.
+administrator. New clients also attach a `session_delta` resource snapshot.
+It is calculated from operating-system cumulative counters captured at process
+start and report creation, without background polling. Desktop process metrics
+cover the client process; Android additionally reports UID-level CPU, network,
+and system-provided charge estimates covering the application and VPN service.
+For `cpu_average_basis_points`, `10000` means one fully occupied logical CPU;
+multithreaded work can legitimately exceed that value.
 
 ## Compatibility
 

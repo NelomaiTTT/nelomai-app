@@ -625,6 +625,16 @@ where
         self.core.start(options, now_unix).await.map_err(Into::into)
     }
 
+    pub async fn start_without_probe_refresh(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        options.probes.clear();
+        self.core.start(options, now_unix).await.map_err(Into::into)
+    }
+
     pub async fn refresh_probes(
         &self,
         layer: Layer,
@@ -705,6 +715,20 @@ where
     pub async fn stop(&self) -> Result<Connection, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.stop().await.map_err(Into::into)
+    }
+
+    pub async fn stop_for_shutdown(&self) -> Result<Option<Connection>, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let state = self.core.state().await;
+        if matches!(
+            state.phase,
+            nelomai_client_core::Phase::Connected
+                | nelomai_client_core::Phase::Connecting
+                | nelomai_client_core::Phase::Stopping
+        ) {
+            return self.core.stop().await.map(Some).map_err(Into::into);
+        }
+        Ok(None)
     }
 
     pub async fn pin_stray(&self) -> Result<Connection, ApplicationError> {

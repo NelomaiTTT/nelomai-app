@@ -115,6 +115,38 @@ pub struct DiagnosticUploadRequest {
     pub architecture: String,
     pub application_log: String,
     pub helper_log: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_usage: Option<DiagnosticResourceUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticResourceUsage {
+    pub measurement_mode: String,
+    pub session_duration_ms: u64,
+    pub components: Vec<DiagnosticResourceComponent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticResourceComponent {
+    pub component: String,
+    pub source: String,
+    pub cpu_user_ms: Option<u64>,
+    pub cpu_system_ms: Option<u64>,
+    pub cpu_average_basis_points: Option<u64>,
+    pub current_resident_memory_bytes: Option<u64>,
+    pub peak_resident_memory_bytes: Option<u64>,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+    pub page_faults: Option<u64>,
+    pub minor_page_faults: Option<u64>,
+    pub major_page_faults: Option<u64>,
+    pub voluntary_context_switches: Option<u64>,
+    pub involuntary_context_switches: Option<u64>,
+    pub network_rx_bytes: Option<u64>,
+    pub network_tx_bytes: Option<u64>,
+    pub cpu_charge_milliamp_milliseconds: Option<u64>,
+    pub mobile_charge_milliamp_milliseconds: Option<u64>,
+    pub wifi_charge_milliamp_milliseconds: Option<u64>,
 }
 
 impl fmt::Debug for DiagnosticUploadRequest {
@@ -130,6 +162,7 @@ impl fmt::Debug for DiagnosticUploadRequest {
                 "helper_log",
                 &self.helper_log.as_ref().map(|_| "<redacted>"),
             )
+            .field("resource_usage", &self.resource_usage)
             .finish()
     }
 }
@@ -860,6 +893,7 @@ mod tests {
             architecture: "x86_64".to_string(),
             application_log: "application-secret".to_string(),
             helper_log: Some("helper-secret".to_string()),
+            resource_usage: None,
         };
 
         let debug = format!("{request:?}");
@@ -867,5 +901,7 @@ mod tests {
         assert!(!debug.contains("application-secret"));
         assert!(!debug.contains("helper-secret"));
         assert!(debug.contains("<redacted>"));
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert!(serialized.get("resource_usage").is_none());
     }
 }

@@ -2753,7 +2753,9 @@ dependencies = [
  "tauri-plugin-tunnel-android",
  "tauri-plugin-updater",
  "tauri-plugin-updater-android",
+ "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
