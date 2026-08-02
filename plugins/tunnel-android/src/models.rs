@@ -187,6 +187,12 @@ pub struct QuickActionResponse {
     pub pending: bool,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteQuickActionRequest {
+    pub success: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +246,12 @@ mod tests {
         assert!(!debug.contains("com.example.private"));
         assert!(!debug.contains("Private application"));
         assert!(debug.contains("applications_count"));
+    }
+
+    #[test]
+    fn complete_quick_action_serializes_result() {
+        let value = serde_json::to_value(CompleteQuickActionRequest { success: true }).unwrap();
+
+        assert_eq!(value, serde_json::json!({ "success": true }));
     }
 }

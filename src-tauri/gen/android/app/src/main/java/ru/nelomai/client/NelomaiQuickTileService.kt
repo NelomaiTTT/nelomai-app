@@ -5,9 +5,14 @@ import android.content.Intent
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import android.util.Log
 import ru.nelomai.tunnel.TunnelPlugin
 
 class NelomaiQuickTileService : TileService() {
+    companion object {
+        private const val LOG_TAG = "NelomaiTunnel"
+    }
+
     override fun onStartListening() {
         super.onStartListening()
         updateTile()
@@ -24,6 +29,7 @@ class NelomaiQuickTileService : TileService() {
 
     private fun dispatchOrOpen() {
         if (!TunnelPlugin.beginQuickToggle()) {
+            Log.i(LOG_TAG, "quick_toggle.ignored reason=operation_in_progress")
             qsTile?.apply {
                 state = Tile.STATE_UNAVAILABLE
                 updateTile()
@@ -34,11 +40,16 @@ class NelomaiQuickTileService : TileService() {
             state = Tile.STATE_UNAVAILABLE
             updateTile()
         }
-        if (TunnelPlugin.dispatchQuickToggle()) return
+        if (TunnelPlugin.dispatchQuickToggle()) {
+            Log.i(LOG_TAG, "quick_toggle.background_dispatch")
+            return
+        }
 
         TunnelPlugin.queueQuickToggle(applicationContext)
-        val intent = Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        Log.i(LOG_TAG, "quick_toggle.open_headless_activity")
+        val intent = Intent(this, QuickActionActivity::class.java).apply {
+            putExtra(TunnelPlugin.QUICK_ACTION_HEADLESS_EXTRA, true)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startActivityAndCollapse(

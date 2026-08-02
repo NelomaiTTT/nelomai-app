@@ -45,7 +45,7 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(false)
     }
 
-    pub fn refresh_quick_tile(&self) -> crate::Result<()> {
+    pub fn refresh_quick_tile(&self, _success: bool) -> crate::Result<()> {
         Ok(())
     }
 

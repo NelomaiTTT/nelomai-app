@@ -69,6 +69,11 @@ class VersionedTunnelArgs {
 }
 
 @InvokeArg
+class CompleteQuickActionArgs {
+    var success: Boolean = false
+}
+
+@InvokeArg
 class TunnelMetricsArgs {
     var apiVersion: Int = 0
     var probe: Boolean = false
@@ -589,6 +594,8 @@ private fun HealthStats.sumMeasurements(vararg keys: Int): Long? {
 @TauriPlugin
 class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     companion object {
+        const val QUICK_ACTION_HEADLESS_EXTRA = "ru.nelomai.client.QUICK_ACTION_HEADLESS"
+
         @Volatile
         private var activeInstance: TunnelPlugin? = null
         private val quickActionStartedAt = AtomicLong(0)
@@ -603,11 +610,20 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         fun dispatchQuickToggle(): Boolean {
-            val plugin = activeInstance ?: return false
-            if (!plugin.resumed.get()) return false
-            if (!plugin.hasListener(QUICK_ACTION_EVENT)) return false
-            if (VpnService.prepare(plugin.activity.applicationContext) != null) return false
+            val plugin = activeInstance ?: run {
+                Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatch_unavailable reason=no_plugin")
+                return false
+            }
+            if (!plugin.hasListener(QUICK_ACTION_EVENT)) {
+                Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatch_unavailable reason=no_listener")
+                return false
+            }
+            if (VpnService.prepare(plugin.activity.applicationContext) != null) {
+                Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatch_unavailable reason=permission_required")
+                return false
+            }
             plugin.trigger(QUICK_ACTION_EVENT, JSObject())
+            Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatched")
             return true
         }
 
@@ -632,8 +648,6 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
-    private val resumed = AtomicBoolean(false)
-
     init {
         TunnelRuntime.initialize(activity.applicationContext)
         activeInstance = this
@@ -641,18 +655,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Suppress("OVERRIDE_DEPRECATION")
     override fun onDestroy() {
-        resumed.set(false)
         if (activeInstance === this) activeInstance = null
-    }
-
-    override fun onResume() {
-        super.onResume()
-        resumed.set(true)
-    }
-
-    override fun onPause() {
-        resumed.set(false)
-        super.onPause()
     }
 
     @Command
@@ -757,9 +760,16 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun refreshQuickTile(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(CompleteQuickActionArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_quick_action_result")
+            return
+        }
         finishQuickToggle()
         refreshQuickTile(activity.applicationContext)
         invoke.resolve()
+        finishHeadlessQuickAction(args.success)
     }
 
     @Command
@@ -854,6 +864,26 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         val response = JSObject()
         response.put("permissionGranted", granted)
         invoke.resolve(response)
+    }
+
+    private fun finishHeadlessQuickAction(success: Boolean) {
+        if (!activity.intent.getBooleanExtra(QUICK_ACTION_HEADLESS_EXTRA, false)) return
+        activity.runOnUiThread {
+            Log.i(TUNNEL_LOG_TAG, "quick_toggle.headless_completed success=$success")
+            if (!success) {
+                activity.packageManager
+                    .getLaunchIntentForPackage(activity.packageName)
+                    ?.apply {
+                        addFlags(
+                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                        )
+                    }
+                    ?.let(activity::startActivity)
+            }
+            activity.finishAndRemoveTask()
+        }
     }
 
     private fun resolveOperation(invoke: Invoke, state: SessionState, durationMillis: Long) {

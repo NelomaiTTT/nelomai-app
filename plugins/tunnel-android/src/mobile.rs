@@ -63,9 +63,9 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
-    pub fn refresh_quick_tile(&self) -> crate::Result<()> {
+    pub fn refresh_quick_tile(&self, success: bool) -> crate::Result<()> {
         self.0
-            .run_mobile_plugin::<()>("refreshQuickTile", EmptyRequest {})
+            .run_mobile_plugin::<()>("refreshQuickTile", CompleteQuickActionRequest { success })
             .map_err(Into::into)
     }
 

@@ -440,7 +440,7 @@ pub async fn app_quick_toggle(
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<AppStateResponse, CommandError> {
     let result = quick_toggle(&app, &application, cfg!(target_os = "android")).await;
-    let _ = app.tunnel_android().refresh_quick_tile();
+    let _ = app.tunnel_android().refresh_quick_tile(result.is_ok());
     result
 }
 
