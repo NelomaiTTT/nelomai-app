@@ -81,6 +81,7 @@
 
   let login = $state("");
   let password = $state("");
+  const DEVICE_NAME_MAX_LENGTH = 40;
   let deviceName = $state("Это устройство");
 
   const phaseLabels: Record<Phase, string> = {
@@ -264,7 +265,7 @@
       const request: LoginRequest = {
         login: login.trim(),
         password,
-        deviceName: deviceName.trim() || "Это устройство",
+        deviceName: deviceName.trim().slice(0, DEVICE_NAME_MAX_LENGTH) || "Это устройство",
         platformVersion: null,
       };
       const response = await nativeClient.login(request);
@@ -880,7 +881,7 @@
         </label>
         <label>
           <span>Название устройства</span>
-          <input bind:value={deviceName} maxlength="80" required />
+          <input bind:value={deviceName} maxlength={DEVICE_NAME_MAX_LENGTH} required />
         </label>
         {#if error}<p class="error-message">{error}</p>{/if}
         <button class="primary-button" type="submit" disabled={busy}>

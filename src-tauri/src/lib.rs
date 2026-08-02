@@ -247,39 +247,61 @@ fn start_connection_metrics_scheduler(
 
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(CONNECTION_METRICS_POLL_INTERVAL);
+        let mut failure_recorded = false;
         loop {
             interval.tick().await;
             if !tracker.is_observed().await {
                 tracker.clear().await;
+                failure_recorded = false;
                 continue;
             }
-            let state = application.state().await;
-            let Some(connection) = state
-                .connection
-                .filter(|_| state.phase == nelomai_client_core::Phase::Connected)
-            else {
+            let Some(context) = application.connection_metrics_context().await else {
                 tracker.clear().await;
+                failure_recorded = false;
                 continue;
             };
-            let probe = tracker.should_probe(&connection.lease_id).await;
-            if let Ok(Some(sample)) = tunnel.metrics(false).await {
-                let probe_result = if probe {
-                    if let Some(probe_url) = connection.probe_url.as_deref() {
-                        Some(
-                            application
-                                .probe_connection_latency_ms(probe_url)
-                                .await
-                                .map(|latency| latency.ceil().clamp(1.0, u32::MAX as f64) as u32),
-                        )
+            let probe = tracker.should_probe(&context.session_id).await;
+            match tunnel.metrics(false).await {
+                Ok(Some(sample)) => {
+                    failure_recorded = false;
+                    let probe_result = if probe {
+                        if let Some(probe_url) = context.probe_url.as_deref() {
+                            Some(
+                                application
+                                    .probe_connection_latency_ms(probe_url)
+                                    .await
+                                    .map(|latency| {
+                                        latency.ceil().clamp(1.0, u32::MAX as f64) as u32
+                                    }),
+                            )
+                        } else {
+                            None
+                        }
                     } else {
                         None
+                    };
+                    tracker
+                        .record(&context.session_id, sample, probe_result)
+                        .await;
+                }
+                Ok(None) => {
+                    if !failure_recorded {
+                        application.record_tunnel_unavailable(
+                            "tunnel.metrics.unavailable",
+                            "metrics_not_supported".to_string(),
+                        );
+                        failure_recorded = true;
                     }
-                } else {
-                    None
-                };
-                tracker
-                    .record(&connection.lease_id, sample, probe_result)
-                    .await;
+                }
+                Err(error) => {
+                    if !failure_recorded {
+                        application.record_tunnel_unavailable(
+                            "tunnel.metrics.unavailable",
+                            error.to_string(),
+                        );
+                        failure_recorded = true;
+                    }
+                }
             }
         }
     });

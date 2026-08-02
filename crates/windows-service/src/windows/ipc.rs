@@ -37,6 +37,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const PIPE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PIPE_RECREATE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub struct NamedPipeTransport;
 
@@ -176,7 +177,9 @@ fn exchange_blocking(request: Request) -> Result<Response, ServiceError> {
 }
 
 fn open_client_pipe(pipe_name: &[u16]) -> Result<HANDLE, ServiceError> {
-    let deadline = std::time::Instant::now() + PIPE_CONNECT_TIMEOUT;
+    let started_at = std::time::Instant::now();
+    let deadline = started_at + PIPE_CONNECT_TIMEOUT;
+    let recreate_deadline = started_at + PIPE_RECREATE_GRACE;
     let mut observed_contention = false;
     loop {
         let pipe = unsafe {
@@ -194,12 +197,16 @@ fn open_client_pipe(pipe_name: &[u16]) -> Result<HANDLE, ServiceError> {
             return Ok(pipe);
         }
         let error = unsafe { GetLastError() };
-        if error == ERROR_FILE_NOT_FOUND
-            && observed_contention
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            continue;
+        if error == ERROR_FILE_NOT_FOUND {
+            let retry_deadline = if observed_contention {
+                deadline
+            } else {
+                recreate_deadline
+            };
+            if std::time::Instant::now() < retry_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
         }
         if error != ERROR_PIPE_BUSY {
             return Err(platform_error(
@@ -522,6 +529,50 @@ mod tests {
                 .as_deref(),
             Some("test-0")
         );
+        server_thread.join().expect("join pipe server");
+    }
+
+    #[test]
+    fn client_waits_while_the_pipe_instance_is_recreated() {
+        let _pipe_test_guard = PIPE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let policy = ClientPolicy {
+            owner_sid: current_process_sid().expect("read current process SID"),
+            installed_client_path: std::env::current_exe().expect("resolve test executable"),
+        };
+        let server = PipeServer::new(policy);
+        let (gap_tx, gap_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (request, pipe) = server
+                .accept()
+                .expect("accept first pipe request")
+                .expect("receive first pipe request");
+            assert!(matches!(request, Request::Version { .. }));
+            finish_request(pipe, &Response::success(None)).expect("send first response");
+
+            gap_tx.send(()).expect("signal pipe recreation gap");
+            thread::sleep(Duration::from_millis(100));
+
+            let (request, pipe) = server
+                .accept()
+                .expect("accept second pipe request")
+                .expect("receive second pipe request");
+            assert!(matches!(request, Request::Version { .. }));
+            let mut response = Response::success(None);
+            response.service_version = Some("recreated".to_string());
+            finish_request(pipe, &response).expect("send second response");
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        exchange_blocking(Request::version()).expect("complete first request");
+        gap_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for pipe recreation gap");
+        let response =
+            exchange_blocking(Request::version()).expect("wait for recreated pipe instance");
+
+        assert_eq!(response.service_version.as_deref(), Some("recreated"));
         server_thread.join().expect("join pipe server");
     }
 }

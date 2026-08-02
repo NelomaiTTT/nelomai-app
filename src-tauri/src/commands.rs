@@ -302,13 +302,9 @@ impl AppStateResponse {
 
 async fn current_connection_metrics(
     tracker: &ConnectionMetricsTracker,
-    state: &CoreState,
+    context: Option<&nelomai_client_core::ConnectionMetricsContext>,
 ) -> Option<ConnectionMetricsResponse> {
-    if state.phase != Phase::Connected {
-        return None;
-    }
-    let lease_id = &state.connection.as_ref()?.lease_id;
-    tracker.snapshot(lease_id).await
+    tracker.snapshot(&context?.session_id).await
 }
 
 #[cfg(desktop)]
@@ -406,7 +402,8 @@ pub async fn app_state(
         application.state().await
     };
     let warning = application.split_tunnel_warning().await;
-    let current_metrics = current_connection_metrics(&metrics, &state).await;
+    let metrics_context = application.connection_metrics_context().await;
+    let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
     Ok(AppStateResponse::new(state, warning, current_metrics))
 }
 
@@ -525,7 +522,8 @@ pub(crate) async fn quick_toggle(
     let state = application.state().await;
     let warning = application.split_tunnel_warning().await;
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>();
-    let current_metrics = current_connection_metrics(&metrics, &state).await;
+    let metrics_context = application.connection_metrics_context().await;
+    let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
     Ok(AppStateResponse::new(state, warning, current_metrics))
 }
 

@@ -50,6 +50,12 @@ pub struct CoreState {
     pub connection: Option<Connection>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionMetricsContext {
+    pub session_id: String,
+    pub probe_url: Option<String>,
+}
+
 impl Default for CoreState {
     fn default() -> Self {
         Self {
@@ -748,6 +754,25 @@ where
                 current
             }
         }
+    }
+
+    pub async fn connection_metrics_context(&self) -> Option<ConnectionMetricsContext> {
+        let state = self.state.lock().await.clone();
+        if state.phase != Phase::Connected {
+            return None;
+        }
+        if let Some(connection) = state.connection {
+            return Some(ConnectionMetricsContext {
+                session_id: connection.lease_id,
+                probe_url: connection.probe_url,
+            });
+        }
+        let stored = self.load_auth().ok()?;
+        let connection = stored.saved_connection.or(stored.pinned_connection)?;
+        Some(ConnectionMetricsContext {
+            session_id: connection.lease_id,
+            probe_url: connection.probe_url,
+        })
     }
 
     pub async fn reconcile_external_tunnel_state(&self) -> CoreState {

@@ -141,6 +141,7 @@ struct MockApi {
     pinned_start: AtomicBool,
     start_lease_override: Mutex<Option<String>>,
     bootstrap_connection: Mutex<Option<Connection>>,
+    bootstrap_binding_without_connection: AtomicBool,
     pin_calls: AtomicUsize,
     unpin_calls: AtomicUsize,
     pin_fails: AtomicBool,
@@ -164,6 +165,7 @@ impl MockApi {
             pinned_start: AtomicBool::new(false),
             start_lease_override: Mutex::new(None),
             bootstrap_connection: Mutex::new(None),
+            bootstrap_binding_without_connection: AtomicBool::new(false),
             pin_calls: AtomicUsize::new(0),
             unpin_calls: AtomicUsize::new(0),
             pin_fails: AtomicBool::new(false),
@@ -188,7 +190,11 @@ impl CoreApi for MockApi {
         }
         let mut response = bootstrap();
         response.connection = self.bootstrap_connection.lock().unwrap().clone();
-        if response.connection.is_some() {
+        if response.connection.is_some()
+            || self
+                .bootstrap_binding_without_connection
+                .load(Ordering::SeqCst)
+        {
             response.binding = Some(PeerBinding {
                 id: "binding-1".to_string(),
                 peer_id: "peer-1".to_string(),
@@ -709,6 +715,68 @@ async fn external_quick_action_reconciles_the_local_tunnel_without_panel_operati
 
     assert_eq!(started.phase, Phase::Connected);
     assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn saved_quick_connection_keeps_its_metrics_context() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+    let started = core.start(options(), 1_700_000_000).await.unwrap();
+
+    let context = core
+        .connection_metrics_context()
+        .await
+        .expect("saved connection metrics context");
+
+    assert_eq!(context.session_id, started.lease_id);
+    assert_eq!(context.probe_url, started.probe_url);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn running_quick_tunnel_uses_saved_metrics_context_after_bootstrap() {
+    let api = Arc::new(MockApi::new(0));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "quick-lease".to_string(),
+        layer: Layer::Tic,
+        tic_connection_mode: TicConnectionMode::Personal,
+        route_mode: RouteMode::ViaTak,
+        probe_url: Some("https://1b.example.test/probe".to_string()),
+        kind: StoredConnectionKind::Fixed,
+        configuration: "[Interface]\nPrivateKey = tunnel-secret\n".to_string(),
+        valid_until_unix: None,
+    });
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(stored)),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.bootstrap(1_700_000_000).await.unwrap();
+    let state = core.state().await;
+    let context = core
+        .connection_metrics_context()
+        .await
+        .expect("quick tunnel metrics context after bootstrap");
+
+    assert_eq!(state.phase, Phase::Connected);
+    assert_eq!(state.connection, None);
+    assert_eq!(context.session_id, "quick-lease");
+    assert_eq!(
+        context.probe_url.as_deref(),
+        Some("https://1b.example.test/probe")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

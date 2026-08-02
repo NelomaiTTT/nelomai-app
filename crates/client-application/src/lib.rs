@@ -4,8 +4,8 @@ use nelomai_client_api::{
     ClientApi, DiagnosticUploadRequest, DiagnosticUploadResponse, LoginRequest, TokenResponse,
 };
 use nelomai_client_core::{
-    ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogger, CoreState,
-    PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
+    ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError, CoreError,
+    CoreLogger, CoreState, PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
 };
 use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError};
@@ -600,6 +600,14 @@ where
 
     pub async fn state(&self) -> CoreState {
         self.core.state().await
+    }
+
+    pub async fn connection_metrics_context(&self) -> Option<ConnectionMetricsContext> {
+        self.core.connection_metrics_context().await
+    }
+
+    pub fn record_tunnel_unavailable(&self, kind: &'static str, code: String) {
+        self.core.record_tunnel_unavailable(kind, code);
     }
 
     pub async fn reconcile_external_tunnel_state(&self) -> CoreState {
