@@ -59,9 +59,14 @@ class NelomaiQuickTileService : TileService() {
     }
 
     private fun openHeadlessActivity() {
-        val intent = Intent(this, QuickActionActivity::class.java).apply {
+        val intent = Intent(this, MainActivity::class.java).apply {
             putExtra(TunnelPlugin.QUICK_ACTION_HEADLESS_EXTRA, true)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_NO_ANIMATION,
+            )
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startActivityAndCollapse(

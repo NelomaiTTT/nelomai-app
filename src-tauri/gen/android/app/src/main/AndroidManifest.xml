@@ -24,16 +24,6 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".QuickActionActivity"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
-            android:excludeFromRecents="true"
-            android:exported="false"
-            android:launchMode="singleTop"
-            android:noHistory="true"
-            android:taskAffinity=""
-            android:theme="@style/Theme.nelomai_quick_action" />
-
         <service
             android:name=".NelomaiQuickTileService"
             android:exported="true"

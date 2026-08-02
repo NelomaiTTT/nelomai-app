@@ -171,18 +171,31 @@
     let listener: PluginListener | null = null;
     try {
       listener = await addPluginListener("tunnel-android", "quick-toggle", () => {
-        void nativeClient.takeQuickAction().then((pending) => {
+        void takeQuickActionWithRetry().then((pending) => {
           if (!pending) return;
           quickActionQueued = true;
           void processQuickAction();
         });
       });
-      if (await nativeClient.takeQuickAction()) quickActionQueued = true;
+      if (await takeQuickActionWithRetry()) quickActionQueued = true;
       void processQuickAction();
     } catch {
       // The Android quick-action bridge is intentionally absent on desktop.
     }
     return listener;
+  }
+
+  async function takeQuickActionWithRetry(): Promise<boolean> {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        return await nativeClient.takeQuickAction();
+      } catch (reason) {
+        lastError = reason;
+        await new Promise((resolve) => window.setTimeout(resolve, 100));
+      }
+    }
+    throw lastError;
   }
 
   async function processQuickAction() {

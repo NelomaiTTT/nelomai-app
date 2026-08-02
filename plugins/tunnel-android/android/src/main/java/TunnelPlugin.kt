@@ -876,16 +876,10 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         activity.runOnUiThread {
             Log.i(TUNNEL_LOG_TAG, "quick_toggle.headless_completed success=$success")
             if (!success) {
-                activity.packageManager
-                    .getLaunchIntentForPackage(activity.packageName)
-                    ?.apply {
-                        addFlags(
-                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
-                                android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP,
-                        )
-                    }
-                    ?.let(activity::startActivity)
+                activity.intent.removeExtra(QUICK_ACTION_HEADLESS_EXTRA)
+                activity.window.decorView.visibility = android.view.View.VISIBLE
+                activity.window.decorView.alpha = 1f
+                return@runOnUiThread
             }
             activity.finishAndRemoveTask()
         }
