@@ -124,7 +124,7 @@
     });
     stateTimer = window.setInterval(() => {
       if (document.visibilityState === "visible") void synchronizeRuntimeState();
-    }, 5_000);
+    }, 1_000);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
     }, 300_000);
@@ -171,8 +171,11 @@
     let listener: PluginListener | null = null;
     try {
       listener = await addPluginListener("tunnel-android", "quick-toggle", () => {
-        quickActionQueued = true;
-        void processQuickAction();
+        void nativeClient.takeQuickAction().then((pending) => {
+          if (!pending) return;
+          quickActionQueued = true;
+          void processQuickAction();
+        });
       });
       if (await nativeClient.takeQuickAction()) quickActionQueued = true;
       void processQuickAction();

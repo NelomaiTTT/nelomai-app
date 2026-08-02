@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const INITIAL_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const INITIAL_PROBE_SAMPLES: usize = 3;
 const PROBE_WINDOW: usize = 12;
 const OBSERVATION_TTL: Duration = Duration::from_secs(15);
 
@@ -67,9 +69,14 @@ impl ConnectionMetricsTracker {
             };
         }
         let now = Instant::now();
+        let interval = if current.probes.len() < INITIAL_PROBE_SAMPLES {
+            INITIAL_PROBE_INTERVAL
+        } else {
+            PROBE_INTERVAL
+        };
         let due = current
             .last_probe_at
-            .is_none_or(|last| now.duration_since(last) >= PROBE_INTERVAL);
+            .is_none_or(|last| now.duration_since(last) >= interval);
         if due {
             current.last_probe_at = Some(now);
         }
@@ -122,14 +129,20 @@ impl ConnectionMetricsTracker {
         let current = session
             .as_ref()
             .filter(|session| session.lease_id == lease_id)?;
-        let successful = current.probes.iter().flatten().copied().collect::<Vec<_>>();
-        let latency_ms = (!successful.is_empty()).then(|| {
-            let total = successful
-                .iter()
-                .fold(0u64, |sum, value| sum.saturating_add(u64::from(*value)));
-            (total / successful.len() as u64).min(u64::from(u32::MAX)) as u32
+        let mut successful = current.probes.iter().flatten().copied().collect::<Vec<_>>();
+        let initial_sample_ready = current.probes.len() >= INITIAL_PROBE_SAMPLES;
+        let latency_ms = (initial_sample_ready && !successful.is_empty()).then(|| {
+            successful.sort_unstable();
+            let middle = successful.len() / 2;
+            if successful.len() % 2 == 0 {
+                let left = u64::from(successful[middle - 1]);
+                let right = u64::from(successful[middle]);
+                ((left + right) / 2).min(u64::from(u32::MAX)) as u32
+            } else {
+                successful[middle]
+            }
         });
-        let packet_loss_percent = (!successful.is_empty()).then(|| {
+        let packet_loss_percent = (initial_sample_ready && !successful.is_empty()).then(|| {
             let lost = current
                 .probes
                 .iter()
@@ -179,12 +192,23 @@ mod tests {
                 Some(None),
             )
             .await;
+        tracker
+            .record(
+                "lease",
+                TunnelMetrics {
+                    received_bytes: 5,
+                    sent_bytes: 2,
+                    probe_target: None,
+                },
+                Some(Some(22)),
+            )
+            .await;
 
         let metrics = tracker.snapshot("lease").await.expect("session metrics");
         assert_eq!(metrics.received_bytes, 105);
         assert_eq!(metrics.sent_bytes, 42);
-        assert_eq!(metrics.latency_ms, Some(20));
-        assert_eq!(metrics.packet_loss_percent, Some(50));
+        assert_eq!(metrics.latency_ms, Some(21));
+        assert_eq!(metrics.packet_loss_percent, Some(33));
     }
 
     #[tokio::test]
@@ -231,6 +255,24 @@ mod tests {
         let metrics = tracker.snapshot("lease").await.unwrap();
         assert_eq!(metrics.latency_ms, None);
         assert_eq!(metrics.packet_loss_percent, None);
+    }
+
+    #[tokio::test]
+    async fn waits_for_three_probes_and_uses_median_latency() {
+        let tracker = ConnectionMetricsTracker::new();
+        for latency in [Some(480), Some(31)] {
+            tracker
+                .record("lease", TunnelMetrics::default(), Some(latency))
+                .await;
+        }
+        assert_eq!(tracker.snapshot("lease").await.unwrap().latency_ms, None);
+
+        tracker
+            .record("lease", TunnelMetrics::default(), Some(Some(29)))
+            .await;
+        let metrics = tracker.snapshot("lease").await.unwrap();
+        assert_eq!(metrics.latency_ms, Some(31));
+        assert_eq!(metrics.packet_loss_percent, Some(0));
     }
 
     #[tokio::test]

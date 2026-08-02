@@ -3,6 +3,8 @@ package ru.nelomai.client
 import android.app.PendingIntent
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.util.Log
@@ -40,13 +42,23 @@ class NelomaiQuickTileService : TileService() {
             state = Tile.STATE_UNAVAILABLE
             updateTile()
         }
+        TunnelPlugin.queueQuickToggle(applicationContext)
         if (TunnelPlugin.dispatchQuickToggle()) {
             Log.i(LOG_TAG, "quick_toggle.background_dispatch")
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (TunnelPlugin.hasPendingQuickToggle(applicationContext)) {
+                    Log.i(LOG_TAG, "quick_toggle.background_fallback")
+                    openHeadlessActivity()
+                }
+            }, 1_000L)
             return
         }
 
-        TunnelPlugin.queueQuickToggle(applicationContext)
         Log.i(LOG_TAG, "quick_toggle.open_headless_activity")
+        openHeadlessActivity()
+    }
+
+    private fun openHeadlessActivity() {
         val intent = Intent(this, QuickActionActivity::class.java).apply {
             putExtra(TunnelPlugin.QUICK_ACTION_HEADLESS_EXTRA, true)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)

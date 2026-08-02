@@ -631,8 +631,12 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             context.getSharedPreferences(QUICK_ACTION_PREFERENCES, Context.MODE_PRIVATE)
                 .edit()
                 .putBoolean(QUICK_ACTION_PENDING, true)
-                .apply()
+                .commit()
         }
+
+        fun hasPendingQuickToggle(context: Context): Boolean =
+            context.getSharedPreferences(QUICK_ACTION_PREFERENCES, Context.MODE_PRIVATE)
+                .getBoolean(QUICK_ACTION_PENDING, false)
 
         fun tunnelState(): String = TunnelRuntime.state().wireName
 
@@ -752,7 +756,8 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             Context.MODE_PRIVATE,
         )
         val pending = preferences.getBoolean(QUICK_ACTION_PENDING, false)
-        if (pending) preferences.edit().remove(QUICK_ACTION_PENDING).apply()
+        if (pending) preferences.edit().remove(QUICK_ACTION_PENDING).commit()
+        Log.i(TUNNEL_LOG_TAG, "quick_toggle.pending_consumed pending=$pending")
         val response = JSObject()
         response.put("pending", pending)
         invoke.resolve(response)

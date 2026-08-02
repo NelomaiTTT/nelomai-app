@@ -19,7 +19,7 @@ const PANEL_BASE: &str = "https://nelomai.ru";
 const SPLIT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PHYSICAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PUSH_REGISTRATION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-const CONNECTION_METRICS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const CONNECTION_METRICS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 type NativeApplication = ClientApplication<
     ClientApi,
