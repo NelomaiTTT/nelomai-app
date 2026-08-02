@@ -83,12 +83,19 @@ internal object AndroidSplitTunnel {
     fun applyOptions(
         config: Config,
         options: EffectiveAndroidTunnelOptions,
+        controlPackageName: String,
     ): Config {
-        if (!options.splitSupported) {
-            return config
-        }
-
         val source = config.getInterface()
+        val includedPackages = if (options.splitSupported) {
+            options.includedPackages.filterNot { it == controlPackageName }
+        } else {
+            source.includedApplications.filterNot { it == controlPackageName }
+        }
+        val excludedPackages = when {
+            includedPackages.isNotEmpty() -> emptyList()
+            options.splitSupported -> (options.excludedPackages + controlPackageName).distinct()
+            else -> (source.excludedApplications + controlPackageName).distinct()
+        }
         val builder = Interface.Builder()
             .addAddresses(source.getAddresses())
             .addDnsServers(source.getDnsServers())
@@ -100,10 +107,10 @@ internal object AndroidSplitTunnel {
         if (source.getMtu().isPresent) {
             builder.setMtu(source.getMtu().get())
         }
-        if (options.excludedPackages.isNotEmpty()) {
-            builder.excludeApplications(options.excludedPackages)
-        } else if (options.includedPackages.isNotEmpty()) {
-            builder.includeApplications(options.includedPackages)
+        if (excludedPackages.isNotEmpty()) {
+            builder.excludeApplications(excludedPackages)
+        } else if (includedPackages.isNotEmpty()) {
+            builder.includeApplications(includedPackages)
         }
 
         return Config.Builder()

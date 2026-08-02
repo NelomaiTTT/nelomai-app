@@ -30,15 +30,11 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
 
-private const val TUNNEL_API_VERSION = 2
+internal const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
 private const val TUNNEL_LOG_TAG = "NelomaiTunnel"
 private const val PHYSICAL_NETWORK_RETRY_MILLIS = 5 * 60 * 1_000L
-private const val QUICK_ACTION_EVENT = "quick-toggle"
-private const val QUICK_ACTION_PREFERENCES = "nelomai-quick-actions"
-private const val QUICK_ACTION_PENDING = "toggle-pending"
 private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
-private const val QUICK_ACTION_STALE_MILLIS = 60_000L
 
 @InvokeArg
 class TunnelOptionsArgs {
@@ -47,6 +43,8 @@ class TunnelOptionsArgs {
     var includedPackages: ArrayList<String> = arrayListOf()
     var splitTunnelRoutes: ArrayList<String> = arrayListOf()
     var excludeLocalNetworks: Boolean = false
+
+    companion object {}
 
     fun isEmpty(): Boolean =
         !splitActive &&
@@ -61,16 +59,13 @@ class StartTunnelArgs {
     var apiVersion: Int = 0
     lateinit var configuration: ByteArray
     var options: TunnelOptionsArgs = TunnelOptionsArgs()
+    var cacheQuickAction: Boolean = false
+    var quickActionValidUntilUnix: Long? = null
 }
 
 @InvokeArg
 class VersionedTunnelArgs {
     var apiVersion: Int = 0
-}
-
-@InvokeArg
-class CompleteQuickActionArgs {
-    var success: Boolean = false
 }
 
 @InvokeArg
@@ -227,13 +222,16 @@ internal object TunnelRuntime {
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
     ) {
+        val applicationContext = context.applicationContext
+        val quickPlan = args.copyForQuickPlan()
         val serviceReady = try {
             validateVersion(args.apiVersion)
-            NelomaiVpnService.ensureStarted(context)
+            NelomaiVpnService.ensureStarted(applicationContext)
         } catch (error: Throwable) {
             if (args.configurationInitialized) {
                 args.configuration.fill(0)
             }
+            quickPlan?.configuration?.fill(0)
             onError(errorCode(error))
             return
         }
@@ -241,6 +239,7 @@ internal object TunnelRuntime {
             TransitionDecision.REPLACE -> true
             TransitionDecision.BUSY -> {
                 args.configuration.fill(0)
+                quickPlan?.configuration?.fill(0)
                 onError("tunnel_operation_in_progress")
                 return
             }
@@ -283,7 +282,11 @@ internal object TunnelRuntime {
                     Build.VERSION.SDK_INT,
                     args.options,
                 )
-                val config = AndroidSplitTunnel.applyOptions(originalConfig, options)
+                val config = AndroidSplitTunnel.applyOptions(
+                    originalConfig,
+                    options,
+                    applicationContext.packageName,
+                )
                 val monitor = if (options.splitSupported && options.excludeLocalNetworks) {
                     PhysicalNetworks(context)
                 } else {
@@ -341,14 +344,28 @@ internal object TunnelRuntime {
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
+                if (resolved == SessionState.RUNNING && quickPlan != null) {
+                    try {
+                        QuickTunnelPlanStore.save(applicationContext, quickPlan)
+                    } catch (error: Throwable) {
+                        Log.w(TUNNEL_LOG_TAG, "quick_plan.save_failed", error)
+                    } finally {
+                        quickPlan.configuration.fill(0)
+                    }
+                } else {
+                    quickPlan?.configuration?.fill(0)
+                    NelomaiVpnService.stopForegroundService()
+                }
                 logStage("start.completed", startedAt, "state=${resolved.wireName}")
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
                 if (args.configurationInitialized) {
                     args.configuration.fill(0)
                 }
+                quickPlan?.configuration?.fill(0)
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
+                NelomaiVpnService.stopForegroundService()
                 val code = errorCode(error)
                 Log.w(
                     TUNNEL_LOG_TAG,
@@ -357,6 +374,39 @@ internal object TunnelRuntime {
                 onError(code)
             }
         }
+    }
+
+    fun quickToggle(
+        context: Context,
+        onSuccess: (SessionState, Long) -> Unit,
+        onError: (String) -> Unit,
+    ) {
+        val applicationContext = context.applicationContext
+        initialize(applicationContext)
+        if (VpnService.prepare(applicationContext) != null) {
+            onError("vpn_permission_required")
+            return
+        }
+        when (stateGate.current()) {
+            SessionState.RUNNING -> stop(TUNNEL_API_VERSION, onSuccess, onError)
+            SessionState.STOPPED, SessionState.FAILED -> {
+                val plan = QuickTunnelPlanStore.load(
+                    applicationContext,
+                    System.currentTimeMillis() / 1_000L,
+                ) ?: run {
+                    onError("quick_action_plan_unavailable")
+                    return
+                }
+                start(applicationContext, plan, onSuccess, onError)
+            }
+            SessionState.STARTING, SessionState.STOPPING -> {
+                onError("tunnel_operation_in_progress")
+            }
+        }
+    }
+
+    fun clearQuickPlan(context: Context) {
+        QuickTunnelPlanStore.clear(context.applicationContext)
     }
 
     fun stop(
@@ -374,6 +424,7 @@ internal object TunnelRuntime {
         when (stateGate.beginStop()) {
             TransitionDecision.ALREADY_COMPLETE -> {
                 clearActiveSession()
+                NelomaiVpnService.stopForegroundService()
                 onSuccess(SessionState.STOPPED, 0)
                 return
             }
@@ -398,6 +449,9 @@ internal object TunnelRuntime {
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
+                if (resolved == SessionState.STOPPED) {
+                    NelomaiVpnService.stopForegroundService()
+                }
                 logStage("stop.completed", startedAt, "state=${resolved.wireName}")
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
@@ -569,13 +623,30 @@ internal object TunnelRuntime {
 
 private class TunnelOperationException(val code: String) : RuntimeException()
 
-private val StartTunnelArgs.configurationInitialized: Boolean
+internal val StartTunnelArgs.configurationInitialized: Boolean
     get() = try {
         configuration
         true
     } catch (_: UninitializedPropertyAccessException) {
         false
     }
+
+private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
+    if (!cacheQuickAction || !configurationInitialized) return null
+    return StartTunnelArgs().also { copy ->
+        copy.apiVersion = apiVersion
+        copy.configuration = configuration.copyOf()
+        copy.options = TunnelOptionsArgs().also { optionsCopy ->
+            optionsCopy.splitActive = options.splitActive
+            optionsCopy.excludedPackages = ArrayList(options.excludedPackages)
+            optionsCopy.includedPackages = ArrayList(options.includedPackages)
+            optionsCopy.splitTunnelRoutes = ArrayList(options.splitTunnelRoutes)
+            optionsCopy.excludeLocalNetworks = options.excludeLocalNetworks
+        }
+        copy.cacheQuickAction = true
+        copy.quickActionValidUntilUnix = quickActionValidUntilUnix
+    }
+}
 
 private fun HealthStats.measurement(key: Int): Long? =
     if (hasMeasurement(key)) getMeasurement(key).coerceAtLeast(0L) else null
@@ -594,56 +665,6 @@ private fun HealthStats.sumMeasurements(vararg keys: Int): Long? {
 @TauriPlugin
 class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     companion object {
-        const val QUICK_ACTION_HEADLESS_EXTRA = "ru.nelomai.client.QUICK_ACTION_HEADLESS"
-
-        @Volatile
-        private var activeInstance: TunnelPlugin? = null
-        private val quickActionStartedAt = AtomicLong(0)
-
-        fun beginQuickToggle(): Boolean {
-            val now = SystemClock.elapsedRealtime()
-            while (true) {
-                val startedAt = quickActionStartedAt.get()
-                if (startedAt != 0L && now - startedAt < QUICK_ACTION_STALE_MILLIS) return false
-                if (quickActionStartedAt.compareAndSet(startedAt, now)) return true
-            }
-        }
-
-        fun dispatchQuickToggle(): Boolean {
-            val plugin = activeInstance ?: run {
-                Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatch_unavailable reason=no_plugin")
-                return false
-            }
-            if (!plugin.hasListener(QUICK_ACTION_EVENT)) {
-                Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatch_unavailable reason=no_listener")
-                return false
-            }
-            if (VpnService.prepare(plugin.activity.applicationContext) != null) {
-                Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatch_unavailable reason=permission_required")
-                return false
-            }
-            plugin.trigger(QUICK_ACTION_EVENT, JSObject())
-            Log.i(TUNNEL_LOG_TAG, "quick_toggle.dispatched")
-            return true
-        }
-
-        fun queueQuickToggle(context: Context) {
-            context.getSharedPreferences(QUICK_ACTION_PREFERENCES, Context.MODE_PRIVATE)
-                .edit()
-                .putBoolean(QUICK_ACTION_PENDING, true)
-                .commit()
-        }
-
-        fun hasPendingQuickToggle(context: Context): Boolean =
-            context.getSharedPreferences(QUICK_ACTION_PREFERENCES, Context.MODE_PRIVATE)
-                .getBoolean(QUICK_ACTION_PENDING, false)
-
-        fun tunnelState(): String = TunnelRuntime.state().wireName
-
-        fun finishQuickToggle() {
-            quickActionStartedAt.set(0)
-        }
-
         fun refreshQuickTile(context: Context) {
             TileService.requestListeningState(
                 context,
@@ -654,12 +675,6 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     init {
         TunnelRuntime.initialize(activity.applicationContext)
-        activeInstance = this
-    }
-
-    @Suppress("OVERRIDE_DEPRECATION")
-    override fun onDestroy() {
-        if (activeInstance === this) activeInstance = null
     }
 
     @Command
@@ -750,31 +765,20 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun takeQuickAction(invoke: Invoke) {
-        val preferences = activity.getSharedPreferences(
-            QUICK_ACTION_PREFERENCES,
-            Context.MODE_PRIVATE,
-        )
-        val pending = preferences.getBoolean(QUICK_ACTION_PENDING, false)
-        if (pending) preferences.edit().remove(QUICK_ACTION_PENDING).commit()
-        Log.i(TUNNEL_LOG_TAG, "quick_toggle.pending_consumed pending=$pending")
-        val response = JSObject()
-        response.put("pending", pending)
-        invoke.resolve(response)
+    fun clearQuickPlan(invoke: Invoke) {
+        TunnelRuntime.clearQuickPlan(activity.applicationContext)
+        QuickTunnelController.clearStateChange(activity.applicationContext)
+        invoke.resolve()
     }
 
     @Command
-    fun refreshQuickTile(invoke: Invoke) {
-        val args = try {
-            invoke.parseArgs(CompleteQuickActionArgs::class.java)
-        } catch (_: Throwable) {
-            invoke.reject("invalid_quick_action_result")
-            return
-        }
-        finishQuickToggle()
-        refreshQuickTile(activity.applicationContext)
-        invoke.resolve()
-        finishHeadlessQuickAction(args.success)
+    fun takeQuickStateChange(invoke: Invoke) {
+        val response = JSObject()
+        response.put(
+            "changed",
+            QuickTunnelController.takeStateChange(activity.applicationContext),
+        )
+        invoke.resolve(response)
     }
 
     @Command
@@ -869,20 +873,6 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         val response = JSObject()
         response.put("permissionGranted", granted)
         invoke.resolve(response)
-    }
-
-    private fun finishHeadlessQuickAction(success: Boolean) {
-        if (!activity.intent.getBooleanExtra(QUICK_ACTION_HEADLESS_EXTRA, false)) return
-        activity.runOnUiThread {
-            Log.i(TUNNEL_LOG_TAG, "quick_toggle.headless_completed success=$success")
-            if (!success) {
-                activity.intent.removeExtra(QUICK_ACTION_HEADLESS_EXTRA)
-                activity.window.decorView.visibility = android.view.View.VISIBLE
-                activity.window.decorView.alpha = 1f
-                return@runOnUiThread
-            }
-            activity.finishAndRemoveTask()
-        }
     }
 
     private fun resolveOperation(invoke: Invoke, state: SessionState, durationMillis: Long) {

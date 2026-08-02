@@ -56,16 +56,16 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
-    pub fn take_quick_action(&self) -> crate::Result<bool> {
+    pub fn clear_quick_plan(&self) -> crate::Result<()> {
         self.0
-            .run_mobile_plugin::<QuickActionResponse>("takeQuickAction", EmptyRequest {})
-            .map(|response| response.pending)
+            .run_mobile_plugin::<()>("clearQuickPlan", EmptyRequest {})
             .map_err(Into::into)
     }
 
-    pub fn refresh_quick_tile(&self, success: bool) -> crate::Result<()> {
+    pub fn take_quick_state_change(&self) -> crate::Result<bool> {
         self.0
-            .run_mobile_plugin::<()>("refreshQuickTile", CompleteQuickActionRequest { success })
+            .run_mobile_plugin::<QuickStateChangeResponse>("takeQuickStateChange", EmptyRequest {})
+            .map(|response| response.changed)
             .map_err(Into::into)
     }
 

@@ -4,6 +4,9 @@ The plugin binds the shared Rust `TunnelController` to the official WireGuard
 Android backend.
 
 - `GoBackend.VpnService` owns the active VPN independently of the WebView.
+- The Quick Settings tile talks directly to the native tunnel runtime and never
+  starts the Tauri activity. The last usable plan is encrypted with Android
+  Keystore; dynamic plans retain their panel-provided expiry.
 - Tunnel mutations run on one dedicated executor.
 - The system VPN permission is requested only by an explicit user action.
 - WireGuard configuration is passed from Rust as bytes and wiped immediately
@@ -16,3 +19,5 @@ Android backend.
   complement. The original WireGuard configuration remains unchanged.
 - Physical local-network routes are discovered in memory and are never sent to
   the panel or diagnostics.
+- The Nelomai package itself stays outside its VPN so authentication,
+  diagnostics, and update control traffic remain available while connected.

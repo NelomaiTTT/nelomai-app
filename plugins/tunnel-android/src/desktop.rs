@@ -41,12 +41,12 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(ResourceUsageResponse::default())
     }
 
-    pub fn take_quick_action(&self) -> crate::Result<bool> {
-        Ok(false)
+    pub fn clear_quick_plan(&self) -> crate::Result<()> {
+        Ok(())
     }
 
-    pub fn refresh_quick_tile(&self, _success: bool) -> crate::Result<()> {
-        Ok(())
+    pub fn take_quick_state_change(&self) -> crate::Result<bool> {
+        Ok(false)
     }
 
     pub fn start_tunnel(

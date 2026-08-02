@@ -687,6 +687,31 @@ async fn stop_always_stops_a_running_device_tunnel_when_the_panel_lease_is_finis
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn external_quick_action_reconciles_the_local_tunnel_without_panel_operations() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+
+    let stopped = core.reconcile_external_tunnel_state().await;
+
+    assert_eq!(stopped.phase, Phase::Ready);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let started = core.reconcile_external_tunnel_state().await;
+
+    assert_eq!(started.phase, Phase::Connected);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn failed_fixed_runtime_requires_cleanup_before_it_can_start_again() {
     let api = Arc::new(MockApi::new(0));
     let tunnel = Arc::new(MemoryTunnel::default());

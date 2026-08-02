@@ -101,6 +101,8 @@ pub struct StartTunnelRequest {
     pub api_version: u16,
     pub configuration: Zeroizing<Vec<u8>>,
     pub options: TunnelOptions,
+    pub cache_quick_action: bool,
+    pub quick_action_valid_until_unix: Option<i64>,
 }
 
 impl StartTunnelRequest {
@@ -109,6 +111,8 @@ impl StartTunnelRequest {
             api_version: TUNNEL_API_VERSION,
             configuration: Zeroizing::new(configuration.to_vec()),
             options: TunnelOptions::default(),
+            cache_quick_action: false,
+            quick_action_valid_until_unix: None,
         }
     }
 }
@@ -120,6 +124,11 @@ impl fmt::Debug for StartTunnelRequest {
             .field("api_version", &self.api_version)
             .field("configuration", &"<redacted>")
             .field("options", &self.options)
+            .field("cache_quick_action", &self.cache_quick_action)
+            .field(
+                "quick_action_valid_until_unix",
+                &self.quick_action_valid_until_unix,
+            )
             .finish()
     }
 }
@@ -135,12 +144,16 @@ impl Serialize for StartTunnelRequest {
             api_version: u16,
             configuration: &'a [u8],
             options: &'a TunnelOptions,
+            cache_quick_action: bool,
+            quick_action_valid_until_unix: Option<i64>,
         }
 
         WireRequest {
             api_version: self.api_version,
             configuration: self.configuration.as_slice(),
             options: &self.options,
+            cache_quick_action: self.cache_quick_action,
+            quick_action_valid_until_unix: self.quick_action_valid_until_unix,
         }
         .serialize(serializer)
     }
@@ -183,14 +196,8 @@ pub struct TunnelOperationResponse {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QuickActionResponse {
-    pub pending: bool,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompleteQuickActionRequest {
-    pub success: bool,
+pub struct QuickStateChangeResponse {
+    pub changed: bool,
 }
 
 #[cfg(test)]
@@ -218,6 +225,20 @@ mod tests {
         assert_eq!(value["options"]["splitTunnelRoutes"], serde_json::json!([]));
         assert_eq!(value["options"]["excludeLocalNetworks"], false);
         assert_eq!(value["options"]["splitActive"], false);
+        assert_eq!(value["cacheQuickAction"], false);
+        assert_eq!(value["quickActionValidUntilUnix"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn start_request_serializes_a_bounded_quick_action_plan() {
+        let mut request = StartTunnelRequest::new(b"[Interface]");
+        request.cache_quick_action = true;
+        request.quick_action_valid_until_unix = Some(1_785_700_000);
+
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(value["cacheQuickAction"], true);
+        assert_eq!(value["quickActionValidUntilUnix"], 1_785_700_000_i64);
     }
 
     #[test]
@@ -246,12 +267,5 @@ mod tests {
         assert!(!debug.contains("com.example.private"));
         assert!(!debug.contains("Private application"));
         assert!(debug.contains("applications_count"));
-    }
-
-    #[test]
-    fn complete_quick_action_serializes_result() {
-        let value = serde_json::to_value(CompleteQuickActionRequest { success: true }).unwrap();
-
-        assert_eq!(value, serde_json::json!({ "success": true }));
     }
 }

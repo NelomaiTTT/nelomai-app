@@ -5,8 +5,8 @@ use nelomai_client_storage::{
     StoredConnectionKind,
 };
 use nelomai_client_tunnel::{
-    TunnelConfiguration, TunnelController, TunnelError, TunnelOptions, TunnelStartRequest,
-    TunnelStatus,
+    QuickReconnect, TunnelConfiguration, TunnelController, TunnelError, TunnelOptions,
+    TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
@@ -750,6 +750,23 @@ where
         }
     }
 
+    pub async fn reconcile_external_tunnel_state(&self) -> CoreState {
+        let status = match self.tunnel.status().await {
+            Ok(status) => status,
+            Err(_) => return self.state.lock().await.clone(),
+        };
+        let mut state = self.state.lock().await;
+        if state.connection.is_some() {
+            state.phase = match status {
+                TunnelStatus::Running | TunnelStatus::Starting => Phase::Connected,
+                TunnelStatus::Stopped => Phase::Ready,
+                TunnelStatus::Stopping => Phase::Stopping,
+                TunnelStatus::Failed => Phase::Error,
+            };
+        }
+        state.clone()
+    }
+
     async fn leave_unconfirmed_connected_state(&self) -> (CoreState, bool) {
         let mut state = self.state.lock().await;
         let changed = state.phase == Phase::Connected;
@@ -1065,6 +1082,10 @@ where
             .start(TunnelStartRequest {
                 configuration: TunnelConfiguration::new(response.configuration),
                 options: tunnel_options.clone(),
+                quick_reconnect: match valid_until_unix {
+                    Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
+                    None => QuickReconnect::Persistent,
+                },
             })
             .await
         {
@@ -1415,6 +1436,10 @@ where
             .start(TunnelStartRequest {
                 configuration: TunnelConfiguration::new(saved.configuration),
                 options: tunnel_options.clone(),
+                quick_reconnect: match saved.valid_until_unix {
+                    Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
+                    None => QuickReconnect::Persistent,
+                },
             })
             .await?;
         let applied_physical_network_fingerprint = self

@@ -3,7 +3,6 @@ package ru.nelomai.tunnel
 import com.wireguard.config.Config
 import java.io.ByteArrayInputStream
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -141,7 +140,7 @@ class AndroidSplitTunnelTest {
     }
 
     @Test
-    fun api32KeepsOriginalConfigAndApi33RebuildsOnlyApplicationRules() {
+    fun everyApiKeepsControlTrafficOutsideTheTunnel() {
         val original = parseConfig(
             """
             [Interface]
@@ -167,12 +166,17 @@ class AndroidSplitTunnelTest {
         val api32 = AndroidSplitTunnel.applyOptions(
             original,
             AndroidSplitTunnel.resolveOptions(32, args),
+            "ru.nelomai.client",
         )
-        assertSame(original, api32)
+        assertEquals(
+            setOf("com.example.old", "ru.nelomai.client"),
+            api32.getInterface().excludedApplications,
+        )
 
         val api33 = AndroidSplitTunnel.applyOptions(
             original,
             AndroidSplitTunnel.resolveOptions(33, args),
+            "ru.nelomai.client",
         )
         assertTrue(api33.getInterface().excludedApplications.isEmpty())
         assertEquals(

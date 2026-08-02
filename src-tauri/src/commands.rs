@@ -396,7 +396,15 @@ pub async fn app_state(
     if metrics_view_is_visible(&app) {
         metrics.mark_observed().await;
     }
-    let state = application.state().await;
+    let state = if app
+        .tunnel_android()
+        .take_quick_state_change()
+        .unwrap_or(false)
+    {
+        application.reconcile_external_tunnel_state().await
+    } else {
+        application.state().await
+    };
     let warning = application.split_tunnel_warning().await;
     let current_metrics = current_connection_metrics(&metrics, &state).await;
     Ok(AppStateResponse::new(state, warning, current_metrics))
@@ -425,23 +433,6 @@ pub fn app_set_close_to_tray(
         close_to_tray_supported: cfg!(desktop),
         close_to_tray: saved.close_to_tray,
     })
-}
-
-#[tauri::command]
-pub fn app_take_quick_action(app: AppHandle) -> Result<bool, CommandError> {
-    app.tunnel_android()
-        .take_quick_action()
-        .map_err(|_| CommandError::new("quick_action_unavailable", "Не удалось открыть действие"))
-}
-
-#[tauri::command]
-pub async fn app_quick_toggle(
-    app: AppHandle,
-    application: State<'_, Arc<NativeApplication>>,
-) -> Result<AppStateResponse, CommandError> {
-    let result = quick_toggle(&app, &application, cfg!(target_os = "android")).await;
-    let _ = app.tunnel_android().refresh_quick_tile(result.is_ok());
-    result
 }
 
 pub(crate) async fn quick_toggle(
@@ -562,6 +553,7 @@ pub async fn app_login(
         )
         .await
         .map_err(CommandError::from)?;
+    let _ = app.tunnel_android().clear_quick_plan();
     let _ = refresh_installed_applications(&app, &application);
     observe_and_schedule_update(
         application.inner().clone(),
@@ -631,13 +623,15 @@ pub async fn app_bind_peer(
 
 #[tauri::command]
 pub async fn app_unbind_peer(
+    app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
 ) -> Result<SafePeerBindingResponse, CommandError> {
-    application
+    let response = application
         .unbind_peer()
         .await
-        .map(Into::into)
-        .map_err(Into::into)
+        .map_err(CommandError::from)?;
+    let _ = app.tunnel_android().clear_quick_plan();
+    Ok(response.into())
 }
 
 #[tauri::command]
@@ -1080,7 +1074,9 @@ pub async fn app_logout(
     push_registration_scheduler
         .logout(&app, &application)
         .await
-        .map_err(Into::into)
+        .map_err(CommandError::from)?;
+    let _ = app.tunnel_android().clear_quick_plan();
+    Ok(())
 }
 
 fn observe_and_schedule_update(

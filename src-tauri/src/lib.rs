@@ -163,8 +163,6 @@ pub fn run() {
             commands::app_state,
             commands::app_preferences,
             commands::app_set_close_to_tray,
-            commands::app_take_quick_action,
-            commands::app_quick_toggle,
             commands::app_login,
             commands::app_bootstrap,
             commands::app_peer_options,

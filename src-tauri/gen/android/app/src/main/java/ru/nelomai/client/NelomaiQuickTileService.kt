@@ -1,14 +1,12 @@
 package ru.nelomai.client
 
-import android.app.PendingIntent
-import android.content.Intent
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.util.Log
-import ru.nelomai.tunnel.TunnelPlugin
+import android.widget.Toast
+import ru.nelomai.tunnel.QuickTunnelController
 
 class NelomaiQuickTileService : TileService() {
     companion object {
@@ -30,68 +28,44 @@ class NelomaiQuickTileService : TileService() {
     }
 
     private fun dispatchOrOpen() {
-        if (!TunnelPlugin.beginQuickToggle()) {
-            Log.i(LOG_TAG, "quick_toggle.ignored reason=operation_in_progress")
-            qsTile?.apply {
-                state = Tile.STATE_UNAVAILABLE
-                updateTile()
-            }
-            return
-        }
         qsTile?.apply {
             state = Tile.STATE_UNAVAILABLE
             updateTile()
         }
-        TunnelPlugin.queueQuickToggle(applicationContext)
-        if (TunnelPlugin.dispatchQuickToggle()) {
-            Log.i(LOG_TAG, "quick_toggle.background_dispatch")
-            Handler(Looper.getMainLooper()).postDelayed({
-                if (TunnelPlugin.hasPendingQuickToggle(applicationContext)) {
-                    Log.i(LOG_TAG, "quick_toggle.background_fallback")
-                    openHeadlessActivity()
+        QuickTunnelController.toggle(applicationContext) { state, errorCode ->
+            Handler(Looper.getMainLooper()).post {
+                Log.i(
+                    LOG_TAG,
+                    "quick_toggle.completed state=$state error=${errorCode ?: "none"}",
+                )
+                updateTile()
+                errorCode?.let {
+                    Toast.makeText(
+                        applicationContext,
+                        quickActionError(it),
+                        Toast.LENGTH_LONG,
+                    ).show()
                 }
-            }, 1_000L)
-            return
-        }
-
-        Log.i(LOG_TAG, "quick_toggle.open_headless_activity")
-        openHeadlessActivity()
-    }
-
-    private fun openHeadlessActivity() {
-        val intent = Intent(this, MainActivity::class.java).apply {
-            putExtra(TunnelPlugin.QUICK_ACTION_HEADLESS_EXTRA, true)
-            addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                    Intent.FLAG_ACTIVITY_NO_ANIMATION,
-            )
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startActivityAndCollapse(
-                PendingIntent.getActivity(
-                    this,
-                    0,
-                    intent,
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                ),
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            startActivityAndCollapse(intent)
+            }
         }
     }
 
     private fun updateTile() {
         qsTile?.apply {
             label = getString(R.string.app_name)
-            state = when (TunnelPlugin.tunnelState()) {
+            state = when (QuickTunnelController.state()) {
                 "running" -> Tile.STATE_ACTIVE
                 "starting", "stopping" -> Tile.STATE_UNAVAILABLE
                 else -> Tile.STATE_INACTIVE
             }
             updateTile()
         }
+    }
+
+    private fun quickActionError(code: String): String = when (code) {
+        "vpn_permission_required" -> "Откройте Nelomai и разрешите VPN-подключение"
+        "quick_action_plan_unavailable" -> "Откройте Nelomai, чтобы подготовить подключение"
+        "tunnel_operation_in_progress" -> "Дождитесь завершения текущего действия"
+        else -> "Не удалось изменить состояние подключения"
     }
 }

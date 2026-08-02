@@ -39,6 +39,7 @@ impl fmt::Debug for TunnelConfiguration {
 pub struct TunnelStartRequest {
     pub configuration: TunnelConfiguration,
     pub options: TunnelOptions,
+    pub quick_reconnect: QuickReconnect,
 }
 
 impl TunnelStartRequest {
@@ -46,6 +47,7 @@ impl TunnelStartRequest {
         Self {
             configuration,
             options: TunnelOptions::default(),
+            quick_reconnect: QuickReconnect::Disabled,
         }
     }
 }
@@ -56,8 +58,17 @@ impl fmt::Debug for TunnelStartRequest {
             .debug_struct("TunnelStartRequest")
             .field("configuration", &"<redacted>")
             .field("options", &self.options)
+            .field("quick_reconnect", &self.quick_reconnect)
             .finish()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuickReconnect {
+    #[default]
+    Disabled,
+    Persistent,
+    Until(i64),
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -338,6 +349,7 @@ mod tests {
                 exclude_local_networks: true,
                 policy_hash: Some("sha256:test".to_string()),
             },
+            quick_reconnect: QuickReconnect::Persistent,
         };
 
         let debug = format!("{request:?}");

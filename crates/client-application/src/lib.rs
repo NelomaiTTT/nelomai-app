@@ -602,6 +602,10 @@ where
         self.core.state().await
     }
 
+    pub async fn reconcile_external_tunnel_state(&self) -> CoreState {
+        self.core.reconcile_external_tunnel_state().await
+    }
+
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.bootstrap(now_unix).await.map_err(Into::into)

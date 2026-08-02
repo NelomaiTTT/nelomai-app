@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics, TunnelPlatform,
-    TunnelStartRequest, TunnelStatus,
+    QuickReconnect, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
+    TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::SplitTunnelMode;
 use tauri::{
@@ -90,6 +90,16 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         }
         plugin_request.options.split_tunnel_routes = request.options.excluded_ipv4_cidrs;
         plugin_request.options.exclude_local_networks = request.options.exclude_local_networks;
+        match request.quick_reconnect {
+            QuickReconnect::Disabled => {}
+            QuickReconnect::Persistent => {
+                plugin_request.cache_quick_action = true;
+            }
+            QuickReconnect::Until(valid_until_unix) => {
+                plugin_request.cache_quick_action = true;
+                plugin_request.quick_action_valid_until_unix = Some(valid_until_unix);
+            }
+        }
 
         let response = self
             .app
