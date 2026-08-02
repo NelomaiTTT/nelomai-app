@@ -606,6 +606,58 @@ async fn failed_panel_stop_can_be_retried_after_the_local_tunnel_is_stopped() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn start_releases_an_active_panel_connection_left_without_a_local_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    *api.bootstrap_connection.lock().unwrap() = Some(Connection {
+        status: LeaseStatus::Connected,
+        ..connection("11111111-1111-4111-8111-111111111111")
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let logger = Arc::new(MemoryLogger::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel,
+        logger.clone(),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    assert_eq!(core.state().await.phase, Phase::Ready);
+
+    core.start(options(), 1_700_000_001).await.unwrap();
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.stale_released"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_keeps_a_warm_panel_connection_available_for_reuse() {
+    let api = Arc::new(MockApi::new(0));
+    *api.bootstrap_connection.lock().unwrap() = Some(Connection {
+        status: LeaseStatus::Warm,
+        stopped_at: Some("2026-07-26T10:00:00Z".to_string()),
+        ..connection("11111111-1111-4111-8111-111111111111")
+    });
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+
+    core.start(options(), 1_700_000_001).await.unwrap();
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn stop_always_stops_a_running_device_tunnel_when_the_panel_lease_is_finished() {
     let api = Arc::new(MockApi::new(0));
     let tunnel = Arc::new(MemoryTunnel::default());

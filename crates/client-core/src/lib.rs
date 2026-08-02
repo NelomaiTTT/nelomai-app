@@ -10,7 +10,7 @@ use nelomai_client_tunnel::{
 };
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
-    ConnectionStartRequest, ConnectionStartResponse, Layer, ProbeResult, RouteMode,
+    ConnectionStartRequest, ConnectionStartResponse, Layer, LeaseStatus, ProbeResult, RouteMode,
     SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
     TicConnectionMode,
@@ -927,6 +927,8 @@ where
             self.set_phase(Phase::UpdateRequired).await;
             return Err(CoreError::UpdateRequired);
         }
+        self.release_stale_panel_connection_before_start(&stored)
+            .await?;
         let split_policy = self.cached_policy_for_start()?;
         let preflight_tunnel_options = match &split_policy {
             Some(policy) => Some(
@@ -1502,6 +1504,62 @@ where
         (state.phase == Phase::Connected)
             .then(|| state.connection.clone())
             .flatten()
+    }
+
+    async fn release_stale_panel_connection_before_start(
+        &self,
+        stored: &nelomai_client_storage::StoredAuth,
+    ) -> Result<(), CoreError> {
+        let stale = {
+            let state = self.state.lock().await;
+            state.connection.clone().filter(|connection| {
+                state.phase != Phase::Connected
+                    && matches!(
+                        connection.status,
+                        LeaseStatus::Allocating | LeaseStatus::Issued | LeaseStatus::Connected
+                    )
+            })
+        };
+        let Some(connection) = stale else {
+            return Ok(());
+        };
+        if !matches!(
+            self.tunnel.status().await?,
+            TunnelStatus::Stopped | TunnelStatus::Failed
+        ) {
+            return Ok(());
+        }
+        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let request = ConnectionOperationRequest {
+            operation_id: Uuid::new_v4().to_string(),
+            lease_id: connection.lease_id,
+        };
+        let response = match self
+            .retry_operation(&access_token, &request, ConnectionOperation::Stop)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.logger.record(CoreLogEvent {
+                    kind: "connection.stale_release_failed",
+                    operation_id: Some(request.operation_id),
+                    request_id: None,
+                    code: Some(error.to_string()),
+                });
+                return Err(error);
+            }
+        };
+        *self.state.lock().await = CoreState {
+            phase: Phase::Ready,
+            connection: Some(response.connection),
+        };
+        self.logger.record(CoreLogEvent {
+            kind: "connection.stale_released",
+            operation_id: Some(request.operation_id),
+            request_id: Some(response.request_id),
+            code: None,
+        });
+        Ok(())
     }
 
     async fn set_phase(&self, phase: Phase) {
