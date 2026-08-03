@@ -465,6 +465,7 @@ where
         request: BindPeerRequest,
     ) -> Result<PeerBindingResponse, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core.prepare_binding_change().await?;
         let access_token = self.access_token()?;
         let _probe_guard = self.probe_gate.lock().await;
         let response = match self.api.bind_peer(&access_token, &request).await {

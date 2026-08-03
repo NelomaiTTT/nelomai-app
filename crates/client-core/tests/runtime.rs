@@ -647,6 +647,31 @@ async fn start_releases_an_active_panel_connection_left_without_a_local_tunnel()
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn binding_change_releases_an_active_panel_connection_without_a_local_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    *api.bootstrap_connection.lock().unwrap() = Some(Connection {
+        status: LeaseStatus::Issued,
+        ..connection("11111111-1111-4111-8111-111111111111")
+    });
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+
+    core.prepare_binding_change().await.unwrap();
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert!(matches!(
+        core.state().await.connection.unwrap().status,
+        LeaseStatus::Warm | LeaseStatus::Released
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn start_keeps_a_warm_panel_connection_available_for_reuse() {
     let api = Arc::new(MockApi::new(0));
     *api.bootstrap_connection.lock().unwrap() = Some(Connection {

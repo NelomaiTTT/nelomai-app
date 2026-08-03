@@ -1242,6 +1242,13 @@ where
         Ok(response.connection)
     }
 
+    pub async fn prepare_binding_change(&self) -> Result<(), CoreError> {
+        let _guard = self.connection_gate.lock().await;
+        let stored = self.load_auth()?;
+        self.release_stale_panel_connection_before_start(&stored)
+            .await
+    }
+
     pub async fn stop(&self) -> Result<Connection, CoreError> {
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
