@@ -17,7 +17,7 @@ object QuickTunnelController {
             return runtimeState.wireName
         }
         val preferences = preferences(context)
-        val persistedState = SessionState.entries.firstOrNull {
+        val persistedState = SessionState.values().firstOrNull {
             it.wireName == preferences.getString(STATE_VALUE, SessionState.STOPPED.wireName)
         } ?: SessionState.STOPPED
         val resolvedState = resolveState(
@@ -35,7 +35,7 @@ object QuickTunnelController {
     @JvmStatic
     fun requestToggle(context: Context): Boolean {
         val current = state(context)
-        val currentState = SessionState.entries.firstOrNull { it.wireName == current }
+        val currentState = SessionState.values().firstOrNull { it.wireName == current }
             ?: SessionState.STOPPED
         val targetActive = current != SessionState.RUNNING.wireName
         if (!updateState(
