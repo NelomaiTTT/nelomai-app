@@ -44,29 +44,21 @@ class NelomaiVpnService : GoBackend.VpnService() {
         activeService = this
         serviceReady.complete(Unit)
         TunnelLog.info("service.created")
+        restoreDesiredTunnel("process_created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        createNotificationChannel()
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            connectionNotification(),
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
-            } else {
-                0
-            },
-        )
+        promoteToForeground()
         when {
             intent?.action == ACTION_QUICK_TOGGLE -> {
                 cancelRestoreRetry()
                 performBackgroundToggle()
             }
-            intent?.action == ACTION_ENSURE_RUNNING -> Unit
+            intent?.action == ACTION_ENSURE_RUNNING -> {
+                restoreDesiredTunnel("ensure_running")
+            }
             intent == null && QuickTunnelController.desiredActive(applicationContext) -> {
-                TunnelLog.info("service.restore_requested")
-                performBackgroundStart(restoring = true)
+                restoreDesiredTunnel("sticky_restart")
             }
             intent == null -> {
                 TunnelLog.info("service.idle_restart_stopped")
@@ -76,6 +68,19 @@ class NelomaiVpnService : GoBackend.VpnService() {
             }
         }
         return START_STICKY
+    }
+
+    override fun onRevoke() {
+        TunnelLog.warning("service.vpn_revoked")
+        QuickTunnelController.updateState(
+            applicationContext,
+            SessionState.STOPPED,
+            desiredActive = false,
+            changed = true,
+        )
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        super.onRevoke()
+        stopSelf()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -111,6 +116,19 @@ class NelomaiVpnService : GoBackend.VpnService() {
             onSuccess = { state, _ -> completeBackgroundAction(state, null, restoring) },
             onError = { completeBackgroundAction(TunnelRuntime.state(), it, restoring) },
         )
+    }
+
+    private fun restoreDesiredTunnel(source: String) {
+        val state = TunnelRuntime.state()
+        if (!shouldRestoreDesiredTunnel(
+            QuickTunnelController.desiredActive(applicationContext),
+            state,
+        )) {
+            return
+        }
+        promoteToForeground()
+        TunnelLog.info("service.restore_requested", mapOf("source" to source))
+        performBackgroundStart(restoring = true)
     }
 
     private fun completeBackgroundAction(
@@ -236,6 +254,20 @@ class NelomaiVpnService : GoBackend.VpnService() {
         )
     }
 
+    private fun promoteToForeground() {
+        createNotificationChannel()
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            connectionNotification(),
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+            } else {
+                0
+            },
+        )
+    }
+
     private fun connectionNotification(): android.app.Notification {
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         val pendingIntent = launchIntent?.let {
@@ -257,6 +289,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
             .build()
     }
 }
+
+internal fun shouldRestoreDesiredTunnel(
+    desiredActive: Boolean,
+    state: SessionState,
+): Boolean = desiredActive && state !in setOf(SessionState.RUNNING, SessionState.STARTING)
 
 internal fun shouldRetryServiceRestore(code: String): Boolean = code in setOf(
     "background_transport_unavailable",
