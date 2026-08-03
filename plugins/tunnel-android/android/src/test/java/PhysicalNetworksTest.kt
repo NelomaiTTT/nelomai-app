@@ -62,6 +62,41 @@ class PhysicalNetworksTest {
     }
 
     @Test
+    fun prefersValidatedNetworksButFallsBackWhenValidationIsUnavailable() {
+        val validated = "wifi" to physicalNetwork(
+            "192.168.10.25/24",
+            wifi = true,
+        )
+        val transient = "cellular" to physicalNetwork(
+            "100.64.1.10/24",
+            cellular = true,
+            validated = false,
+        )
+
+        assertEquals(
+            listOf(validated),
+            PhysicalNetworks.preferValidatedNetworks(listOf(validated, transient)),
+        )
+        assertEquals(
+            listOf(transient),
+            PhysicalNetworks.preferValidatedNetworks(listOf(transient)),
+        )
+    }
+
+    @Test
+    fun localRoutesIgnoreCarrierNetworks() {
+        val snapshots = listOf(
+            physicalNetwork("192.168.10.25/24", wifi = true),
+            physicalNetwork("100.64.1.10/24", cellular = true),
+        )
+
+        assertEquals(
+            listOf("192.168.10.0/24"),
+            PhysicalNetworks.canonicalLocalCidrs(snapshots).map { it.canonical },
+        )
+    }
+
+    @Test
     fun ignoresUnsafeAndHostOnlyAddresses() {
         val snapshots = listOf(
             physicalNetwork(

@@ -34,26 +34,10 @@ object QuickTunnelController {
 
     @JvmStatic
     fun requestToggle(context: Context): Boolean {
-        val current = state(context)
-        val currentState = SessionState.values().firstOrNull { it.wireName == current }
-            ?: SessionState.STOPPED
-        val targetActive = current != SessionState.RUNNING.wireName
-        if (!updateState(
-            context,
-            if (targetActive) SessionState.STARTING else SessionState.STOPPING,
-            desiredActive = targetActive,
-        )) {
-            return false
-        }
         return try {
             NelomaiVpnService.requestToggle(context.applicationContext)
             true
         } catch (error: Throwable) {
-            updateState(
-                context,
-                currentState,
-                desiredActive = currentState == SessionState.RUNNING,
-            )
             TunnelLog.warning("quick_toggle.dispatch_failed", "service_start_failed", error)
             false
         }

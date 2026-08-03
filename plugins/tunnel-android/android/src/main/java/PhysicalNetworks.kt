@@ -65,7 +65,7 @@ internal class PhysicalNetworks(context: Context) {
 
     @Suppress("DEPRECATION")
     fun snapshotState(): PhysicalNetworkState {
-        val eligible = connectivityManager.allNetworks.mapNotNull { network ->
+        val physical = connectivityManager.allNetworks.mapNotNull { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network)
                 ?: return@mapNotNull null
             val properties = connectivityManager.getLinkProperties(network)
@@ -80,7 +80,8 @@ internal class PhysicalNetworks(context: Context) {
             }
             network to snapshot
         }
-        val routes = canonicalCidrs(eligible.map { it.second })
+        val eligible = preferValidatedNetworks(physical)
+        val routes = canonicalLocalCidrs(eligible.map { it.second })
         val networkIds = eligible.map { (network, _) -> network.toString() }
         return PhysicalNetworkState(
             localRoutes = routes,
@@ -121,6 +122,7 @@ internal class PhysicalNetworks(context: Context) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 requestBuilder.clearCapabilities()
             }
+            requestBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             requestBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             val request = requestBuilder.build()
             connectivityManager.registerNetworkCallback(request, networkCallback)
@@ -152,6 +154,13 @@ internal class PhysicalNetworks(context: Context) {
     }
 
     companion object {
+        internal fun <T> preferValidatedNetworks(
+            networks: List<Pair<T, PhysicalNetworkSnapshot>>,
+        ): List<Pair<T, PhysicalNetworkSnapshot>> {
+            val validated = networks.filter { it.second.validated }
+            return validated.ifEmpty { networks }
+        }
+
         fun canonicalCidrs(networks: List<PhysicalNetworkSnapshot>): List<Ipv4Prefix> {
             val routes = linkedMapOf<String, Ipv4Prefix>()
             networks.asSequence()
@@ -163,6 +172,12 @@ internal class PhysicalNetworks(context: Context) {
                 .forEach { routes.putIfAbsent(it.canonical, it) }
             return AndroidSplitTunnel.mergeExcludedRoutes(emptyList(), routes.values.toList())
         }
+
+        fun canonicalLocalCidrs(
+            networks: List<PhysicalNetworkSnapshot>,
+        ): List<Ipv4Prefix> = canonicalCidrs(
+            networks.filter { it.wifi || it.ethernet },
+        )
 
         fun fingerprint(routes: List<Ipv4Prefix>): String =
             routes.joinToString(separator = "\n", transform = Ipv4Prefix::canonical)

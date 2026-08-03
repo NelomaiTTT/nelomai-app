@@ -59,21 +59,6 @@ class TunnelPayloadTest {
     }
 
     @Test
-    fun physicalNetworkRetryIsDeferredOnlyForTheFailedNetwork() {
-        val gate = PhysicalNetworkRetryGate()
-
-        assertTrue(gate.canAttempt("wifi-a", 1_000))
-        gate.defer("wifi-a", 1_000)
-
-        assertTrue(!gate.canAttempt("wifi-a", 1_000 + 299_999))
-        assertTrue(gate.canAttempt("wifi-a", 1_000 + 300_000))
-        assertTrue(gate.canAttempt("cellular-b", 1_001))
-
-        gate.clear()
-        assertTrue(gate.canAttempt("wifi-a", 1_002))
-    }
-
-    @Test
     fun backgroundOperationGateSerializesTheWholeOperation() {
         val gate = BackgroundOperationGate()
 
