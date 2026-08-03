@@ -46,6 +46,22 @@ class PhysicalNetworksTest {
     }
 
     @Test
+    fun keepsInternetNetworkWhenAndroidValidationIsUnavailable() {
+        val snapshots = listOf(
+            physicalNetwork(
+                "192.168.10.25/24",
+                wifi = true,
+                validated = false,
+            ),
+        )
+
+        assertEquals(
+            listOf("192.168.10.0/24"),
+            PhysicalNetworks.canonicalCidrs(snapshots).map { it.canonical },
+        )
+    }
+
+    @Test
     fun ignoresUnsafeAndHostOnlyAddresses() {
         val snapshots = listOf(
             physicalNetwork(
@@ -83,9 +99,22 @@ class PhysicalNetworksTest {
         )
     }
 
+    @Test
+    fun stateFingerprintIsIndependentOfNetworkEnumerationOrder() {
+        val routes = PhysicalNetworks.canonicalCidrs(
+            listOf(physicalNetwork("192.168.1.50/24", wifi = true)),
+        )
+
+        assertEquals(
+            PhysicalNetworks.stateFingerprint(listOf("102", "101"), routes),
+            PhysicalNetworks.stateFingerprint(listOf("101", "102"), routes),
+        )
+    }
+
     private fun physicalNetwork(
         vararg addresses: String,
         active: Boolean = true,
+        validated: Boolean = true,
         wifi: Boolean = false,
         cellular: Boolean = false,
         ethernet: Boolean = false,
@@ -93,6 +122,7 @@ class PhysicalNetworksTest {
     ): PhysicalNetworkSnapshot =
         PhysicalNetworkSnapshot(
             active = active,
+            validated = validated,
             wifi = wifi,
             cellular = cellular,
             ethernet = ethernet,

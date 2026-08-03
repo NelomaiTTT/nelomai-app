@@ -41,6 +41,14 @@ class TunnelPayloadTest {
     }
 
     @Test
+    fun failedTunnelIsCleanedBeforeItIsStartedAgain() {
+        val gate = TunnelStateGate(SessionState.FAILED)
+
+        assertEquals(TransitionDecision.REPLACE, gate.beginStart())
+        assertEquals(TransitionDecision.BUSY, gate.beginStart())
+    }
+
+    @Test
     fun stopIsIdempotentAndBlocksConcurrentMutation() {
         val gate = TunnelStateGate(SessionState.RUNNING)
 
@@ -63,5 +71,47 @@ class TunnelPayloadTest {
 
         gate.clear()
         assertTrue(gate.canAttempt("wifi-a", 1_002))
+    }
+
+    @Test
+    fun backgroundOperationGateSerializesTheWholeOperation() {
+        val gate = BackgroundOperationGate()
+
+        assertTrue(gate.begin())
+        assertTrue(!gate.begin())
+        gate.complete()
+        assertTrue(gate.begin())
+    }
+
+    @Test
+    fun backgroundStartRetriesUnavailableSavedServerOnlyWhenAlternateIsAllowed() {
+        assertTrue(
+            shouldRetryBackgroundStart(
+                "saved-lease",
+                true,
+                "saved_connection_unavailable",
+            ),
+        )
+        assertTrue(
+            shouldRetryBackgroundStart(
+                "saved-lease",
+                true,
+                "saved_stray_unavailable",
+            ),
+        )
+        assertTrue(
+            !shouldRetryBackgroundStart(
+                "saved-lease",
+                false,
+                "saved_connection_unavailable",
+            ),
+        )
+        assertTrue(
+            shouldRetryBackgroundStart(
+                "saved-lease",
+                false,
+                "connection_no_longer_active",
+            ),
+        )
     }
 }

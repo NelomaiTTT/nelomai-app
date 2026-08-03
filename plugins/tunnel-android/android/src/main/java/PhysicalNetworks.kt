@@ -22,12 +22,21 @@ internal data class PhysicalLinkAddress(
 
 internal data class PhysicalNetworkSnapshot(
     val active: Boolean,
+    val validated: Boolean,
     val wifi: Boolean,
     val cellular: Boolean,
     val ethernet: Boolean,
     val vpn: Boolean,
     val addresses: List<PhysicalLinkAddress>,
 )
+
+internal data class PhysicalNetworkState(
+    val localRoutes: List<Ipv4Prefix>,
+    val networks: List<Network>,
+    val fingerprint: String,
+) {
+    val available: Boolean get() = networks.isNotEmpty()
+}
 
 internal class PhysicalNetworks(context: Context) {
     private val connectivityManager =
@@ -36,10 +45,10 @@ internal class PhysicalNetworks(context: Context) {
     private val lock = Any()
 
     private var callback: ConnectivityManager.NetworkCallback? = null
-    private var listener: ((List<Ipv4Prefix>) -> Unit)? = null
+    private var listener: ((PhysicalNetworkState) -> Unit)? = null
     private val refresh = Runnable {
         val currentListener = synchronized(lock) { listener }
-        runCatching(::snapshot)
+        runCatching(::snapshotState)
             .onSuccess { currentListener?.invoke(it) }
             .onFailure {
                 val active = synchronized(lock) { callback != null && listener != null }
@@ -51,26 +60,51 @@ internal class PhysicalNetworks(context: Context) {
 
     @Suppress("DEPRECATION")
     fun snapshot(): List<Ipv4Prefix> {
-        val networks = connectivityManager.allNetworks.mapNotNull { network ->
+        return snapshotState().localRoutes
+    }
+
+    @Suppress("DEPRECATION")
+    fun snapshotState(): PhysicalNetworkState {
+        val eligible = connectivityManager.allNetworks.mapNotNull { network ->
             val capabilities = connectivityManager.getNetworkCapabilities(network)
                 ?: return@mapNotNull null
             val properties = connectivityManager.getLinkProperties(network)
                 ?: return@mapNotNull null
-            snapshot(capabilities, properties)
+            val snapshot = snapshot(capabilities, properties)
+            if (
+                !snapshot.active ||
+                snapshot.vpn ||
+                !(snapshot.wifi || snapshot.cellular || snapshot.ethernet)
+            ) {
+                return@mapNotNull null
+            }
+            network to snapshot
         }
-        return canonicalCidrs(networks)
+        val routes = canonicalCidrs(eligible.map { it.second })
+        val networkIds = eligible.map { (network, _) -> network.toString() }
+        return PhysicalNetworkState(
+            localRoutes = routes,
+            networks = eligible.map { it.first },
+            fingerprint = stateFingerprint(networkIds, routes),
+        )
     }
 
-    fun start(listener: (List<Ipv4Prefix>) -> Unit) {
+    fun start(listener: (PhysicalNetworkState) -> Unit) {
         synchronized(lock) {
             if (callback != null) {
                 return
             }
             this.listener = listener
             val networkCallback = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) = scheduleRefresh()
+                override fun onAvailable(network: Network) {
+                    TunnelLog.info("network.available", mapOf("network" to network.toString()))
+                    scheduleRefresh()
+                }
 
-                override fun onLost(network: Network) = scheduleRefresh()
+                override fun onLost(network: Network) {
+                    TunnelLog.info("network.lost", mapOf("network" to network.toString()))
+                    scheduleRefresh()
+                }
 
                 override fun onCapabilitiesChanged(
                     network: Network,
@@ -133,12 +167,16 @@ internal class PhysicalNetworks(context: Context) {
         fun fingerprint(routes: List<Ipv4Prefix>): String =
             routes.joinToString(separator = "\n", transform = Ipv4Prefix::canonical)
 
+        fun stateFingerprint(networkIds: List<String>, routes: List<Ipv4Prefix>): String =
+            (networkIds.sorted() + routes.map(Ipv4Prefix::canonical)).joinToString("\n")
+
         private fun snapshot(
             capabilities: NetworkCapabilities,
             properties: LinkProperties,
         ): PhysicalNetworkSnapshot =
             PhysicalNetworkSnapshot(
-                active = true,
+                active = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),
+                validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
                 wifi = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
                 cellular = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
                 ethernet = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),

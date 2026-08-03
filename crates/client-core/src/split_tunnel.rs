@@ -855,6 +855,7 @@ where
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
                     options,
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
+                    quick_connection: None,
                 })
         };
         let first = start(configuration.clone(), options.clone()).await;
@@ -1632,6 +1633,7 @@ where
                 ),
                 options: new_options.clone(),
                 quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
+                quick_connection: None,
             })
             .await;
         let (outcome, status, error_code) = if start_new.is_ok() {
@@ -1661,6 +1663,7 @@ where
                     configuration: nelomai_client_tunnel::TunnelConfiguration::new(configuration),
                     options: previous_options.clone(),
                     quick_reconnect: nelomai_client_tunnel::QuickReconnect::Disabled,
+                    quick_connection: None,
                 })
                 .await;
             if rollback.is_ok() {

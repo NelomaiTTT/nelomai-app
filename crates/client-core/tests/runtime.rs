@@ -469,9 +469,10 @@ async fn bootstrap_refreshes_an_expired_access_token_without_signing_out() {
 async fn start_refreshes_once_and_reuses_the_same_operation() {
     let api = Arc::new(MockApi::new(0));
     api.reject_stale_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
     let core = ClientCore::new(
         api.clone(),
-        Arc::new(MemoryStore::new(auth())),
+        store.clone(),
         Arc::new(MemoryTunnel::default()),
         Arc::new(MemoryLogger::default()),
     );
@@ -482,6 +483,10 @@ async fn start_refreshes_once_and_reuses_the_same_operation() {
     let operation_ids = api.operation_ids.lock().unwrap();
     assert_eq!(operation_ids.len(), 2);
     assert_eq!(operation_ids[0], operation_ids[1]);
+    let stored = store.load().unwrap().unwrap();
+    assert_eq!(stored.access_token.as_deref(), Some("fresh-access"));
+    assert_eq!(stored.refresh_token.as_deref(), Some("fresh-refresh"));
+    assert!(stored.saved_connection.is_some());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -715,6 +720,38 @@ async fn external_quick_action_reconciles_the_local_tunnel_without_panel_operati
 
     assert_eq!(started.phase, Phase::Connected);
     assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_discards_stale_saved_connection_after_external_quick_start() {
+    let api = Arc::new(MockApi::new(0));
+    let fresh_connection = connection("22222222-2222-4222-8222-222222222222");
+    *api.bootstrap_connection.lock().unwrap() = Some(fresh_connection.clone());
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        probe_url: Some("https://old.example.test/probe".to_string()),
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: "PrivateKey = stale-secret".to_string(),
+        valid_until_unix: Some(1_700_003_600),
+    });
+    let store = Arc::new(MemoryStore::new(stored));
+    let core = ClientCore::new(
+        api,
+        store.clone(),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.bootstrap(1_700_000_000).await.unwrap();
+
+    assert_eq!(core.state().await.connection, Some(fresh_connection));
+    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

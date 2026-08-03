@@ -83,6 +83,26 @@ pub struct TokenResponse {
     pub device: AuthDevice,
 }
 
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct BackgroundTokenResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub token: String,
+    pub expires_in: u64,
+}
+
+impl fmt::Debug for BackgroundTokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackgroundTokenResponse")
+            .field("api_version", &self.api_version)
+            .field("request_id", &self.request_id)
+            .field("token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
 impl fmt::Debug for TokenResponse {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -279,6 +299,18 @@ impl ClientApi {
         self.send_json(
             self.http
                 .post(self.endpoint("auth/logout-all")?)
+                .bearer_auth(access_token),
+        )
+        .await
+    }
+
+    pub async fn background_token(
+        &self,
+        access_token: &str,
+    ) -> Result<BackgroundTokenResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("background/token")?)
                 .bearer_auth(access_token),
         )
         .await

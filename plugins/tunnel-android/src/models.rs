@@ -103,6 +103,17 @@ pub struct StartTunnelRequest {
     pub options: TunnelOptions,
     pub cache_quick_action: bool,
     pub quick_action_valid_until_unix: Option<i64>,
+    pub quick_connection: Option<QuickConnectionRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickConnectionRequest {
+    pub lease_id: String,
+    pub layer: String,
+    pub tic_connection_mode: String,
+    pub route_mode: String,
+    pub allow_alternate: bool,
 }
 
 impl StartTunnelRequest {
@@ -113,6 +124,7 @@ impl StartTunnelRequest {
             options: TunnelOptions::default(),
             cache_quick_action: false,
             quick_action_valid_until_unix: None,
+            quick_connection: None,
         }
     }
 }
@@ -129,6 +141,7 @@ impl fmt::Debug for StartTunnelRequest {
                 "quick_action_valid_until_unix",
                 &self.quick_action_valid_until_unix,
             )
+            .field("quick_connection", &self.quick_connection)
             .finish()
     }
 }
@@ -146,6 +159,7 @@ impl Serialize for StartTunnelRequest {
             options: &'a TunnelOptions,
             cache_quick_action: bool,
             quick_action_valid_until_unix: Option<i64>,
+            quick_connection: &'a Option<QuickConnectionRequest>,
         }
 
         WireRequest {
@@ -154,8 +168,37 @@ impl Serialize for StartTunnelRequest {
             options: &self.options,
             cache_quick_action: self.cache_quick_action,
             quick_action_valid_until_unix: self.quick_action_valid_until_unix,
+            quick_connection: &self.quick_connection,
         }
         .serialize(serializer)
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundCredentialRequest {
+    pub api_version: u16,
+    pub panel_base: String,
+    pub token: String,
+    pub expires_at_unix: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundCredentialStatusResponse {
+    pub configured: bool,
+    pub expires_at_unix: Option<i64>,
+}
+
+impl fmt::Debug for BackgroundCredentialRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackgroundCredentialRequest")
+            .field("api_version", &self.api_version)
+            .field("panel_base", &self.panel_base)
+            .field("token", &"<redacted>")
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
     }
 }
 

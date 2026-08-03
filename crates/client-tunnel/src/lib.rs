@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use nelomai_contracts::SplitTunnelMode;
+use nelomai_contracts::{Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -40,6 +40,7 @@ pub struct TunnelStartRequest {
     pub configuration: TunnelConfiguration,
     pub options: TunnelOptions,
     pub quick_reconnect: QuickReconnect,
+    pub quick_connection: Option<QuickConnection>,
 }
 
 impl TunnelStartRequest {
@@ -48,6 +49,7 @@ impl TunnelStartRequest {
             configuration,
             options: TunnelOptions::default(),
             quick_reconnect: QuickReconnect::Disabled,
+            quick_connection: None,
         }
     }
 }
@@ -59,8 +61,18 @@ impl fmt::Debug for TunnelStartRequest {
             .field("configuration", &"<redacted>")
             .field("options", &self.options)
             .field("quick_reconnect", &self.quick_reconnect)
+            .field("quick_connection", &self.quick_connection)
             .finish()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickConnection {
+    pub lease_id: String,
+    pub layer: Layer,
+    pub tic_connection_mode: TicConnectionMode,
+    pub route_mode: RouteMode,
+    pub allow_alternate: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -350,6 +362,7 @@ mod tests {
                 policy_hash: Some("sha256:test".to_string()),
             },
             quick_reconnect: QuickReconnect::Persistent,
+            quick_connection: None,
         };
 
         let debug = format!("{request:?}");

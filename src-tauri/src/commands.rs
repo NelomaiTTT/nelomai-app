@@ -19,10 +19,25 @@ use nelomai_contracts::{
     SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "android")]
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_tunnel_android::TunnelAndroidExt;
+
+#[cfg(target_os = "android")]
+static ANDROID_BACKGROUND_PROVISION_GATE: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(target_os = "android")]
+static ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX: AtomicI64 = AtomicI64::new(0);
+
+#[cfg(target_os = "android")]
+const ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+#[cfg(target_os = "android")]
+const ANDROID_QUICK_RECONCILE_RETRY_SECONDS: i64 = 15;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +72,10 @@ impl CommandError {
 
     pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+
+    fn code(&self) -> &str {
+        &self.code
     }
 
     fn from_api(error: CoreApiError) -> Self {
@@ -387,16 +406,42 @@ impl From<PeerBindingResponse> for SafePeerBindingResponse {
 pub async fn app_state(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
     metrics: State<'_, Arc<ConnectionMetricsTracker>>,
 ) -> Result<AppStateResponse, CommandError> {
     if metrics_view_is_visible(&app) {
         metrics.mark_observed().await;
     }
-    let state = if app
+    let quick_state_changed = app
         .tunnel_android()
         .take_quick_state_change()
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
+        match application.bootstrap(now_unix()).await {
+            Ok(_) => {
+                provision_android_background_resilient(
+                    app.clone(),
+                    application.inner().clone(),
+                    diagnostics.inner().clone(),
+                )
+                .await;
+                if app
+                    .tunnel_android()
+                    .acknowledge_quick_state_change()
+                    .is_ok()
+                {
+                    clear_quick_reconcile_retry();
+                } else {
+                    defer_quick_reconcile(now_unix());
+                }
+                application.state().await
+            }
+            Err(_) => {
+                defer_quick_reconcile(now_unix());
+                application.reconcile_external_tunnel_state().await
+            }
+        }
+    } else if quick_state_changed {
         application.reconcile_external_tunnel_state().await
     } else {
         application.state().await
@@ -406,6 +451,35 @@ pub async fn app_state(
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
     Ok(AppStateResponse::new(state, warning, current_metrics))
 }
+
+#[cfg(target_os = "android")]
+fn quick_reconcile_is_due(now_unix: i64) -> bool {
+    now_unix >= ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX.load(Ordering::Relaxed)
+}
+
+#[cfg(not(target_os = "android"))]
+fn quick_reconcile_is_due(_now_unix: i64) -> bool {
+    true
+}
+
+#[cfg(target_os = "android")]
+fn defer_quick_reconcile(now_unix: i64) {
+    ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX.store(
+        now_unix.saturating_add(ANDROID_QUICK_RECONCILE_RETRY_SECONDS),
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+fn defer_quick_reconcile(_now_unix: i64) {}
+
+#[cfg(target_os = "android")]
+fn clear_quick_reconcile_retry() {
+    ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX.store(0, Ordering::Relaxed);
+}
+
+#[cfg(not(target_os = "android"))]
+fn clear_quick_reconcile_retry() {}
 
 #[tauri::command]
 pub fn app_preferences(preferences: State<'_, Arc<AppPreferenceStore>>) -> AppPreferencesResponse {
@@ -531,6 +605,7 @@ pub(crate) async fn quick_toggle(
 pub async fn app_login(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
     split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
@@ -551,7 +626,14 @@ pub async fn app_login(
         )
         .await
         .map_err(CommandError::from)?;
+    let _ = app.tunnel_android().clear_background();
     let _ = app.tunnel_android().clear_quick_plan();
+    provision_android_background_resilient(
+        app.clone(),
+        application.inner().clone(),
+        diagnostics.inner().clone(),
+    )
+    .await;
     let _ = refresh_installed_applications(&app, &application);
     observe_and_schedule_update(
         application.inner().clone(),
@@ -574,6 +656,7 @@ pub async fn app_login(
 pub async fn app_bootstrap(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
     split_tunnel_scheduler: State<'_, Arc<SplitTunnelScheduler>>,
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
@@ -583,6 +666,12 @@ pub async fn app_bootstrap(
         .bootstrap(now_unix())
         .await
         .map_err(CommandError::from)?;
+    provision_android_background_resilient(
+        app.clone(),
+        application.inner().clone(),
+        diagnostics.inner().clone(),
+    )
+    .await;
     observe_and_schedule_update(
         application.inner().clone(),
         updater.inner().clone(),
@@ -598,6 +687,100 @@ pub async fn app_bootstrap(
         push_registration_scheduler.inner().clone(),
     );
     Ok(response)
+}
+
+async fn provision_android_background(
+    app: &AppHandle,
+    application: &NativeApplication,
+) -> Result<(), CommandError> {
+    #[cfg(target_os = "android")]
+    {
+        let now = now_unix();
+        let status = app
+            .tunnel_android()
+            .background_credential_status()
+            .map_err(|_| {
+                CommandError::new(
+                    "background_storage_unavailable",
+                    "Не удалось проверить фоновое подключение",
+                )
+            })?;
+        if status.configured
+            && status.expires_at_unix.is_some_and(|expires_at| {
+                expires_at > now.saturating_add(ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS)
+            })
+        {
+            return Ok(());
+        }
+        let token = application
+            .background_token()
+            .await
+            .map_err(CommandError::from)?;
+        let expires_at_unix = now.saturating_add(token.expires_in.min(i64::MAX as u64) as i64);
+        app.tunnel_android()
+            .configure_background(tauri_plugin_tunnel_android::BackgroundCredentialRequest {
+                api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                panel_base: crate::PANEL_BASE.to_string(),
+                token: token.token,
+                expires_at_unix,
+            })
+            .map_err(|_| {
+                CommandError::new(
+                    "background_storage_unavailable",
+                    "Не удалось подготовить фоновое подключение",
+                )
+            })?;
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = (app, application);
+    Ok(())
+}
+
+async fn provision_android_background_resilient(
+    app: AppHandle,
+    application: Arc<NativeApplication>,
+    diagnostics: Arc<AppDiagnostics>,
+) {
+    let Err(error) = provision_android_background_serialized(&app, &application).await else {
+        return;
+    };
+    diagnostics.record_named(
+        "background.provision_failed",
+        None,
+        None,
+        Some(error.code()),
+    );
+
+    #[cfg(target_os = "android")]
+    tauri::async_runtime::spawn(async move {
+        for delay_seconds in [5, 30, 120] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
+            match provision_android_background_serialized(&app, &application).await {
+                Ok(()) => {
+                    diagnostics.record_named("background.provision_recovered", None, None, None);
+                    return;
+                }
+                Err(error) => diagnostics.record_named(
+                    "background.provision_retry_failed",
+                    None,
+                    None,
+                    Some(error.code()),
+                ),
+            }
+        }
+    });
+
+    #[cfg(not(target_os = "android"))]
+    let _ = (app, application);
+}
+
+async fn provision_android_background_serialized(
+    app: &AppHandle,
+    application: &NativeApplication,
+) -> Result<(), CommandError> {
+    #[cfg(target_os = "android")]
+    let _guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
+    provision_android_background(app, application).await
 }
 
 #[tauri::command]
@@ -1069,11 +1252,25 @@ pub async fn app_logout(
     application: State<'_, Arc<NativeApplication>>,
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
 ) -> Result<(), CommandError> {
-    push_registration_scheduler
-        .logout(&app, &application)
-        .await
-        .map_err(CommandError::from)?;
-    let _ = app.tunnel_android().clear_quick_plan();
+    let logout_result = push_registration_scheduler.logout(&app, &application).await;
+    let quick_plan_result = app.tunnel_android().clear_quick_plan();
+    let background_result = app.tunnel_android().clear_background();
+
+    if let Err(error) = logout_result {
+        return Err(CommandError::from(error));
+    }
+    quick_plan_result.map_err(|_| {
+        CommandError::new(
+            "quick_state_persist_failed",
+            "Не удалось очистить данные быстрого подключения",
+        )
+    })?;
+    background_result.map_err(|_| {
+        CommandError::new(
+            "background_storage_unavailable",
+            "Не удалось очистить данные фонового подключения",
+        )
+    })?;
     Ok(())
 }
 

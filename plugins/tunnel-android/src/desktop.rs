@@ -45,8 +45,26 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(())
     }
 
+    pub fn configure_background(&self, _request: BackgroundCredentialRequest) -> crate::Result<()> {
+        Ok(())
+    }
+
+    pub fn background_credential_status(
+        &self,
+    ) -> crate::Result<BackgroundCredentialStatusResponse> {
+        Ok(BackgroundCredentialStatusResponse::default())
+    }
+
+    pub fn clear_background(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     pub fn take_quick_state_change(&self) -> crate::Result<bool> {
         Ok(false)
+    }
+
+    pub fn acknowledge_quick_state_change(&self) -> crate::Result<()> {
+        Ok(())
     }
 
     pub fn start_tunnel(

@@ -5,8 +5,8 @@ use nelomai_client_storage::{
     StoredConnectionKind,
 };
 use nelomai_client_tunnel::{
-    QuickReconnect, TunnelConfiguration, TunnelController, TunnelError, TunnelOptions,
-    TunnelStartRequest, TunnelStatus,
+    QuickConnection, QuickReconnect, TunnelConfiguration, TunnelController, TunnelError,
+    TunnelOptions, TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
@@ -895,6 +895,23 @@ where
             update_required: response.update.required,
             observed_at_unix: now_unix,
         });
+        if let Some(connection) = response.connection.as_ref() {
+            if connection.pinned {
+                if current_stored
+                    .pinned_connection
+                    .as_ref()
+                    .is_some_and(|saved| saved.lease_id != connection.lease_id)
+                {
+                    current_stored.pinned_connection = None;
+                }
+            } else if current_stored
+                .saved_connection
+                .as_ref()
+                .is_some_and(|saved| saved.lease_id != connection.lease_id)
+            {
+                current_stored.saved_connection = None;
+            }
+        }
         self.store
             .save(&current_stored)
             .map_err(|_| CoreError::Storage)?;
@@ -960,7 +977,7 @@ where
         if let Some(connection) = self.connected_connection().await {
             return Ok(connection);
         }
-        let mut stored = self.load_auth()?;
+        let stored = self.load_auth()?;
         if stored
             .compatibility
             .as_ref()
@@ -1082,13 +1099,17 @@ where
             configuration: response.configuration.clone(),
             valid_until_unix,
         };
+        // The start request may rotate the tokens after an unauthorized response.
+        // Reload before persisting the connection so stale credentials cannot
+        // overwrite the freshly rotated session.
+        let mut current_stored = self.load_auth()?;
         if kind == StoredConnectionKind::Pinned {
-            stored.pinned_connection = Some(saved_connection);
-            stored.saved_connection = None;
+            current_stored.pinned_connection = Some(saved_connection);
+            current_stored.saved_connection = None;
         } else {
-            stored.saved_connection = Some(saved_connection);
+            current_stored.saved_connection = Some(saved_connection);
         }
-        if self.store.save(&stored).is_err() {
+        if self.store.save(&current_stored).is_err() {
             let error = CoreError::Storage;
             self.compensate_failed_start(
                 &access_token,
@@ -1111,6 +1132,13 @@ where
                     Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
                     None => QuickReconnect::Persistent,
                 },
+                quick_connection: Some(QuickConnection {
+                    lease_id: response.connection.lease_id.clone(),
+                    layer: response.connection.layer,
+                    tic_connection_mode: response.connection.tic_connection_mode,
+                    route_mode: response.connection.route_mode,
+                    allow_alternate: options.allow_alternate,
+                }),
             })
             .await
         {
@@ -1465,6 +1493,13 @@ where
                     Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
                     None => QuickReconnect::Persistent,
                 },
+                quick_connection: Some(QuickConnection {
+                    lease_id: saved.lease_id.clone(),
+                    layer: saved.layer,
+                    tic_connection_mode: saved.tic_connection_mode,
+                    route_mode: saved.route_mode,
+                    allow_alternate: false,
+                }),
             })
             .await?;
         let applied_physical_network_fingerprint = self

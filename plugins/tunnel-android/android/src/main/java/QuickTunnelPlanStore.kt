@@ -16,84 +16,60 @@ private const val QUICK_PLAN_KEY_ALIAS = "nelomai-quick-tunnel-plan"
 private const val QUICK_PLAN_PREFERENCES = "nelomai-quick-tunnel-plan"
 private const val QUICK_PLAN_CIPHERTEXT = "ciphertext"
 private const val QUICK_PLAN_IV = "iv"
-private const val QUICK_PLAN_FORMAT = 1
+private const val QUICK_PLAN_FORMAT = 2
+
+internal data class QuickTunnelTemplate(
+    val options: TunnelOptionsArgs,
+    val connection: QuickConnectionArgs,
+)
 
 internal object QuickTunnelPlanStore {
     fun save(context: Context, args: StartTunnelArgs) {
-        if (!args.cacheQuickAction || !args.configurationInitialized) return
+        if (!args.cacheQuickAction || args.quickConnection == null) return
         val plaintext = JSONObject().apply {
             put("format", QUICK_PLAN_FORMAT)
-            put(
-                "configuration",
-                Base64.encodeToString(args.configuration, Base64.NO_WRAP),
-            )
             put("validUntilUnix", args.quickActionValidUntilUnix ?: JSONObject.NULL)
             put("options", args.options.toJson())
+            put("connection", args.quickConnection?.toJson() ?: JSONObject.NULL)
         }.toString().toByteArray(Charsets.UTF_8)
         try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, secretKey())
             val ciphertext = cipher.doFinal(plaintext)
-            context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
+            val saved = context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
                 .edit()
                 .putString(QUICK_PLAN_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
                 .putString(QUICK_PLAN_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
                 .commit()
+            check(saved) { "quick_plan_write_failed" }
         } finally {
             plaintext.fill(0)
         }
     }
 
-    fun load(context: Context, nowUnix: Long): StartTunnelArgs? {
-        val preferences = context.getSharedPreferences(
-            QUICK_PLAN_PREFERENCES,
-            Context.MODE_PRIVATE,
-        )
-        val encodedCiphertext = preferences.getString(QUICK_PLAN_CIPHERTEXT, null) ?: return null
-        val encodedIv = preferences.getString(QUICK_PLAN_IV, null) ?: return null
-        var plaintext: ByteArray? = null
+    fun loadTemplate(context: Context): QuickTunnelTemplate? {
+        val payload = decrypt(context) ?: return null
         return try {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                secretKey(),
-                GCMParameterSpec(128, Base64.decode(encodedIv, Base64.NO_WRAP)),
-            )
-            plaintext = cipher.doFinal(Base64.decode(encodedCiphertext, Base64.NO_WRAP))
-            val payload = JSONObject(plaintext.toString(Charsets.UTF_8))
             if (payload.getInt("format") != QUICK_PLAN_FORMAT) {
                 clear(context)
                 return null
             }
-            val validUntilUnix = payload.optLongOrNull("validUntilUnix")
-            if (validUntilUnix != null && nowUnix >= validUntilUnix) {
-                clear(context)
-                return null
-            }
-            StartTunnelArgs().apply {
-                apiVersion = TUNNEL_API_VERSION
-                configuration = Base64.decode(
-                    payload.getString("configuration"),
-                    Base64.NO_WRAP,
-                )
-                options = TunnelOptionsArgs.fromJson(payload.getJSONObject("options"))
-                cacheQuickAction = false
-                quickActionValidUntilUnix = validUntilUnix
-            }
+            val connection = payload.optJSONObject("connection")?.toQuickConnection() ?: return null
+            QuickTunnelTemplate(
+                options = TunnelOptionsArgs.fromJson(payload.getJSONObject("options")),
+                connection = connection,
+            )
         } catch (_: Throwable) {
             clear(context)
             null
-        } finally {
-            plaintext?.fill(0)
         }
     }
 
-    fun clear(context: Context) {
+    fun clear(context: Context): Boolean =
         context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
             .edit()
             .clear()
             .commit()
-    }
 
     private fun secretKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -109,6 +85,27 @@ internal object QuickTunnelPlanStore {
                     .build(),
             )
             generateKey()
+        }
+    }
+
+    private fun decrypt(context: Context): JSONObject? {
+        val preferences = context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
+        val encodedCiphertext = preferences.getString(QUICK_PLAN_CIPHERTEXT, null) ?: return null
+        val encodedIv = preferences.getString(QUICK_PLAN_IV, null) ?: return null
+        var plaintext: ByteArray? = null
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                secretKey(),
+                GCMParameterSpec(128, Base64.decode(encodedIv, Base64.NO_WRAP)),
+            )
+            plaintext = cipher.doFinal(Base64.decode(encodedCiphertext, Base64.NO_WRAP))
+            JSONObject(plaintext.toString(Charsets.UTF_8))
+        } catch (_: Throwable) {
+            null
+        } finally {
+            plaintext?.fill(0)
         }
     }
 }
@@ -135,5 +132,18 @@ private fun JSONObject.stringList(key: String): ArrayList<String> {
     return ArrayList((0 until values.length()).map(values::getString))
 }
 
-private fun JSONObject.optLongOrNull(key: String): Long? =
-    if (isNull(key) || !has(key)) null else getLong(key)
+private fun QuickConnectionArgs.toJson(): JSONObject = JSONObject().apply {
+    put("leaseId", leaseId)
+    put("layer", layer)
+    put("ticConnectionMode", ticConnectionMode)
+    put("routeMode", routeMode)
+    put("allowAlternate", allowAlternate)
+}
+
+private fun JSONObject.toQuickConnection(): QuickConnectionArgs = QuickConnectionArgs().apply {
+    leaseId = getString("leaseId")
+    layer = getString("layer")
+    ticConnectionMode = getString("ticConnectionMode")
+    routeMode = getString("routeMode")
+    allowAlternate = optBoolean("allowAlternate", false)
+}

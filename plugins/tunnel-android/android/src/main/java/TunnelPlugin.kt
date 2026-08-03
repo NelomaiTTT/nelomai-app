@@ -10,7 +10,6 @@ import android.os.health.HealthStats
 import android.os.health.SystemHealthManager
 import android.os.health.UidHealthStats
 import android.service.quicksettings.TileService
-import android.util.Log
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -32,8 +31,8 @@ import org.json.JSONArray
 
 internal const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
-private const val TUNNEL_LOG_TAG = "NelomaiTunnel"
 private const val PHYSICAL_NETWORK_RETRY_MILLIS = 5 * 60 * 1_000L
+private const val PHYSICAL_NETWORK_RECOVERY_RETRY_MILLIS = 15_000L
 private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
 
 @InvokeArg
@@ -61,6 +60,24 @@ class StartTunnelArgs {
     var options: TunnelOptionsArgs = TunnelOptionsArgs()
     var cacheQuickAction: Boolean = false
     var quickActionValidUntilUnix: Long? = null
+    var quickConnection: QuickConnectionArgs? = null
+}
+
+@InvokeArg
+class QuickConnectionArgs {
+    lateinit var leaseId: String
+    lateinit var layer: String
+    lateinit var ticConnectionMode: String
+    lateinit var routeMode: String
+    var allowAlternate: Boolean = false
+}
+
+@InvokeArg
+class BackgroundCredentialArgs {
+    var apiVersion: Int = 0
+    lateinit var panelBase: String
+    lateinit var token: String
+    var expiresAtUnix: Long = 0
 }
 
 @InvokeArg
@@ -115,9 +132,14 @@ internal class TunnelStateGate(
                     }
                 }
                 SessionState.STARTING, SessionState.STOPPING -> return TransitionDecision.BUSY
-                SessionState.STOPPED, SessionState.FAILED -> {
+                SessionState.STOPPED -> {
                     if (state.compareAndSet(current, SessionState.STARTING)) {
                         return TransitionDecision.PROCEED
+                    }
+                }
+                SessionState.FAILED -> {
+                    if (state.compareAndSet(current, SessionState.STARTING)) {
+                        return TransitionDecision.REPLACE
                     }
                 }
             }
@@ -161,6 +183,16 @@ internal class PhysicalNetworkRetryGate {
     }
 }
 
+internal class BackgroundOperationGate {
+    private val active = AtomicBoolean(false)
+
+    fun begin(): Boolean = active.compareAndSet(false, true)
+
+    fun complete() {
+        active.set(false)
+    }
+}
+
 private class ManagedTunnel(
     private val onStateChange: (Tunnel.State) -> Unit,
 ) : Tunnel {
@@ -178,6 +210,7 @@ private data class ActiveTunnelSession(
     var monitor: PhysicalNetworks?,
     var localRoutes: List<Ipv4Prefix>,
     var observedNetworkFingerprint: String,
+    var networkWasUnavailable: Boolean,
     val networkRetry: PhysicalNetworkRetryGate = PhysicalNetworkRetryGate(),
 )
 
@@ -185,7 +218,11 @@ internal object TunnelRuntime {
     private val executor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "nelomai-tunnel").apply { isDaemon = false }
     }
+    private val backgroundExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "nelomai-background-connection").apply { isDaemon = false }
+    }
     private val stateGate = TunnelStateGate()
+    private val backgroundOperationGate = BackgroundOperationGate()
     private val suppressBackendStateChanges = AtomicBoolean(false)
     private val generation = AtomicLong(0)
     private val tunnel = ManagedTunnel { state ->
@@ -200,9 +237,14 @@ internal object TunnelRuntime {
     private var backend: GoBackend? = null
 
     @Volatile
+    private var runtimeContext: Context? = null
+
+    @Volatile
     private var activeSession: ActiveTunnelSession? = null
 
     fun initialize(context: Context) {
+        runtimeContext = context.applicationContext
+        TunnelLog.initialize(context.applicationContext)
         if (backend == null) {
             synchronized(this) {
                 if (backend == null) {
@@ -221,6 +263,7 @@ internal object TunnelRuntime {
         args: StartTunnelArgs,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
+        keepForegroundServiceOnFailure: Boolean = false,
     ) {
         val applicationContext = context.applicationContext
         val quickPlan = args.copyForQuickPlan()
@@ -249,9 +292,9 @@ internal object TunnelRuntime {
 
         executor.execute {
             val startedAt = System.nanoTime()
-            Log.i(
-                TUNNEL_LOG_TAG,
-                "start.begin replace=$replaceExisting split=${args.options.splitActive}",
+            TunnelLog.info(
+                "start.begin",
+                mapOf("replace" to replaceExisting, "split" to args.options.splitActive),
             )
             try {
                 val serviceStartedAt = System.nanoTime()
@@ -287,14 +330,14 @@ internal object TunnelRuntime {
                     options,
                     applicationContext.packageName,
                 )
-                val monitor = if (options.splitSupported && options.excludeLocalNetworks) {
-                    PhysicalNetworks(context)
+                val monitor = PhysicalNetworks(context)
+                val physicalState = monitor.snapshotState()
+                val localRoutes = if (options.splitSupported && options.excludeLocalNetworks) {
+                    physicalState.localRoutes
                 } else {
-                    null
+                    emptyList()
                 }
-                val localRoutes = monitor
-                    ?.snapshot()
-                    .orEmpty()
+                NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
                 AndroidSplitTunnel.replaceExcludedRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(
                         options.excludedRoutes,
@@ -309,6 +352,9 @@ internal object TunnelRuntime {
 
                 val backendStartedAt = System.nanoTime()
                 val state = requireBackend().setState(tunnel, Tunnel.State.UP, config)
+                if (state == Tunnel.State.UP) {
+                    NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
+                }
                 logStage("start.backend_state_up", backendStartedAt)
                 val resolved = if (state == Tunnel.State.UP) {
                     val session = ActiveTunnelSession(
@@ -317,29 +363,28 @@ internal object TunnelRuntime {
                         options = options,
                         monitor = monitor,
                         localRoutes = localRoutes,
-                        observedNetworkFingerprint = PhysicalNetworks.fingerprint(localRoutes),
+                        observedNetworkFingerprint = physicalState.fingerprint,
+                        networkWasUnavailable = !physicalState.available,
                     )
                     activeSession = session
-                    if (monitor != null) {
-                        try {
-                            monitor.start { networks ->
-                                reapplyPhysicalNetworks(session.generation, networks)
-                            }
-                        } catch (_: Throwable) {
-                            activeSession = null
-                            monitor.stop()
-                            runCatching {
-                                requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
-                            }
-                            AndroidSplitTunnel.clear()
-                            throw TunnelOperationException(
-                                "physical_network_monitor_unavailable",
-                            )
+                    try {
+                        monitor.start { networkState ->
+                            reapplyPhysicalNetworks(session.generation, networkState)
                         }
+                    } catch (_: Throwable) {
+                        activeSession = null
+                        monitor.stop()
+                        runCatching {
+                            requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                        }
+                        AndroidSplitTunnel.clear()
+                        throw TunnelOperationException(
+                            "physical_network_monitor_unavailable",
+                        )
                     }
                     SessionState.RUNNING
                 } else {
-                    monitor?.stop()
+                    monitor.stop()
                     AndroidSplitTunnel.clear()
                     SessionState.FAILED
                 }
@@ -348,13 +393,18 @@ internal object TunnelRuntime {
                     try {
                         QuickTunnelPlanStore.save(applicationContext, quickPlan)
                     } catch (error: Throwable) {
-                        Log.w(TUNNEL_LOG_TAG, "quick_plan.save_failed", error)
+                        TunnelLog.warning("quick_plan.save_failed", error = error)
+                        if (!QuickTunnelPlanStore.clear(applicationContext)) {
+                            TunnelLog.warning("quick_plan.clear_failed")
+                        }
                     } finally {
                         quickPlan.configuration.fill(0)
                     }
                 } else {
                     quickPlan?.configuration?.fill(0)
-                    NelomaiVpnService.stopForegroundService()
+                    if (!keepForegroundServiceOnFailure) {
+                        NelomaiVpnService.stopForegroundService()
+                    }
                 }
                 logStage("start.completed", startedAt, "state=${resolved.wireName}")
                 onSuccess(resolved, elapsedMillis(startedAt))
@@ -365,54 +415,199 @@ internal object TunnelRuntime {
                 quickPlan?.configuration?.fill(0)
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
-                NelomaiVpnService.stopForegroundService()
+                if (!keepForegroundServiceOnFailure) {
+                    NelomaiVpnService.stopForegroundService()
+                }
                 val code = errorCode(error)
-                Log.w(
-                    TUNNEL_LOG_TAG,
-                    "start.failed code=$code duration_ms=${elapsedMillis(startedAt)}",
+                TunnelLog.warning(
+                    "start.failed",
+                    code,
+                    error,
                 )
                 onError(code)
             }
         }
     }
 
-    fun quickToggle(
+    fun backgroundStart(
         context: Context,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
     ) {
         val applicationContext = context.applicationContext
         initialize(applicationContext)
+        if (!backgroundOperationGate.begin()) {
+            onError("tunnel_operation_in_progress")
+            return
+        }
         if (VpnService.prepare(applicationContext) != null) {
+            backgroundOperationGate.complete()
             onError("vpn_permission_required")
             return
         }
-        when (stateGate.current()) {
-            SessionState.RUNNING -> stop(TUNNEL_API_VERSION, onSuccess, onError)
-            SessionState.STOPPED, SessionState.FAILED -> {
-                val plan = QuickTunnelPlanStore.load(
+        if (stateGate.current() in setOf(SessionState.STARTING, SessionState.STOPPING)) {
+            backgroundOperationGate.complete()
+            onError("tunnel_operation_in_progress")
+            return
+        }
+        val credential = BackgroundCredentialStore.load(applicationContext) ?: run {
+            backgroundOperationGate.complete()
+            onError("invalid_background_token")
+            return
+        }
+        val template = QuickTunnelPlanStore.loadTemplate(applicationContext) ?: run {
+            backgroundOperationGate.complete()
+            onError("quick_action_plan_unavailable")
+            return
+        }
+        if (!QuickTunnelController.updateState(
+            applicationContext,
+            SessionState.STARTING,
+            desiredActive = true,
+        )) {
+            backgroundOperationGate.complete()
+            onError("quick_state_persist_failed")
+            return
+        }
+        backgroundExecutor.execute {
+            TunnelLog.info(
+                "background_start.requested",
+                mapOf("layer" to template.connection.layer, "route" to template.connection.routeMode),
+            )
+            try {
+                val result = BackgroundConnectionClient.start(
                     applicationContext,
-                    System.currentTimeMillis() / 1_000L,
-                ) ?: run {
-                    onError("quick_action_plan_unavailable")
-                    return
+                    credential,
+                    template,
+                )
+                val args = StartTunnelArgs().apply {
+                    apiVersion = TUNNEL_API_VERSION
+                    configuration = result.configuration
+                    options = result.options
+                    cacheQuickAction = true
+                    quickActionValidUntilUnix = null
+                    quickConnection = result.connection
                 }
-                start(applicationContext, plan, onSuccess, onError)
-            }
-            SessionState.STARTING, SessionState.STOPPING -> {
-                onError("tunnel_operation_in_progress")
+                start(
+                    applicationContext,
+                    args,
+                    { state, duration ->
+                        try {
+                            onSuccess(state, duration)
+                        } finally {
+                            backgroundOperationGate.complete()
+                        }
+                    },
+                    { code ->
+                        backgroundExecutor.execute {
+                            runCatching {
+                                BackgroundConnectionClient.stop(
+                                    credential,
+                                    result.connection.leaseId,
+                                )
+                            }.onFailure { error ->
+                                TunnelLog.warning(
+                                    "background_start.cleanup_failed",
+                                    (error as? BackgroundConnectionException)?.code,
+                                )
+                            }
+                            try {
+                                onError(code)
+                            } finally {
+                                backgroundOperationGate.complete()
+                            }
+                        }
+                    },
+                    keepForegroundServiceOnFailure = true,
+                )
+            } catch (error: Throwable) {
+                val code = (error as? BackgroundConnectionException)?.code ?: errorCode(error)
+                if (code == "invalid_background_token" &&
+                    !BackgroundCredentialStore.clear(applicationContext)
+                ) {
+                    TunnelLog.warning("background_token.clear_failed")
+                }
+                TunnelLog.warning("background_start.failed", code, error)
+                try {
+                    onError(code)
+                } finally {
+                    backgroundOperationGate.complete()
+                }
             }
         }
     }
 
-    fun clearQuickPlan(context: Context) {
-        QuickTunnelPlanStore.clear(context.applicationContext)
+    fun backgroundStop(
+        context: Context,
+        onSuccess: (SessionState, Long) -> Unit,
+        onError: (String) -> Unit,
+    ) {
+        val applicationContext = context.applicationContext
+        if (!backgroundOperationGate.begin()) {
+            onError("tunnel_operation_in_progress")
+            return
+        }
+        val credential = BackgroundCredentialStore.load(applicationContext)
+        val leaseId = QuickTunnelPlanStore.loadTemplate(applicationContext)?.connection?.leaseId
+        if (!QuickTunnelController.updateState(
+            applicationContext,
+            SessionState.STOPPING,
+            desiredActive = false,
+        )) {
+            backgroundOperationGate.complete()
+            onError("quick_state_persist_failed")
+            return
+        }
+        stop(
+            TUNNEL_API_VERSION,
+            { state, duration ->
+                if (credential == null || leaseId == null) {
+                    NelomaiVpnService.stopForegroundService()
+                    try {
+                        onSuccess(state, duration)
+                    } finally {
+                        backgroundOperationGate.complete()
+                    }
+                    return@stop
+                }
+                backgroundExecutor.execute {
+                    runCatching { BackgroundConnectionClient.stop(credential, leaseId) }
+                        .onFailure { error ->
+                            TunnelLog.warning(
+                                "background_stop.panel_failed",
+                                (error as? BackgroundConnectionException)?.code,
+                            )
+                    }
+                    NelomaiVpnService.stopForegroundService()
+                    try {
+                        onSuccess(state, duration)
+                    } finally {
+                        backgroundOperationGate.complete()
+                    }
+                }
+            },
+            { code ->
+                try {
+                    onError(code)
+                } finally {
+                    backgroundOperationGate.complete()
+                }
+            },
+            keepForegroundService = true,
+        )
     }
+
+    fun clearQuickPlan(context: Context): Boolean =
+        QuickTunnelPlanStore.clear(context.applicationContext)
+
+    fun clearBackgroundCredential(context: Context): Boolean =
+        BackgroundCredentialStore.clear(context.applicationContext)
 
     fun stop(
         apiVersion: Int,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
+        keepForegroundService: Boolean = false,
     ) {
         try {
             validateVersion(apiVersion)
@@ -424,7 +619,9 @@ internal object TunnelRuntime {
         when (stateGate.beginStop()) {
             TransitionDecision.ALREADY_COMPLETE -> {
                 clearActiveSession()
-                NelomaiVpnService.stopForegroundService()
+                if (!keepForegroundService) {
+                    NelomaiVpnService.stopForegroundService()
+                }
                 onSuccess(SessionState.STOPPED, 0)
                 return
             }
@@ -438,7 +635,7 @@ internal object TunnelRuntime {
 
         executor.execute {
             val startedAt = System.nanoTime()
-            Log.i(TUNNEL_LOG_TAG, "stop.begin")
+            TunnelLog.info("stop.begin")
             try {
                 clearActiveSession()
                 val state = requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
@@ -449,7 +646,7 @@ internal object TunnelRuntime {
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
-                if (resolved == SessionState.STOPPED) {
+                if (resolved == SessionState.STOPPED && !keepForegroundService) {
                     NelomaiVpnService.stopForegroundService()
                 }
                 logStage("stop.completed", startedAt, "state=${resolved.wireName}")
@@ -458,10 +655,7 @@ internal object TunnelRuntime {
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
                 val code = errorCode(error)
-                Log.w(
-                    TUNNEL_LOG_TAG,
-                    "stop.failed code=$code duration_ms=${elapsedMillis(startedAt)}",
-                )
+                TunnelLog.warning("stop.failed", code, error)
                 onError(code)
             }
         }
@@ -508,34 +702,61 @@ internal object TunnelRuntime {
 
     private fun reapplyPhysicalNetworks(
         sessionGeneration: Long,
-        localRoutes: List<Ipv4Prefix>,
+        physicalState: PhysicalNetworkState,
     ) {
         executor.execute {
             val session = activeSession
                 ?.takeIf { it.generation == sessionGeneration }
                 ?: return@execute
-            if (stateGate.current() != SessionState.RUNNING) {
+            if (
+                stateGate.current() !in setOf(
+                    SessionState.RUNNING,
+                    SessionState.STOPPED,
+                    SessionState.FAILED,
+                )
+            ) {
                 return@execute
             }
 
-            val fingerprint = PhysicalNetworks.fingerprint(localRoutes)
-            if (fingerprint == session.observedNetworkFingerprint) {
+            if (!physicalState.available) {
+                session.networkWasUnavailable = true
+                session.observedNetworkFingerprint = physicalState.fingerprint
+                NelomaiVpnService.setPhysicalNetworks(emptyList())
+                TunnelLog.info("tunnel.network_unavailable")
+                return@execute
+            }
+            val localRoutes = if (
+                session.options.splitSupported && session.options.excludeLocalNetworks
+            ) {
+                physicalState.localRoutes
+            } else {
+                emptyList()
+            }
+            val fingerprint = physicalState.fingerprint
+            if (fingerprint == session.observedNetworkFingerprint && !session.networkWasUnavailable) {
                 return@execute
             }
             val nowMillis = SystemClock.elapsedRealtime()
             if (!session.networkRetry.canAttempt(fingerprint, nowMillis)) {
                 return@execute
             }
+            val previousFingerprint = session.observedNetworkFingerprint
             session.observedNetworkFingerprint = fingerprint
             val previousRoutes = session.localRoutes
+            val recoveredAfterLoss = session.networkWasUnavailable
             stateGate.complete(SessionState.STARTING)
             suppressBackendStateChanges.set(true)
 
             try {
+                TunnelLog.info(
+                    "tunnel.network_recovery_started",
+                    mapOf("after_loss" to recoveredAfterLoss),
+                )
                 requireState(
                     requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
                     Tunnel.State.DOWN,
                 )
+                NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
                 AndroidSplitTunnel.replaceExcludedRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(
                         session.options.excludedRoutes,
@@ -547,8 +768,10 @@ internal object TunnelRuntime {
                     Tunnel.State.UP,
                 )
                 session.localRoutes = localRoutes
+                session.networkWasUnavailable = false
                 session.networkRetry.clear()
                 stateGate.complete(SessionState.RUNNING)
+                TunnelLog.info("tunnel.network_recovery_succeeded")
             } catch (_: Throwable) {
                 val restored = runCatching {
                     runCatching {
@@ -566,16 +789,26 @@ internal object TunnelRuntime {
                     )
                 }.isSuccess
                 if (restored) {
-                    session.observedNetworkFingerprint =
-                        PhysicalNetworks.fingerprint(previousRoutes)
+                    session.observedNetworkFingerprint = previousFingerprint
+                    session.networkWasUnavailable = false
                     session.networkRetry.defer(fingerprint, nowMillis)
                     session.monitor?.scheduleRetry(PHYSICAL_NETWORK_RETRY_MILLIS)
                     stateGate.complete(SessionState.RUNNING)
+                    TunnelLog.warning("tunnel.network_recovery_deferred")
                 } else {
-                    activeSession = null
-                    session.monitor?.stop()
-                    AndroidSplitTunnel.clear()
+                    session.observedNetworkFingerprint = previousFingerprint
+                    session.networkWasUnavailable = true
+                    session.networkRetry.clear()
+                    session.monitor?.scheduleRetry(PHYSICAL_NETWORK_RECOVERY_RETRY_MILLIS)
                     stateGate.complete(SessionState.FAILED)
+                    runtimeContext?.let { context ->
+                        QuickTunnelController.updateState(
+                            context,
+                            SessionState.FAILED,
+                            desiredActive = true,
+                        )
+                    }
+                    TunnelLog.warning("tunnel.network_recovery_failed")
                 }
             } finally {
                 suppressBackendStateChanges.set(false)
@@ -612,10 +845,12 @@ internal object TunnelRuntime {
         (System.nanoTime() - startedAt) / 1_000_000
 
     private fun logStage(stage: String, startedAt: Long, details: String? = null) {
-        val suffix = details?.let { " $it" }.orEmpty()
-        Log.i(
-            TUNNEL_LOG_TAG,
-            "$stage duration_ms=${elapsedMillis(startedAt)}$suffix",
+        TunnelLog.info(
+            stage,
+            buildMap {
+                put("duration_ms", elapsedMillis(startedAt))
+                details?.let { put("details", it) }
+            },
         )
     }
 
@@ -635,7 +870,7 @@ private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
     if (!cacheQuickAction || !configurationInitialized) return null
     return StartTunnelArgs().also { copy ->
         copy.apiVersion = apiVersion
-        copy.configuration = configuration.copyOf()
+        copy.configuration = byteArrayOf()
         copy.options = TunnelOptionsArgs().also { optionsCopy ->
             optionsCopy.splitActive = options.splitActive
             optionsCopy.excludedPackages = ArrayList(options.excludedPackages)
@@ -645,7 +880,16 @@ private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
         }
         copy.cacheQuickAction = true
         copy.quickActionValidUntilUnix = quickActionValidUntilUnix
+        copy.quickConnection = quickConnection?.copy()
     }
+}
+
+private fun QuickConnectionArgs.copy(): QuickConnectionArgs = QuickConnectionArgs().also { copy ->
+    copy.leaseId = leaseId
+    copy.layer = layer
+    copy.ticConnectionMode = ticConnectionMode
+    copy.routeMode = routeMode
+    copy.allowAlternate = allowAlternate
 }
 
 private fun HealthStats.measurement(key: Int): Long? =
@@ -766,9 +1010,53 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun clearQuickPlan(invoke: Invoke) {
-        TunnelRuntime.clearQuickPlan(activity.applicationContext)
-        QuickTunnelController.clearStateChange(activity.applicationContext)
-        invoke.resolve()
+        val planCleared = TunnelRuntime.clearQuickPlan(activity.applicationContext)
+        val stateCleared = QuickTunnelController.clearStateChange(activity.applicationContext)
+        if (planCleared && stateCleared) {
+            invoke.resolve()
+        } else {
+            invoke.reject("quick_state_persist_failed")
+        }
+    }
+
+    @Command
+    fun configureBackground(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(BackgroundCredentialArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_background_credential")
+            return
+        }
+        try {
+            if (args.apiVersion != TUNNEL_API_VERSION || args.expiresAtUnix <= 0) {
+                throw IllegalArgumentException("invalid background credential")
+            }
+            BackgroundCredentialStore.save(
+                activity.applicationContext,
+                BackgroundCredential(args.panelBase, args.token, args.expiresAtUnix),
+            )
+            invoke.resolve()
+        } catch (_: Throwable) {
+            invoke.reject("invalid_background_credential")
+        }
+    }
+
+    @Command
+    fun backgroundCredentialStatus(invoke: Invoke) {
+        val credential = BackgroundCredentialStore.load(activity.applicationContext)
+        val response = JSObject()
+        response.put("configured", credential != null)
+        response.put("expiresAtUnix", credential?.expiresAtUnix)
+        invoke.resolve(response)
+    }
+
+    @Command
+    fun clearBackground(invoke: Invoke) {
+        if (TunnelRuntime.clearBackgroundCredential(activity.applicationContext)) {
+            invoke.resolve()
+        } else {
+            invoke.reject("background_storage_unavailable")
+        }
     }
 
     @Command
@@ -779,6 +1067,15 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             QuickTunnelController.takeStateChange(activity.applicationContext),
         )
         invoke.resolve(response)
+    }
+
+    @Command
+    fun acknowledgeQuickStateChange(invoke: Invoke) {
+        if (QuickTunnelController.acknowledgeStateChange(activity.applicationContext)) {
+            invoke.resolve()
+        } else {
+            invoke.reject("quick_state_persist_failed")
+        }
     }
 
     @Command
@@ -877,6 +1174,15 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun resolveOperation(invoke: Invoke, state: SessionState, durationMillis: Long) {
         activity.runOnUiThread {
+            QuickTunnelController.updateState(
+                activity.applicationContext,
+                state,
+                desiredActive = when (state) {
+                    SessionState.RUNNING -> true
+                    SessionState.STOPPED -> false
+                    else -> null
+                },
+            )
             val response = JSObject()
             response.put("state", state.wireName)
             response.put("durationMillis", durationMillis)

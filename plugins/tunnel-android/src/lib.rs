@@ -3,7 +3,7 @@ use nelomai_client_tunnel::{
     QuickReconnect, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
     TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
-use nelomai_contracts::SplitTunnelMode;
+use nelomai_contracts::{Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
@@ -100,6 +100,28 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                 plugin_request.quick_action_valid_until_unix = Some(valid_until_unix);
             }
         }
+        plugin_request.quick_connection =
+            request
+                .quick_connection
+                .map(|quick| QuickConnectionRequest {
+                    lease_id: quick.lease_id,
+                    layer: match quick.layer {
+                        Layer::Tic => "tic",
+                        Layer::Stray => "stray",
+                    }
+                    .to_string(),
+                    tic_connection_mode: match quick.tic_connection_mode {
+                        TicConnectionMode::Personal => "personal",
+                        TicConnectionMode::Dynamic => "dynamic",
+                    }
+                    .to_string(),
+                    route_mode: match quick.route_mode {
+                        RouteMode::Standalone => "standalone",
+                        RouteMode::ViaTak => "via_tak",
+                    }
+                    .to_string(),
+                    allow_alternate: quick.allow_alternate,
+                });
 
         let response = self
             .app

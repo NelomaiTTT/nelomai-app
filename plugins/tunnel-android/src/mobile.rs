@@ -62,10 +62,36 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub fn configure_background(&self, request: BackgroundCredentialRequest) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("configureBackground", request)
+            .map_err(Into::into)
+    }
+
+    pub fn background_credential_status(
+        &self,
+    ) -> crate::Result<BackgroundCredentialStatusResponse> {
+        self.0
+            .run_mobile_plugin("backgroundCredentialStatus", EmptyRequest {})
+            .map_err(Into::into)
+    }
+
+    pub fn clear_background(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("clearBackground", EmptyRequest {})
+            .map_err(Into::into)
+    }
+
     pub fn take_quick_state_change(&self) -> crate::Result<bool> {
         self.0
             .run_mobile_plugin::<QuickStateChangeResponse>("takeQuickStateChange", EmptyRequest {})
             .map(|response| response.changed)
+            .map_err(Into::into)
+    }
+
+    pub fn acknowledge_quick_state_change(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("acknowledgeQuickStateChange", EmptyRequest {})
             .map_err(Into::into)
     }
 

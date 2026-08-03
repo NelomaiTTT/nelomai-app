@@ -13,6 +13,12 @@ const PREVIOUS_LOG: &str = "application.previous.jsonl";
 const ROTATE_AT_BYTES: u64 = 256 * 1024;
 const MAX_APPLICATION_REPORT_BYTES: usize = 320 * 1024;
 const MAX_HELPER_REPORT_BYTES: usize = 64 * 1024;
+#[cfg(any(target_os = "android", test))]
+const MAX_ANDROID_PREVIOUS_REPORT_BYTES: usize = 16 * 1024;
+#[cfg(any(target_os = "android", test))]
+const MAX_ANDROID_CURRENT_REPORT_BYTES: usize = 24 * 1024;
+#[cfg(any(target_os = "android", test))]
+const MAX_ANDROID_LOGCAT_REPORT_BYTES: usize = 20 * 1024;
 
 pub struct AppDiagnostics {
     directory: PathBuf,
@@ -122,7 +128,7 @@ impl AppDiagnostics {
             platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
-            helper_log: helper_log().filter(|value| !value.is_empty()),
+            helper_log: helper_log(&self.directory).filter(|value| !value.is_empty()),
             resource_usage: Some(self.resource_baseline.report(resource_snapshot)),
         })
     }
@@ -222,17 +228,24 @@ fn helper_log_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "android")]
-fn helper_log() -> Option<String> {
+fn helper_log(directory: &Path) -> Option<String> {
     use std::process::Command;
 
-    let pid = std::process::id().to_string();
-    let pid_filter = format!("--pid={pid}");
-    let output = Command::new("/system/bin/logcat")
+    let previous = read_tail(
+        &directory.join("android-tunnel.previous.jsonl"),
+        MAX_ANDROID_PREVIOUS_REPORT_BYTES,
+    )
+    .unwrap_or_default();
+    let current = read_tail(
+        &directory.join("android-tunnel.jsonl"),
+        MAX_ANDROID_CURRENT_REPORT_BYTES,
+    )
+    .unwrap_or_default();
+    let logcat = Command::new("/system/bin/logcat")
         .args([
             "-d",
             "-v",
             "threadtime",
-            &pid_filter,
             "-t",
             "500",
             "NelomaiTunnel:V",
@@ -241,16 +254,27 @@ fn helper_log() -> Option<String> {
             "*:S",
         ])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let log = String::from_utf8_lossy(&output.stdout).replace('\0', "");
-    Some(tail_string(&log, MAX_HELPER_REPORT_BYTES))
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).replace('\0', ""))
+        .unwrap_or_default();
+    Some(combine_android_logs(&previous, &current, &logcat))
+}
+
+#[cfg(any(target_os = "android", test))]
+fn combine_android_logs(previous: &str, current: &str, logcat: &str) -> String {
+    let previous = tail_string(previous, MAX_ANDROID_PREVIOUS_REPORT_BYTES);
+    let current = tail_string(current, MAX_ANDROID_CURRENT_REPORT_BYTES);
+    let prefix =
+        format!("[persistent.previous]\n{previous}\n[persistent.current]\n{current}\n[logcat]\n");
+    let logcat_budget =
+        MAX_ANDROID_LOGCAT_REPORT_BYTES.min(MAX_HELPER_REPORT_BYTES.saturating_sub(prefix.len()));
+    let logcat = tail_string(logcat, logcat_budget);
+    format!("{prefix}{logcat}")
 }
 
 #[cfg(not(target_os = "android"))]
-fn helper_log() -> Option<String> {
+fn helper_log(_directory: &Path) -> Option<String> {
     helper_log_path().and_then(|path| read_tail(&path, MAX_HELPER_REPORT_BYTES).ok())
 }
 
@@ -354,5 +378,19 @@ mod tests {
 
         assert_eq!(record["duration_ms"], 12_345);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn keeps_persistent_android_log_when_logcat_is_large() {
+        let previous = format!("{}previous-tail\n", "previous-line\n".repeat(2_000));
+        let current = format!("{}current-tail\n", "current-line\n".repeat(2_000));
+        let report = combine_android_logs(&previous, &current, &"logcat-line\n".repeat(20_000));
+
+        assert!(report.len() <= MAX_HELPER_REPORT_BYTES);
+        assert!(report.contains("[persistent.previous]"));
+        assert!(report.contains("previous-tail"));
+        assert!(report.contains("[persistent.current]"));
+        assert!(report.contains("current-tail"));
+        assert!(report.contains("[logcat]"));
     }
 }

@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use nelomai_client_api::{
-    ClientApi, DiagnosticUploadRequest, DiagnosticUploadResponse, LoginRequest, TokenResponse,
+    BackgroundTokenResponse, ClientApi, DiagnosticUploadRequest, DiagnosticUploadResponse,
+    LoginRequest, TokenResponse,
 };
 use nelomai_client_core::{
     ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError, CoreError,
@@ -50,6 +51,12 @@ pub trait ApplicationApi: CoreApi {
     ) -> Result<ServerCandidatesResponse, CoreApiError>;
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64>;
     async fn logout(&self, access_token: &str) -> Result<(), CoreApiError>;
+    async fn background_token(
+        &self,
+        _access_token: &str,
+    ) -> Result<BackgroundTokenResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
     async fn upload_diagnostics(
         &self,
         _access_token: &str,
@@ -136,6 +143,15 @@ impl ApplicationApi for ClientApi {
         ClientApi::logout(self, access_token)
             .await
             .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    async fn background_token(
+        &self,
+        access_token: &str,
+    ) -> Result<BackgroundTokenResponse, CoreApiError> {
+        ClientApi::background_token(self, access_token)
+            .await
             .map_err(Into::into)
     }
 
@@ -490,6 +506,21 @@ where
         let result = self.core.sign_out().await;
         self.clear_probe_cache()?;
         result.map_err(Into::into)
+    }
+
+    pub async fn background_token(&self) -> Result<BackgroundTokenResponse, ApplicationError> {
+        let access_token = self.access_token()?;
+        match self.api.background_token(&access_token).await {
+            Ok(response) => Ok(response),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .background_token(&access_token)
+                    .await
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn upload_diagnostics(
