@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ResultReceiver
 import androidx.core.content.ContextCompat
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal const val SERVICE_RESULT_OK = 1
 internal const val SERVICE_RESULT_ERROR = 2
@@ -34,6 +35,7 @@ internal const val EXTRA_EXPIRES_AT_UNIX = "expires_at_unix"
 internal const val EXTRA_CONFIGURED = "configured"
 internal const val EXTRA_CHANGED = "changed"
 internal const val EXTRA_DNS_SERVERS = "dns_servers"
+private const val QUICK_DNS_UPDATE_TIMEOUT_MILLIS = 3_000L
 
 internal object TunnelServiceClient {
     fun start(
@@ -196,14 +198,34 @@ internal object TunnelServiceClient {
         dnsServers: ArrayList<String>,
         onSuccess: () -> Unit,
         onError: (String) -> Unit,
-    ) = requestBundle(
-        context,
-        Intent(context, NelomaiVpnService::class.java)
-            .setAction(NelomaiVpnService.ACTION_UPDATE_QUICK_DNS)
-            .putStringArrayListExtra(EXTRA_DNS_SERVERS, dnsServers),
-        { onSuccess() },
-        onError,
-    )
+    ) {
+        val completed = AtomicBoolean(false)
+        val handler = Handler(Looper.getMainLooper())
+        val timeout = Runnable {
+            if (completed.compareAndSet(false, true)) {
+                onError("tunnel_service_unavailable")
+            }
+        }
+        handler.postDelayed(timeout, QUICK_DNS_UPDATE_TIMEOUT_MILLIS)
+        requestBundle(
+            context,
+            Intent(context, NelomaiVpnService::class.java)
+                .setAction(NelomaiVpnService.ACTION_UPDATE_QUICK_DNS)
+                .putStringArrayListExtra(EXTRA_DNS_SERVERS, dnsServers),
+            {
+                if (completed.compareAndSet(false, true)) {
+                    handler.removeCallbacks(timeout)
+                    onSuccess()
+                }
+            },
+            { code ->
+                if (completed.compareAndSet(false, true)) {
+                    handler.removeCallbacks(timeout)
+                    onError(code)
+                }
+            },
+        )
+    }
 
     fun takeQuickStateChange(
         context: Context,

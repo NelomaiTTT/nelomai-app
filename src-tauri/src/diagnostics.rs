@@ -6,12 +6,18 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CURRENT_LOG: &str = "application.jsonl";
 const PREVIOUS_LOG: &str = "application.previous.jsonl";
 const ROTATE_AT_BYTES: u64 = 256 * 1024;
 const MAX_APPLICATION_REPORT_BYTES: usize = 320 * 1024;
+#[cfg(target_os = "android")]
+const ANDROID_STARTUP_LOG: &str = "android-startup.jsonl";
+#[cfg(target_os = "android")]
+const MAX_ANDROID_STARTUP_REPORT_BYTES: usize = 16 * 1024;
+#[cfg(target_os = "android")]
+const ANDROID_FRONTEND_READY_MARKER: &str = "android-frontend-ready";
 const MAX_HELPER_REPORT_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "android", test))]
 const MAX_ANDROID_PREVIOUS_REPORT_BYTES: usize = 16 * 1024;
@@ -58,6 +64,31 @@ impl AppDiagnostics {
         code: Option<&str>,
     ) {
         self.record_with_duration(kind, operation_id, request_id, code, None);
+    }
+
+    pub fn record_timed_named(
+        &self,
+        kind: &str,
+        operation_id: Option<&str>,
+        request_id: Option<&str>,
+        code: Option<&str>,
+        duration: Duration,
+    ) {
+        self.record_with_duration(
+            kind,
+            operation_id,
+            request_id,
+            code,
+            Some(duration.as_millis().min(u64::MAX as u128) as u64),
+        );
+    }
+
+    pub fn mark_frontend_ready(&self) {
+        #[cfg(target_os = "android")]
+        {
+            let marker = self.directory.join(ANDROID_FRONTEND_READY_MARKER);
+            let _ = fs::write(marker, now_unix().to_string());
+        }
     }
 
     fn record_with_duration(
@@ -119,9 +150,8 @@ impl AppDiagnostics {
         } else {
             format!("{previous}{current}")
         };
-        if application_log.len() > MAX_APPLICATION_REPORT_BYTES {
-            application_log = tail_string(&application_log, MAX_APPLICATION_REPORT_BYTES);
-        }
+        application_log = include_android_startup_log(&self.directory, application_log);
+        application_log = tail_string(&application_log, MAX_APPLICATION_REPORT_BYTES);
         Ok(DiagnosticUploadRequest {
             report_id: None,
             trigger: "manual".to_string(),
@@ -138,6 +168,32 @@ impl AppDiagnostics {
             helper_log: helper_log(&self.directory).filter(|value| !value.is_empty()),
             resource_usage: Some(self.resource_baseline.report(resource_snapshot)),
         })
+    }
+}
+
+#[cfg(target_os = "android")]
+fn include_android_startup_log(directory: &Path, application_log: String) -> String {
+    let native = read_tail(
+        &directory.join(ANDROID_STARTUP_LOG),
+        MAX_ANDROID_STARTUP_REPORT_BYTES,
+    )
+    .unwrap_or_default();
+    combine_application_and_startup_logs(application_log, native)
+}
+
+#[cfg(not(target_os = "android"))]
+fn include_android_startup_log(_directory: &Path, application_log: String) -> String {
+    application_log
+}
+
+#[cfg(any(target_os = "android", test))]
+fn combine_application_and_startup_logs(application_log: String, native_log: String) -> String {
+    if native_log.is_empty() {
+        application_log
+    } else if application_log.is_empty() {
+        native_log
+    } else {
+        format!("{application_log}{native_log}")
     }
 }
 
@@ -399,5 +455,16 @@ mod tests {
         assert!(report.contains("[persistent.current]"));
         assert!(report.contains("current-tail"));
         assert!(report.contains("[logcat]"));
+    }
+
+    #[test]
+    fn appends_native_android_startup_stages_to_application_log() {
+        let application = "{\"kind\":\"application.started\"}\n".to_string();
+        let native = "{\"kind\":\"startup.android.activity_created\"}\n".to_string();
+
+        let combined = combine_application_and_startup_logs(application, native);
+
+        assert!(combined.contains("application.started"));
+        assert!(combined.contains("startup.android.activity_created"));
     }
 }

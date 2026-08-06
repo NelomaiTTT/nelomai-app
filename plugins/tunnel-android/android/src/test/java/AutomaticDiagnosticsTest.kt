@@ -44,6 +44,18 @@ class AutomaticDiagnosticsTest {
     }
 
     @Test
+    fun startupStagesAreKeptAlongsideTheTunnelInterval() {
+        val combined = automaticDiagnosticsCombineApplicationLogs(
+            "{\"kind\":\"connection.started\"}\n",
+            "{\"kind\":\"startup.android.activity_created\"}\n",
+            1024,
+        )
+
+        assertTrue(combined.contains("connection.started"))
+        assertTrue(combined.contains("startup.android.activity_created"))
+    }
+
+    @Test
     fun failedOldestReportDoesNotBlockNewerReports() {
         val reports = listOf("0001.json.gz", "0002.json.gz", "0003.json.gz")
 

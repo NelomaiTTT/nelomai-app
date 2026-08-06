@@ -20,6 +20,8 @@ use thiserror::Error;
 const SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT: usize = 1024 * 1024;
 const SPLIT_TUNNEL_SETTINGS_REQUEST_LIMIT: usize = 256 * 1024;
 const SPLIT_TUNNEL_SELECTED_PACKAGES_LIMIT: usize = 512;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct LoginRequest {
@@ -277,7 +279,10 @@ impl ClientApi {
             .map_err(|error| ClientApiError::InvalidBaseUrl(error.to_string()))?;
         Ok(Self {
             // Reqwest has no cookie jar unless its optional `cookies` feature is enabled.
-            http: HttpClient::builder().build()?,
+            http: HttpClient::builder()
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .timeout(HTTP_REQUEST_TIMEOUT)
+                .build()?,
             api_base,
             app_version: None,
         })

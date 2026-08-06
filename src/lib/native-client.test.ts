@@ -119,6 +119,17 @@ describe("native client", () => {
     expect(response.report_id).toBe("report-1");
   });
 
+  it("records only a named startup stage through the native layer", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createNativeClient(invoke);
+
+    await client.recordStartupStage("frontend_first_frame");
+
+    expect(invoke).toHaveBeenCalledWith("app_record_startup_stage", {
+      stage: "frontend_first_frame",
+    });
+  });
+
   it("keeps notification inbox and push registration in native commands", async () => {
     const invoke = vi.fn().mockResolvedValue({});
     const client = createNativeClient(invoke);

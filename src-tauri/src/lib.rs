@@ -13,6 +13,7 @@ use nelomai_client_application::{ApplicationError, ClientApplication};
 use nelomai_client_storage::{FileSplitTunnelStore, SystemSecretStore};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri_plugin_tunnel_android::TunnelAndroidExt;
 use tokio::sync::Mutex;
 
 const PANEL_BASE: &str = "https://nelomai.ru";
@@ -124,6 +125,7 @@ pub fn run() {
             app.path().app_data_dir()?.join("diagnostics"),
             resource_baseline,
         )?);
+        diagnostics.record_named("startup.rust.setup_ready", None, None, None);
         let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
         let preferences = Arc::new(preferences::AppPreferenceStore::new(
             app_data_directory.join("preferences.json"),
@@ -136,7 +138,16 @@ pub fn run() {
             diagnostics.clone(),
         ));
         let dns_servers = preferences.get().dns_provider.servers();
-        application.set_dns_servers(dns_servers);
+        application.set_dns_servers(dns_servers.clone());
+        let app_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = app_handle
+                .tunnel_android()
+                .update_quick_dns_async(tauri_plugin_tunnel_android::DnsServersRequest {
+                    dns_servers: dns_servers.iter().map(ToString::to_string).collect(),
+                })
+                .await;
+        });
         let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
         let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
         let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
@@ -179,6 +190,7 @@ pub fn run() {
             commands::app_pin_stray,
             commands::app_unpin_stray,
             commands::app_send_diagnostics,
+            commands::app_record_startup_stage,
             commands::app_update_status,
             commands::app_update_set_automatic,
             commands::app_update_install,

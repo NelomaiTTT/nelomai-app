@@ -12,6 +12,7 @@ use tempfile::NamedTempFile;
 #[serde(rename_all = "snake_case")]
 pub enum DnsProvider {
     #[default]
+    Auto,
     Google,
     Yandex,
     Quad9,
@@ -20,9 +21,15 @@ pub enum DnsProvider {
 impl DnsProvider {
     pub fn servers(self) -> Vec<IpAddr> {
         let servers = match self {
-            Self::Google => [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
-            Self::Yandex => [Ipv4Addr::new(77, 88, 8, 8), Ipv4Addr::new(77, 88, 8, 1)],
-            Self::Quad9 => [Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)],
+            Self::Auto => vec![
+                Ipv4Addr::new(8, 8, 8, 8),
+                Ipv4Addr::new(77, 88, 8, 8),
+                Ipv4Addr::new(9, 9, 9, 9),
+                Ipv4Addr::new(8, 8, 4, 4),
+            ],
+            Self::Google => vec![Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
+            Self::Yandex => vec![Ipv4Addr::new(77, 88, 8, 8), Ipv4Addr::new(77, 88, 8, 1)],
+            Self::Quad9 => vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)],
         };
         servers.into_iter().map(IpAddr::V4).collect()
     }
@@ -39,7 +46,7 @@ impl Default for AppPreferences {
     fn default() -> Self {
         Self {
             close_to_tray: true,
-            dns_provider: DnsProvider::Google,
+            dns_provider: DnsProvider::Auto,
         }
     }
 }
@@ -138,7 +145,7 @@ mod tests {
         let path = directory.join("preferences.json");
         let store = AppPreferenceStore::new(&path);
         assert!(store.get().close_to_tray);
-        assert_eq!(store.get().dns_provider, DnsProvider::Google);
+        assert_eq!(store.get().dns_provider, DnsProvider::Auto);
 
         store.set_close_to_tray(false).unwrap();
         store.set_dns_provider(DnsProvider::Quad9).unwrap();
@@ -153,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_preferences_default_to_google_dns() {
+    fn legacy_preferences_default_to_automatic_dns() {
         let directory = std::env::temp_dir().join(format!(
             "nelomai-legacy-preferences-{}-{}",
             std::process::id(),
@@ -166,7 +173,28 @@ mod tests {
         let restored = AppPreferenceStore::new(&path).get();
 
         assert!(!restored.close_to_tray);
-        assert_eq!(restored.dns_provider, DnsProvider::Google);
+        assert_eq!(restored.dns_provider, DnsProvider::Auto);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn automatic_dns_covers_fallbacks_and_manual_modes_stay_with_one_provider() {
+        assert_eq!(
+            DnsProvider::Auto.servers(),
+            ["8.8.8.8", "77.88.8.8", "9.9.9.9", "8.8.4.4"]
+                .map(|value| value.parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            DnsProvider::Google.servers(),
+            ["8.8.8.8", "8.8.4.4"].map(|value| value.parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            DnsProvider::Yandex.servers(),
+            ["77.88.8.8", "77.88.8.1"].map(|value| value.parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            DnsProvider::Quad9.servers(),
+            ["9.9.9.9", "149.112.112.112"].map(|value| value.parse::<IpAddr>().unwrap())
+        );
     }
 }

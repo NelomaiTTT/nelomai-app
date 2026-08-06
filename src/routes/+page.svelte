@@ -59,6 +59,9 @@
   let updateBusy = $state(false);
   let updateTimer: number | null = null;
   let stateTimer: number | null = null;
+  let startupTimer: number | null = null;
+  let startupKickoffTimer: number | null = null;
+  let startupSlow = $state(false);
   let runtimeStateBusy = false;
   let splitTunnelState = $state<SplitTunnelState | null>(null);
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
@@ -102,8 +105,16 @@
 
   onMount(() => {
     let disposed = false;
-    void restore();
-    void loadAppPreferences();
+    void nativeClient.recordStartupStage("frontend_mounted");
+    window.requestAnimationFrame(() => {
+      startupKickoffTimer = window.setTimeout(() => {
+        startupKickoffTimer = null;
+        if (disposed) return;
+        void nativeClient.recordStartupStage("frontend_first_frame");
+        void restore();
+        void loadAppPreferences();
+      }, 0);
+    });
     void listen<string | null>("native-connection-changed", (event) => {
       if (event.payload) error = event.payload;
       void synchronizeRuntimeState();
@@ -135,6 +146,8 @@
       window.clearInterval(timer);
       window.clearInterval(notificationTimer);
       if (stateTimer !== null) window.clearInterval(stateTimer);
+      if (startupTimer !== null) window.clearTimeout(startupTimer);
+      if (startupKickoffTimer !== null) window.clearTimeout(startupKickoffTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
       clearUpdateTimer();
       nativeStateUnlisten?.();
@@ -205,6 +218,12 @@
     busy = true;
     error = null;
     diagnosticsStatus = null;
+    startupSlow = false;
+    if (startupTimer !== null) window.clearTimeout(startupTimer);
+    startupTimer = window.setTimeout(() => {
+      startupSlow = true;
+      void nativeClient.recordStartupStage("bootstrap_slow");
+    }, 8_000);
     try {
       const response = await nativeClient.bootstrap();
       await applyBootstrap(response);
@@ -225,6 +244,8 @@
         error = commandMessage(reason);
       }
     } finally {
+      if (startupTimer !== null) window.clearTimeout(startupTimer);
+      startupTimer = null;
       busy = false;
     }
   }
@@ -864,7 +885,10 @@
     {#if view === "loading"}
       <div class="center-state">
         <div class="loader" aria-hidden="true"></div>
-        <h1>Открываем приложение</h1>
+        <h1>{startupSlow ? "Запуск занимает больше времени" : "Открываем приложение"}</h1>
+        {#if startupSlow}
+          <p>Проверяем сеть. Ожидание будет остановлено автоматически.</p>
+        {/if}
       </div>
     {:else if view === "sign_in"}
       <form class="panel sign-in" onsubmit={submitLogin}>
@@ -1136,10 +1160,16 @@
                   phase === "connected" ||
                   phase === "stopping"}
               >
+                <option value="auto">Автовыбор</option>
                 <option value="google">Google</option>
                 <option value="yandex">Яндекс</option>
                 <option value="quad9">Quad9</option>
               </select>
+              <small>
+                {appPreferences.dnsProvider === "auto"
+                  ? "Используется наиболее подходящий доступный DNS"
+                  : "Используются только DNS выбранного провайдера"}
+              </small>
             </label>
           {/if}
           {#if updateStatus?.supported}
@@ -1595,6 +1625,14 @@
     text-align: center;
   }
 
+  .center-state p {
+    max-width: 360px;
+    margin: -8px 0 0;
+    color: #9ca8b0;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
   .loader {
     width: 30px;
     height: 30px;
@@ -1831,6 +1869,12 @@
 
   .select-field {
     gap: 0;
+  }
+
+  .select-field > small {
+    margin-top: 7px;
+    color: #7f8a92;
+    font-size: 11px;
   }
 
   .binding-summary {

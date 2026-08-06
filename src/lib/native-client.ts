@@ -28,6 +28,11 @@ type Invoke = (
   args?: Record<string, unknown>,
 ) => Promise<unknown>;
 
+export type StartupStage =
+  | "frontend_mounted"
+  | "frontend_first_frame"
+  | "bootstrap_slow";
+
 export interface LoginRequest {
   login: string;
   password: string;
@@ -106,6 +111,8 @@ export function createNativeClient(
       }) as Promise<Connection>,
     sendDiagnostics: () =>
       invoke("app_send_diagnostics") as Promise<DiagnosticUploadResponse>,
+    recordStartupStage: (stage: StartupStage) =>
+      invoke("app_record_startup_stage", { stage }) as Promise<void>,
     notifications: (cursor: number | null = null) =>
       invoke("app_notifications", { cursor }) as Promise<AppNotificationList>,
     markNotificationRead: (messageId: number) =>

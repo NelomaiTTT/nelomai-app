@@ -151,7 +151,7 @@ export interface AppPreferences {
   dnsProvider: DnsProvider;
 }
 
-export type DnsProvider = "google" | "yandex" | "quad9";
+export type DnsProvider = "auto" | "google" | "yandex" | "quad9";
 
 export interface BindPeerRequest {
   peer_id: string;

@@ -49,6 +49,10 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(())
     }
 
+    pub async fn update_quick_dns_async(&self, _request: DnsServersRequest) -> crate::Result<()> {
+        Ok(())
+    }
+
     pub fn configure_background(&self, _request: BackgroundCredentialRequest) -> crate::Result<()> {
         Ok(())
     }

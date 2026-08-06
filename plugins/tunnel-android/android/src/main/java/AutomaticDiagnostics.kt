@@ -34,6 +34,7 @@ private const val CHECKPOINT_INTERVAL_SECONDS = 6 * 60 * 60L
 private const val SUCCESS_UPLOAD_SPACING_SECONDS = 65L
 private const val MAX_SENT_REPORTS = 3
 private const val MAX_APPLICATION_LOG_BYTES = 320 * 1024
+private const val MAX_STARTUP_LOG_BYTES = 16 * 1024
 private const val MAX_HELPER_LOG_BYTES = 64 * 1024
 private const val MAX_REPORT_BYTES = 512 * 1024
 private const val AUTOMATIC_DIAGNOSTICS_JOB_ID = 0x4e444941
@@ -321,13 +322,7 @@ internal object AutomaticDiagnostics {
             put("architecture", Build.SUPPORTED_ABIS.firstOrNull()?.take(32) ?: "unknown")
             put(
                 "application_log",
-                intervalLog(
-                    context,
-                    "application",
-                    MAX_APPLICATION_LOG_BYTES,
-                    startedAt,
-                    endedAt,
-                ),
+                applicationLog(context, startedAt, endedAt),
             )
             put(
                 "helper_log",
@@ -773,6 +768,25 @@ private fun intervalLog(
     ).takeLast(maximum)
 }
 
+private fun applicationLog(context: Context, startedAt: Long, endedAt: Long): String {
+    val interval = intervalLog(
+        context,
+        "application",
+        MAX_APPLICATION_LOG_BYTES - MAX_STARTUP_LOG_BYTES,
+        startedAt,
+        endedAt,
+    )
+    val startup = readTail(
+        File(context.applicationInfo.dataDir, "diagnostics/android-startup.jsonl"),
+        MAX_STARTUP_LOG_BYTES,
+    ).let { automaticDiagnosticsFilterIntervalLog(it, Long.MIN_VALUE, Long.MAX_VALUE) }
+    return automaticDiagnosticsCombineApplicationLogs(
+        interval,
+        startup,
+        MAX_APPLICATION_LOG_BYTES,
+    )
+}
+
 private fun readTail(file: File, maximum: Int): String = runCatching {
     FileInputStream(file).use { input ->
         val skip = (file.length() - maximum).coerceAtLeast(0)
@@ -907,3 +921,9 @@ internal fun automaticDiagnosticsFilterIntervalLog(
     }.toList()
     return if (lines.isEmpty()) "" else lines.joinToString(separator = "\n", postfix = "\n")
 }
+
+internal fun automaticDiagnosticsCombineApplicationLogs(
+    intervalLog: String,
+    startupLog: String,
+    maximum: Int,
+): String = (intervalLog + startupLog).takeLast(maximum)

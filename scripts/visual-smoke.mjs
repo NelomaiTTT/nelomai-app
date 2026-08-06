@@ -155,7 +155,7 @@ async function capture(name, viewport, scenario) {
             return {
               closeToTraySupported: desktop,
               closeToTray: true,
-              dnsProvider: "google",
+              dnsProvider: "auto",
             };
           }
           if (command === "app_peer_options") {

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "android")]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_tunnel_android::TunnelAndroidExt;
 
@@ -39,11 +39,31 @@ const ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 #[cfg(target_os = "android")]
 const ANDROID_QUICK_RECONCILE_RETRY_SECONDS: i64 = 15;
 
+const STARTUP_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
     code: String,
     message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupStage {
+    FrontendMounted,
+    FrontendFirstFrame,
+    BootstrapSlow,
+}
+
+impl StartupStage {
+    fn event_name(&self) -> &'static str {
+        match self {
+            Self::FrontendMounted => "startup.frontend.mounted",
+            Self::FrontendFirstFrame => "startup.frontend.first_frame",
+            Self::BootstrapSlow => "startup.bootstrap.slow",
+        }
+    }
 }
 
 impl From<ApplicationError> for CommandError {
@@ -667,15 +687,16 @@ pub async fn app_login(
         response.device.id.clone(),
     )
     .await;
-    let _ = refresh_installed_applications(&app, &application);
+    schedule_startup_split_tunnel_refresh(
+        app.clone(),
+        application.inner().clone(),
+        diagnostics.inner().clone(),
+        split_tunnel_scheduler.inner().clone(),
+    );
     observe_and_schedule_update(
         application.inner().clone(),
         updater.inner().clone(),
         &response,
-    );
-    schedule_split_tunnel_sync(
-        application.inner().clone(),
-        split_tunnel_scheduler.inner().clone(),
     );
     schedule_push_registration(
         app,
@@ -694,26 +715,61 @@ pub async fn app_bootstrap(
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<Bootstrap, CommandError> {
-    let _ = refresh_installed_applications(&app, &application);
-    let response = application
-        .bootstrap(now_unix())
-        .await
-        .map_err(CommandError::from)?;
-    provision_android_background_resilient(
+    diagnostics.record_named("startup.bootstrap.begin", None, None, None);
+    let bootstrap_started = Instant::now();
+    let response =
+        match tokio::time::timeout(STARTUP_BOOTSTRAP_TIMEOUT, application.bootstrap(now_unix()))
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let error = CommandError::from(error);
+                diagnostics.record_timed_named(
+                    "startup.bootstrap.failed",
+                    None,
+                    None,
+                    Some(error.code()),
+                    bootstrap_started.elapsed(),
+                );
+                return Err(error);
+            }
+            Err(_) => {
+                diagnostics.record_timed_named(
+                    "startup.bootstrap.failed",
+                    None,
+                    None,
+                    Some("startup_timeout"),
+                    bootstrap_started.elapsed(),
+                );
+                return Err(CommandError::new(
+                    "startup_timeout",
+                    "Не удалось завершить запуск вовремя. Проверьте сеть и повторите попытку",
+                ));
+            }
+        };
+    diagnostics.record_timed_named(
+        "startup.bootstrap.ready",
+        None,
+        Some(&response.request_id),
+        None,
+        bootstrap_started.elapsed(),
+    );
+    schedule_startup_split_tunnel_refresh(
+        app.clone(),
+        application.inner().clone(),
+        diagnostics.inner().clone(),
+        split_tunnel_scheduler.inner().clone(),
+    );
+    schedule_android_background_provision(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
         response.device.id.clone(),
-    )
-    .await;
+    );
     observe_and_schedule_update(
         application.inner().clone(),
         updater.inner().clone(),
         &response,
-    );
-    schedule_split_tunnel_sync(
-        application.inner().clone(),
-        split_tunnel_scheduler.inner().clone(),
     );
     schedule_push_registration(
         app,
@@ -721,6 +777,14 @@ pub async fn app_bootstrap(
         push_registration_scheduler.inner().clone(),
     );
     Ok(response)
+}
+
+#[tauri::command]
+pub fn app_record_startup_stage(diagnostics: State<'_, Arc<AppDiagnostics>>, stage: StartupStage) {
+    if matches!(&stage, StartupStage::FrontendFirstFrame) {
+        diagnostics.mark_frontend_ready();
+    }
+    diagnostics.record_named(stage.event_name(), None, None, None);
 }
 
 async fn provision_android_background(
@@ -817,6 +881,17 @@ async fn provision_android_background_resilient(
 
     #[cfg(not(target_os = "android"))]
     let _ = (app, application, device_id);
+}
+
+fn schedule_android_background_provision(
+    app: AppHandle,
+    application: Arc<NativeApplication>,
+    diagnostics: Arc<AppDiagnostics>,
+    device_id: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        provision_android_background_resilient(app, application, diagnostics, device_id).await;
+    });
 }
 
 async fn provision_android_background_serialized(
@@ -1339,15 +1414,6 @@ fn schedule_automatic_update(application: Arc<NativeApplication>, updater: Arc<N
     });
 }
 
-fn schedule_split_tunnel_sync(
-    application: Arc<NativeApplication>,
-    scheduler: Arc<SplitTunnelScheduler>,
-) {
-    tauri::async_runtime::spawn(async move {
-        let _ = scheduler.synchronize(&application, false).await;
-    });
-}
-
 fn schedule_push_registration(
     app: AppHandle,
     application: Arc<NativeApplication>,
@@ -1458,6 +1524,67 @@ fn refresh_installed_applications(
             system: application.system,
         })
         .collect())
+}
+
+fn schedule_startup_split_tunnel_refresh(
+    app: AppHandle,
+    application: Arc<NativeApplication>,
+    diagnostics: Arc<AppDiagnostics>,
+    scheduler: Arc<SplitTunnelScheduler>,
+) {
+    tauri::async_runtime::spawn(async move {
+        #[cfg(target_os = "android")]
+        {
+            diagnostics.record_named("startup.application_inventory.scheduled", None, None, None);
+            let inventory_app = app.clone();
+            let inventory_application = application.clone();
+            let inventory_diagnostics = diagnostics.clone();
+            let inventory_refreshed = match tauri::async_runtime::spawn_blocking(move || {
+                let started = Instant::now();
+                match refresh_installed_applications(&inventory_app, &inventory_application) {
+                    Ok(applications) => {
+                        inventory_diagnostics.record_timed_named(
+                            "startup.application_inventory.completed",
+                            None,
+                            None,
+                            Some(&format!("applications={}", applications.len())),
+                            started.elapsed(),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        inventory_diagnostics.record_timed_named(
+                            "startup.application_inventory.failed",
+                            None,
+                            None,
+                            Some(error.code()),
+                            started.elapsed(),
+                        );
+                        false
+                    }
+                }
+            })
+            .await
+            {
+                Ok(refreshed) => refreshed,
+                Err(_) => {
+                    diagnostics.record_named(
+                        "startup.application_inventory.failed",
+                        None,
+                        None,
+                        Some("worker_unavailable"),
+                    );
+                    false
+                }
+            };
+            if !inventory_refreshed {
+                return;
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = (app, diagnostics);
+        let _ = scheduler.synchronize(&application, false).await;
+    });
 }
 
 async fn refresh_installed_applications_before_start(
@@ -1623,5 +1750,12 @@ mod tests {
         }
         let route_error = ApplicationError::Core(CoreError::Tunnel("route_conflict".to_string()));
         assert!(!repairable_stop_error(&route_error));
+    }
+
+    #[test]
+    fn startup_diagnostics_accept_only_known_frontend_stages() {
+        let stage: StartupStage = serde_json::from_str("\"frontend_first_frame\"").unwrap();
+        assert_eq!(stage.event_name(), "startup.frontend.first_frame");
+        assert!(serde_json::from_str::<StartupStage>("\"arbitrary_event\"").is_err());
     }
 }

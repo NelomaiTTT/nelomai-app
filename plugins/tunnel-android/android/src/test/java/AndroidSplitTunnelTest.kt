@@ -249,6 +249,32 @@ class AndroidSplitTunnelTest {
         )
     }
 
+    @Test
+    fun dnsRotationKeepsAllFourResolversInsideTheTunnel() {
+        val dnsServers = arrayListOf(
+            "8.8.8.8",
+            "77.88.8.8",
+            "9.9.9.9",
+            "8.8.4.4",
+        )
+        val args = TunnelOptionsArgs().apply {
+            splitActive = true
+            splitTunnelRoutes = arrayListOf("8.0.0.0/8", "9.0.0.0/8", "77.0.0.0/8")
+            this.dnsServers = dnsServers
+        }
+        val options = AndroidSplitTunnel.resolveOptions(33, args)
+
+        val routes = AndroidSplitTunnel.planVpnRoutes(
+            options.excludedRoutes,
+            options.dnsServers,
+        )
+
+        assertEquals(
+            dnsServers.map { "$it/32" },
+            routes.forcedTunnelRoutes.map { it.canonical },
+        )
+    }
+
     private fun parseConfig(value: String): Config =
         Config.parse(ByteArrayInputStream(value.encodeToByteArray()))
 
