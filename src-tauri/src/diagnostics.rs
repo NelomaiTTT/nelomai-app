@@ -123,6 +123,13 @@ impl AppDiagnostics {
             application_log = tail_string(&application_log, MAX_APPLICATION_REPORT_BYTES);
         }
         Ok(DiagnosticUploadRequest {
+            report_id: None,
+            trigger: "manual".to_string(),
+            tunnel_session_id: None,
+            sequence: None,
+            interval_started_at_unix: None,
+            interval_ended_at_unix: None,
+            tunnel_running: None,
             generated_at_unix: now_unix(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform_version: platform_version(),

@@ -125,6 +125,9 @@ pub fn run() {
             resource_baseline,
         )?);
         let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
+        let preferences = Arc::new(preferences::AppPreferenceStore::new(
+            app_data_directory.join("preferences.json"),
+        ));
         let application = Arc::new(ClientApplication::with_split_tunnel_store(
             Arc::new(api),
             Arc::new(SystemSecretStore::new("primary", fallback)),
@@ -132,11 +135,10 @@ pub fn run() {
             tunnel.clone(),
             diagnostics.clone(),
         ));
+        let dns_servers = preferences.get().dns_provider.servers();
+        application.set_dns_servers(dns_servers);
         let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
         let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
-        let preferences = Arc::new(preferences::AppPreferenceStore::new(
-            app_data_directory.join("preferences.json"),
-        ));
         let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
         app.manage(diagnostics);
         app.manage(application.clone());
@@ -163,6 +165,7 @@ pub fn run() {
             commands::app_state,
             commands::app_preferences,
             commands::app_set_close_to_tray,
+            commands::app_set_dns_provider,
             commands::app_login,
             commands::app_bootstrap,
             commands::app_peer_options,

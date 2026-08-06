@@ -5,11 +5,13 @@ import android.os.Build
 import androidx.annotation.RequiresApi
 import com.wireguard.config.Config
 import com.wireguard.config.Interface
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicReference
 
 private const val MAX_APPLICATION_RULES = 512
 private const val MAX_EXCLUDED_ROUTES = 16_384
+private const val MAX_DNS_SERVERS = 4
 private val PACKAGE_ID = Regex("^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+$")
 
 internal class AndroidSplitTunnelException(
@@ -39,23 +41,31 @@ internal data class EffectiveAndroidTunnelOptions(
     val includedPackages: List<String> = emptyList(),
     val excludedRoutes: List<Ipv4Prefix> = emptyList(),
     val excludeLocalNetworks: Boolean = false,
+    val dnsServers: List<InetAddress> = emptyList(),
 ) {
     fun isEmpty(): Boolean =
         excludedPackages.isEmpty() &&
             includedPackages.isEmpty() &&
             excludedRoutes.isEmpty() &&
-            !excludeLocalNetworks
+            !excludeLocalNetworks &&
+            dnsServers.isEmpty()
 }
 
+internal data class AndroidVpnRoutes(
+    val excludedRoutes: List<Ipv4Prefix> = emptyList(),
+    val forcedTunnelRoutes: List<Ipv4Prefix> = emptyList(),
+)
+
 internal object AndroidSplitTunnel {
-    private val currentRoutes = AtomicReference<List<Ipv4Prefix>>(emptyList())
+    private val currentVpnRoutes = AtomicReference(AndroidVpnRoutes())
 
     fun resolveOptions(
         androidApiLevel: Int,
         args: TunnelOptionsArgs,
     ): EffectiveAndroidTunnelOptions {
+        val dnsServers = normalizeDnsServers(args.dnsServers)
         if (androidApiLevel < 33 || !args.splitActive) {
-            return EffectiveAndroidTunnelOptions()
+            return EffectiveAndroidTunnelOptions(dnsServers = dnsServers)
         }
         if (args.excludedPackages.isNotEmpty() && args.includedPackages.isNotEmpty()) {
             throw AndroidSplitTunnelException("conflicting_application_rules")
@@ -77,6 +87,7 @@ internal object AndroidSplitTunnel {
             includedPackages = includedPackages,
             excludedRoutes = excludedRoutes.values.toList(),
             excludeLocalNetworks = args.excludeLocalNetworks,
+            dnsServers = dnsServers,
         )
     }
 
@@ -98,7 +109,7 @@ internal object AndroidSplitTunnel {
         }
         val builder = Interface.Builder()
             .addAddresses(source.getAddresses())
-            .addDnsServers(source.getDnsServers())
+            .addDnsServers(options.dnsServers.ifEmpty { source.getDnsServers() })
             .addDnsSearchDomains(source.getDnsSearchDomains())
             .setKeyPair(source.getKeyPair())
         if (source.getListenPort().isPresent) {
@@ -119,8 +130,30 @@ internal object AndroidSplitTunnel {
             .build()
     }
 
-    fun replaceExcludedRoutes(routes: List<Ipv4Prefix>) {
-        currentRoutes.set(routes.toList())
+    fun replaceVpnRoutes(
+        excludedRoutes: List<Ipv4Prefix>,
+        dnsServers: List<InetAddress>,
+    ) {
+        currentVpnRoutes.set(planVpnRoutes(excludedRoutes, dnsServers))
+    }
+
+    fun planVpnRoutes(
+        excludedRoutes: List<Ipv4Prefix>,
+        dnsServers: List<InetAddress>,
+    ): AndroidVpnRoutes = AndroidVpnRoutes(
+        excludedRoutes = excludedRoutes.toList(),
+        forcedTunnelRoutes = dnsServers.filterIsInstance<Inet4Address>().map { server ->
+            canonicalIpv4Prefix("${server.hostAddress}/32")
+        },
+    )
+
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+    fun currentVpnRoutes(): Pair<List<IpPrefix>, List<IpPrefix>> {
+        val routes = currentVpnRoutes.get()
+        return Pair(
+            routes.excludedRoutes.map(Ipv4Prefix::toIpPrefix),
+            routes.forcedTunnelRoutes.map(Ipv4Prefix::toIpPrefix),
+        )
     }
 
     fun mergeExcludedRoutes(
@@ -140,12 +173,8 @@ internal object AndroidSplitTunnel {
         }
     }
 
-    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    fun currentExcludedRoutes(): List<IpPrefix> =
-        currentRoutes.get().map(Ipv4Prefix::toIpPrefix)
-
     fun clear() {
-        currentRoutes.set(emptyList())
+        currentVpnRoutes.set(AndroidVpnRoutes())
     }
 
     private fun normalizePackages(values: List<String>): List<String> {
@@ -161,6 +190,28 @@ internal object AndroidSplitTunnel {
             throw AndroidSplitTunnelException("application_rules_limit")
         }
         return packages.toList()
+    }
+
+    private fun normalizeDnsServers(values: List<String>): List<InetAddress> {
+        if (values.size > MAX_DNS_SERVERS) {
+            throw AndroidSplitTunnelException("dns_servers_limit")
+        }
+        val servers = linkedMapOf<String, InetAddress>()
+        values.forEach { raw ->
+            val octets = raw.trim().split(".")
+            if (octets.size != 4) {
+                throw AndroidSplitTunnelException("invalid_dns_server")
+            }
+            val bytes = octets.map { value ->
+                value.toIntOrNull()
+                    ?.takeIf { it in 0..255 && value == it.toString() }
+                    ?.toByte()
+                    ?: throw AndroidSplitTunnelException("invalid_dns_server")
+            }.toByteArray()
+            val canonical = octets.joinToString(".")
+            servers.putIfAbsent(canonical, InetAddress.getByAddress(bytes))
+        }
+        return servers.values.toList()
     }
 
     private fun canonicalIpv4Prefix(value: String): Ipv4Prefix {

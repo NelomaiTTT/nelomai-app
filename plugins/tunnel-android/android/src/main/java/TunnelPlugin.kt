@@ -35,24 +35,36 @@ private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileServic
 @InvokeArg
 class TunnelOptionsArgs {
     var splitActive: Boolean = false
+    var policyHash: String? = null
+    var applicationMode: String? = null
     var excludedPackages: ArrayList<String> = arrayListOf()
     var includedPackages: ArrayList<String> = arrayListOf()
     var splitTunnelRoutes: ArrayList<String> = arrayListOf()
     var excludeLocalNetworks: Boolean = false
+    var dnsServers: ArrayList<String> = arrayListOf()
 
     companion object {}
 
     fun isEmpty(): Boolean =
-        !splitActive &&
+            !splitActive &&
+            policyHash == null &&
+            applicationMode == null &&
             excludedPackages.isEmpty() &&
             includedPackages.isEmpty() &&
             splitTunnelRoutes.isEmpty() &&
-            !excludeLocalNetworks
+            !excludeLocalNetworks &&
+            dnsServers.isEmpty()
+}
+
+@InvokeArg
+class DnsServersArgs {
+    var dnsServers: ArrayList<String> = arrayListOf()
 }
 
 @InvokeArg
 class StartTunnelArgs {
     var apiVersion: Int = 0
+    var startSource: String = "ui"
     lateinit var configuration: ByteArray
     var options: TunnelOptionsArgs = TunnelOptionsArgs()
     var cacheQuickAction: Boolean = false
@@ -72,6 +84,7 @@ class QuickConnectionArgs {
 @InvokeArg
 class BackgroundCredentialArgs {
     var apiVersion: Int = 0
+    lateinit var deviceId: String
     lateinit var panelBase: String
     lateinit var token: String
     var expiresAtUnix: Long = 0
@@ -205,9 +218,16 @@ internal object TunnelRuntime {
     private val generation = AtomicLong(0)
     private val tunnel = ManagedTunnel { state ->
         if (!suppressBackendStateChanges.get()) {
-            stateGate.complete(
-                if (state == Tunnel.State.UP) SessionState.RUNNING else SessionState.STOPPED,
-            )
+            if (state == Tunnel.State.UP) {
+                stateGate.complete(SessionState.RUNNING)
+            } else {
+                stateGate.complete(SessionState.STOPPED)
+                TunnelLog.warning("tunnel.backend_state_down")
+                applicationContext?.let { context ->
+                    runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
+                        .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+                }
+            }
         }
     }
 
@@ -217,12 +237,17 @@ internal object TunnelRuntime {
     @Volatile
     private var activeSession: ActiveTunnelSession? = null
 
+    @Volatile
+    private var applicationContext: Context? = null
+
     fun initialize(context: Context) {
-        TunnelLog.initialize(context.applicationContext)
+        val normalizedContext = context.applicationContext
+        applicationContext = normalizedContext
+        TunnelLog.initialize(normalizedContext)
         if (backend == null) {
             synchronized(this) {
                 if (backend == null) {
-                    backend = GoBackend(context.applicationContext)
+                    backend = GoBackend(normalizedContext)
                 }
             }
         }
@@ -268,7 +293,11 @@ internal object TunnelRuntime {
             val startedAt = System.nanoTime()
             TunnelLog.info(
                 "start.begin",
-                mapOf("replace" to replaceExisting, "split" to args.options.splitActive),
+                mapOf(
+                    "replace" to replaceExisting,
+                    "split" to args.options.splitActive,
+                    "source" to args.startSource,
+                ),
             )
             try {
                 val serviceStartedAt = System.nanoTime()
@@ -287,6 +316,8 @@ internal object TunnelRuntime {
                     } finally {
                         suppressBackendStateChanges.set(false)
                     }
+                    runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
+                        .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
                     logStage("start.previous_tunnel_stopped", replaceStartedAt)
                 }
                 val parseStartedAt = System.nanoTime()
@@ -312,16 +343,33 @@ internal object TunnelRuntime {
                     emptyList()
                 }
                 NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
-                AndroidSplitTunnel.replaceExcludedRoutes(
+                AndroidSplitTunnel.replaceVpnRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(
                         options.excludedRoutes,
                         localRoutes,
                     ),
+                    config.getInterface().getDnsServers().toList(),
                 )
                 logStage(
                     "start.options_ready",
                     optionsStartedAt,
                     "split_supported=${options.splitSupported} local_routes=${localRoutes.size}",
+                )
+                TunnelLog.info(
+                    "start.split_options",
+                    mapOf(
+                        "source" to args.startSource,
+                        "application_mode" to args.options.applicationMode,
+                        "included_packages_count" to options.includedPackages.size,
+                        "excluded_packages_count" to options.excludedPackages.size,
+                        "excluded_routes_count" to options.excludedRoutes.size,
+                        "local_routes_count" to localRoutes.size,
+                        "exclude_local_networks" to options.excludeLocalNetworks,
+                        "policy_hash" to args.options.policyHash,
+                        "dns_servers" to config.getInterface().getDnsServers()
+                            .joinToString(",") { it.hostAddress ?: "unknown" },
+                        "dns_forced_routes_count" to config.getInterface().getDnsServers().size,
+                    ),
                 )
 
                 val backendStartedAt = System.nanoTime()
@@ -363,6 +411,10 @@ internal object TunnelRuntime {
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
+                if (resolved == SessionState.RUNNING) {
+                    runCatching { AutomaticDiagnostics.onTunnelStarted(applicationContext) }
+                        .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+                }
                 if (resolved == SessionState.RUNNING && quickPlan != null) {
                     try {
                         QuickTunnelPlanStore.save(applicationContext, quickPlan)
@@ -456,6 +508,7 @@ internal object TunnelRuntime {
                 )
                 val args = StartTunnelArgs().apply {
                     apiVersion = TUNNEL_API_VERSION
+                    startSource = "background"
                     configuration = result.configuration
                     options = result.options
                     cacheQuickAction = true
@@ -574,6 +627,16 @@ internal object TunnelRuntime {
     fun clearQuickPlan(context: Context): Boolean =
         QuickTunnelPlanStore.clear(context.applicationContext)
 
+    fun updateQuickDns(context: Context, dnsServers: List<String>): Boolean {
+        val args = TunnelOptionsArgs().apply {
+            this.dnsServers = ArrayList(dnsServers)
+        }
+        val normalized = AndroidSplitTunnel.resolveOptions(0, args)
+            .dnsServers
+            .mapNotNull { it.hostAddress }
+        return QuickTunnelPlanStore.updateDnsServers(context.applicationContext, normalized)
+    }
+
     fun clearBackgroundCredential(context: Context): Boolean =
         BackgroundCredentialStore.clear(context.applicationContext)
 
@@ -593,6 +656,10 @@ internal object TunnelRuntime {
         when (stateGate.beginStop()) {
             TransitionDecision.ALREADY_COMPLETE -> {
                 clearActiveSession()
+                applicationContext?.let { context ->
+                    runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
+                        .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+                }
                 if (!keepForegroundService) {
                     NelomaiVpnService.stopForegroundService()
                 }
@@ -612,7 +679,12 @@ internal object TunnelRuntime {
             TunnelLog.info("stop.begin")
             try {
                 clearActiveSession()
-                val state = requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                suppressBackendStateChanges.set(true)
+                val state = try {
+                    requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                } finally {
+                    suppressBackendStateChanges.set(false)
+                }
                 AndroidSplitTunnel.clear()
                 val resolved = if (state == Tunnel.State.DOWN) {
                     SessionState.STOPPED
@@ -620,10 +692,16 @@ internal object TunnelRuntime {
                     SessionState.FAILED
                 }
                 stateGate.complete(resolved)
-                if (resolved == SessionState.STOPPED && !keepForegroundService) {
-                    NelomaiVpnService.stopForegroundService()
-                }
                 logStage("stop.completed", startedAt, "state=${resolved.wireName}")
+                if (resolved == SessionState.STOPPED) {
+                    applicationContext?.let { context ->
+                        runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
+                            .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+                    }
+                    if (!keepForegroundService) {
+                        NelomaiVpnService.stopForegroundService()
+                    }
+                }
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
                 AndroidSplitTunnel.clear()
@@ -784,13 +862,17 @@ private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
     if (!cacheQuickAction || !configurationInitialized) return null
     return StartTunnelArgs().also { copy ->
         copy.apiVersion = apiVersion
+        copy.startSource = startSource
         copy.configuration = byteArrayOf()
         copy.options = TunnelOptionsArgs().also { optionsCopy ->
             optionsCopy.splitActive = options.splitActive
+            optionsCopy.policyHash = options.policyHash
+            optionsCopy.applicationMode = options.applicationMode
             optionsCopy.excludedPackages = ArrayList(options.excludedPackages)
             optionsCopy.includedPackages = ArrayList(options.includedPackages)
             optionsCopy.splitTunnelRoutes = ArrayList(options.splitTunnelRoutes)
             optionsCopy.excludeLocalNetworks = options.excludeLocalNetworks
+            optionsCopy.dnsServers = ArrayList(options.dnsServers)
         }
         copy.cacheQuickAction = true
         copy.quickActionValidUntilUnix = quickActionValidUntilUnix
@@ -889,10 +971,11 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     @Suppress("DEPRECATION")
     @Command
     fun resourceUsage(invoke: Invoke) {
-        try {
-            val manager = activity.getSystemService(SystemHealthManager::class.java)
-            val stats = manager.takeMyUidSnapshot()
-            val response = JSObject()
+        val response = JSObject()
+        var available = false
+        runCatching {
+            activity.getSystemService(SystemHealthManager::class.java).takeMyUidSnapshot()
+        }.getOrNull()?.let { stats ->
             response.put("cpuUserMs", stats.measurement(UidHealthStats.MEASUREMENT_USER_CPU_TIME_MS))
             response.put("cpuSystemMs", stats.measurement(UidHealthStats.MEASUREMENT_SYSTEM_CPU_TIME_MS))
             response.put(
@@ -912,8 +995,15 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             response.put("cpuChargeMilliampMilliseconds", stats.measurement(UidHealthStats.MEASUREMENT_CPU_POWER_MAMS))
             response.put("mobileChargeMilliampMilliseconds", stats.measurement(UidHealthStats.MEASUREMENT_MOBILE_POWER_MAMS))
             response.put("wifiChargeMilliampMilliseconds", stats.measurement(UidHealthStats.MEASUREMENT_WIFI_POWER_MAMS))
+            available = true
+        }
+        runCatching { androidProcessMemory(activity.applicationContext) }.getOrNull()?.let { processes ->
+            response.put("processes", processes)
+            available = true
+        }
+        if (available) {
             invoke.resolve(response)
-        } catch (_: Throwable) {
+        } else {
             invoke.reject("resource_usage_unavailable")
         }
     }
@@ -922,6 +1012,22 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     fun clearQuickPlan(invoke: Invoke) {
         TunnelServiceClient.clearQuickPlan(
             activity.applicationContext,
+            { activity.runOnUiThread { invoke.resolve() } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun updateQuickDns(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(DnsServersArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_dns_servers")
+            return
+        }
+        TunnelServiceClient.updateQuickDns(
+            activity.applicationContext,
+            args.dnsServers,
             { activity.runOnUiThread { invoke.resolve() } },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
         )
@@ -947,10 +1053,11 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     fun backgroundCredentialStatus(invoke: Invoke) {
         TunnelServiceClient.backgroundCredentialStatus(
             activity.applicationContext,
-            { configured, expiresAtUnix ->
+            { configured, deviceId, expiresAtUnix ->
                 activity.runOnUiThread {
                     val response = JSObject()
                     response.put("configured", configured)
+                    response.put("deviceId", deviceId)
                     response.put("expiresAtUnix", expiresAtUnix)
                     invoke.resolve(response)
                 }

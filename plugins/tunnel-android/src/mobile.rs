@@ -62,6 +62,12 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub fn update_quick_dns(&self, request: DnsServersRequest) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("updateQuickDns", request)
+            .map_err(Into::into)
+    }
+
     pub fn configure_background(&self, request: BackgroundCredentialRequest) -> crate::Result<()> {
         self.0
             .run_mobile_plugin::<()>("configureBackground", request)

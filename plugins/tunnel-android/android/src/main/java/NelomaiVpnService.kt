@@ -33,7 +33,12 @@ class NelomaiVpnService : GoBackend.VpnService() {
         object : VpnService.Builder() {
             override fun establish(): ParcelFileDescriptor? {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    AndroidSplitTunnel.currentExcludedRoutes().forEach(::excludeRoute)
+                    val (excludedRoutes, forcedTunnelRoutes) =
+                        AndroidSplitTunnel.currentVpnRoutes()
+                    excludedRoutes.forEach(::excludeRoute)
+                    // A later, more specific route keeps VPN DNS inside the tunnel even when
+                    // a panel or local exclusion contains the resolver's parent prefix.
+                    forcedTunnelRoutes.forEach(::addRoute)
                 }
                 return super.establish()
             }
@@ -43,6 +48,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
         super.onCreate()
         TunnelLog.initialize(applicationContext)
         TunnelRuntime.initialize(applicationContext)
+        runCatching { AutomaticDiagnostics.initialize(applicationContext) }
+            .onFailure { TunnelLog.warning("diagnostics.initialize_failed", error = it) }
         activeService = this
         serviceReady.complete(Unit)
         TunnelLog.info("service.created")
@@ -68,6 +75,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_BACKGROUND_STATUS -> handleBackgroundStatus(intent)
             intent?.action == ACTION_CLEAR_BACKGROUND -> handleClearBackground(intent)
             intent?.action == ACTION_CLEAR_QUICK_PLAN -> handleClearQuickPlan(intent)
+            intent?.action == ACTION_UPDATE_QUICK_DNS -> handleUpdateQuickDns(intent)
             intent?.action == ACTION_TAKE_STATE_CHANGE -> handleTakeStateChange(intent)
             intent?.action == ACTION_ACKNOWLEDGE_STATE_CHANGE -> handleAcknowledgeStateChange(intent)
             intent == null && QuickTunnelController.desiredActive(applicationContext) -> {
@@ -89,6 +97,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         val args = try {
             StartTunnelArgs().apply {
                 apiVersion = intent.getIntExtra(EXTRA_API_VERSION, 0)
+                startSource = intent.getStringExtra(EXTRA_START_SOURCE) ?: "ui"
                 this.configuration = requireNotNull(configuration)
                 options = requireNotNull(intent.getBundleExtra(EXTRA_OPTIONS)).toTunnelOptions()
                 cacheQuickAction = intent.getBooleanExtra(EXTRA_CACHE_QUICK_ACTION, false)
@@ -222,11 +231,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
             BackgroundCredentialStore.save(
                 applicationContext,
                 BackgroundCredential(
+                    requireNotNull(intent.getStringExtra(EXTRA_DEVICE_ID)),
                     requireNotNull(intent.getStringExtra(EXTRA_PANEL_BASE)),
                     requireNotNull(intent.getStringExtra(EXTRA_TOKEN)),
                     expiresAtUnix,
                 ),
             )
+            runCatching { AutomaticDiagnostics.credentialUpdated(applicationContext) }
+                .onFailure { TunnelLog.warning("diagnostics.credential_update_failed", error = it) }
             receiver.sendSuccess()
         } catch (_: Throwable) {
             receiver.sendError("invalid_background_credential")
@@ -241,7 +253,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
             SERVICE_RESULT_OK,
             Bundle().apply {
                 putBoolean(EXTRA_CONFIGURED, credential != null)
-                credential?.let { putLong(EXTRA_EXPIRES_AT_UNIX, it.expiresAtUnix) }
+                credential?.let {
+                    putString(EXTRA_DEVICE_ID, it.deviceId)
+                    putLong(EXTRA_EXPIRES_AT_UNIX, it.expiresAtUnix)
+                }
             },
         )
         stopIfIdle()
@@ -260,6 +275,19 @@ class NelomaiVpnService : GoBackend.VpnService() {
         val planCleared = TunnelRuntime.clearQuickPlan(applicationContext)
         val stateCleared = QuickTunnelController.clearStateChange(applicationContext)
         if (planCleared && stateCleared) {
+            intent.resultReceiver().sendSuccess()
+        } else {
+            intent.resultReceiver().sendError("quick_state_persist_failed")
+        }
+        stopIfIdle()
+    }
+
+    private fun handleUpdateQuickDns(intent: Intent) {
+        val dnsServers = intent.getStringArrayListExtra(EXTRA_DNS_SERVERS) ?: arrayListOf()
+        val updated = runCatching {
+            TunnelRuntime.updateQuickDns(applicationContext, dnsServers)
+        }.getOrDefault(false)
+        if (updated) {
             intent.resultReceiver().sendSuccess()
         } else {
             intent.resultReceiver().sendError("quick_state_persist_failed")
@@ -291,6 +319,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
 
     override fun onRevoke() {
         TunnelLog.warning("service.vpn_revoked")
+        runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
+            .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
         QuickTunnelController.updateState(
             applicationContext,
             SessionState.STOPPED,
@@ -309,6 +339,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
 
     override fun onDestroy() {
         cancelRestoreRetry()
+        runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
+            .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
         activeService = null
         TunnelRuntime.serviceDestroyed()
         AndroidSplitTunnel.clear()
@@ -439,6 +471,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         internal const val ACTION_BACKGROUND_STATUS = "ru.nelomai.tunnel.BACKGROUND_STATUS"
         internal const val ACTION_CLEAR_BACKGROUND = "ru.nelomai.tunnel.CLEAR_BACKGROUND"
         internal const val ACTION_CLEAR_QUICK_PLAN = "ru.nelomai.tunnel.CLEAR_QUICK_PLAN"
+        internal const val ACTION_UPDATE_QUICK_DNS = "ru.nelomai.tunnel.UPDATE_QUICK_DNS"
         internal const val ACTION_TAKE_STATE_CHANGE = "ru.nelomai.tunnel.TAKE_STATE_CHANGE"
         internal const val ACTION_ACKNOWLEDGE_STATE_CHANGE =
             "ru.nelomai.tunnel.ACKNOWLEDGE_STATE_CHANGE"

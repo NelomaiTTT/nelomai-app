@@ -7,7 +7,9 @@ use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
     StoredConnectionKind,
 };
-use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
+use nelomai_client_tunnel::{
+    TunnelController, TunnelError, TunnelOptions, TunnelStartRequest, TunnelStatus,
+};
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
@@ -83,6 +85,7 @@ struct MemoryTunnel {
     fail_next_starts: AtomicUsize,
     status_failures: AtomicUsize,
     configuration: Mutex<Option<String>>,
+    options: Mutex<Option<TunnelOptions>>,
     status: Mutex<TunnelStatus>,
 }
 
@@ -101,6 +104,7 @@ impl TunnelController for MemoryTunnel {
             return Err(TunnelError::Backend("test_start_failed".to_string()));
         }
         *self.configuration.lock().unwrap() = Some(request.configuration.expose().to_string());
+        *self.options.lock().unwrap() = Some(request.options);
         *self.status.lock().unwrap() = TunnelStatus::Running;
         Ok(())
     }
@@ -418,6 +422,29 @@ fn options() -> ConnectOptions {
         probes: Vec::new(),
         allow_alternate: false,
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_dns_servers_are_forwarded_to_the_tunnel() {
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let dns_servers = vec![
+        "9.9.9.9".parse().unwrap(),
+        "149.112.112.112".parse().unwrap(),
+    ];
+    core.set_dns_servers(dns_servers.clone());
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(
+        tunnel.options.lock().unwrap().as_ref().unwrap().dns_servers,
+        dns_servers
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

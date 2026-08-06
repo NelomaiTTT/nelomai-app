@@ -313,6 +313,7 @@ impl EffectiveSplitTunnelPolicy {
                         TunnelPlatform::Windows | TunnelPlatform::Linux | TunnelPlatform::Macos
                     )),
             policy_hash: Some(policy.policy_hash.clone()),
+            dns_servers: Vec::new(),
         };
         options
             .validate()
@@ -1318,7 +1319,7 @@ where
             route_mode,
             &resolved_domains,
         )
-        .map(|effective| effective.options)
+        .map(|effective| self.with_dns_servers(effective.options))
         .map_err(|error| CoreError::SplitTunnel(error.stable_code().to_string()))
     }
 

@@ -32,6 +32,16 @@ struct AndroidUidCounters {
     cpu_charge_milliamp_milliseconds: Option<u64>,
     mobile_charge_milliamp_milliseconds: Option<u64>,
     wifi_charge_milliamp_milliseconds: Option<u64>,
+    processes: Vec<AndroidProcessCounters>,
+}
+
+#[derive(Clone, Default)]
+struct AndroidProcessCounters {
+    process_id: u64,
+    process_name: String,
+    current_resident_memory_bytes: Option<u64>,
+    current_proportional_memory_bytes: Option<u64>,
+    current_private_dirty_memory_bytes: Option<u64>,
 }
 
 impl ResourceSnapshot {
@@ -78,6 +88,9 @@ impl ResourceSnapshot {
                 session_duration_ms,
             ));
         }
+        if let Some(current) = &current.android_uid {
+            components.extend(android_process_components(&current.processes));
+        }
 
         DiagnosticResourceUsage {
             measurement_mode: "session_delta".to_string(),
@@ -97,11 +110,15 @@ fn process_component(
     DiagnosticResourceComponent {
         component: "client_process".to_string(),
         source: "operating_system_process_counters".to_string(),
+        process_id: Some(std::process::id() as u64),
+        process_name: current_process_name(),
         cpu_average_basis_points: average_cpu_basis_points(cpu_user_ms, cpu_system_ms, duration_ms),
         cpu_user_ms,
         cpu_system_ms,
         current_resident_memory_bytes: current.current_resident_memory_bytes,
         peak_resident_memory_bytes: current.peak_resident_memory_bytes,
+        current_proportional_memory_bytes: None,
+        current_private_dirty_memory_bytes: None,
         read_bytes: delta(baseline.read_bytes, current.read_bytes),
         write_bytes: delta(baseline.write_bytes, current.write_bytes),
         page_faults: delta(baseline.page_faults, current.page_faults),
@@ -133,11 +150,15 @@ fn android_uid_component(
     DiagnosticResourceComponent {
         component: "android_application_uid".to_string(),
         source: "android_system_health_manager".to_string(),
+        process_id: None,
+        process_name: None,
         cpu_average_basis_points: average_cpu_basis_points(cpu_user_ms, cpu_system_ms, duration_ms),
         cpu_user_ms,
         cpu_system_ms,
         current_resident_memory_bytes: None,
         peak_resident_memory_bytes: None,
+        current_proportional_memory_bytes: None,
+        current_private_dirty_memory_bytes: None,
         read_bytes: None,
         write_bytes: None,
         page_faults: None,
@@ -160,6 +181,111 @@ fn android_uid_component(
             current.wifi_charge_milliamp_milliseconds,
         ),
     }
+}
+
+fn android_process_components(
+    processes: &[AndroidProcessCounters],
+) -> Vec<DiagnosticResourceComponent> {
+    let mut components = processes
+        .iter()
+        .map(|process| DiagnosticResourceComponent {
+            component: if process.process_name.ends_with(":vpn") {
+                "android_vpn_process".to_string()
+            } else {
+                "android_ui_process".to_string()
+            },
+            source: "android_activity_manager_memory_info".to_string(),
+            process_id: Some(process.process_id),
+            process_name: Some(process.process_name.clone()),
+            cpu_user_ms: None,
+            cpu_system_ms: None,
+            cpu_average_basis_points: None,
+            current_resident_memory_bytes: process.current_resident_memory_bytes,
+            peak_resident_memory_bytes: None,
+            current_proportional_memory_bytes: process.current_proportional_memory_bytes,
+            current_private_dirty_memory_bytes: process.current_private_dirty_memory_bytes,
+            read_bytes: None,
+            write_bytes: None,
+            page_faults: None,
+            minor_page_faults: None,
+            major_page_faults: None,
+            voluntary_context_switches: None,
+            involuntary_context_switches: None,
+            network_rx_bytes: None,
+            network_tx_bytes: None,
+            cpu_charge_milliamp_milliseconds: None,
+            mobile_charge_milliamp_milliseconds: None,
+            wifi_charge_milliamp_milliseconds: None,
+        })
+        .collect::<Vec<_>>();
+    if !processes.is_empty() {
+        components.push(DiagnosticResourceComponent {
+            component: "android_application_processes".to_string(),
+            source: "android_activity_manager_memory_sum".to_string(),
+            process_id: None,
+            process_name: None,
+            cpu_user_ms: None,
+            cpu_system_ms: None,
+            cpu_average_basis_points: None,
+            current_resident_memory_bytes: sum_available(
+                processes
+                    .iter()
+                    .map(|item| item.current_resident_memory_bytes),
+            ),
+            peak_resident_memory_bytes: None,
+            current_proportional_memory_bytes: sum_available(
+                processes
+                    .iter()
+                    .map(|item| item.current_proportional_memory_bytes),
+            ),
+            current_private_dirty_memory_bytes: sum_available(
+                processes
+                    .iter()
+                    .map(|item| item.current_private_dirty_memory_bytes),
+            ),
+            read_bytes: None,
+            write_bytes: None,
+            page_faults: None,
+            minor_page_faults: None,
+            major_page_faults: None,
+            voluntary_context_switches: None,
+            involuntary_context_switches: None,
+            network_rx_bytes: None,
+            network_tx_bytes: None,
+            cpu_charge_milliamp_milliseconds: None,
+            mobile_charge_milliamp_milliseconds: None,
+            wifi_charge_milliamp_milliseconds: None,
+        });
+    }
+    components
+}
+
+fn sum_available(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    let mut found = false;
+    let mut total = 0_u64;
+    for value in values.flatten() {
+        found = true;
+        total = total.saturating_add(value);
+    }
+    found.then_some(total)
+}
+
+fn current_process_name() -> Option<String> {
+    #[cfg(target_os = "android")]
+    if let Ok(value) = std::fs::read("/proc/self/cmdline") {
+        let end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        let name = String::from_utf8_lossy(&value[..end]).trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    std::env::current_exe().ok().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    })
 }
 
 fn delta(baseline: Option<u64>, current: Option<u64>) -> Option<u64> {
@@ -334,6 +460,17 @@ fn capture_android_uid<R: Runtime>(app: &AppHandle<R>) -> Option<AndroidUidCount
         cpu_charge_milliamp_milliseconds: snapshot.cpu_charge_milliamp_milliseconds,
         mobile_charge_milliamp_milliseconds: snapshot.mobile_charge_milliamp_milliseconds,
         wifi_charge_milliamp_milliseconds: snapshot.wifi_charge_milliamp_milliseconds,
+        processes: snapshot
+            .processes
+            .into_iter()
+            .map(|process| AndroidProcessCounters {
+                process_id: process.process_id,
+                process_name: process.process_name,
+                current_resident_memory_bytes: process.current_resident_memory_bytes,
+                current_proportional_memory_bytes: process.current_proportional_memory_bytes,
+                current_private_dirty_memory_bytes: process.current_private_dirty_memory_bytes,
+            })
+            .collect(),
     })
 }
 
@@ -382,5 +519,36 @@ mod tests {
     #[test]
     fn reset_counter_is_reported_as_unavailable() {
         assert_eq!(delta(Some(10), Some(5)), None);
+    }
+
+    #[test]
+    fn current_android_process_memory_survives_a_missing_uid_baseline() {
+        let baseline = ResourceSnapshot {
+            captured_at: Instant::now(),
+            process: ProcessCounters::default(),
+            android_uid: None,
+        };
+        let current = ResourceSnapshot {
+            captured_at: baseline.captured_at + Duration::from_secs(1),
+            process: ProcessCounters::default(),
+            android_uid: Some(AndroidUidCounters {
+                processes: vec![AndroidProcessCounters {
+                    process_id: 42,
+                    process_name: "ru.nelomai.app:vpn".to_string(),
+                    current_resident_memory_bytes: Some(100),
+                    current_proportional_memory_bytes: Some(80),
+                    current_private_dirty_memory_bytes: Some(60),
+                }],
+                ..AndroidUidCounters::default()
+            }),
+        };
+
+        let report = baseline.report(current);
+
+        assert!(report
+            .components
+            .iter()
+            .any(|component| component.component == "android_vpn_process"
+                && component.current_proportional_memory_bytes == Some(80)));
     }
 }

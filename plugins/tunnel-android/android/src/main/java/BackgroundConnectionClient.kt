@@ -93,6 +93,11 @@ internal object BackgroundConnectionClient {
         )
     }
 
+    fun uploadDiagnostics(
+        credential: BackgroundCredential,
+        payload: JSONObject,
+    ): JSONObject = execute(credential, "background/diagnostics", payload)
+
     private fun execute(
         credential: BackgroundCredential,
         endpoint: String,
@@ -170,7 +175,11 @@ internal fun backgroundTunnelOptions(
     resolveDomain: (String) -> List<String>,
 ): TunnelOptionsArgs {
     with(payload) {
-        if (!optBoolean("enabled", false)) return TunnelOptionsArgs()
+        if (!optBoolean("enabled", false)) {
+            return TunnelOptionsArgs().apply {
+                dnsServers = ArrayList(fallback.dnsServers)
+            }
+        }
 
         val mandatory = stringList("mandatory_excluded_packages").toSet()
         val selected = stringList("selected_packages").toSet()
@@ -215,10 +224,13 @@ internal fun backgroundTunnelOptions(
 
         return TunnelOptionsArgs().apply {
             splitActive = true
+            policyHash = optString("policy_hash").takeIf(String::isNotBlank)
+            applicationMode = mode
             excludedPackages = excluded
             includedPackages = included
             splitTunnelRoutes = ArrayList(routes)
             excludeLocalNetworks = optBoolean("exclude_local_networks", true)
+            dnsServers = ArrayList(fallback.dnsServers)
         }
     }
 }

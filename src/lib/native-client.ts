@@ -11,6 +11,7 @@ import type {
   PeerOptions,
   ProbeResults,
   Layer,
+  DnsProvider,
   StartCommandRequest,
   UpdateStatus,
 } from "./app-model";
@@ -80,6 +81,8 @@ export function createNativeClient(
     preferences: () => invoke("app_preferences") as Promise<AppPreferences>,
     setCloseToTray: (enabled: boolean) =>
       invoke("app_set_close_to_tray", { enabled }) as Promise<AppPreferences>,
+    setDnsProvider: (provider: DnsProvider) =>
+      invoke("app_set_dns_provider", { provider }) as Promise<AppPreferences>,
     login: (request: LoginRequest) =>
       invoke("app_login", { request }) as Promise<Bootstrap>,
     bootstrap: () => invoke("app_bootstrap") as Promise<Bootstrap>,

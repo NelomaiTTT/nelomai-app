@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use nelomai_contracts::{Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -28,6 +28,74 @@ impl TunnelConfiguration {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
+
+    pub fn override_dns(&mut self, servers: &[IpAddr]) -> Result<(), TunnelConfigurationError> {
+        if servers.is_empty() {
+            return Ok(());
+        }
+
+        let newline = if self.0.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let trailing_newline = self.0.ends_with('\n');
+        let mut output = Vec::new();
+        let mut interface_found = false;
+        let mut in_interface = false;
+        let mut dns_inserted = false;
+        let dns = format!(
+            "DNS = {}",
+            servers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        for raw_line in self.0.lines() {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            let trimmed = line.trim();
+            let section = trimmed
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'));
+            if let Some(section) = section {
+                if in_interface && !dns_inserted {
+                    output.push(dns.clone());
+                    dns_inserted = true;
+                }
+                in_interface = section.eq_ignore_ascii_case("Interface");
+                interface_found |= in_interface;
+            }
+            if in_interface
+                && trimmed
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("DNS"))
+            {
+                continue;
+            }
+            output.push(line.to_string());
+        }
+        if in_interface && !dns_inserted {
+            output.push(dns);
+        }
+        if !interface_found {
+            return Err(TunnelConfigurationError::MissingInterface);
+        }
+
+        let mut updated = output.join(newline);
+        if trailing_newline {
+            updated.push_str(newline);
+        }
+        self.0 = Zeroizing::new(updated);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TunnelConfigurationError {
+    #[error("wireguard interface section is missing")]
+    MissingInterface,
 }
 
 impl fmt::Debug for TunnelConfiguration {
@@ -90,6 +158,7 @@ pub struct TunnelOptions {
     pub excluded_ipv4_cidrs: Vec<String>,
     pub exclude_local_networks: bool,
     pub policy_hash: Option<String>,
+    pub dns_servers: Vec<IpAddr>,
 }
 
 impl fmt::Debug for TunnelOptions {
@@ -101,6 +170,7 @@ impl fmt::Debug for TunnelOptions {
             .field("excluded_ipv4_cidrs_count", &self.excluded_ipv4_cidrs.len())
             .field("exclude_local_networks", &self.exclude_local_networks)
             .field("policy_hash", &self.policy_hash)
+            .field("dns_servers_count", &self.dns_servers.len())
             .finish()
     }
 }
@@ -349,6 +419,35 @@ mod tests {
     }
 
     #[test]
+    fn configuration_dns_override_replaces_interface_dns_only() {
+        let mut configuration = TunnelConfiguration::new(
+            "[Interface]\r\nPrivateKey = secret\r\nDNS = 1.1.1.1\r\n\r\n[Peer]\r\n# DNS = peer-comment\r\nPublicKey = peer\r\n"
+                .to_string(),
+        );
+
+        configuration
+            .override_dns(&[
+                "9.9.9.9".parse().unwrap(),
+                "149.112.112.112".parse().unwrap(),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            configuration.expose(),
+            "[Interface]\r\nPrivateKey = secret\r\n\r\nDNS = 9.9.9.9, 149.112.112.112\r\n[Peer]\r\n# DNS = peer-comment\r\nPublicKey = peer\r\n"
+        );
+    }
+
+    #[test]
+    fn configuration_dns_override_requires_interface() {
+        let mut configuration = TunnelConfiguration::new("[Peer]\nPublicKey = peer\n".to_string());
+        assert_eq!(
+            configuration.override_dns(&["8.8.8.8".parse().unwrap()]),
+            Err(TunnelConfigurationError::MissingInterface)
+        );
+    }
+
+    #[test]
     fn tunnel_start_request_debug_redacts_configuration_packages_and_cidrs() {
         let request = TunnelStartRequest {
             configuration: TunnelConfiguration::new(
@@ -360,6 +459,7 @@ mod tests {
                 excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
                 exclude_local_networks: true,
                 policy_hash: Some("sha256:test".to_string()),
+                dns_servers: vec!["8.8.8.8".parse().unwrap()],
             },
             quick_reconnect: QuickReconnect::Persistent,
             quick_connection: None,
@@ -380,6 +480,7 @@ mod tests {
             excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
             exclude_local_networks: true,
             policy_hash: Some("sha256:test".to_string()),
+            dns_servers: vec!["8.8.8.8".parse().unwrap()],
         };
         assert!(valid.validate().is_ok());
 
@@ -410,6 +511,7 @@ mod tests {
             excluded_ipv4_cidrs: vec!["203.0.113.0/24".to_string()],
             exclude_local_networks: true,
             policy_hash: Some("sha256:first".to_string()),
+            dns_servers: vec!["8.8.8.8".parse().unwrap()],
         };
         let second = TunnelOptions {
             policy_hash: Some("sha256:second".to_string()),

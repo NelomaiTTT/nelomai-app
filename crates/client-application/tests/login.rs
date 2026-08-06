@@ -341,6 +341,28 @@ async fn peer_selection_lists_unused_peers_first_and_preserves_comments() {
 }
 
 #[tokio::test]
+async fn background_token_is_not_issued_for_a_stale_device_scope() {
+    let api = Arc::new(FakeApi {
+        login_request: Mutex::new(None),
+        bind_request: Mutex::new(None),
+        bootstrap: bootstrap(),
+        logout_fails: false,
+        unbind_fails: false,
+    });
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let application =
+        ClientApplication::new(api, store, Arc::new(StoppedTunnel), Arc::new(NoopLogger));
+
+    let response = application
+        .background_token_for_device("device-from-previous-account", 1_800_000_000)
+        .await
+        .unwrap();
+
+    assert!(response.is_none());
+}
+
+#[tokio::test]
 async fn binding_uses_the_peer_selected_by_the_user() {
     let api = Arc::new(FakeApi {
         login_request: Mutex::new(None),

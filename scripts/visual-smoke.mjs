@@ -101,7 +101,7 @@ async function capture(name, viewport, scenario) {
   });
   const page = await context.newPage();
   await page.addInitScript(
-    ({ fixture, peerFixture, currentScenario }) => {
+    ({ fixture, peerFixture, currentScenario, desktop }) => {
       window.__TAURI_CALLS__ = [];
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
@@ -151,6 +151,13 @@ async function capture(name, viewport, scenario) {
           if (command === "app_state") {
             return { phase: "ready", connection: null };
           }
+          if (command === "app_preferences") {
+            return {
+              closeToTraySupported: desktop,
+              closeToTray: true,
+              dnsProvider: "google",
+            };
+          }
           if (command === "app_peer_options") {
             return peerFixture;
           }
@@ -170,7 +177,12 @@ async function capture(name, viewport, scenario) {
         },
       };
     },
-    { fixture: bootstrap, peerFixture: peers, currentScenario: scenario },
+    {
+      fixture: bootstrap,
+      peerFixture: peers,
+      currentScenario: scenario,
+      desktop: viewport.width >= 600,
+    },
   );
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });

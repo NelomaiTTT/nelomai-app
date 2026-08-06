@@ -79,10 +79,14 @@ describe("native client", () => {
 
     await client.preferences();
     await client.setCloseToTray(false);
+    await client.setDnsProvider("quad9");
 
     expect(invoke).toHaveBeenNthCalledWith(1, "app_preferences");
     expect(invoke).toHaveBeenNthCalledWith(2, "app_set_close_to_tray", {
       enabled: false,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "app_set_dns_provider", {
+      provider: "quad9",
     });
   });
 

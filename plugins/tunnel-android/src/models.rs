@@ -51,6 +51,12 @@ pub struct InstalledApplicationsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct ResourceUsageRequest {}
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsServersRequest {
+    pub dns_servers: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceUsageResponse {
@@ -61,6 +67,18 @@ pub struct ResourceUsageResponse {
     pub cpu_charge_milliamp_milliseconds: Option<u64>,
     pub mobile_charge_milliamp_milliseconds: Option<u64>,
     pub wifi_charge_milliamp_milliseconds: Option<u64>,
+    #[serde(default)]
+    pub processes: Vec<AndroidProcessResourceUsage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidProcessResourceUsage {
+    pub process_id: u64,
+    pub process_name: String,
+    pub current_resident_memory_bytes: Option<u64>,
+    pub current_proportional_memory_bytes: Option<u64>,
+    pub current_private_dirty_memory_bytes: Option<u64>,
 }
 
 impl fmt::Debug for InstalledApplicationsResponse {
@@ -78,10 +96,13 @@ pub const TUNNEL_API_VERSION: u16 = 2;
 #[serde(rename_all = "camelCase")]
 pub struct TunnelOptions {
     pub split_active: bool,
+    pub policy_hash: Option<String>,
+    pub application_mode: Option<String>,
     pub excluded_packages: Vec<String>,
     pub included_packages: Vec<String>,
     pub split_tunnel_routes: Vec<String>,
     pub exclude_local_networks: bool,
+    pub dns_servers: Vec<String>,
 }
 
 impl fmt::Debug for TunnelOptions {
@@ -93,12 +114,14 @@ impl fmt::Debug for TunnelOptions {
             .field("included_packages_count", &self.included_packages.len())
             .field("split_tunnel_routes_count", &self.split_tunnel_routes.len())
             .field("exclude_local_networks", &self.exclude_local_networks)
+            .field("dns_servers_count", &self.dns_servers.len())
             .finish()
     }
 }
 
 pub struct StartTunnelRequest {
     pub api_version: u16,
+    pub start_source: String,
     pub configuration: Zeroizing<Vec<u8>>,
     pub options: TunnelOptions,
     pub cache_quick_action: bool,
@@ -120,6 +143,7 @@ impl StartTunnelRequest {
     pub fn new(configuration: &[u8]) -> Self {
         Self {
             api_version: TUNNEL_API_VERSION,
+            start_source: "ui".to_string(),
             configuration: Zeroizing::new(configuration.to_vec()),
             options: TunnelOptions::default(),
             cache_quick_action: false,
@@ -155,6 +179,7 @@ impl Serialize for StartTunnelRequest {
         #[serde(rename_all = "camelCase")]
         struct WireRequest<'a> {
             api_version: u16,
+            start_source: &'a str,
             configuration: &'a [u8],
             options: &'a TunnelOptions,
             cache_quick_action: bool,
@@ -164,6 +189,7 @@ impl Serialize for StartTunnelRequest {
 
         WireRequest {
             api_version: self.api_version,
+            start_source: &self.start_source,
             configuration: self.configuration.as_slice(),
             options: &self.options,
             cache_quick_action: self.cache_quick_action,
@@ -178,6 +204,7 @@ impl Serialize for StartTunnelRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundCredentialRequest {
     pub api_version: u16,
+    pub device_id: String,
     pub panel_base: String,
     pub token: String,
     pub expires_at_unix: i64,
@@ -187,6 +214,7 @@ pub struct BackgroundCredentialRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundCredentialStatusResponse {
     pub configured: bool,
+    pub device_id: Option<String>,
     pub expires_at_unix: Option<i64>,
 }
 
@@ -195,6 +223,7 @@ impl fmt::Debug for BackgroundCredentialRequest {
         formatter
             .debug_struct("BackgroundCredentialRequest")
             .field("api_version", &self.api_version)
+            .field("device_id", &self.device_id)
             .field("panel_base", &self.panel_base)
             .field("token", &"<redacted>")
             .field("expires_at_unix", &self.expires_at_unix)
@@ -262,12 +291,15 @@ mod tests {
         let value = serde_json::to_value(&request).unwrap();
 
         assert_eq!(value["apiVersion"], TUNNEL_API_VERSION);
+        assert_eq!(value["startSource"], "ui");
         assert_eq!(value["configuration"][0], b'[');
         assert_eq!(value["options"]["excludedPackages"], serde_json::json!([]));
         assert_eq!(value["options"]["includedPackages"], serde_json::json!([]));
         assert_eq!(value["options"]["splitTunnelRoutes"], serde_json::json!([]));
         assert_eq!(value["options"]["excludeLocalNetworks"], false);
         assert_eq!(value["options"]["splitActive"], false);
+        assert_eq!(value["options"]["policyHash"], serde_json::Value::Null);
+        assert_eq!(value["options"]["applicationMode"], serde_json::Value::Null);
         assert_eq!(value["cacheQuickAction"], false);
         assert_eq!(value["quickActionValidUntilUnix"], serde_json::Value::Null);
     }
@@ -282,6 +314,24 @@ mod tests {
 
         assert_eq!(value["cacheQuickAction"], true);
         assert_eq!(value["quickActionValidUntilUnix"], 1_785_700_000_i64);
+    }
+
+    #[test]
+    fn background_credential_is_device_scoped_and_redacts_the_token() {
+        let request = BackgroundCredentialRequest {
+            api_version: TUNNEL_API_VERSION,
+            device_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            panel_base: "https://nelomai.example".to_string(),
+            token: "never-log-this-token".to_string(),
+            expires_at_unix: 1_785_700_000,
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["deviceId"], "11111111-1111-4111-8111-111111111111");
+        let debug = format!("{request:?}");
+        assert!(debug.contains("11111111-1111-4111-8111-111111111111"));
+        assert!(!debug.contains("never-log-this-token"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

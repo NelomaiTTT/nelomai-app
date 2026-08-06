@@ -79,17 +79,26 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
             })?;
         let mut plugin_request = StartTunnelRequest::new(request.configuration.as_bytes());
         plugin_request.options.split_active = request.options.policy_hash.is_some();
+        plugin_request.options.policy_hash = request.options.policy_hash.clone();
         match request.options.application_mode {
             Some(SplitTunnelMode::ExcludeSelected) => {
+                plugin_request.options.application_mode = Some("exclude_selected".to_string());
                 plugin_request.options.excluded_packages = request.options.package_ids;
             }
             Some(SplitTunnelMode::IncludeSelected) => {
+                plugin_request.options.application_mode = Some("include_selected".to_string());
                 plugin_request.options.included_packages = request.options.package_ids;
             }
             None => {}
         }
         plugin_request.options.split_tunnel_routes = request.options.excluded_ipv4_cidrs;
         plugin_request.options.exclude_local_networks = request.options.exclude_local_networks;
+        plugin_request.options.dns_servers = request
+            .options
+            .dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         match request.quick_reconnect {
             QuickReconnect::Disabled => {}
             QuickReconnect::Persistent => {

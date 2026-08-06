@@ -536,13 +536,17 @@ impl<T: ServiceTransport> UnixTunnelController<T> {
 
 #[async_trait]
 impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
-    async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
+    async fn start(&self, mut request: TunnelStartRequest) -> Result<(), TunnelError> {
         request
             .options
             .validate()
             .map_err(|error| TunnelError::InvalidOptions {
                 code: error.stable_code(),
             })?;
+        request
+            .configuration
+            .override_dns(&request.options.dns_servers)
+            .map_err(|error| TunnelError::Backend(error.to_string()))?;
         let response = self
             .transport
             .exchange(Request::start_with_options(

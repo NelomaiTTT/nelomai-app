@@ -14,6 +14,7 @@ internal const val SERVICE_RESULT_ERROR = 2
 
 internal const val EXTRA_RESULT_RECEIVER = "result_receiver"
 internal const val EXTRA_API_VERSION = "api_version"
+internal const val EXTRA_START_SOURCE = "start_source"
 internal const val EXTRA_CONFIGURATION = "configuration"
 internal const val EXTRA_OPTIONS = "options"
 internal const val EXTRA_CACHE_QUICK_ACTION = "cache_quick_action"
@@ -28,9 +29,11 @@ internal const val EXTRA_SENT_BYTES = "sent_bytes"
 internal const val EXTRA_PROBE_TARGET = "probe_target"
 internal const val EXTRA_PANEL_BASE = "panel_base"
 internal const val EXTRA_TOKEN = "token"
+internal const val EXTRA_DEVICE_ID = "device_id"
 internal const val EXTRA_EXPIRES_AT_UNIX = "expires_at_unix"
 internal const val EXTRA_CONFIGURED = "configured"
 internal const val EXTRA_CHANGED = "changed"
+internal const val EXTRA_DNS_SERVERS = "dns_servers"
 
 internal object TunnelServiceClient {
     fun start(
@@ -46,6 +49,7 @@ internal object TunnelServiceClient {
                 Intent(context, NelomaiVpnService::class.java)
                     .setAction(NelomaiVpnService.ACTION_CLIENT_START)
                     .putExtra(EXTRA_API_VERSION, args.apiVersion)
+                    .putExtra(EXTRA_START_SOURCE, args.startSource)
                     .putExtra(EXTRA_CONFIGURATION, configuration)
                     .putExtra(EXTRA_OPTIONS, args.options.toBundle())
                     .putExtra(EXTRA_CACHE_QUICK_ACTION, args.cacheQuickAction)
@@ -136,6 +140,7 @@ internal object TunnelServiceClient {
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_CONFIGURE_BACKGROUND)
             .putExtra(EXTRA_API_VERSION, args.apiVersion)
+            .putExtra(EXTRA_DEVICE_ID, args.deviceId)
             .putExtra(EXTRA_PANEL_BASE, args.panelBase)
             .putExtra(EXTRA_TOKEN, args.token)
             .putExtra(EXTRA_EXPIRES_AT_UNIX, args.expiresAtUnix),
@@ -145,7 +150,7 @@ internal object TunnelServiceClient {
 
     fun backgroundCredentialStatus(
         context: Context,
-        onSuccess: (Boolean, Long?) -> Unit,
+        onSuccess: (Boolean, String?, Long?) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
@@ -155,6 +160,7 @@ internal object TunnelServiceClient {
             val configured = it.getBoolean(EXTRA_CONFIGURED)
             onSuccess(
                 configured,
+                if (configured) it.getString(EXTRA_DEVICE_ID) else null,
                 if (configured) it.getLong(EXTRA_EXPIRES_AT_UNIX) else null,
             )
         },
@@ -181,6 +187,20 @@ internal object TunnelServiceClient {
         context,
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_CLEAR_QUICK_PLAN),
+        { onSuccess() },
+        onError,
+    )
+
+    fun updateQuickDns(
+        context: Context,
+        dnsServers: ArrayList<String>,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_UPDATE_QUICK_DNS)
+            .putStringArrayListExtra(EXTRA_DNS_SERVERS, dnsServers),
         { onSuccess() },
         onError,
     )
@@ -275,18 +295,24 @@ internal fun Intent.resultReceiver(): ResultReceiver? =
 
 internal fun TunnelOptionsArgs.toBundle(): Bundle = Bundle().apply {
     putBoolean("split_active", splitActive)
+    putString("policy_hash", policyHash)
+    putString("application_mode", applicationMode)
     putStringArrayList("excluded_packages", excludedPackages)
     putStringArrayList("included_packages", includedPackages)
     putStringArrayList("split_tunnel_routes", splitTunnelRoutes)
     putBoolean("exclude_local_networks", excludeLocalNetworks)
+    putStringArrayList("dns_servers", dnsServers)
 }
 
 internal fun Bundle.toTunnelOptions(): TunnelOptionsArgs = TunnelOptionsArgs().also {
     it.splitActive = getBoolean("split_active")
+    it.policyHash = getString("policy_hash")
+    it.applicationMode = getString("application_mode")
     it.excludedPackages = getStringArrayList("excluded_packages") ?: arrayListOf()
     it.includedPackages = getStringArrayList("included_packages") ?: arrayListOf()
     it.splitTunnelRoutes = getStringArrayList("split_tunnel_routes") ?: arrayListOf()
     it.excludeLocalNetworks = getBoolean("exclude_local_networks")
+    it.dnsServers = getStringArrayList("dns_servers") ?: arrayListOf()
 }
 
 internal fun QuickConnectionArgs.toBundle(): Bundle = Bundle().apply {

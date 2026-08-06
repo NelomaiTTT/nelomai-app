@@ -15,6 +15,7 @@ use nelomai_contracts::{
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
     TicConnectionMode,
 };
+use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use thiserror::Error;
@@ -641,6 +642,7 @@ pub struct ClientCore<A, S, T, L> {
     split_tunnel_gate: Mutex<()>,
     split_tunnel_packages: RwLock<Vec<SplitTunnelSelectedPackage>>,
     split_tunnel_options: Mutex<TunnelOptions>,
+    dns_servers: RwLock<Vec<IpAddr>>,
     split_tunnel_warning: Mutex<SplitTunnelWarnings>,
     physical_network_change: Mutex<split_tunnel::PhysicalNetworkChangeDetector>,
     retry_policy: RetryPolicy,
@@ -682,6 +684,7 @@ where
             split_tunnel_gate: Mutex::new(()),
             split_tunnel_packages: RwLock::new(Vec::new()),
             split_tunnel_options: Mutex::new(TunnelOptions::default()),
+            dns_servers: RwLock::new(Vec::new()),
             split_tunnel_warning: Mutex::new(SplitTunnelWarnings::default()),
             physical_network_change: Mutex::new(
                 split_tunnel::PhysicalNetworkChangeDetector::default(),
@@ -693,6 +696,21 @@ where
     pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
+    }
+
+    pub fn set_dns_servers(&self, servers: Vec<IpAddr>) {
+        if let Ok(mut current) = self.dns_servers.write() {
+            *current = servers;
+        }
+    }
+
+    pub(crate) fn with_dns_servers(&self, mut options: TunnelOptions) -> TunnelOptions {
+        options.dns_servers = self
+            .dns_servers
+            .read()
+            .map(|servers| servers.clone())
+            .unwrap_or_default();
+        options
     }
 
     async fn set_split_tunnel_warning(
@@ -1080,6 +1098,7 @@ where
                 TunnelOptions::default()
             }
         };
+        let tunnel_options = self.with_dns_servers(tunnel_options);
         if split_policy.is_some() {
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
                 .await;
@@ -1488,6 +1507,7 @@ where
                 TunnelOptions::default()
             }
         };
+        let tunnel_options = self.with_dns_servers(tunnel_options);
         if split_policy.is_some() {
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
                 .await;

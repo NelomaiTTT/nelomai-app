@@ -2,21 +2,44 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     io::Write,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 use tempfile::NamedTempFile;
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsProvider {
+    #[default]
+    Google,
+    Yandex,
+    Quad9,
+}
+
+impl DnsProvider {
+    pub fn servers(self) -> Vec<IpAddr> {
+        let servers = match self {
+            Self::Google => [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(8, 8, 4, 4)],
+            Self::Yandex => [Ipv4Addr::new(77, 88, 8, 8), Ipv4Addr::new(77, 88, 8, 1)],
+            Self::Quad9 => [Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(149, 112, 112, 112)],
+        };
+        servers.into_iter().map(IpAddr::V4).collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AppPreferences {
     pub close_to_tray: bool,
+    pub dns_provider: DnsProvider,
 }
 
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
             close_to_tray: true,
+            dns_provider: DnsProvider::Google,
         }
     }
 }
@@ -44,13 +67,28 @@ impl AppPreferenceStore {
     }
 
     pub fn set_close_to_tray(&self, enabled: bool) -> io::Result<AppPreferences> {
-        let preferences = AppPreferences {
-            close_to_tray: enabled,
-        };
         let mut current = self
             .current
             .lock()
             .map_err(|_| io::Error::other("preference lock poisoned"))?;
+        let preferences = AppPreferences {
+            close_to_tray: enabled,
+            ..*current
+        };
+        save(&self.path, preferences)?;
+        *current = preferences;
+        Ok(preferences)
+    }
+
+    pub fn set_dns_provider(&self, provider: DnsProvider) -> io::Result<AppPreferences> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| io::Error::other("preference lock poisoned"))?;
+        let preferences = AppPreferences {
+            dns_provider: provider,
+            ..*current
+        };
         save(&self.path, preferences)?;
         *current = preferences;
         Ok(preferences)
@@ -91,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn close_to_tray_defaults_to_enabled_and_persists() {
+    fn preferences_default_and_persist_independently() {
         let directory = std::env::temp_dir().join(format!(
             "nelomai-preferences-{}-{}",
             std::process::id(),
@@ -100,10 +138,35 @@ mod tests {
         let path = directory.join("preferences.json");
         let store = AppPreferenceStore::new(&path);
         assert!(store.get().close_to_tray);
+        assert_eq!(store.get().dns_provider, DnsProvider::Google);
 
         store.set_close_to_tray(false).unwrap();
-        assert!(!AppPreferenceStore::new(&path).get().close_to_tray);
+        store.set_dns_provider(DnsProvider::Quad9).unwrap();
+        let restored = AppPreferenceStore::new(&path).get();
+        assert!(!restored.close_to_tray);
+        assert_eq!(restored.dns_provider, DnsProvider::Quad9);
 
+        store.set_close_to_tray(true).unwrap();
+        assert_eq!(store.get().dns_provider, DnsProvider::Quad9);
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn legacy_preferences_default_to_google_dns() {
+        let directory = std::env::temp_dir().join(format!(
+            "nelomai-legacy-preferences-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("preferences.json");
+        fs::write(&path, br#"{"close_to_tray":false}"#).unwrap();
+
+        let restored = AppPreferenceStore::new(&path).get();
+
+        assert!(!restored.close_to_tray);
+        assert_eq!(restored.dns_provider, DnsProvider::Google);
         let _ = fs::remove_dir_all(directory);
     }
 }

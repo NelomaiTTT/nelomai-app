@@ -194,6 +194,61 @@ class AndroidSplitTunnelTest {
         )
     }
 
+    @Test
+    fun dnsOverrideAppliesIndependentlyFromSplitTunnelSupport() {
+        val original = parseConfig(
+            """
+            [Interface]
+            PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+            Address = 10.8.1.2/32
+            DNS = 8.8.8.8
+
+            [Peer]
+            PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = 127.0.0.1:10001
+            """.trimIndent(),
+        )
+        val args = TunnelOptionsArgs().apply {
+            dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
+        }
+
+        val updated = AndroidSplitTunnel.applyOptions(
+            original,
+            AndroidSplitTunnel.resolveOptions(32, args),
+            "ru.nelomai.client",
+        )
+
+        assertEquals(
+            setOf("9.9.9.9", "149.112.112.112"),
+            updated.getInterface().dnsServers.map { it.hostAddress }.toSet(),
+        )
+    }
+
+    @Test
+    fun dnsRoutesStayInTheTunnelWhenAParentPrefixIsExcluded() {
+        val args = TunnelOptionsArgs().apply {
+            splitActive = true
+            splitTunnelRoutes = arrayListOf("9.0.0.0/8", "149.112.0.0/16")
+            dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
+        }
+        val options = AndroidSplitTunnel.resolveOptions(33, args)
+
+        val routes = AndroidSplitTunnel.planVpnRoutes(
+            options.excludedRoutes,
+            options.dnsServers,
+        )
+
+        assertEquals(
+            listOf("9.0.0.0/8", "149.112.0.0/16"),
+            routes.excludedRoutes.map { it.canonical },
+        )
+        assertEquals(
+            listOf("9.9.9.9/32", "149.112.112.112/32"),
+            routes.forcedTunnelRoutes.map { it.canonical },
+        )
+    }
+
     private fun parseConfig(value: String): Config =
         Config.parse(ByteArrayInputStream(value.encodeToByteArray()))
 

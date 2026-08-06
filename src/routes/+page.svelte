@@ -12,6 +12,7 @@
     viewForPhase,
     type AppView,
     type AppPreferences,
+    type DnsProvider,
     type Bootstrap,
     type Connection,
     type ConnectionMetrics,
@@ -148,6 +149,16 @@
     const enabled = (event.currentTarget as HTMLInputElement).checked;
     try {
       appPreferences = await nativeClient.setCloseToTray(enabled);
+    } catch (reason) {
+      error = commandMessage(reason);
+    }
+  }
+
+  async function setDnsProvider(event: Event) {
+    const provider = (event.currentTarget as HTMLSelectElement)
+      .value as DnsProvider;
+    try {
+      appPreferences = await nativeClient.setDnsProvider(provider);
     } catch (reason) {
       error = commandMessage(reason);
     }
@@ -1114,6 +1125,23 @@
                 : "Личный пир"}
             </strong>
           </div>
+          {#if appPreferences}
+            <label class="select-field">
+              <span>DNS</span>
+              <select
+                value={appPreferences.dnsProvider}
+                onchange={setDnsProvider}
+                disabled={busy ||
+                  phase === "connecting" ||
+                  phase === "connected" ||
+                  phase === "stopping"}
+              >
+                <option value="google">Google</option>
+                <option value="yandex">Яндекс</option>
+                <option value="quad9">Quad9</option>
+              </select>
+            </label>
+          {/if}
           {#if updateStatus?.supported}
             <label class="update-preference">
               <span>

@@ -6,6 +6,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.net.URI
 import java.security.KeyStore
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -16,9 +17,10 @@ private const val BACKGROUND_KEY_ALIAS = "nelomai-background-credential"
 private const val BACKGROUND_PREFERENCES = "nelomai-background-credential"
 private const val BACKGROUND_CIPHERTEXT = "ciphertext"
 private const val BACKGROUND_IV = "iv"
-private const val BACKGROUND_FORMAT = 1
+private const val BACKGROUND_FORMAT = 2
 
 internal data class BackgroundCredential(
+    val deviceId: String,
     val panelBase: String,
     val token: String,
     val expiresAtUnix: Long,
@@ -27,8 +29,10 @@ internal data class BackgroundCredential(
 internal object BackgroundCredentialStore {
     fun save(context: Context, credential: BackgroundCredential) {
         val normalizedBase = normalizePanelBase(credential.panelBase)
+        val normalizedDeviceId = UUID.fromString(credential.deviceId).toString()
         val plaintext = JSONObject().apply {
             put("format", BACKGROUND_FORMAT)
+            put("deviceId", normalizedDeviceId)
             put("panelBase", normalizedBase)
             put("token", credential.token)
             put("expiresAtUnix", credential.expiresAtUnix)
@@ -68,6 +72,7 @@ internal object BackgroundCredentialStore {
             }
             val expiresAtUnix = payload.getLong("expiresAtUnix")
             BackgroundCredential(
+                deviceId = UUID.fromString(payload.getString("deviceId")).toString(),
                 panelBase = normalizePanelBase(payload.getString("panelBase")),
                 token = payload.getString("token"),
                 expiresAtUnix = expiresAtUnix,

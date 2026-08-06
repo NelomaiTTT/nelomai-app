@@ -15,6 +15,7 @@ class BackgroundConnectionClientTest {
             splitActive = true
             excludedPackages = arrayListOf("old.package")
             splitTunnelRoutes = arrayListOf("198.51.100.0/24")
+            dnsServers = arrayListOf("9.9.9.9", "149.112.112.112")
         }
         val payload = JSONObject().apply {
             put("enabled", true)
@@ -46,6 +47,7 @@ class BackgroundConnectionClientTest {
             options.splitTunnelRoutes,
         )
         assertFalse(options.excludeLocalNetworks)
+        assertEquals(listOf("9.9.9.9", "149.112.112.112"), options.dnsServers)
     }
 
     @Test

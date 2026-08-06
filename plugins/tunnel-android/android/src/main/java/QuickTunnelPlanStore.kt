@@ -33,15 +33,19 @@ internal object QuickTunnelPlanStore {
             put("connection", args.quickConnection?.toJson() ?: JSONObject.NULL)
         }.toString().toByteArray(Charsets.UTF_8)
         try {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey())
-            val ciphertext = cipher.doFinal(plaintext)
-            val saved = context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
-                .edit()
-                .putString(QUICK_PLAN_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-                .putString(QUICK_PLAN_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-                .commit()
-            check(saved) { "quick_plan_write_failed" }
+            check(encryptAndSave(context, plaintext)) { "quick_plan_write_failed" }
+        } finally {
+            plaintext.fill(0)
+        }
+    }
+
+    fun updateDnsServers(context: Context, dnsServers: List<String>): Boolean {
+        val payload = decrypt(context) ?: return true
+        val options = payload.optJSONObject("options") ?: return false
+        options.put("dnsServers", JSONArray(dnsServers))
+        val plaintext = payload.toString().toByteArray(Charsets.UTF_8)
+        return try {
+            encryptAndSave(context, plaintext)
         } finally {
             plaintext.fill(0)
         }
@@ -88,6 +92,17 @@ internal object QuickTunnelPlanStore {
         }
     }
 
+    private fun encryptAndSave(context: Context, plaintext: ByteArray): Boolean {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey())
+        val ciphertext = cipher.doFinal(plaintext)
+        return context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
+            .edit()
+            .putString(QUICK_PLAN_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+            .putString(QUICK_PLAN_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+            .commit()
+    }
+
     private fun decrypt(context: Context): JSONObject? {
         val preferences = context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
         val encodedCiphertext = preferences.getString(QUICK_PLAN_CIPHERTEXT, null) ?: return null
@@ -112,19 +127,25 @@ internal object QuickTunnelPlanStore {
 
 private fun TunnelOptionsArgs.toJson(): JSONObject = JSONObject().apply {
     put("splitActive", splitActive)
+    put("policyHash", policyHash)
+    put("applicationMode", applicationMode)
     put("excludedPackages", JSONArray(excludedPackages))
     put("includedPackages", JSONArray(includedPackages))
     put("splitTunnelRoutes", JSONArray(splitTunnelRoutes))
     put("excludeLocalNetworks", excludeLocalNetworks)
+    put("dnsServers", JSONArray(dnsServers))
 }
 
 private fun TunnelOptionsArgs.Companion.fromJson(payload: JSONObject): TunnelOptionsArgs =
     TunnelOptionsArgs().apply {
         splitActive = payload.optBoolean("splitActive", false)
+        policyHash = payload.optString("policyHash").takeIf(String::isNotBlank)
+        applicationMode = payload.optString("applicationMode").takeIf(String::isNotBlank)
         excludedPackages = payload.stringList("excludedPackages")
         includedPackages = payload.stringList("includedPackages")
         splitTunnelRoutes = payload.stringList("splitTunnelRoutes")
         excludeLocalNetworks = payload.optBoolean("excludeLocalNetworks", false)
+        dnsServers = payload.stringList("dnsServers")
     }
 
 private fun JSONObject.stringList(key: String): ArrayList<String> {

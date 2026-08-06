@@ -148,7 +148,10 @@ export interface ConnectionMetrics {
 export interface AppPreferences {
   closeToTraySupported: boolean;
   closeToTray: boolean;
+  dnsProvider: DnsProvider;
 }
+
+export type DnsProvider = "google" | "yandex" | "quad9";
 
 export interface BindPeerRequest {
   peer_id: string;

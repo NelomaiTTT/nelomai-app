@@ -2,8 +2,8 @@ use crate::connection_metrics::{ConnectionMetricsResponse, ConnectionMetricsTrac
 use crate::diagnostics::AppDiagnostics;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{
-    preferences::AppPreferenceStore, NativeApplication, PushRegistrationScheduler,
-    SplitTunnelScheduler,
+    preferences::{AppPreferenceStore, DnsProvider},
+    NativeApplication, PushRegistrationScheduler, SplitTunnelScheduler,
 };
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
@@ -302,6 +302,7 @@ pub struct AppStateResponse {
 pub struct AppPreferencesResponse {
     close_to_tray_supported: bool,
     close_to_tray: bool,
+    dns_provider: DnsProvider,
 }
 
 impl AppStateResponse {
@@ -418,11 +419,12 @@ pub async fn app_state(
         .unwrap_or(false);
     let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
         match application.bootstrap(now_unix()).await {
-            Ok(_) => {
+            Ok(response) => {
                 provision_android_background_resilient(
                     app.clone(),
                     application.inner().clone(),
                     diagnostics.inner().clone(),
+                    response.device.id,
                 )
                 .await;
                 if app
@@ -483,9 +485,11 @@ fn clear_quick_reconcile_retry() {}
 
 #[tauri::command]
 pub fn app_preferences(preferences: State<'_, Arc<AppPreferenceStore>>) -> AppPreferencesResponse {
+    let current = preferences.get();
     AppPreferencesResponse {
         close_to_tray_supported: cfg!(desktop),
-        close_to_tray: preferences.get().close_to_tray,
+        close_to_tray: current.close_to_tray,
+        dns_provider: current.dns_provider,
     }
 }
 
@@ -503,6 +507,34 @@ pub fn app_set_close_to_tray(
     Ok(AppPreferencesResponse {
         close_to_tray_supported: cfg!(desktop),
         close_to_tray: saved.close_to_tray,
+        dns_provider: saved.dns_provider,
+    })
+}
+
+#[tauri::command]
+pub fn app_set_dns_provider(
+    app: AppHandle,
+    application: State<'_, Arc<NativeApplication>>,
+    preferences: State<'_, Arc<AppPreferenceStore>>,
+    provider: DnsProvider,
+) -> Result<AppPreferencesResponse, CommandError> {
+    let saved = preferences.set_dns_provider(provider).map_err(|_| {
+        CommandError::new(
+            "preferences_unavailable",
+            "Не удалось сохранить настройки приложения",
+        )
+    })?;
+    let dns_servers = saved.dns_provider.servers();
+    application.set_dns_servers(dns_servers.clone());
+    let _ = app
+        .tunnel_android()
+        .update_quick_dns(tauri_plugin_tunnel_android::DnsServersRequest {
+            dns_servers: dns_servers.iter().map(ToString::to_string).collect(),
+        });
+    Ok(AppPreferencesResponse {
+        close_to_tray_supported: cfg!(desktop),
+        close_to_tray: saved.close_to_tray,
+        dns_provider: saved.dns_provider,
     })
 }
 
@@ -632,6 +664,7 @@ pub async fn app_login(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
+        response.device.id.clone(),
     )
     .await;
     let _ = refresh_installed_applications(&app, &application);
@@ -670,6 +703,7 @@ pub async fn app_bootstrap(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
+        response.device.id.clone(),
     )
     .await;
     observe_and_schedule_update(
@@ -692,6 +726,7 @@ pub async fn app_bootstrap(
 async fn provision_android_background(
     app: &AppHandle,
     application: &NativeApplication,
+    device_id: &str,
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     {
@@ -706,6 +741,7 @@ async fn provision_android_background(
                 )
             })?;
         if status.configured
+            && status.device_id.as_deref() == Some(device_id)
             && status.expires_at_unix.is_some_and(|expires_at| {
                 expires_at > now.saturating_add(ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS)
             })
@@ -713,13 +749,20 @@ async fn provision_android_background(
             return Ok(());
         }
         let token = application
-            .background_token()
+            .background_token_for_device(device_id, now)
             .await
-            .map_err(CommandError::from)?;
+            .map_err(CommandError::from)?
+            .ok_or_else(|| {
+                CommandError::new(
+                    "background_device_changed",
+                    "Учётная запись устройства изменилась",
+                )
+            })?;
         let expires_at_unix = now.saturating_add(token.expires_in.min(i64::MAX as u64) as i64);
         app.tunnel_android()
             .configure_background(tauri_plugin_tunnel_android::BackgroundCredentialRequest {
                 api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                device_id: device_id.to_string(),
                 panel_base: crate::PANEL_BASE.to_string(),
                 token: token.token,
                 expires_at_unix,
@@ -732,7 +775,7 @@ async fn provision_android_background(
             })?;
     }
     #[cfg(not(target_os = "android"))]
-    let _ = (app, application);
+    let _ = (app, application, device_id);
     Ok(())
 }
 
@@ -740,8 +783,10 @@ async fn provision_android_background_resilient(
     app: AppHandle,
     application: Arc<NativeApplication>,
     diagnostics: Arc<AppDiagnostics>,
+    device_id: String,
 ) {
-    let Err(error) = provision_android_background_serialized(&app, &application).await else {
+    let Err(error) = provision_android_background_serialized(&app, &application, &device_id).await
+    else {
         return;
     };
     diagnostics.record_named(
@@ -755,7 +800,7 @@ async fn provision_android_background_resilient(
     tauri::async_runtime::spawn(async move {
         for delay_seconds in [5, 30, 120] {
             tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
-            match provision_android_background_serialized(&app, &application).await {
+            match provision_android_background_serialized(&app, &application, &device_id).await {
                 Ok(()) => {
                     diagnostics.record_named("background.provision_recovered", None, None, None);
                     return;
@@ -771,16 +816,17 @@ async fn provision_android_background_resilient(
     });
 
     #[cfg(not(target_os = "android"))]
-    let _ = (app, application);
+    let _ = (app, application, device_id);
 }
 
 async fn provision_android_background_serialized(
     app: &AppHandle,
     application: &NativeApplication,
+    device_id: &str,
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     let _guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
-    provision_android_background(app, application).await
+    provision_android_background(app, application, device_id).await
 }
 
 #[tauri::command]

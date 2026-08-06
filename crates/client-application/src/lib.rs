@@ -376,6 +376,10 @@ where
         self.core.set_split_tunnel_installed_packages(packages);
     }
 
+    pub fn set_dns_servers(&self, servers: Vec<std::net::IpAddr>) {
+        self.core.set_dns_servers(servers);
+    }
+
     pub async fn synchronize_split_tunnel(
         &self,
         now_unix: i64,
@@ -509,15 +513,25 @@ where
         result.map_err(Into::into)
     }
 
-    pub async fn background_token(&self) -> Result<BackgroundTokenResponse, ApplicationError> {
+    pub async fn background_token_for_device(
+        &self,
+        expected_device_id: &str,
+        now_unix: i64,
+    ) -> Result<Option<BackgroundTokenResponse>, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let bootstrap = self.core.bootstrap(now_unix).await?;
+        if bootstrap.device.id != expected_device_id {
+            return Ok(None);
+        }
         let access_token = self.access_token()?;
         match self.api.background_token(&access_token).await {
-            Ok(response) => Ok(response),
+            Ok(response) => Ok(Some(response)),
             Err(CoreApiError::Unauthorized) => {
                 let access_token = self.core.refresh_access_token(&access_token).await?;
                 self.api
                     .background_token(&access_token)
                     .await
+                    .map(Some)
                     .map_err(Into::into)
             }
             Err(error) => Err(error.into()),

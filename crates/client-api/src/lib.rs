@@ -129,6 +129,19 @@ pub struct SuccessResponse {
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct DiagnosticUploadRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+    pub trigger: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_started_at_unix: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interval_ended_at_unix: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnel_running: Option<bool>,
     pub generated_at_unix: i64,
     pub app_version: String,
     pub platform_version: Option<String>,
@@ -150,11 +163,15 @@ pub struct DiagnosticResourceUsage {
 pub struct DiagnosticResourceComponent {
     pub component: String,
     pub source: String,
+    pub process_id: Option<u64>,
+    pub process_name: Option<String>,
     pub cpu_user_ms: Option<u64>,
     pub cpu_system_ms: Option<u64>,
     pub cpu_average_basis_points: Option<u64>,
     pub current_resident_memory_bytes: Option<u64>,
     pub peak_resident_memory_bytes: Option<u64>,
+    pub current_proportional_memory_bytes: Option<u64>,
+    pub current_private_dirty_memory_bytes: Option<u64>,
     pub read_bytes: Option<u64>,
     pub write_bytes: Option<u64>,
     pub page_faults: Option<u64>,
@@ -173,6 +190,10 @@ impl fmt::Debug for DiagnosticUploadRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DiagnosticUploadRequest")
+            .field("report_id", &self.report_id)
+            .field("trigger", &self.trigger)
+            .field("tunnel_session_id", &self.tunnel_session_id)
+            .field("sequence", &self.sequence)
             .field("generated_at_unix", &self.generated_at_unix)
             .field("app_version", &self.app_version)
             .field("platform_version", &self.platform_version)
@@ -919,6 +940,13 @@ mod tests {
     #[test]
     fn diagnostics_debug_output_redacts_both_logs() {
         let request = DiagnosticUploadRequest {
+            report_id: None,
+            trigger: "manual".to_string(),
+            tunnel_session_id: None,
+            sequence: None,
+            interval_started_at_unix: None,
+            interval_ended_at_unix: None,
+            tunnel_running: None,
             generated_at_unix: 1,
             app_version: "0.1.0".to_string(),
             platform_version: Some("test".to_string()),
