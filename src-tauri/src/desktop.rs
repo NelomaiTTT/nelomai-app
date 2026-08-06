@@ -1,5 +1,7 @@
 use crate::{commands, connection_metrics::ConnectionMetricsTracker, NativeApplication};
 use nelomai_client_core::Phase;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicU64;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -14,9 +16,14 @@ use tauri::{
 const SHOW_ID: &str = "tray-show";
 const TOGGLE_ID: &str = "tray-toggle";
 const QUIT_ID: &str = "tray-quit";
+const TRAY_ID: &str = "nelomai-main-tray";
 const TRAY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const DOCK_HIDE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1100);
 static TOGGLE_RUNNING: AtomicBool = AtomicBool::new(false);
 static EXIT_RUNNING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static DOCK_VISIBILITY_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TrayPresentation {
@@ -49,10 +56,15 @@ pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
     });
     app.manage(menu_state);
 
-    TrayIconBuilder::new()
+    #[cfg(windows)]
+    let icon = app.default_window_icon().cloned().unwrap_or_else(tray_icon);
+    #[cfg(not(windows))]
+    let icon = tray_icon();
+
+    TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .show_menu_on_left_click(cfg!(target_os = "macos"))
-        .icon(tray_icon())
+        .icon(icon)
         .icon_as_template(cfg!(target_os = "macos"))
         .tooltip("Nelomai")
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -157,11 +169,51 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn show_window(app: &AppHandle) {
+pub fn show_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        DOCK_VISIBILITY_GENERATION.fetch_add(1, Ordering::AcqRel);
+        let _ = app.set_dock_visibility(true);
+    }
+
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+    }
+}
+
+pub fn hide_window(window: &tauri::Window) {
+    let _ = window.hide();
+    #[cfg(target_os = "macos")]
+    hide_dock_when_window_stays_hidden(window.app_handle().clone());
+}
+
+#[cfg(target_os = "macos")]
+fn hide_dock_when_window_stays_hidden(app: AppHandle) {
+    let generation = DOCK_VISIBILITY_GENERATION
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    let _ = app.set_dock_visibility(false);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(DOCK_HIDE_RETRY_DELAY).await;
+        if DOCK_VISIBILITY_GENERATION.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let window_is_hidden = app
+            .get_webview_window("main")
+            .and_then(|window| window.is_visible().ok())
+            .is_none_or(|visible| !visible);
+        if window_is_hidden {
+            let _ = app.set_dock_visibility(false);
+        }
+    });
+}
+
+#[cfg(windows)]
+pub fn set_tray_visible(app: &AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_visible(visible);
     }
 }
 

@@ -171,7 +171,7 @@ pub fn run() {
         Ok(())
     });
 
-    builder
+    let app = builder
         .invoke_handler(tauri::generate_handler![
             commands::app_state,
             commands::app_preferences,
@@ -215,15 +215,22 @@ pub fn run() {
                 let preferences = window.state::<Arc<preferences::AppPreferenceStore>>();
                 if preferences.get().close_to_tray {
                     api.prevent_close();
-                    let _ = window.hide();
+                    desktop::hide_window(window);
                 } else {
                     api.prevent_close();
                     desktop::quit_application(window.app_handle().clone());
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|_app, _event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event {
+            desktop::show_window(_app);
+        }
+    });
 }
 
 fn start_split_tunnel_scheduler(

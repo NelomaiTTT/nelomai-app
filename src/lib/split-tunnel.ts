@@ -91,19 +91,22 @@ export function buildApplicationRows(
   search: string,
   showSystem: boolean,
 ): SplitTunnelApplicationRow[] {
-  const mandatory = new Set(state.mandatoryExcludedPackages);
-  const selected = new Set(state.selectedPackages);
+  const packageIndex = installedPackageIndex(applications);
+  const mandatory = canonicalPackageIds(
+    state.mandatoryExcludedPackages,
+    packageIndex,
+  );
+  const selected = canonicalPackageIds(state.selectedPackages, packageIndex);
   const fragments = state.suggestedNameFragments
     .map(normalizeSearch)
     .filter(Boolean);
   const query = normalizeSearch(search);
-  const installedPackageIds = new Set(
-    applications.map((application) => application.packageId),
-  );
+  const installedPackageIds = new Set(packageIndex.exact.keys());
   const unavailableSelected = state.selectedPackages
     .filter(
       (packageId) =>
-        !mandatory.has(packageId) && !installedPackageIds.has(packageId),
+        resolveInstalledPackage(packageId, packageIndex) === null &&
+        !containsPackageId(state.mandatoryExcludedPackages, packageId),
     )
     .map(
       (packageId): InstalledApplication => ({
@@ -171,10 +174,16 @@ export function emptyIncludeSelection(
   ) {
     return false;
   }
-  const installed = new Set(applications.map((application) => application.packageId));
-  const mandatory = new Set(state.mandatoryExcludedPackages);
+  const packageIndex = installedPackageIndex(applications);
+  const mandatory = canonicalPackageIds(
+    state.mandatoryExcludedPackages,
+    packageIndex,
+  );
   return !state.selectedPackages.some(
-    (packageId) => installed.has(packageId) && !mandatory.has(packageId),
+    (packageId) => {
+      const installed = resolveInstalledPackage(packageId, packageIndex);
+      return installed !== null && !mandatory.has(installed.packageId);
+    },
   );
 }
 
@@ -185,8 +194,14 @@ export function settingsUpdate(
   applications: InstalledApplication[],
   mandatoryPackageIds: Iterable<string>,
 ): SplitTunnelSettingsUpdate {
-  const selected = new Set(selectedPackageIds);
-  const mandatory = new Set(mandatoryPackageIds);
+  const packageIndex = installedPackageIndex(applications);
+  const selected = new Set(
+    [...selectedPackageIds].map(
+      (packageId) =>
+        resolveInstalledPackage(packageId, packageIndex)?.packageId ?? packageId,
+    ),
+  );
+  const mandatory = canonicalPackageIds(mandatoryPackageIds, packageIndex);
   const applicationsById = new Map(
     applications.map((application) => [application.packageId, application]),
   );
@@ -211,4 +226,54 @@ function rowPriority(row: SplitTunnelApplicationRow): number {
 
 function normalizeSearch(value: string): string {
   return value.trim().toLocaleLowerCase("ru");
+}
+
+interface InstalledPackageIndex {
+  exact: Map<string, InstalledApplication>;
+  folded: Map<string, InstalledApplication | null>;
+}
+
+function installedPackageIndex(
+  applications: InstalledApplication[],
+): InstalledPackageIndex {
+  const exact = new Map(
+    applications.map((application) => [application.packageId, application]),
+  );
+  const folded = new Map<string, InstalledApplication | null>();
+  for (const application of applications) {
+    const key = foldPackageId(application.packageId);
+    if (folded.has(key)) folded.set(key, null);
+    else folded.set(key, application);
+  }
+  return { exact, folded };
+}
+
+function resolveInstalledPackage(
+  packageId: string,
+  index: InstalledPackageIndex,
+): InstalledApplication | null {
+  return index.exact.get(packageId) ?? index.folded.get(foldPackageId(packageId)) ?? null;
+}
+
+function canonicalPackageIds(
+  packageIds: Iterable<string>,
+  index: InstalledPackageIndex,
+): Set<string> {
+  return new Set(
+    [...packageIds].map(
+      (packageId) =>
+        resolveInstalledPackage(packageId, index)?.packageId ?? packageId,
+    ),
+  );
+}
+
+function containsPackageId(packageIds: Iterable<string>, candidate: string): boolean {
+  const foldedCandidate = foldPackageId(candidate);
+  return [...packageIds].some(
+    (packageId) => foldPackageId(packageId) === foldedCandidate,
+  );
+}
+
+function foldPackageId(packageId: string): string {
+  return packageId.trim().toLowerCase();
 }

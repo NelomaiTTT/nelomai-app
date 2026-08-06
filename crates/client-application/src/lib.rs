@@ -345,6 +345,7 @@ where
                 refresh_token: Some(response.refresh_token),
                 saved_connection: None,
                 pinned_connection: None,
+                pending_start: None,
                 compatibility: None,
             })
             .map_err(|_| ApplicationError::Storage)?;

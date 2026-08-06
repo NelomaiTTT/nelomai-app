@@ -473,6 +473,7 @@ fn previous_account() -> StoredAuth {
             valid_until_unix: None,
         }),
         pinned_connection: None,
+        pending_start: None,
         compatibility: Some(StoredCompatibility {
             update_required: true,
             observed_at_unix: 1_700_000_000,

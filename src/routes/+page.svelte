@@ -4,6 +4,11 @@
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
+  import {
+    historyStateForOverlay,
+    overlayFromHistoryState,
+    type AppOverlay,
+  } from "$lib/navigation";
 
   import {
     bindingRequest,
@@ -141,6 +146,12 @@
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
+    const handleHistoryChange = () => {
+      const overlay = overlayFromHistoryState(window.history.state);
+      splitTunnelOpen = overlay === "split_tunnel" && splitTunnelState !== null;
+      notificationsOpen = overlay === "notifications";
+    };
+    window.addEventListener("popstate", handleHistoryChange);
     return () => {
       disposed = true;
       window.clearInterval(timer);
@@ -149,10 +160,31 @@
       if (startupTimer !== null) window.clearTimeout(startupTimer);
       if (startupKickoffTimer !== null) window.clearTimeout(startupKickoffTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("popstate", handleHistoryChange);
       clearUpdateTimer();
       nativeStateUnlisten?.();
     };
   });
+
+  function showOverlay(overlay: AppOverlay) {
+    if (overlayFromHistoryState(window.history.state) !== overlay) {
+      window.history.pushState(
+        historyStateForOverlay(window.history.state, overlay),
+        "",
+      );
+    }
+    splitTunnelOpen = overlay === "split_tunnel";
+    notificationsOpen = overlay === "notifications";
+  }
+
+  function closeOverlay(overlay: AppOverlay) {
+    if (overlayFromHistoryState(window.history.state) === overlay) {
+      window.history.back();
+      return;
+    }
+    if (overlay === "split_tunnel") splitTunnelOpen = false;
+    else notificationsOpen = false;
+  }
 
   async function loadAppPreferences() {
     appPreferences = await nativeClient.preferences().catch(() => null);
@@ -351,7 +383,7 @@
   async function toggleConnection() {
     if (busy) return;
     if (phase !== "connected" && splitTunnelBlocksStart) {
-      splitTunnelOpen = true;
+      showOverlay("split_tunnel");
       return;
     }
     const stopping = phase === "connected" || phase === "stopping";
@@ -580,7 +612,7 @@
   }
 
   async function openNotifications() {
-    notificationsOpen = true;
+    showOverlay("notifications");
     await refreshNotifications(false);
   }
 
@@ -706,7 +738,7 @@
 
   async function openSplitTunnel() {
     await loadSplitTunnel(false);
-    if (splitTunnelState) splitTunnelOpen = true;
+    if (splitTunnelState) showOverlay("split_tunnel");
   }
 
   async function saveSplitTunnel(
@@ -1295,7 +1327,7 @@
     state={splitTunnelState}
     applications={splitTunnelApplications}
     busy={splitTunnelBusy}
-    onclose={() => (splitTunnelOpen = false)}
+    onclose={() => closeOverlay("split_tunnel")}
     onsave={saveSplitTunnel}
     onrefresh={() => loadSplitTunnel(true)}
     onaddaddressrule={addSplitTunnelAddressRule}
@@ -1310,7 +1342,7 @@
     nextCursor={notificationNextCursor}
     busy={notificationsBusy}
     error={notificationsError}
-    onclose={() => (notificationsOpen = false)}
+    onclose={() => closeOverlay("notifications")}
     onread={markNotificationRead}
     onreadall={markAllNotificationsRead}
     onloadmore={() => refreshNotifications(true)}
@@ -1331,7 +1363,7 @@
   :global(body) {
     margin: 0;
     min-width: 320px;
-    min-height: 100vh;
+    min-height: 100dvh;
     color: #f5f6f8;
     background:
       linear-gradient(180deg, rgba(12, 35, 43, 0.34), transparent 42%),
@@ -1352,7 +1384,12 @@
   }
 
   .app-shell {
-    min-height: 100vh;
+    min-height: 100dvh;
+    padding:
+      env(safe-area-inset-top, 0px)
+      env(safe-area-inset-right, 0px)
+      env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px);
     display: grid;
     grid-template-rows: auto 1fr;
   }

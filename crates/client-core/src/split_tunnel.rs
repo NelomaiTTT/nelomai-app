@@ -232,17 +232,20 @@ impl EffectiveSplitTunnelPolicy {
             });
         }
 
+        let installed_index = InstalledPackageIndex::new(installed_packages);
         let installed_by_id = installed_packages
             .iter()
             .map(|package| (package.package_id.as_str(), package))
             .collect::<HashMap<_, _>>();
-        let mandatory = policy
-            .mandatory_excluded_packages
+        let canonical_mandatory =
+            canonical_available_packages(&policy.mandatory_excluded_packages, &installed_index);
+        let canonical_selected =
+            canonical_available_packages(&policy.selected_packages, &installed_index);
+        let mandatory = canonical_mandatory
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let selected = policy
-            .selected_packages
+        let selected = canonical_selected
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
@@ -250,7 +253,7 @@ impl EffectiveSplitTunnelPolicy {
         let unavailable_selected_packages = policy
             .selected_packages
             .iter()
-            .filter(|package_id| !installed_by_id.contains_key(package_id.as_str()))
+            .filter(|package_id| installed_index.resolve(package_id).is_none())
             .cloned()
             .collect::<Vec<_>>();
         let suggested_packages = suggested_packages(
@@ -263,15 +266,12 @@ impl EffectiveSplitTunnelPolicy {
         let (application_mode, package_ids) = if capabilities.application_split_tunnel {
             let package_ids = match policy.mode {
                 SplitTunnelMode::ExcludeSelected => ordered_available_packages(
-                    policy
-                        .mandatory_excluded_packages
-                        .iter()
-                        .chain(policy.selected_packages.iter()),
+                    canonical_mandatory.iter().chain(canonical_selected.iter()),
                     &installed_by_id,
                     &HashSet::new(),
                 ),
                 SplitTunnelMode::IncludeSelected => ordered_available_packages(
-                    policy.selected_packages.iter(),
+                    canonical_selected.iter(),
                     &installed_by_id,
                     &mandatory,
                 ),
@@ -1990,6 +1990,49 @@ fn ordered_available_packages<'a>(
         .filter(|package_id| !excluded.contains(package_id.as_str()))
         .filter(|package_id| seen.insert(package_id.as_str()))
         .cloned()
+        .collect()
+}
+
+struct InstalledPackageIndex<'a> {
+    exact: HashMap<&'a str, &'a SplitTunnelSelectedPackage>,
+    folded: HashMap<String, Option<&'a SplitTunnelSelectedPackage>>,
+}
+
+impl<'a> InstalledPackageIndex<'a> {
+    fn new(installed: &'a [SplitTunnelSelectedPackage]) -> Self {
+        let exact = installed
+            .iter()
+            .map(|package| (package.package_id.as_str(), package))
+            .collect();
+        let mut folded = HashMap::new();
+        for package in installed {
+            let key = package.package_id.to_ascii_lowercase();
+            folded
+                .entry(key)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(package));
+        }
+        Self { exact, folded }
+    }
+
+    fn resolve(&self, package_id: &str) -> Option<&'a SplitTunnelSelectedPackage> {
+        self.exact.get(package_id).copied().or_else(|| {
+            self.folded
+                .get(&package_id.to_ascii_lowercase())
+                .copied()
+                .flatten()
+        })
+    }
+}
+
+fn canonical_available_packages(
+    package_ids: &[String],
+    installed: &InstalledPackageIndex<'_>,
+) -> Vec<String> {
+    package_ids
+        .iter()
+        .filter_map(|package_id| installed.resolve(package_id))
+        .map(|package| package.package_id.clone())
         .collect()
 }
 

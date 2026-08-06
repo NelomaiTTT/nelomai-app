@@ -7,6 +7,8 @@ import androidx.activity.enableEdgeToEdge
 import io.crates.keyring.Keyring
 
 class MainActivity : TauriActivity() {
+  override val handleBackNavigation: Boolean = true
+
   private val startupHandler = Handler(Looper.getMainLooper())
   private val frontendTimeout = Runnable {
     if (!StartupDiagnostics.frontendReady(applicationContext)) {

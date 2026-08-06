@@ -126,7 +126,7 @@
 
   .notifications-panel {
     width: min(720px, 100%);
-    max-height: min(780px, calc(100vh - 48px));
+    max-height: min(780px, calc(100dvh - 48px));
     padding: 24px;
     display: grid;
     grid-template-rows: auto auto minmax(0, 1fr) auto;
@@ -303,9 +303,13 @@
 
     .notifications-panel {
       width: 100%;
-      max-height: 100vh;
-      min-height: 100vh;
-      padding: max(18px, env(safe-area-inset-top)) 16px max(18px, env(safe-area-inset-bottom));
+      max-height: 100dvh;
+      min-height: 100dvh;
+      padding:
+        max(18px, env(safe-area-inset-top, 0px))
+        max(16px, env(safe-area-inset-right, 0px))
+        max(18px, env(safe-area-inset-bottom, 0px))
+        max(16px, env(safe-area-inset-left, 0px));
       border: 0;
       border-radius: 0;
     }

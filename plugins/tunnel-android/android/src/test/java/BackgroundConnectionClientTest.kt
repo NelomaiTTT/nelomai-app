@@ -94,6 +94,49 @@ class BackgroundConnectionClientTest {
     }
 
     @Test
+    fun packagePolicyUsesTheUniqueInstalledSpelling() {
+        val payload = JSONObject().apply {
+            put("enabled", true)
+            put("mode", "include_selected")
+            put("mandatory_excluded_packages", JSONArray())
+            put("selected_packages", JSONArray(listOf("eu.livesport.flashscore_com")))
+            put("excluded_ipv4_cidrs", JSONArray())
+            put("address_rules", JSONArray())
+        }
+
+        val options = backgroundTunnelOptions(
+            payload,
+            setOf("eu.livesport.FlashScore_com"),
+            TunnelOptionsArgs(),
+        ) { emptyList() }
+
+        assertEquals(listOf("eu.livesport.FlashScore_com"), options.includedPackages)
+    }
+
+    @Test
+    fun packagePolicyDoesNotGuessAnAmbiguousCaseInsensitiveMatch() {
+        val payload = JSONObject().apply {
+            put("enabled", true)
+            put("mode", "include_selected")
+            put("mandatory_excluded_packages", JSONArray())
+            put("selected_packages", JSONArray(listOf("com.example.FOO")))
+            put("excluded_ipv4_cidrs", JSONArray())
+            put("address_rules", JSONArray())
+        }
+
+        try {
+            backgroundTunnelOptions(
+                payload,
+                setOf("com.example.Foo", "com.example.foo"),
+                TunnelOptionsArgs(),
+            ) { emptyList() }
+            fail("ambiguous include selection must be rejected")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("empty_include_selection", error.code)
+        }
+    }
+
+    @Test
     fun serviceRestoreRetriesOnlyTransientFailures() {
         assertTrue(shouldRetryServiceRestore("background_transport_unavailable"))
         assertTrue(shouldRetryServiceRestore("connection_unavailable"))

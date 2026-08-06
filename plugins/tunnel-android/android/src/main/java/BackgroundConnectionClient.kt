@@ -5,6 +5,7 @@ import java.net.URI
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.nio.charset.StandardCharsets
+import java.util.Locale
 import java.util.UUID
 import javax.net.ssl.HttpsURLConnection
 import org.json.JSONArray
@@ -181,16 +182,19 @@ internal fun backgroundTunnelOptions(
             }
         }
 
-        val mandatory = stringList("mandatory_excluded_packages").toSet()
-        val selected = stringList("selected_packages").toSet()
+        val packageIndex = InstalledPackageIndex(installed)
+        val mandatory = stringList("mandatory_excluded_packages")
+            .mapNotNullTo(linkedSetOf(), packageIndex::resolve)
+        val selected = stringList("selected_packages")
+            .mapNotNullTo(linkedSetOf(), packageIndex::resolve)
         val mode = optString("mode", "exclude_selected")
         val excluded = if (mode == "exclude_selected") {
-            (mandatory + selected).filterTo(arrayListOf()) { it in installed }
+            (mandatory + selected).toCollection(arrayListOf())
         } else {
             arrayListOf()
         }
         val included = if (mode == "include_selected") {
-            selected.filterTo(arrayListOf()) { it in installed && it !in mandatory }
+            selected.filterTo(arrayListOf()) { it !in mandatory }
         } else {
             arrayListOf()
         }
@@ -233,6 +237,22 @@ internal fun backgroundTunnelOptions(
             dnsServers = ArrayList(fallback.dnsServers)
         }
     }
+}
+
+private class InstalledPackageIndex(installed: Set<String>) {
+    private val exact = installed.associateByTo(hashMapOf()) { it }
+    private val folded = hashMapOf<String, String?>()
+
+    init {
+        for (packageId in installed) {
+            val key = packageId.lowercase(Locale.ROOT)
+            if (folded.containsKey(key)) folded[key] = null
+            else folded[key] = packageId
+        }
+    }
+
+    fun resolve(packageId: String): String? =
+        exact[packageId] ?: folded[packageId.lowercase(Locale.ROOT)]
 }
 
 private fun JSONObject.stringList(key: String): List<String> {

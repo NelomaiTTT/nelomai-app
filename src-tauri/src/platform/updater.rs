@@ -85,8 +85,8 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
         }
 
         let mut downloaded = 0_u64;
-        update
-            .download_and_install(
+        let bytes = update
+            .download(
                 |chunk, total| {
                     downloaded = downloaded.saturating_add(chunk as u64);
                     progress(DownloadProgress { downloaded, total });
@@ -95,6 +95,15 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             )
             .await
             .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+
+        #[cfg(windows)]
+        crate::desktop::set_tray_visible(&self.app, false);
+        let install = update.install(bytes);
+        #[cfg(windows)]
+        if install.is_err() {
+            crate::desktop::set_tray_visible(&self.app, true);
+        }
+        install.map_err(|_| UpdateBackendError::new("update_install_failed"))?;
         Ok(InstallResult::Installed(InstalledUpdate {
             version: update.version,
         }))

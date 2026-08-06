@@ -195,4 +195,63 @@ describe("split-tunnel application model", () => {
       },
     ]);
   });
+
+  it("uses the installed package ID spelling for a unique case-insensitive match", () => {
+    const installed = [
+      {
+        packageId: "eu.livesport.FlashScore_com",
+        displayName: "Flashscore",
+        system: false,
+      },
+    ];
+    const mismatchedState = {
+      ...state,
+      mode: "include_selected" as const,
+      mandatoryExcludedPackages: [],
+      selectedPackages: ["eu.livesport.flashscore_com"],
+    };
+
+    expect(buildApplicationRows(mismatchedState, installed, "", true)).toEqual([
+      expect.objectContaining({
+        packageId: "eu.livesport.FlashScore_com",
+        available: true,
+        selected: true,
+      }),
+    ]);
+    expect(emptyIncludeSelection(mismatchedState, installed)).toBe(false);
+    expect(
+      settingsUpdate(
+        "include_selected",
+        true,
+        mismatchedState.selectedPackages,
+        installed,
+        [],
+      ).selectedPackages,
+    ).toEqual([
+      {
+        packageId: "eu.livesport.FlashScore_com",
+        displayName: "Flashscore",
+      },
+    ]);
+  });
+
+  it("does not guess when multiple installed package IDs differ only by case", () => {
+    const installed = [
+      { packageId: "com.example.Foo", displayName: "Foo", system: false },
+      { packageId: "com.example.foo", displayName: "foo", system: false },
+    ];
+    const ambiguousState = {
+      ...state,
+      mode: "include_selected" as const,
+      mandatoryExcludedPackages: [],
+      selectedPackages: ["com.example.FOO"],
+    };
+
+    expect(emptyIncludeSelection(ambiguousState, installed)).toBe(true);
+    expect(
+      buildApplicationRows(ambiguousState, installed, "", true).find(
+        (row) => row.packageId === "com.example.FOO",
+      ),
+    ).toMatchObject({ available: false, selected: true });
+  });
 });

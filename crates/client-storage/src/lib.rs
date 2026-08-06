@@ -59,6 +59,14 @@ impl fmt::Debug for StoredConnection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPendingStart {
+    pub operation_id: String,
+    pub layer: StoredLayer,
+    pub tic_connection_mode: StoredTicConnectionMode,
+    pub route_mode: StoredRouteMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredCompatibility {
     pub update_required: bool,
     pub observed_at_unix: i64,
@@ -73,6 +81,8 @@ pub struct StoredAuth {
     pub saved_connection: Option<StoredConnection>,
     #[serde(default)]
     pub pinned_connection: Option<StoredConnection>,
+    #[serde(default)]
+    pub pending_start: Option<StoredPendingStart>,
     #[serde(default)]
     pub compatibility: Option<StoredCompatibility>,
 }
@@ -92,6 +102,7 @@ impl fmt::Debug for StoredAuth {
             )
             .field("saved_connection", &self.saved_connection)
             .field("pinned_connection", &self.pinned_connection)
+            .field("pending_start", &self.pending_start)
             .field("compatibility", &self.compatibility)
             .finish()
     }
@@ -107,6 +118,7 @@ impl StoredAuth {
             refresh_token: None,
             saved_connection: None,
             pinned_connection: None,
+            pending_start: None,
             compatibility: None,
         }
     }
@@ -429,6 +441,7 @@ mod tests {
         let stored: StoredAuth = serde_json::from_value(legacy).unwrap();
         assert!(stored.saved_connection.is_none());
         assert!(stored.pinned_connection.is_none());
+        assert!(stored.pending_start.is_none());
         assert!(stored.compatibility.is_none());
     }
 

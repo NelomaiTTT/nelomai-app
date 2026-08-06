@@ -114,6 +114,11 @@ def run() -> None:
         raise RuntimeError("Tauri updater public key is not valid base64") from exc
     if b"minisign public key" not in decoded_updater_key:
         raise RuntimeError("Tauri updater public key has an invalid format")
+    windows_updater = (
+        tauri_config.get("plugins", {}).get("updater", {}).get("windows", {})
+    )
+    if windows_updater.get("installMode") != "passive":
+        raise RuntimeError("Windows per-machine updater must support elevation")
 
     app_entrypoint = (ROOT / "src-tauri" / "src" / "lib.rs").read_text(
         encoding="utf-8"
@@ -151,6 +156,42 @@ def run() -> None:
         raise RuntimeError("Windows tunnel service requires a per-machine installer")
     if not nsis.get("installerHooks"):
         raise RuntimeError("Windows service installer hooks are missing")
+    windows_hooks = (ROOT / "src-tauri" / "windows" / "hooks.nsh").read_text(
+        encoding="utf-8"
+    )
+    for token in (
+        "$UpdateMode = 1",
+        "ProfileList\\$NelomaiOwnerSid",
+        "UninstallString",
+        "$NelomaiLegacyStartShortcut",
+        "UnpinShortcut",
+        "MUI_STARTMENU_GETFOLDER",
+        "SetLnkAppUserModelId",
+    ):
+        if token not in windows_hooks:
+            raise RuntimeError(f"Windows update shortcut refresh misses {token}")
+    preinstall_hook = windows_hooks.split("!macro NSIS_HOOK_PREINSTALL", 1)[1].split(
+        "!macroend", 1
+    )[0]
+    postinstall_hook = windows_hooks.split("!macro NSIS_HOOK_POSTINSTALL", 1)[1].split(
+        "!macroend", 1
+    )[0]
+    for token in (
+        "RunAsUser",
+        '"/S /UPDATE"',
+        "Pop $2",
+        "nelomai_legacy_install_wait",
+    ):
+        if token not in preinstall_hook:
+            raise RuntimeError(f"Windows legacy migration misses {token}")
+    if "RunAsUser" in postinstall_hook:
+        raise RuntimeError("Windows legacy migration must finish before post-install")
+    if preinstall_hook.index("RunAsUser") > preinstall_hook.index(
+        "Stopping the previous Nelomai tunnel service"
+    ):
+        raise RuntimeError("Windows legacy migration must precede service replacement")
+    if "StrCmp $NelomaiLegacyStartShortcut 1" not in postinstall_hook:
+        raise RuntimeError("Windows legacy migration does not restore its Start shortcut")
 
     macos_resources = json.loads(
         (ROOT / "src-tauri" / "bundle.macos.conf.json").read_text(

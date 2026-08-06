@@ -252,6 +252,65 @@ fn mandatory_precedence_suggestions_and_unavailable_history_are_preserved() {
 }
 
 #[test]
+fn package_ids_use_the_unique_installed_spelling_when_case_differs() {
+    let mut policy = policy(SplitTunnelMode::IncludeSelected);
+    policy.mandatory_excluded_packages = vec!["com.example.bank".to_string()];
+    policy.selected_packages = vec!["eu.livesport.flashscore_com".to_string()];
+    let installed = vec![
+        SplitTunnelSelectedPackage {
+            package_id: "com.example.Bank".to_string(),
+            display_name: "Bank".to_string(),
+        },
+        SplitTunnelSelectedPackage {
+            package_id: "eu.livesport.FlashScore_com".to_string(),
+            display_name: "Flashscore".to_string(),
+        },
+    ];
+
+    let effective = EffectiveSplitTunnelPolicy::build(
+        &policy,
+        &installed,
+        capabilities(TunnelPlatform::Android, Some(35), true, true),
+        Layer::Tic,
+        RouteMode::ViaTak,
+    )
+    .unwrap();
+
+    assert_eq!(
+        effective.options.package_ids,
+        ["eu.livesport.FlashScore_com"]
+    );
+    assert!(effective.unavailable_selected_packages.is_empty());
+}
+
+#[test]
+fn ambiguous_case_insensitive_package_match_is_never_applied() {
+    let mut policy = policy(SplitTunnelMode::IncludeSelected);
+    policy.selected_packages = vec!["com.example.FOO".to_string()];
+    let installed = vec![
+        SplitTunnelSelectedPackage {
+            package_id: "com.example.Foo".to_string(),
+            display_name: "First".to_string(),
+        },
+        SplitTunnelSelectedPackage {
+            package_id: "com.example.foo".to_string(),
+            display_name: "Second".to_string(),
+        },
+    ];
+
+    let error = EffectiveSplitTunnelPolicy::build(
+        &policy,
+        &installed,
+        capabilities(TunnelPlatform::Android, Some(35), true, true),
+        Layer::Tic,
+        RouteMode::ViaTak,
+    )
+    .unwrap_err();
+
+    assert_eq!(error, SplitTunnelPolicyError::EmptyIncludeSelection);
+}
+
+#[test]
 fn policy_collection_limits_are_rejected_before_application() {
     let cases = [
         (
@@ -1012,6 +1071,7 @@ async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
         refresh_token: Some("refresh".to_string()),
         saved_connection: None,
         pinned_connection: None,
+        pending_start: None,
         compatibility: None,
     }))));
     let tunnel = Arc::new(CoordinatorTunnel {
@@ -1657,6 +1717,7 @@ fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
         refresh_token: Some("refresh".to_string()),
         saved_connection: None,
         pinned_connection: None,
+        pending_start: None,
         compatibility: None,
     }))));
     let tunnel = Arc::new(CoordinatorTunnel {

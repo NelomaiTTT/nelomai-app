@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use nelomai_client_api::{ClientApi, ClientApiError, TokenResponse};
 use nelomai_client_storage::{
     MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredCompatibility, StoredConnection,
-    StoredConnectionKind,
+    StoredConnectionKind, StoredPendingStart,
 };
 use nelomai_client_tunnel::{
     QuickConnection, QuickReconnect, TunnelConfiguration, TunnelController, TunnelError,
@@ -844,6 +844,7 @@ where
                 refresh_token: None,
                 saved_connection: None,
                 pinned_connection: None,
+                pending_start: None,
                 compatibility: None,
             })
             .map_err(|_| CoreError::Storage)?;
@@ -995,7 +996,7 @@ where
         if let Some(connection) = self.connected_connection().await {
             return Ok(connection);
         }
-        let stored = self.load_auth()?;
+        let mut stored = self.load_auth()?;
         if stored
             .compatibility
             .as_ref()
@@ -1006,6 +1007,7 @@ where
         }
         self.release_stale_panel_connection_before_start(&stored)
             .await?;
+        stored = self.load_auth()?;
         let split_policy = self.cached_policy_for_start()?;
         let preflight_tunnel_options = match &split_policy {
             Some(policy) => Some(
@@ -1021,8 +1023,19 @@ where
             None => None,
         };
         let mut access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
-        let operation_id = reusable_operation_id(&stored, &options, now_unix)
+        let operation_id = pending_operation_id(&stored, &options)
+            .or_else(|| reusable_operation_id(&stored, &options, now_unix))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let mut pending_stored = self.load_auth()?;
+        pending_stored.pending_start = Some(StoredPendingStart {
+            operation_id: operation_id.clone(),
+            layer: options.layer,
+            tic_connection_mode: options.tic_connection_mode,
+            route_mode: options.route_mode,
+        });
+        self.store
+            .save(&pending_stored)
+            .map_err(|_| CoreError::Storage)?;
         self.set_phase(Phase::Connecting).await;
         let request = ConnectionStartRequest {
             operation_id: operation_id.clone(),
@@ -1036,6 +1049,9 @@ where
         let response = match self.retry_start(&access_token, &request).await {
             Ok(response) => response,
             Err(error) => {
+                if !matches!(&error, CoreError::Api(CoreApiError::Retryable)) {
+                    let _ = self.clear_pending_start(&operation_id);
+                }
                 self.logger.record_timed(
                     CoreLogEvent {
                         kind: "connection.start_failed",
@@ -1058,6 +1074,10 @@ where
             },
             elapsed_millis(panel_started),
         );
+        *self.state.lock().await = CoreState {
+            phase: Phase::Connecting,
+            connection: Some(response.connection.clone()),
+        };
         let tunnel_options = match &split_policy {
             Some(_)
                 if response.connection.layer == options.layer
@@ -1191,6 +1211,7 @@ where
             },
             elapsed_millis(local_start_started),
         );
+        let _ = self.clear_pending_start(&operation_id);
         let applied_physical_network_fingerprint = self
             .initialize_physical_network_detector(&tunnel_options)
             .await;
@@ -1341,6 +1362,9 @@ where
                 return Err(error);
             }
         };
+        if let Some(pending) = &stored.pending_start {
+            self.clear_pending_start(&pending.operation_id)?;
+        }
         *self.state.lock().await = CoreState {
             phase: Phase::Ready,
             connection: Some(response.connection.clone()),
@@ -1661,6 +1685,9 @@ where
                 return Err(error);
             }
         };
+        if let Some(pending) = &stored.pending_start {
+            self.clear_pending_start(&pending.operation_id)?;
+        }
         *self.state.lock().await = CoreState {
             phase: Phase::Ready,
             connection: Some(response.connection),
@@ -1676,6 +1703,21 @@ where
 
     async fn set_phase(&self, phase: Phase) {
         self.state.lock().await.phase = phase;
+    }
+
+    fn clear_pending_start(&self, operation_id: &str) -> Result<(), CoreError> {
+        let Some(mut stored) = self.store.load().map_err(|_| CoreError::Storage)? else {
+            return Ok(());
+        };
+        if stored
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| pending.operation_id == operation_id)
+        {
+            stored.pending_start = None;
+            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        }
+        Ok(())
     }
 
     async fn compensate_failed_start(
@@ -1700,7 +1742,10 @@ where
             )
             .await
         {
-            Ok(compensation) => (compensation.connection, phase_for_start_error(error)),
+            Ok(compensation) => {
+                let _ = self.clear_pending_start(operation_id);
+                (compensation.connection, phase_for_start_error(error))
+            }
             Err(compensation_error) => {
                 self.logger.record(CoreLogEvent {
                     kind: "connection.start_compensation_failed",
@@ -1827,6 +1872,21 @@ fn reusable_operation_id(
             })
         })
         .map(|saved| saved.lease_id.clone())
+}
+
+fn pending_operation_id(
+    stored: &nelomai_client_storage::StoredAuth,
+    options: &ConnectOptions,
+) -> Option<String> {
+    stored
+        .pending_start
+        .as_ref()
+        .filter(|pending| {
+            pending.layer == options.layer
+                && pending.tic_connection_mode == options.tic_connection_mode
+                && pending.route_mode == options.route_mode
+        })
+        .map(|pending| pending.operation_id.clone())
 }
 
 fn stored_connection_kind(connection: &Connection) -> StoredConnectionKind {

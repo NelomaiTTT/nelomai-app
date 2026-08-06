@@ -5,7 +5,7 @@ use nelomai_client_core::{
 };
 use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
-    StoredConnectionKind,
+    StoredConnectionKind, StoredPendingStart,
 };
 use nelomai_client_tunnel::{
     TunnelController, TunnelError, TunnelOptions, TunnelStartRequest, TunnelStatus,
@@ -549,7 +549,7 @@ async fn local_start_failure_stops_the_panel_lease_and_returns_to_ready() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn storage_failure_after_start_stops_the_panel_lease_without_starting_the_tunnel() {
+async fn storage_failure_before_start_never_allocates_a_panel_lease() {
     let api = Arc::new(MockApi::new(0));
     let tunnel = Arc::new(MemoryTunnel::default());
     let logger = Arc::new(MemoryLogger::default());
@@ -564,27 +564,79 @@ async fn storage_failure_after_start_stops_the_panel_lease_without_starting_the_
     let error = core.start(options(), 1_700_000_000).await.unwrap_err();
 
     assert!(matches!(error, nelomai_client_core::CoreError::Storage));
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
     assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
-    assert_eq!(core.state().await.phase, Phase::Ready);
-    assert_eq!(
-        core.state().await.connection.unwrap().status,
-        LeaseStatus::Warm
+    assert!(core.state().await.connection.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn interrupted_start_reuses_its_durable_operation_id() {
+    let api = Arc::new(MockApi::new(0));
+    let mut stored_auth = auth();
+    stored_auth.pending_start = Some(StoredPendingStart {
+        operation_id: "pending-operation".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+    });
+    let store = Arc::new(MemoryStore::new(stored_auth));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
     );
-    assert!(logger
-        .0
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|event| event.kind == "connection.start_storage_failed"));
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(
+        api.operation_ids.lock().unwrap().as_slice(),
+        ["pending-operation"]
+    );
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovered_fixed_start_uses_a_new_operation_after_stale_cleanup() {
+    let api = Arc::new(MockApi::new(0));
+    api.stop_failures.store(1, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    let fixed = ConnectOptions {
+        layer: Layer::Tic,
+        tic_connection_mode: TicConnectionMode::Personal,
+        route_mode: RouteMode::ViaTak,
+        probes: Vec::new(),
+        allow_alternate: false,
+    };
+
+    core.start(fixed.clone(), 1_700_000_000).await.unwrap_err();
+    assert!(store.load().unwrap().unwrap().pending_start.is_some());
+
+    core.start(fixed, 1_700_000_001).await.unwrap();
+
+    let operation_ids = api.operation_ids.lock().unwrap();
+    assert_eq!(operation_ids.len(), 2);
+    assert_ne!(operation_ids[0], operation_ids[1]);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn failed_start_request_never_leaves_the_core_connecting() {
     let api = Arc::new(MockApi::new(1));
+    let store = Arc::new(MemoryStore::new(auth()));
     let core = ClientCore::new(
-        api,
-        Arc::new(MemoryStore::new(auth())),
+        api.clone(),
+        store.clone(),
         Arc::new(MemoryTunnel::default()),
         Arc::new(MemoryLogger::default()),
     )
@@ -593,6 +645,21 @@ async fn failed_start_request_never_leaves_the_core_connecting() {
     core.start(options(), 1_700_000_000).await.unwrap_err();
 
     assert_eq!(core.state().await.phase, Phase::ServerUnavailable);
+    let pending_operation = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_start
+        .unwrap()
+        .operation_id;
+
+    core.start(options(), 1_700_000_001).await.unwrap();
+
+    assert_eq!(
+        api.operation_ids.lock().unwrap().as_slice(),
+        [pending_operation.as_str(), pending_operation.as_str()]
+    );
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

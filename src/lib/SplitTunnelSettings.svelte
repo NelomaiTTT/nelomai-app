@@ -396,7 +396,7 @@
 
   .split-settings {
     width: min(760px, 100%);
-    max-height: min(820px, calc(100vh - 48px));
+    max-height: min(820px, calc(100dvh - 48px));
     padding: 26px;
     display: grid;
     gap: 22px;
@@ -642,8 +642,8 @@
   }
 
   .application-list {
-    min-height: 180px;
-    max-height: 330px;
+    min-height: 360px;
+    max-height: 660px;
     overflow-y: auto;
     border-block: 1px solid #2a3036;
   }
@@ -728,9 +728,13 @@
     }
 
     .split-settings {
-      max-height: 100vh;
-      min-height: 100vh;
-      padding: 20px;
+      max-height: 100dvh;
+      min-height: 100dvh;
+      padding:
+        max(20px, env(safe-area-inset-top, 0px))
+        max(20px, env(safe-area-inset-right, 0px))
+        max(20px, env(safe-area-inset-bottom, 0px))
+        max(20px, env(safe-area-inset-left, 0px));
       border: 0;
       border-radius: 0;
     }
