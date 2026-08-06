@@ -6,6 +6,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+#[cfg(windows)]
+use tauri::Runtime;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -57,7 +59,10 @@ pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
     app.manage(menu_state);
 
     #[cfg(windows)]
-    let icon = app.default_window_icon().cloned().unwrap_or_else(tray_icon);
+    let icon = app
+        .default_window_icon()
+        .map(|icon| Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height()))
+        .unwrap_or_else(tray_icon);
     #[cfg(not(windows))]
     let icon = tray_icon();
 
@@ -211,7 +216,7 @@ fn hide_dock_when_window_stays_hidden(app: AppHandle) {
 }
 
 #[cfg(windows)]
-pub fn set_tray_visible(app: &AppHandle, visible: bool) {
+pub fn set_tray_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_visible(visible);
     }
