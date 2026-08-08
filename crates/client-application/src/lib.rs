@@ -6,7 +6,7 @@ use nelomai_client_api::{
 };
 use nelomai_client_core::{
     ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError, CoreError,
-    CoreLogger, CoreState, PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
+    CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
 };
 use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError};
@@ -778,6 +778,14 @@ where
     pub async fn stop(&self) -> Result<Connection, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.stop().await.map_err(Into::into)
+    }
+
+    pub async fn retry_pending_stop(&self) -> Result<Option<Connection>, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        if self.core.state().await.phase != Phase::Stopping {
+            return Ok(None);
+        }
+        self.core.stop().await.map(Some).map_err(Into::into)
     }
 
     pub async fn stop_for_shutdown(&self) -> Result<Option<Connection>, ApplicationError> {

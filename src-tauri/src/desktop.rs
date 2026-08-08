@@ -1,5 +1,6 @@
 use crate::{commands, connection_metrics::ConnectionMetricsTracker, NativeApplication};
 use nelomai_client_core::Phase;
+use serde::Serialize;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicU64;
 use std::sync::{
@@ -37,6 +38,13 @@ struct TrayMenuState {
     toggle: MenuItem<tauri::Wry>,
     traffic: MenuItem<tauri::Wry>,
     last_presentation: Mutex<Option<TrayPresentation>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeConnectionChangedEvent {
+    error: Option<commands::CommandError>,
+    action: &'static str,
 }
 
 pub fn setup_tray(app: &mut App) -> tauri::Result<()> {
@@ -228,14 +236,23 @@ fn toggle_connection(app: AppHandle) {
     }
     tauri::async_runtime::spawn(async move {
         let application = app.state::<Arc<NativeApplication>>().inner().clone();
+        let action = if matches!(
+            application.state().await.phase,
+            Phase::Connected | Phase::Stopping
+        ) {
+            "stop"
+        } else {
+            "start"
+        };
         let result = commands::quick_toggle(&app, application.as_ref(), false).await;
         TOGGLE_RUNNING.store(false, Ordering::Release);
         if result.is_err() {
             show_window(&app);
         }
+        let error = result.err();
         let _ = app.emit(
             "native-connection-changed",
-            result.err().map(|error| error.message().to_string()),
+            NativeConnectionChangedEvent { error, action },
         );
     });
 }
@@ -254,10 +271,10 @@ pub fn quit_application(app: AppHandle) {
                 show_window(&app);
                 let _ = app.emit(
                     "native-connection-changed",
-                    Some(format!(
-                        "Не удалось завершить подключение: {}",
-                        error.message()
-                    )),
+                    NativeConnectionChangedEvent {
+                        error: Some(error),
+                        action: "stop",
+                    },
                 );
             }
         }

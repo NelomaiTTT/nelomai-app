@@ -57,6 +57,13 @@ pub struct DnsServersRequest {
     pub dns_servers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartFailureDiagnosticsRequest {
+    pub device_id: String,
+    pub error_code: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceUsageResponse {
@@ -314,6 +321,18 @@ mod tests {
 
         assert_eq!(value["cacheQuickAction"], true);
         assert_eq!(value["quickActionValidUntilUnix"], 1_785_700_000_i64);
+    }
+
+    #[test]
+    fn start_failure_diagnostics_uses_the_mobile_command_field_name() {
+        let value = serde_json::to_value(StartFailureDiagnosticsRequest {
+            device_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            error_code: "configuration_fetch_failed".to_string(),
+        })
+        .unwrap();
+
+        assert_eq!(value["deviceId"], "11111111-1111-4111-8111-111111111111");
+        assert_eq!(value["errorCode"], "configuration_fetch_failed");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::build_backend_configuration;
+use crate::process::{output_with_timeout, status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{RouteManager, SystemRouteBackend};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{Userspace, WGApi, WireguardInterfaceApi};
@@ -382,12 +383,14 @@ fn run_networksetup(args: &[&str]) -> Result<Output, ServiceError> {
 }
 
 fn run_networksetup_owned(args: &[String]) -> Result<Output, ServiceError> {
-    let output = Command::new(NETWORKSETUP)
-        .args(args)
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(backend_error)?;
+    let output = output_with_timeout(
+        Command::new(NETWORKSETUP)
+            .args(args)
+            .env("LANG", "C")
+            .env("LC_ALL", "C"),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(backend_error)?;
     if output.status.success() {
         Ok(output)
     } else {
@@ -404,9 +407,11 @@ fn launch_wireguard_go(
     let state_file = runtime_directory.join(INTERFACE_STATE_FILE);
     remove_regular_file_if_present(&state_file).map_err(backend_error)?;
 
-    let status = wireguard_go_command(executable, &state_file)
-        .status()
-        .map_err(backend_error)?;
+    let status = status_with_timeout(
+        &mut wireguard_go_command(executable, &state_file),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(backend_error)?;
     if !status.success() {
         return Err(ServiceError::Backend(
             "wireguard_go_start_failed".to_string(),

@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 const PANEL_BASE: &str = "https://nelomai.ru";
 const SPLIT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const PHYSICAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const PENDING_STOP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const PUSH_REGISTRATION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const CONNECTION_METRICS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -162,6 +163,7 @@ pub fn run() {
         desktop::setup_tray(app)?;
         start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
         start_physical_network_scheduler(application.clone());
+        start_pending_stop_scheduler(application.clone());
         start_connection_metrics_scheduler(application.clone(), tunnel, connection_metrics);
         start_push_registration_scheduler(
             app.handle().clone(),
@@ -184,6 +186,7 @@ pub fn run() {
             commands::app_unbind_peer,
             commands::app_refresh_probes,
             commands::app_prepare_tunnel,
+            commands::app_queue_start_failure_diagnostics,
             commands::app_start,
             commands::app_start_saved_stray,
             commands::app_stop,
@@ -256,6 +259,18 @@ fn start_physical_network_scheduler(application: Arc<NativeApplication>) {
         loop {
             interval.tick().await;
             let _ = application.poll_physical_network(current_unix_time()).await;
+        }
+    });
+}
+
+fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(PENDING_STOP_RETRY_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = application.retry_pending_stop().await;
         }
     });
 }

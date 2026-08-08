@@ -6,7 +6,7 @@ use crate::{ServiceError, TunnelRequestHandler, MANAGER_SERVICE_NAME};
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use windows_service::define_windows_service;
 use windows_service::service::{
@@ -21,6 +21,46 @@ use windows_sys::Win32::System::LibraryLoader::{
 };
 
 define_windows_service!(manager_service_main, manager_service_entry);
+
+const REQUEST_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(40);
+
+struct RequestWatchdog {
+    completed: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RequestWatchdog {
+    fn arm() -> Result<Self, ServiceError> {
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        let completed_for_thread = Arc::clone(&completed);
+        std::thread::Builder::new()
+            .name("nelomai-service-watchdog".to_string())
+            .spawn(move || {
+                let (lock, condition) = &*completed_for_thread;
+                let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (guard, timeout) = condition
+                    .wait_timeout_while(guard, REQUEST_WATCHDOG_TIMEOUT, |completed| !*completed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if timeout.timed_out() && !*guard {
+                    record_service_diagnostic(
+                        "manager request watchdog",
+                        &ServiceError::Backend("service_timeout".to_string()),
+                    );
+                    // Recovery actions restart the manager service. The WireGuard tunnel
+                    // itself runs in a separate service and is not interrupted here.
+                    std::process::exit(1);
+                }
+            })
+            .map_err(|error| platform_error("start manager request watchdog", error))?;
+        Ok(Self { completed })
+    }
+
+    fn complete(self) {
+        let (lock, condition) = &*self.completed;
+        let mut completed = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *completed = true;
+        condition.notify_one();
+    }
+}
 
 pub fn run_manager_service() -> Result<(), ServiceError> {
     service_dispatcher::start(MANAGER_SERVICE_NAME, manager_service_main)
@@ -68,7 +108,17 @@ fn manager_service_loop() -> Result<(), ServiceError> {
                     let _ = finish_request(pipe, &crate::Response::failure("service_stopping"));
                     break;
                 }
-                let response = handler.handle(request);
+                let response = match RequestWatchdog::arm() {
+                    Ok(watchdog) => {
+                        let response = handler.handle(request);
+                        watchdog.complete();
+                        response
+                    }
+                    Err(error) => {
+                        record_service_diagnostic("start request watchdog", &error);
+                        crate::Response::failure(error.code())
+                    }
+                };
                 if let Err(error) = finish_request(pipe, &response) {
                     record_service_diagnostic("send pipe response", &error);
                 }

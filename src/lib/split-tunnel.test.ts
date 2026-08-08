@@ -56,6 +56,24 @@ describe("split-tunnel application model", () => {
     ).toContain("после смены сети");
   });
 
+  it("names actions that are actually available in the interface", () => {
+    expect(splitTunnelWarningMessage("split_tunnel_stop_failed")).toContain(
+      "повторите отключение",
+    );
+    expect(splitTunnelWarningMessage("split_tunnel_rollback_failed")).toContain(
+      "нажмите «Повторить»",
+    );
+    expect(
+      splitTunnelWarningMessage("split_tunnel_domain_resolution_unavailable"),
+    ).toContain("«Принудительная синхронизация»");
+    expect(splitTunnelWarningMessage("tunnel_runtime_stopped")).toContain(
+      "Нажмите «Старт»",
+    );
+    expect(splitTunnelWarningMessage("tunnel_status_unavailable")).toContain(
+      "Нажмите «Стоп»",
+    );
+  });
+
   it("locks mandatory packages and never repeats them as suggestions", () => {
     const rows = buildApplicationRows(state, applications, "", true);
     const mandatory = rows.find(

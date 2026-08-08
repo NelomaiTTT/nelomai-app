@@ -21,7 +21,10 @@ import com.wireguard.android.backend.GoBackend
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import java.io.ByteArrayInputStream
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -31,6 +34,7 @@ import org.json.JSONArray
 internal const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
 private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
+private const val TUNNEL_OPERATION_WATCHDOG_MILLIS = 40_000L
 
 @InvokeArg
 class TunnelOptionsArgs {
@@ -62,8 +66,15 @@ class DnsServersArgs {
 }
 
 @InvokeArg
+class StartFailureDiagnosticsArgs {
+    lateinit var deviceId: String
+    var errorCode: String = "connection_start_failed"
+}
+
+@InvokeArg
 class StartTunnelArgs {
     var apiVersion: Int = 0
+    var clientOperationId: String? = null
     var startSource: String = "ui"
     lateinit var configuration: ByteArray
     var options: TunnelOptionsArgs = TunnelOptionsArgs()
@@ -185,6 +196,22 @@ internal class BackgroundOperationGate {
     }
 }
 
+internal class TunnelOperationWatchdogGate {
+    private val nextGeneration = AtomicLong(0)
+    private val activeGeneration = AtomicLong(0)
+
+    fun begin(): Long {
+        val generation = nextGeneration.incrementAndGet()
+        activeGeneration.set(generation)
+        return generation
+    }
+
+    fun complete(generation: Long): Boolean =
+        activeGeneration.compareAndSet(generation, 0)
+
+    fun expire(generation: Long): Boolean = complete(generation)
+}
+
 private class ManagedTunnel(
     private val onStateChange: (Tunnel.State) -> Unit,
 ) : Tunnel {
@@ -197,12 +224,18 @@ private class ManagedTunnel(
 
 private data class ActiveTunnelSession(
     val generation: Long,
+    val clientOperationId: String?,
     val config: Config,
     val options: EffectiveAndroidTunnelOptions,
     var monitor: PhysicalNetworks?,
     var localRoutes: List<Ipv4Prefix>,
     var observedNetworkFingerprint: String,
     var networkWasUnavailable: Boolean,
+)
+
+private data class TunnelOperationWatchdog(
+    val generation: Long,
+    val future: ScheduledFuture<*>,
 )
 
 internal object TunnelRuntime {
@@ -212,9 +245,14 @@ internal object TunnelRuntime {
     private val backgroundExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "nelomai-background-connection").apply { isDaemon = false }
     }
+    private val watchdogExecutor = Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "nelomai-tunnel-watchdog").apply { isDaemon = false }
+    }
     private val stateGate = TunnelStateGate()
     private val backgroundOperationGate = BackgroundOperationGate()
+    private val watchdogGate = TunnelOperationWatchdogGate()
     private val suppressBackendStateChanges = AtomicBoolean(false)
+    private val cancelledClientStarts = ConcurrentHashMap.newKeySet<String>()
     private val generation = AtomicLong(0)
     private val tunnel = ManagedTunnel { state ->
         if (!suppressBackendStateChanges.get()) {
@@ -289,6 +327,7 @@ internal object TunnelRuntime {
             TransitionDecision.ALREADY_COMPLETE -> error("unreachable_start_transition")
         }
 
+        val watchdog = armOperationWatchdog(applicationContext, "start")
         executor.execute {
             val startedAt = System.nanoTime()
             TunnelLog.info(
@@ -300,8 +339,10 @@ internal object TunnelRuntime {
                 ),
             )
             try {
+                requireClientStartNotCancelled(args.clientOperationId)
                 val serviceStartedAt = System.nanoTime()
                 serviceReady.get(5, TimeUnit.SECONDS)
+                requireClientStartNotCancelled(args.clientOperationId)
                 logStage("start.service_ready", serviceStartedAt)
                 if (replaceExisting) {
                     val replaceStartedAt = System.nanoTime()
@@ -372,8 +413,22 @@ internal object TunnelRuntime {
                     ),
                 )
 
+                requireClientStartNotCancelled(args.clientOperationId)
                 val backendStartedAt = System.nanoTime()
                 val state = requireBackend().setState(tunnel, Tunnel.State.UP, config)
+                if (state == Tunnel.State.UP && isClientStartCancelled(args.clientOperationId)) {
+                    suppressBackendStateChanges.set(true)
+                    try {
+                        requireState(
+                            requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
+                            Tunnel.State.DOWN,
+                        )
+                    } finally {
+                        suppressBackendStateChanges.set(false)
+                    }
+                    AndroidSplitTunnel.clear()
+                    throw TunnelOperationException("tunnel_start_cancelled")
+                }
                 if (state == Tunnel.State.UP) {
                     NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
                 }
@@ -381,6 +436,7 @@ internal object TunnelRuntime {
                 val resolved = if (state == Tunnel.State.UP) {
                     val session = ActiveTunnelSession(
                         generation = generation.incrementAndGet(),
+                        clientOperationId = args.clientOperationId,
                         config = config,
                         options = options,
                         monitor = monitor,
@@ -451,7 +507,54 @@ internal object TunnelRuntime {
                     error,
                 )
                 onError(code)
+            } finally {
+                completeOperationWatchdog(watchdog)
             }
+        }
+    }
+
+    fun cancelClientStart(context: Context, clientOperationId: String) {
+        cancelledClientStarts.add(clientOperationId)
+        executor.execute {
+            val session = activeSession
+            if (
+                stateGate.current() != SessionState.RUNNING ||
+                !shouldCancelActiveClientStart(clientOperationId, session?.clientOperationId)
+            ) {
+                cancelledClientStarts.remove(clientOperationId)
+                return@execute
+            }
+            val applicationContext = context.applicationContext
+            QuickTunnelController.updateState(
+                applicationContext,
+                SessionState.STOPPING,
+                desiredActive = false,
+            )
+            stop(
+                TUNNEL_API_VERSION,
+                { state, _ ->
+                    cancelledClientStarts.remove(clientOperationId)
+                    QuickTunnelController.updateState(
+                        applicationContext,
+                        state,
+                        desiredActive = false,
+                        changed = true,
+                    )
+                    TunnelPlugin.refreshQuickTile(applicationContext)
+                },
+                { code ->
+                    cancelledClientStarts.remove(clientOperationId)
+                    TunnelLog.warning("client_start.cancel_failed", code)
+                    val state = state()
+                    QuickTunnelController.updateState(
+                        applicationContext,
+                        state,
+                        desiredActive = state == SessionState.RUNNING,
+                        changed = true,
+                    )
+                    TunnelPlugin.refreshQuickTile(applicationContext)
+                },
+            )
         }
     }
 
@@ -674,6 +777,10 @@ internal object TunnelRuntime {
             TransitionDecision.REPLACE -> error("unreachable_stop_transition")
         }
 
+        val watchdog = armOperationWatchdog(
+            checkNotNull(applicationContext) { "tunnel_context_unavailable" },
+            "stop",
+        )
         executor.execute {
             val startedAt = System.nanoTime()
             TunnelLog.info("stop.begin")
@@ -709,6 +816,8 @@ internal object TunnelRuntime {
                 val code = errorCode(error)
                 TunnelLog.warning("stop.failed", code, error)
                 onError(code)
+            } finally {
+                completeOperationWatchdog(watchdog)
             }
         }
     }
@@ -745,6 +854,56 @@ internal object TunnelRuntime {
 
     private fun requireBackend(): GoBackend =
         backend ?: error("tunnel_backend_unavailable")
+
+    private fun armOperationWatchdog(
+        context: Context,
+        operation: String,
+    ): TunnelOperationWatchdog {
+        val generation = watchdogGate.begin()
+        val future = watchdogExecutor.schedule(
+            {
+                if (!watchdogGate.expire(generation)) return@schedule
+                terminateHungTunnelProcess(context, operation)
+            },
+            TUNNEL_OPERATION_WATCHDOG_MILLIS,
+            TimeUnit.MILLISECONDS,
+        )
+        return TunnelOperationWatchdog(generation, future)
+    }
+
+    private fun terminateHungTunnelProcess(context: Context, operation: String) {
+        val processId = android.os.Process.myPid()
+        Thread(
+            {
+                try {
+                    Thread.sleep(1_000)
+                } finally {
+                    android.os.Process.killProcess(processId)
+                }
+            },
+            "nelomai-tunnel-watchdog-failsafe",
+        ).apply { isDaemon = false }.start()
+        try {
+            TunnelLog.warning(
+                "tunnel.operation_watchdog_expired",
+                "${operation}_timeout",
+            )
+            QuickTunnelController.updateState(
+                context.applicationContext,
+                SessionState.STOPPED,
+                desiredActive = false,
+                changed = true,
+            )
+        } finally {
+            android.os.Process.killProcess(processId)
+        }
+    }
+
+    private fun completeOperationWatchdog(watchdog: TunnelOperationWatchdog) {
+        if (watchdogGate.complete(watchdog.generation)) {
+            watchdog.future.cancel(false)
+        }
+    }
 
     fun serviceDestroyed() {
         stateGate.complete(SessionState.STOPPED)
@@ -821,6 +980,15 @@ internal object TunnelRuntime {
         }
     }
 
+    private fun isClientStartCancelled(clientOperationId: String?): Boolean =
+        clientOperationId != null && cancelledClientStarts.contains(clientOperationId)
+
+    private fun requireClientStartNotCancelled(clientOperationId: String?) {
+        if (isClientStartCancelled(clientOperationId)) {
+            throw TunnelOperationException("tunnel_start_cancelled")
+        }
+    }
+
     private fun validateVersion(apiVersion: Int) {
         if (apiVersion != TUNNEL_API_VERSION) {
             throw TunnelOperationException("unsupported_api_version")
@@ -849,6 +1017,11 @@ internal object TunnelRuntime {
 }
 
 private class TunnelOperationException(val code: String) : RuntimeException()
+
+internal fun shouldCancelActiveClientStart(
+    requestedOperationId: String,
+    activeOperationId: String?,
+): Boolean = requestedOperationId == activeOperationId
 
 internal val StartTunnelArgs.configurationInitialized: Boolean
     get() = try {
@@ -1031,6 +1204,34 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             { activity.runOnUiThread { invoke.resolve() } },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
         )
+    }
+
+    @Command
+    fun queueStartFailureDiagnostics(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(StartFailureDiagnosticsArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_start_failure_diagnostics")
+            return
+        }
+        val deviceId = runCatching { UUID.fromString(args.deviceId).toString() }.getOrNull()
+        if (deviceId == null || deviceId != args.deviceId) {
+            invoke.reject("invalid_start_failure_diagnostics")
+            return
+        }
+        AutomaticDiagnostics.onConnectionStartFailed(
+            activity.applicationContext,
+            deviceId,
+            args.errorCode.take(80),
+        ) { error ->
+            activity.runOnUiThread {
+                if (error == null) {
+                    invoke.resolve()
+                } else {
+                    invoke.reject("start_failure_diagnostics_unavailable")
+                }
+            }
+        }
     }
 
     @Command

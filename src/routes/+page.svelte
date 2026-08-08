@@ -29,10 +29,14 @@
     type UpdateStatus,
   } from "$lib/app-model";
   import {
+    commandCode,
     commandMessage,
     nativeClient,
+    START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS,
+    waitForSettlement,
     type AppNotification,
     type LoginRequest,
+    type NativeConnectionChangedEvent,
   } from "$lib/native-client";
   import {
     emptyIncludeSelection,
@@ -120,8 +124,15 @@
         void loadAppPreferences();
       }, 0);
     });
-    void listen<string | null>("native-connection-changed", (event) => {
-      if (event.payload) error = event.payload;
+    void listen<NativeConnectionChangedEvent>("native-connection-changed", (event) => {
+      if (event.payload.error) {
+        error = commandMessage(event.payload.error, event.payload.action, {
+          personalPeer:
+            event.payload.action === "start" &&
+            selectedLayer === "tic" &&
+            ticConnectionMode === "personal",
+        });
+      }
       void synchronizeRuntimeState();
     }).then((unlisten) => {
       if (disposed) unlisten();
@@ -195,7 +206,7 @@
     try {
       appPreferences = await nativeClient.setCloseToTray(enabled);
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "preferences");
     }
   }
 
@@ -205,7 +216,7 @@
     try {
       appPreferences = await nativeClient.setDnsProvider(provider);
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "preferences");
     }
   }
 
@@ -273,7 +284,7 @@
       } else {
         phase = "server_unavailable";
         view = "unavailable";
-        error = commandMessage(reason);
+        error = commandMessage(reason, "startup");
       }
     } finally {
       if (startupTimer !== null) window.clearTimeout(startupTimer);
@@ -338,7 +349,7 @@
     } catch (reason) {
       phase = "signed_out";
       view = "sign_in";
-      error = commandMessage(reason);
+      error = commandMessage(reason, "login");
     } finally {
       busy = false;
     }
@@ -354,7 +365,7 @@
     } catch (reason) {
       peers = [];
       selectedPeerId = "";
-      error = commandMessage(reason);
+      error = commandMessage(reason, "peer_list");
     }
   }
 
@@ -374,7 +385,7 @@
       );
       await restore();
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "peer_bind");
     } finally {
       busy = false;
     }
@@ -387,6 +398,9 @@
       return;
     }
     const stopping = phase === "connected" || phase === "stopping";
+    const startDeviceId = bootstrap?.device.id;
+    if (!stopping && !startDeviceId) return;
+    let shouldReportStartFailure = !stopping;
     busy = true;
     error = null;
     try {
@@ -395,16 +409,19 @@
         connectionMetrics = null;
         phase = "ready";
       } else {
+        if (!startDeviceId) return;
         phase = "connecting";
         connectionMetrics = null;
-        await nativeClient.prepareTunnel();
+        await nativeClient.prepareTunnel(startDeviceId);
         await syncBindingPreferences();
         connection = await nativeClient.start({
+          deviceId: startDeviceId,
           layer: selectedLayer,
           ticConnectionMode,
           routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
           allowAlternate: true,
         });
+        shouldReportStartFailure = false;
         phase = "connected";
       }
       view = "connection";
@@ -412,12 +429,26 @@
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
     } catch (reason) {
+      if (shouldReportStartFailure && startDeviceId) {
+        await waitForSettlement(
+          nativeClient.queueStartFailureDiagnostics(
+            startDeviceId,
+            commandCode(reason) ?? "connection_start_failed",
+          ),
+          START_FAILURE_DIAGNOSTICS_UI_TIMEOUT_MILLIS,
+        );
+      }
       const current = await nativeClient.state().catch(() => null);
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
       connectionMetrics = current?.metrics ?? connectionMetrics;
       runtimeWarning = current?.warning ?? runtimeWarning;
-      error = commandMessage(reason);
+      error = commandMessage(reason, stopping ? "stop" : "start", {
+        personalPeer:
+          !stopping &&
+          selectedLayer === "tic" &&
+          ticConnectionMode === "personal",
+      });
     } finally {
       busy = false;
     }
@@ -475,7 +506,7 @@
         pinnedStray = connection;
       }
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "saved_stray");
     } finally {
       busy = false;
     }
@@ -496,7 +527,7 @@
       view = "peer_selection";
       await loadPeers();
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "unbind_peer");
     } finally {
       busy = false;
     }
@@ -562,7 +593,7 @@
       phase = "signed_out";
       view = "sign_in";
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "logout");
     } finally {
       busy = false;
     }
@@ -576,7 +607,7 @@
       const response = await nativeClient.sendDiagnostics();
       diagnosticsStatus = `Отчёт ${response.report_id.slice(0, 8)} отправлен`;
     } catch (reason) {
-      diagnosticsStatus = commandMessage(reason);
+      diagnosticsStatus = commandMessage(reason, "diagnostics");
     } finally {
       diagnosticsBusy = false;
     }
@@ -604,7 +635,7 @@
       notificationUnreadCount = response.unread_count;
     } catch (reason) {
       if (!silent || notificationsOpen) {
-        notificationsError = commandMessage(reason);
+        notificationsError = commandMessage(reason, "notifications");
       }
     } finally {
       notificationsBusy = false;
@@ -630,7 +661,7 @@
       );
       notificationUnreadCount = response.unread_count;
     } catch (reason) {
-      notificationsError = commandMessage(reason);
+      notificationsError = commandMessage(reason, "notifications");
     } finally {
       notificationsBusy = false;
     }
@@ -649,7 +680,7 @@
       }));
       notificationUnreadCount = response.unread_count;
     } catch (reason) {
-      notificationsError = commandMessage(reason);
+      notificationsError = commandMessage(reason, "notifications");
     } finally {
       notificationsBusy = false;
     }
@@ -680,7 +711,7 @@
     try {
       updateStatus = await nativeClient.installUpdate();
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "update");
       await refreshUpdateStatus();
     } finally {
       updateBusy = false;
@@ -696,7 +727,7 @@
       }
     } catch (reason) {
       input.checked = !input.checked;
-      error = commandMessage(reason);
+      error = commandMessage(reason, "update");
     }
   }
 
@@ -706,7 +737,7 @@
     try {
       await nativeClient.restartForUpdate();
     } catch (reason) {
-      error = commandMessage(reason);
+      error = commandMessage(reason, "update");
       updateBusy = false;
     }
   }
@@ -803,17 +834,6 @@
     return `${(value / (1024 * 1024)).toFixed(1)} МБ`;
   }
 
-  function commandCode(reason: unknown): string | null {
-    if (
-      typeof reason === "object" &&
-      reason !== null &&
-      "code" in reason &&
-      typeof reason.code === "string"
-    ) {
-      return reason.code;
-    }
-    return null;
-  }
 </script>
 
 <svelte:head>
@@ -1000,8 +1020,11 @@
           </button>
         {:else}
           <div class="empty-state">
-            <h2>Нет доступных пиров</h2>
+            <h2>{error ? "Не удалось загрузить пиры" : "Нет доступных пиров"}</h2>
             {#if error}<p class="error-message">{error}</p>{/if}
+            {#if !error}
+              <p>Все пиры уже заняты. Освободите один из них в панели и проверьте снова.</p>
+            {/if}
             <button class="secondary-button" type="button" onclick={loadPeers}>
               Проверить ещё раз
             </button>
@@ -1264,6 +1287,7 @@
       <div class="panel message-panel">
         <p class="eyebrow">Доступ</p>
         <h1>Подключение пока недоступно</h1>
+        <p>Срок доступа истёк. Продлите его в панели, затем нажмите «Проверить снова».</p>
         <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
           Проверить снова
         </button>

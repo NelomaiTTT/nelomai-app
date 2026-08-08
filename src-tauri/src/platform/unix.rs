@@ -1,9 +1,14 @@
 use nelomai_unix_service::{UnixSocketTransport, UnixTunnelController, DEFAULT_SOCKET_PATH};
 use semver::Version;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use std::thread;
+use std::time::Instant;
 use tauri::Manager;
 use tokio::time::{sleep, Duration};
+
+const HELPER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub type PlatformTunnelController = UnixTunnelController<UnixSocketTransport>;
 
@@ -55,13 +60,13 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
     #[cfg(target_os = "linux")]
     {
         let installer = required_resource(resources, "install-linux.sh")?;
-        let status = Command::new("/usr/bin/pkexec")
-            .arg("/bin/sh")
-            .arg(installer)
-            .arg(uid)
-            .arg(helper)
-            .status()
-            .map_err(|_| tunnel_error("helper_authorization_unavailable"))?;
+        let status = installer_status(
+            Command::new("/usr/bin/pkexec")
+                .arg("/bin/sh")
+                .arg(installer)
+                .arg(uid)
+                .arg(helper),
+        )?;
         if status.success() {
             Ok(())
         } else {
@@ -74,20 +79,58 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
         let installer = required_resource(resources, "install-macos.sh")?;
         let apple_script = required_resource(resources, "install-macos.applescript")?;
         let wireguard_go = required_resource(resources, "wireguard-go")?;
-        let status = Command::new("/usr/bin/osascript")
-            .arg(apple_script)
-            .arg(installer)
-            .arg(uid)
-            .arg(helper)
-            .arg(wireguard_go)
-            .status()
-            .map_err(|_| tunnel_error("helper_authorization_unavailable"))?;
+        let status = installer_status(
+            Command::new("/usr/bin/osascript")
+                .arg(apple_script)
+                .arg(installer)
+                .arg(uid)
+                .arg(helper)
+                .arg(wireguard_go),
+        )?;
         if status.success() {
             Ok(())
         } else {
             Err(tunnel_error("helper_install_cancelled"))
         }
     }
+}
+
+fn installer_status(
+    command: &mut Command,
+) -> Result<ExitStatus, nelomai_client_tunnel::TunnelError> {
+    installer_status_with_timeout(command, HELPER_INSTALL_TIMEOUT)
+}
+
+fn installer_status_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ExitStatus, nelomai_client_tunnel::TunnelError> {
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|_| tunnel_error("helper_authorization_unavailable"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(_) => {
+                terminate_installer(&mut child);
+                return Err(tunnel_error("helper_authorization_unavailable"));
+            }
+        }
+        if Instant::now() >= deadline {
+            terminate_installer(&mut child);
+            return Err(tunnel_error("helper_installer_timeout"));
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn terminate_installer(child: &mut std::process::Child) {
+    let _ = unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn required_resource(
@@ -104,4 +147,21 @@ fn required_resource(
 
 fn tunnel_error(code: &str) -> nelomai_client_tunnel::TunnelError {
     nelomai_client_tunnel::TunnelError::Backend(code.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installer_wait_has_a_deadline() {
+        let started = Instant::now();
+        let result = installer_status_with_timeout(
+            Command::new("/bin/sh").args(["-c", "sleep 2"]),
+            Duration::from_millis(50),
+        );
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

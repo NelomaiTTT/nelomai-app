@@ -1,4 +1,5 @@
 use super::{OwnedRoute, RouteBackend};
+use crate::process::{output_with_timeout, COMMAND_TIMEOUT};
 use crate::ServiceError;
 use ipnet::Ipv4Net;
 use std::net::Ipv4Addr;
@@ -85,12 +86,14 @@ impl RouteBackend for SystemRouteBackend {
     }
 
     fn route_exists(&self, route: &OwnedRoute) -> Result<bool, ServiceError> {
-        let output = Command::new(ROUTE)
-            .args(["-n", "get", "-net", &route.destination])
-            .env("LANG", "C")
-            .env("LC_ALL", "C")
-            .output()
-            .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
+        let output = output_with_timeout(
+            Command::new(ROUTE)
+                .args(["-n", "get", "-net", &route.destination])
+                .env("LANG", "C")
+                .env("LC_ALL", "C"),
+            COMMAND_TIMEOUT,
+        )
+        .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
         if !output.status.success() {
             let error = String::from_utf8_lossy(&output.stderr);
             return if error.contains("not in table") || error.contains("not found") {
@@ -228,12 +231,14 @@ fn mutate_route(action: &str, route: &OwnedRoute) -> Result<(), ServiceError> {
         .gateway
         .as_deref()
         .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?;
-    let output = Command::new(ROUTE)
-        .args(route_arguments(action, route, gateway))
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
+    let output = output_with_timeout(
+        Command::new(ROUTE)
+            .args(route_arguments(action, route, gateway))
+            .env("LANG", "C")
+            .env("LC_ALL", "C"),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
     if output.status.success()
         || (action == "delete" && String::from_utf8_lossy(&output.stderr).contains("not in table"))
     {
@@ -256,12 +261,14 @@ fn route_arguments<'a>(action: &'a str, route: &'a OwnedRoute, gateway: &'a str)
 }
 
 fn run(path: &str, arguments: &[&str]) -> Result<Output, ServiceError> {
-    let output = Command::new(path)
-        .args(arguments)
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
+    let output = output_with_timeout(
+        Command::new(path)
+            .args(arguments)
+            .env("LANG", "C")
+            .env("LC_ALL", "C"),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
     if output.status.success() {
         Ok(output)
     } else {

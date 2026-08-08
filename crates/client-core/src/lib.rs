@@ -382,6 +382,9 @@ impl From<ClientApiError> for CoreApiError {
             ClientApiError::Transport(_) => Self::Retryable,
             ClientApiError::Api { status, .. } if status.as_u16() == 401 => Self::Unauthorized,
             ClientApiError::Api { code, .. } if code == "access_expired" => Self::AccessExpired,
+            ClientApiError::Api { code, message, .. } if code == "configuration_fetch_failed" => {
+                Self::Rejected { code, message }
+            }
             ClientApiError::Api { status, .. } if status.is_server_error() => Self::Retryable,
             ClientApiError::Api { code, message, .. } => Self::Rejected { code, message },
             ClientApiError::InvalidErrorResponse { status } if status.is_server_error() => {
@@ -591,6 +594,27 @@ enum ConnectionOperation {
     UnpinStray,
 }
 
+#[derive(Clone, Copy)]
+enum FailedStartStage {
+    Preparation,
+    Storage,
+    Local,
+}
+
+impl FailedStartStage {
+    fn log_kind(self) -> &'static str {
+        match self {
+            Self::Preparation => "connection.start_preparation_failed",
+            Self::Storage => "connection.start_storage_failed",
+            Self::Local => "connection.local_start_failed",
+        }
+    }
+
+    fn local_start_may_be_incomplete(self) -> bool {
+        matches!(self, Self::Local)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("требуется вход в приложение")]
@@ -625,6 +649,9 @@ impl From<CoreApiError> for CoreError {
         match error {
             CoreApiError::Unauthorized => Self::SignedOut,
             CoreApiError::AccessExpired => Self::AccessExpired,
+            CoreApiError::Rejected { ref code, .. } if code == "critical_update_required" => {
+                Self::UpdateRequired
+            }
             other => Self::Api(other),
         }
     }
@@ -1023,7 +1050,7 @@ where
             None => None,
         };
         let mut access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
-        let operation_id = pending_operation_id(&stored, &options)
+        let mut operation_id = pending_operation_id(&stored, &options)
             .or_else(|| reusable_operation_id(&stored, &options, now_unix))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let mut pending_stored = self.load_auth()?;
@@ -1037,7 +1064,7 @@ where
             .save(&pending_stored)
             .map_err(|_| CoreError::Storage)?;
         self.set_phase(Phase::Connecting).await;
-        let request = ConnectionStartRequest {
+        let mut request = ConnectionStartRequest {
             operation_id: operation_id.clone(),
             layer: options.layer,
             tic_connection_mode: options.tic_connection_mode,
@@ -1046,7 +1073,9 @@ where
             allow_alternate: options.allow_alternate,
         };
         let panel_started = Instant::now();
-        let response = match self.retry_start(&access_token, &request).await {
+        let start_result = self.retry_start(&access_token, &mut request).await;
+        operation_id.clone_from(&request.operation_id);
+        let response = match start_result {
             Ok(response) => response,
             Err(error) => {
                 if !matches!(&error, CoreError::Api(CoreApiError::Retryable)) {
@@ -1102,7 +1131,7 @@ where
                         &response.connection,
                         &response.request_id,
                         &operation_id,
-                        "connection.start_preparation_failed",
+                        FailedStartStage::Preparation,
                         &error,
                     )
                     .await;
@@ -1155,7 +1184,7 @@ where
                 &response.connection,
                 &response.request_id,
                 &operation_id,
-                "connection.start_storage_failed",
+                FailedStartStage::Storage,
                 &error,
             )
             .await;
@@ -1196,7 +1225,7 @@ where
                 &response.connection,
                 &response.request_id,
                 &operation_id,
-                "connection.local_start_failed",
+                FailedStartStage::Local,
                 &error,
             )
             .await;
@@ -1306,14 +1335,7 @@ where
         let tunnel_status = self.tunnel.status().await.unwrap_or(TunnelStatus::Running);
         if tunnel_status != TunnelStatus::Stopped {
             if let Err(error) = self.tunnel.stop().await {
-                let phase = if self.tunnel.status().await.is_ok_and(|status| {
-                    matches!(status, TunnelStatus::Stopped | TunnelStatus::Failed)
-                }) {
-                    Phase::Stopping
-                } else {
-                    Phase::Connected
-                };
-                self.set_phase(phase).await;
+                self.set_phase(Phase::Stopping).await;
                 return Err(error.into());
             }
         }
@@ -1720,13 +1742,32 @@ where
         Ok(())
     }
 
+    fn replace_pending_start_operation(
+        &self,
+        previous_operation_id: &str,
+        replacement_operation_id: &str,
+    ) -> Result<(), CoreError> {
+        let Some(mut stored) = self.store.load().map_err(|_| CoreError::Storage)? else {
+            return Err(CoreError::Storage);
+        };
+        let Some(pending) = stored
+            .pending_start
+            .as_mut()
+            .filter(|pending| pending.operation_id == previous_operation_id)
+        else {
+            return Err(CoreError::Storage);
+        };
+        pending.operation_id = replacement_operation_id.to_string();
+        self.store.save(&stored).map_err(|_| CoreError::Storage)
+    }
+
     async fn compensate_failed_start(
         &self,
         access_token: &str,
         connection: &Connection,
         request_id: &str,
         operation_id: &str,
-        failure_kind: &'static str,
+        stage: FailedStartStage,
         error: &CoreError,
     ) {
         self.physical_network_change.lock().await.reset();
@@ -1734,7 +1775,7 @@ where
             operation_id: Uuid::new_v4().to_string(),
             lease_id: connection.lease_id.clone(),
         };
-        let (connection, phase) = match self
+        let (connection, mut phase) = match self
             .retry_operation(
                 access_token,
                 &compensation_request,
@@ -1759,12 +1800,17 @@ where
                 )
             }
         };
+        if stage.local_start_may_be_incomplete()
+            && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
+        {
+            phase = Phase::Stopping;
+        }
         *self.state.lock().await = CoreState {
             phase,
             connection: Some(connection),
         };
         self.logger.record(CoreLogEvent {
-            kind: failure_kind,
+            kind: stage.log_kind(),
             operation_id: Some(operation_id.to_string()),
             request_id: Some(request_id.to_string()),
             code: Some(error.to_string()),
@@ -1774,12 +1820,13 @@ where
     async fn retry_start(
         &self,
         access_token: &str,
-        request: &ConnectionStartRequest,
+        request: &mut ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreError> {
         let delays = self.retry_policy.delays_millis();
         let mut retry_index = 0;
         let mut access_token = access_token.to_string();
         let mut refreshed = false;
+        let mut replaced_finished_operation = false;
         loop {
             match self.api.start_connection(&access_token, request).await {
                 Ok(response) => return Ok(response),
@@ -1793,6 +1840,27 @@ where
                     if delay > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     }
+                }
+                Err(CoreApiError::Rejected { ref code, .. })
+                    if code == "connection_no_longer_active"
+                        && request.layer == Layer::Tic
+                        && !replaced_finished_operation =>
+                {
+                    let previous_operation_id = request.operation_id.clone();
+                    let replacement_operation_id = Uuid::new_v4().to_string();
+                    self.replace_pending_start_operation(
+                        &previous_operation_id,
+                        &replacement_operation_id,
+                    )?;
+                    request.operation_id = replacement_operation_id.clone();
+                    replaced_finished_operation = true;
+                    retry_index = 0;
+                    self.logger.record(CoreLogEvent {
+                        kind: "connection.start_operation_replaced",
+                        operation_id: Some(replacement_operation_id),
+                        request_id: None,
+                        code: Some("connection_no_longer_active".to_string()),
+                    });
                 }
                 Err(error) => {
                     self.set_phase(phase_for_api_error(&error)).await;
@@ -1906,6 +1974,9 @@ fn phase_for_api_error(error: &CoreApiError) -> Phase {
         CoreApiError::Unauthorized => Phase::SignedOut,
         CoreApiError::AccessExpired => Phase::AccessExpired,
         CoreApiError::Retryable => Phase::ServerUnavailable,
+        CoreApiError::Rejected { code, .. } if transient_start_rejection(code) => {
+            Phase::ServerUnavailable
+        }
         CoreApiError::Rejected { .. } => Phase::Error,
     }
 }
@@ -1918,12 +1989,19 @@ fn phase_for_start_error(error: &CoreError) -> Phase {
         }
         CoreError::UpdateRequired => Phase::UpdateRequired,
         CoreError::Api(CoreApiError::Retryable) => Phase::ServerUnavailable,
+        CoreError::Api(CoreApiError::Rejected { code, .. }) if transient_start_rejection(code) => {
+            Phase::ServerUnavailable
+        }
         CoreError::Api(CoreApiError::Rejected { .. }) => Phase::Error,
         CoreError::SavedConnectionUnavailable
         | CoreError::Storage
         | CoreError::Tunnel(_)
         | CoreError::SplitTunnel(_) => Phase::Ready,
     }
+}
+
+fn transient_start_rejection(code: &str) -> bool {
+    code == "configuration_fetch_failed"
 }
 
 #[cfg(test)]
@@ -2092,5 +2170,33 @@ mod tests {
                 message: "Сначала остановите текущее подключение.".to_string(),
             },
         );
+    }
+
+    #[test]
+    fn configuration_fetch_failure_keeps_its_stable_code() {
+        let error = ClientApiError::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            request_id: "req".to_string(),
+            code: "configuration_fetch_failed".to_string(),
+            message: "Не удалось получить конфигурацию. Повторите попытку.".to_string(),
+        };
+
+        assert_eq!(
+            CoreApiError::from(error),
+            CoreApiError::Rejected {
+                code: "configuration_fetch_failed".to_string(),
+                message: "Не удалось получить конфигурацию. Повторите попытку.".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn critical_update_rejection_opens_the_required_update_state() {
+        let error = CoreApiError::Rejected {
+            code: "critical_update_required".to_string(),
+            message: "Для подключения необходимо обновить приложение.".to_string(),
+        };
+
+        assert!(matches!(CoreError::from(error), CoreError::UpdateRequired));
     }
 }

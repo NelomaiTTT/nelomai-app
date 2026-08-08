@@ -161,6 +161,7 @@ export interface BindPeerRequest {
 }
 
 export interface StartCommandRequest {
+  deviceId: string;
   layer: Layer;
   ticConnectionMode: TicConnectionMode;
   routeMode: RouteMode;

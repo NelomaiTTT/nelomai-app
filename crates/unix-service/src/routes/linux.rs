@@ -1,4 +1,5 @@
 use super::{OwnedRoute, RouteBackend};
+use crate::process::{output_with_timeout, COMMAND_TIMEOUT};
 use crate::ServiceError;
 use ipnet::Ipv4Net;
 use std::path::{Path, PathBuf};
@@ -168,12 +169,14 @@ fn mutate_route(ip: &Path, action: &str, route: &OwnedRoute) -> Result<(), Servi
         "proto".to_string(),
         "static".to_string(),
     ]);
-    let output = Command::new(ip)
-        .args(arguments)
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
+    let output = output_with_timeout(
+        Command::new(ip)
+            .args(arguments)
+            .env("LANG", "C")
+            .env("LC_ALL", "C"),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
     if output.status.success()
         || (action == "del" && String::from_utf8_lossy(&output.stderr).contains("No such process"))
     {
@@ -184,12 +187,14 @@ fn mutate_route(ip: &Path, action: &str, route: &OwnedRoute) -> Result<(), Servi
 }
 
 fn run(path: &Path, arguments: &[&str]) -> Result<Output, ServiceError> {
-    let output = Command::new(path)
-        .args(arguments)
-        .env("LANG", "C")
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
+    let output = output_with_timeout(
+        Command::new(path)
+            .args(arguments)
+            .env("LANG", "C")
+            .env("LC_ALL", "C"),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
     if output.status.success() {
         Ok(output)
     } else {

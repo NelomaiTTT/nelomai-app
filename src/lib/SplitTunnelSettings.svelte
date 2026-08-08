@@ -121,7 +121,7 @@
       );
       if (saved) onclose();
     } catch (reason) {
-      localError = commandMessage(reason);
+      localError = commandMessage(reason, "split_tunnel");
     } finally {
       localBusy = false;
     }
@@ -149,7 +149,7 @@
       await onaddaddressrule(value, scope);
       addressValue = "";
     } catch (reason) {
-      localError = commandMessage(reason);
+      localError = commandMessage(reason, "split_tunnel");
     } finally {
       localBusy = false;
     }
@@ -162,7 +162,7 @@
     try {
       await onremoveaddressrule(rule.id, rule.scope);
     } catch (reason) {
-      localError = commandMessage(reason);
+      localError = commandMessage(reason, "split_tunnel");
     } finally {
       localBusy = false;
     }

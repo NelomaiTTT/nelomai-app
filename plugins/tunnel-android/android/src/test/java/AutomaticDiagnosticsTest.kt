@@ -7,12 +7,103 @@ import org.junit.Test
 
 class AutomaticDiagnosticsTest {
     @Test
+    fun startFailureRequestRoundTripsItsDurableIdentityAndState() {
+        val request = StartFailureRequest(
+            reportId = "33333333-3333-4333-8333-333333333333",
+            deviceId = "11111111-1111-4111-8111-111111111111",
+            errorCode = "configuration_fetch_failed",
+            queuedAt = 1_000,
+            sent = false,
+        )
+
+        val restored = StartFailureRequest.fromJson(request.toJson())
+
+        assertEquals(request, restored)
+        assertEquals(
+            automaticDiagnosticsPendingReportName(
+                1_000,
+                request.deviceId,
+                request.reportId,
+            ),
+            restored.reportName,
+        )
+        assertTrue(StartFailureRequest.fromJson(request.copy(sent = true).toJson()).sent)
+    }
+
+    @Test
     fun retryScheduleCapsAtSixHours() {
         assertEquals(5 * 60L, automaticDiagnosticsRetryDelaySeconds(0))
         assertEquals(30 * 60L, automaticDiagnosticsRetryDelaySeconds(1))
         assertEquals(2 * 60 * 60L, automaticDiagnosticsRetryDelaySeconds(2))
         assertEquals(6 * 60 * 60L, automaticDiagnosticsRetryDelaySeconds(3))
         assertEquals(6 * 60 * 60L, automaticDiagnosticsRetryDelaySeconds(20))
+    }
+
+    @Test
+    fun startFailureReportIsDeduplicatedWhilePendingAndRateLimitedAfterUpload() {
+        assertTrue(
+            automaticDiagnosticsShouldQueueStartFailure(
+                pendingExists = false,
+                lastQueuedAt = 0,
+                now = 1_000,
+                cooldownSeconds = 900,
+            ),
+        )
+        assertTrue(
+            !automaticDiagnosticsShouldQueueStartFailure(
+                pendingExists = true,
+                lastQueuedAt = 100,
+                now = 2_000,
+                cooldownSeconds = 900,
+            ),
+        )
+        assertTrue(
+            !automaticDiagnosticsShouldQueueStartFailure(
+                pendingExists = false,
+                lastQueuedAt = 1_000,
+                now = 1_899,
+                cooldownSeconds = 900,
+            ),
+        )
+        assertTrue(
+            automaticDiagnosticsShouldQueueStartFailure(
+                pendingExists = false,
+                lastQueuedAt = 1_000,
+                now = 1_900,
+                cooldownSeconds = 900,
+            ),
+        )
+    }
+
+    @Test
+    fun startFailureReportsAndPendingWorkAreScopedToTheDevice() {
+        val firstDevice = "11111111-1111-4111-8111-111111111111"
+        val secondDevice = "22222222-2222-4222-8222-222222222222"
+        val reportName = automaticDiagnosticsPendingReportName(
+            1_000,
+            firstDevice,
+            "33333333-3333-4333-8333-333333333333",
+        )
+
+        assertEquals(firstDevice, automaticDiagnosticsPendingReportScope(reportName))
+        assertTrue(
+            automaticDiagnosticsHasPendingWork(
+                emptyList(),
+                stoppedSessionPending = false,
+                pendingSeal = false,
+                deviceId = firstDevice,
+                pendingStartFailure = true,
+            ),
+        )
+        assertTrue(
+            !automaticDiagnosticsHasPendingWork(
+                listOf(reportName),
+                stoppedSessionPending = false,
+                pendingSeal = false,
+                deviceId = secondDevice,
+                pendingStartFailure = false,
+            ),
+        )
     }
 
     @Test

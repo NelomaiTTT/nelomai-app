@@ -10,9 +10,44 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(40);
+
+struct RequestWatchdog {
+    completed: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl RequestWatchdog {
+    fn arm() -> Result<Self, ServiceError> {
+        let completed = Arc::new((Mutex::new(false), Condvar::new()));
+        let completed_for_thread = Arc::clone(&completed);
+        std::thread::Builder::new()
+            .name("nelomai-helper-watchdog".to_string())
+            .spawn(move || {
+                let (lock, condition) = &*completed_for_thread;
+                let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let (guard, timeout) = condition
+                    .wait_timeout_while(guard, REQUEST_WATCHDOG_TIMEOUT, |completed| !*completed)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if timeout.timed_out() && !*guard {
+                    eprintln!("nelomai tunnel helper request watchdog expired");
+                    std::process::exit(1);
+                }
+            })
+            .map_err(transport_error)?;
+        Ok(Self { completed })
+    }
+
+    fn complete(self) {
+        let (lock, condition) = &*self.completed;
+        let mut completed = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *completed = true;
+        condition.notify_one();
+    }
+}
 
 pub struct UnixSocketTransport {
     path: PathBuf,
@@ -109,7 +144,12 @@ pub fn serve_one<B: ServiceTunnelBackend>(
     authorize_peer(policy, &identity)?;
 
     let response = match read_frame(&mut stream).and_then(|frame| decode_request(&frame)) {
-        Ok(request) => handler.handle(request),
+        Ok(request) => {
+            let watchdog = RequestWatchdog::arm()?;
+            let response = handler.handle(request);
+            watchdog.complete();
+            response
+        }
         Err(error) => Response::failure(error.code()),
     };
     let frame = encode_response(&response)?;

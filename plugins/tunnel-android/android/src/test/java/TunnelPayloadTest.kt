@@ -1,10 +1,25 @@
 package ru.nelomai.tunnel
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TunnelPayloadTest {
+    @Test
+    fun operationWatchdogExpiresOnlyTheCurrentUnfinishedOperation() {
+        val gate = TunnelOperationWatchdogGate()
+        val completed = gate.begin()
+
+        assertTrue(gate.complete(completed))
+        assertFalse(gate.expire(completed))
+
+        val stale = gate.begin()
+        val current = gate.begin()
+        assertFalse(gate.expire(stale))
+        assertTrue(gate.expire(current))
+    }
+
     @Test
     fun payloadIsWipedAfterSuccessfulUse() {
         val payload = "PrivateKey = secret".encodeToByteArray()

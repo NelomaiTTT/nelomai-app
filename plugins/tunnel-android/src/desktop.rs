@@ -49,6 +49,13 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(())
     }
 
+    pub async fn queue_start_failure_diagnostics_async(
+        &self,
+        _request: StartFailureDiagnosticsRequest,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
     pub async fn update_quick_dns_async(&self, _request: DnsServersRequest) -> crate::Result<()> {
         Ok(())
     }

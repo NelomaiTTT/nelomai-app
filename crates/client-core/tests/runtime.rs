@@ -16,6 +16,7 @@ use nelomai_contracts::{
     ConnectionStartResponse, Device, Layer, LeaseStatus, PeerBinding, Platform, RouteMode,
     TicConnectionMode, UpdateState,
 };
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -83,6 +84,9 @@ struct MemoryTunnel {
     starts: AtomicUsize,
     stops: AtomicUsize,
     fail_next_starts: AtomicUsize,
+    fail_next_stops: AtomicUsize,
+    leave_running_on_start_failure: AtomicBool,
+    leave_failed_on_start_failure: AtomicBool,
     status_failures: AtomicUsize,
     configuration: Mutex<Option<String>>,
     options: Mutex<Option<TunnelOptions>>,
@@ -100,7 +104,14 @@ impl TunnelController for MemoryTunnel {
             })
             .is_ok()
         {
-            *self.status.lock().unwrap() = TunnelStatus::Stopped;
+            *self.status.lock().unwrap() =
+                if self.leave_running_on_start_failure.load(Ordering::SeqCst) {
+                    TunnelStatus::Running
+                } else if self.leave_failed_on_start_failure.load(Ordering::SeqCst) {
+                    TunnelStatus::Failed
+                } else {
+                    TunnelStatus::Stopped
+                };
             return Err(TunnelError::Backend("test_start_failed".to_string()));
         }
         *self.configuration.lock().unwrap() = Some(request.configuration.expose().to_string());
@@ -111,6 +122,15 @@ impl TunnelController for MemoryTunnel {
 
     async fn stop(&self) -> Result<(), TunnelError> {
         self.stops.fetch_add(1, Ordering::SeqCst);
+        if self
+            .fail_next_stops
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(TunnelError::Backend("test_stop_failed".to_string()));
+        }
         *self.status.lock().unwrap() = TunnelStatus::Stopped;
         Ok(())
     }
@@ -133,6 +153,7 @@ struct MockApi {
     refresh_calls: AtomicUsize,
     start_calls: AtomicUsize,
     start_failures: AtomicUsize,
+    start_errors: Mutex<VecDeque<CoreApiError>>,
     operation_ids: Mutex<Vec<String>>,
     stop_calls: AtomicUsize,
     stop_failures: AtomicUsize,
@@ -157,6 +178,7 @@ impl MockApi {
             refresh_calls: AtomicUsize::new(0),
             start_calls: AtomicUsize::new(0),
             start_failures: AtomicUsize::new(start_failures),
+            start_errors: Mutex::new(VecDeque::new()),
             operation_ids: Mutex::new(Vec::new()),
             stop_calls: AtomicUsize::new(0),
             stop_failures: AtomicUsize::new(0),
@@ -225,6 +247,9 @@ impl CoreApi for MockApi {
             .push(request.operation_id.clone());
         if self.reject_stale_start.load(Ordering::SeqCst) && access_token == "stale-access" {
             return Err(CoreApiError::Unauthorized);
+        }
+        if let Some(error) = self.start_errors.lock().unwrap().pop_front() {
+            return Err(error);
         }
         if self
             .start_failures
@@ -549,6 +574,56 @@ async fn local_start_failure_stops_the_panel_lease_and_returns_to_ready() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn partial_local_start_failure_is_cleaned_up_by_a_later_stop_retry() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    tunnel
+        .leave_running_on_start_failure
+        .store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+
+    core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    core.stop().await.unwrap();
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_local_status_is_cleaned_up_by_a_later_stop_retry() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    tunnel
+        .leave_failed_on_start_failure
+        .store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+
+    core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    core.stop().await.unwrap();
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn storage_failure_before_start_never_allocates_a_panel_lease() {
     let api = Arc::new(MockApi::new(0));
     let tunnel = Arc::new(MemoryTunnel::default());
@@ -707,6 +782,30 @@ async fn failed_panel_stop_can_be_retried_after_the_local_tunnel_is_stopped() {
 
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 2);
     assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_local_stop_stays_pending_and_can_be_retried() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+
+    assert!(core.stop().await.is_err());
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+
+    core.stop().await.unwrap();
+
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 2);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
     assert_eq!(core.state().await.phase, Phase::Ready);
 }
 
@@ -1086,6 +1185,74 @@ async fn retries_reuse_one_operation_id_and_stop_after_the_bound() {
     let ids = api.operation_ids.lock().unwrap();
     assert_eq!(ids.len(), 3);
     assert!(ids.iter().all(|value| value == &ids[0]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn finished_tic_start_operation_is_replaced_once() {
+    let api = Arc::new(MockApi::new(0));
+    api.start_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Rejected {
+            code: "connection_no_longer_active".to_string(),
+            message: "Это подключение уже завершено. Начните новое.".to_string(),
+        });
+    let store = Arc::new(MemoryStore::new(auth()));
+    let logger = Arc::new(MemoryLogger::default());
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        logger.clone(),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    let fixed = ConnectOptions {
+        layer: Layer::Tic,
+        tic_connection_mode: TicConnectionMode::Personal,
+        route_mode: RouteMode::ViaTak,
+        probes: Vec::new(),
+        allow_alternate: false,
+    };
+
+    core.start(fixed, 1_700_000_000).await.unwrap();
+
+    let operation_ids = api.operation_ids.lock().unwrap();
+    assert_eq!(operation_ids.len(), 2);
+    assert_ne!(operation_ids[0], operation_ids[1]);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.start_operation_replaced"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn configuration_fetch_failure_does_not_retry_a_finished_operation() {
+    let api = Arc::new(MockApi::new(0));
+    api.start_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Rejected {
+            code: "configuration_fetch_failed".to_string(),
+            message: "Не удалось получить конфигурацию. Повторите попытку.".to_string(),
+        });
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(vec![0, 0, 0]));
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(error.to_string().contains("configuration_fetch_failed"));
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(core.state().await.phase, Phase::ServerUnavailable);
 }
 
 #[tokio::test(flavor = "current_thread")]

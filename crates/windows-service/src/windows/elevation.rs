@@ -6,15 +6,17 @@ use std::ptr::null_mut;
 use thiserror::Error;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_CANCELLED, ERROR_INSUFFICIENT_BUFFER, HANDLE,
-    WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
+    GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+const REPAIR_PROCESS_TIMEOUT_MILLIS: u32 = 120_000;
 
 #[derive(Debug, Error)]
 pub enum RepairError {
@@ -126,7 +128,15 @@ fn run_elevated(executable: &Path, parameters: &str) -> Result<(), RepairError> 
     }
 
     let process = OwnedHandle(execute_info.hProcess);
-    let wait_result = unsafe { WaitForSingleObject(process.raw(), INFINITE) };
+    let wait_result = unsafe { WaitForSingleObject(process.raw(), REPAIR_PROCESS_TIMEOUT_MILLIS) };
+    if wait_result == WAIT_TIMEOUT {
+        unsafe {
+            TerminateProcess(process.raw(), 1);
+        }
+        return Err(RepairError::AuthorizationUnavailable(
+            "service installer timed out".to_string(),
+        ));
+    }
     if wait_result == WAIT_FAILED {
         return Err(last_authorization_error(
             "wait for elevated service installer",

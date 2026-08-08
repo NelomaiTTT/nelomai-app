@@ -68,6 +68,16 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub async fn queue_start_failure_diagnostics_async(
+        &self,
+        request: StartFailureDiagnosticsRequest,
+    ) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin_async::<()>("queueStartFailureDiagnostics", request)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn update_quick_dns_async(&self, request: DnsServersRequest) -> crate::Result<()> {
         self.0
             .run_mobile_plugin_async::<()>("updateQuickDns", request)

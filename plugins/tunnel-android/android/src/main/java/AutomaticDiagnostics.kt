@@ -9,10 +9,13 @@ import android.content.ComponentName
 import android.content.Context
 import android.os.Build
 import android.os.Process
+import android.system.Os
+import android.system.OsConstants
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.UUID
@@ -29,8 +32,12 @@ private const val AUTOMATIC_DIAGNOSTICS_PREFERENCES = "nelomai-automatic-diagnos
 private const val AUTOMATIC_DIAGNOSTICS_DIRECTORY = "diagnostics/automatic"
 private const val PENDING_DIRECTORY = "pending"
 private const val SENT_DIRECTORY = "sent"
+private const val START_FAILURE_DIRECTORY = "start-failures"
 private const val REPORT_SUFFIX = ".json.gz"
+private const val START_FAILURE_REQUEST_SUFFIX = ".json"
 private const val CHECKPOINT_INTERVAL_SECONDS = 6 * 60 * 60L
+private const val START_FAILURE_WINDOW_SECONDS = 15 * 60L
+private const val START_FAILURE_COOLDOWN_SECONDS = 15 * 60L
 private const val SUCCESS_UPLOAD_SPACING_SECONDS = 65L
 private const val MAX_SENT_REPORTS = 3
 private const val MAX_APPLICATION_LOG_BYTES = 320 * 1024
@@ -80,6 +87,9 @@ internal object AutomaticDiagnostics {
     private val systemJobRunning = AtomicBoolean(false)
     private val executor = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "nelomai-automatic-diagnostics").apply { isDaemon = true }
+    }
+    private val startFailureExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "nelomai-start-failure-diagnostics").apply { isDaemon = true }
     }
     private var checkpointFuture: ScheduledFuture<*>? = null
     private var uploadFuture: ScheduledFuture<*>? = null
@@ -152,6 +162,29 @@ internal object AutomaticDiagnostics {
                 }
             }
             scheduleUploadLocked(applicationContext, requestedDelaySeconds = 0)
+        }
+    }
+
+    fun onConnectionStartFailed(
+        context: Context,
+        deviceId: String,
+        errorCode: String,
+        onComplete: (Throwable?) -> Unit,
+    ) {
+        val applicationContext = context.applicationContext
+        startFailureExecutor.execute {
+            val failure = runCatching {
+                synchronized(gate) {
+                    queueConnectionStartFailure(applicationContext, deviceId, errorCode)
+                }
+            }
+            failure.exceptionOrNull()?.let { error ->
+                TunnelLog.warning(
+                    "diagnostics.start_failure_report_queue_failed",
+                    error = error,
+                )
+            }
+            onComplete(failure.exceptionOrNull())
         }
     }
 
@@ -345,6 +378,129 @@ internal object AutomaticDiagnostics {
         }
     }
 
+    private fun queueConnectionStartFailure(
+        context: Context,
+        deviceId: String,
+        errorCode: String,
+    ) {
+        ensureDirectories(context)
+        TunnelLog.warning("diagnostics.connection_start_failed", errorCode.take(80))
+        val now = nowUnix()
+        var queuedRequest: StartFailureRequest? = null
+        var pendingExists = false
+        withStartFailureLock(context) {
+            val requestFile = startFailureRequestFile(context, deviceId)
+            val existing = readStartFailureRequestOrQuarantine(context, requestFile, deviceId)
+            pendingExists = existing?.sent == false
+            if (automaticDiagnosticsShouldQueueStartFailure(
+                    pendingExists = pendingExists,
+                    lastQueuedAt = existing?.queuedAt ?: 0,
+                    now = now,
+                    cooldownSeconds = START_FAILURE_COOLDOWN_SECONDS,
+                )
+            ) {
+                queuedRequest = StartFailureRequest(
+                    reportId = UUID.randomUUID().toString(),
+                    deviceId = deviceId,
+                    errorCode = errorCode.take(80),
+                    queuedAt = now,
+                    sent = false,
+                ).also {
+                    writeStartFailureRequest(requestFile, it)
+                    // Persist the OS job immediately after the durable marker. Report
+                    // materialization below may be interrupted by process termination.
+                    scheduleSystemUpload(context, delaySeconds = 0)
+                }
+            }
+        }
+        if (queuedRequest == null && pendingExists) {
+            // Repair an earlier marker whose scheduling window was interrupted.
+            scheduleSystemUpload(context, delaySeconds = 0)
+        }
+        if (queuedRequest == null) {
+            TunnelLog.info(
+                "diagnostics.start_failure_report_deduplicated",
+                mapOf("code" to errorCode, "pending" to pendingExists),
+            )
+        } else {
+            TunnelLog.info(
+                "diagnostics.start_failure_report_queued",
+                mapOf("report_id" to queuedRequest?.reportId, "code" to errorCode),
+            )
+        }
+        try {
+            materializeStartFailureRequest(context, deviceId)
+        } finally {
+            scheduleSystemUpload(context, delaySeconds = 0)
+        }
+    }
+
+    private fun materializeStartFailureRequest(
+        context: Context,
+        requestedDeviceId: String? = null,
+    ) {
+        val deviceId = requestedDeviceId
+            ?: BackgroundCredentialStore.load(context)?.deviceId
+            ?: return
+        withStartFailureLock(context) {
+            val requestFile = startFailureRequestFile(context, deviceId)
+            val request = readStartFailureRequestOrQuarantine(context, requestFile, deviceId)
+                ?.takeUnless { it.sent }
+                ?: return@withStartFailureLock
+            val pendingReport = File(pendingDirectory(context), request.reportName)
+            if (pendingReport.isFile) return@withStartFailureLock
+            if (File(sentDirectory(context), request.reportName).isFile) {
+                writeStartFailureRequest(requestFile, request.copy(sent = true))
+                return@withStartFailureLock
+            }
+            TunnelLog.info(
+                "diagnostics.start_failure_report_materialized",
+                mapOf("report_id" to request.reportId, "code" to request.errorCode),
+            )
+            writePendingReport(
+                pendingReport,
+                buildStartFailureReport(
+                    context,
+                    request.reportId,
+                    request.queuedAt,
+                    request.errorCode,
+                ),
+            )
+        }
+    }
+
+    private fun buildStartFailureReport(
+        context: Context,
+        reportId: String,
+        endedAt: Long,
+        errorCode: String,
+    ): JSONObject {
+        val startedAt = (endedAt - START_FAILURE_WINDOW_SECONDS).coerceAtLeast(0)
+        val processes = androidProcessMemory(context)
+        logMemorySnapshot(context.packageName, processes)
+        return JSONObject().apply {
+            put("report_id", reportId)
+            put("trigger", "connection_start_failed")
+            put("generated_at_unix", endedAt)
+            put("app_version", appVersion(context))
+            put("platform_version", Build.VERSION.RELEASE.takeIf(String::isNotBlank))
+            put("architecture", Build.SUPPORTED_ABIS.firstOrNull()?.take(32) ?: "unknown")
+            put("application_log", applicationLog(context, startedAt, endedAt))
+            put(
+                "helper_log",
+                startFailureHelperLog(context, startedAt, endedAt, errorCode),
+            )
+            put(
+                "resource_usage",
+                JSONObject().apply {
+                    put("measurement_mode", "session_delta")
+                    put("session_duration_ms", 0)
+                    put("components", resourceComponents(processes))
+                },
+            )
+        }
+    }
+
     private fun writePendingReport(finalFile: File, payload: JSONObject) {
         val directory = requireNotNull(finalFile.parentFile)
         val temporaryFile = File(directory, ".${finalFile.name}.part")
@@ -359,7 +515,8 @@ internal object AutomaticDiagnostics {
                 output.fd.sync()
                 gzip.close()
             }
-            check(temporaryFile.renameTo(finalFile)) { "automatic_diagnostics_report_move_failed" }
+            Os.rename(temporaryFile.absolutePath, finalFile.absolutePath)
+            fsyncDirectory(directory)
         } finally {
             encoded.fill(0)
             temporaryFile.delete()
@@ -436,31 +593,60 @@ internal object AutomaticDiagnostics {
     }
 
     private fun processNext(context: Context): Boolean {
-        synchronized(gate) {
-            val preferences = preferences(context)
-            if (!preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
-                preferences.edit()
-                    .remove(KEY_STOPPED_SESSION_PENDING)
-                    .remove(KEY_PENDING_SEAL)
-                    .apply()
-            } else if (preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
-                if (!sealCurrentInterval(context, "tunnel_stopped", tunnelRunning = false)) {
-                    scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
-                    return true
+        var startFailureMaterializationFailed = false
+        try {
+            synchronized(gate) {
+                runCatching {
+                    materializeStartFailureRequest(context)
+                }.onFailure { error ->
+                    startFailureMaterializationFailed = true
+                    TunnelLog.warning(
+                        "diagnostics.report_materialization_failed",
+                        "automatic_diagnostics_report_queue_failed",
+                        error,
+                    )
                 }
-            } else {
-                val seal = loadPendingSeal(preferences)
-                if (seal == null && preferences.contains(KEY_PENDING_SEAL)) {
-                    preferences.edit().remove(KEY_PENDING_SEAL).apply()
-                }
-                seal?.let {
-                    if (!sealCurrentInterval(context, it.trigger, it.tunnelRunning)) {
+                val preferences = preferences(context)
+                if (!preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
+                    preferences.edit()
+                        .remove(KEY_STOPPED_SESSION_PENDING)
+                        .remove(KEY_PENDING_SEAL)
+                        .apply()
+                } else if (preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
+                    if (!sealCurrentInterval(context, "tunnel_stopped", tunnelRunning = false)) {
                         scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
                         return true
                     }
+                } else {
+                    val seal = loadPendingSeal(preferences)
+                    if (seal == null && preferences.contains(KEY_PENDING_SEAL)) {
+                        preferences.edit().remove(KEY_PENDING_SEAL).apply()
+                    }
+                    seal?.let {
+                        if (!sealCurrentInterval(context, it.trigger, it.tunnelRunning)) {
+                            scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
+                            return true
+                        }
+                    }
                 }
+                Unit
             }
-            Unit
+        } catch (error: Throwable) {
+            TunnelLog.warning(
+                "diagnostics.report_materialization_failed",
+                "automatic_diagnostics_report_queue_failed",
+                error,
+            )
+            scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
+            return true
+        }
+        val hasUploadableReport = BackgroundCredentialStore.load(context)?.deviceId?.let { deviceId ->
+            pendingReports(context).any {
+                automaticDiagnosticsPendingReportScope(it.name) == deviceId
+            }
+        } == true
+        if (startFailureMaterializationFailed && !hasUploadableReport) {
+            scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
         }
         return uploadNext(context)
     }
@@ -551,6 +737,7 @@ internal object AutomaticDiagnostics {
     private fun markSent(context: Context, report: File) {
         val destination = File(sentDirectory(context), report.name)
         check(report.renameTo(destination)) { "automatic_diagnostics_sent_move_failed" }
+        markStartFailureRequestSent(context, report.name)
         pruneSent(context)
     }
 
@@ -574,13 +761,18 @@ internal object AutomaticDiagnostics {
             .filter { it.isFile && it.name.endsWith(REPORT_SUFFIX) }
             .sortedBy(File::getName)
 
-    private fun hasPendingWork(context: Context): Boolean =
-        automaticDiagnosticsHasPendingWork(
+    private fun hasPendingWork(context: Context): Boolean {
+        val deviceId = BackgroundCredentialStore.load(context)?.deviceId
+        return automaticDiagnosticsHasPendingWork(
             pendingReports(context).map(File::getName),
             preferences(context).getBoolean(KEY_STOPPED_SESSION_PENDING, false),
             preferences(context).contains(KEY_PENDING_SEAL),
-            BackgroundCredentialStore.load(context)?.deviceId,
+            deviceId,
+            deviceId?.let {
+                hasPendingStartFailureRequest(context, it)
+            } == true,
         )
+    }
 
     private fun markStoppedSessionPending(context: Context) {
         val saved = preferences(context).edit()
@@ -593,6 +785,7 @@ internal object AutomaticDiagnostics {
     private fun ensureDirectories(context: Context) {
         check(pendingDirectory(context).mkdirs() || pendingDirectory(context).isDirectory)
         check(sentDirectory(context).mkdirs() || sentDirectory(context).isDirectory)
+        check(startFailureDirectory(context).mkdirs() || startFailureDirectory(context).isDirectory)
     }
 
     private fun pendingDirectory(context: Context): File =
@@ -600,6 +793,108 @@ internal object AutomaticDiagnostics {
 
     private fun sentDirectory(context: Context): File =
         File(context.applicationInfo.dataDir, "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$SENT_DIRECTORY")
+
+    private fun startFailureDirectory(context: Context): File =
+        File(context.applicationInfo.dataDir, "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$START_FAILURE_DIRECTORY")
+
+    private fun startFailureRequestFile(context: Context, deviceId: String): File =
+        File(startFailureDirectory(context), "$deviceId$START_FAILURE_REQUEST_SUFFIX")
+
+    private fun startFailureLockFile(context: Context): File =
+        File(startFailureDirectory(context), ".queue.lock")
+
+    private fun <T> withStartFailureLock(context: Context, action: () -> T): T {
+        ensureDirectories(context)
+        return RandomAccessFile(startFailureLockFile(context), "rw").use { lockFile ->
+            lockFile.channel.use { channel ->
+                channel.lock().use { action() }
+            }
+        }
+    }
+
+    private fun readStartFailureRequest(
+        file: File,
+        expectedDeviceId: String,
+    ): StartFailureRequest? {
+        if (!file.isFile) return null
+        check(file.length() <= 4 * 1024L) { "automatic_diagnostics_start_failure_request_too_large" }
+        return StartFailureRequest.fromJson(file.readText(StandardCharsets.UTF_8)).also {
+            check(it.deviceId == expectedDeviceId) {
+                "automatic_diagnostics_start_failure_request_device_mismatch"
+            }
+        }
+    }
+
+    private fun readStartFailureRequestOrQuarantine(
+        context: Context,
+        file: File,
+        expectedDeviceId: String,
+    ): StartFailureRequest? = try {
+        readStartFailureRequest(file, expectedDeviceId)
+    } catch (error: Throwable) {
+        val quarantineFile = File(
+            startFailureDirectory(context),
+            "${file.name}.corrupt-${nowUnix()}-${UUID.randomUUID()}",
+        )
+        try {
+            Os.rename(file.absolutePath, quarantineFile.absolutePath)
+            fsyncDirectory(requireNotNull(file.parentFile))
+        } catch (quarantineError: Throwable) {
+            error.addSuppressed(quarantineError)
+            throw error
+        }
+        TunnelLog.warning(
+            "diagnostics.start_failure_request_quarantined",
+            "invalid_start_failure_request",
+            error,
+        )
+        null
+    }
+
+    private fun writeStartFailureRequest(file: File, request: StartFailureRequest) {
+        val temporaryFile = File(requireNotNull(file.parentFile), ".${file.name}.part")
+        val encoded = request.toJson().toByteArray(StandardCharsets.UTF_8)
+        try {
+            FileOutputStream(temporaryFile).use { output ->
+                output.write(encoded)
+                output.flush()
+                output.fd.sync()
+            }
+            Os.rename(temporaryFile.absolutePath, file.absolutePath)
+            fsyncDirectory(requireNotNull(file.parentFile))
+        } finally {
+            encoded.fill(0)
+            temporaryFile.delete()
+        }
+    }
+
+    private fun hasPendingStartFailureRequest(context: Context, deviceId: String): Boolean =
+        withStartFailureLock(context) {
+            val file = startFailureRequestFile(context, deviceId)
+            if (!file.isFile) return@withStartFailureLock false
+            readStartFailureRequestOrQuarantine(context, file, deviceId)?.sent == false
+        }
+
+    private fun markStartFailureRequestSent(context: Context, reportName: String) {
+        val deviceId = automaticDiagnosticsPendingReportScope(reportName) ?: return
+        withStartFailureLock(context) {
+            val file = startFailureRequestFile(context, deviceId)
+            val request = readStartFailureRequestOrQuarantine(context, file, deviceId)
+                ?: return@withStartFailureLock
+            if (!request.sent && request.reportName == reportName) {
+                writeStartFailureRequest(file, request.copy(sent = true))
+            }
+        }
+    }
+
+    private fun fsyncDirectory(directory: File) {
+        val descriptor = Os.open(directory.absolutePath, OsConstants.O_RDONLY, 0)
+        try {
+            Os.fsync(descriptor)
+        } finally {
+            Os.close(descriptor)
+        }
+    }
 
     private fun preferences(context: Context) = context.getSharedPreferences(
         AUTOMATIC_DIAGNOSTICS_PREFERENCES,
@@ -768,6 +1063,28 @@ private fun intervalLog(
     ).takeLast(maximum)
 }
 
+private fun startFailureHelperLog(
+    context: Context,
+    startedAt: Long,
+    endedAt: Long,
+    errorCode: String,
+): String {
+    val interval = intervalLog(
+        context,
+        "android-tunnel",
+        MAX_HELPER_LOG_BYTES,
+        startedAt,
+        endedAt,
+    )
+    val durableEvent = JSONObject().apply {
+        put("timestamp", Instant.ofEpochSecond(endedAt).toString())
+        put("level", "warning")
+        put("event", "diagnostics.connection_start_failed")
+        put("code", errorCode.take(80))
+    }.toString() + "\n"
+    return (interval + durableEvent).takeLast(MAX_HELPER_LOG_BYTES)
+}
+
 private fun applicationLog(context: Context, startedAt: Long, endedAt: Long): String {
     val interval = intervalLog(
         context,
@@ -846,6 +1163,15 @@ private fun nowUnix(): Long = System.currentTimeMillis() / 1000L
 internal fun automaticDiagnosticsRetryDelaySeconds(attempt: Int): Long =
     RETRY_DELAYS_SECONDS[attempt.coerceAtLeast(0).coerceAtMost(RETRY_DELAYS_SECONDS.lastIndex)]
 
+internal fun automaticDiagnosticsShouldQueueStartFailure(
+    pendingExists: Boolean,
+    lastQueuedAt: Long,
+    now: Long,
+    cooldownSeconds: Long,
+): Boolean =
+    !pendingExists &&
+        (lastQueuedAt <= 0 || now < lastQueuedAt || now - lastQueuedAt >= cooldownSeconds)
+
 internal fun automaticDiagnosticsNextPendingReport(
     names: List<String>,
     lastAttempted: String?,
@@ -867,6 +1193,44 @@ internal fun automaticDiagnosticsPendingReportName(
     REPORT_SUFFIX,
 )
 
+internal data class StartFailureRequest(
+    val reportId: String,
+    val deviceId: String,
+    val errorCode: String,
+    val queuedAt: Long,
+    val sent: Boolean,
+) {
+    val reportName: String
+        get() = automaticDiagnosticsPendingReportName(queuedAt, deviceId, reportId)
+
+    fun toJson(): String = JSONObject().apply {
+        put("format", 1)
+        put("report_id", reportId)
+        put("device_id", deviceId)
+        put("error_code", errorCode)
+        put("queued_at", queuedAt)
+        put("sent", sent)
+    }.toString()
+
+    companion object {
+        fun fromJson(value: String): StartFailureRequest {
+            val payload = JSONObject(value)
+            check(payload.getInt("format") == 1) { "invalid_start_failure_request_format" }
+            val reportId = UUID.fromString(payload.getString("report_id")).toString()
+            val deviceId = UUID.fromString(payload.getString("device_id")).toString()
+            check(reportId == payload.getString("report_id")) { "invalid_start_failure_report_id" }
+            check(deviceId == payload.getString("device_id")) { "invalid_start_failure_device_id" }
+            return StartFailureRequest(
+                reportId = reportId,
+                deviceId = deviceId,
+                errorCode = payload.getString("error_code").take(80),
+                queuedAt = payload.getLong("queued_at").coerceAtLeast(0),
+                sent = payload.getBoolean("sent"),
+            )
+        }
+    }
+}
+
 internal fun automaticDiagnosticsPendingReportScope(name: String): String? {
     if (!name.endsWith(REPORT_SUFFIX)) return null
     val parts = name.removeSuffix(REPORT_SUFFIX).split('_')
@@ -881,9 +1245,11 @@ internal fun automaticDiagnosticsHasPendingWork(
     stoppedSessionPending: Boolean,
     pendingSeal: Boolean,
     deviceId: String?,
+    pendingStartFailure: Boolean = false,
 ): Boolean =
     stoppedSessionPending ||
         pendingSeal ||
+        pendingStartFailure ||
         deviceId != null && reportNames.any {
             automaticDiagnosticsPendingReportScope(it) == deviceId
         }

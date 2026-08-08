@@ -38,6 +38,7 @@ use windows_sys::Win32::System::Threading::{
 
 const PIPE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const PIPE_RECREATE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+const PIPE_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct NamedPipeTransport;
 
@@ -56,9 +57,13 @@ impl Default for NamedPipeTransport {
 #[async_trait]
 impl ServiceTransport for NamedPipeTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
-        tokio::task::spawn_blocking(move || exchange_blocking(request))
-            .await
-            .map_err(|error| platform_error("join named pipe operation", error))?
+        tokio::time::timeout(
+            PIPE_EXCHANGE_TIMEOUT,
+            tokio::task::spawn_blocking(move || exchange_blocking(request)),
+        )
+        .await
+        .map_err(|_| ServiceError::Backend("service_timeout".to_string()))?
+        .map_err(|error| platform_error("join named pipe operation", error))?
     }
 }
 

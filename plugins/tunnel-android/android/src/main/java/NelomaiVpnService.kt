@@ -18,6 +18,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.wireguard.android.backend.GoBackend
+import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
 class NelomaiVpnService : GoBackend.VpnService() {
@@ -68,6 +69,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 restoreDesiredTunnel("ensure_running")
             }
             intent?.action == ACTION_CLIENT_START -> handleClientStart(intent)
+            intent?.action == ACTION_CANCEL_CLIENT_START -> handleCancelClientStart(intent)
             intent?.action == ACTION_CLIENT_STOP -> handleClientStop(intent)
             intent?.action == ACTION_CLIENT_STATUS -> handleClientStatus(intent)
             intent?.action == ACTION_CLIENT_METRICS -> handleClientMetrics(intent)
@@ -97,6 +99,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
         val args = try {
             StartTunnelArgs().apply {
                 apiVersion = intent.getIntExtra(EXTRA_API_VERSION, 0)
+                clientOperationId = UUID.fromString(
+                    requireNotNull(intent.getStringExtra(EXTRA_CLIENT_OPERATION_ID)),
+                ).toString()
                 startSource = intent.getStringExtra(EXTRA_START_SOURCE) ?: "ui"
                 this.configuration = requireNotNull(configuration)
                 options = requireNotNull(intent.getBundleExtra(EXTRA_OPTIONS)).toTunnelOptions()
@@ -143,6 +148,19 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 stopIfIdle()
             },
         )
+    }
+
+    private fun handleCancelClientStart(intent: Intent) {
+        val clientOperationId = runCatching {
+            UUID.fromString(
+                requireNotNull(intent.getStringExtra(EXTRA_CLIENT_OPERATION_ID)),
+            ).toString()
+        }.getOrNull() ?: run {
+            stopIfIdle()
+            return
+        }
+        TunnelRuntime.cancelClientStart(applicationContext, clientOperationId)
+        stopIfIdle()
     }
 
     private fun handleClientStop(intent: Intent) {
@@ -361,8 +379,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
         } else {
             TunnelRuntime.backgroundStop(
                 applicationContext,
-                onSuccess = { state, _ -> completeBackgroundAction(state, null, false) },
-                onError = { completeBackgroundAction(TunnelRuntime.state(), it, false) },
+                onSuccess = { state, _ -> completeBackgroundAction(state, null, false, false) },
+                onError = { completeBackgroundAction(TunnelRuntime.state(), it, false, false) },
             )
         }
     }
@@ -370,8 +388,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun performBackgroundStart(restoring: Boolean) {
         TunnelRuntime.backgroundStart(
             applicationContext,
-            onSuccess = { state, _ -> completeBackgroundAction(state, null, restoring) },
-            onError = { completeBackgroundAction(TunnelRuntime.state(), it, restoring) },
+            onSuccess = { state, _ -> completeBackgroundAction(state, null, restoring, true) },
+            onError = { completeBackgroundAction(TunnelRuntime.state(), it, restoring, true) },
         )
     }
 
@@ -400,12 +418,32 @@ class NelomaiVpnService : GoBackend.VpnService() {
         state: SessionState,
         errorCode: String?,
         restoring: Boolean,
+        starting: Boolean,
     ) {
         if (errorCode == "tunnel_operation_in_progress") {
             TunnelLog.info("quick_toggle.duplicate_ignored")
             TunnelPlugin.refreshQuickTile(applicationContext)
             return
         }
+        if (shouldQueueBackgroundStartFailureDiagnostics(starting, errorCode)) {
+            checkNotNull(errorCode)
+            TunnelLog.warning(
+                "background_start.failed",
+                errorCode,
+            )
+            queueBackgroundStartFailureDiagnostics(errorCode) {
+                finishBackgroundAction(state, errorCode, restoring)
+            }
+            return
+        }
+        finishBackgroundAction(state, errorCode, restoring)
+    }
+
+    private fun finishBackgroundAction(
+        state: SessionState,
+        errorCode: String?,
+        restoring: Boolean,
+    ) {
         val retryRestore = errorCode != null && restoring && shouldRetryServiceRestore(errorCode)
         if (retryRestore) {
             QuickTunnelController.updateState(
@@ -438,6 +476,26 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
     }
 
+    private fun queueBackgroundStartFailureDiagnostics(
+        errorCode: String,
+        onComplete: () -> Unit,
+    ) {
+        val deviceId = BackgroundCredentialStore.load(applicationContext)?.deviceId
+        if (deviceId == null) {
+            TunnelLog.warning(
+                "diagnostics.start_failure_report_queue_skipped",
+                "background_credential_unavailable",
+            )
+            onComplete()
+            return
+        }
+        AutomaticDiagnostics.onConnectionStartFailed(
+            applicationContext,
+            deviceId,
+            errorCode,
+        ) { onComplete() }
+    }
+
     private fun scheduleRestoreRetry() {
         restoreHandler.removeCallbacks(restoreRetry)
         val delay = RESTORE_RETRY_DELAYS_MILLIS[
@@ -464,6 +522,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
         internal const val ACTION_QUICK_TOGGLE = "ru.nelomai.tunnel.QUICK_TOGGLE"
         internal const val ACTION_ENSURE_RUNNING = "ru.nelomai.tunnel.ENSURE_RUNNING"
         internal const val ACTION_CLIENT_START = "ru.nelomai.tunnel.CLIENT_START"
+        internal const val ACTION_CANCEL_CLIENT_START =
+            "ru.nelomai.tunnel.CANCEL_CLIENT_START"
         internal const val ACTION_CLIENT_STOP = "ru.nelomai.tunnel.CLIENT_STOP"
         internal const val ACTION_CLIENT_STATUS = "ru.nelomai.tunnel.CLIENT_STATUS"
         internal const val ACTION_CLIENT_METRICS = "ru.nelomai.tunnel.CLIENT_METRICS"
@@ -574,6 +634,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
             .build()
     }
 }
+
+internal fun shouldQueueBackgroundStartFailureDiagnostics(
+    starting: Boolean,
+    errorCode: String?,
+): Boolean = starting && errorCode != null && errorCode != "tunnel_operation_in_progress"
 
 private fun ResultReceiver?.sendOperation(state: SessionState, durationMillis: Long) {
     this?.send(

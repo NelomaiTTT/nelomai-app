@@ -1,8 +1,94 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { createNativeClient } from "./native-client";
+import {
+  commandMessage,
+  createNativeClient,
+  waitForSettlement,
+} from "./native-client";
+
+function commandError(code: string, message = "server message") {
+  return { code, message };
+}
 
 describe("native client", () => {
+  it("gives network failures an action matching the current operation", () => {
+    const error = commandError(
+      "temporarily_unavailable",
+      "Не удалось связаться с панелью",
+    );
+
+    expect(commandMessage(error, "login")).toContain("попробуйте войти снова");
+    expect(commandMessage(error, "startup")).toContain("нажмите «Повторить»");
+    expect(commandMessage(error, "start")).toContain("нажмите «Старт» ещё раз");
+    expect(commandMessage(error, "stop")).toContain("Нажмите «Повторить»");
+  });
+
+  it("explains personal server failures without masking local VPN errors", () => {
+    const options = { personalPeer: true };
+
+    expect(
+      commandMessage(
+        commandError("configuration_fetch_failed"),
+        "start",
+        options,
+      ),
+    ).toBe(
+      "Ваш домашний сервер временно недоступен. Попробуйте позже или используйте динамический режим.",
+    );
+    expect(
+      commandMessage(commandError("personal_peer_unavailable"), "start", options),
+    ).toContain("Ваш домашний сервер временно недоступен");
+    expect(
+      commandMessage(commandError("vpn_permission_denied"), "start", options),
+    ).toContain("Разрешите VPN-подключение");
+  });
+
+  it("uses the actual retry and start button labels", () => {
+    expect(
+      commandMessage(commandError("connection_stop_failed"), "stop"),
+    ).toContain("Нажмите «Повторить»");
+    expect(
+      commandMessage(commandError("connection_no_longer_active"), "start"),
+    ).toBe("Нажмите «Старт» ещё раз");
+    expect(commandMessage(commandError("access_expired"), "startup")).toContain(
+      "нажмите «Проверить снова»",
+    );
+  });
+
+  it("keeps an unknown safe native message as the fallback", () => {
+    expect(
+      commandMessage(commandError("invalid_credentials", "Неверный логин или пароль."), "login"),
+    ).toBe("Неверный логин или пароль.");
+    expect(commandMessage(new Error("private detail"), "start")).toBe(
+      "Не удалось выполнить действие. Повторите попытку.",
+    );
+  });
+
+  it("stops waiting for a background task without cancelling it", async () => {
+    vi.useFakeTimers();
+    try {
+      let finishTask: (() => void) | undefined;
+      const task = new Promise<void>((resolve) => {
+        finishTask = resolve;
+      });
+      const waiting = waitForSettlement(task, 100);
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      await expect(waiting).resolves.toBe(false);
+      finishTask?.();
+      await task;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("finishes the UI wait when the background task rejects", async () => {
+    await expect(
+      waitForSettlement(Promise.reject(new Error("storage unavailable")), 100),
+    ).resolves.toBe(true);
+  });
+
   it("keeps credentials inside the login command request", async () => {
     const invoke = vi.fn().mockResolvedValue({ request_id: "bootstrap" });
     const client = createNativeClient(invoke);
@@ -45,6 +131,7 @@ describe("native client", () => {
 
     await client.refreshProbes("stray");
     await client.start({
+      deviceId: "11111111-1111-4111-8111-111111111111",
       layer: "stray",
       ticConnectionMode: "dynamic",
       routeMode: "standalone",
@@ -56,6 +143,7 @@ describe("native client", () => {
     });
     expect(invoke).toHaveBeenNthCalledWith(2, "app_start", {
       request: {
+        deviceId: "11111111-1111-4111-8111-111111111111",
         layer: "stray",
         ticConnectionMode: "dynamic",
         routeMode: "standalone",
@@ -68,9 +156,29 @@ describe("native client", () => {
     const invoke = vi.fn().mockResolvedValue(undefined);
     const client = createNativeClient(invoke);
 
-    await client.prepareTunnel();
+    await client.prepareTunnel("11111111-1111-4111-8111-111111111111");
 
-    expect(invoke).toHaveBeenCalledWith("app_prepare_tunnel");
+    expect(invoke).toHaveBeenCalledWith("app_prepare_tunnel", {
+      deviceId: "11111111-1111-4111-8111-111111111111",
+    });
+  });
+
+  it("queues start failure diagnostics with the authenticated device", async () => {
+    const invoke = vi.fn().mockResolvedValue(undefined);
+    const client = createNativeClient(invoke);
+
+    await client.queueStartFailureDiagnostics(
+      "11111111-1111-4111-8111-111111111111",
+      "configuration_fetch_failed",
+    );
+
+    expect(invoke).toHaveBeenCalledWith(
+      "app_queue_start_failure_diagnostics",
+      {
+        deviceId: "11111111-1111-4111-8111-111111111111",
+        errorCode: "configuration_fetch_failed",
+      },
+    );
   });
 
   it("routes desktop preferences through native commands", async () => {

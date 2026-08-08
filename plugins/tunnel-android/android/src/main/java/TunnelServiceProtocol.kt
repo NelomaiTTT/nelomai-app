@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ResultReceiver
 import androidx.core.content.ContextCompat
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal const val SERVICE_RESULT_OK = 1
@@ -35,7 +36,20 @@ internal const val EXTRA_EXPIRES_AT_UNIX = "expires_at_unix"
 internal const val EXTRA_CONFIGURED = "configured"
 internal const val EXTRA_CHANGED = "changed"
 internal const val EXTRA_DNS_SERVERS = "dns_servers"
+internal const val EXTRA_CLIENT_OPERATION_ID = "client_operation_id"
 private const val QUICK_DNS_UPDATE_TIMEOUT_MILLIS = 3_000L
+private const val SERVICE_REQUEST_TIMEOUT_MILLIS = 30_000L
+private const val SERVICE_REQUEST_TIMEOUT_ERROR = "tunnel_service_timeout"
+
+internal class ServiceRequestCompletion {
+    private val completed = AtomicBoolean(false)
+
+    fun finish(action: () -> Unit): Boolean {
+        if (!completed.compareAndSet(false, true)) return false
+        action()
+        return true
+    }
+}
 
 internal object TunnelServiceClient {
     fun start(
@@ -45,12 +59,14 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) {
         val configuration = args.configuration.copyOf()
+        val clientOperationId = UUID.randomUUID().toString()
         try {
-            dispatch(
+            requestBundle(
                 context,
                 Intent(context, NelomaiVpnService::class.java)
                     .setAction(NelomaiVpnService.ACTION_CLIENT_START)
                     .putExtra(EXTRA_API_VERSION, args.apiVersion)
+                    .putExtra(EXTRA_CLIENT_OPERATION_ID, clientOperationId)
                     .putExtra(EXTRA_START_SOURCE, args.startSource)
                     .putExtra(EXTRA_CONFIGURATION, configuration)
                     .putExtra(EXTRA_OPTIONS, args.options.toBundle())
@@ -59,13 +75,16 @@ internal object TunnelServiceClient {
                         EXTRA_QUICK_ACTION_VALID_UNTIL,
                         args.quickActionValidUntilUnix ?: Long.MIN_VALUE,
                     )
-                    .putExtra(EXTRA_QUICK_CONNECTION, args.quickConnection?.toBundle())
-                    .putExtra(
-                        EXTRA_RESULT_RECEIVER,
-                        operationReceiver(onSuccess, onError),
-                    ),
+                    .putExtra(EXTRA_QUICK_CONNECTION, args.quickConnection?.toBundle()),
+                { result ->
+                    val state = SessionState.values().firstOrNull {
+                        it.wireName == result.getString(EXTRA_STATE)
+                    } ?: SessionState.FAILED
+                    onSuccess(state, result.getLong(EXTRA_DURATION_MILLIS))
+                },
                 onError,
                 foreground = true,
+                onTimeout = { cancelClientStart(context, clientOperationId) },
             )
         } finally {
             args.configuration.fill(0)
@@ -78,12 +97,17 @@ internal object TunnelServiceClient {
         apiVersion: Int,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
-    ) = dispatch(
+    ) = requestBundle(
         context,
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_CLIENT_STOP)
-            .putExtra(EXTRA_API_VERSION, apiVersion)
-            .putExtra(EXTRA_RESULT_RECEIVER, operationReceiver(onSuccess, onError)),
+            .putExtra(EXTRA_API_VERSION, apiVersion),
+        { result ->
+            val state = SessionState.values().firstOrNull {
+                it.wireName == result.getString(EXTRA_STATE)
+            } ?: SessionState.FAILED
+            onSuccess(state, result.getLong(EXTRA_DURATION_MILLIS))
+        },
         onError,
     )
 
@@ -92,12 +116,17 @@ internal object TunnelServiceClient {
         apiVersion: Int,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
-    ) = dispatch(
+    ) = requestBundle(
         context,
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_CLIENT_STATUS)
-            .putExtra(EXTRA_API_VERSION, apiVersion)
-            .putExtra(EXTRA_RESULT_RECEIVER, operationReceiver(onSuccess, onError)),
+            .putExtra(EXTRA_API_VERSION, apiVersion),
+        { result ->
+            val state = SessionState.values().firstOrNull {
+                it.wireName == result.getString(EXTRA_STATE)
+            } ?: SessionState.FAILED
+            onSuccess(state, result.getLong(EXTRA_DURATION_MILLIS))
+        },
         onError,
     )
 
@@ -107,28 +136,19 @@ internal object TunnelServiceClient {
         probe: Boolean,
         onSuccess: (Long, Long, String?) -> Unit,
         onError: (String) -> Unit,
-    ) = dispatch(
+    ) = requestBundle(
         context,
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_CLIENT_METRICS)
             .putExtra(EXTRA_API_VERSION, apiVersion)
-            .putExtra(EXTRA_PROBE, probe)
-            .putExtra(
-                EXTRA_RESULT_RECEIVER,
-                object : ResultReceiver(Handler(Looper.getMainLooper())) {
-                    override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
-                        if (resultCode == SERVICE_RESULT_OK && resultData != null) {
-                            onSuccess(
-                                resultData.getLong(EXTRA_RECEIVED_BYTES),
-                                resultData.getLong(EXTRA_SENT_BYTES),
-                                resultData.getString(EXTRA_PROBE_TARGET),
-                            )
-                        } else {
-                            onError(resultData?.getString(EXTRA_ERROR_CODE) ?: "tunnel_backend_error")
-                        }
-                    }
-                },
-            ),
+            .putExtra(EXTRA_PROBE, probe),
+        { result ->
+            onSuccess(
+                result.getLong(EXTRA_RECEIVED_BYTES),
+                result.getLong(EXTRA_SENT_BYTES),
+                result.getString(EXTRA_PROBE_TARGET),
+            )
+        },
         onError,
     )
 
@@ -198,34 +218,15 @@ internal object TunnelServiceClient {
         dnsServers: ArrayList<String>,
         onSuccess: () -> Unit,
         onError: (String) -> Unit,
-    ) {
-        val completed = AtomicBoolean(false)
-        val handler = Handler(Looper.getMainLooper())
-        val timeout = Runnable {
-            if (completed.compareAndSet(false, true)) {
-                onError("tunnel_service_unavailable")
-            }
-        }
-        handler.postDelayed(timeout, QUICK_DNS_UPDATE_TIMEOUT_MILLIS)
-        requestBundle(
-            context,
-            Intent(context, NelomaiVpnService::class.java)
-                .setAction(NelomaiVpnService.ACTION_UPDATE_QUICK_DNS)
-                .putStringArrayListExtra(EXTRA_DNS_SERVERS, dnsServers),
-            {
-                if (completed.compareAndSet(false, true)) {
-                    handler.removeCallbacks(timeout)
-                    onSuccess()
-                }
-            },
-            { code ->
-                if (completed.compareAndSet(false, true)) {
-                    handler.removeCallbacks(timeout)
-                    onError(code)
-                }
-            },
-        )
-    }
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_UPDATE_QUICK_DNS)
+            .putStringArrayListExtra(EXTRA_DNS_SERVERS, dnsServers),
+        { onSuccess() },
+        onError,
+        timeoutMillis = QUICK_DNS_UPDATE_TIMEOUT_MILLIS,
+    )
 
     fun takeQuickStateChange(
         context: Context,
@@ -251,43 +252,62 @@ internal object TunnelServiceClient {
         onError,
     )
 
-    private fun operationReceiver(
-        onSuccess: (SessionState, Long) -> Unit,
-        onError: (String) -> Unit,
-    ): ResultReceiver = object : ResultReceiver(Handler(Looper.getMainLooper())) {
-        override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
-            if (resultCode == SERVICE_RESULT_OK && resultData != null) {
-                val state = SessionState.values().firstOrNull {
-                    it.wireName == resultData.getString(EXTRA_STATE)
-                } ?: SessionState.FAILED
-                onSuccess(state, resultData.getLong(EXTRA_DURATION_MILLIS))
-            } else {
-                onError(resultData?.getString(EXTRA_ERROR_CODE) ?: "tunnel_backend_error")
-            }
-        }
-    }
-
     private fun requestBundle(
         context: Context,
         intent: Intent,
         onSuccess: (Bundle) -> Unit,
         onError: (String) -> Unit,
-    ) = dispatch(
-        context,
-        intent.putExtra(
-            EXTRA_RESULT_RECEIVER,
-            object : ResultReceiver(Handler(Looper.getMainLooper())) {
-                override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+        foreground: Boolean = false,
+        timeoutMillis: Long = SERVICE_REQUEST_TIMEOUT_MILLIS,
+        onTimeout: () -> Unit = {},
+    ) {
+        val completion = ServiceRequestCompletion()
+        val handler = Handler(Looper.getMainLooper())
+        lateinit var timeout: Runnable
+        fun finish(action: () -> Unit) {
+            completion.finish {
+                handler.removeCallbacks(timeout)
+                action()
+            }
+        }
+        timeout = Runnable {
+            finish {
+                try {
+                    onTimeout()
+                } finally {
+                    onError(SERVICE_REQUEST_TIMEOUT_ERROR)
+                }
+            }
+        }
+        val receiver = object : ResultReceiver(handler) {
+            override fun onReceiveResult(resultCode: Int, resultData: Bundle?) {
+                finish {
                     if (resultCode == SERVICE_RESULT_OK) {
                         onSuccess(resultData ?: Bundle.EMPTY)
                     } else {
                         onError(resultData?.getString(EXTRA_ERROR_CODE) ?: "tunnel_backend_error")
                     }
                 }
-            },
-        ),
-        onError,
-    )
+            }
+        }
+        handler.postDelayed(timeout, timeoutMillis.coerceAtLeast(1))
+        dispatch(
+            context,
+            intent.putExtra(EXTRA_RESULT_RECEIVER, receiver),
+            { code -> finish { onError(code) } },
+            foreground,
+        )
+    }
+
+    private fun cancelClientStart(context: Context, clientOperationId: String) {
+        dispatch(
+            context,
+            Intent(context, NelomaiVpnService::class.java)
+                .setAction(NelomaiVpnService.ACTION_CANCEL_CLIENT_START)
+                .putExtra(EXTRA_CLIENT_OPERATION_ID, clientOperationId),
+            { code -> TunnelLog.warning("client_start.cancel_dispatch_failed", code) },
+        )
+    }
 
     private fun dispatch(
         context: Context,

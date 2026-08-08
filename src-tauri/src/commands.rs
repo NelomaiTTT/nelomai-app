@@ -41,7 +41,7 @@ const ANDROID_QUICK_RECONCILE_RETRY_SECONDS: i64 = 15;
 
 const STARTUP_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(45);
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
     code: String,
@@ -88,10 +88,6 @@ impl CommandError {
             code: code.into(),
             message: message.into(),
         }
-    }
-
-    pub(crate) fn message(&self) -> &str {
-        &self.message
     }
 
     fn code(&self) -> &str {
@@ -183,6 +179,7 @@ impl CommandError {
                 "Система подключения недоступна на этом устройстве",
             ),
             "service_unavailable"
+            | "service_timeout"
             | "service_outdated"
             | "unauthorized_client"
             | "truncated_frame" => Self::new(
@@ -195,6 +192,10 @@ impl CommandError {
             "helper_authorization_unavailable" => Self::new(
                 "helper_authorization_unavailable",
                 "Не удалось открыть системный запрос прав администратора",
+            ),
+            "helper_installer_timeout" => Self::new(
+                "helper_installer_timeout",
+                "Системная настройка подключения не завершилась вовремя",
             ),
             "helper_resources_unavailable" => Self::new(
                 "helper_resources_unavailable",
@@ -248,6 +249,9 @@ fn tunnel_service_error(code: &str) -> bool {
     matches!(
         code,
         "service_unavailable"
+            | "service_timeout"
+            | "tunnel_service_unavailable"
+            | "tunnel_service_timeout"
             | "service_outdated"
             | "service_stopping"
             | "unsupported_protocol"
@@ -388,6 +392,7 @@ pub struct LoginCommandRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartCommandRequest {
+    device_id: String,
     layer: Layer,
     tic_connection_mode: TicConnectionMode,
     route_mode: RouteMode,
@@ -951,8 +956,9 @@ pub async fn app_refresh_probes(
 pub async fn app_prepare_tunnel(
     app: AppHandle,
     diagnostics: State<'_, Arc<AppDiagnostics>>,
+    device_id: String,
 ) -> Result<(), CommandError> {
-    match crate::platform::prepare_tunnel(app).await {
+    match crate::platform::prepare_tunnel(app.clone()).await {
         Ok(()) => {
             diagnostics.record_named("tunnel.prepare_succeeded", None, None, None);
             Ok(())
@@ -965,6 +971,14 @@ pub async fn app_prepare_tunnel(
                 None,
                 Some(&command_error.code),
             );
+            schedule_start_failure_diagnostics(
+                app,
+                diagnostics.inner().clone(),
+                tauri_plugin_tunnel_android::StartFailureDiagnosticsRequest {
+                    device_id,
+                    error_code: command_error.code().to_string(),
+                },
+            );
             Err(command_error)
         }
     }
@@ -974,28 +988,102 @@ pub async fn app_prepare_tunnel(
 pub async fn app_start(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
     request: StartCommandRequest,
 ) -> Result<Connection, CommandError> {
-    refresh_installed_applications_before_start(
-        &app,
-        &application,
-        request.layer,
-        request.route_mode,
-    )
-    .await?;
-    application
-        .start(
-            ConnectOptions {
-                layer: request.layer,
-                tic_connection_mode: request.tic_connection_mode,
-                route_mode: request.route_mode,
-                probes: Vec::new(),
-                allow_alternate: request.allow_alternate,
+    let device_id = request.device_id;
+    let start_result = async {
+        refresh_installed_applications_before_start(
+            &app,
+            &application,
+            request.layer,
+            request.route_mode,
+        )
+        .await?;
+        application
+            .start(
+                ConnectOptions {
+                    layer: request.layer,
+                    tic_connection_mode: request.tic_connection_mode,
+                    route_mode: request.route_mode,
+                    probes: Vec::new(),
+                    allow_alternate: request.allow_alternate,
+                },
+                now_unix(),
+            )
+            .await
+            .map_err(CommandError::from)
+    }
+    .await;
+    match start_result {
+        Ok(connection) => Ok(connection),
+        Err(command_error) => {
+            schedule_start_failure_diagnostics(
+                app,
+                diagnostics.inner().clone(),
+                tauri_plugin_tunnel_android::StartFailureDiagnosticsRequest {
+                    device_id,
+                    error_code: command_error.code().to_string(),
+                },
+            );
+            Err(command_error)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn app_queue_start_failure_diagnostics(
+    app: AppHandle,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+    device_id: String,
+    error_code: String,
+) -> Result<(), CommandError> {
+    app.tunnel_android()
+        .queue_start_failure_diagnostics_async(
+            tauri_plugin_tunnel_android::StartFailureDiagnosticsRequest {
+                device_id,
+                error_code,
             },
-            now_unix(),
         )
         .await
-        .map_err(Into::into)
+        .map_err(|_| {
+            diagnostics.record_named(
+                "diagnostics.start_failure_enqueue_failed",
+                None,
+                None,
+                Some("diagnostics_storage_unavailable"),
+            );
+            CommandError::new(
+                "diagnostics_storage_unavailable",
+                "Не удалось сохранить автоматический отчёт",
+            )
+        })
+}
+
+fn schedule_start_failure_diagnostics(
+    app: AppHandle,
+    diagnostics: Arc<AppDiagnostics>,
+    request: tauri_plugin_tunnel_android::StartFailureDiagnosticsRequest,
+) {
+    #[cfg(target_os = "android")]
+    tauri::async_runtime::spawn(async move {
+        if app
+            .tunnel_android()
+            .queue_start_failure_diagnostics_async(request)
+            .await
+            .is_err()
+        {
+            diagnostics.record_named(
+                "diagnostics.start_failure_enqueue_failed",
+                None,
+                None,
+                Some("diagnostics_storage_unavailable"),
+            );
+        }
+    });
+
+    #[cfg(not(target_os = "android"))]
+    let _ = (app, diagnostics, request);
 }
 
 #[tauri::command]

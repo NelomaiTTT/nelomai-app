@@ -464,6 +464,7 @@ impl ServiceError {
 
 fn stable_route_error_code(code: &str) -> Option<&'static str> {
     Some(match code {
+        "service_timeout" => "service_timeout",
         "route_plan_too_large" => "route_plan_too_large",
         "route_conflict" => "route_conflict",
         "route_state_too_large" => "route_state_too_large",
