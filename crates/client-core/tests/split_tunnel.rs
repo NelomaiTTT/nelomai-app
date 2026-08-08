@@ -14,11 +14,13 @@ use nelomai_client_tunnel::{
     TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{
-    ApiVersion, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
-    ConnectionStartRequest, ConnectionStartResponse, Layer, LeaseStatus, RouteMode,
+    Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
+    ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
+    ConnectionStartResponse, Device, Layer, LeaseStatus, PeerBinding, Platform, RouteMode,
     SplitTunnelAddressRule, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
     SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy,
     SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    UpdateState,
 };
 use std::{
     collections::VecDeque,
@@ -1700,6 +1702,79 @@ async fn missing_saved_configuration_marks_policy_failure_and_reports_it() {
     }));
 }
 
+#[tokio::test]
+async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Android, Some(35), true, true));
+    fixture
+        .core
+        .set_split_tunnel_installed_packages(installed());
+    let initial = policy(SplitTunnelMode::ExcludeSelected);
+    let mut split_state = StoredSplitTunnelState {
+        cached_policy: Some(initial.clone()),
+        working_policy_hash: Some(initial.policy_hash.clone()),
+        ..StoredSplitTunnelState::default()
+    };
+    fixture.split_store.save(&split_state).unwrap();
+    let running = Connection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        layer: Layer::Tic,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::ViaTak,
+        probe_url: Some("https://1a.example.test/probe".to_string()),
+        status: LeaseStatus::Connected,
+        pinned: false,
+        stopped_at: None,
+    };
+    fixture.api.set_bootstrap_connection(running.clone());
+    *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+
+    fixture.core.bootstrap(1_000).await.unwrap();
+
+    let recovered = fixture
+        .secret_store
+        .load()
+        .unwrap()
+        .unwrap()
+        .saved_connection
+        .expect("background connection configuration recovered");
+    assert_eq!(recovered.lease_id, running.lease_id);
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+
+    let mut changed = initial;
+    changed.revision = 8;
+    changed.force_revision = 3;
+    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+    changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".to_string()];
+    fixture.api.set_policy(changed.clone());
+    fixture
+        .api
+        .set_revision(changed.revision, changed.force_revision);
+
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_100, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: true }
+    );
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Running
+    );
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.core.state().await.connection, Some(running));
+    assert_eq!(fixture.core.split_tunnel_warning().await, None);
+    split_state = fixture.split_store.load().unwrap();
+    assert_eq!(
+        split_state.working_policy_hash.as_deref(),
+        Some(changed.policy_hash.as_str())
+    );
+}
+
 struct CoordinatorFixture {
     core: ClientCore<CoordinatorApi, TestSecretStore, CoordinatorTunnel, TestLogger>,
     api: Arc<CoordinatorApi>,
@@ -1905,6 +1980,7 @@ struct CoordinatorApi {
     settings_calls: AtomicUsize,
     apply_failures: AtomicUsize,
     apply_results: Mutex<Vec<SplitTunnelApplyResult>>,
+    bootstrap_connection: Mutex<Option<Connection>>,
 }
 
 impl CoordinatorApi {
@@ -1925,6 +2001,7 @@ impl CoordinatorApi {
             settings_calls: AtomicUsize::new(0),
             apply_failures: AtomicUsize::new(0),
             apply_results: Mutex::new(Vec::new()),
+            bootstrap_connection: Mutex::new(None),
         }
     }
 
@@ -1939,6 +2016,10 @@ impl CoordinatorApi {
 
     fn set_policy(&self, policy: SplitTunnelPolicy) {
         *self.policy.lock().unwrap() = policy;
+    }
+
+    fn set_bootstrap_connection(&self, connection: Connection) {
+        *self.bootstrap_connection.lock().unwrap() = Some(connection);
     }
 
     fn available(&self) -> Result<(), CoreApiError> {
@@ -1956,7 +2037,47 @@ impl CoreApi for CoordinatorApi {
     }
 
     async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
-        Err(CoreApiError::Retryable)
+        self.available()?;
+        let connection = self.bootstrap_connection.lock().unwrap().clone();
+        Ok(Bootstrap {
+            api_version: ApiVersion::V1,
+            request_id: "bootstrap".to_string(),
+            access: Access {
+                state: AccessState::Active,
+                can_login: true,
+                can_connect: true,
+                expires_at: None,
+            },
+            device: Device {
+                id: "device-1".to_string(),
+                name: "Android".to_string(),
+                platform: Platform::Android,
+            },
+            binding: Some(PeerBinding {
+                id: "binding-1".to_string(),
+                peer_id: "peer-1".to_string(),
+                interface_id: "interface-1".to_string(),
+                interface_name: "Tic".to_string(),
+                slot: 1,
+                preferred_layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Dynamic,
+                route_mode: RouteMode::ViaTak,
+            }),
+            connection,
+            pinned_stray: None,
+            defaults: BootstrapDefaults {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Dynamic,
+                route_mode: RouteMode::ViaTak,
+            },
+            update: UpdateState {
+                current_version: Some("0.1.22".to_string()),
+                minimum_version: None,
+                update_available: false,
+                required: false,
+                release_notes: None,
+            },
+        })
     }
 
     async fn start_connection(

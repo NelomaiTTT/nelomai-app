@@ -50,9 +50,27 @@ describe("native client", () => {
     expect(
       commandMessage(commandError("connection_no_longer_active"), "start"),
     ).toBe("Нажмите «Старт» ещё раз");
+    expect(
+      commandMessage(commandError("tunnel_service_unavailable"), "start"),
+    ).toContain("Нажмите «Старт» ещё раз");
+    expect(
+      commandMessage(commandError("tunnel_service_unavailable"), "stop"),
+    ).toContain("Нажмите «Повторить»");
     expect(commandMessage(commandError("access_expired"), "startup")).toContain(
       "нажмите «Проверить снова»",
     );
+  });
+
+  it("names the actual split-tunnel refresh action", () => {
+    expect(
+      commandMessage(commandError("temporarily_unavailable"), "split_tunnel"),
+    ).toContain("«Принудительная синхронизация»");
+    expect(
+      commandMessage(
+        commandError("split_tunnel_policy_unavailable"),
+        "split_tunnel",
+      ),
+    ).toContain("«Принудительная синхронизация»");
   });
 
   it("keeps an unknown safe native message as the fallback", () => {

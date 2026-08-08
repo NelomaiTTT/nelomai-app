@@ -40,6 +40,7 @@ struct AndroidProcessCounters {
     process_id: u64,
     process_name: String,
     current_resident_memory_bytes: Option<u64>,
+    peak_resident_memory_bytes: Option<u64>,
     current_proportional_memory_bytes: Option<u64>,
     current_private_dirty_memory_bytes: Option<u64>,
 }
@@ -201,7 +202,7 @@ fn android_process_components(
             cpu_system_ms: None,
             cpu_average_basis_points: None,
             current_resident_memory_bytes: process.current_resident_memory_bytes,
-            peak_resident_memory_bytes: None,
+            peak_resident_memory_bytes: process.peak_resident_memory_bytes,
             current_proportional_memory_bytes: process.current_proportional_memory_bytes,
             current_private_dirty_memory_bytes: process.current_private_dirty_memory_bytes,
             read_bytes: None,
@@ -232,7 +233,9 @@ fn android_process_components(
                     .iter()
                     .map(|item| item.current_resident_memory_bytes),
             ),
-            peak_resident_memory_bytes: None,
+            peak_resident_memory_bytes: sum_available(
+                processes.iter().map(|item| item.peak_resident_memory_bytes),
+            ),
             current_proportional_memory_bytes: sum_available(
                 processes
                     .iter()
@@ -467,6 +470,7 @@ fn capture_android_uid<R: Runtime>(app: &AppHandle<R>) -> Option<AndroidUidCount
                 process_id: process.process_id,
                 process_name: process.process_name,
                 current_resident_memory_bytes: process.current_resident_memory_bytes,
+                peak_resident_memory_bytes: process.peak_resident_memory_bytes,
                 current_proportional_memory_bytes: process.current_proportional_memory_bytes,
                 current_private_dirty_memory_bytes: process.current_private_dirty_memory_bytes,
             })
@@ -536,6 +540,7 @@ mod tests {
                     process_id: 42,
                     process_name: "ru.nelomai.app:vpn".to_string(),
                     current_resident_memory_bytes: Some(100),
+                    peak_resident_memory_bytes: Some(140),
                     current_proportional_memory_bytes: Some(80),
                     current_private_dirty_memory_bytes: Some(60),
                 }],
@@ -549,6 +554,7 @@ mod tests {
             .components
             .iter()
             .any(|component| component.component == "android_vpn_process"
-                && component.current_proportional_memory_bytes == Some(80)));
+                && component.current_proportional_memory_bytes == Some(80)
+                && component.peak_resident_memory_bytes == Some(140)));
     }
 }

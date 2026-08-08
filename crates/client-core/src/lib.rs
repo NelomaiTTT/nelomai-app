@@ -999,6 +999,8 @@ where
         };
         if phase == Phase::Connected {
             if let Some(connection) = &response.connection {
+                self.restore_running_connection_configuration(connection, now_unix)
+                    .await;
                 self.restore_running_split_tunnel_options(connection).await;
             }
         }
@@ -1010,6 +1012,104 @@ where
         });
         self.retry_pending_split_tunnel_results().await;
         Ok(response)
+    }
+
+    async fn restore_running_connection_configuration(
+        &self,
+        connection: &Connection,
+        now_unix: i64,
+    ) {
+        let Ok(stored) = self.load_auth() else {
+            return;
+        };
+        let already_saved = stored
+            .saved_connection
+            .as_ref()
+            .into_iter()
+            .chain(stored.pinned_connection.as_ref())
+            .any(|saved| saved.lease_id == connection.lease_id);
+        if already_saved {
+            return;
+        }
+        let Some(mut access_token) = stored.access_token else {
+            return;
+        };
+        let request = ConnectionStartRequest {
+            operation_id: connection.lease_id.clone(),
+            layer: connection.layer,
+            tic_connection_mode: connection.tic_connection_mode,
+            route_mode: connection.route_mode,
+            probes: Vec::new(),
+            allow_alternate: false,
+        };
+        let mut recovered = self.api.start_connection(&access_token, &request).await;
+        if matches!(recovered, Err(CoreApiError::Unauthorized)) {
+            recovered = match self.refresh_access_token(&access_token).await {
+                Ok(refreshed) => {
+                    access_token = refreshed;
+                    self.api.start_connection(&access_token, &request).await
+                }
+                Err(_) => return,
+            };
+        }
+        let Ok(recovered) = recovered else {
+            self.logger.record(CoreLogEvent {
+                kind: "connection.configuration_restore_failed",
+                operation_id: Some(connection.lease_id.clone()),
+                request_id: None,
+                code: Some("configuration_fetch_failed".to_string()),
+            });
+            return;
+        };
+        if recovered.connection.lease_id != connection.lease_id
+            || recovered.configuration.is_empty()
+        {
+            self.logger.record(CoreLogEvent {
+                kind: "connection.configuration_restore_failed",
+                operation_id: Some(connection.lease_id.clone()),
+                request_id: Some(recovered.request_id),
+                code: Some("invalid_client_api_response".to_string()),
+            });
+            return;
+        }
+        let kind = stored_connection_kind(&recovered.connection);
+        let saved_connection = StoredConnection {
+            lease_id: recovered.connection.lease_id.clone(),
+            layer: recovered.connection.layer,
+            tic_connection_mode: recovered.connection.tic_connection_mode,
+            route_mode: recovered.connection.route_mode,
+            probe_url: recovered.connection.probe_url.clone(),
+            kind,
+            configuration: recovered.configuration,
+            valid_until_unix: match kind {
+                StoredConnectionKind::DynamicWarm => Some(now_unix.saturating_add(3_600)),
+                StoredConnectionKind::Fixed | StoredConnectionKind::Pinned => None,
+            },
+        };
+        let Ok(mut current_stored) = self.load_auth() else {
+            return;
+        };
+        if kind == StoredConnectionKind::Pinned {
+            current_stored.pinned_connection = Some(saved_connection);
+            current_stored.saved_connection = None;
+        } else {
+            current_stored.saved_connection = Some(saved_connection);
+        }
+        if self.store.save(&current_stored).is_err() {
+            self.logger.record(CoreLogEvent {
+                kind: "connection.configuration_restore_failed",
+                operation_id: Some(connection.lease_id.clone()),
+                request_id: Some(recovered.request_id),
+                code: Some("storage_unavailable".to_string()),
+            });
+            return;
+        }
+        self.logger.record(CoreLogEvent {
+            kind: "connection.configuration_restored",
+            operation_id: Some(connection.lease_id.clone()),
+            request_id: Some(recovered.request_id),
+            code: None,
+        });
     }
 
     pub async fn start(

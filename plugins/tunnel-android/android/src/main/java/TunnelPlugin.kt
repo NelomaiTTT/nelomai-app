@@ -964,6 +964,12 @@ internal object TunnelRuntime {
                 "tunnel.underlying_networks_updated",
                 mapOf("after_loss" to recoveredAfterLoss),
             )
+            applicationContext?.let { context ->
+                runCatching { AutomaticDiagnostics.onPhysicalNetworkChanged(context) }
+                    .onFailure {
+                        TunnelLog.warning("diagnostics.memory_snapshot_failed", error = it)
+                    }
+            }
         }
     }
 

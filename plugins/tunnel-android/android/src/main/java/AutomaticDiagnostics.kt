@@ -36,6 +36,9 @@ private const val START_FAILURE_DIRECTORY = "start-failures"
 private const val REPORT_SUFFIX = ".json.gz"
 private const val START_FAILURE_REQUEST_SUFFIX = ".json"
 private const val CHECKPOINT_INTERVAL_SECONDS = 6 * 60 * 60L
+private val MEMORY_SAMPLE_DELAYS_SECONDS = longArrayOf(60L, 15 * 60L, 60 * 60L, 3 * 60 * 60L)
+private const val NETWORK_MEMORY_SAMPLE_COOLDOWN_SECONDS = 60L
+private const val UI_REMOVED_SETTLE_SECONDS = 5L
 private const val START_FAILURE_WINDOW_SECONDS = 15 * 60L
 private const val START_FAILURE_COOLDOWN_SECONDS = 15 * 60L
 private const val SUCCESS_UPLOAD_SPACING_SECONDS = 65L
@@ -93,6 +96,8 @@ internal object AutomaticDiagnostics {
     }
     private var checkpointFuture: ScheduledFuture<*>? = null
     private var uploadFuture: ScheduledFuture<*>? = null
+    private val memorySampleFutures = mutableListOf<ScheduledFuture<*>>()
+    private var lastNetworkMemorySampleAt = 0L
 
     fun initialize(context: Context) {
         val applicationContext = context.applicationContext
@@ -143,6 +148,8 @@ internal object AutomaticDiagnostics {
                     .commit(),
             ) { "automatic_diagnostics_session_write_failed" }
             TunnelLog.info("diagnostics.session_started")
+            recordMemorySnapshot(applicationContext, "tunnel_started")
+            scheduleMemorySeriesLocked(applicationContext)
             scheduleCheckpointLocked(applicationContext, CHECKPOINT_INTERVAL_SECONDS)
             scheduleUploadLocked(applicationContext, requestedDelaySeconds = 0)
         }
@@ -153,6 +160,8 @@ internal object AutomaticDiagnostics {
         synchronized(gate) {
             checkpointFuture?.cancel(false)
             checkpointFuture = null
+            cancelMemorySeriesLocked()
+            recordMemorySnapshot(applicationContext, "tunnel_stopping")
             val preferences = preferences(applicationContext)
             if (preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
                 markStoppedSessionPending(applicationContext)
@@ -162,6 +171,26 @@ internal object AutomaticDiagnostics {
                 }
             }
             scheduleUploadLocked(applicationContext, requestedDelaySeconds = 0)
+        }
+    }
+
+    fun onUiTaskRemoved(context: Context) {
+        val applicationContext = context.applicationContext
+        executor.execute { recordMemorySnapshot(applicationContext, "ui_task_removed") }
+        executor.schedule(
+            { recordMemorySnapshot(applicationContext, "ui_task_removed_settled") },
+            UI_REMOVED_SETTLE_SECONDS,
+            TimeUnit.SECONDS,
+        )
+    }
+
+    fun onPhysicalNetworkChanged(context: Context) {
+        val applicationContext = context.applicationContext
+        synchronized(gate) {
+            val now = nowUnix()
+            if (now - lastNetworkMemorySampleAt < NETWORK_MEMORY_SAMPLE_COOLDOWN_SECONDS) return
+            lastNetworkMemorySampleAt = now
+            executor.execute { recordMemorySnapshot(applicationContext, "physical_network_changed") }
         }
     }
 
@@ -340,7 +369,7 @@ internal object AutomaticDiagnostics {
         tunnelRunning: Boolean,
     ): JSONObject {
         val processes = androidProcessMemory(context)
-        logMemorySnapshot(context.packageName, processes)
+        logMemorySnapshot(context.packageName, processes, "report_$trigger")
         return JSONObject().apply {
             put("report_id", reportId)
             put("trigger", trigger)
@@ -477,7 +506,7 @@ internal object AutomaticDiagnostics {
     ): JSONObject {
         val startedAt = (endedAt - START_FAILURE_WINDOW_SECONDS).coerceAtLeast(0)
         val processes = androidProcessMemory(context)
-        logMemorySnapshot(context.packageName, processes)
+        logMemorySnapshot(context.packageName, processes, "connection_start_failed")
         return JSONObject().apply {
             put("report_id", reportId)
             put("trigger", "connection_start_failed")
@@ -568,6 +597,32 @@ internal object AutomaticDiagnostics {
             delaySeconds.coerceAtLeast(1),
             TimeUnit.SECONDS,
         )
+    }
+
+    private fun scheduleMemorySeriesLocked(context: Context) {
+        cancelMemorySeriesLocked()
+        MEMORY_SAMPLE_DELAYS_SECONDS.forEach { delaySeconds ->
+            memorySampleFutures += executor.schedule(
+                {
+                    if (preferences(context).getBoolean(KEY_SESSION_RUNNING, false)) {
+                        recordMemorySnapshot(context, "tunnel_uptime_${delaySeconds}s")
+                    }
+                },
+                delaySeconds,
+                TimeUnit.SECONDS,
+            )
+        }
+    }
+
+    private fun cancelMemorySeriesLocked() {
+        memorySampleFutures.forEach { it.cancel(false) }
+        memorySampleFutures.clear()
+    }
+
+    private fun recordMemorySnapshot(context: Context, reason: String) {
+        runCatching { androidProcessMemory(context) }
+            .onSuccess { logMemorySnapshot(context.packageName, it, reason) }
+            .onFailure { TunnelLog.warning("diagnostics.memory_snapshot_failed", error = it) }
     }
 
     private fun scheduleUploadLocked(context: Context, requestedDelaySeconds: Long) {
@@ -967,6 +1022,7 @@ internal fun androidProcessMemory(context: Context): JSONArray {
                 put("processId", pid.toLong())
                 put("processName", currentProcessName(context).take(192))
                 putNullable("currentResidentMemoryBytes", processRssBytes(pid))
+                putNullable("peakResidentMemoryBytes", processPeakRssBytes(pid))
                 putNullable("currentProportionalMemoryBytes", info?.totalPss?.toLong()?.times(1024L))
                 putNullable("currentPrivateDirtyMemoryBytes", info?.totalPrivateDirty?.toLong()?.times(1024L))
             })
@@ -980,6 +1036,7 @@ internal fun androidProcessMemory(context: Context): JSONArray {
                 put("processId", process.pid.toLong())
                 put("processName", process.processName.take(192))
                 putNullable("currentResidentMemoryBytes", processRssBytes(process.pid))
+                putNullable("peakResidentMemoryBytes", processPeakRssBytes(process.pid))
                 putNullable("currentProportionalMemoryBytes", info?.totalPss?.toLong()?.times(1024L))
                 putNullable("currentPrivateDirtyMemoryBytes", info?.totalPrivateDirty?.toLong()?.times(1024L))
             })
@@ -990,9 +1047,11 @@ internal fun androidProcessMemory(context: Context): JSONArray {
 private fun resourceComponents(processes: JSONArray): JSONArray {
     val result = JSONArray()
     var resident = 0L
+    var peakResident = 0L
     var proportional = 0L
     var privateDirty = 0L
     var residentFound = false
+    var peakResidentFound = false
     var proportionalFound = false
     var privateDirtyFound = false
     for (index in 0 until processes.length()) {
@@ -1004,12 +1063,17 @@ private fun resourceComponents(processes: JSONArray): JSONArray {
             put("process_id", process.getLong("processId"))
             put("process_name", name)
             copyLong(process, this, "currentResidentMemoryBytes", "current_resident_memory_bytes")
+            copyLong(process, this, "peakResidentMemoryBytes", "peak_resident_memory_bytes")
             copyLong(process, this, "currentProportionalMemoryBytes", "current_proportional_memory_bytes")
             copyLong(process, this, "currentPrivateDirtyMemoryBytes", "current_private_dirty_memory_bytes")
         })
         process.optLongOrNull("currentResidentMemoryBytes")?.let {
             residentFound = true
             resident = resident.saturatingAdd(it)
+        }
+        process.optLongOrNull("peakResidentMemoryBytes")?.let {
+            peakResidentFound = true
+            peakResident = peakResident.saturatingAdd(it)
         }
         process.optLongOrNull("currentProportionalMemoryBytes")?.let {
             proportionalFound = true
@@ -1024,13 +1088,14 @@ private fun resourceComponents(processes: JSONArray): JSONArray {
         put("component", "android_application_processes")
         put("source", "android_activity_manager_memory_sum")
         putNullable("current_resident_memory_bytes", resident.takeIf { residentFound })
+        putNullable("peak_resident_memory_bytes", peakResident.takeIf { peakResidentFound })
         putNullable("current_proportional_memory_bytes", proportional.takeIf { proportionalFound })
         putNullable("current_private_dirty_memory_bytes", privateDirty.takeIf { privateDirtyFound })
     })
     return result
 }
 
-private fun logMemorySnapshot(packageName: String, processes: JSONArray) {
+private fun logMemorySnapshot(packageName: String, processes: JSONArray, reason: String) {
     for (index in 0 until processes.length()) {
         val process = processes.getJSONObject(index)
         val name = process.optString("processName")
@@ -1038,7 +1103,10 @@ private fun logMemorySnapshot(packageName: String, processes: JSONArray) {
             "diagnostics.memory_snapshot",
             mapOf(
                 "process" to if (name.endsWith(":vpn")) "vpn" else if (name == packageName) "ui" else "app",
+                "reason" to reason.take(64),
+                "pid" to process.optLong("processId"),
                 "rss_bytes" to process.optLongOrNull("currentResidentMemoryBytes"),
+                "peak_rss_bytes" to process.optLongOrNull("peakResidentMemoryBytes"),
                 "pss_bytes" to process.optLongOrNull("currentProportionalMemoryBytes"),
                 "private_dirty_bytes" to process.optLongOrNull("currentPrivateDirtyMemoryBytes"),
             ),
@@ -1136,13 +1204,27 @@ private fun currentProcessName(context: Context): String {
 }
 
 private fun processRssBytes(processId: Int): Long? = runCatching {
-    File("/proc/$processId/status").useLines { lines ->
-        lines.firstNotNullOfOrNull { line ->
-            if (!line.startsWith("VmRSS:")) return@firstNotNullOfOrNull null
-            line.substringAfter(':').trim().substringBefore(' ').toLongOrNull()?.times(1024L)
+    automaticDiagnosticsStatusMemoryBytes(File("/proc/$processId/status").readText(), "VmRSS")
+}.getOrNull()
+
+private fun processPeakRssBytes(processId: Int): Long? = runCatching {
+    automaticDiagnosticsStatusMemoryBytes(File("/proc/$processId/status").readText(), "VmHWM")
+}.getOrNull()
+
+internal fun automaticDiagnosticsStatusMemoryBytes(status: String, field: String): Long? =
+    status.lineSequence().firstNotNullOfOrNull { line ->
+        if (!line.startsWith("$field:")) return@firstNotNullOfOrNull null
+        val parts = line.substringAfter(':').trim().split(Regex("\\s+"), limit = 2)
+        val value = parts.firstOrNull()
+            ?.toLongOrNull()
+            ?.takeIf { it >= 0 }
+            ?: return@firstNotNullOfOrNull null
+        when (parts.getOrNull(1)?.lowercase()) {
+            "kb" -> value.saturatingMultiply(1024L)
+            null, "b" -> value
+            else -> null
         }
     }
-}.getOrNull()
 
 private fun JSONObject.putNullable(key: String, value: Long?) {
     if (value != null) put(key, value)
@@ -1157,6 +1239,9 @@ private fun copyLong(source: JSONObject, destination: JSONObject, sourceKey: Str
 
 private fun Long.saturatingAdd(value: Long): Long =
     if (Long.MAX_VALUE - this < value) Long.MAX_VALUE else this + value
+
+private fun Long.saturatingMultiply(value: Long): Long =
+    if (this > Long.MAX_VALUE / value) Long.MAX_VALUE else this * value
 
 private fun nowUnix(): Long = System.currentTimeMillis() / 1000L
 

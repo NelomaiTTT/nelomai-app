@@ -100,11 +100,13 @@ reports. Pending requests and reports are retained until upload succeeds, while
 only the three newest confirmed reports remain on the device. The UI waits at
 most five seconds for a start-failure snapshot before becoming interactive;
 durable report creation continues in the VPN process after that deadline. New
-clients also attach a `session_delta` resource snapshot.
-It is calculated from operating-system cumulative counters captured at process
-start and report creation, without background polling. Desktop process metrics
-cover the client process; Android additionally reports UID-level CPU, network,
-and system-provided charge estimates covering the application and VPN service.
+clients also attach a `session_delta` resource snapshot. Desktop counters are
+captured at process start and report creation. Android additionally reports
+UID-level CPU, network, and system-provided charge estimates, plus current and
+kernel peak RSS for the UI and VPN processes. A bounded memory time series is
+written to the existing rotating native log at tunnel start, fixed uptime
+milestones, UI task removal, and physical-network changes; it does not create
+extra reports or change the six-hour upload interval.
 For `cpu_average_basis_points`, `10000` means one fully occupied logical CPU;
 multithreaded work can legitimately exceed that value.
 

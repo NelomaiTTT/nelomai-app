@@ -352,6 +352,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         TunnelLog.info("service.ui_task_removed")
+        runCatching { AutomaticDiagnostics.onUiTaskRemoved(applicationContext) }
+            .onFailure { TunnelLog.warning("diagnostics.memory_snapshot_failed", error = it) }
         super.onTaskRemoved(rootIntent)
     }
 

@@ -266,7 +266,7 @@ function unavailableMessage(context: UserErrorContext): string {
     case "update":
       return "Не удалось загрузить обновление. Проверьте интернет и нажмите «Обновить» ещё раз.";
     case "split_tunnel":
-      return "Не удалось загрузить настройки split-tunnel. Проверьте интернет и нажмите «Обновить».";
+      return "Не удалось загрузить настройки split-tunnel. Проверьте интернет и нажмите «Принудительная синхронизация».";
     case "saved_stray":
       return "Не удалось изменить сохранённое подключение. Проверьте интернет и повторите действие.";
     case "unbind_peer":
@@ -335,7 +335,9 @@ export function commandMessage(
     case "vpn_permission_required":
       return "Разрешите VPN-подключение в системном окне Android. Затем нажмите «Старт» ещё раз.";
     case "tunnel_service_unavailable":
-      return "Системный компонент VPN не отвечает. Нажмите «Повторить» и подтвердите восстановление. Если ошибка повторится — переустановите Nelomai.";
+      return context === "start"
+        ? "Системный компонент VPN не отвечает. Нажмите «Старт» ещё раз и подтвердите восстановление. Если ошибка повторится — переустановите Nelomai."
+        : "Системный компонент VPN не отвечает. Нажмите «Повторить» и подтвердите восстановление. Если ошибка повторится — переустановите Nelomai.";
     case "tunnel_backend_unavailable":
       return "Система VPN недоступна на этом устройстве. Перезапустите Nelomai и попробуйте снова.";
     case "tunnel_failed":
@@ -369,7 +371,7 @@ export function commandMessage(
     case "installed_applications_unavailable":
       return "Android не предоставил список приложений. Перезапустите Nelomai и откройте split-tunnel снова.";
     case "split_tunnel_policy_unavailable":
-      return "Не удалось загрузить настройки split-tunnel. Проверьте интернет и нажмите «Обновить».";
+      return "Не удалось загрузить настройки split-tunnel. Проверьте интернет и нажмите «Принудительная синхронизация».";
     case "split_tunnel_state_save_failed":
       return "VPN продолжает работать, но новые настройки могут не сохраниться после перезапуска. Попробуйте сохранить их ещё раз.";
     case "preferences_unavailable":

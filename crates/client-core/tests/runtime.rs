@@ -941,7 +941,7 @@ async fn external_quick_action_reconciles_the_local_tunnel_without_panel_operati
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn bootstrap_discards_stale_saved_connection_after_external_quick_start() {
+async fn bootstrap_recovers_configuration_after_external_quick_start_changes_lease() {
     let api = Arc::new(MockApi::new(0));
     let fresh_connection = connection("22222222-2222-4222-8222-222222222222");
     *api.bootstrap_connection.lock().unwrap() = Some(fresh_connection.clone());
@@ -960,7 +960,7 @@ async fn bootstrap_discards_stale_saved_connection_after_external_quick_start() 
     });
     let store = Arc::new(MemoryStore::new(stored));
     let core = ClientCore::new(
-        api,
+        api.clone(),
         store.clone(),
         tunnel,
         Arc::new(MemoryLogger::default()),
@@ -969,7 +969,22 @@ async fn bootstrap_discards_stale_saved_connection_after_external_quick_start() 
     core.bootstrap(1_700_000_000).await.unwrap();
 
     assert_eq!(core.state().await.connection, Some(fresh_connection));
-    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
+    let saved = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .saved_connection
+        .expect("configuration recovered for the running lease");
+    assert_eq!(saved.lease_id, "22222222-2222-4222-8222-222222222222");
+    assert_eq!(
+        saved.configuration,
+        "[Interface]\nPrivateKey = tunnel-secret\n"
+    );
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.operation_ids.lock().unwrap().as_slice(),
+        ["22222222-2222-4222-8222-222222222222"]
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

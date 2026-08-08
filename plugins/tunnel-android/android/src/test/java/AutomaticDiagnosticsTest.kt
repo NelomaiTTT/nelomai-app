@@ -7,6 +7,25 @@ import org.junit.Test
 
 class AutomaticDiagnosticsTest {
     @Test
+    fun procStatusMemoryParserReadsCurrentAndPeakRssSafely() {
+        val status = """
+            Name: nelomai
+            VmHWM: 456789 kB
+            VmRSS: 345678 kB
+        """.trimIndent()
+
+        assertEquals(
+            345678L * 1024L,
+            automaticDiagnosticsStatusMemoryBytes(status, "VmRSS"),
+        )
+        assertEquals(
+            456789L * 1024L,
+            automaticDiagnosticsStatusMemoryBytes(status, "VmHWM"),
+        )
+        assertNull(automaticDiagnosticsStatusMemoryBytes(status, "VmPeak"))
+    }
+
+    @Test
     fun startFailureRequestRoundTripsItsDurableIdentityAndState() {
         val request = StartFailureRequest(
             reportId = "33333333-3333-4333-8333-333333333333",

@@ -84,6 +84,7 @@ pub struct AndroidProcessResourceUsage {
     pub process_id: u64,
     pub process_name: String,
     pub current_resident_memory_bytes: Option<u64>,
+    pub peak_resident_memory_bytes: Option<u64>,
     pub current_proportional_memory_bytes: Option<u64>,
     pub current_private_dirty_memory_bytes: Option<u64>,
 }
