@@ -3,7 +3,7 @@ use nelomai_contracts::{
     Access, ApiVersion, AppNotificationList, AppNotificationReadResponse, BindPeerRequest,
     Bootstrap, ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
     ConnectionStartResponse, ErrorPayload, Layer, PeerBindingResponse, PeerOptions, Platform,
-    PushRegistrationRequest, PushRegistrationResponse, ServerCandidatesResponse,
+    ProbeFailureCode, PushRegistrationRequest, PushRegistrationResponse, ServerCandidatesResponse,
     ServerSelectionRequest, ServerSelectionResponse, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision,
     SplitTunnelSettingsUpdate, API_PREFIX,
@@ -607,12 +607,15 @@ impl ClientApi {
         .await
     }
 
-    pub async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
-        let endpoint = Url::parse(probe_url).ok()?;
+    pub async fn probe_candidate_latency_ms(
+        &self,
+        probe_url: &str,
+    ) -> Result<f64, ProbeFailureCode> {
+        let endpoint = Url::parse(probe_url).map_err(|_| ProbeFailureCode::InvalidUrl)?;
         let scheme_allowed =
             endpoint.scheme() == "https" || (cfg!(debug_assertions) && endpoint.scheme() == "http");
         if !scheme_allowed {
-            return None;
+            return Err(ProbeFailureCode::UnsupportedScheme);
         }
 
         let started = Instant::now();
@@ -623,11 +626,21 @@ impl ClientApi {
             .timeout(Duration::from_secs(3))
             .send()
             .await
-            .ok()?;
-        response
-            .status()
-            .is_success()
-            .then(|| started.elapsed().as_secs_f64() * 1_000.0)
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ProbeFailureCode::Timeout
+                } else {
+                    ProbeFailureCode::NetworkError
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(ProbeFailureCode::HttpError);
+        }
+        Ok(started.elapsed().as_secs_f64() * 1_000.0)
+    }
+
+    pub async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
+        self.probe_candidate_latency_ms(probe_url).await.ok()
     }
 
     pub async fn start_connection(

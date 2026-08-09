@@ -8,7 +8,7 @@
     },
     {
       "candidate_id": "opaque-candidate-token-b",
-      "latency_ms": 58.0,
+      "failure_code": "timeout",
       "measured_at": "2026-07-26T09:00:00Z"
     }
   ]

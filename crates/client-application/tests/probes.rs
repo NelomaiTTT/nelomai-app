@@ -11,13 +11,14 @@ use nelomai_contracts::{
     ServerCandidatesResponse, TicConnectionMode,
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
 struct ProbeApi {
     candidate_calls: AtomicUsize,
     probe_calls: AtomicUsize,
+    all_probes_fail: AtomicBool,
     start_request: Mutex<Option<ConnectionStartRequest>>,
 }
 
@@ -120,7 +121,7 @@ impl ApplicationApi for ProbeApi {
 
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
         self.probe_calls.fetch_add(1, Ordering::SeqCst);
-        probe_url.contains("fast").then_some(24.5)
+        (!self.all_probes_fail.load(Ordering::SeqCst) && probe_url.contains("fast")).then_some(24.5)
     }
 
     async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
@@ -165,7 +166,7 @@ impl TunnelController for StoppedTunnel {
 }
 
 #[tokio::test]
-async fn probes_are_cached_for_five_minutes_and_only_successes_are_kept() {
+async fn probes_are_cached_for_five_minutes_with_failures() {
     let (application, api) = application();
 
     let first = application
@@ -186,9 +187,24 @@ async fn probes_are_cached_for_five_minutes_and_only_successes_are_kept() {
         cached.probes[0].measured_at,
         refreshed.probes[0].measured_at
     );
-    assert_eq!(first.probes.len(), 1);
-    assert_eq!(first.probes[0].candidate_id, "candidate-fast");
-    assert_eq!(first.probes[0].latency_ms, 24.5);
+    assert_eq!(first.probes.len(), 2);
+    let fast = first
+        .probes
+        .iter()
+        .find(|probe| probe.candidate_id == "candidate-fast")
+        .unwrap();
+    let down = first
+        .probes
+        .iter()
+        .find(|probe| probe.candidate_id == "candidate-down")
+        .unwrap();
+    assert_eq!(fast.latency_ms, Some(24.5));
+    assert_eq!(fast.failure_code, None);
+    assert_eq!(down.latency_ms, None);
+    assert_eq!(
+        down.failure_code,
+        Some(nelomai_contracts::ProbeFailureCode::Unknown)
+    );
     assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
     assert_eq!(api.probe_calls.load(Ordering::SeqCst), 4);
 }
@@ -205,6 +221,26 @@ async fn concurrent_refreshes_share_one_measurement() {
     assert_eq!(first.unwrap(), second.unwrap());
     assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 1);
     assert_eq!(api.probe_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn completely_failed_probe_set_is_remeasured_on_next_attempt() {
+    let (application, api) = application();
+    api.all_probes_fail.store(true, Ordering::SeqCst);
+
+    let first = application
+        .refresh_probes(Layer::Stray, 1_800_000_000)
+        .await
+        .unwrap();
+    let second = application
+        .refresh_probes(Layer::Stray, 1_800_000_001)
+        .await
+        .unwrap();
+
+    assert!(first.probes.iter().all(|probe| probe.latency_ms.is_none()));
+    assert!(second.probes.iter().all(|probe| probe.latency_ms.is_none()));
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(api.probe_calls.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
@@ -248,7 +284,8 @@ async fn connection_uses_native_probe_cache_instead_of_webview_values() {
                 route_mode: RouteMode::Standalone,
                 probes: vec![ProbeResult {
                     candidate_id: "injected-from-webview".to_string(),
-                    latency_ms: 0.1,
+                    latency_ms: Some(0.1),
+                    failure_code: None,
                     measured_at: "2026-01-01T00:00:00Z".to_string(),
                 }],
                 allow_alternate: true,
@@ -259,8 +296,15 @@ async fn connection_uses_native_probe_cache_instead_of_webview_values() {
         .unwrap();
 
     let request = api.start_request.lock().unwrap().clone().unwrap();
-    assert_eq!(request.probes.len(), 1);
-    assert_eq!(request.probes[0].candidate_id, "candidate-fast");
+    assert_eq!(request.probes.len(), 2);
+    assert!(request
+        .probes
+        .iter()
+        .any(|probe| probe.candidate_id == "candidate-fast" && probe.latency_ms == Some(24.5)));
+    assert!(request.probes.iter().any(|probe| {
+        probe.candidate_id == "candidate-down"
+            && probe.failure_code == Some(nelomai_contracts::ProbeFailureCode::Unknown)
+    }));
     assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -300,7 +344,8 @@ async fn quick_connection_sends_no_probes_and_does_not_measure_candidates() {
                 route_mode: RouteMode::Standalone,
                 probes: vec![ProbeResult {
                     candidate_id: "must-be-discarded".to_string(),
-                    latency_ms: 1.0,
+                    latency_ms: Some(1.0),
+                    failure_code: None,
                     measured_at: "2026-01-01T00:00:00Z".to_string(),
                 }],
                 allow_alternate: true,
@@ -343,6 +388,7 @@ fn application() -> (
     let api = Arc::new(ProbeApi {
         candidate_calls: AtomicUsize::new(0),
         probe_calls: AtomicUsize::new(0),
+        all_probes_fail: AtomicBool::new(false),
         start_request: Mutex::new(None),
     });
     let store = Arc::new(MemoryStore::default());

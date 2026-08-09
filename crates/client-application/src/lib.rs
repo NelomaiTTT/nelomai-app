@@ -12,7 +12,7 @@ use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelSto
 use nelomai_client_tunnel::{TunnelController, TunnelError};
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
-    Layer, PeerBindingResponse, PeerOptions, Platform, ProbeResult, ProbeResults,
+    Layer, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode, ProbeResult, ProbeResults,
     ServerCandidatesResponse, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
     SplitTunnelPolicy, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
@@ -50,6 +50,11 @@ pub trait ApplicationApi: CoreApi {
         layer: Layer,
     ) -> Result<ServerCandidatesResponse, CoreApiError>;
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64>;
+    async fn probe_candidate_latency_ms(&self, probe_url: &str) -> Result<f64, ProbeFailureCode> {
+        self.probe_latency_ms(probe_url)
+            .await
+            .ok_or(ProbeFailureCode::Unknown)
+    }
     async fn logout(&self, access_token: &str) -> Result<(), CoreApiError>;
     async fn background_token(
         &self,
@@ -137,6 +142,10 @@ impl ApplicationApi for ClientApi {
 
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
         ClientApi::probe_latency_ms(self, probe_url).await
+    }
+
+    async fn probe_candidate_latency_ms(&self, probe_url: &str) -> Result<f64, ProbeFailureCode> {
+        ClientApi::probe_candidate_latency_ms(self, probe_url).await
     }
 
     async fn logout(&self, access_token: &str) -> Result<(), CoreApiError> {
@@ -734,21 +743,28 @@ where
             let api = self.api.clone();
             let measured_at = measured_at.clone();
             async move {
-                let latency_ms = api.probe_latency_ms(&candidate.probe_url).await?;
-                (latency_ms.is_finite() && latency_ms > 0.0 && latency_ms <= 10_000.0).then_some({
-                    (
-                        ProbeResult {
-                            candidate_id: candidate.candidate_id,
-                            latency_ms,
-                            measured_at,
-                        },
-                        expires_at,
-                    )
-                })
+                let outcome = api.probe_candidate_latency_ms(&candidate.probe_url).await;
+                let (latency_ms, failure_code) = match outcome {
+                    Ok(latency_ms)
+                        if latency_ms.is_finite() && latency_ms > 0.0 && latency_ms <= 10_000.0 =>
+                    {
+                        (Some(latency_ms), None)
+                    }
+                    Ok(_) => (None, Some(ProbeFailureCode::Unknown)),
+                    Err(code) => (None, Some(code)),
+                };
+                (
+                    ProbeResult {
+                        candidate_id: candidate.candidate_id,
+                        latency_ms,
+                        failure_code,
+                        measured_at,
+                    },
+                    expires_at,
+                )
             }
         }))
         .buffer_unordered(MAX_CONCURRENT_PROBES)
-        .filter_map(|result| async move { result })
         .collect::<Vec<_>>()
         .await;
         let valid_until_unix = measured
@@ -867,6 +883,11 @@ where
             .filter(|cached| {
                 now_unix.saturating_sub(cached.measured_at_unix) < PROBE_REFRESH_SECONDS
                     && now_unix < cached.valid_until_unix
+                    && cached
+                        .results
+                        .probes
+                        .iter()
+                        .any(|probe| probe.latency_ms.is_some())
             })
             .map(|cached| cached.results.clone())
     }
@@ -876,7 +897,14 @@ where
             .lock()
             .ok()?
             .get(layer)
-            .filter(|cached| now_unix < cached.valid_until_unix)
+            .filter(|cached| {
+                now_unix < cached.valid_until_unix
+                    && cached
+                        .results
+                        .probes
+                        .iter()
+                        .any(|probe| probe.latency_ms.is_some())
+            })
             .map(|cached| cached.results.clone())
     }
 

@@ -204,9 +204,23 @@ pub struct ServerCandidatesResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeFailureCode {
+    InvalidUrl,
+    UnsupportedScheme,
+    Timeout,
+    NetworkError,
+    HttpError,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeResult {
     pub candidate_id: String,
-    pub latency_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<ProbeFailureCode>,
     pub measured_at: String,
 }
 

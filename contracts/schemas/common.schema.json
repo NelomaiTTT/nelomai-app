@@ -69,10 +69,31 @@
     },
     "probe": {
       "type": "object",
-      "required": ["candidate_id", "latency_ms", "measured_at"],
+      "required": ["candidate_id", "measured_at"],
+      "oneOf": [
+        {
+          "required": ["latency_ms"],
+          "not": { "required": ["failure_code"] }
+        },
+        {
+          "required": ["failure_code"],
+          "not": { "required": ["latency_ms"] }
+        }
+      ],
       "properties": {
         "candidate_id": { "type": "string", "minLength": 20, "maxLength": 4096 },
         "latency_ms": { "type": "number", "exclusiveMinimum": 0, "maximum": 10000 },
+        "failure_code": {
+          "type": "string",
+          "enum": [
+            "invalid_url",
+            "unsupported_scheme",
+            "timeout",
+            "network_error",
+            "http_error",
+            "unknown"
+          ]
+        },
         "measured_at": { "$ref": "#/$defs/timestamp" }
       },
       "additionalProperties": false

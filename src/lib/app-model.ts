@@ -172,7 +172,14 @@ export interface ProbeResults {
   layer: Layer;
   probes: Array<{
     candidate_id: string;
-    latency_ms: number;
+    latency_ms?: number;
+    failure_code?:
+      | "invalid_url"
+      | "unsupported_scheme"
+      | "timeout"
+      | "network_error"
+      | "http_error"
+      | "unknown";
     measured_at: string;
   }>;
 }
