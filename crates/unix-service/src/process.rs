@@ -1,6 +1,5 @@
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
-#[cfg(any(target_os = "macos", test))]
 use std::process::ExitStatus;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -69,7 +68,6 @@ fn terminate_process_group_members(process_id: u32) {
     let _ = unsafe { libc::kill(-(process_id as i32), libc::SIGKILL) };
 }
 
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn status_with_timeout(
     command: &mut Command,
     timeout: Duration,

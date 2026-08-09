@@ -2,7 +2,7 @@ use super::{apply_awg3_configuration, build_backend_configuration, userspace_soc
 use crate::process::{status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{LinuxUserspaceRouteManager, RouteManager, SystemRouteBackend, AWG_FWMARK};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
-use defguard_wireguard_rs::{Kernel, Userspace, WGApi, WireguardInterfaceApi};
+use defguard_wireguard_rs::{host::Host, Kernel, Userspace, WGApi, WireguardInterfaceApi};
 use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics, TunnelTransport};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -165,7 +165,7 @@ impl LinuxBackend {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn read_active_interface(&self) -> Result<defguard_wireguard_rs::Host, ServiceError> {
+    fn read_active_interface(&self) -> Result<Host, ServiceError> {
         match self.active_transport {
             Some(TunnelTransport::WireGuard) => self
                 .wireguard_api
