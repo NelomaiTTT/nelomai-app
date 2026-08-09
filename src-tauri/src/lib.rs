@@ -100,7 +100,17 @@ fn current_unix_time() -> i64 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // Register this before every plugin that performs setup. A secondary
+    // Windows launch must wake the existing window and exit before it can
+    // create another tray icon or initialize a second application runtime.
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        desktop::show_window(app);
+    }));
+
+    let builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_push_android::init())
         .plugin(tauri_plugin_tunnel_android::init())
