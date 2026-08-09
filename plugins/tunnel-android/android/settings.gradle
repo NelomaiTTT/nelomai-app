@@ -28,6 +28,8 @@ dependencyResolutionManagement {
 }
 
 include ':tauri-android'
+include ':amneziawg-tunnel'
+project(':amneziawg-tunnel').projectDir = new File(rootDir, '../../amneziawg-android-tunnel')
 def tauriAndroidProjectDir = System.getenv('TAURI_ANDROID_PROJECT_DIR')
 project(':tauri-android').projectDir = tauriAndroidProjectDir
     ? new File(tauriAndroidProjectDir)

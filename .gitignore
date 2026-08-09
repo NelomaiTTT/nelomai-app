@@ -6,6 +6,8 @@ target/
 /package
 /src-tauri/platform-runtime/
 /src-tauri/windows/runtime/
+/plugins/amneziawg-android-tunnel/.cxx/
+/plugins/amneziawg-android-tunnel/build/
 .env
 .env.*
 !.env.example

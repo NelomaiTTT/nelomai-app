@@ -17,9 +17,9 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
-import com.wireguard.android.backend.GoBackend
-import com.wireguard.android.backend.Tunnel
-import com.wireguard.config.Config
+import org.amnezia.awg.backend.GoBackend
+import org.amnezia.awg.backend.Tunnel
+import org.amnezia.awg.config.Config
 import java.io.ByteArrayInputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -376,6 +376,14 @@ internal object TunnelRuntime {
                     options,
                     applicationContext.packageName,
                 )
+                val transport = if (
+                    config.getInterface().headerProtectionKey.isPresent ||
+                    config.getInterface().contentPaddingAddition.isPresent
+                ) {
+                    "amneziawg_3"
+                } else {
+                    "wireguard"
+                }
                 val monitor = PhysicalNetworks(context)
                 val physicalState = monitor.snapshotState()
                 val localRoutes = if (options.splitSupported && options.excludeLocalNetworks) {
@@ -400,6 +408,8 @@ internal object TunnelRuntime {
                     "start.split_options",
                     mapOf(
                         "source" to args.startSource,
+                        "transport" to transport,
+                        "backend_version" to requireBackend().version,
                         "application_mode" to args.options.applicationMode,
                         "included_packages_count" to options.includedPackages.size,
                         "excluded_packages_count" to options.excludedPackages.size,

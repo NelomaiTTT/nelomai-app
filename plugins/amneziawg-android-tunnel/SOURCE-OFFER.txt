@@ -1,0 +1,12 @@
+Nelomai AmneziaWG Android corresponding source
+
+The native AmneziaWG components included in the Nelomai Android package are
+built from the pinned vendor/amneziawg-android source tree and its nested
+submodules, plus the pinned vendor/amneziawg-go source tree selected by the
+repository-root go.work workspace. Every Nelomai
+GitHub release that contains these binaries also
+contains a nelomai-<version>-amneziawg-android-source.tar.gz archive with the
+exact corresponding source and build integration used for that release.
+
+Project releases: https://github.com/NelomaiTTT/nelomai-app/releases
+Project source: https://github.com/NelomaiTTT/nelomai-app

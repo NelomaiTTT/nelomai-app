@@ -3,8 +3,8 @@ package ru.nelomai.tunnel
 import android.net.IpPrefix
 import android.os.Build
 import androidx.annotation.RequiresApi
-import com.wireguard.config.Config
-import com.wireguard.config.Interface
+import org.amnezia.awg.config.Config
+import org.amnezia.awg.config.Interface
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicReference
@@ -118,6 +118,29 @@ internal object AndroidSplitTunnel {
         if (source.getMtu().isPresent) {
             builder.setMtu(source.getMtu().get())
         }
+        source.junkPacketCount.ifPresent(builder::setJunkPacketCount)
+        source.junkPacketMinSize.ifPresent(builder::setJunkPacketMinSize)
+        source.junkPacketMaxSize.ifPresent(builder::setJunkPacketMaxSize)
+        source.initPacketJunkSize.ifPresent(builder::setInitPacketJunkSize)
+        source.responsePacketJunkSize.ifPresent(builder::setResponsePacketJunkSize)
+        source.cookieReplyPacketJunkSize.ifPresent(builder::setCookieReplyPacketJunkSize)
+        source.transportPacketJunkSize.ifPresent(builder::setTransportPacketJunkSize)
+        source.initPacketMagicHeader.ifPresent(builder::setInitPacketMagicHeader)
+        source.responsePacketMagicHeader.ifPresent(builder::setResponsePacketMagicHeader)
+        source.underloadPacketMagicHeader.ifPresent(builder::setUnderloadPacketMagicHeader)
+        source.transportPacketMagicHeader.ifPresent(builder::setTransportPacketMagicHeader)
+        source.specialJunkI1.ifPresent(builder::setSpecialJunkI1)
+        source.specialJunkI2.ifPresent(builder::setSpecialJunkI2)
+        source.specialJunkI3.ifPresent(builder::setSpecialJunkI3)
+        source.specialJunkI4.ifPresent(builder::setSpecialJunkI4)
+        source.specialJunkI5.ifPresent(builder::setSpecialJunkI5)
+        source.headerProtectionKey.ifPresent(builder::setHeaderProtectionKey)
+        source.contentPaddingAddition.ifPresent(builder::setContentPaddingAddition)
+        source.rekeyAfterTime.ifPresent(builder::setRekeyAfterTime)
+        source.rekeyTimeout.ifPresent(builder::setRekeyTimeout)
+        source.rejectAfterTime.ifPresent(builder::setRejectAfterTime)
+        source.keepaliveTimeout.ifPresent(builder::setKeepaliveTimeout)
+        source.maxHandshakeAttempts.ifPresent(builder::setMaxHandshakeAttempts)
         if (excludedPackages.isNotEmpty()) {
             builder.excludeApplications(excludedPackages)
         } else if (includedPackages.isNotEmpty()) {

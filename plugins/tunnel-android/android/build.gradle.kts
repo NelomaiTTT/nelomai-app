@@ -33,7 +33,7 @@ android {
 dependencies {
     implementation("androidx.activity:activity:1.10.1")
     implementation("androidx.core:core-ktx:1.16.0")
-    implementation("com.wireguard.android:tunnel:1.0.20260102")
+    implementation(project(":amneziawg-tunnel"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

@@ -157,6 +157,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -168,12 +170,24 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
       - uses: android-actions/setup-android@v3
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
           targets: aarch64-linux-android
       - uses: gradle/actions/setup-gradle@v4
+      - name: Проверить локальный Go backend AmneziaWG
+        run: |
+          test "$(git -C vendor/amneziawg-go rev-parse HEAD)" = \
+            9f5d948bc72cc554791cfe0fb91527e4acfb6b79
+          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && go env GOWORK)" = \
+            "$GITHUB_WORKSPACE/go.work"
+          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && \
+            go list -m -f '{{.Dir}}' github.com/amnezia-vpn/amneziawg-go/v3)" = \
+            "$GITHUB_WORKSPACE/vendor/amneziawg-go"
       - name: Установить Android SDK и NDK
         run: |
           sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
@@ -216,6 +230,22 @@ jobs:
             --output-dir release-android \
             --version "${RELEASE_VERSION#v}" \
             --signer-sha256 "$signer_sha256"
+          source_archive="release-android/nelomai-${RELEASE_VERSION#v}-amneziawg-android-source.tar.gz"
+          tar --exclude='.git' \
+            --exclude='*/build' --exclude='*/build/*' \
+            --exclude='*/.cxx' --exclude='*/.cxx/*' \
+            -czf "$source_archive" \
+            vendor/amneziawg-android \
+            vendor/amneziawg-go \
+            go.work \
+            plugins/amneziawg-android-tunnel \
+            plugins/tunnel-android/android/build.gradle.kts \
+            plugins/tunnel-android/android/src
+          source_archive_name="$(basename "$source_archive")"
+          (
+            cd release-android
+            sha256sum "$source_archive_name" > "${source_archive_name}.sha256"
+          )
       - uses: actions/upload-artifact@v4
         with:
           name: release-android-aarch64
@@ -249,6 +279,11 @@ jobs:
             --input-dir release-input \
             --output-dir release-publish \
             --version "${RELEASE_VERSION#v}"
+          find release-input -type f \
+            \( -name 'nelomai-*-amneziawg-android-source.tar.gz' \
+            -o -name 'nelomai-*-amneziawg-android-source.tar.gz.sha256' \) \
+            -exec cp {} release-publish/ \;
+          test "$(find release-publish -maxdepth 1 -name 'nelomai-*-amneziawg-android-source.tar.gz' | wc -l)" -eq 1
       - name: Опубликовать стабильный GitHub-релиз
         env:
           GH_TOKEN: ${{ github.token }}

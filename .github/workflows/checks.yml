@@ -37,17 +37,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
       - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
-      - name: Установить Android SDK
-        run: sdkmanager "platforms;android-36" "build-tools;30.0.3" "build-tools;36.0.0"
+      - name: Проверить закреплённые исходники AmneziaWG
+        run: |
+          test "$(git -C vendor/amneziawg-android rev-parse HEAD)" = \
+            f82900455f1aceaa85658686dc2c5e32c2c42a73
+          test "$(git -C vendor/amneziawg-go rev-parse HEAD)" = \
+            9f5d948bc72cc554791cfe0fb91527e4acfb6b79
+          test "$(git -C vendor/amneziawg-android/tunnel/tools/amneziawg-tools rev-parse HEAD)" = \
+            5d6179a6d0842e98dfb349c28cf1bd8e4b9d1079
+          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && go env GOWORK)" = \
+            "$GITHUB_WORKSPACE/go.work"
+          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && \
+            go list -m -f '{{.Dir}}' github.com/amnezia-vpn/amneziawg-go/v3)" = \
+            "$GITHUB_WORKSPACE/vendor/amneziawg-go"
+      - name: Установить Android SDK и NDK
+        run: sdkmanager "platforms;android-36" "build-tools;30.0.3" "build-tools;36.0.0" "ndk;28.2.13676358"
       - name: Проверить Android tunnel plugin
         run: |
           chmod +x src-tauri/gen/android/gradlew
@@ -59,7 +77,31 @@ jobs:
           TAURI_ANDROID_PROJECT_DIR="$(dirname "$tauri_manifest")/mobile/android" \
             src-tauri/gen/android/gradlew \
             -p plugins/tunnel-android/android \
-            testDebugUnitTest
+            testDebugUnitTest \
+            :amneziawg-tunnel:assembleDebug
+          unzip -l \
+            plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
+            grep -q 'assets/licenses/AMNEZIAWG-TOOLS-GPL-2.0.txt'
+          unzip -l \
+            plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
+            grep -q 'assets/licenses/ELF-CLEANER-GPL-2.0.txt'
+          unzip -l \
+            plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
+            grep -q 'assets/licenses/AMNEZIAWG-GO-MIT.txt'
+          unzip -l \
+            plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
+            grep -q 'assets/licenses/AMNEZIAWG-ANDROID-APACHE-2.0.txt'
+          unzip -l \
+            plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
+            grep -q 'assets/licenses/SOURCE-OFFER.txt'
+          unzip -l \
+            plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
+            grep -q 'jni/arm64-v8a/libwg-go.so'
+          if unzip -l plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
+            grep -Eq 'jni/(armeabi-v7a|x86|x86_64)/'; then
+            echo 'AWG AAR contains an unsupported Android ABI' >&2
+            exit 1
+          fi
       - name: Проверить Android push plugin
         run: |
           tauri_manifest="$(

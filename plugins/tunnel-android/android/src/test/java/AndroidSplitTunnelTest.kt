@@ -1,6 +1,6 @@
 package ru.nelomai.tunnel
 
-import com.wireguard.config.Config
+import org.amnezia.awg.config.Config
 import java.io.ByteArrayInputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -223,6 +223,56 @@ class AndroidSplitTunnelTest {
             setOf("9.9.9.9", "149.112.112.112"),
             updated.getInterface().dnsServers.map { it.hostAddress }.toSet(),
         )
+    }
+
+    @Test
+    fun splitTunnelRebuildPreservesAmneziaWg3Parameters() {
+        val original = parseConfig(
+            """
+            [Interface]
+            PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+            Address = 10.8.1.2/32
+            DNS = 8.8.8.8
+            MTU = 1280
+            Jc = 6
+            Jmin = 64
+            Jmax = 256
+            S1 = 32
+            S2 = 40
+            S3 = 48
+            S4 = 56
+            H1 = 100000-104095
+            H2 = 104096-108191
+            H3 = 108192-112287
+            H4 = 112288-116383
+            HeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+            ContentPaddingAddition = 0-64
+
+            [Peer]
+            PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+            AllowedIPs = 0.0.0.0/0
+            Endpoint = 127.0.0.1:10001
+            PersistentKeepalive = 21
+            """.trimIndent(),
+        )
+
+        val updated = AndroidSplitTunnel.applyOptions(
+            original,
+            AndroidSplitTunnel.resolveOptions(
+                33,
+                TunnelOptionsArgs().apply {
+                    splitActive = true
+                    excludedPackages = arrayListOf("com.example.excluded")
+                },
+            ),
+            "ru.nelomai.client",
+        ).getInterface()
+
+        assertEquals(original.getInterface().junkPacketCount, updated.junkPacketCount)
+        assertEquals(original.getInterface().transportPacketJunkSize, updated.transportPacketJunkSize)
+        assertEquals(original.getInterface().transportPacketMagicHeader, updated.transportPacketMagicHeader)
+        assertEquals(original.getInterface().headerProtectionKey, updated.headerProtectionKey)
+        assertEquals(original.getInterface().contentPaddingAddition, updated.contentPaddingAddition)
     }
 
     @Test

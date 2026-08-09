@@ -1,0 +1,6 @@
+go 1.25.0
+
+use (
+	./vendor/amneziawg-android/tunnel/tools/libwg-go
+	./vendor/amneziawg-go
+)

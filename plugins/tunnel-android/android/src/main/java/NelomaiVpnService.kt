@@ -17,7 +17,7 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
-import com.wireguard.android.backend.GoBackend
+import org.amnezia.awg.backend.GoBackend
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 

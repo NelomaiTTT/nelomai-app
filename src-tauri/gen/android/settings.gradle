@@ -1,3 +1,5 @@
 include ':app'
+include ':amneziawg-tunnel'
+project(':amneziawg-tunnel').projectDir = file('../../../plugins/amneziawg-android-tunnel')
 
 apply from: 'tauri.settings.gradle'
