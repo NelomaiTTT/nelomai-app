@@ -7,6 +7,10 @@ use std::path::PathBuf;
 const DEFAULT_RUNTIME_DIRECTORY: &str = "/var/run/nelomai";
 #[cfg(target_os = "macos")]
 const DEFAULT_WIREGUARD_GO: &str = "/Library/PrivilegedHelperTools/ru.nelomai.tunnel/wireguard-go";
+#[cfg(target_os = "linux")]
+const DEFAULT_AMNEZIAWG_GO: &str = "/usr/local/libexec/nelomai/amneziawg-go";
+#[cfg(target_os = "macos")]
+const DEFAULT_AMNEZIAWG_GO: &str = "/Library/PrivilegedHelperTools/ru.nelomai.tunnel/amneziawg-go";
 
 struct Options {
     owner_uid: u32,
@@ -14,6 +18,7 @@ struct Options {
     runtime_directory: PathBuf,
     #[cfg(target_os = "macos")]
     wireguard_go: PathBuf,
+    amneziawg_go: PathBuf,
 }
 
 fn main() {
@@ -56,6 +61,7 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
     let mut runtime_directory = PathBuf::from(DEFAULT_RUNTIME_DIRECTORY);
     #[cfg(target_os = "macos")]
     let mut wireguard_go = PathBuf::from(DEFAULT_WIREGUARD_GO);
+    let mut amneziawg_go = PathBuf::from(DEFAULT_AMNEZIAWG_GO);
     let mut arguments = arguments;
 
     while let Some(argument) = arguments.next() {
@@ -76,6 +82,9 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
             "--wireguard-go" => {
                 wireguard_go = absolute_path(arguments.next(), "wireguard-go")?;
             }
+            "--amneziawg-go" => {
+                amneziawg_go = absolute_path(arguments.next(), "amneziawg-go")?;
+            }
             "--version" => {
                 println!("{}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -90,6 +99,7 @@ fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, Str
         runtime_directory,
         #[cfg(target_os = "macos")]
         wireguard_go,
+        amneziawg_go,
     })
 }
 
@@ -105,13 +115,18 @@ fn absolute_path(value: Option<String>, name: &str) -> Result<PathBuf, String> {
 
 #[cfg(target_os = "linux")]
 fn create_backend(options: &Options) -> Result<PlatformBackend, String> {
-    PlatformBackend::new(&options.runtime_directory).map_err(|error| error.code().to_string())
+    PlatformBackend::new(&options.amneziawg_go, &options.runtime_directory)
+        .map_err(|error| error.code().to_string())
 }
 
 #[cfg(target_os = "macos")]
 fn create_backend(options: &Options) -> Result<PlatformBackend, String> {
-    PlatformBackend::new(&options.wireguard_go, &options.runtime_directory)
-        .map_err(|error| error.code().to_string())
+    PlatformBackend::new(
+        &options.wireguard_go,
+        &options.amneziawg_go,
+        &options.runtime_directory,
+    )
+    .map_err(|error| error.code().to_string())
 }
 
 fn generic_io(_error: std::io::Error) -> String {

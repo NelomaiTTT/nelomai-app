@@ -13,7 +13,8 @@ not the product design.
 - Rust for shared native logic and desktop integration.
 - Android plugin backed by the official
   `com.wireguard.android:tunnel` library.
-- Privileged tunnel services for Windows, macOS, and Linux.
+- Privileged WireGuard and AmneziaWG 3 tunnel services for Windows, macOS, and
+  Linux.
 - Signed automatic updates for desktop platforms; Android installation stays a
   separate native boundary.
 

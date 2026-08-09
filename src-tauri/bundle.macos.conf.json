@@ -3,7 +3,9 @@
     "resources": {
       "platform-runtime/nelomai-unix-service": "nelomai-unix-service",
       "platform-runtime/wireguard-go": "wireguard-go",
+      "platform-runtime/amneziawg-go": "amneziawg-go",
       "platform-runtime/WIREGUARD-GO-LICENSE.txt": "licenses/WIREGUARD-GO-LICENSE.txt",
+      "platform-runtime/AMNEZIAWG-GO-LICENSE.txt": "licenses/AMNEZIAWG-GO-LICENSE.txt",
       "platform-runtime/macos-runtime.json": "licenses/macos-runtime.json",
       "../crates/unix-service/install/install-macos.sh": "install-macos.sh",
       "../crates/unix-service/install/install-macos.applescript": "install-macos.applescript"

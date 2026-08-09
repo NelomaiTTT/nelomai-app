@@ -29,6 +29,10 @@ impl TunnelConfiguration {
         self.0.as_bytes()
     }
 
+    pub fn transport(&self) -> TunnelTransport {
+        detect_configuration_transport(self.expose())
+    }
+
     pub fn override_dns(&mut self, servers: &[IpAddr]) -> Result<(), TunnelConfigurationError> {
         if servers.is_empty() {
             return Ok(());
@@ -89,6 +93,50 @@ impl TunnelConfiguration {
         }
         self.0 = Zeroizing::new(updated);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TunnelTransport {
+    #[default]
+    WireGuard,
+    AmneziaWg3,
+}
+
+pub fn detect_configuration_transport(configuration: &str) -> TunnelTransport {
+    let mut in_interface = false;
+    let mut header_protection_key = false;
+    let mut content_padding_addition = false;
+
+    for raw_line in configuration.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_interface = line.eq_ignore_ascii_case("[Interface]");
+            continue;
+        }
+        if !in_interface {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        match key.trim().to_ascii_lowercase().as_str() {
+            "headerprotectionkey" => header_protection_key = true,
+            "contentpaddingaddition" => content_padding_addition = true,
+            _ => {}
+        }
+    }
+
+    if header_protection_key && content_padding_addition {
+        TunnelTransport::AmneziaWg3
+    } else {
+        TunnelTransport::WireGuard
     }
 }
 
@@ -416,6 +464,28 @@ mod tests {
     fn configuration_can_be_consumed_once_by_a_tunnel_backend() {
         let configuration = TunnelConfiguration::new("config".to_string());
         assert_eq!(configuration.expose(), "config");
+    }
+
+    #[test]
+    fn configuration_transport_requires_both_awg3_markers_in_interface() {
+        let awg3 = TunnelConfiguration::new(
+            "[Interface]\nHeaderProtectionKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\nContentPaddingAddition = 0-64\n\n[Peer]\nPublicKey = peer\n"
+                .to_string(),
+        );
+        assert_eq!(awg3.transport(), TunnelTransport::AmneziaWg3);
+
+        assert_eq!(
+            detect_configuration_transport(
+                "[Interface]\nHeaderProtectionKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            ),
+            TunnelTransport::WireGuard
+        );
+        assert_eq!(
+            detect_configuration_transport(
+                "[Interface]\nPrivateKey = secret\n[Peer]\nHeaderProtectionKey = value\nContentPaddingAddition = 0-64\n"
+            ),
+            TunnelTransport::WireGuard
+        );
     }
 
     #[test]

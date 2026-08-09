@@ -155,6 +155,10 @@ def run() -> None:
         "nelomai-windows-service.exe",
         "tunnel.dll",
         "wireguard.dll",
+        "amneziawg-tunnel.dll",
+        "wintun.dll",
+        "licenses/AMNEZIAWG-GO-LICENSE.txt",
+        "licenses/WINTUN-LICENSE.txt",
     ):
         if resource not in windows_resources.values():
             raise RuntimeError(f"Windows bundle misses {resource}")
@@ -205,7 +209,13 @@ def run() -> None:
             encoding="utf-8"
         )
     ).get("bundle", {}).get("resources", {})
-    for resource in ("nelomai-unix-service", "wireguard-go", "install-macos.sh"):
+    for resource in (
+        "nelomai-unix-service",
+        "wireguard-go",
+        "amneziawg-go",
+        "licenses/AMNEZIAWG-GO-LICENSE.txt",
+        "install-macos.sh",
+    ):
         if resource not in macos_resources.values():
             raise RuntimeError(f"macOS bundle misses {resource}")
 
@@ -216,6 +226,8 @@ def run() -> None:
     ).get("bundle", {}).get("resources", {})
     for resource in (
         "nelomai-unix-service",
+        "amneziawg-go",
+        "licenses/AMNEZIAWG-GO-LICENSE.txt",
         "install-linux.sh",
         "resolvconf-linux.sh",
     ):

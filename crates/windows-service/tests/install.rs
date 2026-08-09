@@ -1,6 +1,8 @@
+use nelomai_client_tunnel::TunnelTransport;
 use nelomai_windows_service::{
     manager_service_spec, pipe_security_descriptor, private_directory_security_descriptor,
-    tunnel_service_spec, ServiceStartMode, MANAGER_SERVICE_NAME, TUNNEL_SERVICE_NAME,
+    tunnel_service_spec, ServiceStartMode, AMNEZIAWG_TUNNEL_SERVICE_NAME, MANAGER_SERVICE_NAME,
+    TUNNEL_SERVICE_NAME,
 };
 use std::path::Path;
 
@@ -23,6 +25,7 @@ fn tunnel_service_matches_official_wireguard_requirements() {
     let spec = tunnel_service_spec(
         Path::new(r"C:\Program Files\Nelomai\nelomai-windows-service.exe"),
         Path::new(r"C:\ProgramData\Nelomai\tunnel\nelomai.conf"),
+        TunnelTransport::WireGuard,
     )
     .expect("tunnel service spec");
 
@@ -35,6 +38,27 @@ fn tunnel_service_matches_official_wireguard_requirements() {
         spec.arguments,
         [
             "--wireguard-service",
+            r"C:\ProgramData\Nelomai\tunnel\nelomai.conf"
+        ]
+    );
+}
+
+#[test]
+fn amneziawg_tunnel_service_uses_its_dedicated_runtime() {
+    let spec = tunnel_service_spec(
+        Path::new(r"C:\Program Files\Nelomai\nelomai-windows-service.exe"),
+        Path::new(r"C:\ProgramData\Nelomai\tunnel\nelomai.conf"),
+        TunnelTransport::AmneziaWg3,
+    )
+    .expect("AWG3 tunnel service spec");
+
+    assert_eq!(spec.name, AMNEZIAWG_TUNNEL_SERVICE_NAME);
+    assert!(!spec.name.contains('$'));
+    assert_eq!(spec.display_name, "Nelomai AmneziaWG 3 Tunnel");
+    assert_eq!(
+        spec.arguments,
+        [
+            "--amneziawg-service",
             r"C:\ProgramData\Nelomai\tunnel\nelomai.conf"
         ]
     );

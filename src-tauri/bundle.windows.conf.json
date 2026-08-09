@@ -4,8 +4,13 @@
       "../target/x86_64-pc-windows-msvc/release/nelomai-windows-service.exe": "nelomai-windows-service.exe",
       "windows/runtime/tunnel.dll": "tunnel.dll",
       "windows/runtime/wireguard.dll": "wireguard.dll",
+      "windows/runtime/amneziawg-tunnel.dll": "amneziawg-tunnel.dll",
+      "windows/runtime/wintun.dll": "wintun.dll",
       "windows/runtime/WIREGUARD-WINDOWS-LICENSE.txt": "licenses/WIREGUARD-WINDOWS-LICENSE.txt",
       "windows/runtime/WIREGUARD-NT-LICENSE.txt": "licenses/WIREGUARD-NT-LICENSE.txt",
+      "windows/runtime/AMNEZIAWG-WINDOWS-README.txt": "licenses/AMNEZIAWG-WINDOWS-README.txt",
+      "windows/runtime/WINTUN-LICENSE.txt": "licenses/WINTUN-LICENSE.txt",
+      "windows/runtime/AMNEZIAWG-GO-LICENSE.txt": "licenses/AMNEZIAWG-GO-LICENSE.txt",
       "windows/runtime/windows-runtime.json": "licenses/windows-runtime.json"
     },
     "windows": {

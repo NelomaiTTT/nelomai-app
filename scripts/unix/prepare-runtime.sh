@@ -11,6 +11,7 @@ RUST_TARGET=$2
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 HELPER=$ROOT/target/$RUST_TARGET/release/nelomai-unix-service
 OUTPUT=$ROOT/src-tauri/platform-runtime
+AMNEZIAWG_GO_COMMIT=9f5d948bc72cc554791cfe0fb91527e4acfb6b79
 
 if [ ! -f "$HELPER" ]; then
   echo "Unix helper is missing: $HELPER" >&2
@@ -20,12 +21,48 @@ fi
 mkdir -p "$OUTPUT"
 install -m 0755 "$HELPER" "$OUTPUT/nelomai-unix-service"
 
-if [ "$PLATFORM" = "linux" ]; then
-  exit 0
-fi
-if [ "$PLATFORM" != "macos" ]; then
+if [ "$PLATFORM" != "linux" ] && [ "$PLATFORM" != "macos" ]; then
   echo "Unsupported Unix platform: $PLATFORM" >&2
   exit 1
+fi
+
+if [ "$(git -C "$ROOT/vendor/amneziawg-go" rev-parse HEAD)" != "$AMNEZIAWG_GO_COMMIT" ]; then
+  echo "Unexpected AmneziaWG Go source revision" >&2
+  exit 1
+fi
+(
+  cd "$ROOT/vendor/amneziawg-go"
+  go build -trimpath \
+    -ldflags="-s -w -X github.com/amnezia-vpn/amneziawg-go/v3/ipc.socketDirectory=/var/run/wireguard" \
+    -o "$OUTPUT/amneziawg-go"
+)
+chmod 0755 "$OUTPUT/amneziawg-go"
+install -m 0644 "$ROOT/vendor/amneziawg-go/LICENSE" "$OUTPUT/AMNEZIAWG-GO-LICENSE.txt"
+
+if [ "$PLATFORM" = "linux" ]; then
+  python3 - "$OUTPUT" "$AMNEZIAWG_GO_COMMIT" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+output = Path(sys.argv[1])
+commit = sys.argv[2]
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+metadata = {
+    "amneziawg_go_commit": commit,
+    "amneziawg_go_sha256": sha256(output / "amneziawg-go"),
+    "helper_sha256": sha256(output / "nelomai-unix-service"),
+}
+(output / "linux-runtime.json").write_text(
+    json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+  exit 0
 fi
 
 WIREGUARD_GO_COMMIT=ecfc5a8d54462e18e13c72173e2623d16d8e25a0
@@ -42,7 +79,7 @@ make -C "$SOURCE"
 install -m 0755 "$SOURCE/wireguard-go" "$OUTPUT/wireguard-go"
 install -m 0644 "$SOURCE/LICENSE" "$OUTPUT/WIREGUARD-GO-LICENSE.txt"
 
-python3 - "$OUTPUT" "$WIREGUARD_GO_COMMIT" <<'PY'
+python3 - "$OUTPUT" "$WIREGUARD_GO_COMMIT" "$AMNEZIAWG_GO_COMMIT" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -50,6 +87,7 @@ import sys
 
 output = Path(sys.argv[1])
 commit = sys.argv[2]
+amnezia_commit = sys.argv[3]
 
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -57,6 +95,8 @@ def sha256(path: Path) -> str:
 metadata = {
     "wireguard_go_commit": commit,
     "wireguard_go_sha256": sha256(output / "wireguard-go"),
+    "amneziawg_go_commit": amnezia_commit,
+    "amneziawg_go_sha256": sha256(output / "amneziawg-go"),
     "helper_sha256": sha256(output / "nelomai-unix-service"),
 }
 (output / "macos-runtime.json").write_text(

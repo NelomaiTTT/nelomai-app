@@ -7,7 +7,8 @@ mod socket;
 use async_trait::async_trait;
 pub use backend::PlatformBackend;
 pub use config::{
-    parse_configuration, ConfigurationError, Endpoint, ParsedConfiguration, ParsedPeer, SecretKey,
+    parse_configuration, Awg3Parameters, ConfigurationError, Endpoint, ParsedConfiguration,
+    ParsedPeer, SecretKey,
 };
 use nelomai_client_tunnel::{
     DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
@@ -401,6 +402,13 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "ip_command_unavailable" => "ip_command_unavailable",
         "physical_egress_unavailable" => "physical_egress_unavailable",
         "local_networks_unavailable" => "local_networks_unavailable",
+        "amneziawg_uapi_unavailable" => "amneziawg_uapi_unavailable",
+        "amneziawg_configuration_failed" => "amneziawg_configuration_failed",
+        "amneziawg_interface_already_exists" => "amneziawg_interface_already_exists",
+        "amneziawg_go_start_failed" => "amneziawg_go_start_failed",
+        "amneziawg_go_start_timeout" => "amneziawg_go_start_timeout",
+        "untrusted_amneziawg_go" => "untrusted_amneziawg_go",
+        "multiple_tunnel_interfaces_detected" => "multiple_tunnel_interfaces_detected",
         _ => return None,
     })
 }
@@ -728,6 +736,10 @@ mod service_error_tests {
         assert_eq!(
             ServiceError::Backend("raw operating system error".to_string()).code(),
             "service_unavailable"
+        );
+        assert_eq!(
+            ServiceError::Backend("amneziawg_configuration_failed".to_string()).code(),
+            "amneziawg_configuration_failed"
         );
     }
 }

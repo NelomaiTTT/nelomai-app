@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
     DesktopTunnelOptions, TunnelConfiguration, TunnelController, TunnelError, TunnelMetrics,
-    TunnelStartRequest, TunnelStatus,
+    TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
 use nelomai_windows_service::{
     Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
@@ -12,6 +12,7 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct RecordingBackend {
     starts: Vec<String>,
+    transports: Vec<TunnelTransport>,
     stops: usize,
     state: ServiceTunnelState,
 }
@@ -21,8 +22,10 @@ impl ServiceTunnelBackend for RecordingBackend {
         &mut self,
         configuration: &str,
         _options: &nelomai_client_tunnel::DesktopTunnelOptions,
+        transport: TunnelTransport,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.starts.push(configuration.to_string());
+        self.transports.push(transport);
         self.state = ServiceTunnelState::Running;
         Ok(self.state)
     }
@@ -86,6 +89,7 @@ fn handler_executes_only_typed_tunnel_operations() {
         Some("abababababababababababababababababababababababababababababababab")
     );
     assert_eq!(handler.backend().starts, vec!["PrivateKey = transient"]);
+    assert_eq!(handler.backend().transports, [TunnelTransport::WireGuard]);
     assert_eq!(handler.backend().stops, 1);
     assert_eq!(
         metrics.metrics,
@@ -178,6 +182,26 @@ AllowedIPs = 0.0.0.0/0, ::/0
 
     assert!(response.ok);
     assert_eq!(handler.backend().starts, vec![configuration]);
+}
+
+#[test]
+fn handler_selects_amneziawg_only_for_complete_awg3_markers() {
+    let backend = RecordingBackend::default();
+    let mut handler = TunnelRequestHandler::new(backend, "1.2.3");
+    let configuration = "\
+[Interface]
+PrivateKey = transient
+HeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=
+ContentPaddingAddition = 0-64
+
+[Peer]
+AllowedIPs = 0.0.0.0/0
+";
+
+    let response = handler.handle(Request::start(configuration.to_string()));
+
+    assert!(response.ok);
+    assert_eq!(handler.backend().transports, [TunnelTransport::AmneziaWg3]);
 }
 
 struct RecordingTransport {

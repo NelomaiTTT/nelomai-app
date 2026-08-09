@@ -5,11 +5,22 @@ use std::net::IpAddr;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use nelomai_client_tunnel::TunnelTransport;
+
 pub struct SecretKey(Zeroizing<[u8; 32]>);
 
 impl SecretKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    fn as_hex(&self) -> Zeroizing<String> {
+        let mut value = String::with_capacity(64);
+        for byte in self.as_bytes() {
+            use std::fmt::Write as _;
+            write!(&mut value, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        Zeroizing::new(value)
     }
 }
 
@@ -63,6 +74,8 @@ pub struct ParsedConfiguration {
     pub mtu: Option<u32>,
     pub listen_port: Option<u16>,
     pub peers: Vec<ParsedPeer>,
+    pub transport: TunnelTransport,
+    pub awg3: Option<Awg3Parameters>,
 }
 
 impl fmt::Debug for ParsedConfiguration {
@@ -75,6 +88,43 @@ impl fmt::Debug for ParsedConfiguration {
             .field("mtu", &self.mtu)
             .field("listen_port", &self.listen_port)
             .field("peers", &self.peers)
+            .field("transport", &self.transport)
+            .field("awg3", &self.awg3)
+            .finish()
+    }
+}
+
+pub struct Awg3Parameters {
+    header_protection_key: SecretKey,
+    fields: Vec<(&'static str, String)>,
+}
+
+impl Awg3Parameters {
+    pub(crate) fn uapi_configuration(&self) -> Zeroizing<String> {
+        let header_key = self.header_protection_key.as_hex();
+        let mut output = String::new();
+        output.push_str("header_protection_key=");
+        output.push_str(&header_key);
+        output.push('\n');
+        for (key, value) in &self.fields {
+            output.push_str(key);
+            output.push('=');
+            output.push_str(value);
+            output.push('\n');
+        }
+        Zeroizing::new(output)
+    }
+}
+
+impl fmt::Debug for Awg3Parameters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Awg3Parameters")
+            .field("header_protection_key", &"<redacted>")
+            .field(
+                "fields",
+                &self.fields.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -112,6 +162,54 @@ struct InterfaceBuilder {
     dns: Vec<IpAddr>,
     mtu: Option<u32>,
     listen_port: Option<u16>,
+    awg3: Awg3Builder,
+}
+
+#[derive(Default)]
+struct Awg3Builder {
+    header_protection_key: Option<SecretKey>,
+    content_padding_addition: Option<String>,
+    fields: Vec<(&'static str, String)>,
+    seen: std::collections::HashSet<&'static str>,
+}
+
+impl Awg3Builder {
+    fn has_fields(&self) -> bool {
+        self.header_protection_key.is_some()
+            || self.content_padding_addition.is_some()
+            || !self.fields.is_empty()
+    }
+
+    fn finish(mut self) -> Result<Option<Awg3Parameters>, ConfigurationError> {
+        if !self.has_fields() {
+            return Ok(None);
+        }
+        let header_protection_key = self
+            .header_protection_key
+            .ok_or(ConfigurationError::MissingField)?;
+        let content_padding_addition = self
+            .content_padding_addition
+            .take()
+            .ok_or(ConfigurationError::MissingField)?;
+        self.fields
+            .push(("content_padding_addition", content_padding_addition));
+        Ok(Some(Awg3Parameters {
+            header_protection_key,
+            fields: self.fields,
+        }))
+    }
+
+    fn insert_field(
+        &mut self,
+        uapi_key: &'static str,
+        value: String,
+    ) -> Result<(), ConfigurationError> {
+        if !self.seen.insert(uapi_key) {
+            return Err(ConfigurationError::InvalidStructure);
+        }
+        self.fields.push((uapi_key, value));
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -186,6 +284,13 @@ pub fn parse_configuration(input: &str) -> Result<ParsedConfiguration, Configura
         return Err(ConfigurationError::MissingField);
     }
 
+    let awg3 = interface.awg3.finish()?;
+    let transport = if awg3.is_some() {
+        TunnelTransport::AmneziaWg3
+    } else {
+        TunnelTransport::WireGuard
+    };
+
     Ok(ParsedConfiguration {
         private_key,
         addresses: interface.addresses,
@@ -193,6 +298,8 @@ pub fn parse_configuration(input: &str) -> Result<ParsedConfiguration, Configura
         mtu: interface.mtu,
         listen_port: interface.listen_port,
         peers,
+        transport,
+        awg3,
     })
 }
 
@@ -223,7 +330,40 @@ fn parse_interface_field(
         "ListenPort" if interface.listen_port.is_none() => {
             interface.listen_port = Some(parse_nonzero_port(value)?);
         }
+        "HeaderProtectionKey" if interface.awg3.header_protection_key.is_none() => {
+            interface.awg3.header_protection_key =
+                Some(SecretKey(Zeroizing::new(parse_key(value)?)));
+        }
+        "ContentPaddingAddition" if interface.awg3.content_padding_addition.is_none() => {
+            interface.awg3.content_padding_addition = Some(parse_u32_range(value)?);
+        }
+        "Jc" => parse_awg_u32(&mut interface.awg3, "jc", value)?,
+        "Jmin" => parse_awg_u32(&mut interface.awg3, "jmin", value)?,
+        "Jmax" => parse_awg_u32(&mut interface.awg3, "jmax", value)?,
+        "S1" => parse_awg_u16(&mut interface.awg3, "s1", value)?,
+        "S2" => parse_awg_u16(&mut interface.awg3, "s2", value)?,
+        "S3" => parse_awg_u16(&mut interface.awg3, "s3", value)?,
+        "S4" => parse_awg_u16(&mut interface.awg3, "s4", value)?,
+        "H1" => parse_awg_range(&mut interface.awg3, "h1", value)?,
+        "H2" => parse_awg_range(&mut interface.awg3, "h2", value)?,
+        "H3" => parse_awg_range(&mut interface.awg3, "h3", value)?,
+        "H4" => parse_awg_range(&mut interface.awg3, "h4", value)?,
+        "I1" => parse_awg_template(&mut interface.awg3, "i1", value)?,
+        "I2" => parse_awg_template(&mut interface.awg3, "i2", value)?,
+        "I3" => parse_awg_template(&mut interface.awg3, "i3", value)?,
+        "I4" => parse_awg_template(&mut interface.awg3, "i4", value)?,
+        "I5" => parse_awg_template(&mut interface.awg3, "i5", value)?,
+        "RekeyAfterTime" => parse_awg_range(&mut interface.awg3, "rekey_after_time", value)?,
+        "RekeyTimeout" => parse_awg_range(&mut interface.awg3, "rekey_timeout", value)?,
+        "RejectAfterTime" => parse_awg_range(&mut interface.awg3, "reject_after_time", value)?,
+        "KeepaliveTimeout" => parse_awg_range(&mut interface.awg3, "keepalive_timeout", value)?,
+        "MaxHandshakeAttempts" => {
+            parse_awg_range(&mut interface.awg3, "max_handshake_attempts", value)?
+        }
         "PrivateKey" | "Address" | "DNS" | "MTU" | "ListenPort" => {
+            return Err(ConfigurationError::InvalidStructure);
+        }
+        "HeaderProtectionKey" | "ContentPaddingAddition" => {
             return Err(ConfigurationError::InvalidStructure);
         }
         _ => return Err(ConfigurationError::UnsupportedField),
@@ -318,6 +458,69 @@ fn parse_nonzero_port(value: &str) -> Result<u16, ConfigurationError> {
     } else {
         Ok(port)
     }
+}
+
+fn parse_awg_u32(
+    awg3: &mut Awg3Builder,
+    key: &'static str,
+    value: &str,
+) -> Result<(), ConfigurationError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| ConfigurationError::InvalidValue)?;
+    awg3.insert_field(key, value.to_string())
+}
+
+fn parse_awg_u16(
+    awg3: &mut Awg3Builder,
+    key: &'static str,
+    value: &str,
+) -> Result<(), ConfigurationError> {
+    value
+        .parse::<u16>()
+        .map_err(|_| ConfigurationError::InvalidValue)?;
+    awg3.insert_field(key, value.to_string())
+}
+
+fn parse_awg_range(
+    awg3: &mut Awg3Builder,
+    key: &'static str,
+    value: &str,
+) -> Result<(), ConfigurationError> {
+    awg3.insert_field(key, parse_u32_range(value)?)
+}
+
+fn parse_u32_range(value: &str) -> Result<String, ConfigurationError> {
+    let (minimum, maximum) = value.split_once('-').unwrap_or((value, value));
+    let minimum = minimum
+        .parse::<u32>()
+        .map_err(|_| ConfigurationError::InvalidValue)?;
+    let maximum = maximum
+        .parse::<u32>()
+        .map_err(|_| ConfigurationError::InvalidValue)?;
+    if minimum > maximum {
+        return Err(ConfigurationError::InvalidValue);
+    }
+    Ok(if minimum == maximum {
+        minimum.to_string()
+    } else {
+        format!("{minimum}-{maximum}")
+    })
+}
+
+fn parse_awg_template(
+    awg3: &mut Awg3Builder,
+    key: &'static str,
+    value: &str,
+) -> Result<(), ConfigurationError> {
+    if value.len() > 4096
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+    {
+        return Err(ConfigurationError::InvalidValue);
+    }
+    awg3.insert_field(key, value.to_string())
 }
 
 fn parse_endpoint(value: &str) -> Result<Endpoint, ConfigurationError> {

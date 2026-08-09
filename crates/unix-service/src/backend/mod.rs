@@ -3,12 +3,16 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
-use crate::{ParsedConfiguration, ServiceError};
+use crate::{Awg3Parameters, ParsedConfiguration, ServiceError};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use defguard_wireguard_rs::{key::Key, net::IpAddrMask, peer::Peer, InterfaceConfiguration};
+use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "macos")]
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as PlatformBackend;
@@ -71,10 +75,64 @@ pub(crate) fn build_backend_configuration(
     })
 }
 
+const USERSPACE_SOCKET_TIMEOUT: Duration = Duration::from_secs(3);
+const USERSPACE_SOCKET_DIRECTORY: &str = "/var/run/wireguard";
+
+pub(crate) fn userspace_socket_path(interface_name: &str) -> PathBuf {
+    Path::new(USERSPACE_SOCKET_DIRECTORY).join(format!("{interface_name}.sock"))
+}
+
+pub(crate) fn apply_awg3_configuration(
+    interface_name: &str,
+    parameters: &Awg3Parameters,
+) -> Result<(), ServiceError> {
+    let mut socket = UnixStream::connect(userspace_socket_path(interface_name))
+        .map_err(|_| ServiceError::Backend("amneziawg_uapi_unavailable".to_string()))?;
+    socket
+        .set_read_timeout(Some(USERSPACE_SOCKET_TIMEOUT))
+        .and_then(|_| socket.set_write_timeout(Some(USERSPACE_SOCKET_TIMEOUT)))
+        .map_err(|_| ServiceError::Backend("amneziawg_uapi_unavailable".to_string()))?;
+    let configuration = parameters.uapi_configuration();
+    socket
+        .write_all(b"set=1\n")
+        .and_then(|_| socket.write_all(configuration.as_bytes()))
+        .and_then(|_| socket.write_all(b"\n"))
+        .map_err(|_| ServiceError::Backend("amneziawg_configuration_failed".to_string()))?;
+
+    if read_awg3_response(socket)? {
+        Ok(())
+    } else {
+        Err(ServiceError::Backend(
+            "amneziawg_configuration_failed".to_string(),
+        ))
+    }
+}
+
+fn read_awg3_response(socket: UnixStream) -> Result<bool, ServiceError> {
+    let mut reader = BufReader::new(socket);
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|_| ServiceError::Backend("amneziawg_configuration_failed".to_string()))?;
+        if read == 0 || line == "\n" {
+            return Ok(false);
+        }
+        if line.trim() == "errno=0" {
+            let mut terminator = String::new();
+            reader
+                .read_line(&mut terminator)
+                .map_err(|_| ServiceError::Backend("amneziawg_configuration_failed".to_string()))?;
+            return Ok(terminator == "\n");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parse_configuration;
+    use std::thread;
 
     const PRIVATE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     const PUBLIC_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
@@ -114,5 +172,21 @@ PersistentKeepalive = 21
             native.interface.peers[0].persistent_keepalive_interval,
             Some(21)
         );
+    }
+
+    #[test]
+    fn awg3_uapi_stops_reading_at_the_protocol_terminator() {
+        let (client, mut server_socket) = UnixStream::pair().expect("socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let server = thread::spawn(move || {
+            server_socket
+                .write_all(b"errno=0\n\n")
+                .expect("write response");
+            thread::sleep(Duration::from_millis(200));
+        });
+        assert!(read_awg3_response(client).expect("read response"));
+        server.join().expect("server");
     }
 }

@@ -2,7 +2,10 @@ use super::backend::WindowsServiceBackend;
 use super::install::{load_policy, record_service_diagnostic};
 use super::ipc::{finish_request, wake_server, PipeServer};
 use super::{platform_error, wide};
-use crate::{ServiceError, TunnelRequestHandler, MANAGER_SERVICE_NAME};
+use crate::{
+    ServiceError, TunnelRequestHandler, AMNEZIAWG_TUNNEL_SERVICE_NAME, MANAGER_SERVICE_NAME,
+    MAX_FRAME_SIZE,
+};
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -197,6 +200,62 @@ pub fn run_wireguard_service(configuration: &Path) -> Result<(), ServiceError> {
     } else {
         Err(ServiceError::Backend(
             "WireGuardTunnelService returned failure".to_string(),
+        ))
+    }
+}
+
+pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
+    let metadata = std::fs::metadata(configuration)
+        .map_err(|error| platform_error("read AmneziaWG configuration metadata", error))?;
+    if metadata.len() as usize > MAX_FRAME_SIZE {
+        return Err(ServiceError::FrameTooLarge);
+    }
+    let configuration_text = zeroize::Zeroizing::new(
+        std::fs::read_to_string(configuration)
+            .map_err(|error| platform_error("read AmneziaWG configuration", error))?,
+    );
+    let tunnel_dll = std::env::current_exe()
+        .map_err(|error| platform_error("resolve tunnel service executable", error))?
+        .with_file_name("amneziawg-tunnel.dll");
+    let tunnel_dll = wide(tunnel_dll.as_os_str());
+    let module = unsafe {
+        LoadLibraryExW(
+            tunnel_dll.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+    };
+    if module.is_null() {
+        return Err(platform_error(
+            "load amneziawg-tunnel.dll",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let procedure = unsafe { GetProcAddress(module, c"WireGuardTunnelService".as_ptr().cast()) };
+    let Some(procedure) = procedure else {
+        unsafe {
+            FreeLibrary(module);
+        }
+        return Err(platform_error(
+            "resolve AmneziaWG tunnel service",
+            std::io::Error::last_os_error(),
+        ));
+    };
+    type AmneziaWgTunnelService = unsafe extern "C" fn(*const u16, *const u16) -> bool;
+    let service: AmneziaWgTunnelService =
+        unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(procedure) };
+    let configuration_text =
+        zeroize::Zeroizing::new(wide(std::ffi::OsStr::new(configuration_text.as_str())));
+    let service_name = wide(std::ffi::OsStr::new(AMNEZIAWG_TUNNEL_SERVICE_NAME));
+    let succeeded = unsafe { service(configuration_text.as_ptr(), service_name.as_ptr()) };
+    unsafe {
+        FreeLibrary(module);
+    }
+    if succeeded {
+        Ok(())
+    } else {
+        Err(ServiceError::Backend(
+            "AmneziaWG tunnel service returned failure".to_string(),
         ))
     }
 }

@@ -4,7 +4,9 @@ use super::install::{
 };
 use super::routes::WindowsRouteManager;
 use crate::{ServiceError, ServiceTunnelBackend, ServiceTunnelState};
-use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics};
+use nelomai_client_tunnel::{
+    detect_configuration_transport, DesktopTunnelOptions, TunnelMetrics, TunnelTransport,
+};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -18,6 +20,7 @@ const TUNNEL_INTERFACE_NAME: &str = "nelomai";
 pub(crate) struct WindowsServiceBackend {
     routes: WindowsRouteManager,
     endpoint: Option<IpAddr>,
+    transport: Option<TunnelTransport>,
 }
 
 impl WindowsServiceBackend {
@@ -41,7 +44,14 @@ impl WindowsServiceBackend {
         let endpoint = tunnel_active
             .then(|| tunnel_config_path().ok().and_then(read_endpoint_from_file))
             .flatten();
-        Ok(Self { routes, endpoint })
+        let transport = tunnel_active
+            .then(|| tunnel_config_path().ok().and_then(read_transport_from_file))
+            .flatten();
+        Ok(Self {
+            routes,
+            endpoint,
+            transport,
+        })
     }
 }
 
@@ -50,9 +60,11 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         &mut self,
         configuration: &str,
         options: &DesktopTunnelOptions,
+        transport: TunnelTransport,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.stop()?;
         self.endpoint = resolve_endpoint(configuration);
+        self.transport = Some(transport);
         if let Err(error) = self.routes.apply(options) {
             let _ = self.routes.cleanup();
             return Err(error);
@@ -60,15 +72,30 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         let result = (|| {
             let config_path = tunnel_config_path()?;
             write_configuration_atomically(&config_path, configuration)?;
-            let service = create_or_replace_tunnel_service(&config_path)?;
-            service.start(&[] as &[&str]).map_err(|error| {
-                ServiceError::Backend(format!("start WireGuard tunnel service: {error}"))
-            })?;
-            super::install::wait_until_running(&service)?;
+            let service = create_or_replace_tunnel_service(&config_path, transport)?;
+            service
+                .start(&[] as &[&str])
+                .map_err(|error| match transport {
+                    TunnelTransport::WireGuard => {
+                        ServiceError::Backend(format!("start WireGuard tunnel service: {error}"))
+                    }
+                    TunnelTransport::AmneziaWg3 => {
+                        ServiceError::Backend("amneziawg_service_start_failed".to_string())
+                    }
+                })?;
+            if let Err(error) = super::install::wait_until_running(&service) {
+                return Err(match transport {
+                    TunnelTransport::WireGuard => error,
+                    TunnelTransport::AmneziaWg3 => {
+                        ServiceError::Backend("amneziawg_service_start_failed".to_string())
+                    }
+                });
+            }
             Ok::<_, ServiceError>(())
         })();
         if let Err(error) = result {
             self.endpoint = None;
+            self.transport = None;
             let config_path = tunnel_config_path().ok();
             let _ = remove_tunnel_service();
             if let Some(config_path) = config_path {
@@ -82,6 +109,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
 
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         self.endpoint = None;
+        self.transport = None;
         let mut first_error = remove_tunnel_service().err();
         match tunnel_config_path() {
             Ok(path) => {
@@ -129,7 +157,10 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
     }
 
     fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
-        let (received_bytes, sent_bytes) = interface_counters()?;
+        let transport = self
+            .transport
+            .ok_or_else(|| ServiceError::Backend("tunnel_not_running".to_string()))?;
+        let (received_bytes, sent_bytes) = interface_counters(transport)?;
         Ok(TunnelMetrics {
             received_bytes,
             sent_bytes,
@@ -144,6 +175,11 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
 fn read_endpoint_from_file(path: std::path::PathBuf) -> Option<IpAddr> {
     let configuration = zeroize::Zeroizing::new(fs::read_to_string(path).ok()?);
     resolve_endpoint(&configuration)
+}
+
+fn read_transport_from_file(path: std::path::PathBuf) -> Option<TunnelTransport> {
+    let configuration = zeroize::Zeroizing::new(fs::read_to_string(path).ok()?);
+    Some(detect_configuration_transport(&configuration))
 }
 
 fn resolve_endpoint(configuration: &str) -> Option<IpAddr> {
@@ -165,7 +201,11 @@ fn resolve_endpoint(configuration: &str) -> Option<IpAddr> {
         .map(|endpoint| endpoint.ip())
 }
 
-fn interface_counters() -> Result<(u64, u64), ServiceError> {
+fn interface_counters(transport: TunnelTransport) -> Result<(u64, u64), ServiceError> {
+    let interface_name = match transport {
+        TunnelTransport::WireGuard => TUNNEL_INTERFACE_NAME,
+        TunnelTransport::AmneziaWg3 => crate::AMNEZIAWG_TUNNEL_SERVICE_NAME,
+    };
     let mut table = std::ptr::null_mut::<MIB_IF_TABLE2>();
     let result = unsafe { GetIfTable2(&mut table) };
     if result != NO_ERROR || table.is_null() {
@@ -178,7 +218,7 @@ fn interface_counters() -> Result<(u64, u64), ServiceError> {
             std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
         entries
             .iter()
-            .find(|entry| wide_string(&entry.Alias).eq_ignore_ascii_case(TUNNEL_INTERFACE_NAME))
+            .find(|entry| wide_string(&entry.Alias).eq_ignore_ascii_case(interface_name))
             .map(|entry| (entry.InOctets, entry.OutOctets))
     };
     unsafe { FreeMibTable(table.cast()) };

@@ -1,9 +1,9 @@
-use super::build_backend_configuration;
+use super::{apply_awg3_configuration, build_backend_configuration, userspace_socket_path};
 use crate::process::{output_with_timeout, status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{RouteManager, SystemRouteBackend};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{Userspace, WGApi, WireguardInterfaceApi};
-use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics};
+use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics, TunnelTransport};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 const NETWORKSETUP: &str = "/usr/sbin/networksetup";
-const WIREGUARD_SOCKET_DIRECTORY: &str = "/var/run/wireguard";
 const INTERFACE_STATE_FILE: &str = "interface-name";
 const DNS_STATE_FILE: &str = "dns-state.json";
 const ENDPOINTS_STATE_FILE: &str = "endpoints-state.json";
@@ -24,6 +23,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct MacosBackend {
     wireguard_go: PathBuf,
+    amneziawg_go: PathBuf,
     runtime_directory: PathBuf,
     api: Option<WGApi<Userspace>>,
     endpoints: Vec<SocketAddr>,
@@ -35,10 +35,12 @@ pub struct MacosBackend {
 impl MacosBackend {
     pub fn new(
         wireguard_go: impl Into<PathBuf>,
+        amneziawg_go: impl Into<PathBuf>,
         runtime_directory: impl Into<PathBuf>,
     ) -> Result<Self, ServiceError> {
         let runtime_directory = runtime_directory.into();
         let wireguard_go = wireguard_go.into();
+        let amneziawg_go = amneziawg_go.into();
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
         let dns_snapshot = load_dns_snapshot(&runtime_directory.join(DNS_STATE_FILE))?;
         let api = recover_api(&runtime_directory)?;
@@ -59,6 +61,7 @@ impl MacosBackend {
         };
         let mut backend = Self {
             wireguard_go,
+            amneziawg_go,
             runtime_directory,
             api,
             endpoints,
@@ -80,13 +83,21 @@ impl MacosBackend {
         if self.api.is_some() || self.dns_snapshot.is_some() || self.routes.has_routes() {
             self.stop_inner()?;
         }
-        validate_root_owned_binary(&self.wireguard_go)?;
+        let executable = match configuration.transport {
+            TunnelTransport::WireGuard => self.wireguard_go.clone(),
+            TunnelTransport::AmneziaWg3 => self.amneziawg_go.clone(),
+        };
+        validate_root_owned_binary(&executable)?;
         validate_runtime_directory(&self.runtime_directory)?;
 
         let mut native = build_backend_configuration(configuration)?;
         self.routes.apply(options)?;
         self.capture_dns()?;
-        let ifname = match launch_wireguard_go(&self.wireguard_go, &self.runtime_directory) {
+        let ifname = match launch_userspace_tunnel(
+            &executable,
+            &self.runtime_directory,
+            configuration.transport,
+        ) {
             Ok(ifname) => ifname,
             Err(error) => {
                 let _ = self.stop_inner();
@@ -94,7 +105,7 @@ impl MacosBackend {
             }
         };
         native.interface.name = ifname.clone();
-        let api = match WGApi::<Userspace>::new(ifname) {
+        let api = match WGApi::<Userspace>::new(&ifname) {
             Ok(api) => api,
             Err(error) => {
                 let _ = self.stop_inner();
@@ -111,6 +122,12 @@ impl MacosBackend {
             return Err(error);
         }
 
+        if let Some(parameters) = configuration.awg3.as_ref() {
+            if let Err(error) = apply_awg3_configuration(&ifname, parameters) {
+                let _ = self.stop_inner();
+                return Err(error);
+            }
+        }
         let configured = self
             .api
             .as_ref()
@@ -400,28 +417,29 @@ fn run_networksetup_owned(args: &[String]) -> Result<Output, ServiceError> {
     }
 }
 
-fn launch_wireguard_go(
+fn launch_userspace_tunnel(
     executable: &Path,
     runtime_directory: &Path,
+    transport: TunnelTransport,
 ) -> Result<String, ServiceError> {
     let state_file = runtime_directory.join(INTERFACE_STATE_FILE);
     remove_regular_file_if_present(&state_file).map_err(backend_error)?;
 
     let status = status_with_timeout(
-        &mut wireguard_go_command(executable, &state_file),
+        &mut userspace_tunnel_command(executable, &state_file),
         COMMAND_TIMEOUT,
     )
     .map_err(backend_error)?;
     if !status.success() {
         return Err(ServiceError::Backend(
-            "wireguard_go_start_failed".to_string(),
+            userspace_start_error(transport, false).to_string(),
         ));
     }
 
     let started = Instant::now();
     while started.elapsed() < START_TIMEOUT {
         if let Ok(ifname) = read_interface_name(&state_file) {
-            let socket = Path::new(WIREGUARD_SOCKET_DIRECTORY).join(format!("{ifname}.sock"));
+            let socket = userspace_socket_path(&ifname);
             if socket.exists() {
                 return Ok(ifname);
             }
@@ -429,11 +447,20 @@ fn launch_wireguard_go(
         thread::sleep(Duration::from_millis(50));
     }
     Err(ServiceError::Backend(
-        "wireguard_go_start_timeout".to_string(),
+        userspace_start_error(transport, true).to_string(),
     ))
 }
 
-fn wireguard_go_command(executable: &Path, state_file: &Path) -> Command {
+fn userspace_start_error(transport: TunnelTransport, timed_out: bool) -> &'static str {
+    match (transport, timed_out) {
+        (TunnelTransport::WireGuard, false) => "wireguard_go_start_failed",
+        (TunnelTransport::WireGuard, true) => "wireguard_go_start_timeout",
+        (TunnelTransport::AmneziaWg3, false) => "amneziawg_go_start_failed",
+        (TunnelTransport::AmneziaWg3, true) => "amneziawg_go_start_timeout",
+    }
+}
+
+fn userspace_tunnel_command(executable: &Path, state_file: &Path) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("utun")
@@ -465,7 +492,7 @@ fn recover_api(runtime_directory: &Path) -> Result<Option<WGApi<Userspace>>, Ser
         return Ok(None);
     }
     let ifname = read_interface_name(&state_file)?;
-    let socket = Path::new(WIREGUARD_SOCKET_DIRECTORY).join(format!("{ifname}.sock"));
+    let socket = userspace_socket_path(&ifname);
     if !socket.exists() {
         remove_regular_file_if_present(&state_file).map_err(backend_error)?;
         return Ok(None);
@@ -613,8 +640,8 @@ mod tests {
     }
 
     #[test]
-    fn wireguard_go_receives_no_configuration_or_key_arguments() {
-        let command = wireguard_go_command(
+    fn userspace_tunnel_receives_no_configuration_or_key_arguments() {
+        let command = userspace_tunnel_command(
             Path::new("/Library/PrivilegedHelperTools/wireguard-go"),
             Path::new("/var/run/nelomai/interface-name"),
         );

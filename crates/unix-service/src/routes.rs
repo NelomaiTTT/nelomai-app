@@ -17,7 +17,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::SystemRouteBackend;
+pub(crate) use linux::{LinuxUserspaceRouteManager, SystemRouteBackend, AWG_FWMARK};
 #[cfg(target_os = "macos")]
 pub(crate) use macos::SystemRouteBackend;
 

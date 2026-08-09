@@ -6,13 +6,14 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 2 ]; then
-  echo "Использование: install-linux.sh <uid-пользователя> <путь-к-helper>" >&2
+if [ "$#" -ne 3 ]; then
+  echo "Использование: install-linux.sh <uid-пользователя> <путь-к-helper> <путь-к-amneziawg-go>" >&2
   exit 1
 fi
 
 OWNER_UID=$1
 SOURCE_BINARY=$2
+SOURCE_AMNEZIAWG_GO=$3
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 RESOLVCONF_SOURCE=$SCRIPT_DIR/resolvconf-linux.sh
 
@@ -31,11 +32,13 @@ fi
 INSTALL_DIR=/usr/local/libexec/nelomai
 INSTALL_BINARY=$INSTALL_DIR/nelomai-unix-service
 INSTALL_RESOLVCONF=$INSTALL_DIR/resolvconf
+INSTALL_AMNEZIAWG_GO=$INSTALL_DIR/amneziawg-go
 UNIT_PATH=/etc/systemd/system/nelomai-tunnel.service
 
 install -d -o root -g root -m 0755 "$INSTALL_DIR"
 install -o root -g root -m 0755 "$SOURCE_BINARY" "$INSTALL_BINARY"
 install -o root -g root -m 0755 "$RESOLVCONF_SOURCE" "$INSTALL_RESOLVCONF"
+install -o root -g root -m 0755 "$SOURCE_AMNEZIAWG_GO" "$INSTALL_AMNEZIAWG_GO"
 
 cat >"$UNIT_PATH" <<EOF
 [Unit]
@@ -45,7 +48,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_BINARY --owner-uid $OWNER_UID
+ExecStart=$INSTALL_BINARY --owner-uid $OWNER_UID --amneziawg-go $INSTALL_AMNEZIAWG_GO
 Restart=on-failure
 RestartSec=2
 User=root

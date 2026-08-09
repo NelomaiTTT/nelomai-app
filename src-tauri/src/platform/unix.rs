@@ -60,12 +60,14 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
     #[cfg(target_os = "linux")]
     {
         let installer = required_resource(resources, "install-linux.sh")?;
+        let amneziawg_go = required_resource(resources, "amneziawg-go")?;
         let status = installer_status(
             Command::new("/usr/bin/pkexec")
                 .arg("/bin/sh")
                 .arg(installer)
                 .arg(uid)
-                .arg(helper),
+                .arg(helper)
+                .arg(amneziawg_go),
         )?;
         if status.success() {
             Ok(())
@@ -79,13 +81,15 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
         let installer = required_resource(resources, "install-macos.sh")?;
         let apple_script = required_resource(resources, "install-macos.applescript")?;
         let wireguard_go = required_resource(resources, "wireguard-go")?;
+        let amneziawg_go = required_resource(resources, "amneziawg-go")?;
         let status = installer_status(
             Command::new("/usr/bin/osascript")
                 .arg(apple_script)
                 .arg(installer)
                 .arg(uid)
                 .arg(helper)
-                .arg(wireguard_go),
+                .arg(wireguard_go)
+                .arg(amneziawg_go),
         )?;
         if status.success() {
             Ok(())

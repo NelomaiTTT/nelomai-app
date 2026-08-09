@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
     TunnelConfiguration, TunnelController, TunnelError, TunnelMetrics, TunnelStartRequest,
-    TunnelStatus,
+    TunnelStatus, TunnelTransport,
 };
 use nelomai_unix_service::{
     authorize_peer, decode_request, decode_response, encode_request, parse_configuration,
@@ -44,6 +44,45 @@ fn parser_accepts_panel_wireguard_configuration() {
     assert_eq!(parsed.peers[0].endpoint.port(), 10001);
     assert_eq!(parsed.peers[0].persistent_keepalive, Some(21));
     assert_eq!(parsed.peers[0].allowed_ips.len(), 2);
+    assert_eq!(parsed.transport, TunnelTransport::WireGuard);
+    assert!(parsed.awg3.is_none());
+}
+
+#[test]
+fn parser_accepts_and_redacts_panel_awg3_configuration() {
+    let header_key = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    let configuration = valid_configuration().replace(
+        "MTU = 1280",
+        &format!(
+            "MTU = 1280\nJc = 5\nJmin = 64\nJmax = 96\nS1 = 16\nS2 = 24\nS3 = 32\nS4 = 40\nH1 = 100-200\nH2 = 201\nH3 = 202\nH4 = 203\nI1 = <r 32>\nHeaderProtectionKey = {header_key}\nContentPaddingAddition = 0-64"
+        ),
+    );
+
+    let parsed = parse_configuration(&configuration).expect("parse AWG3 configuration");
+    assert_eq!(parsed.transport, TunnelTransport::AmneziaWg3);
+    assert!(parsed.awg3.is_some());
+    let debug = format!("{parsed:?}");
+    assert!(!debug.contains(header_key));
+    assert!(!debug.contains("<r 32>"));
+    assert!(debug.contains("header_protection_key"));
+}
+
+#[test]
+fn parser_rejects_partial_or_invalid_awg3_configuration() {
+    let partial = valid_configuration().replace("MTU = 1280", "MTU = 1280\nJc = 5");
+    assert_eq!(
+        parse_configuration(&partial).expect_err("reject partial AWG3"),
+        nelomai_unix_service::ConfigurationError::MissingField
+    );
+
+    let reversed_range = valid_configuration().replace(
+        "MTU = 1280",
+        "MTU = 1280\nHeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nContentPaddingAddition = 64-0",
+    );
+    assert_eq!(
+        parse_configuration(&reversed_range).expect_err("reject invalid AWG3 range"),
+        nelomai_unix_service::ConfigurationError::InvalidValue
+    );
 }
 
 #[test]

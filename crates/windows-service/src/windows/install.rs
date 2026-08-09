@@ -3,8 +3,9 @@ use super::{platform_error, wide};
 use crate::{
     manager_service_spec, pipe_security_descriptor, private_directory_security_descriptor,
     tunnel_service_spec, ClientPolicy, ServiceError, ServiceSpec, ServiceStartMode,
-    MANAGER_SERVICE_NAME, TUNNEL_SERVICE_NAME,
+    AMNEZIAWG_TUNNEL_SERVICE_NAME, MANAGER_SERVICE_NAME, TUNNEL_SERVICE_NAME,
 };
+use nelomai_client_tunnel::TunnelTransport;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -109,7 +110,7 @@ fn configure_manager_recovery(service: &Service) -> Result<(), ServiceError> {
 }
 
 pub fn uninstall() -> Result<(), ServiceError> {
-    remove_service(TUNNEL_SERVICE_NAME)?;
+    remove_tunnel_service()?;
     remove_service(MANAGER_SERVICE_NAME)?;
     WindowsRouteManager::new()?.cleanup()?;
     let root = state_directory()?;
@@ -160,11 +161,12 @@ pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
 
 pub(crate) fn create_or_replace_tunnel_service(
     configuration: &Path,
+    transport: TunnelTransport,
 ) -> Result<Service, ServiceError> {
-    remove_service(TUNNEL_SERVICE_NAME)?;
+    remove_tunnel_service()?;
     let executable =
         env::current_exe().map_err(|error| platform_error("resolve service executable", error))?;
-    let spec = tunnel_service_spec(&executable, configuration)?;
+    let spec = tunnel_service_spec(&executable, configuration, transport)?;
     let manager =
         service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     let service = create_service(&manager, &spec)?;
@@ -176,22 +178,34 @@ pub(crate) fn create_or_replace_tunnel_service(
 
 pub(crate) fn open_tunnel_service() -> Result<Option<Service>, ServiceError> {
     let manager = service_manager(ServiceManagerAccess::CONNECT)?;
-    match manager.open_service(
-        TUNNEL_SERVICE_NAME,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-    ) {
-        Ok(service) => Ok(Some(service)),
-        Err(windows_service::Error::Winapi(error))
-            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
-        {
-            Ok(None)
+    let mut active = None;
+    for name in [TUNNEL_SERVICE_NAME, AMNEZIAWG_TUNNEL_SERVICE_NAME] {
+        match manager.open_service(
+            name,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+        ) {
+            Ok(service) if active.is_none() => active = Some(service),
+            Ok(_) => {
+                return Err(ServiceError::Backend(
+                    "multiple_tunnel_services_detected".to_string(),
+                ));
+            }
+            Err(windows_service::Error::Winapi(error))
+                if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) => {}
+            Err(error) => return Err(platform_error("open tunnel service", error)),
         }
-        Err(error) => Err(platform_error("open WireGuard tunnel service", error)),
     }
+    Ok(active)
 }
 
 pub(crate) fn remove_tunnel_service() -> Result<(), ServiceError> {
-    remove_service(TUNNEL_SERVICE_NAME)
+    let mut first_error = None;
+    for name in [TUNNEL_SERVICE_NAME, AMNEZIAWG_TUNNEL_SERVICE_NAME] {
+        if let Err(error) = remove_service(name) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 fn create_service(manager: &ServiceManager, spec: &ServiceSpec) -> Result<Service, ServiceError> {
@@ -351,7 +365,12 @@ fn validate_wireguard_libraries(service_executable: &Path) -> Result<(), Service
     let directory = service_executable
         .parent()
         .ok_or(ServiceError::UnsafePath)?;
-    for library in ["tunnel.dll", "wireguard.dll"] {
+    for library in [
+        "tunnel.dll",
+        "wireguard.dll",
+        "amneziawg-tunnel.dll",
+        "wintun.dll",
+    ] {
         if !directory.join(library).is_file() {
             return Err(ServiceError::Backend(format!(
                 "required WireGuard library is missing: {library}"

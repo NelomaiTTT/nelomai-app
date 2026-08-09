@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_tunnel::{
-    DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
-    TunnelPlatform, TunnelStartRequest, TunnelStatus,
+    detect_configuration_transport, DesktopTunnelOptions, TunnelCapabilities, TunnelController,
+    TunnelError, TunnelMetrics, TunnelPlatform, TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -16,6 +16,7 @@ pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
+pub const AMNEZIAWG_TUNNEL_SERVICE_NAME: &str = "NelomaiAmneziaWg3";
 pub const PIPE_NAME: &str = r"\\.\pipe\NelomaiTunnelManager";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +484,8 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "ip_command_unavailable" => "ip_command_unavailable",
         "physical_egress_unavailable" => "physical_egress_unavailable",
         "local_networks_unavailable" => "local_networks_unavailable",
+        "amneziawg_service_start_failed" => "amneziawg_service_start_failed",
+        "multiple_tunnel_services_detected" => "multiple_tunnel_services_detected",
         _ => return None,
     })
 }
@@ -492,6 +495,7 @@ pub trait ServiceTunnelBackend {
         &mut self,
         configuration: &str,
         options: &DesktopTunnelOptions,
+        transport: TunnelTransport,
     ) -> Result<ServiceTunnelState, ServiceError>;
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError>;
     fn status(&self) -> Result<ServiceTunnelState, ServiceError>;
@@ -536,9 +540,11 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 .validate()
                 .map_err(|_| ServiceError::InvalidRequest)
                 .and_then(|_| {
+                    let transport = detect_configuration_transport(configuration.as_str());
                     let configuration =
                         prepare_windows_wireguard_configuration(configuration.as_str(), &options);
-                    self.backend.start(configuration.as_str(), &options)
+                    self.backend
+                        .start(configuration.as_str(), &options, transport)
                 })
                 .map(|state| Response::success(Some(state))),
             Request::Stop { .. } => self
@@ -863,6 +869,14 @@ pub fn service_command_line(
     executable: &Path,
     configuration: &Path,
 ) -> Result<String, ServiceError> {
+    service_command_line_for_transport(executable, configuration, TunnelTransport::WireGuard)
+}
+
+fn service_command_line_for_transport(
+    executable: &Path,
+    configuration: &Path,
+    transport: TunnelTransport,
+) -> Result<String, ServiceError> {
     let executable = executable.to_string_lossy();
     let configuration = configuration.to_string_lossy();
     if executable.is_empty()
@@ -873,9 +887,11 @@ pub fn service_command_line(
         return Err(ServiceError::UnsafePath);
     }
 
-    Ok(format!(
-        "\"{executable}\" --wireguard-service \"{configuration}\""
-    ))
+    let command = match transport {
+        TunnelTransport::WireGuard => "--wireguard-service",
+        TunnelTransport::AmneziaWg3 => "--amneziawg-service",
+    };
+    Ok(format!("\"{executable}\" {command} \"{configuration}\""))
 }
 
 pub fn manager_service_spec(executable: &Path) -> Result<ServiceSpec, ServiceError> {
@@ -895,15 +911,24 @@ pub fn manager_service_spec(executable: &Path) -> Result<ServiceSpec, ServiceErr
 pub fn tunnel_service_spec(
     executable: &Path,
     configuration: &Path,
+    transport: TunnelTransport,
 ) -> Result<ServiceSpec, ServiceError> {
     validate_safe_path(executable)?;
     validate_safe_path(configuration)?;
     Ok(ServiceSpec {
-        name: TUNNEL_SERVICE_NAME.to_string(),
-        display_name: "Nelomai WireGuard Tunnel".to_string(),
+        name: tunnel_service_name(transport).to_string(),
+        display_name: match transport {
+            TunnelTransport::WireGuard => "Nelomai WireGuard Tunnel",
+            TunnelTransport::AmneziaWg3 => "Nelomai AmneziaWG 3 Tunnel",
+        }
+        .to_string(),
         executable_path: executable.to_path_buf(),
         arguments: vec![
-            "--wireguard-service".to_string(),
+            match transport {
+                TunnelTransport::WireGuard => "--wireguard-service",
+                TunnelTransport::AmneziaWg3 => "--amneziawg-service",
+            }
+            .to_string(),
             configuration.to_string_lossy().into_owned(),
         ],
         dependencies: vec!["Nsi".to_string(), "TcpIp".to_string()],
@@ -911,6 +936,13 @@ pub fn tunnel_service_spec(
         run_as_local_system: true,
         unrestricted_service_sid: true,
     })
+}
+
+pub fn tunnel_service_name(transport: TunnelTransport) -> &'static str {
+    match transport {
+        TunnelTransport::WireGuard => TUNNEL_SERVICE_NAME,
+        TunnelTransport::AmneziaWg3 => AMNEZIAWG_TUNNEL_SERVICE_NAME,
+    }
 }
 
 pub fn private_directory_security_descriptor() -> &'static str {
@@ -983,6 +1015,10 @@ mod service_error_tests {
         assert_eq!(
             ServiceError::Backend("raw operating system error".to_string()).code(),
             "service_unavailable"
+        );
+        assert_eq!(
+            ServiceError::Backend("amneziawg_service_start_failed".to_string()).code(),
+            "amneziawg_service_start_failed"
         );
     }
 }

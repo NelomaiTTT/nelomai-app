@@ -9,7 +9,8 @@ fn main() {
 #[cfg(windows)]
 fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
     use nelomai_windows_service::windows::{
-        install, run_manager_service, run_wireguard_service, uninstall, InstallOptions,
+        install, run_amneziawg_service, run_manager_service, run_wireguard_service, uninstall,
+        InstallOptions,
     };
     use nelomai_windows_service::ServiceError;
     use std::path::PathBuf;
@@ -30,6 +31,16 @@ fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
                 return Err(ServiceError::InvalidRequest);
             }
             run_wireguard_service(&path)
+        }
+        Some("--amneziawg-service") => {
+            let path = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or(ServiceError::InvalidRequest)?;
+            if arguments.next().is_some() {
+                return Err(ServiceError::InvalidRequest);
+            }
+            run_amneziawg_service(&path)
         }
         Some("install") => {
             let mut owner_sid = None;
