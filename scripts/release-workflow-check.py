@@ -39,13 +39,14 @@ def run() -> None:
     ).read_text(encoding="utf-8")
     assert_amneziawg_go_workflow_revision(workflow, "release workflow")
     assert_amneziawg_go_workflow_revision(checks_workflow, "checks workflow")
-    resolved_revision = subprocess.run(
-        ["git", "-C", str(ROOT / "vendor" / "amneziawg-go"), "rev-parse", "HEAD"],
+    submodule_entry = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "--stage", "vendor/amneziawg-go"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    if resolved_revision != AMNEZIAWG_GO_REVISION:
+    fields = submodule_entry.split()
+    if len(fields) < 4 or fields[0] != "160000" or fields[1] != AMNEZIAWG_GO_REVISION:
         raise RuntimeError("vendor/amneziawg-go uses another revision")
     tunnel_plugin = (
         ROOT
