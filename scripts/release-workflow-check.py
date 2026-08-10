@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,16 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 ROOT = Path(__file__).resolve().parents[1]
+AMNEZIAWG_GO_REVISION = "08d68cdae27762c3e07f36bbb12d2bad32f81926"
+
+
+def assert_amneziawg_go_workflow_revision(workflow: str, label: str) -> None:
+    marker = "git -C vendor/amneziawg-go rev-parse HEAD"
+    if marker not in workflow:
+        raise RuntimeError(f"{label} does not verify the AmneziaWG Go revision")
+    checked_revision = re.search(r"[a-f0-9]{40}", workflow.split(marker, 1)[1][:256])
+    if checked_revision is None or checked_revision.group(0) != AMNEZIAWG_GO_REVISION:
+        raise RuntimeError(f"{label} uses another AmneziaWG Go revision")
 
 
 def run() -> None:
@@ -23,6 +34,31 @@ def run() -> None:
     windows_workflow = (
         ROOT / ".github" / "workflows" / "windows-build.yml"
     ).read_text(encoding="utf-8")
+    checks_workflow = (
+        ROOT / ".github" / "workflows" / "checks.yml"
+    ).read_text(encoding="utf-8")
+    assert_amneziawg_go_workflow_revision(workflow, "release workflow")
+    assert_amneziawg_go_workflow_revision(checks_workflow, "checks workflow")
+    resolved_revision = subprocess.run(
+        ["git", "-C", str(ROOT / "vendor" / "amneziawg-go"), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if resolved_revision != AMNEZIAWG_GO_REVISION:
+        raise RuntimeError("vendor/amneziawg-go uses another revision")
+    tunnel_plugin = (
+        ROOT
+        / "plugins"
+        / "tunnel-android"
+        / "android"
+        / "src"
+        / "main"
+        / "java"
+        / "TunnelPlugin.kt"
+    ).read_text(encoding="utf-8")
+    if f'"git-{AMNEZIAWG_GO_REVISION[:7]}"' not in tunnel_plugin:
+        raise RuntimeError("Android diagnostics use another AmneziaWG Go revision")
     for token in (
         "verify:",
         "needs: verify",
@@ -97,6 +133,20 @@ def run() -> None:
     ):
         if token not in windows_workflow:
             raise RuntimeError(f"Windows build workflow misses {token}")
+
+    windows_runtime_script = (
+        ROOT / "scripts" / "windows" / "prepare-runtime.ps1"
+    ).read_text(encoding="utf-8")
+    for token in (
+        "windows.FOLDERID_ProgramData",
+        'root = filepath.Join(root, "Nelomai", "AmneziaWG")',
+        "Pinned AmneziaWG path source no longer contains the expected known folder",
+        "Pinned AmneziaWG path source no longer contains the expected data directory",
+    ):
+        if token not in windows_runtime_script:
+            raise RuntimeError(
+                "Windows AmneziaWG runtime does not isolate the Nelomai data directory"
+            )
 
     version_script = (ROOT / "scripts" / "set-release-version.py").read_text(
         encoding="utf-8"

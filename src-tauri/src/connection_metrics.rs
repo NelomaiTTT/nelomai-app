@@ -176,6 +176,7 @@ mod tests {
                 TunnelMetrics {
                     received_bytes: 100,
                     sent_bytes: 40,
+                    latest_handshake_epoch_millis: None,
                     probe_target: None,
                 },
                 Some(Some(20)),
@@ -187,6 +188,7 @@ mod tests {
                 TunnelMetrics {
                     received_bytes: 5,
                     sent_bytes: 2,
+                    latest_handshake_epoch_millis: None,
                     probe_target: None,
                 },
                 Some(None),
@@ -198,6 +200,7 @@ mod tests {
                 TunnelMetrics {
                     received_bytes: 5,
                     sent_bytes: 2,
+                    latest_handshake_epoch_millis: None,
                     probe_target: None,
                 },
                 Some(Some(22)),

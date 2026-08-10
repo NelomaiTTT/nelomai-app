@@ -105,16 +105,18 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
-    pub fn take_quick_state_change(&self) -> crate::Result<bool> {
+    pub fn take_quick_state_change(&self) -> crate::Result<QuickStateChangeResponse> {
         self.0
             .run_mobile_plugin::<QuickStateChangeResponse>("takeQuickStateChange", EmptyRequest {})
-            .map(|response| response.changed)
             .map_err(Into::into)
     }
 
-    pub fn acknowledge_quick_state_change(&self) -> crate::Result<()> {
+    pub fn acknowledge_quick_state_change(&self, revision: u64) -> crate::Result<()> {
         self.0
-            .run_mobile_plugin::<()>("acknowledgeQuickStateChange", EmptyRequest {})
+            .run_mobile_plugin::<()>(
+                "acknowledgeQuickStateChange",
+                QuickStateChangeAcknowledgeRequest { revision },
+            )
             .map_err(Into::into)
     }
 

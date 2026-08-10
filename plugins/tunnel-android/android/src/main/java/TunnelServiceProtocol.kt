@@ -28,6 +28,7 @@ internal const val EXTRA_DURATION_MILLIS = "duration_millis"
 internal const val EXTRA_ERROR_CODE = "error_code"
 internal const val EXTRA_RECEIVED_BYTES = "received_bytes"
 internal const val EXTRA_SENT_BYTES = "sent_bytes"
+internal const val EXTRA_LATEST_HANDSHAKE_EPOCH_MILLIS = "latest_handshake_epoch_millis"
 internal const val EXTRA_PROBE_TARGET = "probe_target"
 internal const val EXTRA_PANEL_BASE = "panel_base"
 internal const val EXTRA_TOKEN = "token"
@@ -35,6 +36,7 @@ internal const val EXTRA_DEVICE_ID = "device_id"
 internal const val EXTRA_EXPIRES_AT_UNIX = "expires_at_unix"
 internal const val EXTRA_CONFIGURED = "configured"
 internal const val EXTRA_CHANGED = "changed"
+internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
 internal const val EXTRA_DNS_SERVERS = "dns_servers"
 internal const val EXTRA_CLIENT_OPERATION_ID = "client_operation_id"
 private const val QUICK_DNS_UPDATE_TIMEOUT_MILLIS = 3_000L
@@ -134,7 +136,7 @@ internal object TunnelServiceClient {
         context: Context,
         apiVersion: Int,
         probe: Boolean,
-        onSuccess: (Long, Long, String?) -> Unit,
+        onSuccess: (Long, Long, Long?, String?) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
@@ -146,6 +148,8 @@ internal object TunnelServiceClient {
             onSuccess(
                 result.getLong(EXTRA_RECEIVED_BYTES),
                 result.getLong(EXTRA_SENT_BYTES),
+                result.getLong(EXTRA_LATEST_HANDSHAKE_EPOCH_MILLIS)
+                    .takeIf { result.containsKey(EXTRA_LATEST_HANDSHAKE_EPOCH_MILLIS) },
                 result.getString(EXTRA_PROBE_TARGET),
             )
         },
@@ -230,25 +234,32 @@ internal object TunnelServiceClient {
 
     fun takeQuickStateChange(
         context: Context,
-        onSuccess: (Boolean) -> Unit,
+        onSuccess: (Boolean, Long) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE),
-        { onSuccess(it.getBoolean(EXTRA_CHANGED)) },
+        {
+            onSuccess(
+                it.getBoolean(EXTRA_CHANGED),
+                it.getLong(EXTRA_STATE_CHANGE_REVISION),
+            )
+        },
         onError,
     )
 
     fun acknowledgeQuickStateChange(
         context: Context,
-        onSuccess: () -> Unit,
+        revision: Long,
+        onSuccess: (Long) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
         Intent(context, NelomaiVpnService::class.java)
-            .setAction(NelomaiVpnService.ACTION_ACKNOWLEDGE_STATE_CHANGE),
-        { onSuccess() },
+            .setAction(NelomaiVpnService.ACTION_ACKNOWLEDGE_STATE_CHANGE)
+            .putExtra(EXTRA_STATE_CHANGE_REVISION, revision),
+        { onSuccess(it.getLong(EXTRA_STATE_CHANGE_REVISION)) },
         onError,
     )
 

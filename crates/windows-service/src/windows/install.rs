@@ -132,6 +132,19 @@ pub(crate) fn tunnel_config_path() -> Result<PathBuf, ServiceError> {
 }
 
 pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
+    record_service_message(context, &error.to_string());
+}
+
+pub(crate) fn read_service_diagnostics() -> Result<String, ServiceError> {
+    let path = state_directory()?.join(DIAGNOSTIC_LOG_FILE);
+    match fs::read_to_string(path) {
+        Ok(value) => Ok(value.trim_start_matches('\u{feff}').to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(platform_error("read service diagnostics", error)),
+    }
+}
+
+pub(crate) fn record_service_message(context: &str, message: &str) {
     let Ok(root) = state_directory() else {
         return;
     };
@@ -156,7 +169,8 @@ pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
-    let _ = writeln!(log, "{timestamp} {context}: {error}");
+    let message = message.replace(['\r', '\n'], " ");
+    let _ = writeln!(log, "{timestamp} {context}: {message}");
 }
 
 pub(crate) fn create_or_replace_tunnel_service(

@@ -1,6 +1,6 @@
 use super::install::{
-    create_or_replace_tunnel_service, open_tunnel_service, remove_tunnel_service,
-    tunnel_config_path,
+    create_or_replace_tunnel_service, open_tunnel_service, read_service_diagnostics,
+    record_service_diagnostic, record_service_message, remove_tunnel_service, tunnel_config_path,
 };
 use super::routes::WindowsRouteManager;
 use crate::{ServiceError, ServiceTunnelBackend, ServiceTunnelState};
@@ -53,6 +53,12 @@ impl WindowsServiceBackend {
             transport,
         })
     }
+
+    fn protected_endpoint(&self) -> Option<IpAddr> {
+        (self.transport == Some(TunnelTransport::AmneziaWg3))
+            .then_some(self.endpoint)
+            .flatten()
+    }
 }
 
 impl ServiceTunnelBackend for WindowsServiceBackend {
@@ -63,9 +69,29 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         transport: TunnelTransport,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.stop()?;
-        self.endpoint = resolve_endpoint(configuration);
+        let endpoint = resolve_endpoint(configuration);
+        if transport == TunnelTransport::AmneziaWg3 && !matches!(endpoint, Some(IpAddr::V4(_))) {
+            return Err(ServiceError::Backend(
+                "endpoint_route_unavailable".to_string(),
+            ));
+        }
+        let pinned_configuration = if transport == TunnelTransport::AmneziaWg3 {
+            Some(pin_configuration_endpoint(
+                configuration,
+                endpoint.expect("validated IPv4 AmneziaWG endpoint"),
+            )?)
+        } else {
+            None
+        };
+        self.endpoint = endpoint;
         self.transport = Some(transport);
-        if let Err(error) = self.routes.apply(options) {
+        let configuration = pinned_configuration
+            .as_ref()
+            .map_or(configuration, |value| value.as_str());
+        let protected_endpoint = self.protected_endpoint();
+        if let Err(error) = self.routes.apply(options, protected_endpoint) {
+            self.endpoint = None;
+            self.transport = None;
             let _ = self.routes.cleanup();
             return Err(error);
         }
@@ -91,9 +117,12 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
                     }
                 });
             }
+            self.routes
+                .verify_protected_endpoint(self.protected_endpoint())?;
             Ok::<_, ServiceError>(())
         })();
         if let Err(error) = result {
+            record_service_diagnostic("tunnel start failed", &error);
             self.endpoint = None;
             self.transport = None;
             let config_path = tunnel_config_path().ok();
@@ -104,6 +133,13 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
             let _ = self.routes.cleanup();
             return Err(error);
         }
+        record_service_message(
+            "tunnel started",
+            match transport {
+                TunnelTransport::WireGuard => "transport=wireguard endpoint_route=native",
+                TunnelTransport::AmneziaWg3 => "transport=amneziawg_3 endpoint_route=verified",
+            },
+        );
         Ok(ServiceTunnelState::Running)
     }
 
@@ -131,7 +167,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         first_error.map_or(Ok(ServiceTunnelState::Stopped), Err)
     }
 
-    fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
+    fn status(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         let Some(service) = open_tunnel_service()? else {
             return Ok(if self.routes.has_routes() {
                 ServiceTunnelState::Failed
@@ -142,21 +178,40 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         let status = service
             .query_status()
             .map_err(|error| ServiceError::Backend(format!("query tunnel service: {error}")))?;
-        Ok(match status.current_state {
+        let state = match status.current_state {
             ServiceState::Stopped if self.routes.has_routes() => ServiceTunnelState::Failed,
             ServiceState::Stopped => ServiceTunnelState::Stopped,
             ServiceState::StartPending => ServiceTunnelState::Starting,
             ServiceState::Running => ServiceTunnelState::Running,
             ServiceState::StopPending => ServiceTunnelState::Stopping,
             _ => ServiceTunnelState::Failed,
-        })
+        };
+        if state == ServiceTunnelState::Running {
+            if let Err(error) = self
+                .routes
+                .verify_protected_endpoint(self.protected_endpoint())
+            {
+                record_service_diagnostic("unsafe endpoint route detected", &error);
+                let _ = self.stop();
+                return Ok(ServiceTunnelState::Failed);
+            }
+        }
+        Ok(state)
     }
 
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
         self.routes.physical_network_fingerprint()
     }
 
-    fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
+    fn metrics(&mut self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
+        if let Err(error) = self
+            .routes
+            .verify_protected_endpoint(self.protected_endpoint())
+        {
+            record_service_diagnostic("unsafe endpoint route detected", &error);
+            let _ = self.stop();
+            return Err(error);
+        }
         let transport = self
             .transport
             .ok_or_else(|| ServiceError::Backend("tunnel_not_running".to_string()))?;
@@ -164,12 +219,37 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         Ok(TunnelMetrics {
             received_bytes,
             sent_bytes,
+            latest_handshake_epoch_millis: None,
             probe_target: probe
                 .then_some(self.endpoint)
                 .flatten()
                 .map(|target| target.to_string()),
         })
     }
+
+    fn diagnostics(&mut self) -> Result<String, ServiceError> {
+        let service = read_service_diagnostics()?;
+        let ringlogger = match super::ringlogger::read_amneziawg_ringlogger() {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => format!("ringlogger_unavailable: {error}"),
+        };
+        let service = tail_utf8(&service, 24 * 1024);
+        let prefix = format!("[nelomai.service]\n{service}\n[amneziawg.ringlogger]\n");
+        let ringlogger = tail_utf8(&ringlogger, (64_usize * 1024).saturating_sub(prefix.len()));
+        Ok(format!("{prefix}{ringlogger}"))
+    }
+}
+
+fn tail_utf8(value: &str, maximum: usize) -> &str {
+    if value.len() <= maximum {
+        return value;
+    }
+    let mut start = value.len() - maximum;
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
 }
 
 fn read_endpoint_from_file(path: std::path::PathBuf) -> Option<IpAddr> {
@@ -182,7 +262,7 @@ fn read_transport_from_file(path: std::path::PathBuf) -> Option<TunnelTransport>
     Some(detect_configuration_transport(&configuration))
 }
 
-fn resolve_endpoint(configuration: &str) -> Option<IpAddr> {
+pub(crate) fn resolve_endpoint(configuration: &str) -> Option<IpAddr> {
     let value = configuration.lines().find_map(|line| {
         let (key, value) = line.split_once('=')?;
         key.trim()
@@ -194,11 +274,68 @@ fn resolve_endpoint(configuration: &str) -> Option<IpAddr> {
     }
     let (host, port) = value.rsplit_once(':')?;
     let port = port.parse::<u16>().ok()?;
-    (host.trim_matches(['[', ']']), port)
+    let endpoints = (host.trim_matches(['[', ']']), port)
         .to_socket_addrs()
         .ok()?
-        .next()
+        .collect::<Vec<_>>();
+    endpoints
+        .iter()
+        .find(|endpoint| endpoint.is_ipv4())
+        .or_else(|| endpoints.first())
         .map(|endpoint| endpoint.ip())
+}
+
+fn pin_configuration_endpoint(
+    configuration: &str,
+    endpoint: IpAddr,
+) -> Result<zeroize::Zeroizing<String>, ServiceError> {
+    let IpAddr::V4(endpoint) = endpoint else {
+        return Err(ServiceError::Backend(
+            "endpoint_route_unavailable".to_string(),
+        ));
+    };
+    let mut output = zeroize::Zeroizing::new(String::with_capacity(configuration.len()));
+    let mut replacements = 0_u8;
+    for segment in configuration.split_inclusive('\n') {
+        let (line_with_optional_cr, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let (line, carriage_return) = line_with_optional_cr
+            .strip_suffix('\r')
+            .map_or((line_with_optional_cr, ""), |line| (line, "\r"));
+        let Some((key, value)) = line.split_once('=') else {
+            output.push_str(line);
+            output.push_str(carriage_return);
+            output.push_str(newline);
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("Endpoint") {
+            output.push_str(line);
+            output.push_str(carriage_return);
+            output.push_str(newline);
+            continue;
+        }
+        let (_, port) = value
+            .trim()
+            .rsplit_once(':')
+            .ok_or_else(|| ServiceError::Backend("endpoint_route_unavailable".to_string()))?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| ServiceError::Backend("endpoint_route_unavailable".to_string()))?;
+        replacements = replacements.saturating_add(1);
+        output.push_str("Endpoint = ");
+        output.push_str(&endpoint.to_string());
+        output.push(':');
+        output.push_str(&port.to_string());
+        output.push_str(carriage_return);
+        output.push_str(newline);
+    }
+    if replacements != 1 {
+        return Err(ServiceError::Backend(
+            "endpoint_route_unavailable".to_string(),
+        ));
+    }
+    Ok(output)
 }
 
 fn interface_counters(transport: TunnelTransport) -> Result<(u64, u64), ServiceError> {
@@ -250,4 +387,32 @@ fn write_configuration_atomically(path: &Path, configuration: &str) -> Result<()
     }
     fs::rename(&temporary, path)
         .map_err(|error| ServiceError::Backend(format!("activate tunnel config: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn pins_a_hostname_endpoint_to_the_protected_ipv4_address() {
+        let configuration = "[Interface]\r\nPrivateKey = secret\r\n[Peer]\r\nEndpoint = 5a.nelomai.ru:51820\r\nAllowedIPs = 0.0.0.0/0\r\n";
+        let pinned =
+            pin_configuration_endpoint(configuration, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+                .unwrap();
+
+        assert!(pinned.contains("Endpoint = 203.0.113.7:51820\r\n"));
+        assert!(!pinned.contains("5a.nelomai.ru"));
+        assert!(pinned.contains("PrivateKey = secret"));
+    }
+
+    #[test]
+    fn rejects_multiple_endpoints_that_cannot_all_be_route_protected() {
+        let configuration = "[Peer]\nEndpoint = one.example:1\n[Peer]\nEndpoint = two.example:2\n";
+        let error =
+            pin_configuration_endpoint(configuration, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)))
+                .unwrap_err();
+
+        assert_eq!(error.code(), "endpoint_route_unavailable");
+    }
 }

@@ -184,7 +184,7 @@ jobs:
       - name: Проверить локальный Go backend AmneziaWG
         run: |
           test "$(git -C vendor/amneziawg-go rev-parse HEAD)" = \
-            9f5d948bc72cc554791cfe0fb91527e4acfb6b79
+            08d68cdae27762c3e07f36bbb12d2bad32f81926
           test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && go env GOWORK)" = \
             "$GITHUB_WORKSPACE/go.work"
           test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && \

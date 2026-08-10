@@ -414,10 +414,12 @@
         connectionMetrics = null;
         await nativeClient.prepareTunnel(startDeviceId);
         await syncBindingPreferences();
+        const effectiveTicConnectionMode =
+          selectedLayer === "stray" ? "dynamic" : ticConnectionMode;
         connection = await nativeClient.start({
           deviceId: startDeviceId,
           layer: selectedLayer,
-          ticConnectionMode,
+          ticConnectionMode: effectiveTicConnectionMode,
           routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
           allowAlternate: true,
         });

@@ -36,7 +36,7 @@ impl ServiceTunnelBackend for RecordingBackend {
         Ok(self.state)
     }
 
-    fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
+    fn status(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         Ok(self.state)
     }
 
@@ -44,12 +44,17 @@ impl ServiceTunnelBackend for RecordingBackend {
         Ok("ab".repeat(32))
     }
 
-    fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
+    fn metrics(&mut self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
         Ok(TunnelMetrics {
             received_bytes: 120,
             sent_bytes: 45,
+            latest_handshake_epoch_millis: None,
             probe_target: probe.then(|| "192.0.2.10".to_string()),
         })
+    }
+
+    fn diagnostics(&mut self) -> Result<String, ServiceError> {
+        Ok("[amneziawg.ringlogger]\n[TUN] handshake".to_string())
     }
 }
 
@@ -79,6 +84,7 @@ fn handler_executes_only_typed_tunnel_operations() {
     let version = handler.handle(Request::version());
     let fingerprint = handler.handle(Request::physical_network_fingerprint());
     let metrics = handler.handle(Request::metrics(true));
+    let diagnostics = handler.handle(Request::diagnostics());
 
     assert_eq!(started.state, Some(ServiceTunnelState::Running));
     assert_eq!(status.state, Some(ServiceTunnelState::Running));
@@ -96,8 +102,13 @@ fn handler_executes_only_typed_tunnel_operations() {
         Some(TunnelMetrics {
             received_bytes: 120,
             sent_bytes: 45,
+            latest_handshake_epoch_millis: None,
             probe_target: Some("192.0.2.10".to_string()),
         })
+    );
+    assert_eq!(
+        diagnostics.diagnostics.as_deref(),
+        Some("[amneziawg.ringlogger]\n[TUN] handshake")
     );
 }
 
@@ -107,6 +118,7 @@ async fn controller_maps_service_metrics_without_exposing_configuration() {
     response.metrics = Some(TunnelMetrics {
         received_bytes: 512,
         sent_bytes: 128,
+        latest_handshake_epoch_millis: None,
         probe_target: Some("192.0.2.23".to_string()),
     });
     let controller = WindowsTunnelController::new(RecordingTransport {
@@ -119,6 +131,7 @@ async fn controller_maps_service_metrics_without_exposing_configuration() {
         Some(TunnelMetrics {
             received_bytes: 512,
             sent_bytes: 128,
+            latest_handshake_epoch_millis: None,
             probe_target: Some("192.0.2.23".to_string()),
         })
     );
@@ -202,6 +215,7 @@ AllowedIPs = 0.0.0.0/0
 
     assert!(response.ok);
     assert_eq!(handler.backend().transports, [TunnelTransport::AmneziaWg3]);
+    assert!(handler.backend().starts[0].contains("AllowedIPs = 0.0.0.0/1, 128.0.0.0/1"));
 }
 
 struct RecordingTransport {
@@ -231,6 +245,7 @@ impl ServiceTransport for RecordingTransport {
             Request::Version { .. } => "version",
             Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
             Request::Metrics { .. } => "metrics",
+            Request::Diagnostics { .. } => "diagnostics",
         };
         self.requests.lock().unwrap().push(summary.to_string());
         Ok(self.response.clone())
@@ -277,6 +292,25 @@ async fn controller_reads_installed_service_version() {
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
         ["version"]
+    );
+}
+
+#[tokio::test]
+async fn controller_reads_bounded_service_diagnostics() {
+    let mut response = Response::success(None);
+    response.diagnostics = Some("[amneziawg.ringlogger]\n[TUN] handshake".to_string());
+    let controller = WindowsTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    assert_eq!(
+        controller.diagnostics().await.expect("read diagnostics"),
+        "[amneziawg.ringlogger]\n[TUN] handshake"
+    );
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["diagnostics"]
     );
 }
 

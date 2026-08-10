@@ -279,6 +279,13 @@ impl ServiceTunnelBackend for MacosBackend {
             .peers
             .values()
             .fold(0u64, |total, peer| total.saturating_add(peer.tx_bytes));
+        let latest_handshake_epoch_millis = host
+            .peers
+            .values()
+            .filter_map(|peer| peer.last_handshake)
+            .filter_map(|handshake| handshake.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .max();
         let probe_target = probe
             .then(|| {
                 host.peers
@@ -289,6 +296,7 @@ impl ServiceTunnelBackend for MacosBackend {
         Ok(TunnelMetrics {
             received_bytes,
             sent_bytes,
+            latest_handshake_epoch_millis,
             probe_target,
         })
     }

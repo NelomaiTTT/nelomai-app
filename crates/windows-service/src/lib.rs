@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 pub mod windows;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
@@ -59,6 +59,8 @@ pub struct Response {
     pub physical_network_fingerprint: Option<String>,
     #[serde(default)]
     pub metrics: Option<TunnelMetrics>,
+    #[serde(default)]
+    pub diagnostics: Option<String>,
     pub error_code: Option<String>,
 }
 
@@ -71,6 +73,7 @@ impl Response {
             service_version: None,
             physical_network_fingerprint: None,
             metrics: None,
+            diagnostics: None,
             error_code: None,
         }
     }
@@ -83,6 +86,7 @@ impl Response {
             service_version: None,
             physical_network_fingerprint: None,
             metrics: None,
+            diagnostics: None,
             error_code: Some(error_code.into()),
         }
     }
@@ -109,6 +113,9 @@ pub enum Request {
     Metrics {
         protocol_version: u16,
         probe: bool,
+    },
+    Diagnostics {
+        protocol_version: u16,
     },
 }
 
@@ -156,6 +163,12 @@ impl Request {
         }
     }
 
+    pub fn diagnostics() -> Self {
+        Self::Diagnostics {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
     pub fn protocol_version(&self) -> u16 {
         match self {
             Self::Start {
@@ -165,6 +178,7 @@ impl Request {
             | Self::Status { protocol_version }
             | Self::Version { protocol_version }
             | Self::PhysicalNetworkFingerprint { protocol_version }
+            | Self::Diagnostics { protocol_version }
             | Self::Metrics {
                 protocol_version, ..
             } => *protocol_version,
@@ -224,6 +238,14 @@ impl PartialEq for Request {
                 },
             ) => left == right,
             (
+                Self::Diagnostics {
+                    protocol_version: left,
+                },
+                Self::Diagnostics {
+                    protocol_version: right,
+                },
+            ) => left == right,
+            (
                 Self::Metrics {
                     protocol_version: left_version,
                     probe: left_probe,
@@ -277,6 +299,10 @@ impl fmt::Debug for Request {
                 .field("protocol_version", protocol_version)
                 .field("probe", probe)
                 .finish(),
+            Self::Diagnostics { protocol_version } => formatter
+                .debug_struct("Diagnostics")
+                .field("protocol_version", protocol_version)
+                .finish(),
         }
     }
 }
@@ -310,6 +336,10 @@ enum RequestRef<'a> {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
         probe: bool,
+    },
+    Diagnostics {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
     },
 }
 
@@ -349,6 +379,9 @@ impl Serialize for Request {
                 protocol_version: *protocol_version,
                 probe: *probe,
             },
+            Self::Diagnostics { protocol_version } => RequestRef::Diagnostics {
+                protocol_version: *protocol_version,
+            },
         }
         .serialize(serializer)
     }
@@ -385,6 +418,10 @@ enum RequestOwned {
         protocol_version: u16,
         probe: bool,
     },
+    Diagnostics {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
 }
 
 impl<'de> Deserialize<'de> for Request {
@@ -415,6 +452,9 @@ impl<'de> Deserialize<'de> for Request {
                 protocol_version,
                 probe,
             },
+            RequestOwned::Diagnostics { protocol_version } => {
+                Self::Diagnostics { protocol_version }
+            }
         })
     }
 }
@@ -484,6 +524,8 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "ip_command_unavailable" => "ip_command_unavailable",
         "physical_egress_unavailable" => "physical_egress_unavailable",
         "local_networks_unavailable" => "local_networks_unavailable",
+        "endpoint_route_unavailable" => "endpoint_route_unavailable",
+        "endpoint_route_lost" => "endpoint_route_lost",
         "amneziawg_service_start_failed" => "amneziawg_service_start_failed",
         "multiple_tunnel_services_detected" => "multiple_tunnel_services_detected",
         _ => return None,
@@ -498,14 +540,17 @@ pub trait ServiceTunnelBackend {
         transport: TunnelTransport,
     ) -> Result<ServiceTunnelState, ServiceError>;
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError>;
-    fn status(&self) -> Result<ServiceTunnelState, ServiceError>;
+    fn status(&mut self) -> Result<ServiceTunnelState, ServiceError>;
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
         Err(ServiceError::Backend(
             "physical_network_fingerprint_unavailable".to_string(),
         ))
     }
-    fn metrics(&self, _probe: bool) -> Result<TunnelMetrics, ServiceError> {
+    fn metrics(&mut self, _probe: bool) -> Result<TunnelMetrics, ServiceError> {
         Err(ServiceError::Backend("metrics_unavailable".to_string()))
+    }
+    fn diagnostics(&mut self) -> Result<String, ServiceError> {
+        Err(ServiceError::Backend("diagnostics_unavailable".to_string()))
     }
 }
 
@@ -541,8 +586,11 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 .map_err(|_| ServiceError::InvalidRequest)
                 .and_then(|_| {
                     let transport = detect_configuration_transport(configuration.as_str());
-                    let configuration =
-                        prepare_windows_wireguard_configuration(configuration.as_str(), &options);
+                    let configuration = prepare_windows_tunnel_configuration(
+                        configuration.as_str(),
+                        &options,
+                        transport,
+                    );
                     self.backend
                         .start(configuration.as_str(), &options, transport)
                 })
@@ -573,19 +621,25 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 response.metrics = Some(metrics);
                 response
             }),
+            Request::Diagnostics { .. } => self.backend.diagnostics().map(|diagnostics| {
+                let mut response = Response::success(None);
+                response.diagnostics = Some(diagnostics);
+                response
+            }),
         };
 
         result.unwrap_or_else(|error| Response::failure(error.code()))
     }
 }
 
-fn prepare_windows_wireguard_configuration(
+fn prepare_windows_tunnel_configuration(
     configuration: &str,
     options: &DesktopTunnelOptions,
+    transport: TunnelTransport,
 ) -> Zeroizing<String> {
     let address_split_active = options.policy_hash.is_some()
         && (options.exclude_local_networks || !options.excluded_ipv4_cidrs.is_empty());
-    if !address_split_active {
+    if !address_split_active && transport != TunnelTransport::AmneziaWg3 {
         return Zeroizing::new(configuration.to_string());
     }
 
@@ -671,6 +725,18 @@ impl<T: ServiceTransport> WindowsTunnelController<T> {
         response
             .service_version
             .ok_or_else(|| TunnelError::Backend("missing_service_version".to_string()))
+    }
+
+    pub async fn diagnostics(&self) -> Result<String, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::diagnostics())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        response
+            .diagnostics
+            .ok_or_else(|| TunnelError::Backend("missing_service_diagnostics".to_string()))
     }
 }
 
@@ -1019,6 +1085,14 @@ mod service_error_tests {
         assert_eq!(
             ServiceError::Backend("amneziawg_service_start_failed".to_string()).code(),
             "amneziawg_service_start_failed"
+        );
+        assert_eq!(
+            ServiceError::Backend("endpoint_route_lost".to_string()).code(),
+            "endpoint_route_lost"
+        );
+        assert_eq!(
+            ServiceError::Backend("endpoint_route_unavailable".to_string()).code(),
+            "endpoint_route_unavailable"
         );
     }
 }

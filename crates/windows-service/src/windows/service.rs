@@ -1,6 +1,7 @@
-use super::backend::WindowsServiceBackend;
+use super::backend::{resolve_endpoint, WindowsServiceBackend};
 use super::install::{load_policy, record_service_diagnostic};
 use super::ipc::{finish_request, wake_server, PipeServer};
+use super::routes::WindowsRouteManager;
 use super::{platform_error, wide};
 use crate::{
     ServiceError, TunnelRequestHandler, AMNEZIAWG_TUNNEL_SERVICE_NAME, MANAGER_SERVICE_NAME,
@@ -214,6 +215,10 @@ pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
         std::fs::read_to_string(configuration)
             .map_err(|error| platform_error("read AmneziaWG configuration", error))?,
     );
+    let endpoint = resolve_endpoint(configuration_text.as_str())
+        .filter(std::net::IpAddr::is_ipv4)
+        .ok_or_else(|| ServiceError::Backend("endpoint_route_unavailable".to_string()))?;
+    start_amneziawg_endpoint_route_watchdog(endpoint)?;
     let tunnel_dll = std::env::current_exe()
         .map_err(|error| platform_error("resolve tunnel service executable", error))?
         .with_file_name("amneziawg-tunnel.dll");
@@ -258,4 +263,20 @@ pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
             "AmneziaWG tunnel service returned failure".to_string(),
         ))
     }
+}
+
+fn start_amneziawg_endpoint_route_watchdog(endpoint: std::net::IpAddr) -> Result<(), ServiceError> {
+    std::thread::Builder::new()
+        .name("nelomai-awg-endpoint-route-watchdog".to_string())
+        .spawn(move || loop {
+            let result = WindowsRouteManager::new()
+                .and_then(|routes| routes.verify_protected_endpoint(Some(endpoint)));
+            if let Err(error) = result {
+                record_service_diagnostic("AmneziaWG endpoint route watchdog", &error);
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        })
+        .map(|_| ())
+        .map_err(|error| platform_error("start AmneziaWG endpoint route watchdog", error))
 }

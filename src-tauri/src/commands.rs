@@ -226,6 +226,12 @@ impl CommandError {
                 "Не удалось определить текущее подключение устройства к сети"
             }
             "local_networks_unavailable" => "Не удалось определить локальные сети этого устройства",
+            "endpoint_route_unavailable" => {
+                "Не удалось безопасно проложить маршрут до Stray-сервера. Переподключите устройство к сети и нажмите «Старт» снова"
+            }
+            "endpoint_route_lost" => {
+                "Сеть изменилась, поэтому Stray остановлен для защиты. Нажмите «Старт» снова"
+            }
             "route_state_invalid"
             | "route_state_read_failed"
             | "route_state_write_failed"
@@ -272,7 +278,12 @@ async fn stop_connection(
     app: &AppHandle,
     application: &NativeApplication,
 ) -> Result<Connection, CommandError> {
-    match application.stop().await {
+    #[cfg(desktop)]
+    let session_id = application
+        .connection_metrics_context()
+        .await
+        .map(|context| context.session_id);
+    let result = match application.stop().await {
         Ok(connection) => Ok(connection),
         Err(error) if repairable_stop_error(&error) => {
             crate::platform::prepare_tunnel_for_stop(app.clone())
@@ -281,13 +292,23 @@ async fn stop_connection(
             application.stop().await.map_err(Into::into)
         }
         Err(error) => Err(error.into()),
+    };
+    #[cfg(desktop)]
+    if result.is_ok() {
+        queue_desktop_tunnel_stopped(app, session_id.as_deref()).await;
     }
+    result
 }
 
 pub(crate) async fn stop_for_shutdown(
     app: &AppHandle,
     application: &NativeApplication,
 ) -> Result<(), CommandError> {
+    #[cfg(desktop)]
+    let session_id = application
+        .connection_metrics_context()
+        .await
+        .map(|context| context.session_id);
     let state = application.state().await;
     if !matches!(
         state.phase,
@@ -296,7 +317,7 @@ pub(crate) async fn stop_for_shutdown(
         return Ok(());
     }
 
-    match application.stop_for_shutdown().await {
+    let result = match application.stop_for_shutdown().await {
         Ok(_) => Ok(()),
         Err(error) if repairable_stop_error(&error) => {
             crate::platform::prepare_tunnel_for_stop(app.clone())
@@ -309,6 +330,106 @@ pub(crate) async fn stop_for_shutdown(
                 .map_err(Into::into)
         }
         Err(error) => Err(error.into()),
+    };
+    #[cfg(desktop)]
+    if result.is_ok() {
+        queue_desktop_tunnel_stopped(app, session_id.as_deref()).await;
+    }
+    result
+}
+
+#[cfg(desktop)]
+async fn queue_desktop_tunnel_stopped(app: &AppHandle, session_id: Option<&str>) {
+    use tauri::Manager;
+
+    let diagnostics = app.state::<Arc<AppDiagnostics>>().inner().clone();
+    let tunnel = app
+        .state::<Arc<crate::platform::PlatformTunnelController>>()
+        .inner()
+        .clone();
+    let now = now_unix();
+    if let Some(session_id) = session_id {
+        if let Ok(observation) = diagnostics.observe_automatic_tunnel(Some(session_id), true, now) {
+            if observation.interval_started.is_some() {
+                diagnostics.begin_automatic_resource_interval(
+                    &observation,
+                    crate::resource_usage::ResourceSnapshot::capture(app),
+                );
+            }
+        }
+    }
+    let queued = diagnostics
+        .observe_automatic_tunnel(None, false, now)
+        .is_ok_and(|observation| observation.seal_pending);
+    if !queued {
+        return;
+    }
+    let Ok(Some(seal)) = diagnostics.pending_automatic_seal() else {
+        return;
+    };
+    let helper_log = crate::platform::diagnostic_helper_log(&tunnel).await;
+    let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(app);
+    match diagnostics.materialize_automatic_report(&seal, resource_snapshot, helper_log) {
+        Ok(()) => diagnostics.record_named(
+            "diagnostics.automatic_report_queued",
+            Some(&seal.session_id),
+            Some(&seal.report_id),
+            Some(&seal.trigger),
+        ),
+        Err(error) => diagnostics.record_named(
+            "diagnostics.automatic_report_queue_failed",
+            Some(&seal.session_id),
+            None,
+            Some(&error.kind().to_string()),
+        ),
+    }
+}
+
+#[cfg(desktop)]
+async fn prepare_desktop_logout(
+    app: &AppHandle,
+    application: &NativeApplication,
+    diagnostics: &AppDiagnostics,
+) {
+    use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStatus};
+
+    let session_id = application
+        .connection_metrics_context()
+        .await
+        .map(|context| context.session_id);
+    let tunnel = app
+        .state::<Arc<crate::platform::PlatformTunnelController>>()
+        .inner()
+        .clone();
+    let status = tunnel.status().await;
+    let stop_result = if matches!(status, Ok(TunnelStatus::Stopped | TunnelStatus::Failed)) {
+        Ok(())
+    } else {
+        match tunnel.stop().await {
+            Err(TunnelError::Backend(code)) if tunnel_service_error(&code) => {
+                match crate::platform::prepare_tunnel_for_stop(app.clone()).await {
+                    Ok(()) => tunnel.stop().await,
+                    Err(error) => Err(error),
+                }
+            }
+            result => result,
+        }
+    };
+    match stop_result {
+        Ok(()) => {
+            queue_desktop_tunnel_stopped(app, session_id.as_deref()).await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                crate::upload_latest_automatic_diagnostics_for_logout(application, diagnostics),
+            )
+            .await;
+        }
+        Err(error) => diagnostics.record_named(
+            "diagnostics.logout_tunnel_stop_failed",
+            session_id.as_deref(),
+            None,
+            Some(&error.to_string()),
+        ),
     }
 }
 
@@ -438,13 +559,16 @@ pub async fn app_state(
     if metrics_view_is_visible(&app) {
         metrics.mark_observed().await;
     }
-    let quick_state_changed = app
+    let quick_state_change = app
         .tunnel_android()
         .take_quick_state_change()
-        .unwrap_or(false);
+        .unwrap_or_default();
+    let quick_state_changed = quick_state_change.changed;
     let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
         match application.bootstrap(now_unix()).await {
             Ok(response) => {
+                #[cfg(desktop)]
+                diagnostics.set_automatic_device(&response.device.id);
                 provision_android_background_resilient(
                     app.clone(),
                     application.inner().clone(),
@@ -454,7 +578,7 @@ pub async fn app_state(
                 .await;
                 if app
                     .tunnel_android()
-                    .acknowledge_quick_state_change()
+                    .acknowledge_quick_state_change(quick_state_change.revision)
                     .is_ok()
                 {
                     clear_quick_reconcile_retry();
@@ -683,6 +807,8 @@ pub async fn app_login(
         )
         .await
         .map_err(CommandError::from)?;
+    #[cfg(desktop)]
+    diagnostics.set_automatic_device(&response.device.id);
     let _ = app.tunnel_android().clear_background();
     let _ = app.tunnel_android().clear_quick_plan();
     provision_android_background_resilient(
@@ -759,6 +885,8 @@ pub async fn app_bootstrap(
         None,
         bootstrap_started.elapsed(),
     );
+    #[cfg(desktop)]
+    diagnostics.set_automatic_device(&response.device.id);
     schedule_startup_split_tunnel_refresh(
         app.clone(),
         application.inner().clone(),
@@ -1135,14 +1263,24 @@ pub async fn app_send_diagnostics(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     diagnostics: State<'_, Arc<AppDiagnostics>>,
+    tunnel: State<'_, Arc<crate::platform::PlatformTunnelController>>,
 ) -> Result<DiagnosticUploadResponse, CommandError> {
     let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(&app);
-    let report = diagnostics.build_report(resource_snapshot).map_err(|_| {
-        CommandError::new(
-            "diagnostics_unavailable",
-            "Не удалось подготовить диагностический отчёт",
-        )
-    })?;
+    #[cfg(desktop)]
+    let helper_log = crate::platform::diagnostic_helper_log(&tunnel).await;
+    #[cfg(not(desktop))]
+    let helper_log = {
+        let _ = &tunnel;
+        None
+    };
+    let report = diagnostics
+        .build_report_with_helper(resource_snapshot, helper_log)
+        .map_err(|_| {
+            CommandError::new(
+                "diagnostics_unavailable",
+                "Не удалось подготовить диагностический отчёт",
+            )
+        })?;
     match application.upload_diagnostics(&report).await {
         Ok(response) => {
             diagnostics.record_named(
@@ -1459,8 +1597,11 @@ pub async fn app_register_push_token(
 pub async fn app_logout(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
 ) -> Result<(), CommandError> {
+    #[cfg(desktop)]
+    prepare_desktop_logout(&app, &application, &diagnostics).await;
     let logout_result = push_registration_scheduler.logout(&app, &application).await;
     let quick_plan_result = app.tunnel_android().clear_quick_plan();
     let background_result = app.tunnel_android().clear_background();
@@ -1468,6 +1609,10 @@ pub async fn app_logout(
     if let Err(error) = logout_result {
         return Err(CommandError::from(error));
     }
+    #[cfg(desktop)]
+    diagnostics.clear_automatic_device();
+    #[cfg(not(desktop))]
+    let _ = &diagnostics;
     quick_plan_result.map_err(|_| {
         CommandError::new(
             "quick_state_persist_failed",
@@ -1810,6 +1955,11 @@ mod tests {
         assert_eq!(error.code, "route_conflict");
         assert!(error.message.contains("маршрут"));
         assert!(!error.message.contains("Переустановите"));
+
+        let endpoint =
+            CommandError::from_core(CoreError::Tunnel("endpoint_route_lost".to_string()));
+        assert_eq!(endpoint.code, "endpoint_route_lost");
+        assert!(endpoint.message.contains("остановлен для защиты"));
     }
 
     #[test]

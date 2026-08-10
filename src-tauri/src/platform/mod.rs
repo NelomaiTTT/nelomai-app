@@ -26,6 +26,16 @@ pub fn tunnel_controller(_app: tauri::AppHandle<tauri::Wry>) -> PlatformTunnelCo
 }
 
 #[cfg(windows)]
+pub async fn diagnostic_helper_log(tunnel: &PlatformTunnelController) -> Option<String> {
+    tunnel.diagnostics().await.ok()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub async fn diagnostic_helper_log(_tunnel: &PlatformTunnelController) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
 pub fn tunnel_controller(_app: tauri::AppHandle<tauri::Wry>) -> PlatformTunnelController {
     windows::tunnel_controller()
 }

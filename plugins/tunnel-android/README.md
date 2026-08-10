@@ -8,8 +8,8 @@ selects its transport explicitly.
 The source is pinned to upstream `v3.0.1`
 (`f82900455f1aceaa85658686dc2c5e32c2c42a73`) as the recursive
 `vendor/amneziawg-android` submodule.
-The matching AmneziaWG Go backend is pinned to `v3.0.1`
-(`9f5d948bc72cc554791cfe0fb91527e4acfb6b79`) in
+The matching AmneziaWG Go backend is pinned to upstream commit
+`08d68cdae27762c3e07f36bbb12d2bad32f81926` in
 `vendor/amneziawg-go`. The repository-root `go.work` makes the upstream native
 wrapper resolve that local tree instead of downloading the declared module.
 CI and release builds verify the resolved module directory, and the workspace

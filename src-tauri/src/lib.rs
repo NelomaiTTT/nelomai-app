@@ -1,3 +1,5 @@
+#[cfg(desktop)]
+mod automatic_diagnostics;
 mod commands;
 mod connection_metrics;
 #[cfg(desktop)]
@@ -22,6 +24,9 @@ const PHYSICAL_NETWORK_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const PENDING_STOP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const PUSH_REGISTRATION_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const CONNECTION_METRICS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const CONNECTION_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(desktop)]
+const AUTOMATIC_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 type NativeApplication = ClientApplication<
     ClientApi,
@@ -162,8 +167,9 @@ pub fn run() {
         let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
         let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
         let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
-        app.manage(diagnostics);
+        app.manage(diagnostics.clone());
         app.manage(application.clone());
+        app.manage(tunnel.clone());
         app.manage(split_tunnel_scheduler.clone());
         app.manage(push_registration_scheduler.clone());
         app.manage(preferences);
@@ -174,7 +180,19 @@ pub fn run() {
         start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
         start_physical_network_scheduler(application.clone());
         start_pending_stop_scheduler(application.clone());
-        start_connection_metrics_scheduler(application.clone(), tunnel, connection_metrics);
+        start_connection_metrics_scheduler(
+            application.clone(),
+            tunnel.clone(),
+            connection_metrics,
+            diagnostics.clone(),
+        );
+        #[cfg(desktop)]
+        start_automatic_diagnostics_scheduler(
+            app.handle().clone(),
+            application.clone(),
+            tunnel.clone(),
+            diagnostics,
+        );
         start_push_registration_scheduler(
             app.handle().clone(),
             application,
@@ -246,6 +264,200 @@ pub fn run() {
     });
 }
 
+#[cfg(desktop)]
+fn start_automatic_diagnostics_scheduler(
+    app: tauri::AppHandle,
+    application: Arc<NativeApplication>,
+    tunnel: Arc<platform::PlatformTunnelController>,
+    diagnostics: Arc<diagnostics::AppDiagnostics>,
+) {
+    use nelomai_client_tunnel::TunnelController;
+
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(AUTOMATIC_DIAGNOSTICS_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let now = current_unix_time();
+            let context = application.connection_metrics_context().await;
+            let status = tunnel.status().await.ok();
+            let (session_id, tunnel_may_be_running) = automatic_tunnel_state(
+                context.as_ref().map(|context| context.session_id.as_str()),
+                status,
+            );
+            let observation = match diagnostics.observe_automatic_tunnel(
+                session_id,
+                tunnel_may_be_running,
+                now,
+            ) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    diagnostics.record_named(
+                        "diagnostics.automatic_observation_failed",
+                        None,
+                        None,
+                        Some(&error.kind().to_string()),
+                    );
+                    continue;
+                }
+            };
+            if observation.interval_started.is_some() {
+                diagnostics.begin_automatic_resource_interval(
+                    &observation,
+                    resource_usage::ResourceSnapshot::capture(&app),
+                );
+            }
+
+            match diagnostics.pending_automatic_seal() {
+                Ok(Some(seal)) => {
+                    let helper_log = platform::diagnostic_helper_log(&tunnel).await;
+                    let resource_snapshot = resource_usage::ResourceSnapshot::capture(&app);
+                    if let Err(error) = diagnostics.materialize_automatic_report(
+                        &seal,
+                        resource_snapshot,
+                        helper_log,
+                    ) {
+                        diagnostics.record_named(
+                            "diagnostics.automatic_report_queue_failed",
+                            Some(&seal.session_id),
+                            None,
+                            Some(&error.kind().to_string()),
+                        );
+                        continue;
+                    }
+                    diagnostics.record_named(
+                        "diagnostics.automatic_report_queued",
+                        Some(&seal.session_id),
+                        Some(&seal.report_id),
+                        Some(&seal.trigger),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics.record_named(
+                        "diagnostics.automatic_seal_read_failed",
+                        None,
+                        None,
+                        Some(&error.kind().to_string()),
+                    );
+                    continue;
+                }
+            }
+
+            upload_automatic_diagnostics_once(&application, &diagnostics).await;
+        }
+    });
+}
+
+#[cfg(desktop)]
+fn automatic_tunnel_state(
+    session_id: Option<&str>,
+    status: Option<nelomai_client_tunnel::TunnelStatus>,
+) -> (Option<&str>, bool) {
+    use nelomai_client_tunnel::TunnelStatus;
+
+    match status {
+        Some(TunnelStatus::Stopped | TunnelStatus::Failed) => (None, false),
+        Some(TunnelStatus::Starting | TunnelStatus::Running | TunnelStatus::Stopping) => {
+            (session_id, true)
+        }
+        None => (session_id, true),
+    }
+}
+
+#[cfg(desktop)]
+pub(crate) async fn upload_automatic_diagnostics_once(
+    application: &NativeApplication,
+    diagnostics: &diagnostics::AppDiagnostics,
+) {
+    let _ = upload_automatic_diagnostics(application, diagnostics, false).await;
+}
+
+#[cfg(desktop)]
+pub(crate) async fn upload_latest_automatic_diagnostics_for_logout(
+    application: &NativeApplication,
+    diagnostics: &diagnostics::AppDiagnostics,
+) {
+    for _ in 0..50 {
+        if upload_automatic_diagnostics(application, diagnostics, true).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(desktop)]
+async fn upload_automatic_diagnostics(
+    application: &NativeApplication,
+    diagnostics: &diagnostics::AppDiagnostics,
+    latest: bool,
+) -> bool {
+    if application.current_access_token().is_err() {
+        return false;
+    }
+    let now = current_unix_time();
+    let candidate_result = if latest {
+        diagnostics.automatic_latest_upload_candidate(now)
+    } else {
+        diagnostics.automatic_upload_candidate(now)
+    };
+    let candidate = match candidate_result {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => return false,
+        Err(error) => {
+            diagnostics.record_named(
+                "diagnostics.automatic_report_read_failed",
+                None,
+                None,
+                Some(&error.kind().to_string()),
+            );
+            let _ = diagnostics.automatic_upload_failed(now);
+            return true;
+        }
+    };
+    let expected_report_id = candidate.report.report_id.clone();
+    match application.upload_diagnostics(&candidate.report).await {
+        Ok(response) if Some(response.report_id.as_str()) == expected_report_id.as_deref() => {
+            match diagnostics.automatic_upload_succeeded(&candidate, current_unix_time()) {
+                Ok(()) => diagnostics.record_named(
+                    "diagnostics.automatic_report_uploaded",
+                    candidate.report.tunnel_session_id.as_deref(),
+                    Some(&response.request_id),
+                    Some(candidate.report.trigger.as_str()),
+                ),
+                Err(error) => {
+                    let _ = diagnostics.automatic_upload_failed(current_unix_time());
+                    diagnostics.record_named(
+                        "diagnostics.automatic_sent_archive_failed",
+                        candidate.report.tunnel_session_id.as_deref(),
+                        Some(&response.request_id),
+                        Some(&error.kind().to_string()),
+                    );
+                }
+            }
+        }
+        Ok(_) => {
+            let _ = diagnostics.automatic_upload_failed(current_unix_time());
+            diagnostics.record_named(
+                "diagnostics.automatic_upload_failed",
+                candidate.report.tunnel_session_id.as_deref(),
+                None,
+                Some("invalid_diagnostics_response"),
+            );
+        }
+        Err(_) => {
+            let _ = diagnostics.automatic_upload_failed(current_unix_time());
+            diagnostics.record_named(
+                "diagnostics.automatic_upload_failed",
+                candidate.report.tunnel_session_id.as_deref(),
+                None,
+                Some("upload_failed"),
+            );
+        }
+    }
+    true
+}
+
 fn start_split_tunnel_scheduler(
     application: Arc<NativeApplication>,
     scheduler: Arc<SplitTunnelScheduler>,
@@ -289,25 +501,49 @@ fn start_connection_metrics_scheduler(
     application: Arc<NativeApplication>,
     tunnel: Arc<platform::PlatformTunnelController>,
     tracker: Arc<connection_metrics::ConnectionMetricsTracker>,
+    diagnostics: Arc<diagnostics::AppDiagnostics>,
 ) {
     use nelomai_client_tunnel::TunnelController;
 
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(CONNECTION_METRICS_POLL_INTERVAL);
         let mut failure_recorded = false;
+        let mut last_diagnostics_at: Option<std::time::Instant> = None;
+        let mut last_diagnostics_session: Option<String> = None;
+        let mut last_diagnostics_sample = None;
         loop {
             interval.tick().await;
-            if !tracker.is_observed().await {
-                tracker.clear().await;
-                failure_recorded = false;
-                continue;
-            }
             let Some(context) = application.connection_metrics_context().await else {
                 tracker.clear().await;
                 failure_recorded = false;
+                last_diagnostics_at = None;
+                last_diagnostics_session = None;
+                last_diagnostics_sample = None;
                 continue;
             };
-            let probe = tracker.should_probe(&context.session_id).await;
+            let observed = tracker.is_observed().await;
+            let endpoint_route_guard =
+                cfg!(windows) && context.layer == nelomai_contracts::Layer::Stray;
+            let new_diagnostics_session =
+                last_diagnostics_session.as_deref() != Some(context.session_id.as_str());
+            let diagnostics_now = std::time::Instant::now();
+            let diagnostics_due = connection_diagnostics_due(
+                last_diagnostics_session.as_deref(),
+                &context.session_id,
+                last_diagnostics_at,
+                diagnostics_now,
+            );
+            if !observed && !diagnostics_due && !endpoint_route_guard {
+                continue;
+            }
+            if new_diagnostics_session {
+                last_diagnostics_sample = None;
+            }
+            if diagnostics_due {
+                last_diagnostics_at = Some(diagnostics_now);
+                last_diagnostics_session = Some(context.session_id.clone());
+            }
+            let probe = observed && tracker.should_probe(&context.session_id).await;
             match tunnel.metrics(false).await {
                 Ok(Some(sample)) => {
                     failure_recorded = false;
@@ -327,6 +563,15 @@ fn start_connection_metrics_scheduler(
                     } else {
                         None
                     };
+                    if diagnostics_due {
+                        diagnostics.record_tunnel_metrics(
+                            &context.session_id,
+                            &sample,
+                            last_diagnostics_sample.as_ref(),
+                            probe_result,
+                        );
+                        last_diagnostics_sample = Some(sample.clone());
+                    }
                     tracker
                         .record(&context.session_id, sample, probe_result)
                         .await;
@@ -392,3 +637,73 @@ async fn register_android_push(app: &tauri::AppHandle, application: &NativeAppli
 
 #[cfg(not(target_os = "android"))]
 async fn register_android_push(_app: &tauri::AppHandle, _application: &NativeApplication) {}
+
+fn connection_diagnostics_due(
+    previous_session: Option<&str>,
+    current_session: &str,
+    previous_attempt: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    previous_session != Some(current_session)
+        || previous_attempt.is_none_or(|attempt| {
+            now.checked_duration_since(attempt).unwrap_or_default()
+                >= CONNECTION_DIAGNOSTICS_INTERVAL
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(desktop)]
+    use nelomai_client_tunnel::TunnelStatus;
+
+    #[test]
+    fn background_diagnostics_throttle_failed_attempts() {
+        let now = std::time::Instant::now();
+        assert!(connection_diagnostics_due(None, "session", None, now));
+        assert!(!connection_diagnostics_due(
+            Some("session"),
+            "session",
+            Some(now),
+            now + CONNECTION_DIAGNOSTICS_INTERVAL - std::time::Duration::from_secs(1),
+        ));
+        assert!(connection_diagnostics_due(
+            Some("session"),
+            "session",
+            Some(now),
+            now + CONNECTION_DIAGNOSTICS_INTERVAL,
+        ));
+        assert!(connection_diagnostics_due(
+            Some("old-session"),
+            "session",
+            Some(now),
+            now,
+        ));
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn stopped_native_tunnel_overrides_stale_connection_context() {
+        assert_eq!(
+            automatic_tunnel_state(Some("stale-session"), Some(TunnelStatus::Stopped)),
+            (None, false)
+        );
+        assert_eq!(
+            automatic_tunnel_state(Some("stale-session"), Some(TunnelStatus::Failed)),
+            (None, false)
+        );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn uncertain_native_status_does_not_create_a_false_stop() {
+        assert_eq!(
+            automatic_tunnel_state(Some("session"), Some(TunnelStatus::Running)),
+            (Some("session"), true)
+        );
+        assert_eq!(
+            automatic_tunnel_state(Some("session"), None),
+            (Some("session"), true)
+        );
+    }
+}

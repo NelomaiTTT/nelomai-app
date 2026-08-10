@@ -1,6 +1,11 @@
+#[cfg(desktop)]
+use crate::automatic_diagnostics::{
+    AutomaticObservation, DesktopAutomaticDiagnostics, PendingSeal, UploadCandidate,
+};
 use crate::resource_usage::ResourceSnapshot;
 use nelomai_client_api::DiagnosticUploadRequest;
 use nelomai_client_core::{CoreLogEvent, CoreLogger};
+use nelomai_client_tunnel::TunnelMetrics;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -30,6 +35,17 @@ pub struct AppDiagnostics {
     directory: PathBuf,
     write_gate: Mutex<()>,
     resource_baseline: ResourceSnapshot,
+    #[cfg(desktop)]
+    automatic: DesktopAutomaticDiagnostics,
+    #[cfg(desktop)]
+    automatic_resource_baseline: Mutex<Option<AutomaticResourceBaseline>>,
+}
+
+#[cfg(desktop)]
+struct AutomaticResourceBaseline {
+    session_id: String,
+    interval_started_at: i64,
+    snapshot: ResourceSnapshot,
 }
 
 #[derive(Serialize)]
@@ -43,16 +59,43 @@ struct LogRecord<'a> {
     duration_ms: Option<u64>,
 }
 
+#[derive(Serialize)]
+struct TunnelMetricsLogRecord<'a> {
+    timestamp_unix: i64,
+    kind: &'static str,
+    operation_id: &'a str,
+    received_bytes: u64,
+    sent_bytes: u64,
+    received_delta_bytes: u64,
+    sent_delta_bytes: u64,
+    latest_handshake_epoch_millis: Option<u64>,
+    handshake_age_seconds: Option<u64>,
+    probe_succeeded: Option<bool>,
+    latency_ms: Option<u32>,
+}
+
 impl AppDiagnostics {
     pub fn new(directory: PathBuf, resource_baseline: ResourceSnapshot) -> io::Result<Self> {
         fs::create_dir_all(&directory)?;
         restrict_directory_permissions(&directory)?;
+        #[cfg(desktop)]
+        let automatic = DesktopAutomaticDiagnostics::new(directory.join("automatic"))?;
+        #[cfg(desktop)]
+        let automatic_startup_warning = automatic.startup_warning().map(str::to_string);
         let diagnostics = Self {
+            #[cfg(desktop)]
+            automatic,
+            #[cfg(desktop)]
+            automatic_resource_baseline: Mutex::new(None),
             directory,
             write_gate: Mutex::new(()),
             resource_baseline,
         };
         diagnostics.record_named("application.started", None, None, None);
+        #[cfg(desktop)]
+        if let Some(warning) = automatic_startup_warning {
+            diagnostics.record_named("diagnostics.sent_prune_failed", None, None, Some(&warning));
+        }
         Ok(diagnostics)
     }
 
@@ -91,6 +134,39 @@ impl AppDiagnostics {
         }
     }
 
+    pub fn record_tunnel_metrics(
+        &self,
+        operation_id: &str,
+        sample: &TunnelMetrics,
+        previous: Option<&TunnelMetrics>,
+        probe_result: Option<Option<u32>>,
+    ) {
+        let timestamp_unix = now_unix();
+        let now_millis = timestamp_unix.max(0) as u64 * 1_000;
+        let record = TunnelMetricsLogRecord {
+            timestamp_unix,
+            kind: "tunnel.data_plane_snapshot",
+            operation_id,
+            received_bytes: sample.received_bytes,
+            sent_bytes: sample.sent_bytes,
+            received_delta_bytes: counter_delta(
+                previous.map(|value| value.received_bytes),
+                sample.received_bytes,
+            ),
+            sent_delta_bytes: counter_delta(
+                previous.map(|value| value.sent_bytes),
+                sample.sent_bytes,
+            ),
+            latest_handshake_epoch_millis: sample.latest_handshake_epoch_millis,
+            handshake_age_seconds: sample
+                .latest_handshake_epoch_millis
+                .map(|handshake| now_millis.saturating_sub(handshake) / 1_000),
+            probe_succeeded: probe_result.map(|result| result.is_some()),
+            latency_ms: probe_result.flatten(),
+        };
+        self.append_serialized(&record);
+    }
+
     fn record_with_duration(
         &self,
         kind: &str,
@@ -107,7 +183,11 @@ impl AppDiagnostics {
             code,
             duration_ms,
         };
-        let Ok(mut encoded) = serde_json::to_vec(&record) else {
+        self.append_serialized(&record);
+    }
+
+    fn append_serialized(&self, record: &impl Serialize) {
+        let Ok(mut encoded) = serde_json::to_vec(record) else {
             return;
         };
         encoded.push(b'\n');
@@ -129,9 +209,18 @@ impl AppDiagnostics {
         }
     }
 
+    #[cfg(test)]
     pub fn build_report(
         &self,
         resource_snapshot: ResourceSnapshot,
+    ) -> io::Result<DiagnosticUploadRequest> {
+        self.build_report_with_helper(resource_snapshot, None)
+    }
+
+    pub fn build_report_with_helper(
+        &self,
+        resource_snapshot: ResourceSnapshot,
+        helper_override: Option<String>,
     ) -> io::Result<DiagnosticUploadRequest> {
         let _guard = self
             .write_gate
@@ -165,10 +254,183 @@ impl AppDiagnostics {
             platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
-            helper_log: helper_log(&self.directory).filter(|value| !value.is_empty()),
+            helper_log: bounded_helper_log(helper_override.or_else(|| helper_log(&self.directory))),
             resource_usage: Some(self.resource_baseline.report(resource_snapshot)),
         })
     }
+
+    #[cfg(desktop)]
+    pub fn set_automatic_device(&self, device_id: &str) {
+        if let Err(error) = self.automatic.set_current_device(device_id) {
+            self.record_named(
+                "diagnostics.automatic_device_write_failed",
+                None,
+                None,
+                Some(&error.kind().to_string()),
+            );
+        }
+    }
+
+    #[cfg(desktop)]
+    pub fn clear_automatic_device(&self) {
+        if let Err(error) = self.automatic.clear_current_device() {
+            self.record_named(
+                "diagnostics.automatic_device_clear_failed",
+                None,
+                None,
+                Some(&error.kind().to_string()),
+            );
+        }
+    }
+
+    #[cfg(desktop)]
+    pub fn observe_automatic_tunnel(
+        &self,
+        session_id: Option<&str>,
+        tunnel_may_be_running: bool,
+        now: i64,
+    ) -> io::Result<AutomaticObservation> {
+        self.automatic
+            .observe(session_id, tunnel_may_be_running, now)
+    }
+
+    #[cfg(desktop)]
+    pub fn begin_automatic_resource_interval(
+        &self,
+        observation: &AutomaticObservation,
+        snapshot: ResourceSnapshot,
+    ) {
+        let Some(interval) = &observation.interval_started else {
+            return;
+        };
+        let Ok(mut baseline) = self.automatic_resource_baseline.lock() else {
+            return;
+        };
+        *baseline = Some(AutomaticResourceBaseline {
+            session_id: interval.session_id.clone(),
+            interval_started_at: interval.started_at,
+            snapshot,
+        });
+    }
+
+    #[cfg(desktop)]
+    pub fn pending_automatic_seal(&self) -> io::Result<Option<PendingSeal>> {
+        self.automatic.pending_seal()
+    }
+
+    #[cfg(desktop)]
+    pub fn materialize_automatic_report(
+        &self,
+        seal: &PendingSeal,
+        resource_snapshot: ResourceSnapshot,
+        helper_override: Option<String>,
+    ) -> io::Result<()> {
+        let _guard = self
+            .write_gate
+            .lock()
+            .map_err(|_| io::Error::other("diagnostics lock poisoned"))?;
+        let previous = read_tail(
+            &self.directory.join(PREVIOUS_LOG),
+            MAX_APPLICATION_REPORT_BYTES / 2,
+        )?;
+        let current = read_tail(
+            &self.directory.join(CURRENT_LOG),
+            MAX_APPLICATION_REPORT_BYTES,
+        )?;
+        let application_log = tail_string(
+            &if previous.is_empty() {
+                current
+            } else {
+                format!("{previous}{current}")
+            },
+            MAX_APPLICATION_REPORT_BYTES,
+        );
+        let resource_usage = self
+            .automatic_resource_baseline
+            .lock()
+            .map_err(|_| io::Error::other("automatic resource baseline lock poisoned"))?
+            .as_ref()
+            .filter(|baseline| {
+                baseline.session_id == seal.session_id
+                    && baseline.interval_started_at == seal.started_at
+            })
+            .map(|baseline| baseline.snapshot.report(resource_snapshot.clone()));
+        let report = DiagnosticUploadRequest {
+            report_id: Some(seal.report_id.clone()),
+            trigger: seal.trigger.clone(),
+            tunnel_session_id: Some(seal.session_id.clone()),
+            sequence: Some(seal.sequence),
+            interval_started_at_unix: Some(seal.started_at),
+            interval_ended_at_unix: Some(seal.ended_at),
+            tunnel_running: Some(seal.tunnel_running),
+            generated_at_unix: seal.ended_at,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform_version: platform_version(),
+            architecture: std::env::consts::ARCH.to_string(),
+            application_log,
+            helper_log: bounded_helper_log(helper_override.or_else(|| helper_log(&self.directory))),
+            resource_usage,
+        };
+        drop(_guard);
+        self.automatic.materialize(seal, &report)?;
+        let mut baseline = self
+            .automatic_resource_baseline
+            .lock()
+            .map_err(|_| io::Error::other("automatic resource baseline lock poisoned"))?;
+        if seal.tunnel_running {
+            *baseline = Some(AutomaticResourceBaseline {
+                session_id: seal.session_id.clone(),
+                interval_started_at: seal.ended_at,
+                snapshot: resource_snapshot,
+            });
+        } else {
+            *baseline = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(desktop)]
+    pub fn automatic_upload_candidate(&self, now: i64) -> io::Result<Option<UploadCandidate>> {
+        self.automatic.upload_candidate(now)
+    }
+
+    #[cfg(desktop)]
+    pub fn automatic_latest_upload_candidate(
+        &self,
+        now: i64,
+    ) -> io::Result<Option<UploadCandidate>> {
+        self.automatic.upload_latest_candidate(now)
+    }
+
+    #[cfg(desktop)]
+    pub fn automatic_upload_succeeded(
+        &self,
+        candidate: &UploadCandidate,
+        now: i64,
+    ) -> io::Result<()> {
+        self.automatic.upload_succeeded(candidate, now)
+    }
+
+    #[cfg(desktop)]
+    pub fn automatic_upload_failed(&self, now: i64) -> io::Result<i64> {
+        self.automatic.upload_failed(now)
+    }
+}
+
+fn bounded_helper_log(value: Option<String>) -> Option<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| tail_string(&value, MAX_HELPER_REPORT_BYTES))
+}
+
+fn counter_delta(previous: Option<u64>, current: u64) -> u64 {
+    previous.map_or(current, |previous| {
+        if current >= previous {
+            current - previous
+        } else {
+            current
+        }
+    })
 }
 
 #[cfg(target_os = "android")]
@@ -466,5 +728,106 @@ mod tests {
 
         assert!(combined.contains("application.started"));
         assert!(combined.contains("startup.android.activity_created"));
+    }
+
+    #[test]
+    fn records_data_plane_counters_handshake_and_probe_result() {
+        let directory = std::env::temp_dir().join(format!(
+            "nelomai-diagnostics-metrics-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let diagnostics =
+            AppDiagnostics::new(directory.clone(), ResourceSnapshot::capture_for_test()).unwrap();
+        let previous = TunnelMetrics {
+            received_bytes: 100,
+            sent_bytes: 50,
+            ..TunnelMetrics::default()
+        };
+        let sample = TunnelMetrics {
+            received_bytes: 145,
+            sent_bytes: 65,
+            latest_handshake_epoch_millis: Some(1),
+            probe_target: None,
+        };
+
+        diagnostics.record_tunnel_metrics("session-1", &sample, Some(&previous), Some(Some(42)));
+
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
+        let record = report
+            .application_log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "tunnel.data_plane_snapshot")
+            .unwrap();
+        assert_eq!(record["received_delta_bytes"], 45);
+        assert_eq!(record["sent_delta_bytes"], 15);
+        assert_eq!(record["latest_handshake_epoch_millis"], 1);
+        assert_eq!(record["probe_succeeded"], true);
+        assert_eq!(record["latency_ms"], 42);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn counter_delta_handles_backend_counter_reset() {
+        assert_eq!(counter_delta(None, 12), 12);
+        assert_eq!(counter_delta(Some(10), 14), 4);
+        assert_eq!(counter_delta(Some(10), 3), 3);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn automatic_report_omits_resource_delta_without_matching_interval_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().to_path_buf(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        diagnostics.set_automatic_device("device-1");
+        diagnostics
+            .observe_automatic_tunnel(Some("connection-1"), true, 10)
+            .unwrap();
+        diagnostics
+            .observe_automatic_tunnel(None, false, 20)
+            .unwrap();
+        let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+
+        diagnostics
+            .materialize_automatic_report(&seal, ResourceSnapshot::capture_for_test(), None)
+            .unwrap();
+        let candidate = diagnostics.automatic_upload_candidate(20).unwrap().unwrap();
+
+        assert!(candidate.report.resource_usage.is_none());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn automatic_report_uses_the_current_interval_resource_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().to_path_buf(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        diagnostics.set_automatic_device("device-1");
+        let observation = diagnostics
+            .observe_automatic_tunnel(Some("connection-1"), true, 10)
+            .unwrap();
+        diagnostics
+            .begin_automatic_resource_interval(&observation, ResourceSnapshot::capture_for_test());
+        diagnostics
+            .observe_automatic_tunnel(None, false, 20)
+            .unwrap();
+        let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+
+        diagnostics
+            .materialize_automatic_report(&seal, ResourceSnapshot::capture_for_test(), None)
+            .unwrap();
+        let candidate = diagnostics.automatic_upload_candidate(20).unwrap().unwrap();
+
+        assert!(candidate.report.resource_usage.is_some());
     }
 }

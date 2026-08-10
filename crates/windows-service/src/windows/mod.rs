@@ -2,6 +2,7 @@ mod backend;
 mod elevation;
 mod install;
 mod ipc;
+mod ringlogger;
 mod routes;
 mod service;
 

@@ -54,6 +54,7 @@ pub struct CoreState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionMetricsContext {
     pub session_id: String,
+    pub layer: Layer,
     pub probe_url: Option<String>,
 }
 
@@ -297,6 +298,14 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
+    pub fn normalized_for_layer(mut self) -> Self {
+        if self.layer == Layer::Stray {
+            self.tic_connection_mode = TicConnectionMode::Dynamic;
+            self.route_mode = RouteMode::Standalone;
+        }
+        self
+    }
+
     pub fn android_default() -> Self {
         Self {
             layer: Layer::Tic,
@@ -361,6 +370,30 @@ mod platform_default_tests {
         assert_eq!(options.route_mode, RouteMode::Standalone);
         assert!(options.probes.is_empty());
         assert!(options.allow_alternate);
+    }
+
+    #[test]
+    fn stray_never_inherits_personal_tic_preferences() {
+        let options = ConnectOptions {
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Personal,
+            route_mode: RouteMode::ViaTak,
+            probes: Vec::new(),
+            allow_alternate: true,
+        }
+        .normalized_for_layer();
+
+        assert_eq!(options.tic_connection_mode, TicConnectionMode::Dynamic);
+        assert_eq!(options.route_mode, RouteMode::Standalone);
+    }
+
+    #[test]
+    fn tic_preferences_are_not_changed_by_normalization() {
+        let options = ConnectOptions::android_default().normalized_for_layer();
+
+        assert_eq!(options.layer, Layer::Tic);
+        assert_eq!(options.tic_connection_mode, TicConnectionMode::Personal);
+        assert_eq!(options.route_mode, RouteMode::ViaTak);
     }
 }
 
@@ -809,6 +842,7 @@ where
         if let Some(connection) = state.connection {
             return Some(ConnectionMetricsContext {
                 session_id: connection.lease_id,
+                layer: connection.layer,
                 probe_url: connection.probe_url,
             });
         }
@@ -816,6 +850,7 @@ where
         let connection = stored.saved_connection.or(stored.pinned_connection)?;
         Some(ConnectionMetricsContext {
             session_id: connection.lease_id,
+            layer: connection.layer,
             probe_url: connection.probe_url,
         })
     }
@@ -858,6 +893,7 @@ where
     pub async fn sign_out(&self) -> Result<(), CoreError> {
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _connection_guard = self.connection_gate.lock().await;
+        let _refresh_guard = self.refresh_gate.lock().await;
         let tunnel_result = self.tunnel.stop().await;
         let stored = self
             .store
@@ -1117,6 +1153,7 @@ where
         options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
+        let options = options.normalized_for_layer();
         let total_started = Instant::now();
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;

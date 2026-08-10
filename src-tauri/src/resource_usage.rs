@@ -2,13 +2,14 @@ use nelomai_client_api::{DiagnosticResourceComponent, DiagnosticResourceUsage};
 use std::time::Instant;
 use tauri::{AppHandle, Runtime};
 
+#[derive(Clone)]
 pub struct ResourceSnapshot {
     captured_at: Instant,
     process: ProcessCounters,
     android_uid: Option<AndroidUidCounters>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ProcessCounters {
     cpu_user_ms: Option<u64>,
     cpu_system_ms: Option<u64>,
@@ -23,7 +24,7 @@ struct ProcessCounters {
     involuntary_context_switches: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AndroidUidCounters {
     cpu_user_ms: Option<u64>,
     cpu_system_ms: Option<u64>,

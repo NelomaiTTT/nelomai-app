@@ -129,7 +129,7 @@ pub struct SuccessResponse {
     pub ok: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DiagnosticUploadRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_id: Option<String>,
@@ -154,14 +154,14 @@ pub struct DiagnosticUploadRequest {
     pub resource_usage: Option<DiagnosticResourceUsage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DiagnosticResourceUsage {
     pub measurement_mode: String,
     pub session_duration_ms: u64,
     pub components: Vec<DiagnosticResourceComponent>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DiagnosticResourceComponent {
     pub component: String,
     pub source: String,

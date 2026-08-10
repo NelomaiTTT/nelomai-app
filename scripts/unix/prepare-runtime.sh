@@ -11,7 +11,7 @@ RUST_TARGET=$2
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 HELPER=$ROOT/target/$RUST_TARGET/release/nelomai-unix-service
 OUTPUT=$ROOT/src-tauri/platform-runtime
-AMNEZIAWG_GO_COMMIT=9f5d948bc72cc554791cfe0fb91527e4acfb6b79
+AMNEZIAWG_GO_COMMIT=08d68cdae27762c3e07f36bbb12d2bad32f81926
 
 if [ ! -f "$HELPER" ]; then
   echo "Unix helper is missing: $HELPER" >&2

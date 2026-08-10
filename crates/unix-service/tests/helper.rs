@@ -200,6 +200,7 @@ impl ServiceTunnelBackend for RecordingBackend {
         Ok(TunnelMetrics {
             received_bytes: 120,
             sent_bytes: 45,
+            latest_handshake_epoch_millis: None,
             probe_target: probe.then(|| "192.0.2.10".to_string()),
         })
     }
@@ -242,6 +243,7 @@ fn handler_validates_protocol_and_configuration_before_mutation() {
         Some(TunnelMetrics {
             received_bytes: 120,
             sent_bytes: 45,
+            latest_handshake_epoch_millis: None,
             probe_target: Some("192.0.2.10".to_string()),
         })
     );
@@ -253,6 +255,7 @@ async fn controller_maps_helper_metrics_without_exposing_configuration() {
     response.metrics = Some(TunnelMetrics {
         received_bytes: 512,
         sent_bytes: 128,
+        latest_handshake_epoch_millis: None,
         probe_target: Some("192.0.2.23".to_string()),
     });
     let controller = UnixTunnelController::new(RecordingTransport {
@@ -265,6 +268,7 @@ async fn controller_maps_helper_metrics_without_exposing_configuration() {
         Some(TunnelMetrics {
             received_bytes: 512,
             sent_bytes: 128,
+            latest_handshake_epoch_millis: None,
             probe_target: Some("192.0.2.23".to_string()),
         })
     );

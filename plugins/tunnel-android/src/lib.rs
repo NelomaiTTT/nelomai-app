@@ -179,6 +179,7 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         Ok(Some(TunnelMetrics {
             received_bytes: response.received_bytes,
             sent_bytes: response.sent_bytes,
+            latest_handshake_epoch_millis: response.latest_handshake_epoch_millis,
             probe_target: response.probe_target,
         }))
     }

@@ -1,4 +1,7 @@
-use crate::{commands, connection_metrics::ConnectionMetricsTracker, NativeApplication};
+use crate::{
+    commands, connection_metrics::ConnectionMetricsTracker, diagnostics::AppDiagnostics,
+    NativeApplication,
+};
 use nelomai_client_core::Phase;
 use serde::Serialize;
 #[cfg(target_os = "macos")]
@@ -265,7 +268,15 @@ pub fn quit_application(app: AppHandle) {
         let application = app.state::<Arc<NativeApplication>>().inner().clone();
         let result = commands::stop_for_shutdown(&app, application.as_ref()).await;
         match result {
-            Ok(()) => app.exit(0),
+            Ok(()) => {
+                let diagnostics = app.state::<Arc<AppDiagnostics>>().inner().clone();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::upload_automatic_diagnostics_once(&application, &diagnostics),
+                )
+                .await;
+                app.exit(0);
+            }
             Err(error) => {
                 EXIT_RUNNING.store(false, Ordering::Release);
                 show_window(&app);

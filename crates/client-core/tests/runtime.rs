@@ -495,6 +495,32 @@ async fn refresh_is_single_flight_and_rotates_tokens_once() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sign_out_cannot_be_undone_by_an_in_flight_token_refresh() {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = Arc::new(ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+
+    let refresh_core = core.clone();
+    let refresh =
+        tokio::spawn(async move { refresh_core.refresh_access_token("stale-access").await });
+    while api.refresh_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    core.sign_out().await.unwrap();
+    assert_eq!(refresh.await.unwrap().unwrap(), "fresh-access");
+
+    let stored = store.load().unwrap().unwrap();
+    assert!(stored.access_token.is_none());
+    assert!(stored.refresh_token.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn bootstrap_refreshes_an_expired_access_token_without_signing_out() {
     let api = Arc::new(MockApi::new(0));
     api.reject_stale_bootstrap.store(true, Ordering::SeqCst);

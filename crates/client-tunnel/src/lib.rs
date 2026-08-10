@@ -384,6 +384,8 @@ pub enum TunnelStatus {
 pub struct TunnelMetrics {
     pub received_bytes: u64,
     pub sent_bytes: u64,
+    #[serde(default)]
+    pub latest_handshake_epoch_millis: Option<u64>,
     pub probe_target: Option<String>,
 }
 

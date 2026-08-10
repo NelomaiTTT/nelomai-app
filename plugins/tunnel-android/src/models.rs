@@ -263,6 +263,7 @@ pub struct TunnelMetricsRequest {
 pub struct TunnelMetricsResponse {
     pub received_bytes: u64,
     pub sent_bytes: u64,
+    pub latest_handshake_epoch_millis: Option<u64>,
     pub probe_target: Option<String>,
 }
 
@@ -278,6 +279,13 @@ pub struct TunnelOperationResponse {
 #[serde(rename_all = "camelCase")]
 pub struct QuickStateChangeResponse {
     pub changed: bool,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuickStateChangeAcknowledgeRequest {
+    pub revision: u64,
 }
 
 #[cfg(test)]

@@ -74,11 +74,11 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(())
     }
 
-    pub fn take_quick_state_change(&self) -> crate::Result<bool> {
-        Ok(false)
+    pub fn take_quick_state_change(&self) -> crate::Result<QuickStateChangeResponse> {
+        Ok(QuickStateChangeResponse::default())
     }
 
-    pub fn acknowledge_quick_state_change(&self) -> crate::Result<()> {
+    pub fn acknowledge_quick_state_change(&self, _revision: u64) -> crate::Result<()> {
         Ok(())
     }
 

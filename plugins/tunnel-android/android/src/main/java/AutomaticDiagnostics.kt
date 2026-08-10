@@ -99,6 +99,8 @@ internal object AutomaticDiagnostics {
     private val memorySampleFutures = mutableListOf<ScheduledFuture<*>>()
     private var lastNetworkMemorySampleAt = 0L
 
+    fun hasActiveUpload(): Boolean = uploadQueued.get() || systemJobRunning.get()
+
     fun initialize(context: Context) {
         val applicationContext = context.applicationContext
         synchronized(gate) {
@@ -804,8 +806,11 @@ internal object AutomaticDiagnostics {
             reports.map(File::getName),
         )
         reports.filter { it.name in namesToDelete }.forEach { report ->
-            if (!report.delete()) {
-                TunnelLog.warning("diagnostics.sent_prune_failed")
+            if (report.exists() && !report.delete() && report.exists()) {
+                TunnelLog.warning(
+                    "diagnostics.sent_prune_failed",
+                    "delete_failed",
+                )
             }
         }
     }
@@ -1042,6 +1047,23 @@ internal fun androidProcessMemory(context: Context): JSONArray {
             })
         }
     }
+}
+
+internal data class AutomaticDiagnosticsProcessMemory(
+    val residentBytes: Long?,
+    val proportionalBytes: Long?,
+)
+
+internal fun automaticDiagnosticsCurrentProcessMemory(
+    context: Context,
+): AutomaticDiagnosticsProcessMemory {
+    val processId = Process.myPid()
+    val activityManager = context.getSystemService(ActivityManager::class.java)
+    val info = activityManager.getProcessMemoryInfo(intArrayOf(processId)).firstOrNull()
+    return AutomaticDiagnosticsProcessMemory(
+        residentBytes = processRssBytes(processId),
+        proportionalBytes = info?.totalPss?.toLong()?.times(1024L),
+    )
 }
 
 private fun resourceComponents(processes: JSONArray): JSONArray {

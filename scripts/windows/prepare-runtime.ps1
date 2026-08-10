@@ -49,6 +49,25 @@ if ($amneziaBuildText -eq $amneziaBuildOriginal) {
     throw "Pinned AmneziaWG build script no longer contains the expected Go toolchain"
 }
 Set-Content -LiteralPath $amneziaBuild -Value $amneziaBuildText -Encoding ASCII
+$amneziaPathSource = Join-Path $amneziaSource "conf/path_windows.go"
+$amneziaPathText = Get-Content -LiteralPath $amneziaPathSource -Raw
+$amneziaKnownFolder = 'windows.FOLDERID_ProgramFiles'
+if (-not $amneziaPathText.Contains($amneziaKnownFolder)) {
+    throw "Pinned AmneziaWG path source no longer contains the expected known folder"
+}
+$amneziaPathText = $amneziaPathText.Replace(
+    $amneziaKnownFolder,
+    'windows.FOLDERID_ProgramData'
+)
+$amneziaDataDirectory = 'root = filepath.Join(root, "AmneziaWG")'
+if (-not $amneziaPathText.Contains($amneziaDataDirectory)) {
+    throw "Pinned AmneziaWG path source no longer contains the expected data directory"
+}
+$amneziaPathText = $amneziaPathText.Replace(
+    $amneziaDataDirectory,
+    'root = filepath.Join(root, "Nelomai", "AmneziaWG")'
+)
+Set-Content -LiteralPath $amneziaPathSource -Value $amneziaPathText -Encoding ASCII
 & cmd.exe /c $amneziaBuild
 if ($LASTEXITCODE -ne 0) {
     throw "AmneziaWG tunnel.dll build failed with exit code $LASTEXITCODE"

@@ -14,7 +14,7 @@ fn start_request_is_framed_and_redacted() {
     assert_eq!(decoded, request);
     assert_eq!(
         format!("{request:?}"),
-        "Start { protocol_version: 4, configuration: \"<redacted>\", options: DesktopTunnelOptions { excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false } }"
+        format!("Start {{ protocol_version: {PROTOCOL_VERSION}, configuration: \"<redacted>\", options: DesktopTunnelOptions {{ excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false }} }}")
     );
     assert!(!format!("{request:?}").contains("never-log-this"));
 }
@@ -41,6 +41,7 @@ fn previous_helper_response_decodes_without_a_fingerprint_field() {
 
     assert_eq!(response.protocol_version, 2);
     assert_eq!(response.physical_network_fingerprint, None);
+    assert_eq!(response.diagnostics, None);
 }
 
 #[test]
@@ -69,6 +70,17 @@ fn response_uses_the_same_bounded_frame_contract() {
     assert_eq!(
         decode_response(&oversized).unwrap_err(),
         ServiceError::FrameTooLarge
+    );
+}
+
+#[test]
+fn diagnostics_request_round_trips_through_the_typed_protocol() {
+    let request = Request::diagnostics();
+    let frame = encode_request(&request).expect("encode diagnostics request");
+
+    assert_eq!(
+        decode_request(&frame).expect("decode diagnostics request"),
+        request
     );
 }
 

@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2, GetIfEntry2,
     GetIpForwardTable2, GetIpInterfaceEntry, InitializeIpForwardEntry, IF_TYPE_ETHERNET_CSMACD,
-    IF_TYPE_IEEE80211, IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADDRESS_PREFIX, MIB_IF_ROW2,
-    MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    IF_TYPE_IEEE80211, IF_TYPE_PPP, IF_TYPE_WWANPP, IF_TYPE_WWANPP2, IP_ADDRESS_PREFIX,
+    MIB_IF_ROW2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::{NET_IF_OPER_STATUS_UP, TUNNEL_TYPE_NONE};
 use windows_sys::Win32::Networking::WinSock::{
@@ -27,6 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 const ROUTE_STATE_FILE: &str = "routes-state.json";
 const ROUTE_STATE_FORMAT: u16 = 1;
 const ROUTE_METRIC: u32 = 42_760;
+const ENDPOINT_ROUTE_METRIC: u32 = 1;
 const MAX_STATE_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_ROUTES: usize = 16_384;
 
@@ -66,18 +67,24 @@ impl WindowsRouteManager {
         Ok(Self { state_path, state })
     }
 
-    pub(crate) fn apply(&mut self, options: &DesktopTunnelOptions) -> Result<(), ServiceError> {
+    pub(crate) fn apply(
+        &mut self,
+        options: &DesktopTunnelOptions,
+        protected_endpoint: Option<IpAddr>,
+    ) -> Result<(), ServiceError> {
         self.cleanup()?;
         let plan = Ipv4RoutePlan::from_options(options)
             .map_err(|error| stable_error(error.stable_code()))?;
-        if !plan.active() {
-            return Ok(());
-        }
-        if plan.excluded_networks.is_empty() {
+        let endpoint = match protected_endpoint {
+            Some(IpAddr::V4(endpoint)) => Some(endpoint),
+            Some(IpAddr::V6(_)) => return Err(stable_error("endpoint_route_unavailable")),
+            None => None,
+        };
+        if plan.excluded_networks.is_empty() && endpoint.is_none() {
             return Ok(());
         }
         let egress = discover_egress()?;
-        let routes = plan
+        let mut routes = plan
             .excluded_networks
             .into_iter()
             .map(|network| OwnedRoute {
@@ -87,6 +94,12 @@ impl WindowsRouteManager {
                 metric: ROUTE_METRIC,
             })
             .collect::<Vec<_>>();
+        if let Some(endpoint) = endpoint {
+            append_protected_endpoint_route(&mut routes, endpoint, egress)?;
+        }
+        if routes.len() > MAX_ROUTES {
+            return Err(stable_error("route_plan_too_large"));
+        }
         if routes_presence(&routes)?.into_iter().any(|exists| exists) {
             return Err(stable_error("route_conflict"));
         }
@@ -110,6 +123,31 @@ impl WindowsRouteManager {
         if let Err(error) = self.persist() {
             let _ = self.cleanup();
             return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_protected_endpoint(
+        &self,
+        protected_endpoint: Option<IpAddr>,
+    ) -> Result<(), ServiceError> {
+        let Some(endpoint) = protected_endpoint else {
+            return Ok(());
+        };
+        let IpAddr::V4(endpoint) = endpoint else {
+            return Err(stable_error("endpoint_route_unavailable"));
+        };
+        let destination = format!("{endpoint}/32");
+        let Some(expected) = self.state.routes.iter().find(|route| {
+            route.destination == destination && route.metric == ENDPOINT_ROUTE_METRIC
+        }) else {
+            return Err(stable_error("endpoint_route_lost"));
+        };
+        let selected = best_route(endpoint)?;
+        if selected.interface_index != expected.interface_index
+            || selected.gateway.to_string() != expected.gateway
+        {
+            return Err(stable_error("endpoint_route_lost"));
         }
         Ok(())
     }
@@ -204,6 +242,24 @@ impl WindowsRouteManager {
     }
 }
 
+fn append_protected_endpoint_route(
+    routes: &mut Vec<OwnedRoute>,
+    endpoint: Ipv4Addr,
+    egress: WindowsEgress,
+) -> Result<(), ServiceError> {
+    let destination = Ipv4Net::new(endpoint, 32)
+        .map_err(|_| stable_error("endpoint_route_unavailable"))?
+        .to_string();
+    routes.retain(|route| route.destination != destination);
+    routes.push(OwnedRoute {
+        destination,
+        interface_index: egress.interface_index,
+        gateway: egress.gateway.to_string(),
+        metric: ENDPOINT_ROUTE_METRIC,
+    });
+    Ok(())
+}
+
 fn remove_present_routes(
     routes: Vec<OwnedRoute>,
     first_error: &mut Option<ServiceError>,
@@ -246,25 +302,61 @@ fn discover_egress() -> Result<WindowsEgress, ServiceError> {
         .iter()
         .filter(|route| route.DestinationPrefix.PrefixLength == 0)
         .filter_map(|route| {
-            let gateway = ipv4_from_sockaddr(&route.NextHop)?;
             let interface_metric = physical_interface_metric(route)?;
-            if gateway.is_unspecified() {
-                return None;
-            }
-            Some((
-                route.Metric.saturating_add(interface_metric),
-                route.InterfaceIndex,
-                WindowsEgress {
-                    interface_index: route.InterfaceIndex,
-                    gateway,
-                    source: source_for_interface(route.InterfaceIndex),
-                },
-            ))
+            egress_candidate(
+                route,
+                interface_metric,
+                source_for_interface(route.InterfaceIndex),
+            )
         })
         .min_by_key(|(metric, interface_index, _)| (*metric, *interface_index))
         .map(|(_, _, egress)| egress);
     unsafe { FreeMibTable(table.cast()) };
     selected.ok_or_else(|| stable_error("physical_egress_unavailable"))
+}
+
+fn egress_candidate(
+    route: &MIB_IPFORWARD_ROW2,
+    interface_metric: u32,
+    source: Option<Ipv4Addr>,
+) -> Option<(u32, u32, WindowsEgress)> {
+    let gateway = ipv4_from_sockaddr(&route.NextHop)?;
+    Some((
+        route.Metric.saturating_add(interface_metric),
+        route.InterfaceIndex,
+        WindowsEgress {
+            interface_index: route.InterfaceIndex,
+            gateway,
+            source,
+        },
+    ))
+}
+
+fn best_route(destination: Ipv4Addr) -> Result<WindowsEgress, ServiceError> {
+    let destination = sockaddr(destination);
+    let mut route = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    let result = unsafe {
+        GetBestRoute2(
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &destination,
+            0,
+            &mut route,
+            &mut source,
+        )
+    };
+    if result != NO_ERROR {
+        return Err(stable_error("endpoint_route_unavailable"));
+    }
+    let gateway = ipv4_from_sockaddr(&route.NextHop)
+        .ok_or_else(|| stable_error("endpoint_route_unavailable"))?;
+    Ok(WindowsEgress {
+        interface_index: route.InterfaceIndex,
+        gateway,
+        source: ipv4_from_sockaddr(&source),
+    })
 }
 
 fn physical_interface_metric(route: &MIB_IPFORWARD_ROW2) -> Option<u32> {
@@ -278,7 +370,11 @@ fn physical_interface_metric(route: &MIB_IPFORWARD_ROW2) -> Option<u32> {
         || interface.TunnelType != TUNNEL_TYPE_NONE
         || !matches!(
             interface.Type,
-            IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211 | IF_TYPE_WWANPP | IF_TYPE_WWANPP2
+            IF_TYPE_ETHERNET_CSMACD
+                | IF_TYPE_IEEE80211
+                | IF_TYPE_PPP
+                | IF_TYPE_WWANPP
+                | IF_TYPE_WWANPP2
         )
     {
         return None;
@@ -535,5 +631,47 @@ mod tests {
         let mut different_protocol = expected;
         different_protocol.Protocol = windows_sys::Win32::Networking::WinSock::MIB_IPPROTO_OTHER;
         assert!(!route_rows_match(&different_protocol, &expected));
+    }
+
+    #[test]
+    fn endpoint_route_replaces_an_exact_policy_route_with_a_priority_host_route() {
+        let mut routes = vec![OwnedRoute {
+            destination: "203.0.113.7/32".to_string(),
+            interface_index: 12,
+            gateway: "192.168.1.1".to_string(),
+            metric: ROUTE_METRIC,
+        }];
+        append_protected_endpoint_route(
+            &mut routes,
+            Ipv4Addr::new(203, 0, 113, 7),
+            WindowsEgress {
+                interface_index: 18,
+                gateway: Ipv4Addr::new(192, 168, 50, 1),
+                source: Some(Ipv4Addr::new(192, 168, 50, 2)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].destination, "203.0.113.7/32");
+        assert_eq!(routes[0].interface_index, 18);
+        assert_eq!(routes[0].gateway, "192.168.50.1");
+        assert_eq!(routes[0].metric, ENDPOINT_ROUTE_METRIC);
+    }
+
+    #[test]
+    fn on_link_default_route_is_a_valid_physical_egress() {
+        let mut route = MIB_IPFORWARD_ROW2::default();
+        route.InterfaceIndex = 21;
+        route.Metric = 7;
+        route.DestinationPrefix.PrefixLength = 0;
+        route.NextHop = sockaddr(Ipv4Addr::UNSPECIFIED);
+
+        let (_, _, egress) =
+            egress_candidate(&route, 13, Some(Ipv4Addr::new(100, 64, 12, 34))).unwrap();
+
+        assert_eq!(egress.interface_index, 21);
+        assert_eq!(egress.gateway, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(egress.source, Some(Ipv4Addr::new(100, 64, 12, 34)));
     }
 }

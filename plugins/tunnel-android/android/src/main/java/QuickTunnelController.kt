@@ -1,10 +1,23 @@
 package ru.nelomai.tunnel
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import androidx.core.content.ContextCompat
+import java.util.concurrent.atomic.AtomicBoolean
+
+internal data class QuickStateAcknowledgeResult(
+    val saved: Boolean,
+    val pendingRevision: Long,
+)
 
 object QuickTunnelController {
+    internal const val ACTION_STATE_CHANGED = "ru.nelomai.tunnel.STATE_CHANGED"
+    internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
     private const val STATE_PREFERENCES = "nelomai-quick-tunnel-state"
     private const val STATE_CHANGED = "changed"
+    private const val STATE_CHANGE_REVISION = "change-revision"
     private const val STATE_VALUE = "state"
     private const val STATE_UPDATED_AT_MILLIS = "state-updated-at-millis"
     private const val DESIRED_ACTIVE = "desired-active"
@@ -43,20 +56,46 @@ object QuickTunnelController {
         }
     }
 
+    @Synchronized
     internal fun updateState(
         context: Context,
         state: SessionState,
         desiredActive: Boolean? = null,
         changed: Boolean = false,
     ): Boolean {
-        val saved = preferences(context).edit().apply {
+        val preferences = preferences(context)
+        val changedRevision = if (changed) {
+            val storedRevision = preferences.getLong(STATE_CHANGE_REVISION, 0L)
+            val currentRevision = if (preferences.getBoolean(STATE_CHANGED, false)) {
+                storedRevision.coerceAtLeast(1L)
+            } else {
+                storedRevision
+            }
+            if (currentRevision == Long.MAX_VALUE) Long.MAX_VALUE else currentRevision + 1L
+        } else {
+            0L
+        }
+        val saved = preferences.edit().apply {
             putString(STATE_VALUE, state.wireName)
             putLong(STATE_UPDATED_AT_MILLIS, System.currentTimeMillis())
             desiredActive?.let { putBoolean(DESIRED_ACTIVE, it) }
-            if (changed) putBoolean(STATE_CHANGED, true)
+            if (changed) {
+                putBoolean(STATE_CHANGED, true)
+                putLong(STATE_CHANGE_REVISION, changedRevision)
+            }
         }.commit()
         if (!saved) {
             TunnelLog.warning("quick_state.save_failed", "shared_preferences_commit_failed")
+        } else if (changed) {
+            runCatching {
+                context.sendBroadcast(
+                    Intent(ACTION_STATE_CHANGED)
+                        .setPackage(context.packageName)
+                        .putExtra(EXTRA_STATE_CHANGE_REVISION, changedRevision),
+                )
+            }.onFailure { error ->
+                TunnelLog.warning("quick_state.broadcast_failed", "broadcast_failed", error)
+            }
         }
         return saved
     }
@@ -65,24 +104,51 @@ object QuickTunnelController {
         preferences(context).getBoolean(DESIRED_ACTIVE, false)
 
     @JvmStatic
-    fun takeStateChange(context: Context): Boolean {
-        return preferences(context).getBoolean(STATE_CHANGED, false)
+    fun takeStateChange(context: Context): Boolean = takeStateChangeRevision(context) > 0L
+
+    fun takeStateChangeRevision(context: Context): Long {
+        val preferences = preferences(context)
+        return if (preferences.getBoolean(STATE_CHANGED, false)) {
+            preferences.getLong(STATE_CHANGE_REVISION, 0L).coerceAtLeast(1L)
+        } else {
+            0L
+        }
     }
 
-    @JvmStatic
-    fun acknowledgeStateChange(context: Context): Boolean {
+    @Synchronized
+    internal fun acknowledgeStateChange(
+        context: Context,
+        acknowledgedRevision: Long,
+    ): QuickStateAcknowledgeResult {
         val preferences = preferences(context)
-        if (!preferences.getBoolean(STATE_CHANGED, false)) return true
+        if (!preferences.getBoolean(STATE_CHANGED, false)) {
+            return QuickStateAcknowledgeResult(saved = true, pendingRevision = 0L)
+        }
+        val currentRevision = preferences.getLong(STATE_CHANGE_REVISION, 0L).coerceAtLeast(1L)
+        if (acknowledgedRevision != currentRevision) {
+            return QuickStateAcknowledgeResult(
+                saved = true,
+                pendingRevision = currentRevision,
+            )
+        }
         val saved = preferences.edit().remove(STATE_CHANGED).commit()
         if (!saved) {
             TunnelLog.warning("quick_state.change_clear_failed", "shared_preferences_commit_failed")
         }
-        return saved
+        return QuickStateAcknowledgeResult(
+            saved = saved,
+            pendingRevision = if (saved) 0L else currentRevision,
+        )
     }
 
     @JvmStatic
+    @Synchronized
     fun clearStateChange(context: Context): Boolean {
-        val saved = preferences(context).edit().clear().commit()
+        val preferences = preferences(context)
+        val revision = preferences.getLong(STATE_CHANGE_REVISION, 0L)
+        val saved = preferences.edit().clear().apply {
+            if (revision > 0L) putLong(STATE_CHANGE_REVISION, revision)
+        }.commit()
         if (!saved) {
             TunnelLog.warning("quick_state.clear_failed", "shared_preferences_commit_failed")
         }
@@ -113,4 +179,73 @@ object QuickTunnelController {
 
     private fun preferences(context: Context) =
         context.applicationContext.getSharedPreferences(STATE_PREFERENCES, Context.MODE_PRIVATE)
+}
+
+internal class QuickStateChangeGate(initialRevision: Long = 0L) {
+    private val observedRevision = java.util.concurrent.atomic.AtomicLong(initialRevision)
+    private val acknowledgedRevision = java.util.concurrent.atomic.AtomicLong(0)
+
+    fun observe(revision: Long) {
+        if (revision <= 0L) return
+        observedRevision.updateAndGet { current -> maxOf(current, revision) }
+    }
+
+    fun seedPersisted(revision: Long) {
+        observe(revision)
+    }
+
+    fun current(): Boolean = observedRevision.get() > acknowledgedRevision.get()
+
+    fun snapshot(): Long = observedRevision.get()
+
+    fun acknowledgeThrough(revision: Long) {
+        val observed = observedRevision.get()
+        val bounded = revision.coerceIn(0L, observed)
+        acknowledgedRevision.updateAndGet { current -> maxOf(current, bounded) }
+    }
+
+    fun clearPending() {
+        acknowledgedRevision.set(observedRevision.get())
+    }
+}
+
+internal object QuickStateChangeNotifications {
+    val gate = QuickStateChangeGate()
+    private val registered = AtomicBoolean(false)
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == QuickTunnelController.ACTION_STATE_CHANGED) {
+                gate.observe(
+                    intent.getLongExtra(
+                        QuickTunnelController.EXTRA_STATE_CHANGE_REVISION,
+                        0L,
+                    ),
+                )
+            }
+        }
+    }
+
+    fun initialize(context: Context) {
+        val applicationContext = context.applicationContext
+        if (registered.compareAndSet(false, true)) {
+            try {
+                ContextCompat.registerReceiver(
+                    applicationContext,
+                    receiver,
+                    IntentFilter(QuickTunnelController.ACTION_STATE_CHANGED),
+                    ContextCompat.RECEIVER_NOT_EXPORTED,
+                )
+            } catch (error: Throwable) {
+                registered.set(false)
+                TunnelLog.warning(
+                    "quick_state.receiver_registration_failed",
+                    "receiver_registration_failed",
+                    error,
+                )
+            }
+        }
+        gate.seedPersisted(
+            QuickTunnelController.takeStateChangeRevision(applicationContext),
+        )
+    }
 }

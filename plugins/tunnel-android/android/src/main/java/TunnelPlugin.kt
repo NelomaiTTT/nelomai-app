@@ -5,10 +5,12 @@ import android.content.ComponentName
 import android.content.Context
 import android.net.VpnService
 import android.os.Build
+import android.os.SystemClock
 import android.os.health.HealthStats
 import android.os.health.SystemHealthManager
 import android.os.health.UidHealthStats
 import android.service.quicksettings.TileService
+import android.webkit.WebView
 import androidx.activity.result.ActivityResult
 import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
@@ -110,6 +112,11 @@ class VersionedTunnelArgs {
 class TunnelMetricsArgs {
     var apiVersion: Int = 0
     var probe: Boolean = false
+}
+
+@InvokeArg
+class QuickStateChangeAcknowledgeArgs {
+    var revision: Long = 0L
 }
 
 internal object TunnelPayload {
@@ -231,6 +238,10 @@ private data class ActiveTunnelSession(
     var localRoutes: List<Ipv4Prefix>,
     var observedNetworkFingerprint: String,
     var networkWasUnavailable: Boolean,
+    val transport: String,
+    val startedAtElapsedMillis: Long = SystemClock.elapsedRealtime(),
+    var lastDiagnosticsReceivedBytes: Long? = null,
+    var lastDiagnosticsSentBytes: Long? = null,
 )
 
 private data class TunnelOperationWatchdog(
@@ -276,6 +287,9 @@ internal object TunnelRuntime {
     private var activeSession: ActiveTunnelSession? = null
 
     @Volatile
+    private var dataPlaneFuture: ScheduledFuture<*>? = null
+
+    @Volatile
     private var applicationContext: Context? = null
 
     fun initialize(context: Context) {
@@ -291,7 +305,7 @@ internal object TunnelRuntime {
         }
     }
 
-    fun backendVersion(): String = requireBackend().version
+    fun backendVersion(): String = diagnosticBackendVersion(requireBackend().version)
 
     fun state(): SessionState = stateGate.current()
 
@@ -346,6 +360,7 @@ internal object TunnelRuntime {
                 logStage("start.service_ready", serviceStartedAt)
                 if (replaceExisting) {
                     val replaceStartedAt = System.nanoTime()
+                    activeSession?.let { logDataPlaneSnapshot(it, "tunnel_replaced") }
                     clearActiveSession()
                     suppressBackendStateChanges.set(true)
                     try {
@@ -409,7 +424,7 @@ internal object TunnelRuntime {
                     mapOf(
                         "source" to args.startSource,
                         "transport" to transport,
-                        "backend_version" to requireBackend().version,
+                        "backend_version" to diagnosticBackendVersion(requireBackend().version),
                         "application_mode" to args.options.applicationMode,
                         "included_packages_count" to options.includedPackages.size,
                         "excluded_packages_count" to options.excludedPackages.size,
@@ -453,12 +468,14 @@ internal object TunnelRuntime {
                         localRoutes = localRoutes,
                         observedNetworkFingerprint = physicalState.fingerprint,
                         networkWasUnavailable = !physicalState.available,
+                        transport = transport,
                     )
                     activeSession = session
                     try {
                         monitor.start { networkState ->
                             reapplyPhysicalNetworks(session.generation, networkState)
                         }
+                        scheduleDataPlaneDiagnostics(session.generation)
                     } catch (_: Throwable) {
                         activeSession = null
                         monitor.stop()
@@ -795,6 +812,7 @@ internal object TunnelRuntime {
             val startedAt = System.nanoTime()
             TunnelLog.info("stop.begin")
             try {
+                activeSession?.let { logDataPlaneSnapshot(it, "tunnel_stopping") }
                 clearActiveSession()
                 suppressBackendStateChanges.set(true)
                 val state = try {
@@ -835,7 +853,7 @@ internal object TunnelRuntime {
     fun metrics(
         apiVersion: Int,
         probe: Boolean,
-        onSuccess: (Long, Long, String?) -> Unit,
+        onSuccess: (Long, Long, Long?, String?) -> Unit,
         onError: (String) -> Unit,
     ) {
         try {
@@ -850,12 +868,21 @@ internal object TunnelRuntime {
                     ?.takeIf { stateGate.current() == SessionState.RUNNING }
                     ?: throw TunnelOperationException("tunnel_not_running")
                 val statistics = requireBackend().getStatistics(tunnel)
+                val latestHandshakeEpochMillis = statistics.peers()
+                    .mapNotNull { key -> statistics.peer(key)?.latestHandshakeEpochMillis() }
+                    .filter { it > 0 }
+                    .maxOrNull()
                 val target = if (probe) {
                     session.config.peers.firstOrNull()?.endpoint?.orElse(null)?.host
                 } else {
                     null
                 }
-                onSuccess(statistics.totalRx(), statistics.totalTx(), target)
+                onSuccess(
+                    statistics.totalRx(),
+                    statistics.totalTx(),
+                    latestHandshakeEpochMillis,
+                    target,
+                )
             } catch (error: Throwable) {
                 onError(errorCode(error))
             }
@@ -921,6 +948,15 @@ internal object TunnelRuntime {
         AndroidSplitTunnel.clear()
     }
 
+    fun releaseBackend() {
+        if (stateGate.current() != SessionState.STOPPED || activeSession != null) return
+        synchronized(this) {
+            if (stateGate.current() == SessionState.STOPPED && activeSession == null) {
+                backend = null
+            }
+        }
+    }
+
     private fun reapplyPhysicalNetworks(
         sessionGeneration: Long,
         physicalState: PhysicalNetworkState,
@@ -944,6 +980,7 @@ internal object TunnelRuntime {
                 session.observedNetworkFingerprint = physicalState.fingerprint
                 NelomaiVpnService.setPhysicalNetworks(emptyList())
                 TunnelLog.info("tunnel.network_unavailable")
+                logDataPlaneSnapshot(session, "physical_network_unavailable")
                 return@execute
             }
             val localRoutes = if (
@@ -974,6 +1011,7 @@ internal object TunnelRuntime {
                 "tunnel.underlying_networks_updated",
                 mapOf("after_loss" to recoveredAfterLoss),
             )
+            logDataPlaneSnapshot(session, "physical_network_changed")
             applicationContext?.let { context ->
                 runCatching { AutomaticDiagnostics.onPhysicalNetworkChanged(context) }
                     .onFailure {
@@ -984,10 +1022,74 @@ internal object TunnelRuntime {
     }
 
     private fun clearActiveSession() {
+        dataPlaneFuture?.cancel(false)
+        dataPlaneFuture = null
         val session = activeSession
         activeSession = null
         generation.incrementAndGet()
         session?.monitor?.stop()
+    }
+
+    private fun scheduleDataPlaneDiagnostics(sessionGeneration: Long) {
+        dataPlaneFuture?.cancel(false)
+        dataPlaneFuture = watchdogExecutor.scheduleAtFixedRate(
+            {
+                executor.execute {
+                    val session = activeSession
+                        ?.takeIf { it.generation == sessionGeneration }
+                        ?: return@execute
+                    if (stateGate.current() == SessionState.RUNNING) {
+                        logDataPlaneSnapshot(session, "periodic")
+                    }
+                }
+            },
+            5,
+            DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS,
+            TimeUnit.SECONDS,
+        )
+    }
+
+    private fun logDataPlaneSnapshot(session: ActiveTunnelSession, reason: String) {
+        try {
+            val statistics = requireBackend().getStatistics(tunnel)
+            val receivedBytes = statistics.totalRx()
+            val sentBytes = statistics.totalTx()
+            val receivedDelta = counterDelta(session.lastDiagnosticsReceivedBytes, receivedBytes)
+            val sentDelta = counterDelta(session.lastDiagnosticsSentBytes, sentBytes)
+            val latestHandshakeEpochMillis = statistics.peers()
+                .mapNotNull { key -> statistics.peer(key)?.latestHandshakeEpochMillis() }
+                .filter { it > 0 }
+                .maxOrNull()
+            val uptimeSeconds = (
+                SystemClock.elapsedRealtime() - session.startedAtElapsedMillis
+            ).coerceAtLeast(0) / 1_000L
+            session.lastDiagnosticsReceivedBytes = receivedBytes
+            session.lastDiagnosticsSentBytes = sentBytes
+            TunnelLog.info(
+                "tunnel.data_plane_snapshot",
+                mapOf(
+                    "reason" to reason.take(64),
+                    "transport" to session.transport,
+                    "uptime_seconds" to uptimeSeconds,
+                    "received_bytes" to receivedBytes,
+                    "sent_bytes" to sentBytes,
+                    "received_delta_bytes" to receivedDelta,
+                    "sent_delta_bytes" to sentDelta,
+                    "latest_handshake_epoch_millis" to latestHandshakeEpochMillis,
+                    "handshake_age_seconds" to latestHandshakeEpochMillis?.let {
+                        ((System.currentTimeMillis() - it).coerceAtLeast(0)) / 1_000L
+                    },
+                    "state" to tunnelDataPlaneState(
+                        uptimeSeconds,
+                        latestHandshakeEpochMillis,
+                        receivedDelta,
+                        sentDelta,
+                    ),
+                ),
+            )
+        } catch (error: Throwable) {
+            TunnelLog.warning("tunnel.data_plane_snapshot_failed", error = error)
+        }
     }
 
     private fun requireState(actual: Tunnel.State, expected: Tunnel.State) {
@@ -1031,6 +1133,46 @@ internal object TunnelRuntime {
     }
 
 }
+
+internal fun counterDelta(previous: Long?, current: Long): Long = when {
+    previous == null -> current
+    current >= previous -> current - previous
+    else -> current
+}
+
+internal fun tunnelDataPlaneState(
+    uptimeSeconds: Long,
+    latestHandshakeEpochMillis: Long?,
+    receivedDeltaBytes: Long,
+    sentDeltaBytes: Long,
+): String = when {
+    latestHandshakeEpochMillis == null -> "waiting_for_handshake"
+    receivedDeltaBytes > 0 || sentDeltaBytes > 0 -> "encrypted_counter_activity"
+    uptimeSeconds >= 30 -> "handshake_without_counter_activity"
+    else -> "handshake_idle"
+}
+
+private const val IDLE_VPN_PROCESS_RSS_RECYCLE_BYTES = 512L * 1024L * 1024L
+private const val IDLE_VPN_PROCESS_PSS_RECYCLE_BYTES = 256L * 1024L * 1024L
+private const val DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS = 5L * 60L
+private const val PINNED_AWG_GO_BACKEND_BUILD = "git-08d68cd"
+
+internal fun diagnosticBackendVersion(reported: String?): String = reported
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() && it != "(devel)" && it != "unknown" }
+    ?: PINNED_AWG_GO_BACKEND_BUILD
+
+internal fun shouldRecycleIdleVpnProcess(
+    state: SessionState,
+    desiredActive: Boolean,
+    residentBytes: Long?,
+    proportionalBytes: Long?,
+): Boolean = state == SessionState.STOPPED &&
+    !desiredActive &&
+    (
+        residentBytes?.let { it >= IDLE_VPN_PROCESS_RSS_RECYCLE_BYTES } == true ||
+            proportionalBytes?.let { it >= IDLE_VPN_PROCESS_PSS_RECYCLE_BYTES } == true
+    )
 
 private class TunnelOperationException(val code: String) : RuntimeException()
 
@@ -1093,6 +1235,13 @@ private fun HealthStats.sumMeasurements(vararg keys: Int): Long? {
 
 @TauriPlugin
 class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
+    private val quickStateChangeGate: QuickStateChangeGate
+        get() = QuickStateChangeNotifications.gate
+
+    override fun load(webView: WebView) {
+        QuickStateChangeNotifications.initialize(activity.applicationContext)
+    }
+
     companion object {
         fun refreshQuickTile(context: Context) {
             TileService.requestListeningState(
@@ -1116,7 +1265,10 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
         try {
             response.put("backendAvailable", true)
-            response.put("backendVersion", GoBackend(activity.applicationContext).version)
+            response.put(
+                "backendVersion",
+                diagnosticBackendVersion(GoBackend(activity.applicationContext).version),
+            )
             response.put("error", null)
         } catch (_: Throwable) {
             response.put("backendAvailable", false)
@@ -1201,7 +1353,10 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     fun clearQuickPlan(invoke: Invoke) {
         TunnelServiceClient.clearQuickPlan(
             activity.applicationContext,
-            { activity.runOnUiThread { invoke.resolve() } },
+            {
+                quickStateChangeGate.clearPending()
+                activity.runOnUiThread { invoke.resolve() }
+            },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
         )
     }
@@ -1294,24 +1449,29 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun takeQuickStateChange(invoke: Invoke) {
-        TunnelServiceClient.takeQuickStateChange(
-            activity.applicationContext,
-            { changed ->
-                activity.runOnUiThread {
-                    val response = JSObject()
-                    response.put("changed", changed)
-                    invoke.resolve(response)
-                }
-            },
-            { code -> activity.runOnUiThread { invoke.reject(code) } },
-        )
+        val response = JSObject()
+        response.put("changed", quickStateChangeGate.current())
+        response.put("revision", quickStateChangeGate.snapshot())
+        invoke.resolve(response)
     }
 
     @Command
     fun acknowledgeQuickStateChange(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(QuickStateChangeAcknowledgeArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_quick_state_revision")
+            return
+        }
+        val acknowledgedRevision = args.revision.coerceAtLeast(0L)
         TunnelServiceClient.acknowledgeQuickStateChange(
             activity.applicationContext,
-            { activity.runOnUiThread { invoke.resolve() } },
+            acknowledgedRevision,
+            { pendingRevision ->
+                quickStateChangeGate.observe(pendingRevision)
+                quickStateChangeGate.acknowledgeThrough(acknowledgedRevision)
+                activity.runOnUiThread { invoke.resolve() }
+            },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
         )
     }
@@ -1391,11 +1551,12 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             activity.applicationContext,
             args.apiVersion,
             args.probe,
-            { received, sent, target ->
+            { received, sent, latestHandshakeEpochMillis, target ->
                 activity.runOnUiThread {
                     val response = JSObject()
                     response.put("receivedBytes", received)
                     response.put("sentBytes", sent)
+                    response.put("latestHandshakeEpochMillis", latestHandshakeEpochMillis)
                     response.put("probeTarget", target)
                     invoke.resolve(response)
                 }

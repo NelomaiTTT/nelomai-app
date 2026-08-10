@@ -56,7 +56,7 @@ jobs:
           test "$(git -C vendor/amneziawg-android rev-parse HEAD)" = \
             f82900455f1aceaa85658686dc2c5e32c2c42a73
           test "$(git -C vendor/amneziawg-go rev-parse HEAD)" = \
-            9f5d948bc72cc554791cfe0fb91527e4acfb6b79
+            08d68cdae27762c3e07f36bbb12d2bad32f81926
           test "$(git -C vendor/amneziawg-android/tunnel/tools/amneziawg-tools rev-parse HEAD)" = \
             5d6179a6d0842e98dfb349c28cf1bd8e4b9d1079
           test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && go env GOWORK)" = \

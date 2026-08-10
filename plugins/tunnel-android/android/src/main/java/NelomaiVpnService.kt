@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.os.ResultReceiver
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
@@ -22,6 +23,7 @@ import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
 class NelomaiVpnService : GoBackend.VpnService() {
+    private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
     private val restoreHandler = Handler(Looper.getMainLooper())
     private var restoreRetryAttempt = 0
     private val restoreRetry = Runnable {
@@ -220,12 +222,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
         TunnelRuntime.metrics(
             intent.getIntExtra(EXTRA_API_VERSION, 0),
             intent.getBooleanExtra(EXTRA_PROBE, false),
-            { received, sent, target ->
+            { received, sent, latestHandshakeEpochMillis, target ->
                 receiver?.send(
                     SERVICE_RESULT_OK,
                     Bundle().apply {
                         putLong(EXTRA_RECEIVED_BYTES, received)
                         putLong(EXTRA_SENT_BYTES, sent)
+                        latestHandshakeEpochMillis?.let {
+                            putLong(EXTRA_LATEST_HANDSHAKE_EPOCH_MILLIS, it)
+                        }
                         putString(EXTRA_PROBE_TARGET, target)
                     },
                 )
@@ -314,21 +319,29 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun handleTakeStateChange(intent: Intent) {
+        val revision = QuickTunnelController.takeStateChangeRevision(applicationContext)
         intent.resultReceiver()?.send(
             SERVICE_RESULT_OK,
             Bundle().apply {
-                putBoolean(
-                    EXTRA_CHANGED,
-                    QuickTunnelController.takeStateChange(applicationContext),
-                )
+                putBoolean(EXTRA_CHANGED, revision > 0L)
+                putLong(EXTRA_STATE_CHANGE_REVISION, revision)
             },
         )
         stopIfIdle()
     }
 
     private fun handleAcknowledgeStateChange(intent: Intent) {
-        if (QuickTunnelController.acknowledgeStateChange(applicationContext)) {
-            intent.resultReceiver().sendSuccess()
+        val result = QuickTunnelController.acknowledgeStateChange(
+            applicationContext,
+            intent.getLongExtra(EXTRA_STATE_CHANGE_REVISION, 0L),
+        )
+        if (result.saved) {
+            intent.resultReceiver()?.send(
+                SERVICE_RESULT_OK,
+                Bundle().apply {
+                    putLong(EXTRA_STATE_CHANGE_REVISION, result.pendingRevision)
+                },
+            )
         } else {
             intent.resultReceiver().sendError("quick_state_persist_failed")
         }
@@ -365,8 +378,52 @@ class NelomaiVpnService : GoBackend.VpnService() {
         TunnelRuntime.serviceDestroyed()
         AndroidSplitTunnel.clear()
         TunnelLog.info("service.destroyed")
+        val idleMemory = runCatching {
+            automaticDiagnosticsCurrentProcessMemory(applicationContext)
+        }.getOrNull()
         super.onDestroy()
+        TunnelRuntime.releaseBackend()
         serviceReady = CompletableFuture()
+        idleMemory?.let { scheduleIdleProcessRecycle(it) }
+    }
+
+    private fun scheduleIdleProcessRecycle(memory: AutomaticDiagnosticsProcessMemory) {
+        if (!shouldRecycleIdleVpnProcess(
+                TunnelRuntime.state(),
+                QuickTunnelController.desiredActive(applicationContext),
+                memory.residentBytes,
+                memory.proportionalBytes,
+            )
+        ) {
+            return
+        }
+        TunnelLog.info(
+            "service.process_recycle_scheduled",
+            mapOf(
+                "rss_bytes" to memory.residentBytes,
+                "pss_bytes" to memory.proportionalBytes,
+            ),
+        )
+        val processId = Process.myPid()
+        var attempts = 0
+        lateinit var recycle: Runnable
+        recycle = Runnable {
+            if (serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() ||
+                activeService != null ||
+                TunnelRuntime.state() != SessionState.STOPPED ||
+                QuickTunnelController.desiredActive(applicationContext)
+            ) {
+                return@Runnable
+            }
+            if (AutomaticDiagnostics.hasActiveUpload() && attempts < 6) {
+                attempts += 1
+                restoreHandler.postDelayed(recycle, IDLE_PROCESS_RECYCLE_DELAY_MILLIS)
+                return@Runnable
+            }
+            TunnelLog.info("service.process_recycled")
+            Process.killProcess(processId)
+        }
+        restoreHandler.postDelayed(recycle, IDLE_PROCESS_RECYCLE_DELAY_MILLIS)
     }
 
     private fun performBackgroundToggle() {
@@ -548,6 +605,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
             120_000L,
             300_000L,
         )
+        private const val IDLE_PROCESS_RECYCLE_DELAY_MILLIS = 10_000L
+        private val VPN_PROCESS_SERVICE_GENERATION =
+            java.util.concurrent.atomic.AtomicLong(0)
 
         fun ensureStarted(context: Context): CompletableFuture<Unit> {
             if (activeService != null) {

@@ -73,6 +73,15 @@ describe("native client", () => {
     ).toContain("«Принудительная синхронизация»");
   });
 
+  it("explains the safe recovery after a Stray endpoint route failure", () => {
+    expect(
+      commandMessage(commandError("endpoint_route_unavailable"), "start"),
+    ).toContain("Переподключите устройство к сети");
+    expect(
+      commandMessage(commandError("endpoint_route_lost"), "start"),
+    ).toContain("Stray остановлен для защиты");
+  });
+
   it("keeps an unknown safe native message as the fallback", () => {
     expect(
       commandMessage(commandError("invalid_credentials", "Неверный логин или пароль."), "login"),
