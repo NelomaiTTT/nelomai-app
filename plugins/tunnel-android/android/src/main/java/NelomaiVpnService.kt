@@ -384,15 +384,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
         super.onDestroy()
         TunnelRuntime.releaseBackend()
         serviceReady = CompletableFuture()
-        idleMemory?.let { scheduleIdleProcessRecycle(it) }
+        scheduleIdleProcessRecycle(idleMemory)
     }
 
-    private fun scheduleIdleProcessRecycle(memory: AutomaticDiagnosticsProcessMemory) {
+    private fun scheduleIdleProcessRecycle(memory: AutomaticDiagnosticsProcessMemory?) {
         if (!shouldRecycleIdleVpnProcess(
                 TunnelRuntime.state(),
                 QuickTunnelController.desiredActive(applicationContext),
-                memory.residentBytes,
-                memory.proportionalBytes,
             )
         ) {
             return
@@ -400,8 +398,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
         TunnelLog.info(
             "service.process_recycle_scheduled",
             mapOf(
-                "rss_bytes" to memory.residentBytes,
-                "pss_bytes" to memory.proportionalBytes,
+                "rss_bytes" to memory?.residentBytes,
+                "pss_bytes" to memory?.proportionalBytes,
             ),
         )
         val processId = Process.myPid()

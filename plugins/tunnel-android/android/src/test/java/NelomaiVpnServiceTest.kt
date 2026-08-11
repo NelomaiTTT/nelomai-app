@@ -33,29 +33,23 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
-    fun idleVpnProcessIsRecycledOnlyAfterAbnormalMemoryGrowth() {
+    fun idleVpnProcessIsRecycledAfterTunnelStops() {
         assertTrue(
             shouldRecycleIdleVpnProcess(
                 SessionState.STOPPED,
                 desiredActive = false,
-                residentBytes = 600L * 1024L * 1024L,
-                proportionalBytes = 100L * 1024L * 1024L,
             ),
         )
         assertFalse(
             shouldRecycleIdleVpnProcess(
                 SessionState.RUNNING,
                 desiredActive = true,
-                residentBytes = 900L * 1024L * 1024L,
-                proportionalBytes = 800L * 1024L * 1024L,
             ),
         )
         assertFalse(
             shouldRecycleIdleVpnProcess(
                 SessionState.STOPPED,
-                desiredActive = false,
-                residentBytes = 150L * 1024L * 1024L,
-                proportionalBytes = 80L * 1024L * 1024L,
+                desiredActive = true,
             ),
         )
     }

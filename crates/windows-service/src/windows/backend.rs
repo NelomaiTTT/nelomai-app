@@ -21,6 +21,7 @@ pub(crate) struct WindowsServiceBackend {
     routes: WindowsRouteManager,
     endpoint: Option<IpAddr>,
     transport: Option<TunnelTransport>,
+    started_at_epoch_millis: Option<u64>,
 }
 
 impl WindowsServiceBackend {
@@ -47,10 +48,18 @@ impl WindowsServiceBackend {
         let transport = tunnel_active
             .then(|| tunnel_config_path().ok().and_then(read_transport_from_file))
             .flatten();
+        let started_at_epoch_millis = tunnel_active
+            .then(|| {
+                tunnel_config_path()
+                    .ok()
+                    .and_then(configuration_modified_epoch_millis)
+            })
+            .flatten();
         Ok(Self {
             routes,
             endpoint,
             transport,
+            started_at_epoch_millis,
         })
     }
 
@@ -85,16 +94,20 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         };
         self.endpoint = endpoint;
         self.transport = Some(transport);
+        self.started_at_epoch_millis = None;
         let configuration = pinned_configuration
             .as_ref()
             .map_or(configuration, |value| value.as_str());
         let protected_endpoint = self.protected_endpoint();
+        let started_at_epoch_millis = unix_now_epoch_millis();
         if let Err(error) = self.routes.apply(options, protected_endpoint) {
             self.endpoint = None;
             self.transport = None;
+            self.started_at_epoch_millis = None;
             let _ = self.routes.cleanup();
             return Err(error);
         }
+        self.started_at_epoch_millis = Some(started_at_epoch_millis);
         let result = (|| {
             let config_path = tunnel_config_path()?;
             write_configuration_atomically(&config_path, configuration)?;
@@ -125,6 +138,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
             record_service_diagnostic("tunnel start failed", &error);
             self.endpoint = None;
             self.transport = None;
+            self.started_at_epoch_millis = None;
             let config_path = tunnel_config_path().ok();
             let _ = remove_tunnel_service();
             if let Some(config_path) = config_path {
@@ -146,6 +160,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         self.endpoint = None;
         self.transport = None;
+        self.started_at_epoch_millis = None;
         let mut first_error = remove_tunnel_service().err();
         match tunnel_config_path() {
             Ok(path) => {
@@ -216,10 +231,20 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
             .transport
             .ok_or_else(|| ServiceError::Backend("tunnel_not_running".to_string()))?;
         let (received_bytes, sent_bytes) = interface_counters(transport)?;
+        let latest_handshake_epoch_millis = (transport == TunnelTransport::AmneziaWg3)
+            .then(super::ringlogger::latest_amneziawg_handshake_epoch_millis)
+            .transpose()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|handshake| {
+                self.started_at_epoch_millis
+                    .is_none_or(|started_at| *handshake >= started_at)
+            });
         Ok(TunnelMetrics {
             received_bytes,
             sent_bytes,
-            latest_handshake_epoch_millis: None,
+            latest_handshake_epoch_millis,
             probe_target: probe
                 .then_some(self.endpoint)
                 .flatten()
@@ -260,6 +285,25 @@ fn read_endpoint_from_file(path: std::path::PathBuf) -> Option<IpAddr> {
 fn read_transport_from_file(path: std::path::PathBuf) -> Option<TunnelTransport> {
     let configuration = zeroize::Zeroizing::new(fs::read_to_string(path).ok()?);
     Some(detect_configuration_transport(&configuration))
+}
+
+fn configuration_modified_epoch_millis(path: std::path::PathBuf) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
+
+fn unix_now_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }
 
 pub(crate) fn resolve_endpoint(configuration: &str) -> Option<IpAddr> {

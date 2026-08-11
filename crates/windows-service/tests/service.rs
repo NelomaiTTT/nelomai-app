@@ -7,6 +7,7 @@ use nelomai_windows_service::{
     Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
     TunnelRequestHandler, WindowsTunnelController, PROTOCOL_VERSION,
 };
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -270,6 +271,54 @@ async fn controller_maps_service_response_to_shared_tunnel_contract() {
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
         ["start", "status"]
+    );
+}
+
+struct SequenceTransport {
+    requests: Mutex<Vec<String>>,
+    responses: Mutex<VecDeque<Response>>,
+}
+
+#[async_trait]
+impl ServiceTransport for SequenceTransport {
+    async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
+        let Request::Start { configuration, .. } = request else {
+            panic!("expected start request");
+        };
+        assert!(configuration.contains("HeaderProtectionKey"));
+        self.requests.lock().unwrap().push("start".to_string());
+        Ok(self.responses.lock().unwrap().pop_front().unwrap())
+    }
+}
+
+#[tokio::test]
+async fn controller_retries_one_transient_amneziawg_service_start_failure() {
+    let controller = WindowsTunnelController::new(SequenceTransport {
+        requests: Mutex::new(Vec::new()),
+        responses: Mutex::new(VecDeque::from([
+            Response::failure("amneziawg_service_start_failed"),
+            Response::success(Some(ServiceTunnelState::Running)),
+        ])),
+    });
+    let configuration = "\
+[Interface]\n\
+PrivateKey = client-only\n\
+HeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\n\
+ContentPaddingAddition = 0-64\n\
+\n\
+[Peer]\n\
+AllowedIPs = 0.0.0.0/0\n";
+
+    controller
+        .start(TunnelStartRequest::full_tunnel(TunnelConfiguration::new(
+            configuration.to_string(),
+        )))
+        .await
+        .expect("retry AmneziaWG start");
+
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["start", "start"],
     );
 }
 

@@ -6,6 +6,7 @@ import android.content.Context
 import android.net.VpnService
 import android.os.Build
 import android.os.SystemClock
+import android.system.Os
 import android.os.health.HealthStats
 import android.os.health.SystemHealthManager
 import android.os.health.UidHealthStats
@@ -299,6 +300,11 @@ internal object TunnelRuntime {
         if (backend == null) {
             synchronized(this) {
                 if (backend == null) {
+                    runCatching {
+                        Os.setenv("GOMEMLIMIT", GO_BACKEND_MEMORY_LIMIT, false)
+                    }.onFailure {
+                        TunnelLog.warning("backend.memory_limit_failed", error = it)
+                    }
                     backend = GoBackend(normalizedContext)
                 }
             }
@@ -1152,10 +1158,9 @@ internal fun tunnelDataPlaneState(
     else -> "handshake_idle"
 }
 
-private const val IDLE_VPN_PROCESS_RSS_RECYCLE_BYTES = 512L * 1024L * 1024L
-private const val IDLE_VPN_PROCESS_PSS_RECYCLE_BYTES = 256L * 1024L * 1024L
 private const val DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS = 5L * 60L
 private const val PINNED_AWG_GO_BACKEND_BUILD = "git-08d68cd"
+private const val GO_BACKEND_MEMORY_LIMIT = "256MiB"
 
 internal fun diagnosticBackendVersion(reported: String?): String = reported
     ?.trim()
@@ -1165,14 +1170,7 @@ internal fun diagnosticBackendVersion(reported: String?): String = reported
 internal fun shouldRecycleIdleVpnProcess(
     state: SessionState,
     desiredActive: Boolean,
-    residentBytes: Long?,
-    proportionalBytes: Long?,
-): Boolean = state == SessionState.STOPPED &&
-    !desiredActive &&
-    (
-        residentBytes?.let { it >= IDLE_VPN_PROCESS_RSS_RECYCLE_BYTES } == true ||
-            proportionalBytes?.let { it >= IDLE_VPN_PROCESS_PSS_RECYCLE_BYTES } == true
-    )
+): Boolean = state == SessionState.STOPPED && !desiredActive
 
 private class TunnelOperationException(val code: String) : RuntimeException()
 

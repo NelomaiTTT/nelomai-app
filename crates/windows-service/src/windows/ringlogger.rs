@@ -14,6 +14,13 @@ pub(crate) fn read_amneziawg_ringlogger() -> io::Result<String> {
     read_ringlogger(&amneziawg_ringlogger_path(&PathBuf::from(program_data)))
 }
 
+pub(crate) fn latest_amneziawg_handshake_epoch_millis() -> io::Result<Option<u64>> {
+    let program_data = std::env::var_os("ProgramData")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "ProgramData is unavailable"))?;
+    let ringlogger = read_ringlogger(&amneziawg_ringlogger_path(&PathBuf::from(program_data)))?;
+    Ok(parse_latest_handshake_epoch_millis(&ringlogger))
+}
+
 fn amneziawg_ringlogger_path(program_data: &Path) -> PathBuf {
     program_data
         .join("Nelomai")
@@ -85,6 +92,19 @@ fn tail_string(value: String, maximum: usize) -> String {
     value[start..].to_string()
 }
 
+fn parse_latest_handshake_epoch_millis(value: &str) -> Option<u64> {
+    value
+        .lines()
+        .filter_map(|line| {
+            if !line.contains("Received handshake response") {
+                return None;
+            }
+            let timestamp = line.strip_prefix("time_ns=")?.split_once(' ')?.0;
+            timestamp.parse::<u64>().ok().map(|value| value / 1_000_000)
+        })
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +160,19 @@ mod tests {
                 .join("AmneziaWG")
                 .join("Data")
                 .join("log.bin")
+        );
+    }
+
+    #[test]
+    fn extracts_latest_received_handshake_timestamp() {
+        let log = "\
+time_ns=1786477191000000000 [TUN] Sending handshake initiation\n\
+time_ns=1786477192123456789 [TUN] Received handshake response\n\
+time_ns=1786477314987654321 [TUN] Received handshake response\n";
+
+        assert_eq!(
+            parse_latest_handshake_epoch_millis(log),
+            Some(1_786_477_314_987),
         );
     }
 }

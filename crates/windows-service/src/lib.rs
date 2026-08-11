@@ -18,6 +18,7 @@ pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
 pub const AMNEZIAWG_TUNNEL_SERVICE_NAME: &str = "NelomaiAmneziaWg3";
 pub const PIPE_NAME: &str = r"\\.\pipe\NelomaiTunnelManager";
+const AMNEZIAWG_START_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceStartMode {
@@ -753,14 +754,30 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
             .configuration
             .override_dns(&request.options.dns_servers)
             .map_err(|error| TunnelError::Backend(error.to_string()))?;
-        let response = self
+        let configuration = Zeroizing::new(request.configuration.expose().to_string());
+        let options = DesktopTunnelOptions::from_tunnel_options(&request.options);
+        let transport = detect_configuration_transport(configuration.as_str());
+        let mut response = self
             .transport
             .exchange(Request::start_with_options(
-                request.configuration.expose().to_string(),
-                DesktopTunnelOptions::from_tunnel_options(&request.options),
+                configuration.to_string(),
+                options.clone(),
             ))
             .await
             .map_err(to_tunnel_error)?;
+        if transport == TunnelTransport::AmneziaWg3
+            && response.error_code.as_deref() == Some("amneziawg_service_start_failed")
+        {
+            tokio::time::sleep(AMNEZIAWG_START_RETRY_DELAY).await;
+            response = self
+                .transport
+                .exchange(Request::start_with_options(
+                    configuration.to_string(),
+                    options,
+                ))
+                .await
+                .map_err(to_tunnel_error)?;
+        }
         require_state(response, ServiceTunnelState::Running)
     }
 
