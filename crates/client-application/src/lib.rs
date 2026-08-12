@@ -818,6 +818,10 @@ where
         Ok(None)
     }
 
+    pub fn reset_transport(&self) -> Result<(), ApplicationError> {
+        self.api.reset_transport().map_err(Into::into)
+    }
+
     pub async fn pin_stray(&self) -> Result<Connection, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.pin_stray().await.map_err(Into::into)

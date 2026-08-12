@@ -14,6 +14,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -256,9 +257,62 @@ impl ClientApiError {
 
 #[derive(Clone)]
 pub struct ClientApi {
-    http: HttpClient,
+    http: ResettableHttpClient,
     api_base: Url,
     app_version: Option<HeaderValue>,
+}
+
+#[derive(Clone)]
+struct ResettableHttpClient {
+    current: Arc<RwLock<HttpClient>>,
+}
+
+impl ResettableHttpClient {
+    fn new() -> Result<Self, ClientApiError> {
+        Ok(Self {
+            current: Arc::new(RwLock::new(Self::build()?)),
+        })
+    }
+
+    fn build() -> Result<HttpClient, ClientApiError> {
+        Ok(HttpClient::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()?)
+    }
+
+    fn reset(&self) -> Result<(), ClientApiError> {
+        let replacement = Self::build()?;
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = replacement;
+        Ok(())
+    }
+
+    fn client(&self) -> HttpClient {
+        self.current
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn get(&self, endpoint: Url) -> RequestBuilder {
+        self.client().get(endpoint)
+    }
+
+    fn post(&self, endpoint: Url) -> RequestBuilder {
+        self.client().post(endpoint)
+    }
+
+    fn put(&self, endpoint: Url) -> RequestBuilder {
+        self.client().put(endpoint)
+    }
+
+    fn delete(&self, endpoint: Url) -> RequestBuilder {
+        self.client().delete(endpoint)
+    }
 }
 
 impl ClientApi {
@@ -279,13 +333,14 @@ impl ClientApi {
             .map_err(|error| ClientApiError::InvalidBaseUrl(error.to_string()))?;
         Ok(Self {
             // Reqwest has no cookie jar unless its optional `cookies` feature is enabled.
-            http: HttpClient::builder()
-                .connect_timeout(HTTP_CONNECT_TIMEOUT)
-                .timeout(HTTP_REQUEST_TIMEOUT)
-                .build()?,
+            http: ResettableHttpClient::new()?,
             api_base,
             app_version: None,
         })
+    }
+
+    pub fn reset_transport(&self) -> Result<(), ClientApiError> {
+        self.http.reset()
     }
 
     pub fn with_app_version(mut self, app_version: &str) -> Result<Self, ClientApiError> {

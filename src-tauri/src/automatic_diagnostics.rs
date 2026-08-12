@@ -595,6 +595,28 @@ mod tests {
     }
 
     #[test]
+    fn completed_stop_does_not_create_a_duplicate_but_restart_starts_a_new_interval() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DesktopAutomaticDiagnostics::new(directory.path().to_path_buf()).unwrap();
+        queue.set_current_device("device-1").unwrap();
+        queue.observe(Some("lease-1"), true, 10).unwrap();
+        queue.observe(None, false, 20).unwrap();
+        let first = queue.pending_seal().unwrap().unwrap();
+        queue.materialize(&first, &report(&first)).unwrap();
+
+        let duplicate_stop = queue.observe(None, false, 21).unwrap();
+        assert!(!duplicate_stop.seal_pending);
+        assert!(duplicate_stop.interval_started.is_none());
+        assert!(queue.pending_seal().unwrap().is_none());
+
+        let restarted = queue.observe(Some("lease-1"), true, 30).unwrap();
+        assert!(restarted.interval_started.is_some());
+        assert!(queue.observe(None, false, 40).unwrap().seal_pending);
+        let second = queue.pending_seal().unwrap().unwrap();
+        assert_ne!(first.session_id, second.session_id);
+    }
+
+    #[test]
     fn seals_six_hour_intervals_without_ending_session() {
         let directory = tempfile::tempdir().unwrap();
         let queue = DesktopAutomaticDiagnostics::new(directory.path().to_path_buf()).unwrap();

@@ -413,6 +413,9 @@ impl From<ClientApiError> for CoreApiError {
     fn from(error: ClientApiError) -> Self {
         match error {
             ClientApiError::Transport(_) => Self::Retryable,
+            ClientApiError::Api { code, message, .. } if code == "invalid_credentials" => {
+                Self::Rejected { code, message }
+            }
             ClientApiError::Api { status, .. } if status.as_u16() == 401 => Self::Unauthorized,
             ClientApiError::Api { code, .. } if code == "access_expired" => Self::AccessExpired,
             ClientApiError::Api { code, message, .. } if code == "configuration_fetch_failed" => {
@@ -440,6 +443,10 @@ impl From<ClientApiError> for CoreApiError {
 
 #[async_trait]
 pub trait CoreApi: Send + Sync {
+    fn reset_transport(&self) -> Result<(), CoreApiError> {
+        Ok(())
+    }
+
     async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, CoreApiError>;
     async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, CoreApiError>;
     async fn start_connection(
@@ -507,6 +514,10 @@ pub trait CoreApi: Send + Sync {
 
 #[async_trait]
 impl CoreApi for ClientApi {
+    fn reset_transport(&self) -> Result<(), CoreApiError> {
+        ClientApi::reset_transport(self).map_err(Into::into)
+    }
+
     async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
         ClientApi::refresh(self, refresh_token.to_string())
             .await
@@ -1476,6 +1487,20 @@ where
                 return Err(error.into());
             }
         }
+        match self.api.reset_transport() {
+            Ok(()) => self.logger.record(CoreLogEvent {
+                kind: "connection.transport_reset",
+                operation_id: None,
+                request_id: None,
+                code: None,
+            }),
+            Err(error) => self.logger.record(CoreLogEvent {
+                kind: "connection.transport_reset_failed",
+                operation_id: None,
+                request_id: None,
+                code: Some(error.to_string()),
+            }),
+        }
         self.physical_network_change.lock().await.reset();
         self.clear_applied_physical_network_fingerprint();
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
@@ -2290,6 +2315,36 @@ mod tests {
             message: "expired".to_string(),
         };
         assert_eq!(CoreApiError::from(error), CoreApiError::AccessExpired);
+    }
+
+    #[test]
+    fn invalid_login_credentials_keep_their_actionable_error() {
+        let error = ClientApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            request_id: "req".to_string(),
+            code: "invalid_credentials".to_string(),
+            message: "Неверный логин или пароль.".to_string(),
+        };
+
+        assert_eq!(
+            CoreApiError::from(error),
+            CoreApiError::Rejected {
+                code: "invalid_credentials".to_string(),
+                message: "Неверный логин или пароль.".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_access_token_still_maps_to_signed_out_state() {
+        let error = ClientApiError::Api {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            request_id: "req".to_string(),
+            code: "invalid_access_token".to_string(),
+            message: "Недействительный токен доступа.".to_string(),
+        };
+
+        assert_eq!(CoreApiError::from(error), CoreApiError::Unauthorized);
     }
 
     #[test]

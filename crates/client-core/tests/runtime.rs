@@ -150,6 +150,7 @@ impl TunnelController for MemoryTunnel {
 }
 
 struct MockApi {
+    transport_resets: AtomicUsize,
     refresh_calls: AtomicUsize,
     start_calls: AtomicUsize,
     start_failures: AtomicUsize,
@@ -175,6 +176,7 @@ struct MockApi {
 impl MockApi {
     fn new(start_failures: usize) -> Self {
         Self {
+            transport_resets: AtomicUsize::new(0),
             refresh_calls: AtomicUsize::new(0),
             start_calls: AtomicUsize::new(0),
             start_failures: AtomicUsize::new(start_failures),
@@ -201,6 +203,11 @@ impl MockApi {
 
 #[async_trait]
 impl CoreApi for MockApi {
+    fn reset_transport(&self) -> Result<(), CoreApiError> {
+        self.transport_resets.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
         self.refresh_calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -778,6 +785,7 @@ async fn stop_refreshes_once_after_the_local_tunnel_is_stopped() {
 
     core.stop().await.unwrap();
 
+    assert_eq!(api.transport_resets.load(Ordering::SeqCst), 1);
     assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
     {
         let operation_ids = api.stop_operation_ids.lock().unwrap();
@@ -827,11 +835,13 @@ async fn failed_local_stop_stays_pending_and_can_be_retried() {
     assert!(core.stop().await.is_err());
     assert_eq!(core.state().await.phase, Phase::Stopping);
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.transport_resets.load(Ordering::SeqCst), 0);
 
     core.stop().await.unwrap();
 
     assert_eq!(tunnel.stops.load(Ordering::SeqCst), 2);
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.transport_resets.load(Ordering::SeqCst), 1);
     assert_eq!(core.state().await.phase, Phase::Ready);
 }
 

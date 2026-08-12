@@ -278,11 +278,6 @@ async fn stop_connection(
     app: &AppHandle,
     application: &NativeApplication,
 ) -> Result<Connection, CommandError> {
-    #[cfg(desktop)]
-    let session_id = application
-        .connection_metrics_context()
-        .await
-        .map(|context| context.session_id);
     let result = match application.stop().await {
         Ok(connection) => Ok(connection),
         Err(error) if repairable_stop_error(&error) => {
@@ -295,7 +290,7 @@ async fn stop_connection(
     };
     #[cfg(desktop)]
     if result.is_ok() {
-        queue_desktop_tunnel_stopped(app, session_id.as_deref()).await;
+        queue_desktop_tunnel_stopped(app).await;
     }
     result
 }
@@ -304,11 +299,6 @@ pub(crate) async fn stop_for_shutdown(
     app: &AppHandle,
     application: &NativeApplication,
 ) -> Result<(), CommandError> {
-    #[cfg(desktop)]
-    let session_id = application
-        .connection_metrics_context()
-        .await
-        .map(|context| context.session_id);
     let state = application.state().await;
     if !matches!(
         state.phase,
@@ -333,13 +323,29 @@ pub(crate) async fn stop_for_shutdown(
     };
     #[cfg(desktop)]
     if result.is_ok() {
-        queue_desktop_tunnel_stopped(app, session_id.as_deref()).await;
+        queue_desktop_tunnel_stopped(app).await;
     }
     result
 }
 
 #[cfg(desktop)]
-async fn queue_desktop_tunnel_stopped(app: &AppHandle, session_id: Option<&str>) {
+fn begin_desktop_tunnel_diagnostics(app: &AppHandle, session_id: &str) {
+    use tauri::Manager;
+
+    let diagnostics = app.state::<Arc<AppDiagnostics>>();
+    let now = now_unix();
+    if let Ok(observation) = diagnostics.observe_automatic_tunnel(Some(session_id), true, now) {
+        if observation.interval_started.is_some() {
+            diagnostics.begin_automatic_resource_interval(
+                &observation,
+                crate::resource_usage::ResourceSnapshot::capture(app),
+            );
+        }
+    }
+}
+
+#[cfg(desktop)]
+async fn queue_desktop_tunnel_stopped(app: &AppHandle) {
     use tauri::Manager;
 
     let diagnostics = app.state::<Arc<AppDiagnostics>>().inner().clone();
@@ -348,16 +354,6 @@ async fn queue_desktop_tunnel_stopped(app: &AppHandle, session_id: Option<&str>)
         .inner()
         .clone();
     let now = now_unix();
-    if let Some(session_id) = session_id {
-        if let Ok(observation) = diagnostics.observe_automatic_tunnel(Some(session_id), true, now) {
-            if observation.interval_started.is_some() {
-                diagnostics.begin_automatic_resource_interval(
-                    &observation,
-                    crate::resource_usage::ResourceSnapshot::capture(app),
-                );
-            }
-        }
-    }
     let queued = diagnostics
         .observe_automatic_tunnel(None, false, now)
         .is_ok_and(|observation| observation.seal_pending);
@@ -417,7 +413,15 @@ async fn prepare_desktop_logout(
     };
     match stop_result {
         Ok(()) => {
-            queue_desktop_tunnel_stopped(app, session_id.as_deref()).await;
+            if let Err(error) = application.reset_transport() {
+                diagnostics.record_named(
+                    "connection.transport_reset_failed",
+                    session_id.as_deref(),
+                    None,
+                    Some(&error.to_string()),
+                );
+            }
+            queue_desktop_tunnel_stopped(app).await;
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
                 crate::upload_latest_automatic_diagnostics_for_logout(application, diagnostics),
@@ -731,17 +735,21 @@ pub(crate) async fn quick_toggle(
                 probes: Vec::new(),
                 allow_alternate: true,
             };
-            if skip_probe_refresh {
+            let connection = if skip_probe_refresh {
                 application
                     .start_without_probe_refresh(options, now_unix())
                     .await
-                    .map_err(CommandError::from)?;
+                    .map_err(CommandError::from)?
             } else {
                 application
                     .start(options, now_unix())
                     .await
-                    .map_err(CommandError::from)?;
-            }
+                    .map_err(CommandError::from)?
+            };
+            #[cfg(desktop)]
+            begin_desktop_tunnel_diagnostics(app, &connection.lease_id);
+            #[cfg(not(desktop))]
+            let _ = connection;
         }
         Phase::Connecting | Phase::Stopping | Phase::Measuring | Phase::Authenticating => {
             return Err(CommandError::new(
@@ -1144,7 +1152,11 @@ pub async fn app_start(
     }
     .await;
     match start_result {
-        Ok(connection) => Ok(connection),
+        Ok(connection) => {
+            #[cfg(desktop)]
+            begin_desktop_tunnel_diagnostics(&app, &connection.lease_id);
+            Ok(connection)
+        }
         Err(command_error) => {
             schedule_start_failure_diagnostics(
                 app,
@@ -1226,10 +1238,13 @@ pub async fn app_start_saved_stray(
         RouteMode::Standalone,
     )
     .await?;
-    application
+    let session_id = application
         .start_saved_stray_offline(now_unix())
         .await
-        .map_err(Into::into)
+        .map_err(CommandError::from)?;
+    #[cfg(desktop)]
+    begin_desktop_tunnel_diagnostics(&app, &session_id);
+    Ok(session_id)
 }
 
 #[tauri::command]
