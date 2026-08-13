@@ -82,6 +82,15 @@ describe("native client", () => {
     ).toContain("Stray остановлен для защиты");
   });
 
+  it("explains recovery when the AWG3 runtime rejects the issued profile", () => {
+    expect(
+      commandMessage(commandError("amneziawg_profile_mismatch"), "start"),
+    ).toContain("параметры Stray");
+    expect(
+      commandMessage(commandError("awg3_profile_apply_failed"), "start"),
+    ).toContain("отправьте логи");
+  });
+
   it("keeps an unknown safe native message as the fallback", () => {
     expect(
       commandMessage(commandError("invalid_credentials", "Неверный логин или пароль."), "login"),

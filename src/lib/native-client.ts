@@ -354,6 +354,10 @@ export function commandMessage(
       return "Не удалось безопасно проложить маршрут до Stray-сервера. Переподключите устройство к сети и нажмите «Старт» снова.";
     case "endpoint_route_lost":
       return "Сеть изменилась, поэтому Stray остановлен для защиты. Нажмите «Старт» снова.";
+    case "amneziawg_profile_mismatch":
+    case "awg3_profile_apply_failed":
+    case "awg3_profile_transform_mismatch":
+      return "Не удалось применить параметры Stray. Нажмите «Старт» ещё раз. Если ошибка повторится — отправьте логи.";
     case "route_conflict":
       return "Маршрут split-tunnel уже используется другим VPN. Отключите другие VPN-приложения и попробуйте снова.";
     case "route_add_failed":

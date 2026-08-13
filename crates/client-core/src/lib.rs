@@ -2004,9 +2004,7 @@ where
                     }
                 }
                 Err(CoreApiError::Rejected { ref code, .. })
-                    if code == "connection_no_longer_active"
-                        && request.layer == Layer::Tic
-                        && !replaced_finished_operation =>
+                    if code == "connection_no_longer_active" && !replaced_finished_operation =>
                 {
                     let previous_operation_id = request.operation_id.clone();
                     let replacement_operation_id = Uuid::new_v4().to_string();

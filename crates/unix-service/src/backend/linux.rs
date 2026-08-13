@@ -1,4 +1,6 @@
-use super::{apply_awg3_configuration, build_backend_configuration, userspace_socket_path};
+use super::{
+    apply_and_verify_awg3_configuration, build_backend_configuration, userspace_socket_path,
+};
 use crate::process::{status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{LinuxUserspaceRouteManager, RouteManager, SystemRouteBackend, AWG_FWMARK};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
@@ -104,13 +106,6 @@ impl LinuxBackend {
         }
         self.active_transport = Some(configuration.transport);
 
-        if let Some(parameters) = configuration.awg3.as_ref() {
-            if let Err(error) = apply_awg3_configuration(interface_name, parameters) {
-                let _ = self.stop_inner();
-                return Err(error);
-            }
-        }
-
         let configured = match configuration.transport {
             TunnelTransport::WireGuard => self.wireguard_api.configure_interface(&native.interface),
             TunnelTransport::AmneziaWg3 => {
@@ -121,6 +116,12 @@ impl LinuxBackend {
         if let Err(error) = configured {
             let _ = self.stop_inner();
             return Err(backend_error(error));
+        }
+        if let Some(parameters) = configuration.awg3.as_ref() {
+            if let Err(error) = apply_and_verify_awg3_configuration(interface_name, parameters) {
+                let _ = self.stop_inner();
+                return Err(error);
+            }
         }
 
         let configured_routes: Result<(), ServiceError> = match configuration.transport {

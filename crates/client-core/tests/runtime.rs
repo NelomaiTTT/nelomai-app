@@ -1280,6 +1280,40 @@ async fn finished_tic_start_operation_is_replaced_once() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn finished_stray_start_operation_is_replaced_once() {
+    let api = Arc::new(MockApi::new(0));
+    api.start_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Rejected {
+            code: "connection_no_longer_active".to_string(),
+            message: "Это подключение уже завершено. Начните новое.".to_string(),
+        });
+    let store = Arc::new(MemoryStore::new(auth()));
+    let logger = Arc::new(MemoryLogger::default());
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        logger.clone(),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    let operation_ids = api.operation_ids.lock().unwrap();
+    assert_eq!(operation_ids.len(), 2);
+    assert_ne!(operation_ids[0], operation_ids[1]);
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.start_operation_replaced"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn configuration_fetch_failure_does_not_retry_a_finished_operation() {
     let api = Arc::new(MockApi::new(0));
     api.start_errors

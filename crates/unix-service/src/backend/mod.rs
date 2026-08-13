@@ -108,6 +108,77 @@ pub(crate) fn apply_awg3_configuration(
     }
 }
 
+pub(crate) fn verify_awg3_configuration(
+    interface_name: &str,
+    parameters: &Awg3Parameters,
+) -> Result<bool, ServiceError> {
+    let mut socket = UnixStream::connect(userspace_socket_path(interface_name))
+        .map_err(|_| ServiceError::Backend("amneziawg_uapi_unavailable".to_string()))?;
+    socket
+        .set_read_timeout(Some(USERSPACE_SOCKET_TIMEOUT))
+        .and_then(|_| socket.set_write_timeout(Some(USERSPACE_SOCKET_TIMEOUT)))
+        .map_err(|_| ServiceError::Backend("amneziawg_uapi_unavailable".to_string()))?;
+    socket
+        .write_all(b"get=1\n\n")
+        .map_err(|_| ServiceError::Backend("amneziawg_configuration_failed".to_string()))?;
+    read_awg3_configuration(socket, parameters)
+}
+
+pub(crate) fn apply_and_verify_awg3_configuration(
+    interface_name: &str,
+    parameters: &Awg3Parameters,
+) -> Result<(), ServiceError> {
+    apply_awg3_configuration(interface_name, parameters)?;
+    if verify_awg3_configuration(interface_name, parameters)? {
+        return Ok(());
+    }
+
+    apply_awg3_configuration(interface_name, parameters)?;
+    verify_awg3_configuration(interface_name, parameters)?
+        .then_some(())
+        .ok_or_else(|| ServiceError::Backend("amneziawg_profile_mismatch".to_string()))
+}
+
+fn read_awg3_configuration(
+    socket: UnixStream,
+    parameters: &Awg3Parameters,
+) -> Result<bool, ServiceError> {
+    let expected = parameters.uapi_configuration();
+    let expected_lines = expected.lines().collect::<Vec<_>>();
+    let mut matched = vec![false; expected_lines.len()];
+    let mut reader = BufReader::new(socket);
+
+    loop {
+        let mut line = zeroize::Zeroizing::new(String::new());
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|_| ServiceError::Backend("amneziawg_configuration_failed".to_string()))?;
+        if read == 0 || line.as_str() == "\n" {
+            return Ok(false);
+        }
+        let value = line.trim_end_matches(['\r', '\n']);
+        if value == "errno=0" {
+            let mut terminator = String::new();
+            reader
+                .read_line(&mut terminator)
+                .map_err(|_| ServiceError::Backend("amneziawg_configuration_failed".to_string()))?;
+            return Ok(terminator == "\n" && matched.into_iter().all(|value| value));
+        }
+
+        let Some((key, _)) = value.split_once('=') else {
+            continue;
+        };
+        if let Some(index) = expected_lines.iter().position(|expected| {
+            expected.starts_with(key) && expected.as_bytes().get(key.len()) == Some(&b'=')
+        }) {
+            if expected_lines[index] != value {
+                return Ok(false);
+            }
+            matched[index] = true;
+        }
+    }
+}
+
 fn read_awg3_response(socket: UnixStream) -> Result<bool, ServiceError> {
     let mut reader = BufReader::new(socket);
     loop {
@@ -188,5 +259,33 @@ PersistentKeepalive = 21
         });
         assert!(read_awg3_response(client).expect("read response"));
         server.join().expect("server");
+    }
+
+    #[test]
+    fn awg3_uapi_verification_requires_the_exact_live_profile() {
+        let parsed = parse_configuration(&format!(
+            "[Interface]\nPrivateKey = {PRIVATE_KEY}\nAddress = 10.8.1.2/32\nJc = 5\nJmin = 48\nJmax = 192\nS1 = 132\nS2 = 67\nS3 = 28\nS4 = 30\nH1 = 100-120\nH2 = 121\nH3 = 122\nH4 = 123\nHeaderProtectionKey = {PUBLIC_KEY}\nContentPaddingAddition = 0-32\n\n[Peer]\nPublicKey = {PUBLIC_KEY}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 127.0.0.1:10001\n"
+        ))
+        .expect("parse");
+        let parameters = parsed.awg3.as_ref().expect("AWG3 parameters");
+        let expected = parameters.uapi_configuration();
+        let response = format!(
+            "private_key={}\n{}errno=0\n\n",
+            "00".repeat(32),
+            expected.as_str()
+        );
+        let (client, mut server_socket) = UnixStream::pair().expect("socket pair");
+        let server = thread::spawn(move || server_socket.write_all(response.as_bytes()));
+
+        assert!(read_awg3_configuration(client, parameters).expect("read response"));
+        server.join().expect("server").expect("write response");
+
+        let mismatched = expected.replace("s1=132", "s1=167");
+        let response = format!("{mismatched}errno=0\n\n");
+        let (client, mut server_socket) = UnixStream::pair().expect("socket pair");
+        let server = thread::spawn(move || server_socket.write_all(response.as_bytes()));
+
+        assert!(!read_awg3_configuration(client, parameters).expect("read response"));
+        server.join().expect("server").expect("write response");
     }
 }

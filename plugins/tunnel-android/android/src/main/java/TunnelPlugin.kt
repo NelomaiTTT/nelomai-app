@@ -284,6 +284,14 @@ internal object TunnelRuntime {
     @Volatile
     private var backend: GoBackend? = null
 
+    private val activeTunnelHandleField by lazy {
+        runCatching {
+            GoBackend::class.java.getDeclaredField("currentTunnelHandle").apply {
+                isAccessible = true
+            }
+        }
+    }
+
     @Volatile
     private var activeSession: ActiveTunnelSession? = null
 
@@ -300,12 +308,7 @@ internal object TunnelRuntime {
         if (backend == null) {
             synchronized(this) {
                 if (backend == null) {
-                    runCatching {
-                        Os.setenv("GOMEMLIMIT", GO_BACKEND_MEMORY_LIMIT, false)
-                    }.onFailure {
-                        TunnelLog.warning("backend.memory_limit_failed", error = it)
-                    }
-                    backend = GoBackend(normalizedContext)
+                    backend = createBackend(normalizedContext)
                 }
             }
         }
@@ -386,6 +389,12 @@ internal object TunnelRuntime {
                 val originalConfig = TunnelPayload.consume(args.configuration) { payload ->
                     Config.parse(ByteArrayInputStream(payload))
                 }
+                val receivedAwg3Profile = originalConfig.getInterface()
+                    .takeIf { it.headerProtectionKey.isPresent || it.contentPaddingAddition.isPresent }
+                    ?.let(Awg3ProfileSnapshot::fromInterface)
+                receivedAwg3Profile?.let { profile ->
+                    logAwg3Profile("start.awg3_profile_received", profile)
+                }
                 logStage("start.configuration_parsed", parseStartedAt)
                 val optionsStartedAt = System.nanoTime()
                 val options = AndroidSplitTunnel.resolveOptions(
@@ -404,6 +413,25 @@ internal object TunnelRuntime {
                     "amneziawg_3"
                 } else {
                     "wireguard"
+                }
+                val preparedAwg3Profile = if (transport == "amneziawg_3") {
+                    Awg3ProfileSnapshot.fromInterface(config.getInterface())
+                } else {
+                    null
+                }
+                preparedAwg3Profile?.let { profile ->
+                    logAwg3Profile("start.awg3_profile_prepared", profile)
+                    val received = checkNotNull(receivedAwg3Profile) {
+                        "awg3_received_profile_unavailable"
+                    }
+                    val differingFields = received.differingFields(profile)
+                    if (differingFields.isNotEmpty()) {
+                        TunnelLog.warning(
+                            "start.awg3_profile_transform_mismatch",
+                            "fields=${differingFields.joinToString(",")}",
+                        )
+                        throw TunnelOperationException("awg3_profile_transform_mismatch")
+                    }
                 }
                 val monitor = PhysicalNetworks(context)
                 val physicalState = monitor.snapshotState()
@@ -446,7 +474,61 @@ internal object TunnelRuntime {
 
                 requireClientStartNotCancelled(args.clientOperationId)
                 val backendStartedAt = System.nanoTime()
-                val state = requireBackend().setState(tunnel, Tunnel.State.UP, config)
+                var activeBackend = requireBackend()
+                var state = activeBackend.setState(tunnel, Tunnel.State.UP, config)
+                if (state == Tunnel.State.UP && preparedAwg3Profile != null) {
+                    val firstRuntimeProfile = runtimeAwg3Profile(activeBackend)
+                    if (!runtimeProfileMatches(preparedAwg3Profile, firstRuntimeProfile)) {
+                        logAwg3Mismatch(
+                            "start.awg3_runtime_profile_mismatch",
+                            preparedAwg3Profile,
+                            firstRuntimeProfile,
+                            retry = false,
+                        )
+                        suppressBackendStateChanges.set(true)
+                        try {
+                            activeBackend.setState(tunnel, Tunnel.State.DOWN, null)
+                            activeBackend = replaceBackend(applicationContext)
+                            state = activeBackend.setState(tunnel, Tunnel.State.UP, config)
+                        } finally {
+                            suppressBackendStateChanges.set(false)
+                        }
+                        val retriedRuntimeProfile = if (state == Tunnel.State.UP) {
+                            runtimeAwg3Profile(activeBackend)
+                        } else {
+                            null
+                        }
+                        if (
+                            state != Tunnel.State.UP ||
+                            !runtimeProfileMatches(preparedAwg3Profile, retriedRuntimeProfile)
+                        ) {
+                            logAwg3Mismatch(
+                                "start.awg3_runtime_profile_mismatch",
+                                preparedAwg3Profile,
+                                retriedRuntimeProfile,
+                                retry = true,
+                            )
+                            suppressBackendStateChanges.set(true)
+                            try {
+                                if (state == Tunnel.State.UP) {
+                                    activeBackend.setState(tunnel, Tunnel.State.DOWN, null)
+                                }
+                            } finally {
+                                suppressBackendStateChanges.set(false)
+                            }
+                            throw TunnelOperationException("awg3_profile_apply_failed")
+                        }
+                        TunnelLog.info(
+                            "start.awg3_runtime_profile_recovered",
+                            mapOf("fingerprint" to preparedAwg3Profile.fingerprint),
+                        )
+                    } else {
+                        TunnelLog.info(
+                            "start.awg3_runtime_profile_verified",
+                            mapOf("fingerprint" to preparedAwg3Profile.fingerprint),
+                        )
+                    }
+                }
                 if (state == Tunnel.State.UP && isClientStartCancelled(args.clientOperationId)) {
                     suppressBackendStateChanges.set(true)
                     try {
@@ -897,6 +979,67 @@ internal object TunnelRuntime {
 
     private fun requireBackend(): GoBackend =
         backend ?: error("tunnel_backend_unavailable")
+
+    private fun createBackend(context: Context): GoBackend {
+        runCatching {
+            Os.setenv("GOMEMLIMIT", GO_BACKEND_MEMORY_LIMIT, false)
+        }.onFailure {
+            TunnelLog.warning("backend.memory_limit_failed", error = it)
+        }
+        return GoBackend(context.applicationContext)
+    }
+
+    private fun replaceBackend(context: Context): GoBackend = synchronized(this) {
+        createBackend(context).also { replacement -> backend = replacement }
+    }
+
+    private fun runtimeAwg3Profile(activeBackend: GoBackend): Awg3ProfileSnapshot? {
+        val field = activeTunnelHandleField.getOrElse { error ->
+            TunnelLog.warning("start.awg3_runtime_handle_unavailable", error = error)
+            return null
+        }
+        val handle = runCatching { field.getInt(activeBackend) }.getOrElse { error ->
+            TunnelLog.warning("start.awg3_runtime_handle_unavailable", error = error)
+            return null
+        }
+        if (handle < 0) return null
+        // The raw UAPI response contains private and preshared keys. Keep it in-memory
+        // only long enough to extract the allowlisted AWG3 profile fields.
+        return org.amnezia.awg.GoBackend.awgGetConfig(handle)
+            ?.let(Awg3ProfileSnapshot::fromUserspace)
+    }
+
+    private fun runtimeProfileMatches(
+        expected: Awg3ProfileSnapshot,
+        actual: Awg3ProfileSnapshot?,
+    ): Boolean = actual != null && expected.differingFields(actual).isEmpty()
+
+    private fun logAwg3Profile(event: String, profile: Awg3ProfileSnapshot) {
+        TunnelLog.info(
+            event,
+            mapOf(
+                "fingerprint" to profile.fingerprint,
+                "parameters" to profile.safeSummary,
+            ),
+        )
+    }
+
+    private fun logAwg3Mismatch(
+        event: String,
+        expected: Awg3ProfileSnapshot,
+        actual: Awg3ProfileSnapshot?,
+        retry: Boolean,
+    ) {
+        TunnelLog.warning(
+            event,
+            listOfNotNull(
+                "retry=$retry",
+                "expected=${expected.fingerprint}",
+                "actual=${actual?.fingerprint ?: "unavailable"}",
+                "fields=${actual?.let(expected::differingFields)?.joinToString(",") ?: "runtime_config"}",
+            ).joinToString(" "),
+        )
+    }
 
     private fun armOperationWatchdog(
         context: Context,

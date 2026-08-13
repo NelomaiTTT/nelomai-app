@@ -404,6 +404,7 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "local_networks_unavailable" => "local_networks_unavailable",
         "amneziawg_uapi_unavailable" => "amneziawg_uapi_unavailable",
         "amneziawg_configuration_failed" => "amneziawg_configuration_failed",
+        "amneziawg_profile_mismatch" => "amneziawg_profile_mismatch",
         "amneziawg_interface_already_exists" => "amneziawg_interface_already_exists",
         "amneziawg_go_start_failed" => "amneziawg_go_start_failed",
         "amneziawg_go_start_timeout" => "amneziawg_go_start_timeout",
@@ -740,6 +741,10 @@ mod service_error_tests {
         assert_eq!(
             ServiceError::Backend("amneziawg_configuration_failed".to_string()).code(),
             "amneziawg_configuration_failed"
+        );
+        assert_eq!(
+            ServiceError::Backend("amneziawg_profile_mismatch".to_string()).code(),
+            "amneziawg_profile_mismatch"
         );
     }
 }

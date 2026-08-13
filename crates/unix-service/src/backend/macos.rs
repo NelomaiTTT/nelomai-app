@@ -1,4 +1,6 @@
-use super::{apply_awg3_configuration, build_backend_configuration, userspace_socket_path};
+use super::{
+    apply_and_verify_awg3_configuration, build_backend_configuration, userspace_socket_path,
+};
 use crate::process::{output_with_timeout, status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{RouteManager, SystemRouteBackend};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
@@ -122,12 +124,6 @@ impl MacosBackend {
             return Err(error);
         }
 
-        if let Some(parameters) = configuration.awg3.as_ref() {
-            if let Err(error) = apply_awg3_configuration(&ifname, parameters) {
-                let _ = self.stop_inner();
-                return Err(error);
-            }
-        }
         let configured = self
             .api
             .as_ref()
@@ -137,6 +133,12 @@ impl MacosBackend {
         if let Err(error) = configured {
             let _ = self.stop_inner();
             return Err(backend_error(error));
+        }
+        if let Some(parameters) = configuration.awg3.as_ref() {
+            if let Err(error) = apply_and_verify_awg3_configuration(&ifname, parameters) {
+                let _ = self.stop_inner();
+                return Err(error);
+            }
         }
         if let Err(error) = self
             .api
