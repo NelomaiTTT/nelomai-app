@@ -75,6 +75,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_CLIENT_STOP -> handleClientStop(intent)
             intent?.action == ACTION_CLIENT_STATUS -> handleClientStatus(intent)
             intent?.action == ACTION_CLIENT_METRICS -> handleClientMetrics(intent)
+            intent?.action == ACTION_CLIENT_REBIND_UDP -> handleClientRebindUdp(intent)
             intent?.action == ACTION_CONFIGURE_BACKGROUND -> handleConfigureBackground(intent)
             intent?.action == ACTION_BACKGROUND_STATUS -> handleBackgroundStatus(intent)
             intent?.action == ACTION_CLEAR_BACKGROUND -> handleClearBackground(intent)
@@ -240,6 +241,16 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 receiver.sendError(code)
                 stopIfIdle()
             },
+        )
+    }
+
+    private fun handleClientRebindUdp(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        TunnelRuntime.rebindUdp(
+            applicationContext,
+            intent.getIntExtra(EXTRA_API_VERSION, 0),
+            { state, duration -> receiver.sendOperation(state, duration) },
+            { code -> receiver.sendError(code) },
         )
     }
 
@@ -584,6 +595,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         internal const val ACTION_CLIENT_STOP = "ru.nelomai.tunnel.CLIENT_STOP"
         internal const val ACTION_CLIENT_STATUS = "ru.nelomai.tunnel.CLIENT_STATUS"
         internal const val ACTION_CLIENT_METRICS = "ru.nelomai.tunnel.CLIENT_METRICS"
+        internal const val ACTION_CLIENT_REBIND_UDP = "ru.nelomai.tunnel.CLIENT_REBIND_UDP"
         internal const val ACTION_CONFIGURE_BACKGROUND = "ru.nelomai.tunnel.CONFIGURE_BACKGROUND"
         internal const val ACTION_BACKGROUND_STATUS = "ru.nelomai.tunnel.BACKGROUND_STATUS"
         internal const val ACTION_CLEAR_BACKGROUND = "ru.nelomai.tunnel.CLEAR_BACKGROUND"

@@ -151,15 +151,40 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
-    pub fn tunnel_metrics(&self, probe: bool) -> crate::Result<TunnelMetricsResponse> {
+    pub async fn tunnel_status_async(&self) -> crate::Result<TunnelOperationResponse> {
         self.0
-            .run_mobile_plugin(
+            .run_mobile_plugin_async(
+                "tunnelStatus",
+                TunnelStatusRequest {
+                    api_version: TUNNEL_API_VERSION,
+                },
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn tunnel_metrics_async(&self, probe: bool) -> crate::Result<TunnelMetricsResponse> {
+        self.0
+            .run_mobile_plugin_async(
                 "tunnelMetrics",
                 TunnelMetricsRequest {
                     api_version: TUNNEL_API_VERSION,
                     probe,
                 },
             )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn tunnel_rebind_udp_async(&self) -> crate::Result<TunnelOperationResponse> {
+        self.0
+            .run_mobile_plugin_async(
+                "tunnelRebindUdp",
+                TunnelStatusRequest {
+                    api_version: TUNNEL_API_VERSION,
+                },
+            )
+            .await
             .map_err(Into::into)
     }
 }

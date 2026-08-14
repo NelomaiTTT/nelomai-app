@@ -511,6 +511,7 @@ fn start_connection_metrics_scheduler(
         let mut last_diagnostics_at: Option<std::time::Instant> = None;
         let mut last_diagnostics_session: Option<String> = None;
         let mut last_diagnostics_sample = None;
+        let mut skipped_probe_session: Option<String> = None;
         loop {
             interval.tick().await;
             let Some(context) = application.connection_metrics_context().await else {
@@ -519,6 +520,7 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_at = None;
                 last_diagnostics_session = None;
                 last_diagnostics_sample = None;
+                skipped_probe_session = None;
                 continue;
             };
             let observed = tracker.is_observed().await;
@@ -544,22 +546,32 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_session = Some(context.session_id.clone());
             }
             let probe = observed && tracker.should_probe(&context.session_id).await;
+            if probe
+                && cfg!(target_os = "android")
+                && skipped_probe_session.as_deref() != Some(context.session_id.as_str())
+            {
+                diagnostics.record_named(
+                    "tunnel.probe.skipped",
+                    Some(&context.session_id),
+                    None,
+                    Some("app_process_bypasses_vpn"),
+                );
+                skipped_probe_session = Some(context.session_id.clone());
+            }
             match tunnel.metrics(false).await {
                 Ok(Some(sample)) => {
                     failure_recorded = false;
-                    let probe_result = if probe {
-                        if let Some(probe_url) = context.probe_url.as_deref() {
-                            Some(
-                                application
-                                    .probe_connection_latency_ms(probe_url)
-                                    .await
-                                    .map(|latency| {
-                                        latency.ceil().clamp(1.0, u32::MAX as f64) as u32
-                                    }),
-                            )
-                        } else {
-                            None
-                        }
+                    // Nelomai is deliberately excluded from Android's own VpnService, so an
+                    // HTTP request from the app process cannot validate the tunnel there.
+                    // Desktop probes use the panel rather than the VPN endpoint, whose host
+                    // route is intentionally kept outside the tunnel.
+                    let probe_result = if probe && !cfg!(target_os = "android") {
+                        Some(
+                            application
+                                .probe_connection_latency_ms(&format!("{PANEL_BASE}/health"))
+                                .await
+                                .map(|latency| latency.ceil().clamp(1.0, u32::MAX as f64) as u32),
+                        )
                     } else {
                         None
                     };

@@ -150,6 +150,21 @@ fn previous_helper_response_decodes_without_a_fingerprint_field() {
 
     assert_eq!(response.protocol_version, 2);
     assert_eq!(response.physical_network_fingerprint, None);
+    assert_eq!(response.diagnostics, None);
+}
+
+#[test]
+fn diagnostics_request_round_trips_through_the_typed_protocol() {
+    let request = Request::diagnostics();
+    let frame = encode_request(&request).expect("encode diagnostics request");
+
+    assert_eq!(
+        format!(
+            "{:?}",
+            decode_request(&frame).expect("decode diagnostics request")
+        ),
+        format!("{request:?}")
+    );
 }
 
 #[test]
@@ -204,6 +219,10 @@ impl ServiceTunnelBackend for RecordingBackend {
             probe_target: probe.then(|| "192.0.2.10".to_string()),
         })
     }
+
+    fn diagnostics(&self) -> Result<String, ServiceError> {
+        Ok("[nelomai.unix_helper.snapshot]\nstate=running".to_string())
+    }
 }
 
 #[test]
@@ -220,6 +239,7 @@ fn handler_validates_protocol_and_configuration_before_mutation() {
     let version = handler.handle(Request::version());
     let fingerprint = handler.handle(Request::physical_network_fingerprint());
     let metrics = handler.handle(Request::metrics(true));
+    let diagnostics = handler.handle(Request::diagnostics());
 
     assert_eq!(
         bad_protocol.error_code.as_deref(),
@@ -238,6 +258,10 @@ fn handler_validates_protocol_and_configuration_before_mutation() {
     );
     assert_eq!(handler.backend().starts, 1);
     assert_eq!(handler.backend().stops, 1);
+    assert_eq!(
+        diagnostics.diagnostics.as_deref(),
+        Some("[nelomai.unix_helper.snapshot]\nstate=running")
+    );
     assert_eq!(
         metrics.metrics,
         Some(TunnelMetrics {
@@ -293,10 +317,31 @@ impl ServiceTransport for RecordingTransport {
             Request::Version { .. } => "version",
             Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
             Request::Metrics { .. } => "metrics",
+            Request::Diagnostics { .. } => "diagnostics",
+            Request::RebindUdp { .. } => "rebind_udp",
         };
         self.requests.lock().unwrap().push(command);
         Ok(self.response.clone())
     }
+}
+
+#[tokio::test]
+async fn controller_reads_bounded_helper_diagnostics() {
+    let mut response = Response::success(None);
+    response.diagnostics = Some("[nelomai.unix_helper.snapshot]\nlisten_port=49152".to_string());
+    let controller = UnixTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    assert_eq!(
+        controller.diagnostics().await.expect("read diagnostics"),
+        "[nelomai.unix_helper.snapshot]\nlisten_port=49152"
+    );
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["diagnostics"]
+    );
 }
 
 #[tokio::test]
@@ -316,9 +361,10 @@ async fn controller_maps_helper_responses_to_shared_tunnel_contract() {
         controller.status().await.expect("read status"),
         TunnelStatus::Running
     );
+    assert!(controller.rebind_udp().await.expect("rebind UDP"));
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
-        ["start", "status"]
+        ["start", "status", "rebind_udp"]
     );
 }
 

@@ -1,6 +1,7 @@
 use super::install::{
     create_or_replace_tunnel_service, open_tunnel_service, read_service_diagnostics,
     record_service_diagnostic, record_service_message, remove_tunnel_service, tunnel_config_path,
+    wait_until_running_until, wait_until_stopped_until,
 };
 use super::routes::WindowsRouteManager;
 use crate::{ServiceError, ServiceTunnelBackend, ServiceTunnelState};
@@ -11,11 +12,13 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use windows_service::service::ServiceState;
 use windows_sys::Win32::Foundation::NO_ERROR;
 use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
 
 const TUNNEL_INTERFACE_NAME: &str = "nelomai";
+const UDP_REBIND_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) struct WindowsServiceBackend {
     routes: WindowsRouteManager,
@@ -263,6 +266,35 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         let prefix = format!("[nelomai.service]\n{service}\n[amneziawg.ringlogger]\n");
         let ringlogger = tail_utf8(&ringlogger, (64_usize * 1024).saturating_sub(prefix.len()));
         Ok(format!("{prefix}{ringlogger}"))
+    }
+
+    fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.transport != Some(TunnelTransport::AmneziaWg3) {
+            return Err(ServiceError::Backend("udp_rebind_unsupported".to_string()));
+        }
+        let result = (|| {
+            let deadline = Instant::now() + UDP_REBIND_TIMEOUT;
+            let service = open_tunnel_service()?
+                .ok_or_else(|| ServiceError::Backend("tunnel_not_running".to_string()))?;
+            service.stop().map_err(|error| {
+                ServiceError::Backend(format!("stop tunnel for UDP rebind: {error}"))
+            })?;
+            wait_until_stopped_until(&service, deadline)?;
+            let started_at_epoch_millis = unix_now_epoch_millis();
+            service.start(&[] as &[&str]).map_err(|error| {
+                ServiceError::Backend(format!("start tunnel after UDP rebind: {error}"))
+            })?;
+            wait_until_running_until(&service, deadline)?;
+            self.started_at_epoch_millis = Some(started_at_epoch_millis);
+            self.routes
+                .verify_protected_endpoint(self.protected_endpoint())
+        })();
+        if let Err(error) = result {
+            record_service_diagnostic("tunnel UDP rebind failed", &error);
+            return Err(ServiceError::Backend("udp_rebind_failed".to_string()));
+        }
+        record_service_message("tunnel UDP rebound", "transport=amneziawg_3");
+        Ok(ServiceTunnelState::Running)
     }
 }
 

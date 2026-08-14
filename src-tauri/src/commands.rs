@@ -123,6 +123,10 @@ impl CommandError {
             ),
             CoreError::Api(error) => Self::from_api(error),
             CoreError::Tunnel(code) => match code.as_str() {
+                "tunnel_handshake_timeout" => Self::new(
+                    "tunnel_handshake_timeout",
+                    "Stray-сервер не ответил через текущую сеть",
+                ),
                 code if tunnel_service_error(code) => Self::new(
                     "tunnel_service_unavailable",
                     "Служба подключения недоступна. Повторите действие и разрешите её восстановление",
@@ -170,6 +174,10 @@ impl CommandError {
             nelomai_client_tunnel::TunnelError::InvalidOptions { code } => code.to_string(),
         };
         match code.as_str() {
+            "tunnel_handshake_timeout" => Self::new(
+                "tunnel_handshake_timeout",
+                "Stray-сервер не ответил через текущую сеть",
+            ),
             "vpn_permission_denied" => Self::new(
                 "vpn_permission_denied",
                 "Без разрешения Android подключение невозможно",
@@ -260,6 +268,8 @@ fn tunnel_service_error(code: &str) -> bool {
             | "tunnel_service_timeout"
             | "service_outdated"
             | "service_stopping"
+            | "udp_rebind_failed"
+            | "udp_rebind_timeout"
             | "unsupported_protocol"
             | "unauthorized_client"
             | "truncated_frame"
@@ -1975,6 +1985,11 @@ mod tests {
             CommandError::from_core(CoreError::Tunnel("endpoint_route_lost".to_string()));
         assert_eq!(endpoint.code, "endpoint_route_lost");
         assert!(endpoint.message.contains("остановлен для защиты"));
+
+        let handshake =
+            CommandError::from_core(CoreError::Tunnel("tunnel_handshake_timeout".to_string()));
+        assert_eq!(handshake.code, "tunnel_handshake_timeout");
+        assert!(handshake.message.contains("Stray-сервер"));
     }
 
     #[test]
@@ -1992,6 +2007,8 @@ mod tests {
         for code in [
             "service_unavailable",
             "service_outdated",
+            "udp_rebind_failed",
+            "udp_rebind_timeout",
             "service_stopping",
             "unsupported_protocol",
             "unauthorized_client",
@@ -2003,6 +2020,16 @@ mod tests {
         }
         let route_error = ApplicationError::Core(CoreError::Tunnel("route_conflict".to_string()));
         assert!(!repairable_stop_error(&route_error));
+    }
+
+    #[test]
+    fn udp_rebind_failures_keep_the_service_recovery_message() {
+        for code in ["udp_rebind_failed", "udp_rebind_timeout"] {
+            let error = CommandError::from_core(CoreError::Tunnel(code.to_string()));
+
+            assert_eq!(error.code, "tunnel_service_unavailable", "{code}");
+            assert!(error.message.contains("Повторите действие"), "{code}");
+        }
     }
 
     #[test]

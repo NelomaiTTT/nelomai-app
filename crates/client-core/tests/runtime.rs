@@ -1,14 +1,15 @@
 use async_trait::async_trait;
 use nelomai_client_api::{AuthDevice, TokenResponse};
 use nelomai_client_core::{
-    ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreLogEvent, CoreLogger, Phase, RetryPolicy,
+    ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogEvent, CoreLogger, Phase,
+    RetryPolicy,
 };
 use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
     StoredConnectionKind, StoredPendingStart,
 };
 use nelomai_client_tunnel::{
-    TunnelController, TunnelError, TunnelOptions, TunnelStartRequest, TunnelStatus,
+    TunnelController, TunnelError, TunnelMetrics, TunnelOptions, TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
@@ -18,7 +19,7 @@ use nelomai_contracts::{
 };
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -87,7 +88,19 @@ struct MemoryTunnel {
     fail_next_stops: AtomicUsize,
     leave_running_on_start_failure: AtomicBool,
     leave_failed_on_start_failure: AtomicBool,
+    start_delay_millis: AtomicU64,
     status_failures: AtomicUsize,
+    metrics_supported: AtomicBool,
+    metric_successes_before_failures: AtomicUsize,
+    metric_failures: AtomicUsize,
+    fail_tunnel_on_metrics_error: AtomicBool,
+    metrics_delay_millis: AtomicU64,
+    handshake_before_rebind: AtomicBool,
+    handshake_after_rebind: AtomicBool,
+    rebinds: AtomicUsize,
+    rebind_supported: AtomicBool,
+    rebind_failures: AtomicUsize,
+    rebind_delay_millis: AtomicU64,
     configuration: Mutex<Option<String>>,
     options: Mutex<Option<TunnelOptions>>,
     status: Mutex<TunnelStatus>,
@@ -97,6 +110,10 @@ struct MemoryTunnel {
 impl TunnelController for MemoryTunnel {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        let delay_millis = self.start_delay_millis.load(Ordering::SeqCst);
+        if delay_millis > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_millis)).await;
+        }
         if self
             .fail_next_starts
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -147,6 +164,63 @@ impl TunnelController for MemoryTunnel {
         }
         Ok(*self.status.lock().unwrap())
     }
+
+    async fn rebind_udp(&self) -> Result<bool, TunnelError> {
+        self.rebinds.fetch_add(1, Ordering::SeqCst);
+        let delay_millis = self.rebind_delay_millis.load(Ordering::SeqCst);
+        if delay_millis > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_millis)).await;
+        }
+        if self
+            .rebind_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(TunnelError::Backend("test_rebind_failed".to_string()));
+        }
+        Ok(self.rebind_supported.load(Ordering::SeqCst))
+    }
+
+    async fn metrics(&self, _probe: bool) -> Result<Option<TunnelMetrics>, TunnelError> {
+        let delay_millis = self.metrics_delay_millis.load(Ordering::SeqCst);
+        if delay_millis > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_millis)).await;
+        }
+        let forced_success = self
+            .metric_successes_before_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        if !forced_success
+            && self
+                .metric_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            if self.fail_tunnel_on_metrics_error.load(Ordering::SeqCst) {
+                *self.status.lock().unwrap() = TunnelStatus::Failed;
+            }
+            return Err(TunnelError::Backend("test_metrics_failed".to_string()));
+        }
+        if !self.metrics_supported.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        let rebound = self.rebinds.load(Ordering::SeqCst) > 0;
+        let established = if rebound {
+            self.handshake_after_rebind.load(Ordering::SeqCst)
+        } else {
+            self.handshake_before_rebind.load(Ordering::SeqCst)
+        };
+        Ok(Some(TunnelMetrics {
+            latest_handshake_epoch_millis: established.then_some(1),
+            ..TunnelMetrics::default()
+        }))
+    }
 }
 
 struct MockApi {
@@ -165,6 +239,7 @@ struct MockApi {
     reject_stale_start: AtomicBool,
     reject_stale_stop: AtomicBool,
     pinned_start: AtomicBool,
+    awg3_start: AtomicBool,
     start_lease_override: Mutex<Option<String>>,
     bootstrap_connection: Mutex<Option<Connection>>,
     bootstrap_binding_without_connection: AtomicBool,
@@ -191,6 +266,7 @@ impl MockApi {
             reject_stale_start: AtomicBool::new(false),
             reject_stale_stop: AtomicBool::new(false),
             pinned_start: AtomicBool::new(false),
+            awg3_start: AtomicBool::new(false),
             start_lease_override: Mutex::new(None),
             bootstrap_connection: Mutex::new(None),
             bootstrap_binding_without_connection: AtomicBool::new(false),
@@ -275,6 +351,9 @@ impl CoreApi for MockApi {
             .clone()
             .unwrap_or_else(|| request.operation_id.clone());
         let mut response = start_response(&lease_id);
+        if self.awg3_start.load(Ordering::SeqCst) {
+            response.configuration = awg3_configuration("tunnel-secret");
+        }
         response.connection.layer = request.layer;
         response.connection.tic_connection_mode = request.tic_connection_mode;
         response.connection.route_mode = request.route_mode;
@@ -413,6 +492,12 @@ fn start_response(lease_id: &str) -> ConnectionStartResponse {
     }
 }
 
+fn awg3_configuration(private_key: &str) -> String {
+    format!(
+        "[Interface]\nPrivateKey = {private_key}\nHeaderProtectionKey = test\nContentPaddingAddition = 0-32\n"
+    )
+}
+
 fn bootstrap() -> Bootstrap {
     Bootstrap {
         api_version: ApiVersion::V1,
@@ -477,6 +562,343 @@ async fn local_dns_servers_are_forwarded_to_the_tunnel() {
         tunnel.options.lock().unwrap().as_ref().unwrap().dns_servers,
         dns_servers
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn transient_metrics_error_does_not_trigger_awg3_rebind() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.metric_failures.store(1, Ordering::SeqCst);
+    tunnel.handshake_before_rebind.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 0);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn persistent_metrics_error_cannot_confirm_a_running_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metric_failures.store(100, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "test_metrics_failed"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn fatal_metrics_error_is_not_reported_as_a_connected_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metric_failures.store(100, Ordering::SeqCst);
+    tunnel
+        .fail_tunnel_on_metrics_error
+        .store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "test_metrics_failed"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn metrics_failure_after_a_no_handshake_sample_cannot_confirm_the_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel
+        .metric_successes_before_failures
+        .store(1, Ordering::SeqCst);
+    tunnel.metric_failures.store(100, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "test_metrics_failed"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn hung_metrics_call_is_bounded_and_cannot_confirm_the_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_delay_millis.store(30_000, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let started = tokio::time::Instant::now();
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_metrics_timeout"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn awg3_start_rebinds_once_and_recovers_the_handshake() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    tunnel.handshake_after_rebind.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn slow_successful_metrics_poll_still_reaches_handshake_recovery() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.metrics_delay_millis.store(50, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    tunnel.handshake_after_rebind.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn healthy_metrics_after_rebind_replace_the_initial_metrics_error() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.metric_failures.store(10, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_handshake_timeout"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn awg3_start_stops_and_releases_the_lease_when_handshake_never_appears() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_handshake_timeout"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn awg3_rebind_has_a_bounded_window() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_delay_millis.store(10_000, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let started = tokio::time::Instant::now();
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "udp_rebind_timeout"
+    ));
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn slow_rebind_still_gets_a_separate_post_rebind_handshake_window() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.metrics_delay_millis.store(200, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_delay_millis.store(2_900, Ordering::SeqCst);
+    tunnel.handshake_after_rebind.store(true, Ordering::SeqCst);
+    let logger = Arc::new(MemoryLogger::default());
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        logger.clone(),
+    );
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.handshake_recovered"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn awg3_rebind_backend_error_is_preserved_for_service_recovery() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_failures.store(1, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "test_rebind_failed"
+    ));
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn online_awg3_cleanup_failure_is_returned_and_remains_stoppable() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    let logger = Arc::new(MemoryLogger::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        logger.clone(),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "test_stop_failed"
+    ));
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.handshake_cleanup_failed"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1419,6 +1841,133 @@ async fn valid_saved_stray_starts_offline_but_a_critical_update_blocks_it() {
         error.to_string(),
         "требуется обязательное обновление приложения"
     );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn offline_start_exposes_connecting_until_the_tunnel_is_ready() {
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        probe_url: Some("https://5a.example.test/probe".to_string()),
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: "[Interface]\nPrivateKey = offline-secret\n".to_string(),
+        valid_until_unix: Some(1_700_000_100),
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.start_delay_millis.store(1_000, Ordering::SeqCst);
+    let core = Arc::new(ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(stored)),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    ));
+    let start = tokio::spawn({
+        let core = core.clone();
+        async move { core.start_saved_stray_offline(1_700_000_000).await }
+    });
+
+    tokio::task::yield_now().await;
+
+    let state = core.state().await;
+    assert_eq!(state.phase, Phase::Connecting);
+    assert_eq!(
+        state
+            .connection
+            .as_ref()
+            .map(|value| value.lease_id.as_str()),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    start.await.unwrap().unwrap();
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn offline_awg3_handshake_cleanup_failure_remains_stoppable() {
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        probe_url: Some("https://5a.example.test/probe".to_string()),
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: awg3_configuration("offline-secret"),
+        valid_until_unix: Some(1_700_000_100),
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(stored)),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core
+        .start_saved_stray_offline(1_700_000_000)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "test_stop_failed"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    let state = core.state().await;
+    assert_eq!(state.phase, Phase::Stopping);
+    assert_eq!(
+        state
+            .connection
+            .as_ref()
+            .map(|connection| connection.lease_id.as_str()),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn offline_awg3_handshake_failure_returns_to_ready_after_cleanup() {
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        probe_url: Some("https://5a.example.test/probe".to_string()),
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: awg3_configuration("offline-secret"),
+        valid_until_unix: Some(1_700_000_100),
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(stored)),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core
+        .start_saved_stray_offline(1_700_000_000)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_handshake_timeout"
+    ));
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    let state = core.state().await;
+    assert_eq!(state.phase, Phase::Ready);
+    assert!(state.connection.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

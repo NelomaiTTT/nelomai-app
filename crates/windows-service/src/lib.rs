@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 pub mod windows;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
@@ -118,6 +118,9 @@ pub enum Request {
     Diagnostics {
         protocol_version: u16,
     },
+    RebindUdp {
+        protocol_version: u16,
+    },
 }
 
 impl Request {
@@ -170,6 +173,12 @@ impl Request {
         }
     }
 
+    pub fn rebind_udp() -> Self {
+        Self::RebindUdp {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
     pub fn protocol_version(&self) -> u16 {
         match self {
             Self::Start {
@@ -180,6 +189,7 @@ impl Request {
             | Self::Version { protocol_version }
             | Self::PhysicalNetworkFingerprint { protocol_version }
             | Self::Diagnostics { protocol_version }
+            | Self::RebindUdp { protocol_version }
             | Self::Metrics {
                 protocol_version, ..
             } => *protocol_version,
@@ -235,6 +245,14 @@ impl PartialEq for Request {
                     protocol_version: left,
                 },
                 Self::PhysicalNetworkFingerprint {
+                    protocol_version: right,
+                },
+            ) => left == right,
+            (
+                Self::RebindUdp {
+                    protocol_version: left,
+                },
+                Self::RebindUdp {
                     protocol_version: right,
                 },
             ) => left == right,
@@ -304,6 +322,10 @@ impl fmt::Debug for Request {
                 .debug_struct("Diagnostics")
                 .field("protocol_version", protocol_version)
                 .finish(),
+            Self::RebindUdp { protocol_version } => formatter
+                .debug_struct("RebindUdp")
+                .field("protocol_version", protocol_version)
+                .finish(),
         }
     }
 }
@@ -339,6 +361,10 @@ enum RequestRef<'a> {
         probe: bool,
     },
     Diagnostics {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    RebindUdp {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
@@ -383,6 +409,9 @@ impl Serialize for Request {
             Self::Diagnostics { protocol_version } => RequestRef::Diagnostics {
                 protocol_version: *protocol_version,
             },
+            Self::RebindUdp { protocol_version } => RequestRef::RebindUdp {
+                protocol_version: *protocol_version,
+            },
         }
         .serialize(serializer)
     }
@@ -423,6 +452,10 @@ enum RequestOwned {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
+    RebindUdp {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
 }
 
 impl<'de> Deserialize<'de> for Request {
@@ -456,6 +489,7 @@ impl<'de> Deserialize<'de> for Request {
             RequestOwned::Diagnostics { protocol_version } => {
                 Self::Diagnostics { protocol_version }
             }
+            RequestOwned::RebindUdp { protocol_version } => Self::RebindUdp { protocol_version },
         })
     }
 }
@@ -529,6 +563,8 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "endpoint_route_lost" => "endpoint_route_lost",
         "amneziawg_service_start_failed" => "amneziawg_service_start_failed",
         "multiple_tunnel_services_detected" => "multiple_tunnel_services_detected",
+        "udp_rebind_failed" => "udp_rebind_failed",
+        "udp_rebind_unsupported" => "udp_rebind_unsupported",
         _ => return None,
     })
 }
@@ -552,6 +588,9 @@ pub trait ServiceTunnelBackend {
     }
     fn diagnostics(&mut self) -> Result<String, ServiceError> {
         Err(ServiceError::Backend("diagnostics_unavailable".to_string()))
+    }
+    fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        Err(ServiceError::Backend("udp_rebind_unsupported".to_string()))
     }
 }
 
@@ -627,6 +666,10 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 response.diagnostics = Some(diagnostics);
                 response
             }),
+            Request::RebindUdp { .. } => self
+                .backend
+                .rebind_udp()
+                .map(|state| Response::success(Some(state))),
         };
 
         result.unwrap_or_else(|error| Response::failure(error.code()))
@@ -839,6 +882,16 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
             .metrics
             .map(Some)
             .ok_or_else(|| TunnelError::Backend("missing_tunnel_metrics".to_string()))
+    }
+
+    async fn rebind_udp(&self) -> Result<bool, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::rebind_udp())
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Running)?;
+        Ok(true)
     }
 
     async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {

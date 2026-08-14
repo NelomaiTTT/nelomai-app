@@ -6,7 +6,7 @@ use nelomai_client_storage::{
 };
 use nelomai_client_tunnel::{
     QuickConnection, QuickReconnect, TunnelConfiguration, TunnelController, TunnelError,
-    TunnelOptions, TunnelStartRequest, TunnelStatus,
+    TunnelOptions, TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
@@ -17,12 +17,25 @@ use nelomai_contracts::{
 };
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod split_tunnel;
+
+const INITIAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const UDP_REBIND_TIMEOUT: Duration = Duration::from_millis(3_500);
+const POST_REBIND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const HANDSHAKE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
+const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeWaitOutcome {
+    Established,
+    MetricsUnsupported,
+    TimedOut,
+}
 
 pub use split_tunnel::{
     split_tunnel_active, validate_split_tunnel_policy, EffectiveSplitTunnelPolicy,
@@ -1197,7 +1210,7 @@ where
             ),
             None => None,
         };
-        let mut access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
         let mut operation_id = pending_operation_id(&stored, &options)
             .or_else(|| reusable_operation_id(&stored, &options, now_unix))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -1338,11 +1351,13 @@ where
             .await;
             return Err(error);
         }
+        let configuration = TunnelConfiguration::new(response.configuration);
+        let transport = configuration.transport();
         let local_start_started = Instant::now();
         if let Err(start_error) = self
             .tunnel
             .start(TunnelStartRequest {
-                configuration: TunnelConfiguration::new(response.configuration),
+                configuration,
                 options: tunnel_options.clone(),
                 quick_reconnect: match valid_until_unix {
                     Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
@@ -1388,6 +1403,33 @@ where
             },
             elapsed_millis(local_start_started),
         );
+        if transport == TunnelTransport::AmneziaWg3 {
+            if let Err(error) = self
+                .ensure_awg3_handshake(&operation_id, Some(&response.request_id))
+                .await
+            {
+                let cleanup_error = self.tunnel.stop().await.err().map(CoreError::from);
+                if let Some(cleanup_error) = &cleanup_error {
+                    self.logger.record(CoreLogEvent {
+                        kind: "connection.handshake_cleanup_failed",
+                        operation_id: Some(operation_id.clone()),
+                        request_id: Some(response.request_id.clone()),
+                        code: Some(cleanup_error.to_string()),
+                    });
+                }
+                let surfaced_error = cleanup_error.as_ref().unwrap_or(&error);
+                self.compensate_failed_start(
+                    &access_token,
+                    &response.connection,
+                    &response.request_id,
+                    &operation_id,
+                    FailedStartStage::Local,
+                    surfaced_error,
+                )
+                .await;
+                return Err(cleanup_error.unwrap_or(error));
+            }
+        }
         let _ = self.clear_pending_start(&operation_id);
         let applied_physical_network_fingerprint = self
             .initialize_physical_network_detector(&tunnel_options)
@@ -1407,7 +1449,7 @@ where
                     policy,
                     tunnel_options,
                     applied_physical_network_fingerprint,
-                    Some(&mut access_token),
+                    None,
                     now_unix,
                 )
                 .await
@@ -1720,9 +1762,26 @@ where
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
                 .await;
         }
-        self.tunnel
+        let configuration = TunnelConfiguration::new(saved.configuration.clone());
+        let transport = configuration.transport();
+        let connection = Connection {
+            lease_id: saved.lease_id.clone(),
+            layer: saved.layer,
+            tic_connection_mode: saved.tic_connection_mode,
+            route_mode: saved.route_mode,
+            probe_url: saved.probe_url.clone(),
+            status: nelomai_contracts::LeaseStatus::Connected,
+            pinned: saved.kind == StoredConnectionKind::Pinned,
+            stopped_at: None,
+        };
+        *self.state.lock().await = CoreState {
+            phase: Phase::Connecting,
+            connection: Some(connection.clone()),
+        };
+        if let Err(error) = self
+            .tunnel
             .start(TunnelStartRequest {
-                configuration: TunnelConfiguration::new(saved.configuration),
+                configuration,
                 options: tunnel_options.clone(),
                 quick_reconnect: match saved.valid_until_unix {
                     Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
@@ -1736,20 +1795,55 @@ where
                     allow_alternate: false,
                 }),
             })
-            .await?;
+            .await
+        {
+            *self.state.lock().await = CoreState {
+                phase: Phase::Ready,
+                connection: None,
+            };
+            return Err(error.into());
+        }
+        if transport == TunnelTransport::AmneziaWg3 {
+            if let Err(error) = self.ensure_awg3_handshake(&saved.lease_id, None).await {
+                if let Err(stop_error) = self.tunnel.stop().await {
+                    let stop_error = CoreError::from(stop_error);
+                    *self.state.lock().await = CoreState {
+                        phase: Phase::Stopping,
+                        connection: Some(Connection {
+                            lease_id: saved.lease_id.clone(),
+                            layer: saved.layer,
+                            tic_connection_mode: saved.tic_connection_mode,
+                            route_mode: saved.route_mode,
+                            probe_url: saved.probe_url.clone(),
+                            status: nelomai_contracts::LeaseStatus::Connected,
+                            pinned: saved.kind == StoredConnectionKind::Pinned,
+                            stopped_at: None,
+                        }),
+                    };
+                    self.logger.record(CoreLogEvent {
+                        kind: "connection.offline_handshake_cleanup_failed",
+                        operation_id: Some(saved.lease_id.clone()),
+                        request_id: None,
+                        code: Some(stop_error.to_string()),
+                    });
+                    return Err(stop_error);
+                }
+                *self.state.lock().await = CoreState {
+                    phase: Phase::Ready,
+                    connection: None,
+                };
+                self.logger.record(CoreLogEvent {
+                    kind: "connection.offline_handshake_failed",
+                    operation_id: Some(saved.lease_id.clone()),
+                    request_id: None,
+                    code: Some(error.to_string()),
+                });
+                return Err(error);
+            }
+        }
         let applied_physical_network_fingerprint = self
             .initialize_physical_network_detector(&tunnel_options)
             .await;
-        let connection = Connection {
-            lease_id: saved.lease_id.clone(),
-            layer: saved.layer,
-            tic_connection_mode: saved.tic_connection_mode,
-            route_mode: saved.route_mode,
-            probe_url: saved.probe_url.clone(),
-            status: nelomai_contracts::LeaseStatus::Connected,
-            pinned: saved.kind == StoredConnectionKind::Pinned,
-            stopped_at: None,
-        };
         *self.state.lock().await = CoreState {
             phase: Phase::Connected,
             connection: Some(connection),
@@ -1921,6 +2015,204 @@ where
         };
         pending.operation_id = replacement_operation_id.to_string();
         self.store.save(&stored).map_err(|_| CoreError::Storage)
+    }
+
+    async fn ensure_awg3_handshake(
+        &self,
+        operation_id: &str,
+        request_id: Option<&str>,
+    ) -> Result<(), CoreError> {
+        let handshake_started = Instant::now();
+        let event = |kind, code| CoreLogEvent {
+            kind,
+            operation_id: Some(operation_id.to_string()),
+            request_id: request_id.map(str::to_string),
+            code,
+        };
+        let mut initial_metrics_error = None;
+        let handshake_outcome = match self.wait_for_handshake(INITIAL_HANDSHAKE_TIMEOUT).await {
+            Ok(outcome) => outcome,
+            Err(metrics_error) => {
+                self.logger.record(event(
+                    "connection.handshake_metrics_failed",
+                    Some(metrics_error.to_string()),
+                ));
+                if !self.tunnel_is_running_after_metrics_failure().await {
+                    return Err(metrics_error);
+                }
+                initial_metrics_error = Some(metrics_error);
+                HandshakeWaitOutcome::TimedOut
+            }
+        };
+        match handshake_outcome {
+            HandshakeWaitOutcome::Established => {
+                self.logger.record_timed(
+                    event("connection.handshake_established", None),
+                    elapsed_millis(handshake_started),
+                );
+                return Ok(());
+            }
+            HandshakeWaitOutcome::MetricsUnsupported => {
+                self.logger.record(event(
+                    "connection.handshake_gate_skipped",
+                    Some("metrics_unsupported".to_string()),
+                ));
+                return Ok(());
+            }
+            HandshakeWaitOutcome::TimedOut if initial_metrics_error.is_none() => {
+                self.logger.record_timed(
+                    event(
+                        "connection.handshake_wait_timed_out",
+                        Some("initial".to_string()),
+                    ),
+                    elapsed_millis(handshake_started),
+                )
+            }
+            HandshakeWaitOutcome::TimedOut => {}
+        }
+
+        let mut rebind_error = None;
+        let rebound = match tokio::time::timeout(UDP_REBIND_TIMEOUT, self.tunnel.rebind_udp()).await
+        {
+            Ok(Ok(rebound)) => rebound,
+            Ok(Err(error)) => {
+                let error = CoreError::from(error);
+                self.logger.record(event(
+                    "connection.udp_rebind_failed",
+                    Some(error.to_string()),
+                ));
+                rebind_error = Some(error);
+                false
+            }
+            Err(_) => {
+                let error = CoreError::Tunnel("udp_rebind_timeout".to_string());
+                self.logger.record(event(
+                    "connection.udp_rebind_failed",
+                    Some(error.to_string()),
+                ));
+                rebind_error = Some(error);
+                false
+            }
+        };
+        if rebound {
+            self.logger.record(event("connection.udp_rebound", None));
+        }
+        let rebound_started = Instant::now();
+        let recovered = if rebound {
+            match self.wait_for_handshake(POST_REBIND_HANDSHAKE_TIMEOUT).await {
+                Ok(HandshakeWaitOutcome::Established) => true,
+                Ok(HandshakeWaitOutcome::TimedOut) => false,
+                Ok(HandshakeWaitOutcome::MetricsUnsupported) => {
+                    self.logger.record(event(
+                        "connection.handshake_gate_skipped",
+                        Some("metrics_unsupported_after_rebind".to_string()),
+                    ));
+                    return Ok(());
+                }
+                Err(metrics_error) => {
+                    self.logger.record(event(
+                        "connection.handshake_metrics_failed",
+                        Some(metrics_error.to_string()),
+                    ));
+                    return Err(metrics_error);
+                }
+            }
+        } else {
+            false
+        };
+        if recovered {
+            self.logger.record_timed(
+                event("connection.handshake_recovered", None),
+                elapsed_millis(rebound_started),
+            );
+            return Ok(());
+        }
+
+        if let Some(error) = rebind_error {
+            self.logger.record_timed(
+                event("connection.handshake_failed", Some(error.to_string())),
+                elapsed_millis(handshake_started),
+            );
+            return Err(error);
+        }
+        if !rebound {
+            if let Some(error) = initial_metrics_error {
+                self.logger.record_timed(
+                    event("connection.handshake_failed", Some(error.to_string())),
+                    elapsed_millis(handshake_started),
+                );
+                return Err(error);
+            }
+        }
+
+        self.logger.record_timed(
+            event(
+                "connection.handshake_failed",
+                Some("tunnel_handshake_timeout".to_string()),
+            ),
+            elapsed_millis(handshake_started),
+        );
+        Err(CoreError::Tunnel("tunnel_handshake_timeout".to_string()))
+    }
+
+    async fn tunnel_is_running_after_metrics_failure(&self) -> bool {
+        matches!(
+            tokio::time::timeout(HANDSHAKE_STATUS_TIMEOUT, self.tunnel.status()).await,
+            Ok(Ok(TunnelStatus::Running))
+        )
+    }
+
+    async fn wait_for_handshake(
+        &self,
+        timeout: Duration,
+    ) -> Result<HandshakeWaitOutcome, CoreError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last_metrics_error = None;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let metrics = match tokio::time::timeout_at(deadline, self.tunnel.metrics(false)).await
+            {
+                Ok(metrics) => metrics,
+                Err(_) => {
+                    last_metrics_error =
+                        Some(CoreError::Tunnel("tunnel_metrics_timeout".to_string()));
+                    break;
+                }
+            };
+            match metrics {
+                Ok(Some(metrics)) if metrics.latest_handshake_epoch_millis.is_some() => {
+                    return Ok(HandshakeWaitOutcome::Established);
+                }
+                Ok(Some(_)) => {
+                    last_metrics_error = None;
+                }
+                Ok(None) => return Ok(HandshakeWaitOutcome::MetricsUnsupported),
+                Err(TunnelError::Backend(code))
+                    if matches!(
+                        code.as_str(),
+                        "metrics_unavailable" | "metrics_not_supported"
+                    ) =>
+                {
+                    return Ok(HandshakeWaitOutcome::MetricsUnsupported);
+                }
+                Err(error) => last_metrics_error = Some(CoreError::from(error)),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(
+                HANDSHAKE_POLL_INTERVAL
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+        }
+        if let Some(error) = last_metrics_error {
+            Err(error)
+        } else {
+            Ok(HandshakeWaitOutcome::TimedOut)
+        }
     }
 
     async fn compensate_failed_start(

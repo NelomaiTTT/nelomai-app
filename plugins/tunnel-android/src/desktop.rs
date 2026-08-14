@@ -96,8 +96,14 @@ impl<R: Runtime> TunnelAndroid<R> {
     pub fn tunnel_status(&self) -> crate::Result<TunnelOperationResponse> {
         Ok(unsupported_response())
     }
-    pub fn tunnel_metrics(&self, _probe: bool) -> crate::Result<TunnelMetricsResponse> {
+    pub async fn tunnel_status_async(&self) -> crate::Result<TunnelOperationResponse> {
+        self.tunnel_status()
+    }
+    pub async fn tunnel_metrics_async(&self, _probe: bool) -> crate::Result<TunnelMetricsResponse> {
         Ok(TunnelMetricsResponse::default())
+    }
+    pub async fn tunnel_rebind_udp_async(&self) -> crate::Result<TunnelOperationResponse> {
+        Ok(unsupported_response())
     }
 }
 

@@ -843,6 +843,7 @@ where
         &self,
         now_unix: i64,
     ) -> Result<String, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core
             .start_saved_stray_offline(now_unix)
             .await

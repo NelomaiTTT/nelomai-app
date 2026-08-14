@@ -401,6 +401,13 @@ pub enum TunnelError {
 pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
+    /// Rebind the client UDP socket without replacing the panel lease.
+    ///
+    /// Returns `true` when the active backend performed a rebind and `false`
+    /// when the platform does not support the operation.
+    async fn rebind_udp(&self) -> Result<bool, TunnelError> {
+        Ok(false)
+    }
     async fn status(&self) -> Result<TunnelStatus, TunnelError>;
     async fn metrics(&self, _probe: bool) -> Result<Option<TunnelMetrics>, TunnelError> {
         Ok(None)

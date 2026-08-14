@@ -38,6 +38,9 @@ internal const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
 private const val QUICK_TILE_SERVICE = "ru.nelomai.client.NelomaiQuickTileService"
 private const val TUNNEL_OPERATION_WATCHDOG_MILLIS = 40_000L
+private const val METRICS_OPERATION_WATCHDOG_MILLIS = 1_500L
+private const val UDP_REBIND_QUEUE_TIMEOUT_MILLIS = 500L
+private const val UDP_REBIND_OPERATION_WATCHDOG_MILLIS = 2_500L
 
 @InvokeArg
 class TunnelOptionsArgs {
@@ -189,6 +192,25 @@ internal class TunnelStateGate(
         }
     }
 
+    fun beginRebind(): TransitionDecision {
+        while (true) {
+            when (val current = state.get()) {
+                SessionState.RUNNING -> {
+                    if (state.compareAndSet(current, SessionState.STARTING)) {
+                        return TransitionDecision.PROCEED
+                    }
+                }
+                SessionState.STARTING, SessionState.STOPPING -> return TransitionDecision.BUSY
+                SessionState.STOPPED, SessionState.FAILED -> {
+                    return TransitionDecision.ALREADY_COMPLETE
+                }
+            }
+        }
+    }
+
+    fun cancelRebind(): Boolean =
+        state.compareAndSet(SessionState.STARTING, SessionState.RUNNING)
+
     fun complete(next: SessionState) {
         state.set(next)
     }
@@ -220,6 +242,50 @@ internal class TunnelOperationWatchdogGate {
     fun expire(generation: Long): Boolean = complete(generation)
 }
 
+internal enum class TunnelOperationWatchdogScope {
+    LIFECYCLE,
+    METRICS,
+}
+
+internal data class TunnelOperationWatchdogToken(
+    val scope: TunnelOperationWatchdogScope,
+    val generation: Long,
+)
+
+internal class TunnelOperationWatchdogGates {
+    private val lifecycle = TunnelOperationWatchdogGate()
+    private val metrics = TunnelOperationWatchdogGate()
+
+    fun begin(scope: TunnelOperationWatchdogScope): TunnelOperationWatchdogToken =
+        TunnelOperationWatchdogToken(scope, gate(scope).begin())
+
+    fun complete(token: TunnelOperationWatchdogToken): Boolean =
+        gate(token.scope).complete(token.generation)
+
+    fun expire(token: TunnelOperationWatchdogToken): Boolean =
+        gate(token.scope).expire(token.generation)
+
+    private fun gate(scope: TunnelOperationWatchdogScope): TunnelOperationWatchdogGate =
+        when (scope) {
+            TunnelOperationWatchdogScope.LIFECYCLE -> lifecycle
+            TunnelOperationWatchdogScope.METRICS -> metrics
+        }
+}
+
+internal class RebindQueueGate {
+    private enum class State {
+        QUEUED,
+        RUNNING,
+        CANCELLED,
+    }
+
+    private val state = AtomicReference(State.QUEUED)
+
+    fun begin(): Boolean = state.compareAndSet(State.QUEUED, State.RUNNING)
+
+    fun cancel(): Boolean = state.compareAndSet(State.QUEUED, State.CANCELLED)
+}
+
 private class ManagedTunnel(
     private val onStateChange: (Tunnel.State) -> Unit,
 ) : Tunnel {
@@ -246,7 +312,7 @@ private data class ActiveTunnelSession(
 )
 
 private data class TunnelOperationWatchdog(
-    val generation: Long,
+    val token: TunnelOperationWatchdogToken,
     val future: ScheduledFuture<*>,
 )
 
@@ -262,7 +328,7 @@ internal object TunnelRuntime {
     }
     private val stateGate = TunnelStateGate()
     private val backgroundOperationGate = BackgroundOperationGate()
-    private val watchdogGate = TunnelOperationWatchdogGate()
+    private val watchdogGates = TunnelOperationWatchdogGates()
     private val suppressBackendStateChanges = AtomicBoolean(false)
     private val cancelledClientStarts = ConcurrentHashMap.newKeySet<String>()
     private val generation = AtomicLong(0)
@@ -951,6 +1017,17 @@ internal object TunnelRuntime {
             return
         }
         executor.execute {
+            val watchdog = try {
+                armOperationWatchdog(
+                    checkNotNull(applicationContext) { "tunnel_context_unavailable" },
+                    "metrics",
+                    METRICS_OPERATION_WATCHDOG_MILLIS,
+                    TunnelOperationWatchdogScope.METRICS,
+                )
+            } catch (error: Throwable) {
+                onError(errorCode(error))
+                return@execute
+            }
             try {
                 val session = activeSession
                     ?.takeIf { stateGate.current() == SessionState.RUNNING }
@@ -973,6 +1050,155 @@ internal object TunnelRuntime {
                 )
             } catch (error: Throwable) {
                 onError(errorCode(error))
+            } finally {
+                completeOperationWatchdog(watchdog)
+            }
+        }
+    }
+
+    fun rebindUdp(
+        context: Context,
+        apiVersion: Int,
+        onSuccess: (SessionState, Long) -> Unit,
+        onError: (String) -> Unit,
+    ) {
+        try {
+            validateVersion(apiVersion)
+        } catch (error: Throwable) {
+            onError(errorCode(error))
+            return
+        }
+        when (stateGate.beginRebind()) {
+            TransitionDecision.PROCEED -> Unit
+            TransitionDecision.BUSY -> {
+                onError("tunnel_operation_in_progress")
+                return
+            }
+            TransitionDecision.ALREADY_COMPLETE -> {
+                onError("tunnel_not_running")
+                return
+            }
+            TransitionDecision.REPLACE -> error("unreachable_rebind_transition")
+        }
+        val applicationContext = context.applicationContext
+        val queueGate = RebindQueueGate()
+        val queueWatchdog = try {
+            watchdogExecutor.schedule(
+                {
+                    if (!queueGate.cancel()) return@schedule
+                    stateGate.cancelRebind()
+                    TunnelLog.warning(
+                        "tunnel.udp_rebind_queue_timed_out",
+                        "udp_rebind_timeout",
+                    )
+                    onError("udp_rebind_timeout")
+                },
+                UDP_REBIND_QUEUE_TIMEOUT_MILLIS,
+                TimeUnit.MILLISECONDS,
+            )
+        } catch (error: Throwable) {
+            stateGate.cancelRebind()
+            val code = errorCode(error)
+            TunnelLog.warning("tunnel.udp_rebind_queue_watchdog_failed", code, error)
+            onError(code)
+            return
+        }
+        val operation = Runnable {
+            if (!queueGate.begin()) return@Runnable
+            val startedAt = System.nanoTime()
+            queueWatchdog.cancel(false)
+            val watchdog = try {
+                armOperationWatchdog(
+                    applicationContext,
+                    "udp_rebind",
+                    UDP_REBIND_OPERATION_WATCHDOG_MILLIS,
+                )
+            } catch (error: Throwable) {
+                stateGate.cancelRebind()
+                val code = errorCode(error)
+                TunnelLog.warning("tunnel.udp_rebind_watchdog_failed", code, error)
+                onError(code)
+                return@Runnable
+            }
+            var failureCode: String? = null
+            TunnelLog.info("tunnel.udp_rebind_begin")
+            try {
+                val session = activeSession
+                    ?: throw TunnelOperationException("tunnel_not_running")
+                if (session.transport != "amneziawg_3") {
+                    throw TunnelOperationException("udp_rebind_unsupported")
+                }
+                logDataPlaneSnapshot(session, "before_udp_rebind")
+                val expectedProfile = Awg3ProfileSnapshot.fromInterface(
+                    session.config.getInterface(),
+                )
+                val physicalState = runCatching { session.monitor?.snapshotState() }
+                    .onFailure {
+                        TunnelLog.warning("tunnel.udp_rebind_network_snapshot_failed", error = it)
+                    }
+                    .getOrNull()
+                suppressBackendStateChanges.set(true)
+                try {
+                    requireState(
+                        requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
+                        Tunnel.State.DOWN,
+                    )
+                    val replacement = replaceBackend(applicationContext)
+                    physicalState?.let { NelomaiVpnService.setPhysicalNetworks(it.networks) }
+                    requireState(
+                        replacement.setState(tunnel, Tunnel.State.UP, session.config),
+                        Tunnel.State.UP,
+                    )
+                    val actualProfile = runtimeAwg3Profile(replacement)
+                    if (!runtimeProfileMatches(expectedProfile, actualProfile)) {
+                        logAwg3Mismatch(
+                            "tunnel.udp_rebind_profile_mismatch",
+                            expectedProfile,
+                            actualProfile,
+                            retry = false,
+                        )
+                        throw TunnelOperationException("awg3_profile_apply_failed")
+                    }
+                } finally {
+                    suppressBackendStateChanges.set(false)
+                }
+                TunnelLog.info(
+                    "tunnel.udp_rebind_completed",
+                    mapOf("duration_millis" to elapsedMillis(startedAt)),
+                )
+                stateGate.complete(SessionState.RUNNING)
+            } catch (error: Throwable) {
+                val code = errorCode(error)
+                TunnelLog.warning("tunnel.udp_rebind_failed", code, error)
+                runCatching {
+                    suppressBackendStateChanges.set(true)
+                    requireBackend().setState(tunnel, Tunnel.State.DOWN, null)
+                }
+                suppressBackendStateChanges.set(false)
+                clearActiveSession()
+                AndroidSplitTunnel.clear()
+                stateGate.complete(SessionState.FAILED)
+                failureCode = code
+            } finally {
+                completeOperationWatchdog(watchdog)
+            }
+            val durationMillis = elapsedMillis(startedAt)
+            val code = failureCode
+            if (code == null) {
+                onSuccess(SessionState.RUNNING, durationMillis)
+            } else {
+                onError(code)
+            }
+        }
+        try {
+            executor.execute(operation)
+        } catch (error: Throwable) {
+            queueWatchdog.cancel(false)
+            if (queueGate.cancel()) {
+                stateGate.cancelRebind()
+                val code = errorCode(error)
+                TunnelLog.warning("tunnel.udp_rebind_schedule_failed", code, error)
+                onError(code)
             }
         }
     }
@@ -1044,17 +1270,19 @@ internal object TunnelRuntime {
     private fun armOperationWatchdog(
         context: Context,
         operation: String,
+        timeoutMillis: Long = TUNNEL_OPERATION_WATCHDOG_MILLIS,
+        scope: TunnelOperationWatchdogScope = TunnelOperationWatchdogScope.LIFECYCLE,
     ): TunnelOperationWatchdog {
-        val generation = watchdogGate.begin()
+        val token = watchdogGates.begin(scope)
         val future = watchdogExecutor.schedule(
             {
-                if (!watchdogGate.expire(generation)) return@schedule
+                if (!watchdogGates.expire(token)) return@schedule
                 terminateHungTunnelProcess(context, operation)
             },
-            TUNNEL_OPERATION_WATCHDOG_MILLIS,
+            timeoutMillis,
             TimeUnit.MILLISECONDS,
         )
-        return TunnelOperationWatchdog(generation, future)
+        return TunnelOperationWatchdog(token, future)
     }
 
     private fun terminateHungTunnelProcess(context: Context, operation: String) {
@@ -1086,7 +1314,7 @@ internal object TunnelRuntime {
     }
 
     private fun completeOperationWatchdog(watchdog: TunnelOperationWatchdog) {
-        if (watchdogGate.complete(watchdog.generation)) {
+        if (watchdogGates.complete(watchdog.token)) {
             watchdog.future.cancel(false)
         }
     }
@@ -1702,6 +1930,22 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
                     invoke.resolve(response)
                 }
             },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun tunnelRebindUdp(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(VersionedTunnelArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_tunnel_request")
+            return
+        }
+        TunnelServiceClient.rebindUdp(
+            activity.applicationContext,
+            args.apiVersion,
+            { state, duration -> resolveOperation(invoke, state, duration) },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
         )
     }

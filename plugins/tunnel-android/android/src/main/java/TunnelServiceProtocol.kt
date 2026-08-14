@@ -40,6 +40,8 @@ internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
 internal const val EXTRA_DNS_SERVERS = "dns_servers"
 internal const val EXTRA_CLIENT_OPERATION_ID = "client_operation_id"
 private const val QUICK_DNS_UPDATE_TIMEOUT_MILLIS = 3_000L
+private const val METRICS_REQUEST_TIMEOUT_MILLIS = 1_800L
+private const val UDP_REBIND_REQUEST_TIMEOUT_MILLIS = 3_250L
 private const val SERVICE_REQUEST_TIMEOUT_MILLIS = 30_000L
 private const val SERVICE_REQUEST_TIMEOUT_ERROR = "tunnel_service_timeout"
 
@@ -154,6 +156,27 @@ internal object TunnelServiceClient {
             )
         },
         onError,
+        timeoutMillis = METRICS_REQUEST_TIMEOUT_MILLIS,
+    )
+
+    fun rebindUdp(
+        context: Context,
+        apiVersion: Int,
+        onSuccess: (SessionState, Long) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_CLIENT_REBIND_UDP)
+            .putExtra(EXTRA_API_VERSION, apiVersion),
+        { result ->
+            val state = SessionState.values().firstOrNull {
+                it.wireName == result.getString(EXTRA_STATE)
+            } ?: SessionState.FAILED
+            onSuccess(state, result.getLong(EXTRA_DURATION_MILLIS))
+        },
+        onError,
+        timeoutMillis = UDP_REBIND_REQUEST_TIMEOUT_MILLIS,
     )
 
     fun configureBackground(

@@ -247,6 +247,7 @@ impl ServiceTransport for RecordingTransport {
             Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
             Request::Metrics { .. } => "metrics",
             Request::Diagnostics { .. } => "diagnostics",
+            Request::RebindUdp { .. } => "rebind_udp",
         };
         self.requests.lock().unwrap().push(summary.to_string());
         Ok(self.response.clone())
@@ -267,10 +268,11 @@ async fn controller_maps_service_response_to_shared_tunnel_contract() {
         controller.status().await.expect("read status"),
         TunnelStatus::Running
     );
+    assert!(controller.rebind_udp().await.expect("rebind UDP"));
 
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
-        ["start", "status"]
+        ["start", "status", "rebind_udp"]
     );
 }
 

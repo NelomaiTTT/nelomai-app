@@ -1,5 +1,8 @@
 use super::{
-    apply_and_verify_awg3_configuration, build_backend_configuration, userspace_socket_path,
+    append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
+    host_diagnostic_snapshot, rebind_peers_from_configuration, rebind_peers_from_host,
+    rebind_userspace_udp, state_name, transport_name, userspace_log_streams, userspace_socket_path,
+    DiagnosticJournal, RebindPeer,
 };
 use crate::process::{status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{LinuxUserspaceRouteManager, RouteManager, SystemRouteBackend, AWG_FWMARK};
@@ -21,10 +24,13 @@ pub struct LinuxBackend {
     wireguard_api: WGApi<Kernel>,
     amneziawg_api: WGApi<Userspace>,
     amneziawg_go: PathBuf,
+    runtime_directory: PathBuf,
     active_transport: Option<TunnelTransport>,
+    rebind_peers: Vec<RebindPeer>,
     amneziawg_routes: LinuxUserspaceRouteManager,
     routes: RouteManager<SystemRouteBackend>,
     state: ServiceTunnelState,
+    diagnostics: DiagnosticJournal,
 }
 
 impl LinuxBackend {
@@ -32,14 +38,17 @@ impl LinuxBackend {
         amneziawg_go: impl Into<PathBuf>,
         runtime_directory: impl AsRef<Path>,
     ) -> Result<Self, ServiceError> {
+        let runtime_directory = runtime_directory.as_ref().to_path_buf();
         let wireguard_api =
             WGApi::<Kernel>::new(WIREGUARD_INTERFACE_NAME).map_err(backend_error)?;
         let amneziawg_api =
             WGApi::<Userspace>::new(AMNEZIAWG_INTERFACE_NAME).map_err(backend_error)?;
         let mut amneziawg_routes = LinuxUserspaceRouteManager::new(&runtime_directory)?;
-        let mut routes = RouteManager::new(runtime_directory, SystemRouteBackend::new()?)?;
-        let wireguard_running = wireguard_api.read_interface_data().is_ok();
-        let amneziawg_running = amneziawg_api.read_interface_data().is_ok();
+        let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
+        let wireguard_host = wireguard_api.read_interface_data().ok();
+        let amneziawg_host = amneziawg_api.read_interface_data().ok();
+        let wireguard_running = wireguard_host.is_some();
+        let amneziawg_running = amneziawg_host.is_some();
         if wireguard_running && amneziawg_running {
             return Err(ServiceError::Backend(
                 "multiple_tunnel_interfaces_detected".to_string(),
@@ -59,14 +68,30 @@ impl LinuxBackend {
         } else {
             ServiceTunnelState::Stopped
         };
+        let rebind_peers = amneziawg_host
+            .as_ref()
+            .map(rebind_peers_from_host)
+            .unwrap_or_default();
+        let mut diagnostics = DiagnosticJournal::default();
+        diagnostics.record(
+            "helper_initialized",
+            &format!(
+                "state={} transport={}",
+                state_name(state),
+                transport_name(active_transport)
+            ),
+        );
         Ok(Self {
             wireguard_api,
             amneziawg_api,
             amneziawg_go: amneziawg_go.into(),
+            runtime_directory,
             active_transport,
+            rebind_peers,
             amneziawg_routes,
             routes,
             state,
+            diagnostics,
         })
     }
 
@@ -101,7 +126,7 @@ impl LinuxBackend {
             }
             TunnelTransport::AmneziaWg3 => {
                 validate_root_owned_binary(&self.amneziawg_go)?;
-                launch_amneziawg_go(&self.amneziawg_go, interface_name)?;
+                launch_amneziawg_go(&self.amneziawg_go, interface_name, &self.runtime_directory)?;
             }
         }
         self.active_transport = Some(configuration.transport);
@@ -143,11 +168,17 @@ impl LinuxBackend {
             let _ = self.stop_inner();
             return Err(error);
         }
+        self.rebind_peers = if configuration.transport == TunnelTransport::AmneziaWg3 {
+            rebind_peers_from_configuration(configuration)
+        } else {
+            Vec::new()
+        };
         Ok(())
     }
 
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
         let transport = self.active_transport.take();
+        self.rebind_peers.clear();
         let mut first_error = None;
         if let Err(error) = self.amneziawg_routes.cleanup() {
             first_error.get_or_insert(error);
@@ -179,6 +210,27 @@ impl LinuxBackend {
             None => Err(ServiceError::Backend("tunnel_not_running".to_string())),
         }
     }
+
+    fn diagnostic_snapshot(&self) -> String {
+        let mut snapshot = format!(
+            "state={}\ntransport={}\nroutes_active={}\nawg_routes_active={}",
+            state_name(self.state),
+            transport_name(self.active_transport),
+            self.routes.has_routes(),
+            self.amneziawg_routes.has_routes(),
+        );
+        match self.read_active_interface() {
+            Ok(host) => {
+                snapshot.push('\n');
+                snapshot.push_str(&host_diagnostic_snapshot(&host));
+            }
+            Err(error) => {
+                snapshot.push_str("\nuapi=unavailable\nuapi_error_code=");
+                snapshot.push_str(error.code());
+            }
+        }
+        snapshot
+    }
 }
 
 impl ServiceTunnelBackend for LinuxBackend {
@@ -188,14 +240,25 @@ impl ServiceTunnelBackend for LinuxBackend {
         options: &DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.state = ServiceTunnelState::Starting;
+        self.diagnostics.record(
+            "start_begin",
+            &format!(
+                "transport={}",
+                transport_name(Some(configuration.transport))
+            ),
+        );
         match self.start_inner(configuration, options) {
             Ok(()) => {
                 self.state = ServiceTunnelState::Running;
+                let snapshot = self.diagnostic_snapshot().replace('\n', " ");
+                self.diagnostics.record("start_ok", &snapshot);
                 Ok(self.state)
             }
             Err(error) => {
                 let _ = self.stop_inner();
                 self.state = ServiceTunnelState::Failed;
+                self.diagnostics
+                    .record("start_error", &format!("code={}", error.code()));
                 Err(error)
             }
         }
@@ -203,13 +266,18 @@ impl ServiceTunnelBackend for LinuxBackend {
 
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         self.state = ServiceTunnelState::Stopping;
+        let snapshot = self.diagnostic_snapshot().replace('\n', " ");
+        self.diagnostics.record("stop_begin", &snapshot);
         match self.stop_inner() {
             Ok(()) => {
                 self.state = ServiceTunnelState::Stopped;
+                self.diagnostics.record("stop_ok", "");
                 Ok(self.state)
             }
             Err(error) => {
                 self.state = ServiceTunnelState::Failed;
+                self.diagnostics
+                    .record("stop_error", &format!("code={}", error.code()));
                 Err(error)
             }
         }
@@ -264,24 +332,56 @@ impl ServiceTunnelBackend for LinuxBackend {
             probe_target,
         })
     }
+
+    fn diagnostics(&self) -> Result<String, ServiceError> {
+        let mut output = self.diagnostics.render(&self.diagnostic_snapshot());
+        append_userspace_log(&mut output, &self.runtime_directory);
+        Ok(output)
+    }
+
+    fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.active_transport != Some(TunnelTransport::AmneziaWg3) {
+            return Err(ServiceError::Backend("udp_rebind_unsupported".to_string()));
+        }
+        let before = self.diagnostic_snapshot().replace('\n', " ");
+        self.diagnostics.record("udp_rebind_begin", &before);
+        match rebind_userspace_udp(AMNEZIAWG_INTERFACE_NAME, &self.rebind_peers) {
+            Ok(()) => {
+                let after = self.diagnostic_snapshot().replace('\n', " ");
+                self.diagnostics.record("udp_rebind_ok", &after);
+                Ok(ServiceTunnelState::Running)
+            }
+            Err(error) => {
+                self.diagnostics
+                    .record("udp_rebind_error", &format!("code={}", error.code()));
+                Err(error)
+            }
+        }
+    }
 }
 
-fn launch_amneziawg_go(executable: &Path, interface_name: &str) -> Result<(), ServiceError> {
+fn launch_amneziawg_go(
+    executable: &Path,
+    interface_name: &str,
+    runtime_directory: &Path,
+) -> Result<(), ServiceError> {
     let socket_path = userspace_socket_path(interface_name);
     if socket_path.exists() {
         return Err(ServiceError::Backend(
             "amneziawg_interface_already_exists".to_string(),
         ));
     }
-    let status = status_with_timeout(
-        Command::new(executable)
-            .arg(interface_name)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-        COMMAND_TIMEOUT,
-    )
-    .map_err(backend_error)?;
+    let mut command = Command::new(executable);
+    command.arg(interface_name).stdin(Stdio::null());
+    if let Some((stdout, stderr)) = userspace_log_streams(runtime_directory) {
+        command
+            .env("LOG_LEVEL", "error")
+            .stdout(stdout)
+            .stderr(stderr);
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let status = status_with_timeout(&mut command, COMMAND_TIMEOUT).map_err(backend_error)?;
     if !status.success() {
         return Err(ServiceError::Backend(
             "amneziawg_go_start_failed".to_string(),

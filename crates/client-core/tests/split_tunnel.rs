@@ -1299,7 +1299,7 @@ async fn settings_save_updates_cache_and_unknown_format_keeps_the_working_policy
 }
 
 #[tokio::test]
-async fn failed_apply_result_is_queued_and_retried_on_the_next_authenticated_sync() {
+async fn queued_apply_result_is_retried_without_blocking_tunnel_start() {
     let fixture = coordinator_fixture(android_35_capabilities());
     fixture
         .core
@@ -1325,6 +1325,20 @@ async fn failed_apply_result_is_queued_and_retried_on_the_next_authenticated_syn
     fixture
         .core
         .synchronize_split_tunnel(1_300, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .split_store
+            .load()
+            .unwrap()
+            .pending_apply_results
+            .len(),
+        1
+    );
+    fixture
+        .core
+        .synchronize_split_tunnel(1_600, false)
         .await
         .unwrap();
     assert!(fixture

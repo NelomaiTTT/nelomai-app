@@ -153,7 +153,8 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         let response = self
             .app
             .tunnel_android()
-            .tunnel_status()
+            .tunnel_status_async()
+            .await
             .map_err(to_tunnel_error)?;
         match response.state.as_str() {
             "stopped" => Ok(TunnelStatus::Stopped),
@@ -174,7 +175,8 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         let response = self
             .app
             .tunnel_android()
-            .tunnel_metrics(probe)
+            .tunnel_metrics_async(probe)
+            .await
             .map_err(to_tunnel_error)?;
         Ok(Some(TunnelMetrics {
             received_bytes: response.received_bytes,
@@ -182,6 +184,17 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
             latest_handshake_epoch_millis: response.latest_handshake_epoch_millis,
             probe_target: response.probe_target,
         }))
+    }
+
+    async fn rebind_udp(&self) -> std::result::Result<bool, TunnelError> {
+        let response = self
+            .app
+            .tunnel_android()
+            .tunnel_rebind_udp_async()
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, "running")?;
+        Ok(true)
     }
 
     async fn capabilities(&self) -> std::result::Result<TunnelCapabilities, TunnelError> {

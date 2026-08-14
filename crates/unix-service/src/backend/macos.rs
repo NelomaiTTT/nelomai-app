@@ -1,5 +1,8 @@
 use super::{
-    apply_and_verify_awg3_configuration, build_backend_configuration, userspace_socket_path,
+    append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
+    host_diagnostic_snapshot, rebind_peers_from_configuration, rebind_peers_from_host,
+    rebind_userspace_udp, state_name, transport_name, userspace_log_streams, userspace_socket_path,
+    DiagnosticJournal, RebindPeer,
 };
 use crate::process::{output_with_timeout, status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{RouteManager, SystemRouteBackend};
@@ -28,10 +31,13 @@ pub struct MacosBackend {
     amneziawg_go: PathBuf,
     runtime_directory: PathBuf,
     api: Option<WGApi<Userspace>>,
+    active_transport: Option<TunnelTransport>,
+    rebind_peers: Vec<RebindPeer>,
     endpoints: Vec<SocketAddr>,
     dns_snapshot: Option<DnsSnapshot>,
     routes: RouteManager<SystemRouteBackend>,
     state: ServiceTunnelState,
+    diagnostics: DiagnosticJournal,
 }
 
 impl MacosBackend {
@@ -46,6 +52,12 @@ impl MacosBackend {
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
         let dns_snapshot = load_dns_snapshot(&runtime_directory.join(DNS_STATE_FILE))?;
         let api = recover_api(&runtime_directory)?;
+        let rebind_peers = api
+            .as_ref()
+            .and_then(|api| api.read_interface_data().ok())
+            .as_ref()
+            .map(rebind_peers_from_host)
+            .unwrap_or_default();
         if api.is_none() {
             routes.cleanup()?;
         }
@@ -61,15 +73,27 @@ impl MacosBackend {
         } else {
             ServiceTunnelState::Stopped
         };
+        let mut diagnostics = DiagnosticJournal::default();
+        diagnostics.record(
+            "helper_initialized",
+            &format!(
+                "state={} transport={}",
+                state_name(state),
+                if api.is_some() { "unknown" } else { "none" }
+            ),
+        );
         let mut backend = Self {
             wireguard_go,
             amneziawg_go,
             runtime_directory,
             api,
+            active_transport: None,
+            rebind_peers,
             endpoints,
             dns_snapshot,
             routes,
             state,
+            diagnostics,
         };
         if backend.api.is_none() && backend.dns_snapshot.is_some() {
             backend.restore_dns()?;
@@ -106,6 +130,7 @@ impl MacosBackend {
                 return Err(error);
             }
         };
+        self.active_transport = Some(configuration.transport);
         native.interface.name = ifname.clone();
         let api = match WGApi::<Userspace>::new(&ifname) {
             Ok(api) => api,
@@ -160,10 +185,17 @@ impl MacosBackend {
                 return Err(error);
             }
         }
+        self.rebind_peers = if configuration.transport == TunnelTransport::AmneziaWg3 {
+            rebind_peers_from_configuration(configuration)
+        } else {
+            Vec::new()
+        };
         Ok(())
     }
 
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
+        self.active_transport = None;
+        self.rebind_peers.clear();
         let mut first_error = None;
         if let Some(api) = self.api.take() {
             if let Err(error) = api.remove_interface() {
@@ -214,6 +246,36 @@ impl MacosBackend {
         self.dns_snapshot = None;
         Ok(())
     }
+
+    fn diagnostic_snapshot(&self) -> String {
+        let transport = if self.active_transport.is_none() && self.api.is_some() {
+            "unknown"
+        } else {
+            transport_name(self.active_transport)
+        };
+        let mut snapshot = format!(
+            "state={}\ntransport={transport}\nroutes_active={}\ndns_snapshot_active={}",
+            state_name(self.state),
+            self.routes.has_routes(),
+            self.dns_snapshot.is_some(),
+        );
+        match self
+            .api
+            .as_ref()
+            .ok_or_else(|| ServiceError::Backend("tunnel_not_running".to_string()))
+            .and_then(|api| api.read_interface_data().map_err(backend_error))
+        {
+            Ok(host) => {
+                snapshot.push('\n');
+                snapshot.push_str(&host_diagnostic_snapshot(&host));
+            }
+            Err(error) => {
+                snapshot.push_str("\nuapi=unavailable\nuapi_error_code=");
+                snapshot.push_str(error.code());
+            }
+        }
+        snapshot
+    }
 }
 
 impl ServiceTunnelBackend for MacosBackend {
@@ -223,14 +285,25 @@ impl ServiceTunnelBackend for MacosBackend {
         options: &DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
         self.state = ServiceTunnelState::Starting;
+        self.diagnostics.record(
+            "start_begin",
+            &format!(
+                "transport={}",
+                transport_name(Some(configuration.transport))
+            ),
+        );
         match self.start_inner(configuration, options) {
             Ok(()) => {
                 self.state = ServiceTunnelState::Running;
+                let snapshot = self.diagnostic_snapshot().replace('\n', " ");
+                self.diagnostics.record("start_ok", &snapshot);
                 Ok(self.state)
             }
             Err(error) => {
                 let _ = self.stop_inner();
                 self.state = ServiceTunnelState::Failed;
+                self.diagnostics
+                    .record("start_error", &format!("code={}", error.code()));
                 Err(error)
             }
         }
@@ -238,13 +311,18 @@ impl ServiceTunnelBackend for MacosBackend {
 
     fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         self.state = ServiceTunnelState::Stopping;
+        let snapshot = self.diagnostic_snapshot().replace('\n', " ");
+        self.diagnostics.record("stop_begin", &snapshot);
         match self.stop_inner() {
             Ok(()) => {
                 self.state = ServiceTunnelState::Stopped;
+                self.diagnostics.record("stop_ok", "");
                 Ok(self.state)
             }
             Err(error) => {
                 self.state = ServiceTunnelState::Failed;
+                self.diagnostics
+                    .record("stop_error", &format!("code={}", error.code()));
                 Err(error)
             }
         }
@@ -301,6 +379,33 @@ impl ServiceTunnelBackend for MacosBackend {
             latest_handshake_epoch_millis,
             probe_target,
         })
+    }
+
+    fn diagnostics(&self) -> Result<String, ServiceError> {
+        let mut output = self.diagnostics.render(&self.diagnostic_snapshot());
+        append_userspace_log(&mut output, &self.runtime_directory);
+        Ok(output)
+    }
+
+    fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.api.is_none() {
+            return Err(ServiceError::Backend("tunnel_not_running".to_string()));
+        }
+        let ifname = read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?;
+        let before = self.diagnostic_snapshot().replace('\n', " ");
+        self.diagnostics.record("udp_rebind_begin", &before);
+        match rebind_userspace_udp(&ifname, &self.rebind_peers) {
+            Ok(()) => {
+                let after = self.diagnostic_snapshot().replace('\n', " ");
+                self.diagnostics.record("udp_rebind_ok", &after);
+                Ok(ServiceTunnelState::Running)
+            }
+            Err(error) => {
+                self.diagnostics
+                    .record("udp_rebind_error", &format!("code={}", error.code()));
+                Err(error)
+            }
+        }
     }
 }
 
@@ -436,7 +541,7 @@ fn launch_userspace_tunnel(
     remove_regular_file_if_present(&state_file).map_err(backend_error)?;
 
     let status = status_with_timeout(
-        &mut userspace_tunnel_command(executable, &state_file),
+        &mut userspace_tunnel_command(executable, &state_file, runtime_directory),
         COMMAND_TIMEOUT,
     )
     .map_err(backend_error)?;
@@ -470,14 +575,24 @@ fn userspace_start_error(transport: TunnelTransport, timed_out: bool) -> &'stati
     }
 }
 
-fn userspace_tunnel_command(executable: &Path, state_file: &Path) -> Command {
+fn userspace_tunnel_command(
+    executable: &Path,
+    state_file: &Path,
+    runtime_directory: &Path,
+) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("utun")
         .env("WG_TUN_NAME_FILE", state_file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(Stdio::null());
+    if let Some((stdout, stderr)) = userspace_log_streams(runtime_directory) {
+        command
+            .env("LOG_LEVEL", "error")
+            .stdout(stdout)
+            .stderr(stderr);
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
     command
 }
 
@@ -651,9 +766,11 @@ mod tests {
 
     #[test]
     fn userspace_tunnel_receives_no_configuration_or_key_arguments() {
+        let runtime = tempfile::tempdir().expect("create runtime directory");
         let command = userspace_tunnel_command(
             Path::new("/Library/PrivilegedHelperTools/wireguard-go"),
             Path::new("/var/run/nelomai/interface-name"),
+            runtime.path(),
         );
         let args: Vec<&OsStr> = command.get_args().collect();
 

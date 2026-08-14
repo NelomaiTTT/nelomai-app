@@ -21,6 +21,16 @@ class TunnelPayloadTest {
     }
 
     @Test
+    fun metricsWatchdogCannotReplaceTheLifecycleWatchdog() {
+        val gates = TunnelOperationWatchdogGates()
+        val lifecycle = gates.begin(TunnelOperationWatchdogScope.LIFECYCLE)
+        val metrics = gates.begin(TunnelOperationWatchdogScope.METRICS)
+
+        assertTrue(gates.complete(metrics))
+        assertTrue(gates.expire(lifecycle))
+    }
+
+    @Test
     fun payloadIsWipedAfterSuccessfulUse() {
         val payload = "PrivateKey = secret".encodeToByteArray()
 
@@ -71,6 +81,47 @@ class TunnelPayloadTest {
         assertEquals(TransitionDecision.BUSY, gate.beginStop())
         gate.complete(SessionState.STOPPED)
         assertEquals(TransitionDecision.ALREADY_COMPLETE, gate.beginStop())
+    }
+
+    @Test
+    fun rebindBlocksConcurrentStartStopAndSecondRebind() {
+        val gate = TunnelStateGate(SessionState.RUNNING)
+
+        assertEquals(TransitionDecision.PROCEED, gate.beginRebind())
+        assertEquals(TransitionDecision.BUSY, gate.beginStart())
+        assertEquals(TransitionDecision.BUSY, gate.beginStop())
+        assertEquals(TransitionDecision.BUSY, gate.beginRebind())
+        gate.complete(SessionState.RUNNING)
+        assertEquals(TransitionDecision.PROCEED, gate.beginStop())
+    }
+
+    @Test
+    fun cancellingRebindCannotResurrectAStoppedService() {
+        val gate = TunnelStateGate(SessionState.RUNNING)
+
+        assertEquals(TransitionDecision.PROCEED, gate.beginRebind())
+        gate.complete(SessionState.STOPPED)
+
+        assertTrue(!gate.cancelRebind())
+        assertEquals(SessionState.STOPPED, gate.current())
+    }
+
+    @Test
+    fun cancelledQueuedRebindCanNeverStartLater() {
+        val gate = RebindQueueGate()
+
+        assertTrue(gate.cancel())
+        assertTrue(!gate.begin())
+        assertTrue(!gate.cancel())
+    }
+
+    @Test
+    fun runningRebindCanNoLongerBeCancelledAsQueued() {
+        val gate = RebindQueueGate()
+
+        assertTrue(gate.begin())
+        assertTrue(!gate.cancel())
+        assertTrue(!gate.begin())
     }
 
     @Test

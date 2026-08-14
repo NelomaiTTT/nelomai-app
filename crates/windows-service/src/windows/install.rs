@@ -196,7 +196,10 @@ pub(crate) fn open_tunnel_service() -> Result<Option<Service>, ServiceError> {
     for name in [TUNNEL_SERVICE_NAME, AMNEZIAWG_TUNNEL_SERVICE_NAME] {
         match manager.open_service(
             name,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::START
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE,
         ) {
             Ok(service) if active.is_none() => active = Some(service),
             Ok(_) => {
@@ -303,8 +306,15 @@ fn remove_service(name: &str) -> Result<(), ServiceError> {
     ))
 }
 
-fn wait_until_stopped(service: &Service) -> Result<(), ServiceError> {
+pub(crate) fn wait_until_stopped(service: &Service) -> Result<(), ServiceError> {
     let deadline = Instant::now() + Duration::from_secs(15);
+    wait_until_stopped_until(service, deadline)
+}
+
+pub(crate) fn wait_until_stopped_until(
+    service: &Service,
+    deadline: Instant,
+) -> Result<(), ServiceError> {
     while Instant::now() < deadline {
         if service
             .query_status()
@@ -317,12 +327,19 @@ fn wait_until_stopped(service: &Service) -> Result<(), ServiceError> {
         thread::sleep(Duration::from_millis(100));
     }
     Err(ServiceError::Backend(
-        "Windows service did not stop within 15 seconds".to_string(),
+        "Windows service did not stop before the deadline".to_string(),
     ))
 }
 
 pub(crate) fn wait_until_running(service: &Service) -> Result<(), ServiceError> {
     let deadline = Instant::now() + Duration::from_secs(15);
+    wait_until_running_until(service, deadline)
+}
+
+pub(crate) fn wait_until_running_until(
+    service: &Service,
+    deadline: Instant,
+) -> Result<(), ServiceError> {
     while Instant::now() < deadline {
         match service
             .query_status()
@@ -339,7 +356,7 @@ pub(crate) fn wait_until_running(service: &Service) -> Result<(), ServiceError> 
         }
     }
     Err(ServiceError::Backend(
-        "WireGuard tunnel service did not start within 15 seconds".to_string(),
+        "WireGuard tunnel service did not start before the deadline".to_string(),
     ))
 }
 

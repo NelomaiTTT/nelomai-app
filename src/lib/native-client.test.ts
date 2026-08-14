@@ -91,6 +91,12 @@ describe("native client", () => {
     ).toContain("отправьте логи");
   });
 
+  it("explains what to change after an AWG3 handshake timeout", () => {
+    expect(
+      commandMessage(commandError("tunnel_handshake_timeout"), "start"),
+    ).toContain("Переключите Wi‑Fi или мобильный интернет");
+  });
+
   it("keeps an unknown safe native message as the fallback", () => {
     expect(
       commandMessage(commandError("invalid_credentials", "Неверный логин или пароль."), "login"),

@@ -31,8 +31,8 @@ pub async fn diagnostic_helper_log(tunnel: &PlatformTunnelController) -> Option<
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub async fn diagnostic_helper_log(_tunnel: &PlatformTunnelController) -> Option<String> {
-    None
+pub async fn diagnostic_helper_log(tunnel: &PlatformTunnelController) -> Option<String> {
+    tunnel.diagnostics().await.ok()
 }
 
 #[cfg(windows)]
