@@ -1,0 +1,299 @@
+diff --git a/device/device.go b/device/device.go
+index 26c8ede..0329c87 100644
+--- a/device/device.go
++++ b/device/device.go
+@@ -126,6 +126,11 @@ type Device struct {
+ 		keepaliveTimeoutSec AtomicUintRange
+ 		maxHandshakeAttemps AtomicUintRange
+ 	}
++
++	controlProbe struct {
++		nextGeneration      atomic.Uint64
++		completedGeneration atomic.Uint64
++	}
+ }
+ 
+ // deviceState represents the state of a Device.
+@@ -585,3 +590,76 @@ func (device *Device) BindClose() error {
+ 	device.net.Unlock()
+ 	return err
+ }
++
++// SendKeepalivesToAllRunningPeers queues one keepalive for every running peer
++// without changing its configured persistent keepalive interval.
++func (device *Device) SendKeepalivesToAllRunningPeers() int {
++	peers := device.runningPeersSnapshot()
++	for _, peer := range peers {
++		peer.SendKeepalive()
++	}
++	return len(peers)
++}
++
++// StartHandshakeProbe forces a fresh authenticated handshake without expiring
++// the current data-plane keypair. The returned generation is completed only by
++// a response to this initiation or one of its native retries.
++func (device *Device) StartHandshakeProbe() uint64 {
++	peers := device.runningPeersSnapshot()
++	if len(peers) == 0 {
++		return 0
++	}
++	generation := device.controlProbe.nextGeneration.Add(1)
++	if generation == 0 {
++		generation = device.controlProbe.nextGeneration.Add(1)
++	}
++	sent := 0
++	for _, peer := range peers {
++		peer.controlProbe.expectedIndex.Store(0)
++		peer.controlProbe.generation.Store(generation)
++		peer.handshake.mutex.Lock()
++		peer.handshake.lastSentHandshake = time.Now().Add(
++			-(peer.device.rekeyMinTimeout() + time.Second),
++		)
++		peer.handshake.mutex.Unlock()
++		if peer.SendHandshakeProbe(generation) == nil {
++			sent++
++		} else {
++			peer.cancelHandshakeProbe(generation)
++		}
++	}
++	if sent == 0 {
++		return 0
++	}
++	return generation
++}
++
++// HandshakeProbeSucceeded reports only authenticated responses belonging to
++// the requested probe generation.
++func (device *Device) HandshakeProbeSucceeded(generation uint64) bool {
++	return generation != 0 && device.controlProbe.completedGeneration.Load() >= generation
++}
++
++// HandshakeProbeTimeoutMillis includes the longest configured first retry and
++// enough time for its response to be authenticated by the native backend.
++func (device *Device) HandshakeProbeTimeoutMillis() int64 {
++	timeout := RekeyTimeout
++	if configured := device.timings.rekeyTimeoutSec.Load(); !configured.IsZero() {
++		timeout = time.Duration(configured.Hi()) * time.Second
++	}
++	return (timeout +
++		time.Duration(RekeyTimeoutJitterMaxMs)*time.Millisecond +
++		time.Second).Milliseconds()
++}
++
++func (device *Device) runningPeersSnapshot() []*Peer {
++	device.peers.RLock()
++	peers := make([]*Peer, 0, len(device.peers.keyMap))
++	for _, peer := range device.peers.keyMap {
++		if peer.isRunning.Load() {
++			peers = append(peers, peer)
++		}
++	}
++	device.peers.RUnlock()
++	return peers
++}
+diff --git a/device/device_test.go b/device/device_test.go
+index 1e13f9d..1a42459 100644
+--- a/device/device_test.go
++++ b/device/device_test.go
+@@ -329,6 +329,103 @@ func TestUpDown(t *testing.T) {
+ 	}
+ }
+ 
++func TestSendKeepalivesWithoutPersistentInterval(t *testing.T) {
++	pair := genTestPair(t, false)
++	for i, peer := range pair {
++		if count := peer.dev.SendKeepalivesToAllRunningPeers(); count != 1 {
++			t.Fatalf("device %d queued keepalives for %d peers, want 1", i, count)
++		}
++	}
++}
++
++func TestProbeHandshakeWithoutExpiringCurrentKeypair(t *testing.T) {
++	pair := genTestPair(t, false)
++	device := pair[0].dev
++	generation := device.StartHandshakeProbe()
++	if generation == 0 {
++		t.Fatal("handshake probe was not started")
++	}
++	deadline := time.Now().Add(time.Second)
++	for time.Now().Before(deadline) {
++		if device.HandshakeProbeSucceeded(generation) {
++			return
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("forced handshake did not receive an authenticated response")
++}
++
++func TestHandshakeProbeRejectsAnUnrelatedGeneration(t *testing.T) {
++	pair := genTestPair(t, false)
++	device := pair[0].dev
++	generation := device.StartHandshakeProbe()
++	if generation == 0 {
++		t.Fatal("handshake probe was not started")
++	}
++	if device.HandshakeProbeSucceeded(generation + 1) {
++		t.Fatal("unrelated handshake probe generation was accepted")
++	}
++}
++
++func TestHandshakeProbeCompletesOnlyForExpectedIndex(t *testing.T) {
++	device := new(Device)
++	peer := &Peer{device: device}
++	const generation = 7
++	peer.controlProbe.generation.Store(generation)
++	peer.controlProbe.expectedIndex.Store(42)
++
++	peer.completeHandshakeProbe(41)
++	if device.HandshakeProbeSucceeded(generation) {
++		t.Fatal("handshake response with an unrelated receiver index was accepted")
++	}
++	peer.completeHandshakeProbe(42)
++	if !device.HandshakeProbeSucceeded(generation) {
++		t.Fatal("handshake response with the expected receiver index was rejected")
++	}
++}
++
++func TestHandshakeProbeRetryTracksReplacementIndex(t *testing.T) {
++	pair := genTestPair(t, false)
++	if err := pair[1].dev.Down(); err != nil {
++		t.Fatalf("failed to stop remote test device: %v", err)
++	}
++	device := pair[0].dev
++	peer := device.runningPeersSnapshot()[0]
++	generation := device.StartHandshakeProbe()
++	if generation == 0 {
++		t.Fatal("handshake probe was not started")
++	}
++	firstIndex := peer.controlProbe.expectedIndex.Load()
++	peer.handshake.mutex.Lock()
++	peer.handshake.lastSentHandshake = time.Now().Add(
++		-(peer.device.rekeyMinTimeout() + time.Second),
++	)
++	peer.handshake.mutex.Unlock()
++	if err := peer.SendHandshakeInitiation(true); err != nil {
++		t.Fatalf("failed to send handshake probe retry: %v", err)
++	}
++	retryIndex := peer.controlProbe.expectedIndex.Load()
++	if firstIndex == 0 || retryIndex == 0 || retryIndex == firstIndex {
++		t.Fatalf("retry index is %d after initial index %d", retryIndex, firstIndex)
++	}
++	if got := peer.controlProbe.retryGeneration.Load(); got != generation {
++		t.Fatalf("retry generation is %d, want %d", got, generation)
++	}
++}
++
++func TestHandshakeProbeTimeoutIncludesConfiguredRetry(t *testing.T) {
++	device := new(Device)
++	var configured UintRange
++	configured.FromUint32(7, 9)
++	device.timings.rekeyTimeoutSec.Store(configured)
++	want := (9*time.Second +
++		time.Duration(RekeyTimeoutJitterMaxMs)*time.Millisecond +
++		time.Second).Milliseconds()
++	if got := device.HandshakeProbeTimeoutMillis(); got != want {
++		t.Fatalf("handshake probe timeout is %d ms, want %d ms", got, want)
++	}
++}
++
+ // TestConcurrencySafety does other things concurrently with tunnel use.
+ // It is intended to be used with the race detector to catch data races.
+ func TestConcurrencySafety(t *testing.T) {
+diff --git a/device/peer.go b/device/peer.go
+index e9ef5ee..9eda890 100644
+--- a/device/peer.go
++++ b/device/peer.go
+@@ -25,6 +25,12 @@ type Peer struct {
+ 	rxBytes           atomic.Uint64  // bytes received from peer
+ 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+ 
++	controlProbe struct {
++		generation      atomic.Uint64
++		retryGeneration atomic.Uint64
++		expectedIndex   atomic.Uint32
++	}
++
+ 	endpoint struct {
+ 		sync.Mutex
+ 		val            conn.Endpoint
+@@ -59,6 +65,32 @@ type Peer struct {
+ 	persistentKeepaliveInterval AtomicUintRange
+ }
+ 
++func (peer *Peer) cancelHandshakeProbe(generation uint64) {
++	if peer.controlProbe.generation.CompareAndSwap(generation, 0) {
++		peer.controlProbe.retryGeneration.CompareAndSwap(generation, 0)
++		peer.controlProbe.expectedIndex.Store(0)
++	}
++}
++
++func (peer *Peer) completeHandshakeProbe(receiver uint32) {
++	if peer.controlProbe.expectedIndex.Load() != receiver {
++		return
++	}
++	generation := peer.controlProbe.generation.Load()
++	if generation == 0 || !peer.controlProbe.generation.CompareAndSwap(generation, 0) {
++		return
++	}
++	peer.controlProbe.retryGeneration.CompareAndSwap(generation, 0)
++	peer.controlProbe.expectedIndex.Store(0)
++	for {
++		completed := peer.device.controlProbe.completedGeneration.Load()
++		if completed >= generation ||
++			peer.device.controlProbe.completedGeneration.CompareAndSwap(completed, generation) {
++			return
++		}
++	}
++}
++
+ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+ 	if device.isClosed() {
+ 		return nil, errors.New("device closed")
+diff --git a/device/receive.go b/device/receive.go
+index fc2e2da..d6bc92c 100644
+--- a/device/receive.go
++++ b/device/receive.go
+@@ -466,6 +466,7 @@ func (device *Device) RoutineHandshake(id int) {
+ 			}
+ 
+ 			peer.timersSessionDerived()
++			peer.completeHandshakeProbe(msg.Receiver)
+ 			peer.timersHandshakeComplete()
+ 			peer.SendKeepalive()
+ 		}
+diff --git a/device/send.go b/device/send.go
+index 5c22d97..c6748d9 100644
+--- a/device/send.go
++++ b/device/send.go
+@@ -104,6 +104,21 @@ func (peer *Peer) SendKeepalive() {
+ }
+ 
+ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
++	probeGeneration := uint64(0)
++	if isRetry {
++		probeGeneration = peer.controlProbe.retryGeneration.Load()
++	} else {
++		peer.controlProbe.retryGeneration.Store(0)
++	}
++	return peer.sendHandshakeInitiation(isRetry, probeGeneration)
++}
++
++func (peer *Peer) SendHandshakeProbe(generation uint64) error {
++	peer.controlProbe.retryGeneration.Store(generation)
++	return peer.sendHandshakeInitiation(false, generation)
++}
++
++func (peer *Peer) sendHandshakeInitiation(isRetry bool, probeGeneration uint64) error {
+ 	if !isRetry {
+ 		peer.timers.handshakeAttempts.Store(0)
+ 		peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttemps())
+@@ -133,6 +148,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+ 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+ 		return err
+ 	}
++	if probeGeneration != 0 && peer.controlProbe.generation.Load() == probeGeneration {
++		peer.controlProbe.expectedIndex.Store(msg.Sender)
++	}
+ 
+ 	var sendBuffer [][]byte
+ 

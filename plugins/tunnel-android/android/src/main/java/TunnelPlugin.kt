@@ -24,6 +24,7 @@ import org.amnezia.awg.backend.GoBackend
 import org.amnezia.awg.backend.Tunnel
 import org.amnezia.awg.config.Config
 import java.io.ByteArrayInputStream
+import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -33,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import org.json.JSONArray
+import org.json.JSONObject
 
 internal const val TUNNEL_API_VERSION = 2
 private const val TUNNEL_NAME = "nelomai"
@@ -309,7 +311,105 @@ private data class ActiveTunnelSession(
     val startedAtElapsedMillis: Long = SystemClock.elapsedRealtime(),
     var lastDiagnosticsReceivedBytes: Long? = null,
     var lastDiagnosticsSentBytes: Long? = null,
+    var lastNetworkTelemetry: NetworkTelemetry? = null,
+    val recentNetworkTelemetry: ArrayDeque<JSONObject> = ArrayDeque(),
+    var lastTunActivityElapsedMillis: Long = startedAtElapsedMillis,
+    var lastTunWriteActivityElapsedMillis: Long = startedAtElapsedMillis,
+    var lastUdpReceiveElapsedMillis: Long = startedAtElapsedMillis,
+    var udpStallStartedElapsedMillis: Long? = null,
+    var lastUdpRecoveryElapsedMillis: Long? = null,
+    var udpRecoveryArmed: Boolean = true,
+    var udpRecoveryAttempts: Int = 0,
+    var pendingUdpControlProbe: PendingUdpControlProbe? = null,
+    var lastDataPlaneSnapshotElapsedMillis: Long = startedAtElapsedMillis,
+    var lastTelemetryErrorLoggedElapsedMillis: Long = 0,
 )
+
+internal enum class UdpControlProbeStage {
+    BEFORE_REBIND,
+    AFTER_REBIND,
+}
+
+internal enum class UdpControlProbeAction {
+    MARK_TRANSPORT_REACHABLE,
+    REBIND,
+    RETRY,
+    STOP,
+}
+
+private data class PendingUdpControlProbe(
+    val stage: UdpControlProbeStage,
+    val generation: Long,
+    val startedAtElapsedMillis: Long,
+    val evaluateAtElapsedMillis: Long,
+    val tunWriteBytesBefore: Long,
+    val udpReceiveBytesBefore: Long,
+    val localPortBefore: Int,
+    val localPortAfter: Int,
+)
+
+internal data class NetworkTelemetry(
+    val tunReadPackets: Long,
+    val tunReadBytes: Long,
+    val tunReadErrors: Long,
+    val tunWritePackets: Long,
+    val tunWriteBytes: Long,
+    val tunWriteErrors: Long,
+    val udpSendCalls: Long,
+    val udpSendPackets: Long,
+    val udpSendBytes: Long,
+    val udpSendErrors: Long,
+    val udpReceiveCalls: Long,
+    val udpReceivePackets: Long,
+    val udpReceiveBytes: Long,
+    val udpReceiveErrors: Long,
+    val localPort: Int,
+    val lastTunReadAtUnixMillis: Long,
+    val lastTunWriteAtUnixMillis: Long,
+    val lastUdpSendAtUnixMillis: Long,
+    val lastUdpReceiveAtUnixMillis: Long,
+    val lastUdpSendError: String?,
+    val lastUdpReceiveError: String?,
+    val lastUdpSendErrno: Int?,
+    val lastUdpReceiveErrno: Int?,
+    val endpoint: String?,
+) {
+    companion object {
+        fun fromJson(value: String): NetworkTelemetry {
+            val payload = JSONObject(value)
+            return NetworkTelemetry(
+                tunReadPackets = payload.getLong("tun_read_packets"),
+                tunReadBytes = payload.getLong("tun_read_bytes"),
+                tunReadErrors = payload.getLong("tun_read_errors"),
+                tunWritePackets = payload.getLong("tun_write_packets"),
+                tunWriteBytes = payload.getLong("tun_write_bytes"),
+                tunWriteErrors = payload.getLong("tun_write_errors"),
+                udpSendCalls = payload.getLong("udp_send_calls"),
+                udpSendPackets = payload.getLong("udp_send_packets"),
+                udpSendBytes = payload.getLong("udp_send_bytes"),
+                udpSendErrors = payload.getLong("udp_send_errors"),
+                udpReceiveCalls = payload.getLong("udp_receive_calls"),
+                udpReceivePackets = payload.getLong("udp_receive_packets"),
+                udpReceiveBytes = payload.getLong("udp_receive_bytes"),
+                udpReceiveErrors = payload.getLong("udp_receive_errors"),
+                localPort = payload.getInt("local_port"),
+                lastTunReadAtUnixMillis = payload.getLong("last_tun_read_at_unix_ms"),
+                lastTunWriteAtUnixMillis = payload.getLong("last_tun_write_at_unix_ms"),
+                lastUdpSendAtUnixMillis = payload.getLong("last_udp_send_at_unix_ms"),
+                lastUdpReceiveAtUnixMillis = payload.getLong("last_udp_receive_at_unix_ms"),
+                lastUdpSendError = payload.optString("last_udp_send_error")
+                    .takeIf(String::isNotBlank),
+                lastUdpReceiveError = payload.optString("last_udp_receive_error")
+                    .takeIf(String::isNotBlank),
+                lastUdpSendErrno = payload.optInt("last_udp_send_errno")
+                    .takeIf { it != 0 },
+                lastUdpReceiveErrno = payload.optInt("last_udp_receive_errno")
+                    .takeIf { it != 0 },
+                endpoint = payload.optString("endpoint").takeIf(String::isNotBlank),
+            )
+        }
+    }
+}
 
 private data class TunnelOperationWatchdog(
     val token: TunnelOperationWatchdogToken,
@@ -363,6 +463,8 @@ internal object TunnelRuntime {
 
     @Volatile
     private var dataPlaneFuture: ScheduledFuture<*>? = null
+
+    private val dataPlaneSampleQueued = AtomicBoolean(false)
 
     @Volatile
     private var applicationContext: Context? = null
@@ -966,7 +1068,10 @@ internal object TunnelRuntime {
             val startedAt = System.nanoTime()
             TunnelLog.info("stop.begin")
             try {
-                activeSession?.let { logDataPlaneSnapshot(it, "tunnel_stopping") }
+                activeSession?.let { session ->
+                    logDataPlaneSnapshot(session, "tunnel_stopping")
+                    logNetworkTelemetrySnapshot(session, "tunnel_stopping")
+                }
                 clearActiveSession()
                 suppressBackendStateChanges.set(true)
                 val state = try {
@@ -1132,39 +1237,27 @@ internal object TunnelRuntime {
                 val expectedProfile = Awg3ProfileSnapshot.fromInterface(
                     session.config.getInterface(),
                 )
-                val physicalState = runCatching { session.monitor?.snapshotState() }
-                    .onFailure {
-                        TunnelLog.warning("tunnel.udp_rebind_network_snapshot_failed", error = it)
-                    }
-                    .getOrNull()
-                suppressBackendStateChanges.set(true)
-                try {
-                    requireState(
-                        requireBackend().setState(tunnel, Tunnel.State.DOWN, null),
-                        Tunnel.State.DOWN,
+                val activeBackend = requireBackend()
+                val before = networkTelemetry(activeBackend)
+                activeBackend.rebindUdp(tunnel)
+                val actualProfile = runtimeAwg3Profile(activeBackend)
+                if (!runtimeProfileMatches(expectedProfile, actualProfile)) {
+                    logAwg3Mismatch(
+                        "tunnel.udp_rebind_profile_mismatch",
+                        expectedProfile,
+                        actualProfile,
+                        retry = false,
                     )
-                    val replacement = replaceBackend(applicationContext)
-                    physicalState?.let { NelomaiVpnService.setPhysicalNetworks(it.networks) }
-                    requireState(
-                        replacement.setState(tunnel, Tunnel.State.UP, session.config),
-                        Tunnel.State.UP,
-                    )
-                    val actualProfile = runtimeAwg3Profile(replacement)
-                    if (!runtimeProfileMatches(expectedProfile, actualProfile)) {
-                        logAwg3Mismatch(
-                            "tunnel.udp_rebind_profile_mismatch",
-                            expectedProfile,
-                            actualProfile,
-                            retry = false,
-                        )
-                        throw TunnelOperationException("awg3_profile_apply_failed")
-                    }
-                } finally {
-                    suppressBackendStateChanges.set(false)
+                    throw TunnelOperationException("awg3_profile_apply_failed")
                 }
+                val after = networkTelemetry(activeBackend)
                 TunnelLog.info(
                     "tunnel.udp_rebind_completed",
-                    mapOf("duration_millis" to elapsedMillis(startedAt)),
+                    mapOf(
+                        "duration_millis" to elapsedMillis(startedAt),
+                        "old_local_port" to before?.localPort,
+                        "new_local_port" to after?.localPort,
+                    ),
                 )
                 stateGate.complete(SessionState.RUNNING)
             } catch (error: Throwable) {
@@ -1234,6 +1327,9 @@ internal object TunnelRuntime {
         return org.amnezia.awg.GoBackend.awgGetConfig(handle)
             ?.let(Awg3ProfileSnapshot::fromUserspace)
     }
+
+    private fun networkTelemetry(activeBackend: GoBackend = requireBackend()): NetworkTelemetry? =
+        activeBackend.getNetworkTelemetry(tunnel)?.let(NetworkTelemetry::fromJson)
 
     private fun runtimeProfileMatches(
         expected: Awg3ProfileSnapshot,
@@ -1411,18 +1507,431 @@ internal object TunnelRuntime {
         dataPlaneFuture?.cancel(false)
         dataPlaneFuture = watchdogExecutor.scheduleAtFixedRate(
             {
+                if (!dataPlaneSampleQueued.compareAndSet(false, true)) {
+                    return@scheduleAtFixedRate
+                }
                 executor.execute {
-                    val session = activeSession
-                        ?.takeIf { it.generation == sessionGeneration }
-                        ?: return@execute
-                    if (stateGate.current() == SessionState.RUNNING) {
-                        logDataPlaneSnapshot(session, "periodic")
+                    try {
+                        val session = activeSession
+                            ?.takeIf { it.generation == sessionGeneration }
+                            ?: return@execute
+                        if (stateGate.current() == SessionState.RUNNING) {
+                            inspectNetworkTelemetry(session)
+                            val now = SystemClock.elapsedRealtime()
+                            if (now - session.lastDataPlaneSnapshotElapsedMillis >=
+                                DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS * 1_000L
+                            ) {
+                                logDataPlaneSnapshot(session, "periodic")
+                                session.lastDataPlaneSnapshotElapsedMillis = now
+                            }
+                        }
+                    } finally {
+                        dataPlaneSampleQueued.set(false)
                     }
                 }
             },
-            5,
-            DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS,
+            1,
+            NETWORK_TELEMETRY_INTERVAL_SECONDS,
             TimeUnit.SECONDS,
+        )
+    }
+
+    private fun inspectNetworkTelemetry(session: ActiveTunnelSession) {
+        if (session.transport != "amneziawg_3") return
+        val now = SystemClock.elapsedRealtime()
+        val sample = try {
+            networkTelemetry() ?: return
+        } catch (error: Throwable) {
+            if (now - session.lastTelemetryErrorLoggedElapsedMillis >=
+                NETWORK_TELEMETRY_ERROR_LOG_INTERVAL_MILLIS
+            ) {
+                session.lastTelemetryErrorLoggedElapsedMillis = now
+                TunnelLog.warning("tunnel.network_telemetry_failed", error = error)
+            }
+            return
+        }
+        val previous = session.lastNetworkTelemetry
+        val tunReadDelta = counterDelta(previous?.tunReadBytes, sample.tunReadBytes)
+        val tunWriteDelta = counterDelta(previous?.tunWriteBytes, sample.tunWriteBytes)
+        val udpReceiveDelta = counterDelta(previous?.udpReceiveBytes, sample.udpReceiveBytes)
+        session.lastNetworkTelemetry = sample
+        if (tunReadDelta > 0) {
+            if (now - session.lastTunActivityElapsedMillis >
+                UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS
+            ) {
+                session.udpStallStartedElapsedMillis = now
+            } else if (session.udpStallStartedElapsedMillis == null) {
+                session.udpStallStartedElapsedMillis = now
+            }
+            session.lastTunActivityElapsedMillis = now
+        } else if (now - session.lastTunActivityElapsedMillis >
+            UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS
+        ) {
+            session.udpStallStartedElapsedMillis = null
+        }
+        if (tunWriteDelta > 0) {
+            session.lastTunWriteActivityElapsedMillis = now
+            session.udpStallStartedElapsedMillis = null
+            session.udpRecoveryArmed = true
+            session.udpRecoveryAttempts = 0
+        }
+        if (udpReceiveDelta > 0) {
+            session.lastUdpReceiveElapsedMillis = now
+        }
+
+        appendNetworkTelemetrySample(session, now, previous, sample)
+
+        session.pendingUdpControlProbe
+            ?.takeIf { now >= it.evaluateAtElapsedMillis }
+            ?.let { probe ->
+                val succeeded = try {
+                    requireBackend().handshakeProbeSucceeded(tunnel, probe.generation)
+                } catch (error: Throwable) {
+                    session.pendingUdpControlProbe = null
+                    session.udpRecoveryArmed = true
+                    TunnelLog.warning(
+                        "tunnel.udp_control_probe_measurement_failed",
+                        "udp_control_probe_failed",
+                        error,
+                    )
+                    return
+                }
+                val action = udpControlProbeAction(
+                    stage = probe.stage,
+                    succeeded = succeeded,
+                    recoveryAttempts = session.udpRecoveryAttempts,
+                )
+                TunnelLog.info(
+                    "tunnel.udp_control_probe_evaluated",
+                    mapOf(
+                        "stage" to probe.stage.name.lowercase(),
+                        "generation" to probe.generation,
+                        "succeeded" to succeeded,
+                        "action" to action.name.lowercase(),
+                        "duration_millis" to (now - probe.startedAtElapsedMillis)
+                            .coerceAtLeast(0),
+                        "old_local_port" to probe.localPortBefore,
+                        "new_local_port" to probe.localPortAfter,
+                        "tun_write_delta_bytes" to counterDelta(
+                            probe.tunWriteBytesBefore,
+                            sample.tunWriteBytes,
+                        ),
+                        "udp_receive_delta_bytes" to counterDelta(
+                            probe.udpReceiveBytesBefore,
+                            sample.udpReceiveBytes,
+                        ),
+                    ),
+                )
+                session.pendingUdpControlProbe = null
+                when (action) {
+                    UdpControlProbeAction.MARK_TRANSPORT_REACHABLE -> {
+                        session.udpRecoveryAttempts = 0
+                        session.udpStallStartedElapsedMillis = null
+                        session.udpRecoveryArmed = true
+                    }
+                    UdpControlProbeAction.REBIND -> applyUdpRecovery(session, sample)
+                    UdpControlProbeAction.RETRY -> session.udpRecoveryArmed = true
+                    UdpControlProbeAction.STOP -> {
+                        TunnelLog.warning(
+                            "tunnel.udp_recovery_exhausted",
+                            "udp_recovery_failed",
+                        )
+                        stopAfterUdpRecoveryFailure()
+                        return
+                    }
+                }
+                return
+            }
+
+        if (!shouldRecoverUdpStall(
+                transport = session.transport,
+                uptimeMillis = now - session.startedAtElapsedMillis,
+                millisSinceTunActivity = now - session.lastTunActivityElapsedMillis,
+                millisSinceTunWrite = now - session.lastTunWriteActivityElapsedMillis,
+                stallDurationMillis = session.udpStallStartedElapsedMillis?.let { now - it },
+                millisSinceRecovery = session.lastUdpRecoveryElapsedMillis?.let { now - it },
+                armed = session.udpRecoveryArmed,
+            )
+        ) {
+            return
+        }
+
+        session.udpRecoveryArmed = false
+        session.lastUdpRecoveryElapsedMillis = now
+        TunnelLog.info(
+            "tunnel.udp_stall_detected",
+            mapOf(
+                "millis_since_tun_activity" to now - session.lastTunActivityElapsedMillis,
+                "millis_since_tun_write" to now - session.lastTunWriteActivityElapsedMillis,
+                "millis_since_udp_receive" to now - session.lastUdpReceiveElapsedMillis,
+                "local_port" to sample.localPort,
+                "last_udp_send_error" to sample.lastUdpSendError,
+                "last_udp_receive_error" to sample.lastUdpReceiveError,
+                "last_udp_send_errno" to sample.lastUdpSendErrno,
+                "last_udp_receive_errno" to sample.lastUdpReceiveErrno,
+                "samples" to JSONArray(session.recentNetworkTelemetry.toList()),
+            ),
+        )
+        try {
+            startUdpControlProbe(
+                session = session,
+                stage = UdpControlProbeStage.BEFORE_REBIND,
+                baseline = sample,
+                localPortBefore = sample.localPort,
+                localPortAfter = sample.localPort,
+            )
+        } catch (error: Throwable) {
+            handleUdpControlProbeStartFailure(
+                session = session,
+                stage = UdpControlProbeStage.BEFORE_REBIND,
+                baseline = sample,
+                cause = error,
+            )
+        }
+    }
+
+    private fun startUdpControlProbe(
+        session: ActiveTunnelSession,
+        stage: UdpControlProbeStage,
+        baseline: NetworkTelemetry,
+        localPortBefore: Int,
+        localPortAfter: Int,
+    ) {
+        val activeBackend = requireBackend()
+        val startedAt = SystemClock.elapsedRealtime()
+        val generation = activeBackend.startHandshakeProbe(tunnel)
+        val timeoutMillis = activeBackend.handshakeProbeTimeoutMillis(tunnel)
+        val completedAt = SystemClock.elapsedRealtime()
+        session.pendingUdpControlProbe = PendingUdpControlProbe(
+            stage = stage,
+            generation = generation,
+            startedAtElapsedMillis = startedAt,
+            evaluateAtElapsedMillis = completedAt + timeoutMillis,
+            tunWriteBytesBefore = baseline.tunWriteBytes,
+            udpReceiveBytesBefore = baseline.udpReceiveBytes,
+            localPortBefore = localPortBefore,
+            localPortAfter = localPortAfter,
+        )
+        TunnelLog.info(
+            "tunnel.udp_control_probe_started",
+            mapOf(
+                "stage" to stage.name.lowercase(),
+                "generation" to generation,
+                "evaluation_timeout_millis" to timeoutMillis,
+                "duration_millis" to (completedAt - startedAt).coerceAtLeast(0),
+                "old_local_port" to localPortBefore,
+                "new_local_port" to localPortAfter,
+            ),
+        )
+    }
+
+    private fun applyUdpRecovery(session: ActiveTunnelSession, sample: NetworkTelemetry) {
+        session.udpRecoveryAttempts += 1
+        session.lastUdpRecoveryElapsedMillis = SystemClock.elapsedRealtime()
+        val activeBackend = requireBackend()
+        val startedAt = SystemClock.elapsedRealtime()
+        val rebound = try {
+            activeBackend.rebindUdp(tunnel)
+            networkTelemetry(activeBackend) ?: sample
+        } catch (error: Throwable) {
+            TunnelLog.warning("tunnel.udp_recovery_failed", "udp_rebind_failed", error)
+            stopAfterUdpRecoveryFailure()
+            return
+        }
+        val completedAt = SystemClock.elapsedRealtime()
+        TunnelLog.info(
+            "tunnel.udp_recovery_applied",
+            mapOf(
+                "attempt" to session.udpRecoveryAttempts,
+                "duration_millis" to (completedAt - startedAt).coerceAtLeast(0),
+                "old_local_port" to sample.localPort,
+                "new_local_port" to rebound.localPort,
+            ),
+        )
+        try {
+            startUdpControlProbe(
+                session = session,
+                stage = UdpControlProbeStage.AFTER_REBIND,
+                baseline = rebound,
+                localPortBefore = sample.localPort,
+                localPortAfter = rebound.localPort,
+            )
+        } catch (error: Throwable) {
+            handleUdpControlProbeStartFailure(
+                session = session,
+                stage = UdpControlProbeStage.AFTER_REBIND,
+                baseline = rebound,
+                cause = error,
+            )
+        }
+    }
+
+    private fun handleUdpControlProbeStartFailure(
+        session: ActiveTunnelSession,
+        stage: UdpControlProbeStage,
+        baseline: NetworkTelemetry,
+        cause: Throwable,
+    ) {
+        val action = udpControlProbeStartFailureAction(
+            stage = stage,
+            recoveryAttempts = session.udpRecoveryAttempts,
+        )
+        TunnelLog.warning(
+            "tunnel.udp_control_probe_start_failed",
+            "udp_control_probe_failed",
+            cause,
+        )
+        TunnelLog.info(
+            "tunnel.udp_control_probe_start_failure_action",
+            mapOf(
+                "stage" to stage.name.lowercase(),
+                "action" to action.name.lowercase(),
+                "attempt" to session.udpRecoveryAttempts,
+                "local_port" to baseline.localPort,
+            ),
+        )
+        when (action) {
+            UdpControlProbeAction.REBIND,
+            UdpControlProbeAction.RETRY,
+            -> applyUdpRecovery(session, baseline)
+            UdpControlProbeAction.STOP -> {
+                TunnelLog.warning(
+                    "tunnel.udp_recovery_exhausted",
+                    "udp_recovery_failed",
+                )
+                stopAfterUdpRecoveryFailure()
+            }
+            UdpControlProbeAction.MARK_TRANSPORT_REACHABLE -> error(
+                "unreachable_successful_probe_start_failure",
+            )
+        }
+    }
+
+    private fun stopAfterUdpRecoveryFailure() {
+        val context = applicationContext ?: run {
+            suppressBackendStateChanges.set(true)
+            try {
+                runCatching { requireBackend().setState(tunnel, Tunnel.State.DOWN, null) }
+            } finally {
+                suppressBackendStateChanges.set(false)
+            }
+            clearActiveSession()
+            AndroidSplitTunnel.clear()
+            stateGate.complete(SessionState.FAILED)
+            return
+        }
+        stop(
+            TUNNEL_API_VERSION,
+            { state, _ ->
+                if (state != SessionState.STOPPED) {
+                    runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
+                        .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+                    NelomaiVpnService.stopForegroundService()
+                }
+                QuickTunnelController.updateState(
+                    context,
+                    state,
+                    desiredActive = false,
+                    changed = true,
+                )
+                TunnelPlugin.refreshQuickTile(context)
+            },
+            { code ->
+                TunnelLog.warning("tunnel.udp_recovery_stop_failed", code)
+                runCatching { AutomaticDiagnostics.onTunnelStopped(context) }
+                    .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
+                stateGate.complete(SessionState.FAILED)
+                QuickTunnelController.updateState(
+                    context,
+                    SessionState.FAILED,
+                    desiredActive = false,
+                    changed = true,
+                )
+                TunnelPlugin.refreshQuickTile(context)
+                NelomaiVpnService.stopForegroundService()
+            },
+        )
+    }
+
+    private fun appendNetworkTelemetrySample(
+        session: ActiveTunnelSession,
+        now: Long,
+        previous: NetworkTelemetry?,
+        sample: NetworkTelemetry,
+    ) {
+        val tunReadDelta = counterDelta(previous?.tunReadBytes, sample.tunReadBytes)
+        val tunWriteDelta = counterDelta(previous?.tunWriteBytes, sample.tunWriteBytes)
+        val udpSendDelta = counterDelta(previous?.udpSendBytes, sample.udpSendBytes)
+        val udpReceiveDelta = counterDelta(previous?.udpReceiveBytes, sample.udpReceiveBytes)
+        val record = JSONObject().apply {
+            put("elapsed_millis", (now - session.startedAtElapsedMillis).coerceAtLeast(0))
+            put(
+                "tun_read_delta_packets",
+                counterDelta(previous?.tunReadPackets, sample.tunReadPackets),
+            )
+            put("tun_read_delta_bytes", tunReadDelta)
+            put(
+                "tun_write_delta_packets",
+                counterDelta(previous?.tunWritePackets, sample.tunWritePackets),
+            )
+            put("tun_write_delta_bytes", tunWriteDelta)
+            put(
+                "udp_send_delta_packets",
+                counterDelta(previous?.udpSendPackets, sample.udpSendPackets),
+            )
+            put("udp_send_delta_bytes", udpSendDelta)
+            put(
+                "udp_receive_delta_packets",
+                counterDelta(previous?.udpReceivePackets, sample.udpReceivePackets),
+            )
+            put("udp_receive_delta_bytes", udpReceiveDelta)
+            put("tun_read_bytes", sample.tunReadBytes)
+            put("tun_write_bytes", sample.tunWriteBytes)
+            put("udp_send_bytes", sample.udpSendBytes)
+            put("udp_receive_bytes", sample.udpReceiveBytes)
+            put("tun_read_errors", sample.tunReadErrors)
+            put("tun_write_errors", sample.tunWriteErrors)
+            put("udp_send_errors", sample.udpSendErrors)
+            put("udp_receive_errors", sample.udpReceiveErrors)
+            put("local_port", sample.localPort)
+            put("last_tun_read_at_unix_ms", sample.lastTunReadAtUnixMillis)
+            put("last_tun_write_at_unix_ms", sample.lastTunWriteAtUnixMillis)
+            put("last_udp_send_at_unix_ms", sample.lastUdpSendAtUnixMillis)
+            put("last_udp_receive_at_unix_ms", sample.lastUdpReceiveAtUnixMillis)
+            sample.lastUdpSendErrno?.let { put("last_udp_send_errno", it) }
+            sample.lastUdpReceiveErrno?.let { put("last_udp_receive_errno", it) }
+            sample.endpoint?.let { put("endpoint", it) }
+        }
+        session.recentNetworkTelemetry.addLast(record)
+        while (session.recentNetworkTelemetry.size > NETWORK_TELEMETRY_RING_SAMPLES) {
+            session.recentNetworkTelemetry.removeFirst()
+        }
+    }
+
+    private fun logNetworkTelemetrySnapshot(session: ActiveTunnelSession, reason: String) {
+        if (session.transport != "amneziawg_3") return
+        val now = SystemClock.elapsedRealtime()
+        val sample = runCatching { networkTelemetry() }
+            .onFailure {
+                TunnelLog.warning("tunnel.network_telemetry_snapshot_failed", error = it)
+            }
+            .getOrNull()
+        if (sample != null) {
+            val previous = session.lastNetworkTelemetry
+            session.lastNetworkTelemetry = sample
+            appendNetworkTelemetrySample(session, now, previous, sample)
+        }
+        TunnelLog.info(
+            "tunnel.network_telemetry_snapshot",
+            mapOf(
+                "reason" to reason.take(64),
+                "local_port" to sample?.localPort,
+                "last_udp_send_error" to sample?.lastUdpSendError,
+                "last_udp_receive_error" to sample?.lastUdpReceiveError,
+                "last_udp_send_errno" to sample?.lastUdpSendErrno,
+                "last_udp_receive_errno" to sample?.lastUdpReceiveErrno,
+                "samples" to JSONArray(session.recentNetworkTelemetry.toList()),
+            ),
         )
     }
 
@@ -1529,7 +2038,53 @@ internal fun tunnelDataPlaneState(
     else -> "handshake_idle"
 }
 
+internal fun shouldRecoverUdpStall(
+    transport: String,
+    uptimeMillis: Long,
+    millisSinceTunActivity: Long,
+    millisSinceTunWrite: Long,
+    stallDurationMillis: Long?,
+    millisSinceRecovery: Long?,
+    armed: Boolean,
+): Boolean =
+    transport == "amneziawg_3" &&
+        armed &&
+        uptimeMillis >= UDP_RECOVERY_MINIMUM_UPTIME_MILLIS &&
+        millisSinceTunActivity in 0..UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS &&
+        millisSinceTunWrite >= UDP_RECOVERY_STALL_MILLIS &&
+        stallDurationMillis != null &&
+        stallDurationMillis >= UDP_RECOVERY_STALL_MILLIS &&
+        (millisSinceRecovery == null || millisSinceRecovery >= UDP_RECOVERY_COOLDOWN_MILLIS)
+
+internal fun udpControlProbeAction(
+    stage: UdpControlProbeStage,
+    succeeded: Boolean,
+    recoveryAttempts: Int,
+): UdpControlProbeAction = when {
+    succeeded -> UdpControlProbeAction.MARK_TRANSPORT_REACHABLE
+    stage == UdpControlProbeStage.BEFORE_REBIND -> UdpControlProbeAction.REBIND
+    recoveryAttempts < UDP_RECOVERY_MAX_ATTEMPTS -> UdpControlProbeAction.RETRY
+    else -> UdpControlProbeAction.STOP
+}
+
+internal fun udpControlProbeStartFailureAction(
+    stage: UdpControlProbeStage,
+    recoveryAttempts: Int,
+): UdpControlProbeAction = when {
+    recoveryAttempts >= UDP_RECOVERY_MAX_ATTEMPTS -> UdpControlProbeAction.STOP
+    stage == UdpControlProbeStage.BEFORE_REBIND -> UdpControlProbeAction.REBIND
+    else -> UdpControlProbeAction.RETRY
+}
+
 private const val DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS = 5L * 60L
+private const val NETWORK_TELEMETRY_INTERVAL_SECONDS = 1L
+private const val NETWORK_TELEMETRY_RING_SAMPLES = 45
+private const val NETWORK_TELEMETRY_ERROR_LOG_INTERVAL_MILLIS = 60_000L
+private const val UDP_RECOVERY_MINIMUM_UPTIME_MILLIS = 10_000L
+private const val UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS = 2_500L
+private const val UDP_RECOVERY_STALL_MILLIS = 5_000L
+private const val UDP_RECOVERY_COOLDOWN_MILLIS = 60_000L
+private const val UDP_RECOVERY_MAX_ATTEMPTS = 2
 private const val PINNED_AWG_GO_BACKEND_BUILD = "git-08d68cd"
 private const val GO_BACKEND_MEMORY_LIMIT = "256MiB"
 

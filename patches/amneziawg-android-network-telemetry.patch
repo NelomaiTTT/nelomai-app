@@ -1,0 +1,682 @@
+diff --git a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
+index 3f168208..a8e936b3 100644
+--- a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
++++ b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
+@@ -6,10 +6,25 @@ public class GoBackend {
+     @Nullable
+     public static native String awgGetConfig(int handle);
+ 
++    @Nullable
++    public static native String awgGetNetworkTelemetry(int handle);
++
+     public static native int awgGetSocketV4(int handle);
+ 
+     public static native int awgGetSocketV6(int handle);
+ 
++    public static native int awgCloseUdp(int handle);
++
++    public static native int awgRebindUdp(int handle);
++
++    public static native int awgSendKeepalives(int handle);
++
++    public static native long awgStartHandshakeProbe(int handle);
++
++    public static native int awgHandshakeProbeStatus(int handle, long generation);
++
++    public static native long awgHandshakeProbeTimeoutMillis(int handle);
++
+     public static native void awgTurnOff(int handle);
+ 
+     public static native int awgTurnOn(String ifName, int tunFd, String settings);
+diff --git a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
+index 2bb8026a..de358507 100644
+--- a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
++++ b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
+@@ -171,6 +171,69 @@ public final class GoBackend implements Backend {
+         return stats;
+     }
+ 
++    /** Return transport telemetry collected below the WireGuard device counters. */
++    @Nullable
++    public String getNetworkTelemetry(final Tunnel tunnel) {
++        if (tunnel != currentTunnel || currentTunnelHandle == -1)
++            return null;
++        return awgGetNetworkTelemetry(currentTunnelHandle);
++    }
++
++    /** Rotate only the userspace UDP sockets without rebuilding the Android VPN interface. */
++    public void rebindUdp(final Tunnel tunnel) throws Exception {
++        if (tunnel != currentTunnel || currentTunnelHandle == -1)
++            throw new IllegalStateException("Tunnel is not active");
++
++        final VpnService service;
++        try {
++            service = vpnService.get(2, TimeUnit.SECONDS);
++        } catch (final TimeoutException e) {
++            throw new IllegalStateException("VPN service is unavailable", e);
++        }
++        if (awgRebindUdp(currentTunnelHandle) != 0)
++            throw new IllegalStateException("Unable to rebind UDP sockets");
++        final int socketV4 = awgGetSocketV4(currentTunnelHandle);
++        final int socketV6 = awgGetSocketV6(currentTunnelHandle);
++        final boolean socketV4Protected = socketV4 < 0 || service.protect(socketV4);
++        final boolean socketV6Protected = socketV6 < 0 || service.protect(socketV6);
++        if (!socketV4Protected || !socketV6Protected) {
++            awgCloseUdp(currentTunnelHandle);
++            throw new IllegalStateException("Unable to protect rebound UDP sockets");
++        }
++        if (awgSendKeepalives(currentTunnelHandle) != 0)
++            throw new IllegalStateException("Unable to send keepalive after UDP rebind");
++    }
++
++    /** Force a fresh authenticated handshake without expiring the data-plane keypair. */
++    public long startHandshakeProbe(final Tunnel tunnel) {
++        if (tunnel != currentTunnel || currentTunnelHandle == -1)
++            throw new IllegalStateException("Tunnel is not active");
++        final long generation = awgStartHandshakeProbe(currentTunnelHandle);
++        if (generation <= 0)
++            throw new IllegalStateException("Unable to start handshake probe");
++        return generation;
++    }
++
++    /** Report whether the exact native handshake probe generation completed. */
++    public boolean handshakeProbeSucceeded(final Tunnel tunnel, final long generation) {
++        if (tunnel != currentTunnel || currentTunnelHandle == -1)
++            throw new IllegalStateException("Tunnel is not active");
++        final int status = awgHandshakeProbeStatus(currentTunnelHandle, generation);
++        if (status < 0)
++            throw new IllegalStateException("Unable to read handshake probe status");
++        return status == 1;
++    }
++
++    /** Return the native observation window including the configured first retry. */
++    public long handshakeProbeTimeoutMillis(final Tunnel tunnel) {
++        if (tunnel != currentTunnel || currentTunnelHandle == -1)
++            throw new IllegalStateException("Tunnel is not active");
++        final long timeoutMillis = awgHandshakeProbeTimeoutMillis(currentTunnelHandle);
++        if (timeoutMillis <= 0)
++            throw new IllegalStateException("Unable to read handshake probe timeout");
++        return timeoutMillis;
++    }
++
+ 
+     /**
+      * Get the last handshake time for a given {@link Tunnel}.
+diff --git a/tunnel/tools/libwg-go/Makefile b/tunnel/tools/libwg-go/Makefile
+index 9b9c081f..9045ea05 100644
+--- a/tunnel/tools/libwg-go/Makefile
++++ b/tunnel/tools/libwg-go/Makefile
+@@ -29,6 +29,14 @@ GO_HASH_linux-amd64 := 68097bd680839cbc9d464a0edce4f7c333975e27a90246890e9f1078c
+ 
+ default: $(DESTDIR)/libwg-go.so
+ 
++WORKSPACE_ROOT := ../../../../..
++AMNEZIAWG_GO_ROOT := ../../../../amneziawg-go
++NATIVE_SOURCE_PATTERN := \( -name '*.go' -o -name '*.s' -o -name '*.S' -o -name '*.c' -o -name '*.h' \)
++LIBWG_GO_SOURCES := $(shell find . -type f $(NATIVE_SOURCE_PATTERN))
++AMNEZIAWG_GO_SOURCES := $(shell find $(AMNEZIAWG_GO_ROOT) -type f $(NATIVE_SOURCE_PATTERN))
++GO_WORKSPACE_FILES := $(wildcard go.mod go.sum $(WORKSPACE_ROOT)/go.work $(WORKSPACE_ROOT)/go.work.sum)
++GO_BUILD_FILES := Makefile $(GO_WORKSPACE_FILES)
++
+ $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL):
+ 	mkdir -p "$(dir $@)"
+ 	flock "$@.lock" -c ' \
+@@ -46,7 +54,7 @@ $(BUILDDIR)/go-$(GO_VERSION)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_T
+ 	touch "$@"'
+ 
+ $(DESTDIR)/libwg-go.so: export PATH := $(BUILDDIR)/go-$(GO_VERSION)/bin/:$(PATH)
+-$(DESTDIR)/libwg-go.so: $(BUILDDIR)/go-$(GO_VERSION)/.prepared go.mod
++$(DESTDIR)/libwg-go.so: $(BUILDDIR)/go-$(GO_VERSION)/.prepared $(GO_BUILD_FILES) $(LIBWG_GO_SOURCES) $(AMNEZIAWG_GO_SOURCES)
+ 	go build -tags linux -ldflags="-X github.com/amnezia-vpn/amneziawg-go/ipc.socketDirectory=/data/data/$(ANDROID_PACKAGE_NAME)/cache/amneziawg -buildid=" -v -trimpath -buildvcs=false -o "$@" -buildmode c-shared
+ 
+ .DELETE_ON_ERROR:
+diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
+index 3af343d1..e9f34d73 100644
+--- a/tunnel/tools/libwg-go/api-android.go
++++ b/tunnel/tools/libwg-go/api-android.go
+@@ -10,6 +10,8 @@ package main
+ import "C"
+ 
+ import (
++	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"math"
+ 	"net"
+@@ -18,6 +20,10 @@ import (
+ 	"runtime"
+ 	"runtime/debug"
+ 	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
+ 	"unsafe"
+ 
+ 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+@@ -46,11 +52,285 @@ func (l AndroidLogger) Printf(format string, args ...interface{}) {
+ }
+ 
+ type TunnelHandle struct {
+-	device *device.Device
+-	uapi   net.Listener
++	device    *device.Device
++	uapi      net.Listener
++	telemetry *tunnelTelemetry
++}
++
++type tunnelTelemetry struct {
++	tunReadPackets  atomic.Uint64
++	tunReadBytes    atomic.Uint64
++	tunReadErrors   atomic.Uint64
++	tunWritePackets atomic.Uint64
++	tunWriteBytes   atomic.Uint64
++	tunWriteErrors  atomic.Uint64
++	udpSendCalls    atomic.Uint64
++	udpSendPackets  atomic.Uint64
++	udpSendBytes    atomic.Uint64
++	udpSendErrors   atomic.Uint64
++	udpRecvCalls    atomic.Uint64
++	udpRecvPackets  atomic.Uint64
++	udpRecvBytes    atomic.Uint64
++	udpRecvErrors   atomic.Uint64
++	localPort       atomic.Uint32
++	lastTunReadAt   atomic.Int64
++	lastTunWriteAt  atomic.Int64
++	lastUdpSendAt   atomic.Int64
++	lastUdpRecvAt   atomic.Int64
++	lastSendErrno   atomic.Int64
++	lastRecvErrno   atomic.Int64
++	endpointAt      atomic.Int64
++	lastSendError   atomic.Value
++	lastRecvError   atomic.Value
++	endpoint        atomic.Value
++}
++
++type tunnelTelemetrySnapshot struct {
++	TunReadPackets  uint64 `json:"tun_read_packets"`
++	TunReadBytes    uint64 `json:"tun_read_bytes"`
++	TunReadErrors   uint64 `json:"tun_read_errors"`
++	TunWritePackets uint64 `json:"tun_write_packets"`
++	TunWriteBytes   uint64 `json:"tun_write_bytes"`
++	TunWriteErrors  uint64 `json:"tun_write_errors"`
++	UdpSendCalls    uint64 `json:"udp_send_calls"`
++	UdpSendPackets  uint64 `json:"udp_send_packets"`
++	UdpSendBytes    uint64 `json:"udp_send_bytes"`
++	UdpSendErrors   uint64 `json:"udp_send_errors"`
++	UdpRecvCalls    uint64 `json:"udp_receive_calls"`
++	UdpRecvPackets  uint64 `json:"udp_receive_packets"`
++	UdpRecvBytes    uint64 `json:"udp_receive_bytes"`
++	UdpRecvErrors   uint64 `json:"udp_receive_errors"`
++	LocalPort       uint16 `json:"local_port"`
++	LastTunReadAt   int64  `json:"last_tun_read_at_unix_ms"`
++	LastTunWriteAt  int64  `json:"last_tun_write_at_unix_ms"`
++	LastUdpSendAt   int64  `json:"last_udp_send_at_unix_ms"`
++	LastUdpRecvAt   int64  `json:"last_udp_receive_at_unix_ms"`
++	LastSendError   string `json:"last_udp_send_error,omitempty"`
++	LastRecvError   string `json:"last_udp_receive_error,omitempty"`
++	LastSendErrno   int    `json:"last_udp_send_errno,omitempty"`
++	LastRecvErrno   int    `json:"last_udp_receive_errno,omitempty"`
++	Endpoint        string `json:"endpoint,omitempty"`
++}
++
++func nowUnixMillis() int64 {
++	return time.Now().UnixMilli()
++}
++
++func diagnosticError(err error) string {
++	if err == nil {
++		return ""
++	}
++	value := err.Error()
++	if len(value) > 160 {
++		return value[:160]
++	}
++	return value
++}
++
++func diagnosticErrno(err error) int {
++	var errno syscall.Errno
++	if errors.As(err, &errno) {
++		return int(errno)
++	}
++	return 0
++}
++
++func atomicString(value *atomic.Value) string {
++	stored := value.Load()
++	if stored == nil {
++		return ""
++	}
++	return stored.(string)
++}
++
++func (t *tunnelTelemetry) shouldCaptureEndpoint(now int64) bool {
++	if now <= 0 {
++		return false
++	}
++	for {
++		previous := t.endpointAt.Load()
++		if previous > 0 && now >= previous && now-previous < 1_000 {
++			return false
++		}
++		if t.endpointAt.CompareAndSwap(previous, now) {
++			return true
++		}
++	}
++}
++
++func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
++	return tunnelTelemetrySnapshot{
++		TunReadPackets: t.tunReadPackets.Load(), TunReadBytes: t.tunReadBytes.Load(),
++		TunReadErrors: t.tunReadErrors.Load(), TunWritePackets: t.tunWritePackets.Load(),
++		TunWriteBytes: t.tunWriteBytes.Load(), TunWriteErrors: t.tunWriteErrors.Load(),
++		UdpSendCalls: t.udpSendCalls.Load(), UdpSendPackets: t.udpSendPackets.Load(),
++		UdpSendBytes: t.udpSendBytes.Load(), UdpSendErrors: t.udpSendErrors.Load(),
++		UdpRecvCalls: t.udpRecvCalls.Load(), UdpRecvPackets: t.udpRecvPackets.Load(),
++		UdpRecvBytes: t.udpRecvBytes.Load(), UdpRecvErrors: t.udpRecvErrors.Load(),
++		LocalPort: uint16(t.localPort.Load()), LastTunReadAt: t.lastTunReadAt.Load(),
++		LastTunWriteAt: t.lastTunWriteAt.Load(), LastUdpSendAt: t.lastUdpSendAt.Load(),
++		LastUdpRecvAt: t.lastUdpRecvAt.Load(), LastSendError: atomicString(&t.lastSendError),
++		LastRecvError: atomicString(&t.lastRecvError), Endpoint: atomicString(&t.endpoint),
++		LastSendErrno: int(t.lastSendErrno.Load()), LastRecvErrno: int(t.lastRecvErrno.Load()),
++	}
++}
++
++type diagnosticTun struct {
++	tun.Device
++	telemetry *tunnelTelemetry
++}
++
++func (d *diagnosticTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	n, err := d.Device.Read(bufs, sizes, offset)
++	var bytes uint64
++	for i := 0; i < n && i < len(sizes); i++ {
++		if sizes[i] > 0 {
++			bytes += uint64(sizes[i])
++		}
++	}
++	d.telemetry.tunReadPackets.Add(uint64(max(n, 0)))
++	d.telemetry.tunReadBytes.Add(bytes)
++	if n > 0 {
++		d.telemetry.lastTunReadAt.Store(nowUnixMillis())
++	}
++	if err != nil {
++		d.telemetry.tunReadErrors.Add(1)
++	}
++	return n, err
++}
++
++func (d *diagnosticTun) Write(bufs [][]byte, offset int) (int, error) {
++	n, err := d.Device.Write(bufs, offset)
++	var bytes uint64
++	var packets uint64
++	if err == nil {
++		for _, buffer := range bufs {
++			if len(buffer) > offset {
++				bytes += uint64(len(buffer) - offset)
++				packets++
++			}
++		}
++	} else if n > 0 {
++		// Android's native TUN returns the number of bytes written on partial success.
++		bytes = uint64(n)
++		// NativeTun exposes only the total bytes written on an error. A positive
++		// total guarantees at least one complete TUN packet, but not its exact count.
++		packets = 1
++	}
++	d.telemetry.tunWritePackets.Add(packets)
++	d.telemetry.tunWriteBytes.Add(bytes)
++	if n > 0 {
++		d.telemetry.lastTunWriteAt.Store(nowUnixMillis())
++	}
++	if err != nil {
++		d.telemetry.tunWriteErrors.Add(1)
++	}
++	return n, err
++}
++
++type diagnosticBind struct {
++	conn.Bind
++	telemetry *tunnelTelemetry
++}
++
++func (d *diagnosticBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
++	functions, actualPort, err := d.Bind.Open(port)
++	if err == nil {
++		d.telemetry.localPort.Store(uint32(actualPort))
++	} else {
++		d.telemetry.localPort.Store(0)
++		d.telemetry.udpRecvErrors.Add(1)
++		d.telemetry.lastRecvError.Store(diagnosticError(err))
++		d.telemetry.lastRecvErrno.Store(int64(diagnosticErrno(err)))
++	}
++	if err != nil {
++		return functions, actualPort, err
++	}
++	wrapped := make([]conn.ReceiveFunc, len(functions))
++	for i, receive := range functions {
++		receive := receive
++		wrapped[i] = func(packets [][]byte, sizes []int, endpoints []conn.Endpoint) (int, error) {
++			n, receiveErr := receive(packets, sizes, endpoints)
++			var bytes uint64
++			var endpoint conn.Endpoint
++			for index := 0; index < n && index < len(sizes); index++ {
++				if sizes[index] > 0 {
++					bytes += uint64(sizes[index])
++				}
++				if endpoint == nil && index < len(endpoints) && endpoints[index] != nil {
++					endpoint = endpoints[index]
++				}
++			}
++			d.telemetry.udpRecvCalls.Add(1)
++			d.telemetry.udpRecvPackets.Add(uint64(max(n, 0)))
++			d.telemetry.udpRecvBytes.Add(bytes)
++			var now int64
++			if n > 0 {
++				now = nowUnixMillis()
++				d.telemetry.lastUdpRecvAt.Store(now)
++			}
++			if endpoint != nil && d.telemetry.shouldCaptureEndpoint(now) {
++				d.telemetry.endpoint.Store(endpoint.DstToString())
++			}
++			if receiveErr != nil && !errors.Is(receiveErr, net.ErrClosed) {
++				d.telemetry.udpRecvErrors.Add(1)
++				d.telemetry.lastRecvError.Store(diagnosticError(receiveErr))
++				d.telemetry.lastRecvErrno.Store(int64(diagnosticErrno(receiveErr)))
++			}
++			return n, receiveErr
++		}
++	}
++	return wrapped, actualPort, nil
++}
++
++func (d *diagnosticBind) Send(bufs [][]byte, endpoint conn.Endpoint) error {
++	var bytes uint64
++	for _, buffer := range bufs {
++		bytes += uint64(len(buffer))
++	}
++	err := d.Bind.Send(bufs, endpoint)
++	d.telemetry.udpSendCalls.Add(1)
++	now := nowUnixMillis()
++	d.telemetry.lastUdpSendAt.Store(now)
++	if endpoint != nil && d.telemetry.shouldCaptureEndpoint(now) {
++		d.telemetry.endpoint.Store(endpoint.DstToString())
++	}
++	if err != nil {
++		d.telemetry.udpSendErrors.Add(1)
++		d.telemetry.lastSendError.Store(diagnosticError(err))
++		d.telemetry.lastSendErrno.Store(int64(diagnosticErrno(err)))
++	} else {
++		d.telemetry.udpSendPackets.Add(uint64(len(bufs)))
++		d.telemetry.udpSendBytes.Add(bytes)
++	}
++	return err
++}
++
++func (d *diagnosticBind) PeekLookAtSocketFd4() (int, error) {
++	peek, ok := d.Bind.(conn.PeekLookAtSocketFd)
++	if !ok {
++		return -1, fmt.Errorf("socket inspection unavailable")
++	}
++	return peek.PeekLookAtSocketFd4()
++}
++
++func (d *diagnosticBind) PeekLookAtSocketFd6() (int, error) {
++	peek, ok := d.Bind.(conn.PeekLookAtSocketFd)
++	if !ok {
++		return -1, fmt.Errorf("socket inspection unavailable")
++	}
++	return peek.PeekLookAtSocketFd6()
+ }
+ 
+ var tunnelHandles map[int32]TunnelHandle
++var tunnelHandlesMutex sync.RWMutex
++
++func lookupTunnelHandle(tunnelHandle int32) (TunnelHandle, bool) {
++	tunnelHandlesMutex.RLock()
++	defer tunnelHandlesMutex.RUnlock()
++	handle, ok := tunnelHandles[tunnelHandle]
++	return handle, ok
++}
+ 
+ func init() {
+ 	tunnelHandles = make(map[int32]TunnelHandle)
+@@ -80,7 +360,7 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
+ 	}
+ 
+-	tun, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
++	nativeTun, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
+ 	if err != nil {
+ 		unix.Close(int(tunFd))
+ 		logger.Errorf("CreateUnmonitoredTUNFromFD: %v", err)
+@@ -88,7 +368,10 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	}
+ 
+ 	logger.Verbosef("Attaching to interface %v", name)
+-	device := device.NewDevice(tun, conn.NewStdNetBind(), logger)
++	telemetry := new(tunnelTelemetry)
++	diagnosticTun := &diagnosticTun{Device: nativeTun, telemetry: telemetry}
++	diagnosticBind := &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
++	device := device.NewDevice(diagnosticTun, diagnosticBind, logger)
+ 
+ 	err = device.IpcSet(settings)
+ 	if err != nil {
+@@ -131,6 +414,8 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	logger.Verbosef("Device started")
+ 
+ 	var i int32
++	tunnelHandlesMutex.Lock()
++	defer tunnelHandlesMutex.Unlock()
+ 	for i = 0; i < math.MaxInt32; i++ {
+ 		if _, exists := tunnelHandles[i]; !exists {
+ 			break
+@@ -142,17 +427,20 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 		device.Close()
+ 		return -1
+ 	}
+-	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi}
++	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi, telemetry: telemetry}
+ 	return i
+ }
+ 
+ //export awgTurnOff
+ func awgTurnOff(tunnelHandle int32) {
++	tunnelHandlesMutex.Lock()
+ 	handle, ok := tunnelHandles[tunnelHandle]
+ 	if !ok {
++		tunnelHandlesMutex.Unlock()
+ 		return
+ 	}
+ 	delete(tunnelHandles, tunnelHandle)
++	tunnelHandlesMutex.Unlock()
+ 	if handle.uapi != nil {
+ 		handle.uapi.Close()
+ 	}
+@@ -161,7 +449,7 @@ func awgTurnOff(tunnelHandle int32) {
+ 
+ //export awgGetSocketV4
+ func awgGetSocketV4(tunnelHandle int32) int32 {
+-	handle, ok := tunnelHandles[tunnelHandle]
++	handle, ok := lookupTunnelHandle(tunnelHandle)
+ 	if !ok {
+ 		return -1
+ 	}
+@@ -178,7 +466,7 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
+ 
+ //export awgGetSocketV6
+ func awgGetSocketV6(tunnelHandle int32) int32 {
+-	handle, ok := tunnelHandles[tunnelHandle]
++	handle, ok := lookupTunnelHandle(tunnelHandle)
+ 	if !ok {
+ 		return -1
+ 	}
+@@ -195,7 +483,7 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
+ 
+ //export awgGetConfig
+ func awgGetConfig(tunnelHandle int32) *C.char {
+-	handle, ok := tunnelHandles[tunnelHandle]
++	handle, ok := lookupTunnelHandle(tunnelHandle)
+ 	if !ok {
+ 		return nil
+ 	}
+@@ -206,6 +494,92 @@ func awgGetConfig(tunnelHandle int32) *C.char {
+ 	return C.CString(settings)
+ }
+ 
++//export awgGetNetworkTelemetry
++func awgGetNetworkTelemetry(tunnelHandle int32) *C.char {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok || handle.telemetry == nil {
++		return nil
++	}
++	encoded, err := json.Marshal(handle.telemetry.snapshot())
++	if err != nil {
++		return nil
++	}
++	return C.CString(string(encoded))
++}
++
++//export awgCloseUdp
++func awgCloseUdp(tunnelHandle int32) int32 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok {
++		return -1
++	}
++	if err := handle.device.BindClose(); err != nil {
++		return -1
++	}
++	if handle.telemetry != nil {
++		handle.telemetry.localPort.Store(0)
++	}
++	return 0
++}
++
++//export awgRebindUdp
++func awgRebindUdp(tunnelHandle int32) int32 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok {
++		return -1
++	}
++	if err := handle.device.IpcSet("listen_port=0\n\n"); err != nil {
++		return -1
++	}
++	return 0
++}
++
++//export awgSendKeepalives
++func awgSendKeepalives(tunnelHandle int32) int32 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok {
++		return -1
++	}
++	if handle.device.SendKeepalivesToAllRunningPeers() == 0 {
++		return -1
++	}
++	return 0
++}
++
++//export awgStartHandshakeProbe
++func awgStartHandshakeProbe(tunnelHandle int32) int64 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok {
++		return -1
++	}
++	generation := handle.device.StartHandshakeProbe()
++	if generation == 0 || generation > math.MaxInt64 {
++		return -1
++	}
++	return int64(generation)
++}
++
++//export awgHandshakeProbeStatus
++func awgHandshakeProbeStatus(tunnelHandle int32, generation int64) int32 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok || generation <= 0 {
++		return -1
++	}
++	if handle.device.HandshakeProbeSucceeded(uint64(generation)) {
++		return 1
++	}
++	return 0
++}
++
++//export awgHandshakeProbeTimeoutMillis
++func awgHandshakeProbeTimeoutMillis(tunnelHandle int32) int64 {
++	handle, ok := lookupTunnelHandle(tunnelHandle)
++	if !ok {
++		return -1
++	}
++	return handle.device.HandshakeProbeTimeoutMillis()
++}
++
+ //export awgVersion
+ func awgVersion() *C.char {
+ 	info, ok := debug.ReadBuildInfo()
+diff --git a/tunnel/tools/libwg-go/jni.c b/tunnel/tools/libwg-go/jni.c
+index 237043e5..e18bf9c7 100644
+--- a/tunnel/tools/libwg-go/jni.c
++++ b/tunnel/tools/libwg-go/jni.c
+@@ -13,6 +13,13 @@ extern void awgTurnOff(int handle);
+ extern int awgGetSocketV4(int handle);
+ extern int awgGetSocketV6(int handle);
+ extern char *awgGetConfig(int handle);
++extern char *awgGetNetworkTelemetry(int handle);
++extern int awgCloseUdp(int handle);
++extern int awgRebindUdp(int handle);
++extern int awgSendKeepalives(int handle);
++extern long long awgStartHandshakeProbe(int handle);
++extern int awgHandshakeProbeStatus(int handle, long long generation);
++extern long long awgHandshakeProbeTimeoutMillis(int handle);
+ extern char *awgVersion();
+ 
+ JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgTurnOn(JNIEnv *env, jclass c, jstring ifname, jint tun_fd, jstring settings)
+@@ -59,6 +66,47 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetConfig(JNIEnv *en
+ 	return ret;
+ }
+ 
++JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetNetworkTelemetry(JNIEnv *env, jclass c, jint handle)
++{
++	jstring ret;
++	char *telemetry = awgGetNetworkTelemetry(handle);
++	if (!telemetry)
++		return NULL;
++	ret = (*env)->NewStringUTF(env, telemetry);
++	free(telemetry);
++	return ret;
++}
++
++JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgCloseUdp(JNIEnv *env, jclass c, jint handle)
++{
++	return awgCloseUdp(handle);
++}
++
++JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgRebindUdp(JNIEnv *env, jclass c, jint handle)
++{
++	return awgRebindUdp(handle);
++}
++
++JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgSendKeepalives(JNIEnv *env, jclass c, jint handle)
++{
++	return awgSendKeepalives(handle);
++}
++
++JNIEXPORT jlong JNICALL Java_org_amnezia_awg_GoBackend_awgStartHandshakeProbe(JNIEnv *env, jclass c, jint handle)
++{
++	return (jlong)awgStartHandshakeProbe(handle);
++}
++
++JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgHandshakeProbeStatus(JNIEnv *env, jclass c, jint handle, jlong generation)
++{
++	return awgHandshakeProbeStatus(handle, (long long)generation);
++}
++
++JNIEXPORT jlong JNICALL Java_org_amnezia_awg_GoBackend_awgHandshakeProbeTimeoutMillis(JNIEnv *env, jclass c, jint handle)
++{
++	return (jlong)awgHandshakeProbeTimeoutMillis(handle);
++}
++
+ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env, jclass c)
+ {
+ 	jstring ret;

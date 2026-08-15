@@ -97,6 +97,22 @@ jobs:
           unzip -l \
             plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
             grep -q 'jni/arm64-v8a/libwg-go.so'
+          native_library="$RUNNER_TEMP/libwg-go.so"
+          unzip -p \
+            plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar \
+            jni/arm64-v8a/libwg-go.so > "$native_library"
+          native_symbols="$RUNNER_TEMP/libwg-go.symbols"
+          readelf --dyn-syms --wide "$native_library" > "$native_symbols"
+          for symbol in \
+            Java_org_amnezia_awg_GoBackend_awgGetNetworkTelemetry \
+            Java_org_amnezia_awg_GoBackend_awgCloseUdp \
+            Java_org_amnezia_awg_GoBackend_awgRebindUdp \
+            Java_org_amnezia_awg_GoBackend_awgSendKeepalives \
+            Java_org_amnezia_awg_GoBackend_awgStartHandshakeProbe \
+            Java_org_amnezia_awg_GoBackend_awgHandshakeProbeStatus \
+            Java_org_amnezia_awg_GoBackend_awgHandshakeProbeTimeoutMillis; do
+            grep -Fq " $symbol" "$native_symbols"
+          done
           if unzip -l plugins/amneziawg-android-tunnel/build/outputs/aar/amneziawg-tunnel-debug.aar | \
             grep -Eq 'jni/(armeabi-v7a|x86|x86_64)/'; then
             echo 'AWG AAR contains an unsupported Android ABI' >&2

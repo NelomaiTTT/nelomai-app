@@ -23,6 +23,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
 import org.json.JSONArray
@@ -88,6 +89,8 @@ internal object AutomaticDiagnostics {
     private val gate = Any()
     private val uploadQueued = AtomicBoolean(false)
     private val systemJobRunning = AtomicBoolean(false)
+    private val immediateUploadPending = AtomicBoolean(false)
+    private val uploadScheduleGeneration = AtomicLong(0)
     private val executor = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "nelomai-automatic-diagnostics").apply { isDaemon = true }
     }
@@ -99,7 +102,8 @@ internal object AutomaticDiagnostics {
     private val memorySampleFutures = mutableListOf<ScheduledFuture<*>>()
     private var lastNetworkMemorySampleAt = 0L
 
-    fun hasActiveUpload(): Boolean = uploadQueued.get() || systemJobRunning.get()
+    fun hasActiveUpload(): Boolean =
+        uploadQueued.get() || systemJobRunning.get() || immediateUploadPending.get()
 
     fun initialize(context: Context) {
         val applicationContext = context.applicationContext
@@ -629,6 +633,10 @@ internal object AutomaticDiagnostics {
 
     private fun scheduleUploadLocked(context: Context, requestedDelaySeconds: Long) {
         if (!hasPendingWork(context)) {
+            uploadFuture?.cancel(false)
+            uploadFuture = null
+            uploadScheduleGeneration.incrementAndGet()
+            immediateUploadPending.set(false)
             preferences(context).edit()
                 .remove(KEY_LAST_ATTEMPTED_REPORT)
                 .putInt(KEY_RETRY_ATTEMPT, 0)
@@ -641,8 +649,18 @@ internal object AutomaticDiagnostics {
         val persistedDelay = (preferences.getLong(KEY_NEXT_UPLOAD_AT, 0) - nowUnix()).coerceAtLeast(0)
         val delay = maxOf(requestedDelaySeconds, persistedDelay)
         uploadFuture?.cancel(false)
+        val scheduleGeneration = uploadScheduleGeneration.incrementAndGet()
+        immediateUploadPending.set(delay == 0L)
         uploadFuture = executor.schedule(
-            { processNext(context.applicationContext) },
+            {
+                try {
+                    processNext(context.applicationContext)
+                } finally {
+                    if (uploadScheduleGeneration.get() == scheduleGeneration) {
+                        immediateUploadPending.set(false)
+                    }
+                }
+            },
             delay,
             TimeUnit.SECONDS,
         )

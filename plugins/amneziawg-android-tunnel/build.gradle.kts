@@ -6,6 +6,11 @@ val repositoryRoot = rootDir.resolve("../../../vendor/amneziawg-android")
 val goBackendRoot = rootDir.resolve("../../../vendor/amneziawg-go")
 val tunnelRoot = repositoryRoot.resolve("tunnel")
 val generatedLicenseAssets = layout.buildDirectory.dir("generated/amneziawgLicenseAssets")
+val repositoryProjectRoot = rootDir.resolve("../../..")
+val applyAmneziaWgOverrides by tasks.registering(Exec::class) {
+    workingDir(repositoryProjectRoot)
+    commandLine("bash", "scripts/android/apply-amneziawg-overrides.sh")
+}
 val prepareAmneziaWgLicense by tasks.registering(Copy::class) {
     from(repositoryRoot.resolve("COPYING")) {
         rename { "AMNEZIAWG-ANDROID-APACHE-2.0.txt" }
@@ -70,7 +75,12 @@ android {
 }
 
 tasks.named("preBuild").configure {
+    dependsOn(applyAmneziaWgOverrides)
     dependsOn(prepareAmneziaWgLicense)
+}
+
+tasks.matching { it.name.startsWith("configureCMake") }.configureEach {
+    dependsOn(applyAmneziaWgOverrides)
 }
 
 dependencies {

@@ -225,6 +225,20 @@ jobs:
           test -f "$apk"
           apksigner="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
           "$apksigner" verify --verbose "$apk"
+          native_library="$RUNNER_TEMP/libwg-go-release.so"
+          unzip -p "$apk" lib/arm64-v8a/libwg-go.so > "$native_library"
+          native_symbols="$RUNNER_TEMP/libwg-go-release.symbols"
+          readelf --dyn-syms --wide "$native_library" > "$native_symbols"
+          for symbol in \
+            Java_org_amnezia_awg_GoBackend_awgGetNetworkTelemetry \
+            Java_org_amnezia_awg_GoBackend_awgCloseUdp \
+            Java_org_amnezia_awg_GoBackend_awgRebindUdp \
+            Java_org_amnezia_awg_GoBackend_awgSendKeepalives \
+            Java_org_amnezia_awg_GoBackend_awgStartHandshakeProbe \
+            Java_org_amnezia_awg_GoBackend_awgHandshakeProbeStatus \
+            Java_org_amnezia_awg_GoBackend_awgHandshakeProbeTimeoutMillis; do
+            grep -Fq " $symbol" "$native_symbols"
+          done
           signer_sha256="$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1)"
           test -n "$signer_sha256"
           python scripts/collect-android-release-artifact.py \
@@ -240,9 +254,12 @@ jobs:
             vendor/amneziawg-android \
             vendor/amneziawg-go \
             go.work \
+            patches/amneziawg-android-network-telemetry.patch \
+            patches/amneziawg-go-network-recovery.patch \
             plugins/amneziawg-android-tunnel \
             plugins/tunnel-android/android/build.gradle.kts \
-            plugins/tunnel-android/android/src
+            plugins/tunnel-android/android/src \
+            scripts/android/apply-amneziawg-overrides.sh
           source_archive_name="$(basename "$source_archive")"
           (
             cd release-android

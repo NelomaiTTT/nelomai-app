@@ -8,6 +8,7 @@ target/
 /src-tauri/windows/runtime/
 /plugins/amneziawg-android-tunnel/.cxx/
 /plugins/amneziawg-android-tunnel/build/
+/.nelomai-locks/
 .env
 .env.*
 !.env.example
