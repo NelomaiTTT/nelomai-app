@@ -37,6 +37,7 @@
     type AppNotification,
     type LoginRequest,
     type NativeConnectionChangedEvent,
+    type WindowsDefenderStatus,
   } from "$lib/native-client";
   import {
     emptyIncludeSelection,
@@ -86,6 +87,27 @@
   let notificationsBusy = $state(false);
   let notificationsError = $state<string | null>(null);
   let appPreferences = $state<AppPreferences | null>(null);
+  let windowsDefender = $state<WindowsDefenderStatus | null>(null);
+  let defenderRepairBusy = $state(false);
+  let defenderRepairMessage = $state<string | null>(null);
+  let antivirusStartFailure = $state(false);
+  let activeThirdPartyAntivirus = $derived(
+    windowsDefender?.antivirusProducts.find(
+      (product) =>
+        product.state === "on" &&
+        !product.isMicrosoftDefender &&
+        product.isDefault !== false,
+    ) ??
+      windowsDefender?.antivirusProducts.find(
+        (product) => product.state === "on" && !product.isMicrosoftDefender,
+      ) ??
+      null,
+  );
+  let reportedThirdPartyBlocker = $derived(
+    antivirusStartFailure && windowsDefender?.state !== "missing"
+      ? activeThirdPartyAntivirus
+      : null,
+  );
   let nativeStateUnlisten: UnlistenFn | null = null;
   let splitTunnelBlocksStart = $derived(
     splitTunnelState !== null &&
@@ -122,16 +144,26 @@
         void nativeClient.recordStartupStage("frontend_first_frame");
         void restore();
         void loadAppPreferences();
+        void refreshWindowsDefender();
       }, 0);
     });
     void listen<NativeConnectionChangedEvent>("native-connection-changed", (event) => {
       if (event.payload.error) {
+        const code = commandCode(event.payload.error);
         error = commandMessage(event.payload.error, event.payload.action, {
           personalPeer:
             event.payload.action === "start" &&
             selectedLayer === "tic" &&
             ticConnectionMode === "personal",
         });
+        if (
+          code === "defender_exclusion_missing" ||
+          code === "amneziawg_component_missing" ||
+          code === "antivirus_may_block_amneziawg"
+        ) {
+          antivirusStartFailure = code === "antivirus_may_block_amneziawg";
+          void refreshWindowsDefender();
+        }
       }
       void synchronizeRuntimeState();
     }).then((unlisten) => {
@@ -199,6 +231,28 @@
 
   async function loadAppPreferences() {
     appPreferences = await nativeClient.preferences().catch(() => null);
+  }
+
+  async function refreshWindowsDefender() {
+    const status = await nativeClient.windowsDefenderStatus().catch(() => null);
+    if (status?.supported) windowsDefender = status;
+  }
+
+  async function repairWindowsDefender() {
+    if (defenderRepairBusy) return;
+    defenderRepairBusy = true;
+    defenderRepairMessage = null;
+    try {
+      windowsDefender = await nativeClient.repairWindowsDefender();
+      defenderRepairMessage = windowsDefender.dllPresent
+        ? "Исключение добавлено. Stray снова готов к запуску."
+        : "Исключение добавлено. Теперь переустановите последнюю версию Nelomai, чтобы восстановить удалённый компонент.";
+    } catch (reason) {
+      defenderRepairMessage = commandMessage(reason, "start");
+      await refreshWindowsDefender();
+    } finally {
+      defenderRepairBusy = false;
+    }
   }
 
   async function setCloseToTray(event: Event) {
@@ -423,6 +477,7 @@
           routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
           allowAlternate: true,
         });
+        antivirusStartFailure = false;
         shouldReportStartFailure = false;
         phase = "connected";
       }
@@ -431,6 +486,7 @@
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
     } catch (reason) {
+      const failureCode = commandCode(reason);
       if (shouldReportStartFailure && startDeviceId) {
         await waitForSettlement(
           nativeClient.queueStartFailureDiagnostics(
@@ -451,6 +507,14 @@
           selectedLayer === "tic" &&
           ticConnectionMode === "personal",
       });
+      if (
+        failureCode === "defender_exclusion_missing" ||
+        failureCode === "amneziawg_component_missing" ||
+        failureCode === "antivirus_may_block_amneziawg"
+      ) {
+        antivirusStartFailure = failureCode === "antivirus_may_block_amneziawg";
+        await refreshWindowsDefender();
+      }
     } finally {
       busy = false;
     }
@@ -883,6 +947,47 @@
   </header>
   {#if diagnosticsStatus}
     <p class="diagnostics-status" aria-live="polite">{diagnosticsStatus}</p>
+  {/if}
+  {#if windowsDefender &&
+  (windowsDefender.state === "missing" ||
+    !windowsDefender.dllPresent ||
+    reportedThirdPartyBlocker)}
+    <section class="defender-banner" aria-live="polite">
+      <div>
+        <p class="eyebrow">
+          {reportedThirdPartyBlocker?.name ??
+            activeThirdPartyAntivirus?.name ??
+            "Защита Windows"}
+        </p>
+        <strong>
+          {reportedThirdPartyBlocker
+            ? `${reportedThirdPartyBlocker.name} может блокировать компонент Stray`
+            : windowsDefender.dllPresent
+            ? "Microsoft Defender может заблокировать Stray"
+            : activeThirdPartyAntivirus
+              ? `${activeThirdPartyAntivirus.name} мог удалить компонент Stray`
+              : "Антивирус мог удалить компонент Stray"}
+        </strong>
+        <span>
+          {reportedThirdPartyBlocker
+            ? `Добавьте ${windowsDefender.dllPath ?? "amneziawg-tunnel.dll"} в исключения ${reportedThirdPartyBlocker.name} и нажмите «Старт» снова.`
+            : windowsDefender.dllPresent
+            ? "Добавьте компонент AmneziaWG в исключения перед подключением."
+            : `Проверьте карантин, восстановите ${windowsDefender.dllPath ?? "amneziawg-tunnel.dll"} и добавьте файл в исключения. Если восстановление недоступно — настройте исключение и переустановите Nelomai.`}
+        </span>
+        {#if defenderRepairMessage}<span>{defenderRepairMessage}</span>{/if}
+      </div>
+      {#if windowsDefender.state === "missing"}
+        <button
+          class="secondary-button defender-action"
+          type="button"
+          onclick={repairWindowsDefender}
+          disabled={defenderRepairBusy}
+        >
+          {defenderRepairBusy ? "Исправляем…" : "Исправить"}
+        </button>
+      {/if}
+    </section>
   {/if}
   {#if updateStatus && updateStatus.phase !== "idle" && view !== "sign_in"}
     <section class="update-banner" aria-live="polite">
@@ -1502,7 +1607,8 @@
     text-align: right;
   }
 
-  .update-banner {
+  .update-banner,
+  .defender-banner {
     width: min(1180px, calc(100% - 40px));
     margin: 14px auto 0;
     padding: 16px 18px;
@@ -1515,27 +1621,41 @@
     background: #102923;
   }
 
-  .update-banner > div {
+  .update-banner > div,
+  .defender-banner > div {
     min-width: 0;
     display: grid;
     gap: 4px;
   }
 
-  .update-banner .eyebrow {
+  .update-banner .eyebrow,
+  .defender-banner .eyebrow {
     margin: 0;
   }
 
   .update-banner strong,
-  .update-banner span {
+  .update-banner span,
+  .defender-banner strong,
+  .defender-banner span {
     overflow-wrap: anywhere;
   }
 
-  .update-banner span {
+  .update-banner span,
+  .defender-banner span {
     color: #b7c7c3;
     font-size: 13px;
   }
 
   .update-action {
+    flex: 0 0 auto;
+  }
+
+  .defender-banner {
+    border-color: #8a6434;
+    background: #302313;
+  }
+
+  .defender-action {
     flex: 0 0 auto;
   }
 
@@ -1999,7 +2119,8 @@
   @media (max-width: 760px) {
     header,
     .workspace,
-    .update-banner {
+    .update-banner,
+    .defender-banner {
       width: min(100% - 28px, 620px);
     }
 
@@ -2060,12 +2181,14 @@
       order: 2;
     }
 
-    .update-banner {
+    .update-banner,
+    .defender-banner {
       align-items: stretch;
       flex-direction: column;
     }
 
-    .update-action {
+    .update-action,
+    .defender-action {
       width: 100%;
     }
 

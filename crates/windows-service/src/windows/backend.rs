@@ -4,7 +4,7 @@ use super::install::{
     wait_until_running_until, wait_until_stopped_until,
 };
 use super::routes::WindowsRouteManager;
-use crate::{ServiceError, ServiceTunnelBackend, ServiceTunnelState};
+use crate::{DefenderStatus, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use nelomai_client_tunnel::{
     detect_configuration_transport, DesktopTunnelOptions, TunnelMetrics, TunnelTransport,
 };
@@ -266,6 +266,10 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         let prefix = format!("[nelomai.service]\n{service}\n[amneziawg.ringlogger]\n");
         let ringlogger = tail_utf8(&ringlogger, (64_usize * 1024).saturating_sub(prefix.len()));
         Ok(format!("{prefix}{ringlogger}"))
+    }
+
+    fn defender_status(&mut self) -> Result<DefenderStatus, ServiceError> {
+        Ok(super::defender::exclusion_status())
     }
 
     fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {

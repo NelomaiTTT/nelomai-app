@@ -91,6 +91,15 @@ describe("native client", () => {
     ).toContain("отправьте логи");
   });
 
+  it("explains how to recover a Defender-blocked AWG3 runtime", () => {
+    expect(
+      commandMessage(commandError("defender_exclusion_missing"), "start"),
+    ).toContain("Нажмите «Исправить»");
+    expect(
+      commandMessage(commandError("amneziawg_component_missing"), "start"),
+    ).toContain("переустановите последнюю версию");
+  });
+
   it("explains what to change after an AWG3 handshake timeout", () => {
     expect(
       commandMessage(commandError("tunnel_handshake_timeout"), "start"),
@@ -203,6 +212,17 @@ describe("native client", () => {
     expect(invoke).toHaveBeenCalledWith("app_prepare_tunnel", {
       deviceId: "11111111-1111-4111-8111-111111111111",
     });
+  });
+
+  it("routes Defender status and repair through native commands", async () => {
+    const invoke = vi.fn().mockResolvedValue({ supported: true, state: "excluded" });
+    const client = createNativeClient(invoke);
+
+    await client.windowsDefenderStatus();
+    await client.repairWindowsDefender();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "app_windows_defender_status");
+    expect(invoke).toHaveBeenNthCalledWith(2, "app_windows_defender_repair");
   });
 
   it("queues start failure diagnostics with the authenticated device", async () => {

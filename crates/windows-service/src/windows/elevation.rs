@@ -43,6 +43,17 @@ pub fn repair_installation(
     run_elevated(service_executable, &parameters)
 }
 
+pub fn repair_defender_exclusion(
+    service_executable: &Path,
+    client_executable: &Path,
+) -> Result<(), RepairError> {
+    if !service_executable.is_file() || !client_executable.is_file() {
+        return Err(RepairError::ResourcesUnavailable);
+    }
+    let parameters = defender_repair_parameters(client_executable)?;
+    run_elevated(service_executable, &parameters)
+}
+
 fn install_parameters(owner_sid: &str, client_executable: &Path) -> Result<String, RepairError> {
     let client_executable = client_executable.to_string_lossy();
     if owner_sid.is_empty()
@@ -54,6 +65,16 @@ fn install_parameters(owner_sid: &str, client_executable: &Path) -> Result<Strin
     }
     Ok(format!(
         "install --owner-sid \"{owner_sid}\" --client-path \"{client_executable}\""
+    ))
+}
+
+fn defender_repair_parameters(client_executable: &Path) -> Result<String, RepairError> {
+    let client_executable = client_executable.to_string_lossy();
+    if client_executable.is_empty() || client_executable.contains('"') {
+        return Err(RepairError::ResourcesUnavailable);
+    }
+    Ok(format!(
+        "configure-defender-exclusion --client-path \"{client_executable}\""
     ))
 }
 
@@ -185,7 +206,7 @@ impl Drop for OwnedHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::install_parameters;
+    use super::{defender_repair_parameters, install_parameters};
     use std::path::Path;
 
     #[test]
@@ -203,5 +224,14 @@ mod tests {
     #[test]
     fn rejects_unsafe_installation_parameters() {
         assert!(install_parameters("S-1-5-21-123", Path::new(r#"C:\Nelomai"\app.exe"#)).is_err());
+    }
+
+    #[test]
+    fn quotes_defender_repair_parameters() {
+        assert_eq!(
+            defender_repair_parameters(Path::new(r"C:\Program Files\Nelomai\nelomai-app.exe"))
+                .unwrap(),
+            r#"configure-defender-exclusion --client-path "C:\Program Files\Nelomai\nelomai-app.exe""#
+        );
     }
 }

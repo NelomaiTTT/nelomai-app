@@ -4,7 +4,8 @@ use nelomai_client_tunnel::{
     TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
 use nelomai_windows_service::{
-    Request, Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
+    AntivirusProduct, AntivirusProductState, DefenderExclusionState, DefenderStatus, Request,
+    Response, ServiceError, ServiceTransport, ServiceTunnelBackend, ServiceTunnelState,
     TunnelRequestHandler, WindowsTunnelController, PROTOCOL_VERSION,
 };
 use std::collections::VecDeque;
@@ -57,6 +58,26 @@ impl ServiceTunnelBackend for RecordingBackend {
     fn diagnostics(&mut self) -> Result<String, ServiceError> {
         Ok("[amneziawg.ringlogger]\n[TUN] handshake".to_string())
     }
+
+    fn defender_status(&mut self) -> Result<DefenderStatus, ServiceError> {
+        Ok(DefenderStatus {
+            state: DefenderExclusionState::Excluded,
+            dll_present: true,
+            detail_code: None,
+            antivirus_products: vec![test_antivirus_product()],
+            antivirus_detail_code: None,
+        })
+    }
+}
+
+fn test_antivirus_product() -> AntivirusProduct {
+    AntivirusProduct {
+        name: "Microsoft Defender Antivirus".to_string(),
+        state: AntivirusProductState::On,
+        signatures_up_to_date: Some(true),
+        is_default: Some(true),
+        is_microsoft_defender: true,
+    }
 }
 
 #[test]
@@ -86,6 +107,7 @@ fn handler_executes_only_typed_tunnel_operations() {
     let fingerprint = handler.handle(Request::physical_network_fingerprint());
     let metrics = handler.handle(Request::metrics(true));
     let diagnostics = handler.handle(Request::diagnostics());
+    let defender = handler.handle(Request::defender_status());
 
     assert_eq!(started.state, Some(ServiceTunnelState::Running));
     assert_eq!(status.state, Some(ServiceTunnelState::Running));
@@ -110,6 +132,39 @@ fn handler_executes_only_typed_tunnel_operations() {
     assert_eq!(
         diagnostics.diagnostics.as_deref(),
         Some("[amneziawg.ringlogger]\n[TUN] handshake")
+    );
+    assert_eq!(
+        defender.defender_status,
+        Some(DefenderStatus {
+            state: DefenderExclusionState::Excluded,
+            dll_present: true,
+            detail_code: None,
+            antivirus_products: vec![test_antivirus_product()],
+            antivirus_detail_code: None,
+        })
+    );
+}
+
+#[tokio::test]
+async fn controller_maps_defender_status() {
+    let expected = DefenderStatus {
+        state: DefenderExclusionState::Missing,
+        dll_present: true,
+        detail_code: None,
+        antivirus_products: vec![test_antivirus_product()],
+        antivirus_detail_code: None,
+    };
+    let mut response = Response::success(None);
+    response.defender_status = Some(expected.clone());
+    let controller = WindowsTunnelController::new(RecordingTransport {
+        requests: Mutex::new(Vec::new()),
+        response,
+    });
+
+    assert_eq!(controller.defender_status().await.unwrap(), expected);
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["defender_status"]
     );
 }
 
@@ -247,6 +302,7 @@ impl ServiceTransport for RecordingTransport {
             Request::PhysicalNetworkFingerprint { .. } => "fingerprint",
             Request::Metrics { .. } => "metrics",
             Request::Diagnostics { .. } => "diagnostics",
+            Request::DefenderStatus { .. } => "defender_status",
             Request::RebindUdp { .. } => "rebind_udp",
         };
         self.requests.lock().unwrap().push(summary.to_string());
@@ -284,11 +340,15 @@ struct SequenceTransport {
 #[async_trait]
 impl ServiceTransport for SequenceTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
-        let Request::Start { configuration, .. } = request else {
-            panic!("expected start request");
+        let summary = match request {
+            Request::Start { configuration, .. } => {
+                assert!(configuration.contains("HeaderProtectionKey"));
+                "start"
+            }
+            Request::DefenderStatus { .. } => "defender_status",
+            _ => panic!("unexpected request"),
         };
-        assert!(configuration.contains("HeaderProtectionKey"));
-        self.requests.lock().unwrap().push("start".to_string());
+        self.requests.lock().unwrap().push(summary.to_string());
         Ok(self.responses.lock().unwrap().pop_front().unwrap())
     }
 }
@@ -321,6 +381,90 @@ AllowedIPs = 0.0.0.0/0\n";
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
         ["start", "start"],
+    );
+}
+
+#[tokio::test]
+async fn controller_explains_persistent_amneziawg_failure_when_defender_exclusion_is_missing() {
+    let mut defender_response = Response::success(None);
+    defender_response.defender_status = Some(DefenderStatus {
+        state: DefenderExclusionState::Missing,
+        dll_present: true,
+        detail_code: None,
+        antivirus_products: vec![test_antivirus_product()],
+        antivirus_detail_code: None,
+    });
+    let controller = WindowsTunnelController::new(SequenceTransport {
+        requests: Mutex::new(Vec::new()),
+        responses: Mutex::new(VecDeque::from([
+            Response::failure("amneziawg_service_start_failed"),
+            Response::failure("amneziawg_service_start_failed"),
+            defender_response,
+        ])),
+    });
+    let configuration = "\
+[Interface]\n\
+PrivateKey = client-only\n\
+HeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\n\
+ContentPaddingAddition = 0-64\n\
+\n\
+[Peer]\n\
+AllowedIPs = 0.0.0.0/0\n";
+
+    let error = controller
+        .start(TunnelStartRequest::full_tunnel(TunnelConfiguration::new(
+            configuration.to_string(),
+        )))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        TunnelError::Backend(code) if code == "defender_exclusion_missing"
+    ));
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["start", "start", "defender_status"],
+    );
+}
+
+#[tokio::test]
+async fn controller_identifies_an_active_third_party_antivirus_after_awg_start_failure() {
+    let mut defender_response = Response::success(None);
+    defender_response.defender_status = Some(DefenderStatus {
+        state: DefenderExclusionState::Inactive,
+        dll_present: true,
+        detail_code: None,
+        antivirus_products: vec![AntivirusProduct {
+            name: "Example Antivirus".to_string(),
+            state: AntivirusProductState::On,
+            signatures_up_to_date: Some(true),
+            is_default: Some(true),
+            is_microsoft_defender: false,
+        }],
+        antivirus_detail_code: None,
+    });
+    let controller = WindowsTunnelController::new(SequenceTransport {
+        requests: Mutex::new(Vec::new()),
+        responses: Mutex::new(VecDeque::from([
+            Response::failure("amneziawg_service_start_failed"),
+            Response::failure("amneziawg_service_start_failed"),
+            defender_response,
+        ])),
+    });
+    let configuration = "[Interface]\nPrivateKey = client-only\nHeaderProtectionKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\nContentPaddingAddition = 0-64\n\n[Peer]\nAllowedIPs = 0.0.0.0/0\n";
+
+    assert!(matches!(
+        controller
+            .start(TunnelStartRequest::full_tunnel(TunnelConfiguration::new(
+                configuration.to_string(),
+            )))
+            .await,
+        Err(TunnelError::Backend(code)) if code == "antivirus_may_block_amneziawg"
+    ));
+    assert_eq!(
+        controller.transport().requests.lock().unwrap().as_slice(),
+        ["start", "start", "defender_status"],
     );
 }
 

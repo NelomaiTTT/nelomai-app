@@ -371,7 +371,7 @@ pub(crate) fn state_directory() -> Result<PathBuf, ServiceError> {
     Ok(PathBuf::from(program_data).join("Nelomai").join("Tunnel"))
 }
 
-fn validate_install_location(
+pub(crate) fn validate_install_location(
     service_executable: &Path,
     installed_client_path: &Path,
 ) -> Result<PathBuf, ServiceError> {

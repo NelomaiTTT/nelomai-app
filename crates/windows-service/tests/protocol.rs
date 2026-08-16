@@ -42,6 +42,7 @@ fn previous_helper_response_decodes_without_a_fingerprint_field() {
     assert_eq!(response.protocol_version, 2);
     assert_eq!(response.physical_network_fingerprint, None);
     assert_eq!(response.diagnostics, None);
+    assert_eq!(response.defender_status, None);
 }
 
 #[test]
@@ -80,6 +81,17 @@ fn diagnostics_request_round_trips_through_the_typed_protocol() {
 
     assert_eq!(
         decode_request(&frame).expect("decode diagnostics request"),
+        request
+    );
+}
+
+#[test]
+fn defender_status_request_round_trips_through_the_typed_protocol() {
+    let request = Request::defender_status();
+    let frame = encode_request(&request).expect("encode Defender status request");
+
+    assert_eq!(
+        decode_request(&frame).expect("decode Defender request"),
         request
     );
 }

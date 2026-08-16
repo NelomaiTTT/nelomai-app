@@ -76,6 +76,24 @@ export interface DiagnosticUploadResponse {
   received_bytes: number;
 }
 
+export interface WindowsDefenderStatus {
+  supported: boolean;
+  state: "excluded" | "missing" | "inactive" | "unavailable" | "not_applicable";
+  dllPresent: boolean;
+  dllPath: string | null;
+  detailCode: string | null;
+  antivirusProducts: WindowsAntivirusProduct[];
+  antivirusDetailCode: string | null;
+}
+
+export interface WindowsAntivirusProduct {
+  name: string;
+  state: "on" | "off" | "snoozed" | "expired" | "unknown";
+  signaturesUpToDate: boolean | null;
+  isDefault: boolean | null;
+  isMicrosoftDefender: boolean;
+}
+
 export interface AppNotification {
   id: number;
   kind: string;
@@ -123,6 +141,10 @@ export function createNativeClient(
       invoke("app_refresh_probes", { layer }) as Promise<ProbeResults>,
     prepareTunnel: (deviceId: string) =>
       invoke("app_prepare_tunnel", { deviceId }) as Promise<void>,
+    windowsDefenderStatus: () =>
+      invoke("app_windows_defender_status") as Promise<WindowsDefenderStatus>,
+    repairWindowsDefender: () =>
+      invoke("app_windows_defender_repair") as Promise<WindowsDefenderStatus>,
     queueStartFailureDiagnostics: (deviceId: string, errorCode: string) =>
       invoke("app_queue_start_failure_diagnostics", {
         deviceId,
@@ -378,6 +400,16 @@ export function commandMessage(
       return "Системная настройка не завершилась. Закройте оставшееся системное окно и нажмите «Старт» снова.";
     case "helper_resources_unavailable":
       return "В приложении отсутствует системный компонент VPN. Переустановите последнюю версию Nelomai.";
+    case "defender_exclusion_missing":
+      return "Microsoft Defender может заблокировать компонент Stray. Нажмите «Исправить» и подтвердите запрос Windows.";
+    case "amneziawg_component_missing":
+      return "Антивирус удалил или заблокировал компонент Stray. Добавьте компонент в исключения, затем переустановите последнюю версию Nelomai.";
+    case "antivirus_may_block_amneziawg":
+      return "Сторонний антивирус может блокировать компонент Stray. Добавьте компонент в исключения антивируса и нажмите «Старт» снова.";
+    case "defender_exclusion_repair_cancelled":
+      return "Исправление отменено. Нажмите «Исправить» и подтвердите запрос администратора Windows.";
+    case "defender_exclusion_repair_failed":
+      return "Не удалось добавить исключение Microsoft Defender. Проверьте ограничения антивируса или организации и повторите попытку.";
     case "installed_applications_unavailable":
       return "Android не предоставил список приложений. Перезапустите Nelomai и откройте split-tunnel снова.";
     case "split_tunnel_policy_unavailable":

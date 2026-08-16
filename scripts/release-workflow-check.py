@@ -255,8 +255,57 @@ def run() -> None:
         "Stopping the previous Nelomai tunnel service"
     ):
         raise RuntimeError("Windows legacy migration must precede service replacement")
+    for token in (
+        "amneziawg-tunnel.dll",
+        "$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "Add-MpPreference -ExclusionPath",
+        "NelomaiDefenderExclusionValue",
+    ):
+        if token not in preinstall_hook:
+            raise RuntimeError(f"Windows Defender setup misses {token}")
+    if preinstall_hook.index("Add-MpPreference -ExclusionPath") < preinstall_hook.index(
+        "Stopping the previous Nelomai tunnel service"
+    ):
+        raise RuntimeError("Windows Defender exclusion must be the final pre-install mutation")
     if "StrCmp $NelomaiLegacyStartShortcut 1" not in postinstall_hook:
         raise RuntimeError("Windows legacy migration does not restore its Start shortcut")
+    preuninstall_hook = windows_hooks.split(
+        "!macro NSIS_HOOK_PREUNINSTALL", 1
+    )[1].split("!macroend", 1)[0]
+    for token in (
+        "$UpdateMode <> 1",
+        "NelomaiDefenderExclusionValue",
+        "Remove-MpPreference -ExclusionPath",
+    ):
+        if token not in preuninstall_hook:
+            raise RuntimeError(f"Windows Defender cleanup misses {token}")
+    defender_runtime = (
+        ROOT / "crates" / "windows-service" / "src" / "windows" / "defender.rs"
+    ).read_text(encoding="utf-8")
+    for token in (
+        "Get-MpComputerStatus",
+        "MpCmdRun.exe",
+        "-CheckExclusion",
+        "Add-MpPreference -ExclusionPath",
+        "ManagedDefenderExclusionPath",
+        "CREATE_NO_WINDOW",
+    ):
+        if token not in defender_runtime:
+            raise RuntimeError(f"Windows Defender runtime check misses {token}")
+    windows_commands = (ROOT / "src-tauri" / "src" / "commands.rs").read_text(
+        encoding="utf-8"
+    )
+    for token in (
+        "app_windows_defender_status",
+        "app_windows_defender_repair",
+        "windows.defender.before_awg_start",
+        "amneziawg_component_missing",
+    ):
+        if token not in windows_commands:
+            raise RuntimeError(f"Windows Defender app integration misses {token}")
+    for command in ("app_windows_defender_status", "app_windows_defender_repair"):
+        if command not in app_entrypoint:
+            raise RuntimeError(f"Windows Defender command is not registered: {command}")
 
     macos_resources = json.loads(
         (ROOT / "src-tauri" / "bundle.macos.conf.json").read_text(

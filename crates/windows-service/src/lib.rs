@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 pub mod windows;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MANAGER_SERVICE_NAME: &str = "NelomaiTunnelManager";
 pub const TUNNEL_SERVICE_NAME: &str = "WireGuardTunnel$Nelomai";
@@ -49,6 +49,47 @@ pub enum ServiceTunnelState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefenderExclusionState {
+    Excluded,
+    Missing,
+    Inactive,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntivirusProductState {
+    On,
+    Off,
+    Snoozed,
+    Expired,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AntivirusProduct {
+    pub name: String,
+    pub state: AntivirusProductState,
+    pub signatures_up_to_date: Option<bool>,
+    pub is_default: Option<bool>,
+    pub is_microsoft_defender: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DefenderStatus {
+    pub state: DefenderExclusionState,
+    pub dll_present: bool,
+    pub detail_code: Option<String>,
+    #[serde(default)]
+    pub antivirus_products: Vec<AntivirusProduct>,
+    #[serde(default)]
+    pub antivirus_detail_code: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
@@ -62,6 +103,8 @@ pub struct Response {
     pub metrics: Option<TunnelMetrics>,
     #[serde(default)]
     pub diagnostics: Option<String>,
+    #[serde(default)]
+    pub defender_status: Option<DefenderStatus>,
     pub error_code: Option<String>,
 }
 
@@ -75,6 +118,7 @@ impl Response {
             physical_network_fingerprint: None,
             metrics: None,
             diagnostics: None,
+            defender_status: None,
             error_code: None,
         }
     }
@@ -88,6 +132,7 @@ impl Response {
             physical_network_fingerprint: None,
             metrics: None,
             diagnostics: None,
+            defender_status: None,
             error_code: Some(error_code.into()),
         }
     }
@@ -116,6 +161,9 @@ pub enum Request {
         probe: bool,
     },
     Diagnostics {
+        protocol_version: u16,
+    },
+    DefenderStatus {
         protocol_version: u16,
     },
     RebindUdp {
@@ -173,6 +221,12 @@ impl Request {
         }
     }
 
+    pub fn defender_status() -> Self {
+        Self::DefenderStatus {
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
     pub fn rebind_udp() -> Self {
         Self::RebindUdp {
             protocol_version: PROTOCOL_VERSION,
@@ -189,6 +243,7 @@ impl Request {
             | Self::Version { protocol_version }
             | Self::PhysicalNetworkFingerprint { protocol_version }
             | Self::Diagnostics { protocol_version }
+            | Self::DefenderStatus { protocol_version }
             | Self::RebindUdp { protocol_version }
             | Self::Metrics {
                 protocol_version, ..
@@ -265,6 +320,14 @@ impl PartialEq for Request {
                 },
             ) => left == right,
             (
+                Self::DefenderStatus {
+                    protocol_version: left,
+                },
+                Self::DefenderStatus {
+                    protocol_version: right,
+                },
+            ) => left == right,
+            (
                 Self::Metrics {
                     protocol_version: left_version,
                     probe: left_probe,
@@ -322,6 +385,10 @@ impl fmt::Debug for Request {
                 .debug_struct("Diagnostics")
                 .field("protocol_version", protocol_version)
                 .finish(),
+            Self::DefenderStatus { protocol_version } => formatter
+                .debug_struct("DefenderStatus")
+                .field("protocol_version", protocol_version)
+                .finish(),
             Self::RebindUdp { protocol_version } => formatter
                 .debug_struct("RebindUdp")
                 .field("protocol_version", protocol_version)
@@ -361,6 +428,10 @@ enum RequestRef<'a> {
         probe: bool,
     },
     Diagnostics {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
+    DefenderStatus {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
@@ -409,6 +480,9 @@ impl Serialize for Request {
             Self::Diagnostics { protocol_version } => RequestRef::Diagnostics {
                 protocol_version: *protocol_version,
             },
+            Self::DefenderStatus { protocol_version } => RequestRef::DefenderStatus {
+                protocol_version: *protocol_version,
+            },
             Self::RebindUdp { protocol_version } => RequestRef::RebindUdp {
                 protocol_version: *protocol_version,
             },
@@ -452,6 +526,10 @@ enum RequestOwned {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
     },
+    DefenderStatus {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+    },
     RebindUdp {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
@@ -488,6 +566,9 @@ impl<'de> Deserialize<'de> for Request {
             },
             RequestOwned::Diagnostics { protocol_version } => {
                 Self::Diagnostics { protocol_version }
+            }
+            RequestOwned::DefenderStatus { protocol_version } => {
+                Self::DefenderStatus { protocol_version }
             }
             RequestOwned::RebindUdp { protocol_version } => Self::RebindUdp { protocol_version },
         })
@@ -589,6 +670,11 @@ pub trait ServiceTunnelBackend {
     fn diagnostics(&mut self) -> Result<String, ServiceError> {
         Err(ServiceError::Backend("diagnostics_unavailable".to_string()))
     }
+    fn defender_status(&mut self) -> Result<DefenderStatus, ServiceError> {
+        Err(ServiceError::Backend(
+            "defender_status_unavailable".to_string(),
+        ))
+    }
     fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
         Err(ServiceError::Backend("udp_rebind_unsupported".to_string()))
     }
@@ -664,6 +750,11 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
             Request::Diagnostics { .. } => self.backend.diagnostics().map(|diagnostics| {
                 let mut response = Response::success(None);
                 response.diagnostics = Some(diagnostics);
+                response
+            }),
+            Request::DefenderStatus { .. } => self.backend.defender_status().map(|status| {
+                let mut response = Response::success(None);
+                response.defender_status = Some(status);
                 response
             }),
             Request::RebindUdp { .. } => self
@@ -782,6 +873,18 @@ impl<T: ServiceTransport> WindowsTunnelController<T> {
             .diagnostics
             .ok_or_else(|| TunnelError::Backend("missing_service_diagnostics".to_string()))
     }
+
+    pub async fn defender_status(&self) -> Result<DefenderStatus, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::defender_status())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        response
+            .defender_status
+            .ok_or_else(|| TunnelError::Backend("missing_defender_status".to_string()))
+    }
 }
 
 #[async_trait]
@@ -820,6 +923,29 @@ impl<T: ServiceTransport> TunnelController for WindowsTunnelController<T> {
                 ))
                 .await
                 .map_err(to_tunnel_error)?;
+        }
+        if transport == TunnelTransport::AmneziaWg3
+            && response.error_code.as_deref() == Some("amneziawg_service_start_failed")
+        {
+            if let Ok(status) = self.defender_status().await {
+                if !status.dll_present {
+                    return Err(TunnelError::Backend(
+                        "amneziawg_component_missing".to_string(),
+                    ));
+                }
+                if status.state == DefenderExclusionState::Missing {
+                    return Err(TunnelError::Backend(
+                        "defender_exclusion_missing".to_string(),
+                    ));
+                }
+                if status.antivirus_products.iter().any(|product| {
+                    product.state == AntivirusProductState::On && !product.is_microsoft_defender
+                }) {
+                    return Err(TunnelError::Backend(
+                        "antivirus_may_block_amneziawg".to_string(),
+                    ));
+                }
+            }
         }
         require_state(response, ServiceTunnelState::Running)
     }

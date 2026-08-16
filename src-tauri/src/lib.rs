@@ -216,6 +216,8 @@ pub fn run() {
             commands::app_unbind_peer,
             commands::app_refresh_probes,
             commands::app_prepare_tunnel,
+            commands::app_windows_defender_status,
+            commands::app_windows_defender_repair,
             commands::app_queue_start_failure_diagnostics,
             commands::app_start,
             commands::app_start_saved_stray,

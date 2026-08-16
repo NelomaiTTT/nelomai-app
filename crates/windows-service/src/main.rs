@@ -9,8 +9,8 @@ fn main() {
 #[cfg(windows)]
 fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
     use nelomai_windows_service::windows::{
-        install, run_amneziawg_service, run_manager_service, run_wireguard_service, uninstall,
-        InstallOptions,
+        configure_exclusion, install, run_amneziawg_service, run_manager_service,
+        run_wireguard_service, uninstall, InstallOptions,
     };
     use nelomai_windows_service::ServiceError;
     use std::path::PathBuf;
@@ -58,6 +58,19 @@ fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
                 owner_sid: owner_sid.ok_or(ServiceError::InvalidRequest)?,
                 installed_client_path: client_path.ok_or(ServiceError::InvalidRequest)?,
             })
+        }
+        Some("configure-defender-exclusion") => {
+            let client_path = match arguments.next() {
+                Some(option) if option.to_string_lossy() == "--client-path" => {
+                    arguments.next().map(PathBuf::from)
+                }
+                _ => None,
+            }
+            .ok_or(ServiceError::InvalidRequest)?;
+            if arguments.next().is_some() {
+                return Err(ServiceError::InvalidRequest);
+            }
+            configure_exclusion(&client_path)
         }
         Some("uninstall") if arguments.next().is_none() => uninstall(),
         _ => Err(ServiceError::InvalidRequest),

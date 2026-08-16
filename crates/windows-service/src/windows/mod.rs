@@ -1,4 +1,5 @@
 mod backend;
+mod defender;
 mod elevation;
 mod install;
 mod ipc;
@@ -6,7 +7,8 @@ mod ringlogger;
 mod routes;
 mod service;
 
-pub use elevation::{repair_installation, RepairError};
+pub use defender::configure_exclusion;
+pub use elevation::{repair_defender_exclusion, repair_installation, RepairError};
 pub use install::{install, uninstall, InstallOptions};
 pub use ipc::NamedPipeTransport;
 pub use service::{run_amneziawg_service, run_manager_service, run_wireguard_service};

@@ -48,6 +48,28 @@ pub struct CommandError {
     message: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsDefenderStatusResponse {
+    supported: bool,
+    state: String,
+    dll_present: bool,
+    dll_path: Option<String>,
+    detail_code: Option<String>,
+    antivirus_products: Vec<WindowsAntivirusProductResponse>,
+    antivirus_detail_code: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowsAntivirusProductResponse {
+    name: String,
+    state: String,
+    signatures_up_to_date: Option<bool>,
+    is_default: Option<bool>,
+    is_microsoft_defender: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupStage {
@@ -208,6 +230,26 @@ impl CommandError {
             "helper_resources_unavailable" => Self::new(
                 "helper_resources_unavailable",
                 "В установленном приложении отсутствуют компоненты подключения",
+            ),
+            "defender_exclusion_missing" => Self::new(
+                "defender_exclusion_missing",
+                "Microsoft Defender не исключает компонент AmneziaWG из проверки",
+            ),
+            "amneziawg_component_missing" => Self::new(
+                "amneziawg_component_missing",
+                "Антивирус мог удалить или заблокировать компонент AmneziaWG",
+            ),
+            "antivirus_may_block_amneziawg" => Self::new(
+                "antivirus_may_block_amneziawg",
+                "Активный сторонний антивирус может блокировать компонент AmneziaWG",
+            ),
+            "defender_exclusion_repair_cancelled" => Self::new(
+                "defender_exclusion_repair_cancelled",
+                "Исправление настройки Microsoft Defender отменено",
+            ),
+            "defender_exclusion_repair_failed" => Self::new(
+                "defender_exclusion_repair_failed",
+                "Не удалось добавить исключение Microsoft Defender",
             ),
             "physical_network_monitor_unavailable" => Self::new(
                 "physical_network_monitor_unavailable",
@@ -1131,6 +1173,168 @@ pub async fn app_prepare_tunnel(
 }
 
 #[tauri::command]
+pub async fn app_windows_defender_status(
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<WindowsDefenderStatusResponse, CommandError> {
+    #[cfg(windows)]
+    {
+        let status = crate::platform::windows::refresh_defender_status()
+            .await
+            .map_err(CommandError::from_tunnel)?;
+        record_defender_status(&diagnostics, "windows.defender.checked", &status);
+        Ok(defender_status_response(status))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = diagnostics;
+        Ok(WindowsDefenderStatusResponse {
+            supported: false,
+            state: "not_applicable".to_string(),
+            dll_present: false,
+            dll_path: None,
+            detail_code: None,
+            antivirus_products: Vec::new(),
+            antivirus_detail_code: None,
+        })
+    }
+}
+
+#[tauri::command]
+pub async fn app_windows_defender_repair(
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<WindowsDefenderStatusResponse, CommandError> {
+    #[cfg(windows)]
+    {
+        let status = match crate::platform::windows::repair_defender_exclusion().await {
+            Ok(status) => status,
+            Err(error) => {
+                let error = CommandError::from_tunnel(error);
+                diagnostics.record_named(
+                    "windows.defender.repair_failed",
+                    None,
+                    None,
+                    Some(error.code()),
+                );
+                return Err(error);
+            }
+        };
+        record_defender_status(&diagnostics, "windows.defender.repaired", &status);
+        Ok(defender_status_response(status))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = diagnostics;
+        Err(CommandError::new(
+            "defender_exclusion_unsupported",
+            "Microsoft Defender доступен только в Windows",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn defender_status_response(
+    status: nelomai_windows_service::DefenderStatus,
+) -> WindowsDefenderStatusResponse {
+    WindowsDefenderStatusResponse {
+        supported: true,
+        state: defender_state_name(status.state).to_string(),
+        dll_present: status.dll_present,
+        dll_path: std::env::current_exe().ok().map(|path| {
+            path.with_file_name("amneziawg-tunnel.dll")
+                .display()
+                .to_string()
+        }),
+        detail_code: status.detail_code,
+        antivirus_products: status
+            .antivirus_products
+            .into_iter()
+            .map(|product| WindowsAntivirusProductResponse {
+                name: product.name,
+                state: antivirus_product_state_name(product.state).to_string(),
+                signatures_up_to_date: product.signatures_up_to_date,
+                is_default: product.is_default,
+                is_microsoft_defender: product.is_microsoft_defender,
+            })
+            .collect(),
+        antivirus_detail_code: status.antivirus_detail_code,
+    }
+}
+
+#[cfg(windows)]
+fn record_defender_status(
+    diagnostics: &AppDiagnostics,
+    event: &str,
+    status: &nelomai_windows_service::DefenderStatus,
+) {
+    let active_third_party = status
+        .antivirus_products
+        .iter()
+        .filter(|product| {
+            product.state == nelomai_windows_service::AntivirusProductState::On
+                && !product.is_microsoft_defender
+        })
+        .count();
+    let code = format!(
+        "{}_dll_{}_{}_antivirus_{}_active_third_party_{}_{}",
+        defender_state_name(status.state),
+        if status.dll_present {
+            "present"
+        } else {
+            "missing"
+        },
+        status.detail_code.as_deref().unwrap_or("ok"),
+        status.antivirus_products.len(),
+        active_third_party,
+        status.antivirus_detail_code.as_deref().unwrap_or("ok")
+    );
+    diagnostics.record_named(event, None, None, Some(&code));
+}
+
+#[cfg(windows)]
+fn antivirus_product_state_name(
+    state: nelomai_windows_service::AntivirusProductState,
+) -> &'static str {
+    use nelomai_windows_service::AntivirusProductState;
+    match state {
+        AntivirusProductState::On => "on",
+        AntivirusProductState::Off => "off",
+        AntivirusProductState::Snoozed => "snoozed",
+        AntivirusProductState::Expired => "expired",
+        AntivirusProductState::Unknown => "unknown",
+    }
+}
+
+#[cfg(windows)]
+fn defender_state_name(state: nelomai_windows_service::DefenderExclusionState) -> &'static str {
+    use nelomai_windows_service::DefenderExclusionState;
+    match state {
+        DefenderExclusionState::Excluded => "excluded",
+        DefenderExclusionState::Missing => "missing",
+        DefenderExclusionState::Inactive => "inactive",
+        DefenderExclusionState::Unavailable => "unavailable",
+    }
+}
+
+#[cfg(windows)]
+async fn ensure_defender_ready_for_awg(diagnostics: &AppDiagnostics) -> Result<(), CommandError> {
+    let defender = crate::platform::windows::defender_status()
+        .await
+        .map_err(CommandError::from_tunnel)?;
+    record_defender_status(diagnostics, "windows.defender.before_awg_start", &defender);
+    if !defender.dll_present {
+        return Err(CommandError::from_tunnel(
+            nelomai_client_tunnel::TunnelError::Backend("amneziawg_component_missing".to_string()),
+        ));
+    }
+    if defender.state == nelomai_windows_service::DefenderExclusionState::Missing {
+        return Err(CommandError::from_tunnel(
+            nelomai_client_tunnel::TunnelError::Backend("defender_exclusion_missing".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn app_start(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
@@ -1139,6 +1343,10 @@ pub async fn app_start(
 ) -> Result<Connection, CommandError> {
     let device_id = request.device_id;
     let start_result = async {
+        #[cfg(windows)]
+        if request.layer == Layer::Stray {
+            ensure_defender_ready_for_awg(&diagnostics).await?;
+        }
         refresh_installed_applications_before_start(
             &app,
             &application,
@@ -1240,7 +1448,12 @@ fn schedule_start_failure_diagnostics(
 pub async fn app_start_saved_stray(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
 ) -> Result<String, CommandError> {
+    #[cfg(windows)]
+    ensure_defender_ready_for_awg(&diagnostics).await?;
+    #[cfg(not(windows))]
+    let _ = &diagnostics;
     refresh_installed_applications_before_start(
         &app,
         &application,
