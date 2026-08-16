@@ -44,6 +44,33 @@ private const val METRICS_OPERATION_WATCHDOG_MILLIS = 1_500L
 private const val UDP_REBIND_QUEUE_TIMEOUT_MILLIS = 500L
 private const val UDP_REBIND_OPERATION_WATCHDOG_MILLIS = 2_500L
 
+private fun endpointPort(endpoint: String?): Int? {
+    val value = endpoint?.trim().orEmpty()
+    if (value.isEmpty()) return null
+    return value.substringAfterLast(':', "").toIntOrNull()?.takeIf { it in 1..65_535 }
+}
+
+internal fun diagnosticNetworkError(error: String?): String? {
+    val normalized = error?.trim()?.lowercase().orEmpty()
+    if (normalized.isEmpty()) return null
+    return when {
+        "network is unreachable" in normalized || "network unreachable" in normalized ->
+            "network_unreachable"
+        "no route to host" in normalized || "host is unreachable" in normalized ||
+            "host unreachable" in normalized -> "host_unreachable"
+        "connection refused" in normalized -> "connection_refused"
+        "permission denied" in normalized || "operation not permitted" in normalized ->
+            "permission_denied"
+        "address not available" in normalized || "cannot assign requested address" in normalized ->
+            "address_unavailable"
+        "network is down" in normalized || "network down" in normalized -> "network_down"
+        "timed out" in normalized || "timeout" in normalized -> "timeout"
+        "socket closed" in normalized || "closed network connection" in normalized ->
+            "socket_closed"
+        else -> "network_io_error"
+    }
+}
+
 @InvokeArg
 class TunnelOptionsArgs {
     var splitActive: Boolean = false
@@ -308,6 +335,7 @@ private data class ActiveTunnelSession(
     var observedNetworkFingerprint: String,
     var networkWasUnavailable: Boolean,
     val transport: String,
+    val connectionLeaseId: String?,
     val startedAtElapsedMillis: Long = SystemClock.elapsedRealtime(),
     var lastDiagnosticsReceivedBytes: Long? = null,
     var lastDiagnosticsSentBytes: Long? = null,
@@ -323,6 +351,8 @@ private data class ActiveTunnelSession(
     var pendingUdpControlProbe: PendingUdpControlProbe? = null,
     var lastDataPlaneSnapshotElapsedMillis: Long = startedAtElapsedMillis,
     var lastTelemetryErrorLoggedElapsedMillis: Long = 0,
+    var networkIncidentCount: Int = 0,
+    var openNetworkIncidentElapsedMillis: Long? = null,
 )
 
 internal enum class UdpControlProbeStage {
@@ -397,10 +427,12 @@ internal data class NetworkTelemetry(
                 lastTunWriteAtUnixMillis = payload.getLong("last_tun_write_at_unix_ms"),
                 lastUdpSendAtUnixMillis = payload.getLong("last_udp_send_at_unix_ms"),
                 lastUdpReceiveAtUnixMillis = payload.getLong("last_udp_receive_at_unix_ms"),
-                lastUdpSendError = payload.optString("last_udp_send_error")
-                    .takeIf(String::isNotBlank),
-                lastUdpReceiveError = payload.optString("last_udp_receive_error")
-                    .takeIf(String::isNotBlank),
+                lastUdpSendError = diagnosticNetworkError(
+                    payload.optString("last_udp_send_error").takeIf(String::isNotBlank),
+                ),
+                lastUdpReceiveError = diagnosticNetworkError(
+                    payload.optString("last_udp_receive_error").takeIf(String::isNotBlank),
+                ),
                 lastUdpSendErrno = payload.optInt("last_udp_send_errno")
                     .takeIf { it != 0 },
                 lastUdpReceiveErrno = payload.optInt("last_udp_receive_errno")
@@ -725,6 +757,7 @@ internal object TunnelRuntime {
                         observedNetworkFingerprint = physicalState.fingerprint,
                         networkWasUnavailable = !physicalState.available,
                         transport = transport,
+                        connectionLeaseId = args.quickConnection?.leaseId,
                     )
                     activeSession = session
                     try {
@@ -751,7 +784,12 @@ internal object TunnelRuntime {
                 }
                 stateGate.complete(resolved)
                 if (resolved == SessionState.RUNNING) {
-                    runCatching { AutomaticDiagnostics.onTunnelStarted(applicationContext) }
+                    runCatching {
+                        AutomaticDiagnostics.onTunnelStarted(
+                            applicationContext,
+                            args.quickConnection?.leaseId,
+                        )
+                    }
                         .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
                 }
                 if (resolved == SessionState.RUNNING && quickPlan != null) {
@@ -1570,6 +1608,19 @@ internal object TunnelRuntime {
             session.udpStallStartedElapsedMillis = null
         }
         if (tunWriteDelta > 0) {
+            session.openNetworkIncidentElapsedMillis?.let { detectedAt ->
+                TunnelLog.incident(
+                    "tunnel.network_incident_recovered",
+                    mapOf(
+                        "connection_lease_id" to session.connectionLeaseId,
+                        "incident_sequence" to session.networkIncidentCount,
+                        "duration_millis" to (now - detectedAt).coerceAtLeast(0),
+                        "local_port" to sample.localPort,
+                        "endpoint_port" to endpointPort(sample.endpoint),
+                    ),
+                )
+                session.openNetworkIncidentElapsedMillis = null
+            }
             session.lastTunWriteActivityElapsedMillis = now
             session.udpStallStartedElapsedMillis = null
             session.udpRecoveryArmed = true
@@ -1672,6 +1723,32 @@ internal object TunnelRuntime {
                 "samples" to JSONArray(session.recentNetworkTelemetry.toList()),
             ),
         )
+        if (session.openNetworkIncidentElapsedMillis == null) {
+            session.networkIncidentCount += 1
+            session.openNetworkIncidentElapsedMillis = now
+            TunnelLog.incident(
+                "tunnel.network_incident_detected",
+                buildMap {
+                    put("connection_lease_id", session.connectionLeaseId)
+                    put("incident_sequence", session.networkIncidentCount)
+                    put("kind", "suspected_data_path_stall")
+                    put("local_port", sample.localPort)
+                    put("endpoint_port", endpointPort(sample.endpoint))
+                    put("last_udp_send_error", sample.lastUdpSendError)
+                    put("last_udp_receive_error", sample.lastUdpReceiveError)
+                    put("last_udp_send_errno", sample.lastUdpSendErrno)
+                    put("last_udp_receive_errno", sample.lastUdpReceiveErrno)
+                    if (session.networkIncidentCount <= MAX_DETAILED_NETWORK_INCIDENTS) {
+                        put("samples", JSONArray(session.recentNetworkTelemetry.toList()))
+                    } else {
+                        put(
+                            "additional_count",
+                            session.networkIncidentCount - MAX_DETAILED_NETWORK_INCIDENTS,
+                        )
+                    }
+                },
+            )
+        }
         try {
             startUdpControlProbe(
                 session = session,
@@ -1900,7 +1977,7 @@ internal object TunnelRuntime {
             put("last_udp_receive_at_unix_ms", sample.lastUdpReceiveAtUnixMillis)
             sample.lastUdpSendErrno?.let { put("last_udp_send_errno", it) }
             sample.lastUdpReceiveErrno?.let { put("last_udp_receive_errno", it) }
-            sample.endpoint?.let { put("endpoint", it) }
+            endpointPort(sample.endpoint)?.let { put("endpoint_port", it) }
         }
         session.recentNetworkTelemetry.addLast(record)
         while (session.recentNetworkTelemetry.size > NETWORK_TELEMETRY_RING_SAMPLES) {
@@ -2079,6 +2156,7 @@ internal fun udpControlProbeStartFailureAction(
 private const val DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS = 5L * 60L
 private const val NETWORK_TELEMETRY_INTERVAL_SECONDS = 1L
 private const val NETWORK_TELEMETRY_RING_SAMPLES = 45
+private const val MAX_DETAILED_NETWORK_INCIDENTS = 3
 private const val NETWORK_TELEMETRY_ERROR_LOG_INTERVAL_MILLIS = 60_000L
 private const val UDP_RECOVERY_MINIMUM_UPTIME_MILLIS = 10_000L
 private const val UDP_RECOVERY_TUN_ACTIVITY_WINDOW_MILLIS = 2_500L

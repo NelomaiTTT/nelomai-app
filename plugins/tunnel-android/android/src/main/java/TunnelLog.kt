@@ -10,7 +10,10 @@ private const val TUNNEL_LOG_TAG = "NelomaiTunnel"
 private const val LOG_DIRECTORY = "diagnostics"
 private const val LOG_FILE = "android-tunnel.jsonl"
 private const val LOG_PREVIOUS_FILE = "android-tunnel.previous.jsonl"
+private const val INCIDENT_LOG_FILE = "android-network-incidents.jsonl"
+private const val INCIDENT_LOG_PREVIOUS_FILE = "android-network-incidents.previous.jsonl"
 private const val LOG_ROTATE_BYTES = 128 * 1024L
+private const val INCIDENT_LOG_ROTATE_BYTES = 96 * 1024L
 
 internal object TunnelLog {
     private val lock = Any()
@@ -34,7 +37,37 @@ internal object TunnelLog {
         append("warning", event, details)
     }
 
+    fun incident(event: String, details: Map<String, Any?> = emptyMap()) {
+        Log.i(TUNNEL_LOG_TAG, renderLogcat(event, details))
+        appendLine(
+            level = "info",
+            event = event,
+            details = details,
+            fileName = INCIDENT_LOG_FILE,
+            previousFileName = INCIDENT_LOG_PREVIOUS_FILE,
+            rotateBytes = INCIDENT_LOG_ROTATE_BYTES,
+        )
+    }
+
     private fun append(level: String, event: String, details: Map<String, Any?>) {
+        appendLine(
+            level = level,
+            event = event,
+            details = details,
+            fileName = LOG_FILE,
+            previousFileName = LOG_PREVIOUS_FILE,
+            rotateBytes = LOG_ROTATE_BYTES,
+        )
+    }
+
+    private fun appendLine(
+        level: String,
+        event: String,
+        details: Map<String, Any?>,
+        fileName: String,
+        previousFileName: String,
+        rotateBytes: Long,
+    ) {
         val root = directory ?: return
         val line = JSONObject().apply {
             put("timestamp", Instant.now().toString())
@@ -44,10 +77,10 @@ internal object TunnelLog {
         }.toString() + "\n"
         synchronized(lock) {
             runCatching {
-                val current = File(root, LOG_FILE)
-                if (current.exists() && current.length() + line.toByteArray().size > LOG_ROTATE_BYTES) {
-                    File(root, LOG_PREVIOUS_FILE).delete()
-                    current.renameTo(File(root, LOG_PREVIOUS_FILE))
+                val current = File(root, fileName)
+                if (current.exists() && current.length() + line.toByteArray().size > rotateBytes) {
+                    File(root, previousFileName).delete()
+                    current.renameTo(File(root, previousFileName))
                 }
                 current.appendText(line, Charsets.UTF_8)
             }

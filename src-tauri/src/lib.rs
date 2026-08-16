@@ -5,6 +5,8 @@ mod connection_metrics;
 #[cfg(desktop)]
 mod desktop;
 mod diagnostics;
+#[cfg(desktop)]
+mod network_incidents;
 mod platform;
 mod preferences;
 mod resource_usage;
@@ -507,10 +509,12 @@ fn start_connection_metrics_scheduler(
 
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(CONNECTION_METRICS_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut failure_recorded = false;
         let mut last_diagnostics_at: Option<std::time::Instant> = None;
         let mut last_diagnostics_session: Option<String> = None;
         let mut last_diagnostics_sample = None;
+        let mut last_incident_sample = None;
         let mut skipped_probe_session: Option<String> = None;
         loop {
             interval.tick().await;
@@ -520,12 +524,14 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_at = None;
                 last_diagnostics_session = None;
                 last_diagnostics_sample = None;
+                last_incident_sample = None;
                 skipped_probe_session = None;
                 continue;
             };
             let observed = tracker.is_observed().await;
             let endpoint_route_guard =
                 cfg!(windows) && context.layer == nelomai_contracts::Layer::Stray;
+            let incident_sampling = cfg!(desktop);
             let new_diagnostics_session =
                 last_diagnostics_session.as_deref() != Some(context.session_id.as_str());
             let diagnostics_now = std::time::Instant::now();
@@ -535,11 +541,17 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_at,
                 diagnostics_now,
             );
-            if !observed && !diagnostics_due && !endpoint_route_guard {
+            if !connection_metrics_poll_required(
+                observed,
+                diagnostics_due,
+                endpoint_route_guard,
+                incident_sampling,
+            ) {
                 continue;
             }
             if new_diagnostics_session {
                 last_diagnostics_sample = None;
+                last_incident_sample = None;
             }
             if diagnostics_due {
                 last_diagnostics_at = Some(diagnostics_now);
@@ -561,6 +573,12 @@ fn start_connection_metrics_scheduler(
             match tunnel.metrics(false).await {
                 Ok(Some(sample)) => {
                     failure_recorded = false;
+                    diagnostics.observe_tunnel_metrics(
+                        &context.session_id,
+                        &sample,
+                        last_incident_sample.as_ref(),
+                    );
+                    last_incident_sample = Some(sample.clone());
                     // Nelomai is deliberately excluded from Android's own VpnService, so an
                     // HTTP request from the app process cannot validate the tunnel there.
                     // Desktop probes use the panel rather than the VPN endpoint, whose host
@@ -663,9 +681,26 @@ fn connection_diagnostics_due(
         })
 }
 
+fn connection_metrics_poll_required(
+    observed: bool,
+    diagnostics_due: bool,
+    endpoint_route_guard: bool,
+    incident_sampling: bool,
+) -> bool {
+    observed || diagnostics_due || endpoint_route_guard || incident_sampling
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_incident_sampling_does_not_depend_on_visible_metrics() {
+        assert!(connection_metrics_poll_required(false, false, false, true));
+        assert!(!connection_metrics_poll_required(
+            false, false, false, false
+        ));
+    }
     #[cfg(desktop)]
     use nelomai_client_tunnel::TunnelStatus;
 

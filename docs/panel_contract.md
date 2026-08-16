@@ -107,6 +107,18 @@ kernel peak RSS for the UI and VPN processes. A bounded memory time series is
 written to the existing rotating native log at tunnel start, fixed uptime
 milestones, UI task removal, and physical-network changes; it does not create
 extra reports or change the six-hour upload interval.
+Tunnel-session reports may also carry the dynamic `connection_lease_id` and a
+bounded incident snapshot. Desktop keeps at most three detailed stalls per
+session and aggregates later occurrences; Android writes the same bounded
+events from its AWG3 telemetry ring. Android omits endpoint hosts entirely and
+records only the numeric port; server agents use a keyed server-local HMAC when
+they need to correlate changes of a remote endpoint without disclosing its
+address. A manually requested report created while a tunnel is active includes
+the current lease identifier and only that lease's incident entries, including
+the native VPN-process journal on Android, so the panel can correlate the same
+server history as for an automatic report. Incident capture does not trigger an
+extra upload: the existing tunnel-stop, six-hour, and manual paths remain the
+only report triggers.
 For `cpu_average_basis_points`, `10000` means one fully occupied logical CPU;
 multithreaded work can legitimately exceed that value.
 

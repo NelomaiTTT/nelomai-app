@@ -47,6 +47,8 @@ pub(crate) struct PendingSeal {
     pub started_at: i64,
     pub ended_at: i64,
     pub tunnel_running: bool,
+    #[serde(default)]
+    pub connection_id: Option<String>,
 }
 
 pub(crate) struct UploadCandidate {
@@ -402,6 +404,7 @@ fn seal(session: &AutomaticSession, trigger: &str, tunnel_running: bool, now: i6
         started_at: session.interval_started_at,
         ended_at: now.max(session.interval_started_at),
         tunnel_running,
+        connection_id: Some(session.connection_id.clone()),
     }
 }
 
@@ -557,12 +560,14 @@ mod tests {
             interval_started_at_unix: Some(seal.started_at),
             interval_ended_at_unix: Some(seal.ended_at),
             tunnel_running: Some(seal.tunnel_running),
+            connection_lease_id: seal.connection_id.clone(),
             generated_at_unix: seal.ended_at,
             app_version: "test".to_string(),
             platform_version: None,
             architecture: "test".to_string(),
             application_log: "test".to_string(),
             helper_log: None,
+            network_incidents: None,
             resource_usage: None,
         }
     }

@@ -1290,6 +1290,10 @@ pub async fn app_send_diagnostics(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     tunnel: State<'_, Arc<crate::platform::PlatformTunnelController>>,
 ) -> Result<DiagnosticUploadResponse, CommandError> {
+    let connection_before = application
+        .connection_metrics_context()
+        .await
+        .map(|context| context.session_id);
     let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(&app);
     #[cfg(desktop)]
     let helper_log = crate::platform::diagnostic_helper_log(&tunnel).await;
@@ -1298,8 +1302,18 @@ pub async fn app_send_diagnostics(
         let _ = &tunnel;
         None
     };
+    let connection_after = application
+        .connection_metrics_context()
+        .await
+        .map(|context| context.session_id);
+    let connection_lease_id =
+        stable_diagnostics_connection_lease(connection_before, connection_after);
     let report = diagnostics
-        .build_report_with_helper(resource_snapshot, helper_log)
+        .build_report_with_helper(
+            resource_snapshot,
+            helper_log,
+            connection_lease_id.as_deref(),
+        )
         .map_err(|_| {
             CommandError::new(
                 "diagnostics_unavailable",
@@ -1325,6 +1339,16 @@ pub async fn app_send_diagnostics(
             );
             Err(error.into())
         }
+    }
+}
+
+fn stable_diagnostics_connection_lease(
+    before: Option<String>,
+    after: Option<String>,
+) -> Option<String> {
+    match (before, after) {
+        (Some(before), Some(after)) if before == after => Some(before),
+        _ => None,
     }
 }
 
@@ -1928,6 +1952,32 @@ fn current_platform() -> Platform {
 mod tests {
     use super::*;
     use nelomai_contracts::{ApiVersion, PeerBinding};
+
+    #[test]
+    fn manual_diagnostics_uses_only_an_unchanged_connection_lease() {
+        assert_eq!(
+            stable_diagnostics_connection_lease(
+                Some("lease-1".to_string()),
+                Some("lease-1".to_string()),
+            ),
+            Some("lease-1".to_string()),
+        );
+        assert_eq!(
+            stable_diagnostics_connection_lease(
+                Some("lease-1".to_string()),
+                Some("lease-2".to_string()),
+            ),
+            None,
+        );
+        assert_eq!(
+            stable_diagnostics_connection_lease(Some("lease-1".to_string()), None),
+            None,
+        );
+        assert_eq!(
+            stable_diagnostics_connection_lease(None, Some("lease-1".to_string())),
+            None,
+        );
+    }
 
     #[test]
     fn binding_response_never_serializes_wireguard_configuration() {

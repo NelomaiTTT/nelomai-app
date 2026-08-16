@@ -145,12 +145,16 @@ pub struct DiagnosticUploadRequest {
     pub interval_ended_at_unix: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tunnel_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_lease_id: Option<String>,
     pub generated_at_unix: i64,
     pub app_version: String,
     pub platform_version: Option<String>,
     pub architecture: String,
     pub application_log: String,
     pub helper_log: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_incidents: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_usage: Option<DiagnosticResourceUsage>,
 }
@@ -197,6 +201,7 @@ impl fmt::Debug for DiagnosticUploadRequest {
             .field("trigger", &self.trigger)
             .field("tunnel_session_id", &self.tunnel_session_id)
             .field("sequence", &self.sequence)
+            .field("connection_lease_id", &self.connection_lease_id)
             .field("generated_at_unix", &self.generated_at_unix)
             .field("app_version", &self.app_version)
             .field("platform_version", &self.platform_version)
@@ -205,6 +210,10 @@ impl fmt::Debug for DiagnosticUploadRequest {
             .field(
                 "helper_log",
                 &self.helper_log.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "network_incidents",
+                &self.network_incidents.as_ref().map(|_| "<redacted>"),
             )
             .field("resource_usage", &self.resource_usage)
             .finish()
@@ -1020,12 +1029,14 @@ mod tests {
             interval_started_at_unix: None,
             interval_ended_at_unix: None,
             tunnel_running: None,
+            connection_lease_id: None,
             generated_at_unix: 1,
             app_version: "0.1.0".to_string(),
             platform_version: Some("test".to_string()),
             architecture: "x86_64".to_string(),
             application_log: "application-secret".to_string(),
             helper_log: Some("helper-secret".to_string()),
+            network_incidents: Some("incident-secret".to_string()),
             resource_usage: None,
         };
 
@@ -1033,6 +1044,7 @@ mod tests {
 
         assert!(!debug.contains("application-secret"));
         assert!(!debug.contains("helper-secret"));
+        assert!(!debug.contains("incident-secret"));
         assert!(debug.contains("<redacted>"));
         let serialized = serde_json::to_value(&request).unwrap();
         assert!(serialized.get("resource_usage").is_none());

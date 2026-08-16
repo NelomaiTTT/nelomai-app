@@ -47,6 +47,7 @@ private const val MAX_SENT_REPORTS = 3
 private const val MAX_APPLICATION_LOG_BYTES = 320 * 1024
 private const val MAX_STARTUP_LOG_BYTES = 16 * 1024
 private const val MAX_HELPER_LOG_BYTES = 64 * 1024
+private const val MAX_NETWORK_INCIDENT_LOG_BYTES = 48 * 1024
 private const val MAX_REPORT_BYTES = 512 * 1024
 private const val AUTOMATIC_DIAGNOSTICS_JOB_ID = 0x4e444941
 private val RETRY_DELAYS_SECONDS = longArrayOf(5 * 60L, 30 * 60L, 2 * 60 * 60L, 6 * 60 * 60L)
@@ -56,6 +57,7 @@ private const val KEY_SESSION_SEQUENCE = "session_sequence"
 private const val KEY_INTERVAL_STARTED_AT = "interval_started_at"
 private const val KEY_SESSION_RUNNING = "session_running"
 private const val KEY_SESSION_DEVICE_ID = "session_device_id"
+private const val KEY_SESSION_LEASE_ID = "session_lease_id"
 private const val KEY_STOPPED_SESSION_PENDING = "stopped_session_pending"
 private const val KEY_PENDING_SEAL = "pending_seal"
 private const val KEY_RETRY_ATTEMPT = "retry_attempt"
@@ -72,6 +74,7 @@ private data class PendingSeal(
     val startedAt: Long,
     val endedAt: Long,
     val tunnelRunning: Boolean,
+    val connectionLeaseId: String?,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("report_id", reportId)
@@ -82,6 +85,7 @@ private data class PendingSeal(
         put("started_at", startedAt)
         put("ended_at", endedAt)
         put("tunnel_running", tunnelRunning)
+        put("connection_lease_id", connectionLeaseId ?: JSONObject.NULL)
     }.toString()
 }
 
@@ -126,7 +130,7 @@ internal object AutomaticDiagnostics {
         }
     }
 
-    fun onTunnelStarted(context: Context) {
+    fun onTunnelStarted(context: Context, connectionLeaseId: String?) {
         val applicationContext = context.applicationContext
         synchronized(gate) {
             val preferences = preferences(applicationContext)
@@ -149,6 +153,7 @@ internal object AutomaticDiagnostics {
                     .putLong(KEY_INTERVAL_STARTED_AT, now)
                     .putBoolean(KEY_SESSION_RUNNING, true)
                     .putString(KEY_SESSION_DEVICE_ID, deviceId)
+                    .putString(KEY_SESSION_LEASE_ID, connectionLeaseId)
                     .remove(KEY_STOPPED_SESSION_PENDING)
                     .remove(KEY_PENDING_SEAL)
                     .commit(),
@@ -306,6 +311,7 @@ internal object AutomaticDiagnostics {
                     startedAt = startedAt,
                     endedAt = maxOf(nowUnix(), startedAt),
                     tunnelRunning = tunnelRunning,
+                    connectionLeaseId = preferences.getString(KEY_SESSION_LEASE_ID, null),
                 )
                 val markerSaved = preferences.edit()
                     .putString(KEY_PENDING_SEAL, seal.toJson())
@@ -333,6 +339,7 @@ internal object AutomaticDiagnostics {
                     seal.startedAt,
                     seal.endedAt,
                     seal.tunnelRunning,
+                    seal.connectionLeaseId,
                 )
                 writePendingReport(finalFile, payload)
             }
@@ -346,6 +353,7 @@ internal object AutomaticDiagnostics {
                     .remove(KEY_SESSION_SEQUENCE)
                     .remove(KEY_INTERVAL_STARTED_AT)
                     .remove(KEY_SESSION_DEVICE_ID)
+                    .remove(KEY_SESSION_LEASE_ID)
                     .remove(KEY_STOPPED_SESSION_PENDING)
                     .putBoolean(KEY_SESSION_RUNNING, false)
             }
@@ -373,6 +381,7 @@ internal object AutomaticDiagnostics {
         startedAt: Long,
         endedAt: Long,
         tunnelRunning: Boolean,
+        connectionLeaseId: String?,
     ): JSONObject {
         val processes = androidProcessMemory(context)
         logMemorySnapshot(context.packageName, processes, "report_$trigger")
@@ -384,6 +393,7 @@ internal object AutomaticDiagnostics {
             put("interval_started_at_unix", startedAt)
             put("interval_ended_at_unix", endedAt)
             put("tunnel_running", tunnelRunning)
+            connectionLeaseId?.let { put("connection_lease_id", it) }
             put("generated_at_unix", endedAt)
             put("app_version", appVersion(context))
             put("platform_version", Build.VERSION.RELEASE.takeIf(String::isNotBlank))
@@ -402,6 +412,16 @@ internal object AutomaticDiagnostics {
                     endedAt,
                 ),
             )
+            val networkIncidents = intervalLog(
+                context,
+                "android-network-incidents",
+                MAX_NETWORK_INCIDENT_LOG_BYTES,
+                startedAt,
+                endedAt,
+            )
+            if (networkIncidents.isNotBlank()) {
+                put("network_incidents", networkIncidents)
+            }
             put(
                 "resource_usage",
                 JSONObject().apply {
@@ -592,6 +612,11 @@ internal object AutomaticDiagnostics {
                 startedAt = startedAt,
                 endedAt = endedAt,
                 tunnelRunning = payload.getBoolean("tunnel_running"),
+                connectionLeaseId = if (payload.isNull("connection_lease_id")) {
+                    null
+                } else {
+                    UUID.fromString(payload.getString("connection_lease_id")).toString()
+                },
             )
         }.getOrNull()
     }

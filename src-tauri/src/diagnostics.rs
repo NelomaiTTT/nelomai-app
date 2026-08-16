@@ -2,6 +2,8 @@
 use crate::automatic_diagnostics::{
     AutomaticObservation, DesktopAutomaticDiagnostics, PendingSeal, UploadCandidate,
 };
+#[cfg(desktop)]
+use crate::network_incidents::NetworkIncidentRecorder;
 use crate::resource_usage::ResourceSnapshot;
 use nelomai_client_api::DiagnosticUploadRequest;
 use nelomai_client_core::{CoreLogEvent, CoreLogger};
@@ -30,6 +32,8 @@ const MAX_ANDROID_PREVIOUS_REPORT_BYTES: usize = 16 * 1024;
 const MAX_ANDROID_CURRENT_REPORT_BYTES: usize = 24 * 1024;
 #[cfg(any(target_os = "android", test))]
 const MAX_ANDROID_LOGCAT_REPORT_BYTES: usize = 20 * 1024;
+#[cfg(any(target_os = "android", test))]
+const MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES: usize = 48 * 1024;
 
 pub struct AppDiagnostics {
     directory: PathBuf,
@@ -39,6 +43,8 @@ pub struct AppDiagnostics {
     automatic: DesktopAutomaticDiagnostics,
     #[cfg(desktop)]
     automatic_resource_baseline: Mutex<Option<AutomaticResourceBaseline>>,
+    #[cfg(desktop)]
+    network_incidents: NetworkIncidentRecorder,
 }
 
 #[cfg(desktop)]
@@ -81,12 +87,19 @@ impl AppDiagnostics {
         #[cfg(desktop)]
         let automatic = DesktopAutomaticDiagnostics::new(directory.join("automatic"))?;
         #[cfg(desktop)]
+        let network_incidents = NetworkIncidentRecorder::new(&directory)?;
+        #[cfg(desktop)]
         let automatic_startup_warning = automatic.startup_warning().map(str::to_string);
+        #[cfg(desktop)]
+        let network_incident_startup_warning =
+            network_incidents.startup_warning().map(str::to_string);
         let diagnostics = Self {
             #[cfg(desktop)]
             automatic,
             #[cfg(desktop)]
             automatic_resource_baseline: Mutex::new(None),
+            #[cfg(desktop)]
+            network_incidents,
             directory,
             write_gate: Mutex::new(()),
             resource_baseline,
@@ -95,6 +108,15 @@ impl AppDiagnostics {
         #[cfg(desktop)]
         if let Some(warning) = automatic_startup_warning {
             diagnostics.record_named("diagnostics.sent_prune_failed", None, None, Some(&warning));
+        }
+        #[cfg(desktop)]
+        if let Some(warning) = network_incident_startup_warning {
+            diagnostics.record_named(
+                "diagnostics.network_incident_archive_quarantined",
+                None,
+                None,
+                Some(&warning),
+            );
         }
         Ok(diagnostics)
     }
@@ -167,6 +189,40 @@ impl AppDiagnostics {
         self.append_serialized(&record);
     }
 
+    pub fn observe_tunnel_metrics(
+        &self,
+        connection_id: &str,
+        sample: &TunnelMetrics,
+        previous: Option<&TunnelMetrics>,
+    ) {
+        #[cfg(desktop)]
+        if let Err(error) =
+            self.network_incidents
+                .observe(connection_id, sample, previous, now_unix())
+        {
+            self.record_named(
+                "diagnostics.network_incident_write_failed",
+                Some(connection_id),
+                None,
+                Some(&error.kind().to_string()),
+            );
+        }
+        #[cfg(not(desktop))]
+        let _ = (connection_id, sample, previous);
+    }
+
+    #[cfg(desktop)]
+    pub fn reset_network_incident_detector(&self) {
+        if let Err(error) = self.network_incidents.reset_detector() {
+            self.record_named(
+                "diagnostics.network_incident_reset_failed",
+                None,
+                None,
+                Some(&error.kind().to_string()),
+            );
+        }
+    }
+
     fn record_with_duration(
         &self,
         kind: &str,
@@ -214,13 +270,14 @@ impl AppDiagnostics {
         &self,
         resource_snapshot: ResourceSnapshot,
     ) -> io::Result<DiagnosticUploadRequest> {
-        self.build_report_with_helper(resource_snapshot, None)
+        self.build_report_with_helper(resource_snapshot, None, None)
     }
 
     pub fn build_report_with_helper(
         &self,
         resource_snapshot: ResourceSnapshot,
         helper_override: Option<String>,
+        connection_lease_id: Option<&str>,
     ) -> io::Result<DiagnosticUploadRequest> {
         let _guard = self
             .write_gate
@@ -241,6 +298,22 @@ impl AppDiagnostics {
         };
         application_log = include_android_startup_log(&self.directory, application_log);
         application_log = tail_string(&application_log, MAX_APPLICATION_REPORT_BYTES);
+        #[cfg(desktop)]
+        let network_incident_device_id = self.network_incidents.current_device_id()?;
+        #[cfg(desktop)]
+        let network_incidents = self
+            .network_incidents
+            .snapshot(
+                connection_lease_id,
+                network_incident_device_id.as_deref(),
+                None,
+                None,
+            )?
+            .map(|snapshot| snapshot.payload);
+        #[cfg(target_os = "android")]
+        let network_incidents = android_network_incidents(&self.directory, connection_lease_id);
+        #[cfg(all(not(desktop), not(target_os = "android")))]
+        let network_incidents = None;
         Ok(DiagnosticUploadRequest {
             report_id: None,
             trigger: "manual".to_string(),
@@ -249,12 +322,14 @@ impl AppDiagnostics {
             interval_started_at_unix: None,
             interval_ended_at_unix: None,
             tunnel_running: None,
+            connection_lease_id: connection_lease_id.map(str::to_string),
             generated_at_unix: now_unix(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
             helper_log: bounded_helper_log(helper_override.or_else(|| helper_log(&self.directory))),
+            network_incidents,
             resource_usage: Some(self.resource_baseline.report(resource_snapshot)),
         })
     }
@@ -269,6 +344,14 @@ impl AppDiagnostics {
                 Some(&error.kind().to_string()),
             );
         }
+        if let Err(error) = self.network_incidents.set_current_device(device_id) {
+            self.record_named(
+                "diagnostics.network_incident_device_write_failed",
+                None,
+                None,
+                Some(&error.kind().to_string()),
+            );
+        }
     }
 
     #[cfg(desktop)]
@@ -276,6 +359,14 @@ impl AppDiagnostics {
         if let Err(error) = self.automatic.clear_current_device() {
             self.record_named(
                 "diagnostics.automatic_device_clear_failed",
+                None,
+                None,
+                Some(&error.kind().to_string()),
+            );
+        }
+        if let Err(error) = self.network_incidents.clear_current_device() {
+            self.record_named(
+                "diagnostics.network_incident_device_clear_failed",
                 None,
                 None,
                 Some(&error.kind().to_string()),
@@ -355,6 +446,12 @@ impl AppDiagnostics {
                     && baseline.interval_started_at == seal.started_at
             })
             .map(|baseline| baseline.snapshot.report(resource_snapshot.clone()));
+        let network_incident_snapshot = self.network_incidents.snapshot(
+            seal.connection_id.as_deref(),
+            None,
+            Some(seal.started_at),
+            Some(seal.ended_at),
+        )?;
         let report = DiagnosticUploadRequest {
             report_id: Some(seal.report_id.clone()),
             trigger: seal.trigger.clone(),
@@ -363,16 +460,39 @@ impl AppDiagnostics {
             interval_started_at_unix: Some(seal.started_at),
             interval_ended_at_unix: Some(seal.ended_at),
             tunnel_running: Some(seal.tunnel_running),
+            connection_lease_id: seal.connection_id.clone(),
             generated_at_unix: seal.ended_at,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             platform_version: platform_version(),
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
             helper_log: bounded_helper_log(helper_override.or_else(|| helper_log(&self.directory))),
+            network_incidents: network_incident_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.payload.clone()),
             resource_usage,
         };
         drop(_guard);
         self.automatic.materialize(seal, &report)?;
+        if let (Some(connection_id), Some(snapshot)) = (
+            seal.connection_id.as_deref(),
+            network_incident_snapshot.as_ref(),
+        ) {
+            if let Err(error) =
+                self.network_incidents
+                    .prune_snapshot(connection_id, snapshot, seal.tunnel_running)
+            {
+                self.record_named(
+                    "diagnostics.network_incident_prune_failed",
+                    Some(&seal.session_id),
+                    Some(&seal.report_id),
+                    Some(&error.kind().to_string()),
+                );
+            }
+        }
+        if !seal.tunnel_running {
+            self.reset_network_incident_detector();
+        }
         let mut baseline = self
             .automatic_resource_baseline
             .lock()
@@ -446,6 +566,58 @@ fn include_android_startup_log(directory: &Path, application_log: String) -> Str
 #[cfg(not(target_os = "android"))]
 fn include_android_startup_log(_directory: &Path, application_log: String) -> String {
     application_log
+}
+
+#[cfg(target_os = "android")]
+fn android_network_incidents(
+    directory: &Path,
+    connection_lease_id: Option<&str>,
+) -> Option<String> {
+    let previous = read_tail(
+        &directory.join("android-network-incidents.previous.jsonl"),
+        MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES / 2,
+    )
+    .unwrap_or_default();
+    let current = read_tail(
+        &directory.join("android-network-incidents.jsonl"),
+        MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES,
+    )
+    .unwrap_or_default();
+    combine_android_incident_logs(&previous, &current, connection_lease_id)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn combine_android_incident_logs(
+    previous: &str,
+    current: &str,
+    connection_lease_id: Option<&str>,
+) -> Option<String> {
+    let combined = if previous.is_empty() {
+        current.to_string()
+    } else {
+        format!("{previous}{current}")
+    };
+    let filtered = combined
+        .lines()
+        .filter(|line| {
+            let Some(connection_lease_id) = connection_lease_id else {
+                return true;
+            };
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|record| {
+                    record["details"]["connection_lease_id"]
+                        .as_str()
+                        .map(|value| value == connection_lease_id)
+                })
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!filtered.is_empty()).then(|| {
+        let filtered = format!("{filtered}\n");
+        tail_string(&filtered, MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES)
+    })
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -658,6 +830,26 @@ mod tests {
     }
 
     #[test]
+    fn manual_report_can_include_the_current_connection_lease() {
+        let directory = std::env::temp_dir().join(format!(
+            "nelomai-diagnostics-manual-lease-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let diagnostics =
+            AppDiagnostics::new(directory.clone(), ResourceSnapshot::capture_for_test()).unwrap();
+        let lease_id = "12345678-1234-4234-8234-123456789abc";
+
+        let report = diagnostics
+            .build_report_with_helper(ResourceSnapshot::capture_for_test(), None, Some(lease_id))
+            .unwrap();
+
+        assert_eq!(report.trigger, "manual");
+        assert_eq!(report.connection_lease_id.as_deref(), Some(lease_id));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn reads_only_the_requested_tail() {
         let directory =
             std::env::temp_dir().join(format!("nelomai-tail-test-{}", std::process::id()));
@@ -728,6 +920,33 @@ mod tests {
 
         assert!(combined.contains("application.started"));
         assert!(combined.contains("startup.android.activity_created"));
+    }
+
+    #[test]
+    fn combines_and_bounds_android_network_incidents() {
+        let previous = format!("{}previous-incident\n", "previous\n".repeat(8_000));
+        let current = format!("{}current-incident\n", "current\n".repeat(8_000));
+
+        let combined = combine_android_incident_logs(&previous, &current, None).unwrap();
+
+        assert!(combined.len() <= MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES);
+        assert!(combined.contains("current-incident"));
+        assert_eq!(combine_android_incident_logs("", "", None), None);
+    }
+
+    #[test]
+    fn filters_android_network_incidents_by_current_lease() {
+        let current = concat!(
+            "{\"event\":\"tunnel.network_incident_detected\",\"details\":{",
+            "\"connection_lease_id\":\"lease-current\"}}\n",
+            "{\"event\":\"tunnel.network_incident_detected\",\"details\":{",
+            "\"connection_lease_id\":\"lease-old\"}}\n",
+        );
+
+        let combined = combine_android_incident_logs("", current, Some("lease-current")).unwrap();
+
+        assert!(combined.contains("lease-current"));
+        assert!(!combined.contains("lease-old"));
     }
 
     #[test]

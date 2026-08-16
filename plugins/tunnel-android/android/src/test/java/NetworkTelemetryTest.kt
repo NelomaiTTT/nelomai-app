@@ -36,13 +36,17 @@ class NetworkTelemetryTest {
                 "udp_receive_bytes":0,"udp_receive_errors":1,"local_port":32000,
                 "last_tun_read_at_unix_ms":0,"last_tun_write_at_unix_ms":0,
                 "last_udp_send_at_unix_ms":20,"last_udp_receive_at_unix_ms":0,
-                "last_udp_send_error":"network unreachable","last_udp_send_errno":101,
-                "last_udp_receive_error":"socket closed","last_udp_receive_errno":9,
+                "last_udp_send_error":"write udp 10.0.0.2:32000->192.0.2.1:443: network unreachable",
+                "last_udp_send_errno":101,
+                "last_udp_receive_error":"read udp 10.0.0.2:32000: socket closed",
+                "last_udp_receive_errno":9,
                 "endpoint":"192.0.2.1:443"
             }""".trimIndent(),
         )
 
-        assertTrue(sample.lastUdpSendError == "network unreachable")
+        assertTrue(sample.lastUdpSendError == "network_unreachable")
+        assertTrue(sample.lastUdpReceiveError == "socket_closed")
+        assertFalse(sample.lastUdpSendError?.contains("192.0.2.1") == true)
         assertTrue(sample.lastUdpSendErrno == 101)
         assertTrue(sample.lastUdpReceiveErrno == 9)
         assertTrue(sample.endpoint == "192.0.2.1:443")
