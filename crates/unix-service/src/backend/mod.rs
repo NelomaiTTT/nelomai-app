@@ -415,6 +415,21 @@ pub(crate) fn apply_and_verify_awg3_configuration(
         .ok_or_else(|| ServiceError::Backend("amneziawg_profile_mismatch".to_string()))
 }
 
+pub(crate) fn configure_interface_after_awg3<ApplyAwg3, ConfigureInterface>(
+    parameters: Option<&Awg3Parameters>,
+    apply_awg3: ApplyAwg3,
+    configure_interface: ConfigureInterface,
+) -> Result<(), ServiceError>
+where
+    ApplyAwg3: FnOnce(&Awg3Parameters) -> Result<(), ServiceError>,
+    ConfigureInterface: FnOnce() -> Result<(), ServiceError>,
+{
+    if let Some(parameters) = parameters {
+        apply_awg3(parameters)?;
+    }
+    configure_interface()
+}
+
 fn read_awg3_configuration(
     socket: UnixStream,
     parameters: &Awg3Parameters,
@@ -624,5 +639,55 @@ PersistentKeepalive = 21
 
         assert!(!read_awg3_configuration(client, parameters).expect("read response"));
         server.join().expect("server").expect("write response");
+    }
+
+    #[test]
+    fn awg3_profile_is_applied_before_peer_configuration() {
+        let parsed = parse_configuration(&format!(
+            "[Interface]\nPrivateKey = {PRIVATE_KEY}\nAddress = 10.8.1.2/32\nJc = 5\nJmin = 48\nJmax = 192\nS1 = 132\nS2 = 67\nS3 = 28\nS4 = 30\nH1 = 100\nH2 = 121\nH3 = 122\nH4 = 123\nHeaderProtectionKey = {PUBLIC_KEY}\nContentPaddingAddition = 0-32\n\n[Peer]\nPublicKey = {PUBLIC_KEY}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 127.0.0.1:10001\n"
+        ))
+        .expect("parse");
+        let events = std::cell::RefCell::new(Vec::new());
+
+        configure_interface_after_awg3(
+            parsed.awg3.as_ref(),
+            |_| {
+                events.borrow_mut().push("awg3");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("peer");
+                Ok(())
+            },
+        )
+        .expect("configure AWG3 interface");
+
+        assert_eq!(events.into_inner(), ["awg3", "peer"]);
+    }
+
+    #[test]
+    fn awg3_profile_failure_prevents_peer_configuration() {
+        let parsed = parse_configuration(&format!(
+            "[Interface]\nPrivateKey = {PRIVATE_KEY}\nAddress = 10.8.1.2/32\nJc = 5\nJmin = 48\nJmax = 192\nS1 = 132\nS2 = 67\nS3 = 28\nS4 = 30\nH1 = 100\nH2 = 121\nH3 = 122\nH4 = 123\nHeaderProtectionKey = {PUBLIC_KEY}\nContentPaddingAddition = 0-32\n\n[Peer]\nPublicKey = {PUBLIC_KEY}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 127.0.0.1:10001\n"
+        ))
+        .expect("parse");
+        let peer_configured = std::cell::Cell::new(false);
+
+        let error = configure_interface_after_awg3(
+            parsed.awg3.as_ref(),
+            |_| {
+                Err(ServiceError::Backend(
+                    "amneziawg_configuration_failed".to_string(),
+                ))
+            },
+            || {
+                peer_configured.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("AWG3 configuration must fail");
+
+        assert_eq!(error.code(), "amneziawg_configuration_failed");
+        assert!(!peer_configured.get());
     }
 }

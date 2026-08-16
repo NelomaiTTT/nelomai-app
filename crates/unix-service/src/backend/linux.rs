@@ -1,8 +1,8 @@
 use super::{
     append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
-    host_diagnostic_snapshot, rebind_peers_from_configuration, rebind_peers_from_host,
-    rebind_userspace_udp, state_name, transport_name, userspace_log_streams, userspace_socket_path,
-    DiagnosticJournal, RebindPeer,
+    configure_interface_after_awg3, host_diagnostic_snapshot, rebind_peers_from_configuration,
+    rebind_peers_from_host, rebind_userspace_udp, state_name, transport_name,
+    userspace_log_streams, userspace_socket_path, DiagnosticJournal, RebindPeer,
 };
 use crate::process::{status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{LinuxUserspaceRouteManager, RouteManager, SystemRouteBackend, AWG_FWMARK};
@@ -131,22 +131,25 @@ impl LinuxBackend {
         }
         self.active_transport = Some(configuration.transport);
 
-        let configured = match configuration.transport {
-            TunnelTransport::WireGuard => self.wireguard_api.configure_interface(&native.interface),
-            TunnelTransport::AmneziaWg3 => {
-                self.amneziawg_api.configure_interface(&native.interface)
-            }
-        };
+        let configured = configure_interface_after_awg3(
+            configuration.awg3.as_ref(),
+            |parameters| apply_and_verify_awg3_configuration(interface_name, parameters),
+            || {
+                match configuration.transport {
+                    TunnelTransport::WireGuard => {
+                        self.wireguard_api.configure_interface(&native.interface)
+                    }
+                    TunnelTransport::AmneziaWg3 => {
+                        self.amneziawg_api.configure_interface(&native.interface)
+                    }
+                }
+                .map_err(backend_error)
+            },
+        );
         native.interface.prvkey.zeroize();
         if let Err(error) = configured {
             let _ = self.stop_inner();
-            return Err(backend_error(error));
-        }
-        if let Some(parameters) = configuration.awg3.as_ref() {
-            if let Err(error) = apply_and_verify_awg3_configuration(interface_name, parameters) {
-                let _ = self.stop_inner();
-                return Err(error);
-            }
+            return Err(error);
         }
 
         let configured_routes: Result<(), ServiceError> = match configuration.transport {
