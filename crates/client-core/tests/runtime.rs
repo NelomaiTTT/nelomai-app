@@ -40,6 +40,38 @@ impl FailingSaveStore {
     }
 }
 
+struct RejectDynamicCacheRemovalStore(Mutex<Option<StoredAuth>>);
+
+impl RejectDynamicCacheRemovalStore {
+    fn new(auth: StoredAuth) -> Self {
+        Self(Mutex::new(Some(auth)))
+    }
+}
+
+impl SecretStore for RejectDynamicCacheRemovalStore {
+    fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+
+    fn save(&self, auth: &StoredAuth) -> Result<(), StorageError> {
+        let mut stored = self.0.lock().unwrap();
+        let removes_existing_dynamic_cache = stored
+            .as_ref()
+            .is_some_and(|current| current.saved_connection.is_some())
+            && auth.saved_connection.is_none();
+        if removes_existing_dynamic_cache {
+            return Err(StorageError::SplitTunnelStateLock);
+        }
+        *stored = Some(auth.clone());
+        Ok(())
+    }
+
+    fn delete(&self) -> Result<(), StorageError> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
 impl SecretStore for FailingSaveStore {
     fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
         Ok(self.0.lock().unwrap().clone())
@@ -234,6 +266,7 @@ struct MockApi {
     stop_failures: AtomicUsize,
     stop_error: Mutex<Option<CoreApiError>>,
     stop_operation_ids: Mutex<Vec<String>>,
+    stop_failure_codes: Mutex<Vec<Option<String>>>,
     bootstrap_fails: AtomicBool,
     reject_stale_bootstrap: AtomicBool,
     reject_stale_start: AtomicBool,
@@ -261,6 +294,7 @@ impl MockApi {
             stop_failures: AtomicUsize::new(0),
             stop_error: Mutex::new(None),
             stop_operation_ids: Mutex::new(Vec::new()),
+            stop_failure_codes: Mutex::new(Vec::new()),
             bootstrap_fails: AtomicBool::new(false),
             reject_stale_bootstrap: AtomicBool::new(false),
             reject_stale_start: AtomicBool::new(false),
@@ -371,6 +405,10 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.operation_id.clone());
+        self.stop_failure_codes
+            .lock()
+            .unwrap()
+            .push(request.failure_code.clone());
         if self.reject_stale_stop.load(Ordering::SeqCst) && access_token == "stale-access" {
             return Err(CoreApiError::Unauthorized);
         }
@@ -607,6 +645,7 @@ async fn persistent_metrics_error_cannot_confirm_a_running_tunnel() {
     assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
     assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_failure_codes.lock().unwrap().as_slice(), &[None]);
     assert_eq!(core.state().await.phase, Phase::Ready);
 }
 
@@ -771,9 +810,10 @@ async fn awg3_start_stops_and_releases_the_lease_when_handshake_never_appears() 
     let tunnel = Arc::new(MemoryTunnel::default());
     tunnel.metrics_supported.store(true, Ordering::SeqCst);
     tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
     let core = ClientCore::new(
         api.clone(),
-        Arc::new(MemoryStore::new(auth())),
+        store.clone(),
         tunnel.clone(),
         Arc::new(MemoryLogger::default()),
     );
@@ -787,7 +827,82 @@ async fn awg3_start_stops_and_releases_the_lease_when_handshake_never_appears() 
     assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
     assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.stop_failure_codes.lock().unwrap().as_slice(),
+        &[Some("tunnel_handshake_timeout".to_string())]
+    );
     assert_eq!(core.state().await.phase, Phase::Ready);
+    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn handshake_timeout_surfaces_dynamic_cache_reconciliation_failure() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let logger = Arc::new(MemoryLogger::default());
+    let store = Arc::new(RejectDynamicCacheRemovalStore::new(auth()));
+    let core = ClientCore::new(api, store.clone(), tunnel, logger.clone());
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(error, CoreError::Storage));
+    assert!(store.load().unwrap().unwrap().saved_connection.is_some());
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.start_compensation_storage_failed"));
+    assert!(matches!(
+        core.start_saved_stray_offline(1_700_000_000).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn pinned_awg3_handshake_timeout_blocks_offline_cache_until_online_reissue() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    api.pinned_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_handshake_timeout"
+    ));
+    let stored = store.load().unwrap().unwrap();
+    let pinned = stored.pinned_connection.unwrap();
+    let retry_not_before = pinned.valid_until_unix.unwrap();
+    assert!(retry_not_before > 1_700_000_000);
+    assert!(matches!(
+        core.start_saved_stray_offline(retry_not_before - 1).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    assert!(matches!(
+        core.start_saved_stray_offline(retry_not_before).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    assert!(matches!(
+        core.start(options(), retry_not_before).await,
+        Err(CoreError::Tunnel(code)) if code == "tunnel_handshake_timeout"
+    ));
+    let operation_ids = api.operation_ids.lock().unwrap();
+    assert_eq!(operation_ids.len(), 2);
+    assert_eq!(operation_ids[0], operation_ids[1]);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -878,12 +993,8 @@ async fn online_awg3_cleanup_failure_is_returned_and_remains_stoppable() {
     tunnel.metrics_supported.store(true, Ordering::SeqCst);
     tunnel.fail_next_stops.store(1, Ordering::SeqCst);
     let logger = Arc::new(MemoryLogger::default());
-    let core = ClientCore::new(
-        api.clone(),
-        Arc::new(MemoryStore::new(auth())),
-        tunnel.clone(),
-        logger.clone(),
-    );
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(api.clone(), store.clone(), tunnel.clone(), logger.clone());
 
     let error = core.start(options(), 1_700_000_000).await.unwrap_err();
 
@@ -892,6 +1003,11 @@ async fn online_awg3_cleanup_failure_is_returned_and_remains_stoppable() {
         CoreError::Tunnel(code) if code == "test_stop_failed"
     ));
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.stop_failure_codes.lock().unwrap().as_slice(),
+        &[Some("tunnel_handshake_timeout".to_string())]
+    );
+    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
     assert_eq!(core.state().await.phase, Phase::Stopping);
     assert!(logger
         .0
@@ -1948,9 +2064,10 @@ async fn offline_awg3_handshake_failure_returns_to_ready_after_cleanup() {
     let tunnel = Arc::new(MemoryTunnel::default());
     tunnel.metrics_supported.store(true, Ordering::SeqCst);
     tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(stored));
     let core = ClientCore::new(
         Arc::new(MockApi::new(0)),
-        Arc::new(MemoryStore::new(stored)),
+        store.clone(),
         tunnel.clone(),
         Arc::new(MemoryLogger::default()),
     );
@@ -1968,6 +2085,106 @@ async fn offline_awg3_handshake_failure_returns_to_ready_after_cleanup() {
     let state = core.state().await;
     assert_eq!(state.phase, Phase::Ready);
     assert!(state.connection.is_none());
+    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn offline_handshake_timeout_surfaces_dynamic_cache_reconciliation_failure() {
+    let mut stored = auth();
+    stored.saved_connection = Some(StoredConnection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        probe_url: Some("https://5a.example.test/probe".to_string()),
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: awg3_configuration("offline-secret"),
+        valid_until_unix: Some(1_700_000_100),
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let logger = Arc::new(MemoryLogger::default());
+    let store = Arc::new(RejectDynamicCacheRemovalStore::new(stored));
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        store.clone(),
+        tunnel.clone(),
+        logger.clone(),
+    );
+
+    let error = core
+        .start_saved_stray_offline(1_700_000_000)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, CoreError::Storage));
+    assert!(store.load().unwrap().unwrap().saved_connection.is_some());
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.offline_handshake_storage_failed"));
+    let starts_after_failure = tunnel.starts.load(Ordering::SeqCst);
+    assert!(matches!(
+        core.start_saved_stray_offline(1_700_000_000).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), starts_after_failure);
+    assert!(logger
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "connection.offline_cache_quarantined"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn offline_pinned_awg3_handshake_failure_blocks_the_saved_configuration() {
+    let mut stored = auth();
+    stored.pinned_connection = Some(StoredConnection {
+        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        probe_url: Some("https://5a.example.test/probe".to_string()),
+        kind: StoredConnectionKind::Pinned,
+        configuration: awg3_configuration("offline-secret"),
+        valid_until_unix: None,
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(stored));
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        store.clone(),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core
+        .start_saved_stray_offline(1_700_000_000)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_handshake_timeout"
+    ));
+    let retry_not_before = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pinned_connection
+        .unwrap()
+        .valid_until_unix
+        .unwrap();
+    assert!(matches!(
+        core.start_saved_stray_offline(retry_not_before).await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

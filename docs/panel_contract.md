@@ -64,7 +64,20 @@ is restarted by launchd, systemd, or the Windows service recovery policy. The
 independently hosted WireGuard tunnel is not stopped merely because its manager
 was recycled. Failed and partially completed local stops remain in `Stopping`;
 the application retries cleanup and the same idempotent panel operation every
-30 seconds until the connection state is reconciled.
+30 seconds until the connection state is reconciled. When an AWG3 start ends
+with `tunnel_handshake_timeout`, its compensating `connections/stop` request
+includes that optional `failure_code`. Other stops omit it. This lets the panel
+recycle a peer immediately without mistaking a short user-requested session for
+a failed handshake. For a pinned Stray peer, the panel preserves the saved peer
+but requires an explicitly approved alternate after such a timeout instead of
+immediately reusing the failed saved connection. The saved peer becomes
+retryable again after the panel cooldown. After the compensating stop succeeds,
+the client removes the failed dynamic configuration from its offline cache. A
+pinned configuration is preserved, but its operation-ID reuse is blocked for
+the same cooldown. Offline start stays blocked until a later successful online
+reissue refreshes the saved configuration, so it cannot bypass the server-side
+peer reset. The same cache invalidation or pinned block is applied when an
+offline AWG3 start reaches the handshake timeout and local cleanup succeeds.
 
 ## Diagnostic reports
 

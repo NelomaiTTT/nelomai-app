@@ -960,12 +960,27 @@ mod tests {
         let operation = ConnectionOperationRequest {
             operation_id: "11111111-1111-4111-8111-111111111111".to_string(),
             lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            failure_code: None,
         };
         assert_eq!(
             serde_json::to_value(operation).unwrap(),
             serde_json::json!({
                 "operation_id": "11111111-1111-4111-8111-111111111111",
                 "lease_id": "22222222-2222-4222-8222-222222222222"
+            })
+        );
+
+        let failed_operation = ConnectionOperationRequest {
+            operation_id: "33333333-3333-4333-8333-333333333333".to_string(),
+            lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            failure_code: Some("tunnel_handshake_timeout".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(failed_operation).unwrap(),
+            serde_json::json!({
+                "operation_id": "33333333-3333-4333-8333-333333333333",
+                "lease_id": "22222222-2222-4222-8222-222222222222",
+                "failure_code": "tunnel_handshake_timeout"
             })
         );
     }

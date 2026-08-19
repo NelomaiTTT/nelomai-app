@@ -15,9 +15,10 @@ use nelomai_contracts::{
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
     TicConnectionMode,
 };
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -29,6 +30,25 @@ const UDP_REBIND_TIMEOUT: Duration = Duration::from_millis(3_500);
 const POST_REBIND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDSHAKE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const PINNED_HANDSHAKE_RETRY_COOLDOWN_SECONDS: i64 = 30;
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn pinned_connection_retry_allowed(connection: &StoredConnection, now_unix: i64) -> bool {
+    connection
+        .valid_until_unix
+        .is_none_or(|retry_not_before| retry_not_before <= now_unix)
+}
+
+fn pinned_connection_offline_allowed(connection: &StoredConnection) -> bool {
+    connection.valid_until_unix.is_none()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandshakeWaitOutcome {
@@ -729,6 +749,7 @@ pub struct ClientCore<A, S, T, L> {
     dns_servers: RwLock<Vec<IpAddr>>,
     split_tunnel_warning: Mutex<SplitTunnelWarnings>,
     physical_network_change: Mutex<split_tunnel::PhysicalNetworkChangeDetector>,
+    offline_connection_quarantine: RwLock<HashSet<String>>,
     retry_policy: RetryPolicy,
 }
 
@@ -773,6 +794,7 @@ where
             physical_network_change: Mutex::new(
                 split_tunnel::PhysicalNetworkChangeDetector::default(),
             ),
+            offline_connection_quarantine: RwLock::new(HashSet::new()),
             retry_policy: RetryPolicy::default(),
         }
     }
@@ -786,6 +808,31 @@ where
         if let Ok(mut current) = self.dns_servers.write() {
             *current = servers;
         }
+    }
+
+    fn quarantine_offline_connection(&self, lease_id: &str) {
+        if let Ok(mut quarantined) = self.offline_connection_quarantine.write() {
+            quarantined.insert(lease_id.to_string());
+        }
+    }
+
+    fn clear_offline_connection_quarantine(&self, lease_id: &str) {
+        if let Ok(mut quarantined) = self.offline_connection_quarantine.write() {
+            quarantined.remove(lease_id);
+        }
+    }
+
+    fn clear_all_offline_connection_quarantines(&self) {
+        if let Ok(mut quarantined) = self.offline_connection_quarantine.write() {
+            quarantined.clear();
+        }
+    }
+
+    fn offline_connection_is_quarantined(&self, lease_id: &str) -> bool {
+        self.offline_connection_quarantine
+            .read()
+            .map(|quarantined| quarantined.contains(lease_id))
+            .unwrap_or(true)
     }
 
     pub(crate) fn with_dns_servers(&self, mut options: TunnelOptions) -> TunnelOptions {
@@ -944,6 +991,7 @@ where
         *self.split_tunnel_options.lock().await = TunnelOptions::default();
         self.clear_all_split_tunnel_warnings().await;
         self.physical_network_change.lock().await.reset();
+        self.clear_all_offline_connection_quarantines();
         *self.state.lock().await = CoreState::default();
         self.logger.record(CoreLogEvent {
             kind: "auth.signed_out",
@@ -1287,16 +1335,18 @@ where
             {
                 Ok(options) => options,
                 Err(error) => {
-                    self.compensate_failed_start(
-                        &access_token,
-                        &response.connection,
-                        &response.request_id,
-                        &operation_id,
-                        FailedStartStage::Preparation,
-                        &error,
-                    )
-                    .await;
-                    return Err(error);
+                    let compensation_error = self
+                        .compensate_failed_start(
+                            &access_token,
+                            &response.connection,
+                            &response.request_id,
+                            &operation_id,
+                            FailedStartStage::Preparation,
+                            &error,
+                        )
+                        .await
+                        .err();
+                    return Err(compensation_error.unwrap_or(error));
                 }
             },
             None => {
@@ -1340,16 +1390,18 @@ where
         }
         if self.store.save(&current_stored).is_err() {
             let error = CoreError::Storage;
-            self.compensate_failed_start(
-                &access_token,
-                &response.connection,
-                &response.request_id,
-                &operation_id,
-                FailedStartStage::Storage,
-                &error,
-            )
-            .await;
-            return Err(error);
+            let compensation_error = self
+                .compensate_failed_start(
+                    &access_token,
+                    &response.connection,
+                    &response.request_id,
+                    &operation_id,
+                    FailedStartStage::Storage,
+                    &error,
+                )
+                .await
+                .err();
+            return Err(compensation_error.unwrap_or(error));
         }
         let configuration = TunnelConfiguration::new(response.configuration);
         let transport = configuration.transport();
@@ -1383,16 +1435,18 @@ where
                 },
                 elapsed_millis(local_start_started),
             );
-            self.compensate_failed_start(
-                &access_token,
-                &response.connection,
-                &response.request_id,
-                &operation_id,
-                FailedStartStage::Local,
-                &error,
-            )
-            .await;
-            return Err(error);
+            let compensation_error = self
+                .compensate_failed_start(
+                    &access_token,
+                    &response.connection,
+                    &response.request_id,
+                    &operation_id,
+                    FailedStartStage::Local,
+                    &error,
+                )
+                .await
+                .err();
+            return Err(compensation_error.unwrap_or(error));
         }
         self.logger.record_timed(
             CoreLogEvent {
@@ -1417,17 +1471,18 @@ where
                         code: Some(cleanup_error.to_string()),
                     });
                 }
-                let surfaced_error = cleanup_error.as_ref().unwrap_or(&error);
-                self.compensate_failed_start(
-                    &access_token,
-                    &response.connection,
-                    &response.request_id,
-                    &operation_id,
-                    FailedStartStage::Local,
-                    surfaced_error,
-                )
-                .await;
-                return Err(cleanup_error.unwrap_or(error));
+                let compensation_error = self
+                    .compensate_failed_start(
+                        &access_token,
+                        &response.connection,
+                        &response.request_id,
+                        &operation_id,
+                        FailedStartStage::Local,
+                        &error,
+                    )
+                    .await
+                    .err();
+                return Err(cleanup_error.or(compensation_error).unwrap_or(error));
             }
         }
         let _ = self.clear_pending_start(&operation_id);
@@ -1438,6 +1493,7 @@ where
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
         };
+        self.clear_offline_connection_quarantine(&response.connection.lease_id);
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
             .await;
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
@@ -1561,6 +1617,7 @@ where
         let request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: current.lease_id.clone(),
+            failure_code: None,
         };
         let response = match self
             .retry_operation(&access_token, &request, ConnectionOperation::Stop)
@@ -1625,6 +1682,7 @@ where
         let request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: current.lease_id,
+            failure_code: None,
         };
         let response = self
             .retry_operation(&access_token, &request, ConnectionOperation::PinStray)
@@ -1635,6 +1693,7 @@ where
             ..saved
         });
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        self.clear_offline_connection_quarantine(&response.connection.lease_id);
         *self.state.lock().await = CoreState {
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
@@ -1664,6 +1723,7 @@ where
         let request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: lease_id.to_string(),
+            failure_code: None,
         };
         let response = self
             .retry_operation(&access_token, &request, ConnectionOperation::UnpinStray)
@@ -1700,6 +1760,7 @@ where
         stored.saved_connection = None;
         stored.pinned_connection = None;
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        self.clear_all_offline_connection_quarantines();
         *self.state.lock().await = CoreState {
             phase: Phase::NeedsPeerBinding,
             connection: None,
@@ -1729,7 +1790,9 @@ where
             .filter(|connection| {
                 connection.layer == Layer::Stray
                     && match connection.kind {
-                        StoredConnectionKind::Pinned => true,
+                        StoredConnectionKind::Pinned => {
+                            pinned_connection_offline_allowed(connection)
+                        }
                         StoredConnectionKind::DynamicWarm => connection
                             .valid_until_unix
                             .is_some_and(|expiry| expiry > now_unix),
@@ -1737,11 +1800,21 @@ where
                     }
             })
             .or_else(|| {
-                stored
-                    .pinned_connection
-                    .filter(|connection| connection.layer == Layer::Stray)
+                stored.pinned_connection.filter(|connection| {
+                    connection.layer == Layer::Stray
+                        && pinned_connection_offline_allowed(connection)
+                })
             })
             .ok_or(CoreError::SavedConnectionUnavailable)?;
+        if self.offline_connection_is_quarantined(&saved.lease_id) {
+            self.logger.record(CoreLogEvent {
+                kind: "connection.offline_cache_quarantined",
+                operation_id: Some(saved.lease_id.clone()),
+                request_id: None,
+                code: Some("storage_reconciliation_pending".to_string()),
+            });
+            return Err(CoreError::SavedConnectionUnavailable);
+        }
         let split_policy = self.cached_policy_for_start()?;
         let tunnel_options = match &split_policy {
             Some(policy) => {
@@ -1783,9 +1856,11 @@ where
             .start(TunnelStartRequest {
                 configuration,
                 options: tunnel_options.clone(),
-                quick_reconnect: match saved.valid_until_unix {
-                    Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
-                    None => QuickReconnect::Persistent,
+                quick_reconnect: match (saved.kind, saved.valid_until_unix) {
+                    (StoredConnectionKind::DynamicWarm, Some(valid_until_unix)) => {
+                        QuickReconnect::Until(valid_until_unix)
+                    }
+                    _ => QuickReconnect::Persistent,
                 },
                 quick_connection: Some(QuickConnection {
                     lease_id: saved.lease_id.clone(),
@@ -1831,6 +1906,23 @@ where
                 *self.state.lock().await = CoreState {
                     phase: Phase::Ready,
                     connection: None,
+                };
+                let error = if matches!(&error, CoreError::Tunnel(code) if code == "tunnel_handshake_timeout")
+                {
+                    match self.reconcile_handshake_timeout_storage(&saved.lease_id, &connection) {
+                        Ok(()) => error,
+                        Err(storage_error) => {
+                            self.logger.record(CoreLogEvent {
+                                kind: "connection.offline_handshake_storage_failed",
+                                operation_id: Some(saved.lease_id.clone()),
+                                request_id: None,
+                                code: Some(storage_error.to_string()),
+                            });
+                            storage_error
+                        }
+                    }
+                } else {
+                    error
                 };
                 self.logger.record(CoreLogEvent {
                     kind: "connection.offline_handshake_failed",
@@ -1947,6 +2039,7 @@ where
         let request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: connection.lease_id,
+            failure_code: None,
         };
         let response = match self
             .retry_operation(&access_token, &request, ConnectionOperation::Stop)
@@ -1996,6 +2089,54 @@ where
             self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         }
         Ok(())
+    }
+
+    fn reconcile_handshake_timeout_storage(
+        &self,
+        operation_id: &str,
+        connection: &Connection,
+    ) -> Result<(), CoreError> {
+        let result = (|| {
+            let Some(mut stored) = self.store.load().map_err(|_| CoreError::Storage)? else {
+                return Ok(());
+            };
+            if stored
+                .pending_start
+                .as_ref()
+                .is_some_and(|pending| pending.operation_id == operation_id)
+            {
+                stored.pending_start = None;
+            }
+            if connection.pinned {
+                let retry_not_before = current_unix_timestamp()
+                    .saturating_add(PINNED_HANDSHAKE_RETRY_COOLDOWN_SECONDS);
+                for saved in [
+                    stored.saved_connection.as_mut(),
+                    stored.pinned_connection.as_mut(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if saved.lease_id == connection.lease_id
+                        && saved.kind == StoredConnectionKind::Pinned
+                    {
+                        saved.valid_until_unix = Some(retry_not_before);
+                    }
+                }
+            } else if stored
+                .saved_connection
+                .as_ref()
+                .is_some_and(|saved| saved.lease_id == connection.lease_id)
+            {
+                stored.saved_connection = None;
+            }
+            self.store.save(&stored).map_err(|_| CoreError::Storage)
+        })();
+        match result {
+            Ok(()) => self.clear_offline_connection_quarantine(&connection.lease_id),
+            Err(_) => self.quarantine_offline_connection(&connection.lease_id),
+        }
+        result
     }
 
     fn replace_pending_start_operation(
@@ -2223,12 +2364,17 @@ where
         operation_id: &str,
         stage: FailedStartStage,
         error: &CoreError,
-    ) {
+    ) -> Result<(), CoreError> {
         self.physical_network_change.lock().await.reset();
         let compensation_request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: connection.lease_id.clone(),
+            failure_code: match error {
+                CoreError::Tunnel(code) if code == "tunnel_handshake_timeout" => Some(code.clone()),
+                _ => None,
+            },
         };
+        let mut storage_error = None;
         let (connection, mut phase) = match self
             .retry_operation(
                 access_token,
@@ -2238,7 +2384,13 @@ where
             .await
         {
             Ok(compensation) => {
-                let _ = self.clear_pending_start(operation_id);
+                if matches!(error, CoreError::Tunnel(code) if code == "tunnel_handshake_timeout") {
+                    storage_error = self
+                        .reconcile_handshake_timeout_storage(operation_id, connection)
+                        .err();
+                } else {
+                    let _ = self.clear_pending_start(operation_id);
+                }
                 (compensation.connection, phase_for_start_error(error))
             }
             Err(compensation_error) => {
@@ -2269,6 +2421,16 @@ where
             request_id: Some(request_id.to_string()),
             code: Some(error.to_string()),
         });
+        if let Some(storage_error) = storage_error {
+            self.logger.record(CoreLogEvent {
+                kind: "connection.start_compensation_storage_failed",
+                operation_id: Some(operation_id.to_string()),
+                request_id: Some(request_id.to_string()),
+                code: Some(storage_error.to_string()),
+            });
+            return Err(storage_error);
+        }
+        Ok(())
     }
 
     async fn retry_start(
@@ -2377,7 +2539,9 @@ fn reusable_operation_id(
                 && saved.tic_connection_mode == options.tic_connection_mode
                 && saved.route_mode == options.route_mode
                 && match saved.kind {
-                    StoredConnectionKind::Pinned => true,
+                    StoredConnectionKind::Pinned => {
+                        pinned_connection_retry_allowed(saved, now_unix)
+                    }
                     StoredConnectionKind::Fixed => false,
                     StoredConnectionKind::DynamicWarm => saved
                         .valid_until_unix
@@ -2389,6 +2553,7 @@ fn reusable_operation_id(
                 saved.layer == options.layer
                     && saved.tic_connection_mode == options.tic_connection_mode
                     && saved.route_mode == options.route_mode
+                    && pinned_connection_retry_allowed(saved, now_unix)
             })
         })
         .map(|saved| saved.lease_id.clone())

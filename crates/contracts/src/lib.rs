@@ -334,6 +334,8 @@ impl fmt::Debug for ConnectionStartResponse {
 pub struct ConnectionOperationRequest {
     pub operation_id: String,
     pub lease_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
