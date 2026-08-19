@@ -1,0 +1,11 @@
+diff --git a/device/queueconstants_android.go b/device/queueconstants_android.go
+index 88662c2..bacc6a5 100644
+--- a/device/queueconstants_android.go
++++ b/device/queueconstants_android.go
+@@ -15,5 +15,5 @@ const (
+ 	QueueInboundSize           = 1024
+ 	QueueHandshakeSize         = 1024
+ 	MaxSegmentSize             = (1 << 16) - 1 // largest possible UDP datagram
+-	PreallocatedBuffersPerPool = 4096
++	PreallocatedBuffersPerPool = 1024
+ )

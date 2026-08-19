@@ -15,7 +15,13 @@ class NetworkTelemetryTest {
                 "udp_send_errors":0,"udp_receive_calls":2,"udp_receive_packets":3,
                 "udp_receive_bytes":480,"udp_receive_errors":0,"local_port":51820,
                 "last_tun_read_at_unix_ms":10,"last_tun_write_at_unix_ms":11,
-                "last_udp_send_at_unix_ms":12,"last_udp_receive_at_unix_ms":13
+                "last_udp_send_at_unix_ms":12,"last_udp_receive_at_unix_ms":13,
+                "go_heap_alloc_bytes":1048576,"go_heap_sys_bytes":4194304,
+                "go_heap_idle_bytes":2097152,"go_heap_inuse_bytes":2097152,
+                "go_heap_released_bytes":1048576,"go_stack_inuse_bytes":524288,
+                "go_gc_cycles":7,"go_memory_limit_bytes":268435456,
+                "go_device_starts":2,"go_device_start_failures":1,
+                "go_device_closes":1,"go_devices_starting":0,"go_active_devices":1
             }""".trimIndent(),
         )
 
@@ -23,6 +29,15 @@ class NetworkTelemetryTest {
         assertTrue(sample.udpReceiveBytes == 480L)
         assertTrue(sample.localPort == 51820)
         assertTrue(sample.lastUdpSendError == null)
+        assertTrue(sample.goHeapAllocBytes == 1048576L)
+        assertTrue(sample.goHeapReleasedBytes == 1048576L)
+        assertTrue(sample.goGcCycles == 7L)
+        assertTrue(sample.goMemoryLimitBytes == 268435456L)
+        assertTrue(sample.goDeviceStarts == 2L)
+        assertTrue(sample.goDeviceStartFailures == 1L)
+        assertTrue(sample.goDeviceCloses == 1L)
+        assertTrue(sample.goDevicesStarting == 0L)
+        assertTrue(sample.goActiveDevices == 1)
     }
 
     @Test

@@ -255,7 +255,9 @@ jobs:
             vendor/amneziawg-go \
             go.work \
             patches/amneziawg-android-network-telemetry.patch \
+            patches/amneziawg-android-memory-diagnostics.patch \
             patches/amneziawg-go-network-recovery.patch \
+            patches/amneziawg-go-android-memory.patch \
             plugins/amneziawg-android-tunnel \
             plugins/tunnel-android/android/build.gradle.kts \
             plugins/tunnel-android/android/src \

@@ -403,6 +403,19 @@ internal data class NetworkTelemetry(
     val lastUdpSendErrno: Int?,
     val lastUdpReceiveErrno: Int?,
     val endpoint: String?,
+    val goHeapAllocBytes: Long,
+    val goHeapSysBytes: Long,
+    val goHeapIdleBytes: Long,
+    val goHeapInuseBytes: Long,
+    val goHeapReleasedBytes: Long,
+    val goStackInuseBytes: Long,
+    val goGcCycles: Long,
+    val goMemoryLimitBytes: Long,
+    val goDeviceStarts: Long,
+    val goDeviceStartFailures: Long,
+    val goDeviceCloses: Long,
+    val goDevicesStarting: Long,
+    val goActiveDevices: Int,
 ) {
     companion object {
         fun fromJson(value: String): NetworkTelemetry {
@@ -438,6 +451,19 @@ internal data class NetworkTelemetry(
                 lastUdpReceiveErrno = payload.optInt("last_udp_receive_errno")
                     .takeIf { it != 0 },
                 endpoint = payload.optString("endpoint").takeIf(String::isNotBlank),
+                goHeapAllocBytes = payload.optLong("go_heap_alloc_bytes"),
+                goHeapSysBytes = payload.optLong("go_heap_sys_bytes"),
+                goHeapIdleBytes = payload.optLong("go_heap_idle_bytes"),
+                goHeapInuseBytes = payload.optLong("go_heap_inuse_bytes"),
+                goHeapReleasedBytes = payload.optLong("go_heap_released_bytes"),
+                goStackInuseBytes = payload.optLong("go_stack_inuse_bytes"),
+                goGcCycles = payload.optLong("go_gc_cycles"),
+                goMemoryLimitBytes = payload.optLong("go_memory_limit_bytes"),
+                goDeviceStarts = payload.optLong("go_device_starts"),
+                goDeviceStartFailures = payload.optLong("go_device_start_failures"),
+                goDeviceCloses = payload.optLong("go_device_closes"),
+                goDevicesStarting = payload.optLong("go_devices_starting"),
+                goActiveDevices = payload.optInt("go_active_devices"),
             )
         }
     }
@@ -1970,6 +1996,19 @@ internal object TunnelRuntime {
             put("tun_write_errors", sample.tunWriteErrors)
             put("udp_send_errors", sample.udpSendErrors)
             put("udp_receive_errors", sample.udpReceiveErrors)
+            put("go_heap_alloc_bytes", sample.goHeapAllocBytes)
+            put("go_heap_sys_bytes", sample.goHeapSysBytes)
+            put("go_heap_idle_bytes", sample.goHeapIdleBytes)
+            put("go_heap_inuse_bytes", sample.goHeapInuseBytes)
+            put("go_heap_released_bytes", sample.goHeapReleasedBytes)
+            put("go_stack_inuse_bytes", sample.goStackInuseBytes)
+            put("go_gc_cycles", sample.goGcCycles)
+            put("go_memory_limit_bytes", sample.goMemoryLimitBytes)
+            put("go_device_starts", sample.goDeviceStarts)
+            put("go_device_start_failures", sample.goDeviceStartFailures)
+            put("go_device_closes", sample.goDeviceCloses)
+            put("go_devices_starting", sample.goDevicesStarting)
+            put("go_active_devices", sample.goActiveDevices)
             put("local_port", sample.localPort)
             put("last_tun_read_at_unix_ms", sample.lastTunReadAtUnixMillis)
             put("last_tun_write_at_unix_ms", sample.lastTunWriteAtUnixMillis)
@@ -2007,6 +2046,17 @@ internal object TunnelRuntime {
                 "last_udp_receive_error" to sample?.lastUdpReceiveError,
                 "last_udp_send_errno" to sample?.lastUdpSendErrno,
                 "last_udp_receive_errno" to sample?.lastUdpReceiveErrno,
+                "go_heap_alloc_bytes" to sample?.goHeapAllocBytes,
+                "go_heap_sys_bytes" to sample?.goHeapSysBytes,
+                "go_heap_idle_bytes" to sample?.goHeapIdleBytes,
+                "go_heap_released_bytes" to sample?.goHeapReleasedBytes,
+                "go_gc_cycles" to sample?.goGcCycles,
+                "go_memory_limit_bytes" to sample?.goMemoryLimitBytes,
+                "go_device_starts" to sample?.goDeviceStarts,
+                "go_device_start_failures" to sample?.goDeviceStartFailures,
+                "go_device_closes" to sample?.goDeviceCloses,
+                "go_devices_starting" to sample?.goDevicesStarting,
+                "go_active_devices" to sample?.goActiveDevices,
                 "samples" to JSONArray(session.recentNetworkTelemetry.toList()),
             ),
         )

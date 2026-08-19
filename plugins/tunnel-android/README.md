@@ -14,6 +14,11 @@ The matching AmneziaWG Go backend is pinned to upstream commit
 wrapper resolve that local tree instead of downloading the declared module.
 CI and release builds verify the resolved module directory, and the workspace
 file is included in every corresponding-source archive.
+Repository-owned patches cap the Android packet-buffer pool, apply the Go
+runtime memory limit directly, release unused Go heap pages after tunnel
+shutdown, and include Go heap counters in network diagnostics. The original
+pinned sources and every applied patch are shipped in the corresponding-source
+archive.
 Clone and CI checkouts must initialize submodules recursively; the local
 `plugins/amneziawg-android-tunnel` Gradle wrapper builds the upstream tunnel
 library and native Go backend for Nelomai's application ID.

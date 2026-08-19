@@ -5,8 +5,10 @@ SCRIPT_DIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd "$SCRIPT_DIRECTORY/../.." && pwd)"
 ANDROID_VENDOR_DIRECTORY="$REPOSITORY_ROOT/vendor/amneziawg-android"
 ANDROID_PATCH_FILE="$REPOSITORY_ROOT/patches/amneziawg-android-network-telemetry.patch"
+ANDROID_MEMORY_PATCH_FILE="$REPOSITORY_ROOT/patches/amneziawg-android-memory-diagnostics.patch"
 GO_VENDOR_DIRECTORY="$REPOSITORY_ROOT/vendor/amneziawg-go"
 GO_PATCH_FILE="$REPOSITORY_ROOT/patches/amneziawg-go-network-recovery.patch"
+GO_MEMORY_PATCH_FILE="$REPOSITORY_ROOT/patches/amneziawg-go-android-memory.patch"
 LOCK_DIRECTORY="$REPOSITORY_ROOT/.nelomai-locks"
 LOCK_FILE="$LOCK_DIRECTORY/vendor-overrides.lock"
 LOCK_WAIT_ATTEMPTS=300
@@ -14,6 +16,8 @@ lock_acquired=false
 lock_mode=''
 android_applied_by_this_run=false
 go_applied_by_this_run=false
+android_memory_applied_by_this_run=false
+go_memory_applied_by_this_run=false
 
 acquire_lock() {
   local attempt=0
@@ -85,11 +89,26 @@ patch_state() {
   return 1
 }
 
+patch_is_applied() {
+  local vendor_directory="$1"
+  local patch_file="$2"
+
+  test -d "$vendor_directory/.git" || test -f "$vendor_directory/.git"
+  test -f "$patch_file"
+  git -C "$vendor_directory" apply --reverse --check "$patch_file" >/dev/null 2>&1
+}
+
 rollback_partial_application() {
   local status=$?
   trap - EXIT
   set +e
   if [ "$status" -ne 0 ]; then
+    if [ "$go_memory_applied_by_this_run" = true ]; then
+      git -C "$GO_VENDOR_DIRECTORY" apply --reverse "$GO_MEMORY_PATCH_FILE"
+    fi
+    if [ "$android_memory_applied_by_this_run" = true ]; then
+      git -C "$ANDROID_VENDOR_DIRECTORY" apply --reverse "$ANDROID_MEMORY_PATCH_FILE"
+    fi
     if [ "$go_applied_by_this_run" = true ]; then
       git -C "$GO_VENDOR_DIRECTORY" apply --reverse "$GO_PATCH_FILE"
     fi
@@ -104,14 +123,28 @@ rollback_partial_application() {
 trap rollback_partial_application EXIT
 acquire_lock
 
-android_patch_state="$(patch_state "$ANDROID_VENDOR_DIRECTORY" "$ANDROID_PATCH_FILE")"
-go_patch_state="$(patch_state "$GO_VENDOR_DIRECTORY" "$GO_PATCH_FILE")"
-
-if [ "$android_patch_state" = pending ]; then
-  git -C "$ANDROID_VENDOR_DIRECTORY" apply "$ANDROID_PATCH_FILE"
-  android_applied_by_this_run=true
+if ! patch_is_applied "$ANDROID_VENDOR_DIRECTORY" "$ANDROID_MEMORY_PATCH_FILE"; then
+  android_patch_state="$(patch_state "$ANDROID_VENDOR_DIRECTORY" "$ANDROID_PATCH_FILE")"
+  if [ "$android_patch_state" = pending ]; then
+    git -C "$ANDROID_VENDOR_DIRECTORY" apply "$ANDROID_PATCH_FILE"
+    android_applied_by_this_run=true
+  fi
+  android_memory_patch_state="$(patch_state "$ANDROID_VENDOR_DIRECTORY" "$ANDROID_MEMORY_PATCH_FILE")"
+  if [ "$android_memory_patch_state" = pending ]; then
+    git -C "$ANDROID_VENDOR_DIRECTORY" apply "$ANDROID_MEMORY_PATCH_FILE"
+    android_memory_applied_by_this_run=true
+  fi
 fi
-if [ "$go_patch_state" = pending ]; then
-  git -C "$GO_VENDOR_DIRECTORY" apply "$GO_PATCH_FILE"
-  go_applied_by_this_run=true
+
+if ! patch_is_applied "$GO_VENDOR_DIRECTORY" "$GO_MEMORY_PATCH_FILE"; then
+  go_patch_state="$(patch_state "$GO_VENDOR_DIRECTORY" "$GO_PATCH_FILE")"
+  if [ "$go_patch_state" = pending ]; then
+    git -C "$GO_VENDOR_DIRECTORY" apply "$GO_PATCH_FILE"
+    go_applied_by_this_run=true
+  fi
+  go_memory_patch_state="$(patch_state "$GO_VENDOR_DIRECTORY" "$GO_MEMORY_PATCH_FILE")"
+  if [ "$go_memory_patch_state" = pending ]; then
+    git -C "$GO_VENDOR_DIRECTORY" apply "$GO_MEMORY_PATCH_FILE"
+    go_memory_applied_by_this_run=true
+  fi
 fi

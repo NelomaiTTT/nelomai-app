@@ -1,0 +1,198 @@
+diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
+index e9f34d73..0edc1532 100644
+--- a/tunnel/tools/libwg-go/api-android.go
++++ b/tunnel/tools/libwg-go/api-android.go
+@@ -110,6 +110,19 @@ type tunnelTelemetrySnapshot struct {
+ 	LastSendErrno   int    `json:"last_udp_send_errno,omitempty"`
+ 	LastRecvErrno   int    `json:"last_udp_receive_errno,omitempty"`
+ 	Endpoint        string `json:"endpoint,omitempty"`
++	GoHeapAlloc     uint64 `json:"go_heap_alloc_bytes"`
++	GoHeapSys       uint64 `json:"go_heap_sys_bytes"`
++	GoHeapIdle      uint64 `json:"go_heap_idle_bytes"`
++	GoHeapInuse     uint64 `json:"go_heap_inuse_bytes"`
++	GoHeapReleased  uint64 `json:"go_heap_released_bytes"`
++	GoStackInuse    uint64 `json:"go_stack_inuse_bytes"`
++	GoGCCycles      uint32 `json:"go_gc_cycles"`
++	GoMemoryLimit   int64  `json:"go_memory_limit_bytes"`
++	GoDeviceStarts  uint64 `json:"go_device_starts"`
++	GoStartFailures uint64 `json:"go_device_start_failures"`
++	GoDeviceCloses  uint64 `json:"go_device_closes"`
++	GoStarting      int64  `json:"go_devices_starting"`
++	GoActiveDevices int    `json:"go_active_devices"`
+ }
+ 
+ func nowUnixMillis() int64 {
+@@ -159,6 +172,7 @@ func (t *tunnelTelemetry) shouldCaptureEndpoint(now int64) bool {
+ }
+ 
+ func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
++	memory := readGoMemoryStats()
+ 	return tunnelTelemetrySnapshot{
+ 		TunReadPackets: t.tunReadPackets.Load(), TunReadBytes: t.tunReadBytes.Load(),
+ 		TunReadErrors: t.tunReadErrors.Load(), TunWritePackets: t.tunWritePackets.Load(),
+@@ -172,6 +186,13 @@ func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
+ 		LastUdpRecvAt: t.lastUdpRecvAt.Load(), LastSendError: atomicString(&t.lastSendError),
+ 		LastRecvError: atomicString(&t.lastRecvError), Endpoint: atomicString(&t.endpoint),
+ 		LastSendErrno: int(t.lastSendErrno.Load()), LastRecvErrno: int(t.lastRecvErrno.Load()),
++		GoHeapAlloc: memory.HeapAlloc, GoHeapSys: memory.HeapSys,
++		GoHeapIdle: memory.HeapIdle, GoHeapInuse: memory.HeapInuse,
++		GoHeapReleased: memory.HeapReleased, GoStackInuse: memory.StackInuse,
++		GoGCCycles: memory.NumGC, GoMemoryLimit: goBackendMemoryLimitBytes,
++		GoDeviceStarts: goDeviceStarts.Load(), GoStartFailures: goDeviceStartFailures.Load(),
++		GoDeviceCloses: goDeviceCloses.Load(), GoStarting: goDevicesStarting.Load(),
++		GoActiveDevices: activeTunnelCount(),
+ 	}
+ }
+ 
+@@ -324,6 +345,19 @@ func (d *diagnosticBind) PeekLookAtSocketFd6() (int, error) {
+ 
+ var tunnelHandles map[int32]TunnelHandle
+ var tunnelHandlesMutex sync.RWMutex
++var goDeviceStarts atomic.Uint64
++var goDeviceStartFailures atomic.Uint64
++var goDeviceCloses atomic.Uint64
++var goDevicesStarting atomic.Int64
++var goMemoryCleanupRunning atomic.Bool
++var goMemoryLifecycleMutex sync.Mutex
++var goMemoryStatsMutex sync.Mutex
++var goMemoryStats runtime.MemStats
++var goMemoryStatsAt int64
++
++const goBackendMemoryLimitBytes int64 = 256 << 20
++const goMemoryStatsIntervalMillis int64 = 10_000
++const goMemoryCleanupDelay = time.Second
+ 
+ func lookupTunnelHandle(tunnelHandle int32) (TunnelHandle, bool) {
+ 	tunnelHandlesMutex.RLock()
+@@ -332,7 +366,66 @@ func lookupTunnelHandle(tunnelHandle int32) (TunnelHandle, bool) {
+ 	return handle, ok
+ }
+ 
++func activeTunnelCount() int {
++	tunnelHandlesMutex.RLock()
++	defer tunnelHandlesMutex.RUnlock()
++	return len(tunnelHandles)
++}
++
++func readGoMemoryStats() runtime.MemStats {
++	now := nowUnixMillis()
++	goMemoryStatsMutex.Lock()
++	defer goMemoryStatsMutex.Unlock()
++	if goMemoryStatsAt == 0 || now-goMemoryStatsAt >= goMemoryStatsIntervalMillis {
++		runtime.ReadMemStats(&goMemoryStats)
++		goMemoryStatsAt = now
++	}
++	return goMemoryStats
++}
++
++func beginGoDeviceStart() {
++	goMemoryLifecycleMutex.Lock()
++	goDevicesStarting.Add(1)
++	goMemoryLifecycleMutex.Unlock()
++}
++
++func finishGoDeviceStart(succeeded bool) {
++	goMemoryLifecycleMutex.Lock()
++	goDevicesStarting.Add(-1)
++	if !succeeded {
++		goDeviceStartFailures.Add(1)
++	}
++	goMemoryLifecycleMutex.Unlock()
++	releaseUnusedGoMemory()
++}
++
++func closeGoDevice(value *device.Device) {
++	value.Close()
++	goDeviceCloses.Add(1)
++}
++
++func releaseUnusedGoMemory() {
++	if goDevicesStarting.Load() != 0 || activeTunnelCount() != 0 ||
++		!goMemoryCleanupRunning.CompareAndSwap(false, true) {
++		return
++	}
++	go func() {
++		defer goMemoryCleanupRunning.Store(false)
++		time.Sleep(goMemoryCleanupDelay)
++		goMemoryLifecycleMutex.Lock()
++		defer goMemoryLifecycleMutex.Unlock()
++		if goDevicesStarting.Load() != 0 || activeTunnelCount() != 0 {
++			return
++		}
++		debug.FreeOSMemory()
++		goMemoryStatsMutex.Lock()
++		goMemoryStatsAt = 0
++		goMemoryStatsMutex.Unlock()
++	}()
++}
++
+ func init() {
++	debug.SetMemoryLimit(goBackendMemoryLimitBytes)
+ 	tunnelHandles = make(map[int32]TunnelHandle)
+ 	signals := make(chan os.Signal)
+ 	signal.Notify(signals, unix.SIGUSR2)
+@@ -354,6 +447,10 @@ func init() {
+ 
+ //export awgTurnOn
+ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
++	beginGoDeviceStart()
++	startSucceeded := false
++	defer func() { finishGoDeviceStart(startSucceeded) }()
++
+ 	tag := cstring("AmneziaWG/" + interfaceName)
+ 	logger := &device.Logger{
+ 		Verbosef: AndroidLogger{level: C.ANDROID_LOG_DEBUG, tag: tag}.Printf,
+@@ -372,11 +469,12 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	diagnosticTun := &diagnosticTun{Device: nativeTun, telemetry: telemetry}
+ 	diagnosticBind := &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
+ 	device := device.NewDevice(diagnosticTun, diagnosticBind, logger)
++	goDeviceStarts.Add(1)
+ 
+ 	err = device.IpcSet(settings)
+ 	if err != nil {
+-		unix.Close(int(tunFd))
+ 		logger.Errorf("IpcSet: %v", err)
++		closeGoDevice(device)
+ 		return -1
+ 	}
+ 	device.DisableSomeRoamingForBrokenMobileSemantics()
+@@ -407,8 +505,10 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	err = device.Up()
+ 	if err != nil {
+ 		logger.Errorf("Unable to bring up device: %v", err)
+-		uapiFile.Close()
+-		device.Close()
++		if uapiFile != nil {
++			uapiFile.Close()
++		}
++		closeGoDevice(device)
+ 		return -1
+ 	}
+ 	logger.Verbosef("Device started")
+@@ -423,11 +523,14 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	}
+ 	if i == math.MaxInt32 {
+ 		logger.Errorf("Unable to find empty handle")
+-		uapiFile.Close()
+-		device.Close()
++		if uapiFile != nil {
++			uapiFile.Close()
++		}
++		closeGoDevice(device)
+ 		return -1
+ 	}
+ 	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi, telemetry: telemetry}
++	startSucceeded = true
+ 	return i
+ }
+ 
+@@ -444,7 +547,8 @@ func awgTurnOff(tunnelHandle int32) {
+ 	if handle.uapi != nil {
+ 		handle.uapi.Close()
+ 	}
+-	handle.device.Close()
++	closeGoDevice(handle.device)
++	releaseUnusedGoMemory()
+ }
+ 
+ //export awgGetSocketV4
