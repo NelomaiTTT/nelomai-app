@@ -460,6 +460,8 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "ip_command_unavailable" => "ip_command_unavailable",
         "physical_egress_unavailable" => "physical_egress_unavailable",
         "local_networks_unavailable" => "local_networks_unavailable",
+        "endpoint_route_unavailable" => "endpoint_route_unavailable",
+        "endpoint_route_lost" => "endpoint_route_lost",
         "amneziawg_uapi_unavailable" => "amneziawg_uapi_unavailable",
         "amneziawg_configuration_failed" => "amneziawg_configuration_failed",
         "amneziawg_profile_mismatch" => "amneziawg_profile_mismatch",
@@ -858,6 +860,14 @@ mod service_error_tests {
         assert_eq!(
             ServiceError::Backend("tunnel_not_running".to_string()).code(),
             "tunnel_not_running"
+        );
+        assert_eq!(
+            ServiceError::Backend("endpoint_route_unavailable".to_string()).code(),
+            "endpoint_route_unavailable"
+        );
+        assert_eq!(
+            ServiceError::Backend("endpoint_route_lost".to_string()).code(),
+            "endpoint_route_lost"
         );
     }
 }

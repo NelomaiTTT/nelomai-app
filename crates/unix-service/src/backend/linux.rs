@@ -320,6 +320,7 @@ impl ServiceTunnelBackend for LinuxBackend {
             .filter_map(|peer| peer.last_handshake)
             .filter_map(|handshake| handshake.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .filter(|timestamp| *timestamp > 0)
             .max();
         let probe_target = probe
             .then(|| {

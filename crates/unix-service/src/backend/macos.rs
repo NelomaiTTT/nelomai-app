@@ -5,7 +5,9 @@ use super::{
     userspace_log_streams, userspace_socket_path, DiagnosticJournal, RebindPeer,
 };
 use crate::process::{output_with_timeout, status_with_timeout, COMMAND_TIMEOUT};
-use crate::routes::{RouteManager, SystemRouteBackend};
+use crate::routes::{
+    endpoint_route_summary, verify_endpoint_routes, RouteManager, SystemRouteBackend,
+};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{Userspace, WGApi, WireguardInterfaceApi};
 use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics, TunnelTransport};
@@ -174,6 +176,12 @@ impl MacosBackend {
             let _ = self.stop_inner();
             return Err(backend_error(error));
         }
+        if configuration.transport == TunnelTransport::AmneziaWg3 {
+            if let Err(error) = verify_endpoint_routes(&self.endpoints) {
+                let _ = self.stop_inner();
+                return Err(error);
+            }
+        }
         if !configuration.dns.is_empty() {
             if let Err(error) = apply_dns(
                 self.dns_snapshot
@@ -254,10 +262,11 @@ impl MacosBackend {
             transport_name(self.active_transport)
         };
         let mut snapshot = format!(
-            "state={}\ntransport={transport}\nroutes_active={}\ndns_snapshot_active={}",
+            "state={}\ntransport={transport}\nroutes_active={}\ndns_snapshot_active={}\n{}",
             state_name(self.state),
             self.routes.has_routes(),
             self.dns_snapshot.is_some(),
+            endpoint_route_summary(&self.endpoints),
         );
         match self
             .api
@@ -365,6 +374,7 @@ impl ServiceTunnelBackend for MacosBackend {
             .filter_map(|peer| peer.last_handshake)
             .filter_map(|handshake| handshake.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .filter(|timestamp| *timestamp > 0)
             .max();
         let probe_target = probe
             .then(|| {
@@ -394,6 +404,11 @@ impl ServiceTunnelBackend for MacosBackend {
         let ifname = read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?;
         let before = self.diagnostic_snapshot().replace('\n', " ");
         self.diagnostics.record("udp_rebind_begin", &before);
+        if let Err(error) = verify_endpoint_routes(&self.endpoints) {
+            self.diagnostics
+                .record("udp_rebind_error", &format!("code={}", error.code()));
+            return Err(error);
+        }
         match rebind_userspace_udp(&ifname, &self.rebind_peers) {
             Ok(()) => {
                 let after = self.diagnostic_snapshot().replace('\n', " ");

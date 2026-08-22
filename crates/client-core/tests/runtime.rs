@@ -129,6 +129,8 @@ struct MemoryTunnel {
     metrics_delay_millis: AtomicU64,
     handshake_before_rebind: AtomicBool,
     handshake_after_rebind: AtomicBool,
+    zero_handshake_before_rebind: AtomicBool,
+    zero_handshake_after_rebind: AtomicBool,
     rebinds: AtomicUsize,
     rebind_supported: AtomicBool,
     rebind_failures: AtomicUsize,
@@ -248,8 +250,19 @@ impl TunnelController for MemoryTunnel {
         } else {
             self.handshake_before_rebind.load(Ordering::SeqCst)
         };
+        let zero_handshake = if rebound {
+            self.zero_handshake_after_rebind.load(Ordering::SeqCst)
+        } else {
+            self.zero_handshake_before_rebind.load(Ordering::SeqCst)
+        };
         Ok(Some(TunnelMetrics {
-            latest_handshake_epoch_millis: established.then_some(1),
+            latest_handshake_epoch_millis: if established {
+                Some(1)
+            } else if zero_handshake {
+                Some(0)
+            } else {
+                None
+            },
             ..TunnelMetrics::default()
         }))
     }
@@ -752,6 +765,61 @@ async fn awg3_start_rebinds_once_and_recovers_the_handshake() {
 
     assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
     assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn zero_handshake_timestamp_cannot_confirm_an_awg3_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel
+        .zero_handshake_before_rebind
+        .store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    tunnel.handshake_after_rebind.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn zero_handshake_timestamp_after_rebind_still_fails_the_awg3_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    tunnel
+        .zero_handshake_after_rebind
+        .store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Tunnel(code) if code == "tunnel_handshake_timeout"
+    ));
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

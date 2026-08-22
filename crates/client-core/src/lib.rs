@@ -2323,7 +2323,11 @@ where
                 }
             };
             match metrics {
-                Ok(Some(metrics)) if metrics.latest_handshake_epoch_millis.is_some() => {
+                Ok(Some(metrics))
+                    if metrics
+                        .latest_handshake_epoch_millis
+                        .is_some_and(|timestamp| timestamp > 0) =>
+                {
                     return Ok(HandshakeWaitOutcome::Established);
                 }
                 Ok(Some(_)) => {

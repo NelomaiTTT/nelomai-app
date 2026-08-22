@@ -118,6 +118,7 @@ pub(crate) fn host_diagnostic_snapshot(host: &Host) -> String {
         .filter_map(|peer| peer.last_handshake)
         .filter_map(|handshake| handshake.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis())
+        .filter(|timestamp| *timestamp > 0)
         .max()
         .map_or_else(|| "none".to_string(), |value| value.to_string());
     format!(

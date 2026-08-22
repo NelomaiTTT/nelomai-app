@@ -2,7 +2,7 @@ use super::{OwnedRoute, RouteBackend};
 use crate::process::{output_with_timeout, COMMAND_TIMEOUT};
 use crate::ServiceError;
 use ipnet::Ipv4Net;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::{Command, Output};
 
 const ROUTE: &str = "/sbin/route";
@@ -17,6 +17,84 @@ pub(crate) struct MacosEgress {
 }
 
 pub(crate) struct SystemRouteBackend;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndpointRouteState {
+    Physical,
+    Tunnel,
+    Unavailable,
+}
+
+pub(crate) fn verify_endpoint_routes(endpoints: &[SocketAddr]) -> Result<(), ServiceError> {
+    if endpoints.is_empty() {
+        return Err(ServiceError::Backend(
+            "endpoint_route_unavailable".to_string(),
+        ));
+    }
+    for endpoint in endpoints {
+        match endpoint_route_state(endpoint.ip()) {
+            EndpointRouteState::Physical => {}
+            EndpointRouteState::Tunnel => {
+                return Err(ServiceError::Backend("endpoint_route_lost".to_string()));
+            }
+            EndpointRouteState::Unavailable => {
+                return Err(ServiceError::Backend(
+                    "endpoint_route_unavailable".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn endpoint_route_summary(endpoints: &[SocketAddr]) -> String {
+    let ports = endpoints
+        .iter()
+        .map(|endpoint| endpoint.port().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut physical = 0usize;
+    let mut tunnel = 0usize;
+    let mut unavailable = 0usize;
+    for endpoint in endpoints {
+        match endpoint_route_state(endpoint.ip()) {
+            EndpointRouteState::Physical => physical += 1,
+            EndpointRouteState::Tunnel => tunnel += 1,
+            EndpointRouteState::Unavailable => unavailable += 1,
+        }
+    }
+    format!(
+        "endpoint_count={}\nendpoint_ports={}\nendpoint_routes_physical={physical}\nendpoint_routes_tunnel={tunnel}\nendpoint_routes_unavailable={unavailable}",
+        endpoints.len(),
+        if ports.is_empty() { "none" } else { &ports },
+    )
+}
+
+fn endpoint_route_state(endpoint: IpAddr) -> EndpointRouteState {
+    let family = if endpoint.is_ipv4() {
+        "-inet"
+    } else {
+        "-inet6"
+    };
+    let address = endpoint.to_string();
+    let Ok(output) = run(ROUTE, &["-n", "get", family, &address]) else {
+        return EndpointRouteState::Unavailable;
+    };
+    endpoint_route_state_from_output(&output.stdout)
+}
+
+fn endpoint_route_state_from_output(output: &[u8]) -> EndpointRouteState {
+    let output = String::from_utf8_lossy(output);
+    let interface = output.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        (key.trim() == "interface").then(|| value.trim())
+    });
+    match interface {
+        Some(interface) if physical_interface(interface) => EndpointRouteState::Physical,
+        Some(_) => EndpointRouteState::Tunnel,
+        None => EndpointRouteState::Unavailable,
+    }
+}
 
 impl SystemRouteBackend {
     pub(crate) fn new() -> Result<Self, ServiceError> {
@@ -419,6 +497,32 @@ default            192.168.3.1        UGScIg                en0\n";
 
         assert_eq!(route.interface, "en0");
         assert_eq!(route.gateway, "192.168.3.1");
+    }
+
+    #[test]
+    fn classifies_endpoint_routes_without_exposing_the_endpoint() {
+        for interface in ["en0", "en7", "pdp_ip0"] {
+            let output =
+                format!("route to: 203.0.113.10\ngateway: 192.168.1.1\ninterface: {interface}\n");
+            assert_eq!(
+                endpoint_route_state_from_output(output.as_bytes()),
+                EndpointRouteState::Physical,
+                "{interface} must remain a physical endpoint route"
+            );
+        }
+        for interface in ["utun4", "bridge0", "tap0", "tun0", "lo0"] {
+            let output =
+                format!("route to: 203.0.113.10\ngateway: 10.0.0.1\ninterface: {interface}\n");
+            assert_eq!(
+                endpoint_route_state_from_output(output.as_bytes()),
+                EndpointRouteState::Tunnel,
+                "{interface} must not be accepted as physical"
+            );
+        }
+        assert_eq!(
+            endpoint_route_state_from_output(b"route to: 203.0.113.10\n"),
+            EndpointRouteState::Unavailable
+        );
     }
 
     #[test]

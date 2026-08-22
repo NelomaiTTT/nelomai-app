@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{LinuxUserspaceRouteManager, SystemRouteBackend, AWG_FWMARK};
 #[cfg(target_os = "macos")]
-pub(crate) use macos::SystemRouteBackend;
+pub(crate) use macos::{endpoint_route_summary, verify_endpoint_routes, SystemRouteBackend};
 
 const ROUTE_STATE_FILE: &str = "routes-state.json";
 const ROUTE_STATE_FORMAT: u16 = 1;
