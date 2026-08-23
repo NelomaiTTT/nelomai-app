@@ -43,6 +43,18 @@ pub(crate) struct NetworkIncidentSnapshot {
     open_incident_ids: HashSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NetworkIncidentObservation {
+    Unchanged,
+    Detected,
+    Recovered,
+}
+
+pub(crate) struct NetworkIncidentObservationResult {
+    pub(crate) observation: NetworkIncidentObservation,
+    pub(crate) persistence_error_kind: Option<io::ErrorKind>,
+}
+
 #[derive(Default)]
 struct Detector {
     connection_id: Option<String>,
@@ -196,7 +208,7 @@ impl NetworkIncidentRecorder {
         sample: &TunnelMetrics,
         previous: Option<&TunnelMetrics>,
         now_unix: i64,
-    ) -> io::Result<()> {
+    ) -> io::Result<NetworkIncidentObservationResult> {
         let mut detector = self
             .detector
             .lock()
@@ -248,9 +260,15 @@ impl NetworkIncidentRecorder {
                         }
                     }
                 }
-                return result;
+                return Ok(NetworkIncidentObservationResult {
+                    observation: NetworkIncidentObservation::Recovered,
+                    persistence_error_kind: result.err().map(|error| error.kind()),
+                });
             }
-            return Ok(());
+            return Ok(NetworkIncidentObservationResult {
+                observation: NetworkIncidentObservation::Unchanged,
+                persistence_error_kind: None,
+            });
         }
         if sent_delta > 0 {
             detector.candidate_started_at_unix.get_or_insert(now_unix);
@@ -269,7 +287,10 @@ impl NetworkIncidentRecorder {
             detector.candidate_last_activity_at_unix = None;
         }
         let Some(candidate_at) = detector.candidate_started_at_unix else {
-            return Ok(());
+            return Ok(NetworkIncidentObservationResult {
+                observation: NetworkIncidentObservation::Unchanged,
+                persistence_error_kind: None,
+            });
         };
         if detector.open_incident_at_unix.is_some()
             || now_unix.saturating_sub(detector.started_at_unix) < MINIMUM_SESSION_AGE_SECONDS
@@ -277,22 +298,22 @@ impl NetworkIncidentRecorder {
             || detector.candidate_sent_bytes < MINIMUM_CANDIDATE_SENT_BYTES
             || detector.candidate_active_samples < MINIMUM_CANDIDATE_ACTIVE_SAMPLES
         {
-            return Ok(());
+            return Ok(NetworkIncidentObservationResult {
+                observation: NetworkIncidentObservation::Unchanged,
+                persistence_error_kind: None,
+            });
         }
         detector.open_incident_at_unix = Some(now_unix);
         let samples = detector.samples.iter().cloned().collect();
         drop(detector);
-        let result = self.record_detection(connection_id, now_unix, samples);
-        if result.is_err() {
-            if let Ok(mut detector) = self.detector.lock() {
-                if detector.connection_id.as_deref() == Some(connection_id)
-                    && detector.open_incident_at_unix == Some(now_unix)
-                {
-                    detector.open_incident_at_unix = None;
-                }
-            }
-        }
-        result
+        let persistence_error_kind = self
+            .record_detection(connection_id, now_unix, samples)
+            .err()
+            .map(|error| error.kind());
+        Ok(NetworkIncidentObservationResult {
+            observation: NetworkIncidentObservation::Detected,
+            persistence_error_kind,
+        })
     }
 
     pub(crate) fn snapshot(
@@ -846,17 +867,24 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
         let mut previous = sample(100, 100, 10_000);
+        let mut detected = false;
         for second in 10..=21 {
             let current = sample(100, 100 + (second - 9) as u64 * 200, 10_000);
-            recorder
+            let observation = recorder
                 .observe("lease-1", &current, Some(&previous), second)
                 .unwrap();
+            detected |= observation.observation == NetworkIncidentObservation::Detected;
             previous = current;
         }
+        assert!(detected);
         let recovered = sample(200, 200, 10_000);
-        recorder
+        let observation = recorder
             .observe("lease-1", &recovered, Some(&previous), 22)
             .unwrap();
+        assert_eq!(
+            observation.observation,
+            NetworkIncidentObservation::Recovered
+        );
 
         let payload = recorder
             .snapshot(Some("lease-1"), None, Some(0), Some(30))
@@ -868,6 +896,28 @@ mod tests {
         assert_eq!(incident["recovered_at_unix"], 22);
         assert_eq!(incident["duration_ms"], 2_000);
         assert!(incident["samples"].as_array().unwrap().len() <= MAX_SAMPLES);
+    }
+
+    #[test]
+    fn detection_survives_an_archive_write_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = NetworkIncidentRecorder::new(directory.path()).unwrap();
+        fs::create_dir(directory.path().join("network-incidents.json")).unwrap();
+        let mut previous = sample(100, 100, 10_000);
+        let mut detection = None;
+        for second in 10..=21 {
+            let current = sample(100, 100 + (second - 9) as u64 * 200, 10_000);
+            let result = recorder
+                .observe("lease-1", &current, Some(&previous), second)
+                .unwrap();
+            if result.observation == NetworkIncidentObservation::Detected {
+                detection = Some(result);
+            }
+            previous = current;
+        }
+
+        let detection = detection.expect("detector must not depend on archive I/O");
+        assert!(detection.persistence_error_kind.is_some());
     }
 
     #[test]

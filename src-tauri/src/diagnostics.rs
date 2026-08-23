@@ -3,7 +3,7 @@ use crate::automatic_diagnostics::{
     AutomaticObservation, DesktopAutomaticDiagnostics, PendingSeal, UploadCandidate,
 };
 #[cfg(desktop)]
-use crate::network_incidents::NetworkIncidentRecorder;
+use crate::network_incidents::{NetworkIncidentObservation, NetworkIncidentRecorder};
 use crate::resource_usage::ResourceSnapshot;
 use nelomai_client_api::DiagnosticUploadRequest;
 use nelomai_client_core::{CoreLogEvent, CoreLogger};
@@ -32,6 +32,13 @@ const MAX_ANDROID_PREVIOUS_REPORT_BYTES: usize = 16 * 1024;
 const MAX_ANDROID_CURRENT_REPORT_BYTES: usize = 24 * 1024;
 #[cfg(any(target_os = "android", test))]
 const MAX_ANDROID_LOGCAT_REPORT_BYTES: usize = 20 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TunnelMetricsObservation {
+    Unchanged,
+    Detected,
+    Recovered,
+}
 #[cfg(any(target_os = "android", test))]
 const MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES: usize = 48 * 1024;
 
@@ -194,21 +201,48 @@ impl AppDiagnostics {
         connection_id: &str,
         sample: &TunnelMetrics,
         previous: Option<&TunnelMetrics>,
-    ) {
+    ) -> Option<TunnelMetricsObservation> {
         #[cfg(desktop)]
-        if let Err(error) =
-            self.network_incidents
-                .observe(connection_id, sample, previous, now_unix())
         {
-            self.record_named(
-                "diagnostics.network_incident_write_failed",
-                Some(connection_id),
-                None,
-                Some(&error.kind().to_string()),
-            );
+            match self
+                .network_incidents
+                .observe(connection_id, sample, previous, now_unix())
+            {
+                Ok(result) => {
+                    if let Some(error_kind) = result.persistence_error_kind {
+                        self.record_named(
+                            "diagnostics.network_incident_write_failed",
+                            Some(connection_id),
+                            None,
+                            Some(&error_kind.to_string()),
+                        );
+                    }
+                    Some(match result.observation {
+                        NetworkIncidentObservation::Unchanged => {
+                            TunnelMetricsObservation::Unchanged
+                        }
+                        NetworkIncidentObservation::Detected => TunnelMetricsObservation::Detected,
+                        NetworkIncidentObservation::Recovered => {
+                            TunnelMetricsObservation::Recovered
+                        }
+                    })
+                }
+                Err(error) => {
+                    self.record_named(
+                        "diagnostics.network_incident_write_failed",
+                        Some(connection_id),
+                        None,
+                        Some(&error.kind().to_string()),
+                    );
+                    None
+                }
+            }
         }
         #[cfg(not(desktop))]
-        let _ = (connection_id, sample, previous);
+        {
+            let _ = (connection_id, sample, previous);
+            None
+        }
     }
 
     #[cfg(desktop)]

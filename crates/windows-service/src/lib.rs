@@ -172,6 +172,27 @@ pub enum Request {
 }
 
 impl Request {
+    pub fn diagnostic_name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start",
+            Self::Stop { .. } => "stop",
+            Self::Status { .. } => "status",
+            Self::Version { .. } => "version",
+            Self::PhysicalNetworkFingerprint { .. } => "physical_network_fingerprint",
+            Self::Metrics { .. } => "metrics",
+            Self::Diagnostics { .. } => "diagnostics",
+            Self::DefenderStatus { .. } => "defender_status",
+            Self::RebindUdp { .. } => "rebind_udp",
+        }
+    }
+
+    pub fn is_lifecycle_event(&self) -> bool {
+        matches!(
+            self,
+            Self::Start { .. } | Self::Stop { .. } | Self::RebindUdp { .. }
+        )
+    }
+
     pub fn start(configuration: String) -> Self {
         Self::start_with_options(configuration, DesktopTunnelOptions::default())
     }

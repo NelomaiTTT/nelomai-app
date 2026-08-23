@@ -17,6 +17,49 @@ fn start_request_is_framed_and_redacted() {
         format!("Start {{ protocol_version: {PROTOCOL_VERSION}, configuration: \"<redacted>\", options: DesktopTunnelOptions {{ excluded_ipv4_cidrs_count: 0, exclude_local_networks: false, policy_hash_present: false }} }}")
     );
     assert!(!format!("{request:?}").contains("never-log-this"));
+    assert_eq!(request.diagnostic_name(), "start");
+}
+
+#[test]
+fn every_typed_request_has_a_secret_free_diagnostic_name() {
+    let requests = [
+        Request::stop(),
+        Request::status(),
+        Request::version(),
+        Request::physical_network_fingerprint(),
+        Request::metrics(true),
+        Request::diagnostics(),
+        Request::defender_status(),
+        Request::rebind_udp(),
+    ];
+
+    assert_eq!(
+        requests.map(|request| request.diagnostic_name()),
+        [
+            "stop",
+            "status",
+            "version",
+            "physical_network_fingerprint",
+            "metrics",
+            "diagnostics",
+            "defender_status",
+            "rebind_udp",
+        ],
+    );
+}
+
+#[test]
+fn only_state_changing_requests_are_lifecycle_events() {
+    assert!(Request::start("PrivateKey = redacted".to_string()).is_lifecycle_event());
+    assert!(Request::stop().is_lifecycle_event());
+    assert!(Request::rebind_udp().is_lifecycle_event());
+
+    assert!(!Request::status().is_lifecycle_event());
+    assert!(!Request::version().is_lifecycle_event());
+    assert!(!Request::physical_network_fingerprint().is_lifecycle_event());
+    assert!(!Request::metrics(false).is_lifecycle_event());
+    assert!(!Request::diagnostics().is_lifecycle_event());
+    assert!(!Request::defender_status().is_lifecycle_event());
 }
 
 #[test]

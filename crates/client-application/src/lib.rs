@@ -7,6 +7,7 @@ use nelomai_client_api::{
 use nelomai_client_core::{
     ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError, CoreError,
     CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
+    StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
 };
 use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError};
@@ -50,6 +51,16 @@ pub trait ApplicationApi: CoreApi {
         layer: Layer,
     ) -> Result<ServerCandidatesResponse, CoreApiError>;
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64>;
+    async fn probe_fresh_latency_ms(&self, probe_url: &str) -> Option<f64> {
+        self.probe_latency_ms(probe_url).await
+    }
+    async fn probe_fresh_latency_ms_resolved(
+        &self,
+        probe_url: &str,
+        _resolved_ip: std::net::IpAddr,
+    ) -> Option<f64> {
+        self.probe_fresh_latency_ms(probe_url).await
+    }
     async fn probe_candidate_latency_ms(&self, probe_url: &str) -> Result<f64, ProbeFailureCode> {
         self.probe_latency_ms(probe_url)
             .await
@@ -142,6 +153,18 @@ impl ApplicationApi for ClientApi {
 
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
         ClientApi::probe_latency_ms(self, probe_url).await
+    }
+
+    async fn probe_fresh_latency_ms(&self, probe_url: &str) -> Option<f64> {
+        ClientApi::probe_fresh_latency_ms(self, probe_url).await
+    }
+
+    async fn probe_fresh_latency_ms_resolved(
+        &self,
+        probe_url: &str,
+        resolved_ip: std::net::IpAddr,
+    ) -> Option<f64> {
+        ClientApi::probe_fresh_latency_ms_resolved(self, probe_url, resolved_ip).await
     }
 
     async fn probe_candidate_latency_ms(&self, probe_url: &str) -> Result<f64, ProbeFailureCode> {
@@ -380,6 +403,20 @@ where
 
     pub async fn probe_connection_latency_ms(&self, probe_url: &str) -> Option<f64> {
         self.api.probe_latency_ms(probe_url).await
+    }
+
+    pub async fn probe_fresh_connection_latency_ms(&self, probe_url: &str) -> Option<f64> {
+        self.api.probe_fresh_latency_ms(probe_url).await
+    }
+
+    pub async fn probe_fresh_connection_latency_ms_resolved(
+        &self,
+        probe_url: &str,
+        resolved_ip: std::net::IpAddr,
+    ) -> Option<f64> {
+        self.api
+            .probe_fresh_latency_ms_resolved(probe_url, resolved_ip)
+            .await
     }
 
     pub fn set_split_tunnel_installed_packages(&self, packages: Vec<SplitTunnelSelectedPackage>) {
@@ -664,6 +701,17 @@ where
 
     pub fn record_tunnel_unavailable(&self, kind: &'static str, code: String) {
         self.core.record_tunnel_unavailable(kind, code);
+    }
+
+    pub async fn recover_stalled_data_plane(
+        &self,
+        lease_id: &str,
+        recovery: StalledDataPlaneRecovery,
+    ) -> Result<StalledDataPlaneRecoveryOutcome, ApplicationError> {
+        self.core
+            .recover_stalled_data_plane(lease_id, recovery)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn reconcile_external_tunnel_state(&self) -> CoreState {

@@ -1,5 +1,5 @@
 use super::backend::{resolve_endpoint, WindowsServiceBackend};
-use super::install::{load_policy, record_service_diagnostic};
+use super::install::{load_policy, record_service_diagnostic, record_service_message};
 use super::ipc::{finish_request, wake_server, PipeServer};
 use super::routes::WindowsRouteManager;
 use super::{platform_error, wide};
@@ -72,8 +72,18 @@ pub fn run_manager_service() -> Result<(), ServiceError> {
 }
 
 fn manager_service_entry(_arguments: Vec<OsString>) {
+    record_service_message(
+        "manager lifecycle",
+        &format!(
+            "started pid={} version={}",
+            std::process::id(),
+            env!("CARGO_PKG_VERSION")
+        ),
+    );
     if let Err(error) = manager_service_loop() {
         record_service_diagnostic("manager service stopped", &error);
+    } else {
+        record_service_message("manager lifecycle", "stopped cleanly");
     }
 }
 
@@ -105,12 +115,18 @@ fn manager_service_loop() -> Result<(), ServiceError> {
         ServiceState::Running,
         ServiceControlAccept::STOP,
     )?;
+    record_service_message("manager lifecycle", "running");
     while !stopping.load(Ordering::Acquire) {
         match server.accept() {
             Ok(Some((request, pipe))) => {
                 if stopping.load(Ordering::Acquire) {
                     let _ = finish_request(pipe, &crate::Response::failure("service_stopping"));
                     break;
+                }
+                let action = request.diagnostic_name();
+                let lifecycle_event = request.is_lifecycle_event();
+                if lifecycle_event {
+                    record_service_message("manager request", &format!("started action={action}"));
                 }
                 let response = match RequestWatchdog::arm() {
                     Ok(watchdog) => {
@@ -123,6 +139,17 @@ fn manager_service_loop() -> Result<(), ServiceError> {
                         crate::Response::failure(error.code())
                     }
                 };
+                if lifecycle_event {
+                    record_service_message(
+                        "manager request",
+                        &format!(
+                            "completed action={action} ok={} state={:?} error={}",
+                            response.ok,
+                            response.state,
+                            response.error_code.as_deref().unwrap_or("none")
+                        ),
+                    );
+                }
                 if let Err(error) = finish_request(pipe, &response) {
                     record_service_diagnostic("send pipe response", &error);
                 }
@@ -135,6 +162,7 @@ fn manager_service_loop() -> Result<(), ServiceError> {
             }
         }
     }
+    record_service_message("manager lifecycle", "SCM stop requested");
     set_status(
         &status_handle,
         ServiceState::Stopped,
@@ -161,6 +189,10 @@ fn set_status(
 }
 
 pub fn run_wireguard_service(configuration: &Path) -> Result<(), ServiceError> {
+    record_service_message(
+        "WireGuard tunnel lifecycle",
+        &format!("started pid={}", std::process::id()),
+    );
     let tunnel_dll = std::env::current_exe()
         .map_err(|error| platform_error("resolve tunnel service executable", error))?
         .with_file_name("tunnel.dll");
@@ -197,8 +229,16 @@ pub fn run_wireguard_service(configuration: &Path) -> Result<(), ServiceError> {
         FreeLibrary(module);
     }
     if succeeded {
+        record_service_message(
+            "WireGuard tunnel lifecycle",
+            "service function returned success",
+        );
         Ok(())
     } else {
+        record_service_message(
+            "WireGuard tunnel lifecycle",
+            "service function returned failure",
+        );
         Err(ServiceError::Backend(
             "WireGuardTunnelService returned failure".to_string(),
         ))
@@ -206,6 +246,10 @@ pub fn run_wireguard_service(configuration: &Path) -> Result<(), ServiceError> {
 }
 
 pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
+    record_service_message(
+        "AmneziaWG tunnel lifecycle",
+        &format!("started pid={}", std::process::id()),
+    );
     let metadata = std::fs::metadata(configuration)
         .map_err(|error| platform_error("read AmneziaWG configuration metadata", error))?;
     if metadata.len() as usize > MAX_FRAME_SIZE {
@@ -257,8 +301,16 @@ pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
         FreeLibrary(module);
     }
     if succeeded {
+        record_service_message(
+            "AmneziaWG tunnel lifecycle",
+            "service function returned success",
+        );
         Ok(())
     } else {
+        record_service_message(
+            "AmneziaWG tunnel lifecycle",
+            "service function returned failure",
+        );
         Err(ServiceError::Backend(
             "AmneziaWG tunnel service returned failure".to_string(),
         ))

@@ -14,6 +14,7 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -703,6 +704,74 @@ impl ClientApi {
         Ok(started.elapsed().as_secs_f64() * 1_000.0)
     }
 
+    fn fresh_probe_request(
+        endpoint: Url,
+        resolved_ip: Option<IpAddr>,
+    ) -> Result<RequestBuilder, ProbeFailureCode> {
+        let mut client = HttpClient::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(3))
+            .http1_only()
+            .pool_max_idle_per_host(0);
+        if let Some(resolved_ip) = resolved_ip {
+            let host = endpoint
+                .host_str()
+                .ok_or(ProbeFailureCode::InvalidUrl)?
+                .to_string();
+            let port = endpoint
+                .port_or_known_default()
+                .ok_or(ProbeFailureCode::InvalidUrl)?;
+            client = client.resolve(&host, SocketAddr::new(resolved_ip, port));
+        }
+        let client = client.build().map_err(|_| ProbeFailureCode::NetworkError)?;
+        Ok(client
+            .get(endpoint)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache")
+            .header(reqwest::header::CONNECTION, "close"))
+    }
+
+    pub async fn probe_fresh_latency_ms(&self, probe_url: &str) -> Option<f64> {
+        let endpoint = Url::parse(probe_url).ok()?;
+        let scheme_allowed =
+            endpoint.scheme() == "https" || (cfg!(debug_assertions) && endpoint.scheme() == "http");
+        if !scheme_allowed {
+            return None;
+        }
+        let started = Instant::now();
+        let response = Self::fresh_probe_request(endpoint, None)
+            .ok()?
+            .send()
+            .await
+            .ok()?;
+        response
+            .status()
+            .is_success()
+            .then(|| started.elapsed().as_secs_f64() * 1_000.0)
+    }
+
+    pub async fn probe_fresh_latency_ms_resolved(
+        &self,
+        probe_url: &str,
+        resolved_ip: IpAddr,
+    ) -> Option<f64> {
+        let endpoint = Url::parse(probe_url).ok()?;
+        let scheme_allowed =
+            endpoint.scheme() == "https" || (cfg!(debug_assertions) && endpoint.scheme() == "http");
+        if !scheme_allowed {
+            return None;
+        }
+        let started = Instant::now();
+        let response = Self::fresh_probe_request(endpoint, Some(resolved_ip))
+            .ok()?
+            .send()
+            .await
+            .ok()?;
+        response
+            .status()
+            .is_success()
+            .then(|| started.elapsed().as_secs_f64() * 1_000.0)
+    }
+
     pub async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
         self.probe_candidate_latency_ms(probe_url).await.ok()
     }
@@ -871,6 +940,9 @@ mod tests {
     use nelomai_contracts::{
         ConnectionOperationRequest, ConnectionStartRequest, Layer, RouteMode, TicConnectionMode,
     };
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    use std::thread;
 
     #[test]
     fn builds_versioned_endpoint_without_browser_cookie_state() {
@@ -879,6 +951,51 @@ mod tests {
             client.endpoint("auth/login").unwrap().as_str(),
             "https://nelomai.ru/api/client/v1/auth/login"
         );
+    }
+
+    #[test]
+    fn fresh_probe_closes_its_dedicated_http_connection() {
+        let request =
+            ClientApi::fresh_probe_request(Url::parse("https://nelomai.ru/health").unwrap(), None)
+                .unwrap()
+                .build()
+                .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::CONNECTION)
+                .and_then(|value| value.to_str().ok()),
+            Some("close"),
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_probe_can_pin_hostname_to_known_endpoint_ip() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let received = stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..received]).starts_with("GET /probe HTTP/1.1")
+            );
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let client = ClientApi::new("https://nelomai.ru").unwrap();
+
+        let latency = client
+            .probe_fresh_latency_ms_resolved(
+                &format!("http://unresolvable.invalid:{port}/probe"),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            )
+            .await;
+
+        assert!(latency.is_some());
+        server.join().unwrap();
     }
 
     #[test]

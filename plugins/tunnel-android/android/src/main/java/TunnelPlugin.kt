@@ -579,6 +579,8 @@ internal object TunnelRuntime {
         val watchdog = armOperationWatchdog(applicationContext, "start")
         executor.execute {
             val startedAt = System.nanoTime()
+            val startMemoryDiagnostics = TunnelStartMemoryDiagnostics()
+            startMemoryDiagnostics.record(applicationContext, "start_begin")
             TunnelLog.info(
                 "start.begin",
                 mapOf(
@@ -612,6 +614,7 @@ internal object TunnelRuntime {
                     logStage("start.previous_tunnel_stopped", replaceStartedAt)
                 }
                 val parseStartedAt = System.nanoTime()
+                startMemoryDiagnostics.record(applicationContext, "before_configuration_parse")
                 val originalConfig = TunnelPayload.consume(args.configuration) { payload ->
                     Config.parse(ByteArrayInputStream(payload))
                 }
@@ -622,6 +625,7 @@ internal object TunnelRuntime {
                     logAwg3Profile("start.awg3_profile_received", profile)
                 }
                 logStage("start.configuration_parsed", parseStartedAt)
+                startMemoryDiagnostics.record(applicationContext, "after_configuration_parse")
                 val optionsStartedAt = System.nanoTime()
                 val options = AndroidSplitTunnel.resolveOptions(
                     Build.VERSION.SDK_INT,
@@ -697,11 +701,26 @@ internal object TunnelRuntime {
                         "dns_forced_routes_count" to config.getInterface().getDnsServers().size,
                     ),
                 )
+                startMemoryDiagnostics.record(
+                    applicationContext,
+                    "after_split_options",
+                    transport,
+                )
 
                 requireClientStartNotCancelled(args.clientOperationId)
                 val backendStartedAt = System.nanoTime()
                 var activeBackend = requireBackend()
+                startMemoryDiagnostics.record(
+                    applicationContext,
+                    "before_backend_up",
+                    transport,
+                )
                 var state = activeBackend.setState(tunnel, Tunnel.State.UP, config)
+                startMemoryDiagnostics.record(
+                    applicationContext,
+                    "after_backend_up",
+                    transport,
+                )
                 if (state == Tunnel.State.UP && preparedAwg3Profile != null) {
                     val firstRuntimeProfile = runtimeAwg3Profile(activeBackend)
                     if (!runtimeProfileMatches(preparedAwg3Profile, firstRuntimeProfile)) {
@@ -787,10 +806,28 @@ internal object TunnelRuntime {
                     )
                     activeSession = session
                     try {
-                        monitor.start { networkState ->
-                            reapplyPhysicalNetworks(session.generation, networkState)
-                        }
-                        scheduleDataPlaneDiagnostics(session.generation)
+                        runTunnelStartupPostActions(
+                            required = {
+                                monitor.start { networkState ->
+                                    reapplyPhysicalNetworks(session.generation, networkState)
+                                }
+                                scheduleDataPlaneDiagnostics(session.generation)
+                            },
+                            optionalDiagnostics = {
+                                scheduleTunnelStartMemoryDiagnostics(
+                                    applicationContext,
+                                    session.generation,
+                                    startMemoryDiagnostics,
+                                    transport,
+                                )
+                            },
+                            onDiagnosticsFailure = {
+                                TunnelLog.warning(
+                                    "diagnostics.memory_start_schedule_failed",
+                                    error = it,
+                                )
+                            },
+                        )
                     } catch (_: Throwable) {
                         activeSession = null
                         monitor.stop()
@@ -1598,6 +1635,26 @@ internal object TunnelRuntime {
             NETWORK_TELEMETRY_INTERVAL_SECONDS,
             TimeUnit.SECONDS,
         )
+    }
+
+    private fun scheduleTunnelStartMemoryDiagnostics(
+        context: Context,
+        sessionGeneration: Long,
+        diagnostics: TunnelStartMemoryDiagnostics,
+        transport: String,
+    ) {
+        tunnelStartMemoryDelayedStages().forEach { (stage, delayMillis) ->
+            watchdogExecutor.schedule(
+                {
+                    if (activeSession?.generation != sessionGeneration) return@schedule
+                    if (stateGate.current() == SessionState.RUNNING) {
+                        diagnostics.record(context, stage, transport)
+                    }
+                },
+                delayMillis,
+                TimeUnit.MILLISECONDS,
+            )
+        }
     }
 
     private fun inspectNetworkTelemetry(session: ActiveTunnelSession) {

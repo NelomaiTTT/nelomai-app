@@ -8,7 +8,9 @@ import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
 import android.os.Build
+import android.os.Debug
 import android.os.Process
+import android.os.SystemClock
 import android.system.Os
 import android.system.OsConstants
 import java.io.ByteArrayOutputStream
@@ -49,6 +51,8 @@ private const val MAX_STARTUP_LOG_BYTES = 16 * 1024
 private const val MAX_HELPER_LOG_BYTES = 64 * 1024
 private const val MAX_NETWORK_INCIDENT_LOG_BYTES = 48 * 1024
 private const val MAX_REPORT_BYTES = 512 * 1024
+private const val TUNNEL_START_MEMORY_GROWTH_THRESHOLD_BYTES = 256L * 1024L * 1024L
+private const val TUNNEL_START_MEMORY_ABSOLUTE_THRESHOLD_BYTES = 512L * 1024L * 1024L
 private const val AUTOMATIC_DIAGNOSTICS_JOB_ID = 0x4e444941
 private val RETRY_DELAYS_SECONDS = longArrayOf(5 * 60L, 30 * 60L, 2 * 60 * 60L, 6 * 60 * 60L)
 
@@ -1096,6 +1100,123 @@ internal data class AutomaticDiagnosticsProcessMemory(
     val residentBytes: Long?,
     val proportionalBytes: Long?,
 )
+
+internal class TunnelStartMemoryDetailGate(
+    private val baselineRssBytes: Long?,
+) {
+    private val captured = AtomicBoolean(false)
+
+    fun shouldCapture(currentRssBytes: Long?): Boolean {
+        val current = currentRssBytes ?: return false
+        val growth = baselineRssBytes?.let { baseline -> (current - baseline).coerceAtLeast(0) }
+        val thresholdReached = current >= TUNNEL_START_MEMORY_ABSOLUTE_THRESHOLD_BYTES ||
+            growth?.let { it >= TUNNEL_START_MEMORY_GROWTH_THRESHOLD_BYTES } == true
+        return thresholdReached && captured.compareAndSet(false, true)
+    }
+}
+
+internal fun tunnelStartMemoryDelayedStages(): List<Pair<String, Long>> = listOf(
+    "after_backend_100ms" to 100L,
+    "after_backend_1s" to 1_000L,
+    "after_backend_5s" to 5_000L,
+)
+
+internal fun containTunnelStartMemoryDiagnosticsFailure(block: () -> Unit): Throwable? =
+    runCatching(block).exceptionOrNull()
+
+internal fun runTunnelStartupPostActions(
+    required: () -> Unit,
+    optionalDiagnostics: () -> Unit,
+    onDiagnosticsFailure: (Throwable) -> Unit,
+) {
+    required()
+    containTunnelStartMemoryDiagnosticsFailure(optionalDiagnostics)
+        ?.let { failure -> runCatching { onDiagnosticsFailure(failure) } }
+}
+
+internal class TunnelStartMemoryDiagnostics {
+    private val processId = Process.myPid()
+    private val baselineRssBytes = processRssBytes(processId)
+    private val detailGate = TunnelStartMemoryDetailGate(baselineRssBytes)
+    private val startedAtElapsedMillis = SystemClock.elapsedRealtime()
+
+    fun record(context: Context, stage: String, transport: String? = null) {
+        val failure = containTunnelStartMemoryDiagnosticsFailure {
+            recordUnchecked(context, stage, transport)
+        }
+        if (failure != null) {
+            runCatching {
+                TunnelLog.warning("diagnostics.memory_start_failed", error = failure)
+            }
+        }
+    }
+
+    private fun recordUnchecked(context: Context, stage: String, transport: String?) {
+        val rssBytes = processRssBytes(processId)
+        TunnelLog.info(
+            "diagnostics.memory_start_stage",
+            mapOf(
+                "stage" to stage.take(64),
+                "transport" to transport,
+                "pid" to processId,
+                "elapsed_ms" to (
+                    SystemClock.elapsedRealtime() - startedAtElapsedMillis
+                ).coerceAtLeast(0),
+                "rss_bytes" to rssBytes,
+                "rss_delta_bytes" to baselineRssBytes?.let { baseline ->
+                    rssBytes?.let { current -> (current - baseline).coerceAtLeast(0) }
+                },
+                "peak_rss_bytes" to processPeakRssBytes(processId),
+            ),
+        )
+        if (detailGate.shouldCapture(rssBytes)) {
+            recordDetailedMemory(context, stage, transport, rssBytes)
+        }
+    }
+
+    private fun recordDetailedMemory(
+        context: Context,
+        stage: String,
+        transport: String?,
+        rssBytes: Long?,
+    ) {
+        val activityManager = context.getSystemService(ActivityManager::class.java)
+        val info = activityManager.getProcessMemoryInfo(intArrayOf(processId)).firstOrNull()
+        val runtime = Runtime.getRuntime()
+        val memoryStats = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            info?.memoryStats.orEmpty()
+        } else {
+            emptyMap()
+        }
+        fun statBytes(name: String): Long? = memoryStats[name]
+            ?.toLongOrNull()
+            ?.times(1024L)
+        TunnelLog.info(
+            "diagnostics.memory_pressure",
+            mapOf(
+                "stage" to stage.take(64),
+                "transport" to transport,
+                "pid" to processId,
+                "rss_bytes" to rssBytes,
+                "peak_rss_bytes" to processPeakRssBytes(processId),
+                "pss_bytes" to info?.totalPss?.toLong()?.times(1024L),
+                "private_dirty_bytes" to info?.totalPrivateDirty?.toLong()?.times(1024L),
+                "java_heap_used_bytes" to (runtime.totalMemory() - runtime.freeMemory()),
+                "java_heap_committed_bytes" to runtime.totalMemory(),
+                "java_heap_max_bytes" to runtime.maxMemory(),
+                "native_heap_allocated_bytes" to Debug.getNativeHeapAllocatedSize(),
+                "native_heap_committed_bytes" to Debug.getNativeHeapSize(),
+                "pss_java_heap_bytes" to statBytes("summary.java-heap"),
+                "pss_native_heap_bytes" to statBytes("summary.native-heap"),
+                "pss_code_bytes" to statBytes("summary.code"),
+                "pss_stack_bytes" to statBytes("summary.stack"),
+                "pss_graphics_bytes" to statBytes("summary.graphics"),
+                "pss_private_other_bytes" to statBytes("summary.private-other"),
+                "pss_system_bytes" to statBytes("summary.system"),
+            ),
+        )
+    }
+}
 
 internal fun automaticDiagnosticsCurrentProcessMemory(
     context: Context,

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use nelomai_client_api::{AuthDevice, TokenResponse};
 use nelomai_client_core::{
     ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogEvent, CoreLogger, Phase,
-    RetryPolicy,
+    RetryPolicy, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
 };
 use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
@@ -1961,6 +1961,140 @@ async fn concurrent_stop_is_single_flight() {
     assert_eq!(first.unwrap().lease_id, second.unwrap().lease_id);
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
     assert_eq!(core.state().await.phase, Phase::Ready);
+}
+
+#[tokio::test]
+async fn stalled_data_plane_recovery_rebinds_then_restarts_only_the_local_tunnel() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.rebind_supported.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert_eq!(
+        core.recover_stalled_data_plane(&connection.lease_id, StalledDataPlaneRecovery::RebindUdp,)
+            .await
+            .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Rebound,
+    );
+    assert_eq!(tunnel.rebinds.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+
+    assert_eq!(
+        core.recover_stalled_data_plane(
+            &connection.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await
+        .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected,
+    );
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 2);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test]
+async fn stalled_recovery_continues_after_stop_error_when_tunnel_is_already_stopped() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+
+    assert_eq!(
+        core.recover_stalled_data_plane(
+            &connection.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await
+        .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected,
+    );
+    assert_eq!(core.state().await.phase, Phase::Connected);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stalled_recovery_retries_one_local_start_failure_without_replacing_the_lease() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+
+    assert_eq!(
+        core.recover_stalled_data_plane(
+            &connection.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await
+        .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Reconnected,
+    );
+    let recovered_state = core.state().await;
+    assert_eq!(recovered_state.phase, Phase::Connected);
+    assert_eq!(
+        recovered_state
+            .connection
+            .as_ref()
+            .map(|value| value.lease_id.as_str()),
+        Some(connection.lease_id.as_str()),
+    );
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 3);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn stalled_awg3_recovery_does_not_report_reconnected_without_a_handshake() {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+    let mut stored = store.load().unwrap().unwrap();
+    stored.saved_connection.as_mut().unwrap().configuration = awg3_configuration("tunnel-secret");
+    store.save(&stored).unwrap();
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+
+    assert!(core
+        .recover_stalled_data_plane(
+            &connection.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await
+        .is_err());
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Stopped);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 2);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]

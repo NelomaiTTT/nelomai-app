@@ -518,6 +518,12 @@ fn start_connection_metrics_scheduler(
         let mut last_diagnostics_sample = None;
         let mut last_incident_sample = None;
         let mut skipped_probe_session: Option<String> = None;
+        #[cfg(any(target_os = "macos", windows))]
+        let mut stall_recovery_limiter = connection_metrics::StallRecoveryLimiter::default();
+        #[cfg(target_os = "macos")]
+        let mut macos_stall_recovery = MacosStallRecoveryEpisode::default();
+        #[cfg(windows)]
+        let mut windows_service_recovery = WindowsServiceRecoveryEpisode::default();
         loop {
             interval.tick().await;
             let Some(context) = application.connection_metrics_context().await else {
@@ -528,6 +534,12 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_sample = None;
                 last_incident_sample = None;
                 skipped_probe_session = None;
+                #[cfg(any(target_os = "macos", windows))]
+                stall_recovery_limiter.reset();
+                #[cfg(target_os = "macos")]
+                macos_stall_recovery.reset();
+                #[cfg(windows)]
+                windows_service_recovery.reset();
                 continue;
             };
             let observed = tracker.is_observed().await;
@@ -554,6 +566,13 @@ fn start_connection_metrics_scheduler(
             if new_diagnostics_session {
                 last_diagnostics_sample = None;
                 last_incident_sample = None;
+                failure_recorded = false;
+                #[cfg(any(target_os = "macos", windows))]
+                stall_recovery_limiter.reset();
+                #[cfg(target_os = "macos")]
+                macos_stall_recovery.reset();
+                #[cfg(windows)]
+                windows_service_recovery.reset();
             }
             if diagnostics_due {
                 last_diagnostics_at = Some(diagnostics_now);
@@ -572,15 +591,50 @@ fn start_connection_metrics_scheduler(
                 );
                 skipped_probe_session = Some(context.session_id.clone());
             }
-            match tunnel.metrics(false).await {
+            let collect_probe_target =
+                cfg!(target_os = "macos") && context.layer == nelomai_contracts::Layer::Stray;
+            match tunnel.metrics(collect_probe_target).await {
                 Ok(Some(sample)) => {
                     failure_recorded = false;
-                    diagnostics.observe_tunnel_metrics(
+                    #[cfg(windows)]
+                    windows_service_recovery.reset();
+                    #[cfg(target_os = "macos")]
+                    let (sample, direct_probe_target) = {
+                        let mut sample = sample;
+                        let direct_probe_target = take_direct_probe_target(&mut sample);
+                        (sample, direct_probe_target)
+                    };
+                    let incident_observation = diagnostics.observe_tunnel_metrics(
                         &context.session_id,
                         &sample,
                         last_incident_sample.as_ref(),
                     );
+                    #[cfg(not(target_os = "macos"))]
+                    let _ = incident_observation;
                     last_incident_sample = Some(sample.clone());
+                    #[cfg(target_os = "macos")]
+                    if context.layer == nelomai_contracts::Layer::Stray {
+                        if let Some(observation) = incident_observation {
+                            if macos_stall_recovery.should_attempt(
+                                &context.session_id,
+                                observation,
+                                current_unix_time(),
+                            ) {
+                                let result = diagnose_and_recover_macos_stall(
+                                    application.as_ref(),
+                                    diagnostics.as_ref(),
+                                    &context,
+                                    direct_probe_target,
+                                    &mut stall_recovery_limiter,
+                                    macos_stall_recovery.allows_uncertain_recovery(),
+                                )
+                                .await;
+                                macos_stall_recovery.complete(result, current_unix_time());
+                            }
+                        }
+                    } else {
+                        macos_stall_recovery.reset();
+                    }
                     // Nelomai is deliberately excluded from Android's own VpnService, so an
                     // HTTP request from the app process cannot validate the tunnel there.
                     // Desktop probes use the panel rather than the VPN endpoint, whose host
@@ -625,10 +679,630 @@ fn start_connection_metrics_scheduler(
                         );
                         failure_recorded = true;
                     }
+                    #[cfg(windows)]
+                    {
+                        let recovery_relevant = should_attempt_windows_service_recovery(
+                            &error,
+                            windows_service_recovery.is_active(),
+                        );
+                        let recovery_now = current_unix_time();
+                        if windows_service_recovery.should_poll(recovery_relevant, recovery_now) {
+                            let first_outage = windows_service_recovery.first_outage();
+                            let pending = recover_windows_service_outage(
+                                application.as_ref(),
+                                tunnel.as_ref(),
+                                diagnostics.as_ref(),
+                                &context,
+                                &mut stall_recovery_limiter,
+                                first_outage,
+                            )
+                            .await;
+                            windows_service_recovery.complete(pending, recovery_now);
+                        } else if !recovery_relevant {
+                            windows_service_recovery.reset();
+                        }
+                    }
                 }
             }
         }
     });
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopStallClassification {
+    TunnelPathFailed,
+    PhysicalPathFailed,
+    RecoveredBeforeProbe,
+    Ambiguous,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosStallRecoveryResult {
+    Complete,
+    Retry,
+    RetryAt(i64),
+    DirectProbeUnavailable,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct MacosStallRecoveryEpisode {
+    lease_id: String,
+    pending: bool,
+    retry_count: u8,
+    direct_probe_failures: u8,
+    next_attempt_at_unix: Option<i64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosStallRecoveryEpisode {
+    fn should_attempt(
+        &mut self,
+        lease_id: &str,
+        observation: diagnostics::TunnelMetricsObservation,
+        now_unix: i64,
+    ) -> bool {
+        if self.lease_id != lease_id {
+            self.reset();
+            self.lease_id = lease_id.to_string();
+        }
+        match observation {
+            diagnostics::TunnelMetricsObservation::Detected => {
+                self.pending = true;
+                self.retry_count = 0;
+                self.direct_probe_failures = 0;
+                self.next_attempt_at_unix = None;
+                true
+            }
+            diagnostics::TunnelMetricsObservation::Recovered => {
+                self.reset();
+                false
+            }
+            diagnostics::TunnelMetricsObservation::Unchanged => {
+                self.pending
+                    && self
+                        .next_attempt_at_unix
+                        .is_none_or(|next_attempt| now_unix >= next_attempt)
+            }
+        }
+    }
+
+    fn allows_uncertain_recovery(&self) -> bool {
+        self.direct_probe_failures > 0
+    }
+
+    fn complete(&mut self, result: MacosStallRecoveryResult, now_unix: i64) {
+        match result {
+            MacosStallRecoveryResult::Complete => {
+                self.pending = false;
+                self.retry_count = 0;
+                self.direct_probe_failures = 0;
+                self.next_attempt_at_unix = None;
+            }
+            MacosStallRecoveryResult::Retry | MacosStallRecoveryResult::DirectProbeUnavailable => {
+                self.pending = true;
+                self.retry_count = self.retry_count.saturating_add(1);
+                if result == MacosStallRecoveryResult::DirectProbeUnavailable {
+                    self.direct_probe_failures = self.direct_probe_failures.saturating_add(1);
+                }
+                let delay_seconds = match self.retry_count {
+                    1 => 5,
+                    2 => 15,
+                    _ => 60,
+                };
+                self.next_attempt_at_unix = Some(now_unix.saturating_add(delay_seconds));
+            }
+            MacosStallRecoveryResult::RetryAt(next_attempt_at_unix) => {
+                self.pending = true;
+                self.next_attempt_at_unix = Some(next_attempt_at_unix);
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsServiceRecoveryDecision {
+    Wait,
+    NoAction,
+    RestartLocalTunnel,
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_service_outage(error: &nelomai_client_tunnel::TunnelError) -> bool {
+    matches!(
+        error,
+        nelomai_client_tunnel::TunnelError::Backend(code)
+            if matches!(code.as_str(), "service_unavailable" | "service_timeout")
+    )
+}
+
+#[cfg(any(windows, test))]
+fn should_attempt_windows_service_recovery(
+    error: &nelomai_client_tunnel::TunnelError,
+    episode_active: bool,
+) -> bool {
+    is_windows_service_outage(error)
+        || matches!(
+            error,
+            nelomai_client_tunnel::TunnelError::Backend(code)
+                if matches!(code.as_str(), "endpoint_route_lost" | "endpoint_route_unavailable")
+        )
+        || episode_active
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_service_recovery(
+    status: Option<nelomai_client_tunnel::TunnelStatus>,
+) -> WindowsServiceRecoveryDecision {
+    use nelomai_client_tunnel::TunnelStatus;
+
+    match status {
+        Some(TunnelStatus::Stopped | TunnelStatus::Failed) => {
+            WindowsServiceRecoveryDecision::RestartLocalTunnel
+        }
+        Some(TunnelStatus::Running) => WindowsServiceRecoveryDecision::NoAction,
+        Some(TunnelStatus::Starting | TunnelStatus::Stopping) | None => {
+            WindowsServiceRecoveryDecision::Wait
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsLocalRestartOutcomeDecision {
+    code: &'static str,
+    refund_attempt: bool,
+    retry_immediately: bool,
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_local_restart_outcome(
+    outcome: nelomai_client_core::StalledDataPlaneRecoveryOutcome,
+) -> WindowsLocalRestartOutcomeDecision {
+    use nelomai_client_core::StalledDataPlaneRecoveryOutcome;
+
+    match outcome {
+        StalledDataPlaneRecoveryOutcome::Busy => WindowsLocalRestartOutcomeDecision {
+            code: "busy",
+            refund_attempt: true,
+            retry_immediately: false,
+        },
+        StalledDataPlaneRecoveryOutcome::Skipped => WindowsLocalRestartOutcomeDecision {
+            code: "connection_changed",
+            refund_attempt: true,
+            retry_immediately: false,
+        },
+        StalledDataPlaneRecoveryOutcome::Unsupported => WindowsLocalRestartOutcomeDecision {
+            code: "unsupported",
+            refund_attempt: false,
+            retry_immediately: false,
+        },
+        StalledDataPlaneRecoveryOutcome::Rebound => WindowsLocalRestartOutcomeDecision {
+            code: "unexpected_rebound",
+            refund_attempt: false,
+            retry_immediately: false,
+        },
+        StalledDataPlaneRecoveryOutcome::Reconnected => WindowsLocalRestartOutcomeDecision {
+            code: "reconnected",
+            refund_attempt: false,
+            retry_immediately: false,
+        },
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct WindowsServiceRecoveryEpisode {
+    pending: bool,
+    next_poll_at_unix: Option<i64>,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsServiceRecoveryEpisode {
+    fn is_active(&self) -> bool {
+        self.pending || self.next_poll_at_unix.is_some()
+    }
+
+    fn should_poll(&self, service_outage: bool, now_unix: i64) -> bool {
+        service_outage
+            && (self.pending
+                || self
+                    .next_poll_at_unix
+                    .is_none_or(|next_poll| now_unix >= next_poll))
+    }
+
+    fn first_outage(&self) -> bool {
+        !self.pending && self.next_poll_at_unix.is_none()
+    }
+
+    fn complete(&mut self, pending: bool, now_unix: i64) {
+        self.pending = pending;
+        self.next_poll_at_unix = (!pending).then(|| now_unix.saturating_add(10));
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(windows)]
+async fn recover_windows_service_outage(
+    application: &NativeApplication,
+    tunnel: &platform::PlatformTunnelController,
+    diagnostics: &diagnostics::AppDiagnostics,
+    context: &nelomai_client_core::ConnectionMetricsContext,
+    limiter: &mut connection_metrics::StallRecoveryLimiter,
+    first_failure: bool,
+) -> bool {
+    use nelomai_client_core::{StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome};
+    use nelomai_client_tunnel::TunnelController;
+
+    let status = match tunnel.status().await {
+        Ok(status) => Some(status),
+        Err(error) => {
+            if first_failure {
+                diagnostics.record_named(
+                    "windows.service.recovery_waiting",
+                    Some(&context.session_id),
+                    None,
+                    Some(&error.to_string()),
+                );
+            }
+            None
+        }
+    };
+    match classify_windows_service_recovery(status) {
+        WindowsServiceRecoveryDecision::Wait => true,
+        WindowsServiceRecoveryDecision::NoAction => {
+            if first_failure {
+                diagnostics.record_named(
+                    "windows.service.status_running_after_metrics_failure",
+                    Some(&context.session_id),
+                    None,
+                    None,
+                );
+            }
+            false
+        }
+        WindowsServiceRecoveryDecision::RestartLocalTunnel => {
+            let attempt_unix = current_unix_time();
+            if !limiter.begin_attempt(&context.session_id, attempt_unix) {
+                diagnostics.record_named(
+                    "windows.service.local_restart_skipped",
+                    Some(&context.session_id),
+                    None,
+                    Some("rate_limited"),
+                );
+                return false;
+            }
+            match application
+                .recover_stalled_data_plane(
+                    &context.session_id,
+                    StalledDataPlaneRecovery::RestartLocalTunnel,
+                )
+                .await
+            {
+                Ok(StalledDataPlaneRecoveryOutcome::Reconnected) => {
+                    diagnostics.record_named(
+                        "windows.service.local_tunnel_restarted",
+                        Some(&context.session_id),
+                        None,
+                        None,
+                    );
+                    false
+                }
+                Ok(outcome) => {
+                    let decision = classify_windows_local_restart_outcome(outcome);
+                    if decision.refund_attempt {
+                        limiter.cancel_attempt(&context.session_id, attempt_unix);
+                    }
+                    diagnostics.record_named(
+                        "windows.service.local_restart_skipped",
+                        Some(&context.session_id),
+                        None,
+                        Some(decision.code),
+                    );
+                    decision.retry_immediately
+                }
+                Err(error) => {
+                    diagnostics.record_named(
+                        "windows.service.local_restart_failed",
+                        Some(&context.session_id),
+                        None,
+                        Some(&error.to_string()),
+                    );
+                    true
+                }
+            }
+        }
+    }
+}
+
+fn classify_desktop_stall_probe(
+    tunnel_probe_succeeded: bool,
+    direct_probe_succeeded: Option<bool>,
+) -> DesktopStallClassification {
+    if tunnel_probe_succeeded {
+        return DesktopStallClassification::RecoveredBeforeProbe;
+    }
+    match direct_probe_succeeded {
+        Some(true) => DesktopStallClassification::TunnelPathFailed,
+        Some(false) => DesktopStallClassification::PhysicalPathFailed,
+        None => DesktopStallClassification::Ambiguous,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacosStallProbeAction {
+    Complete,
+    RetryProbe,
+    Recover,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_stall_recovery(
+    classification: DesktopStallClassification,
+    allow_uncertain_recovery: bool,
+) -> MacosStallProbeAction {
+    match classification {
+        DesktopStallClassification::RecoveredBeforeProbe => MacosStallProbeAction::Complete,
+        DesktopStallClassification::TunnelPathFailed => MacosStallProbeAction::Recover,
+        DesktopStallClassification::PhysicalPathFailed | DesktopStallClassification::Ambiguous
+            if allow_uncertain_recovery =>
+        {
+            MacosStallProbeAction::Recover
+        }
+        DesktopStallClassification::PhysicalPathFailed | DesktopStallClassification::Ambiguous => {
+            MacosStallProbeAction::RetryProbe
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn take_direct_probe_target(
+    sample: &mut nelomai_client_tunnel::TunnelMetrics,
+) -> Option<std::net::IpAddr> {
+    sample.probe_target.take()?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+async fn diagnose_and_recover_macos_stall(
+    application: &NativeApplication,
+    diagnostics: &diagnostics::AppDiagnostics,
+    context: &nelomai_client_core::ConnectionMetricsContext,
+    direct_probe_target: Option<std::net::IpAddr>,
+    limiter: &mut connection_metrics::StallRecoveryLimiter,
+    allow_uncertain_recovery: bool,
+) -> MacosStallRecoveryResult {
+    use nelomai_client_core::{StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome};
+
+    let tunnel_probe_url = format!("{PANEL_BASE}/health");
+    let tunnel_probe = application.probe_fresh_connection_latency_ms(&tunnel_probe_url);
+    let direct_probe = async {
+        match (context.probe_url.as_deref(), direct_probe_target) {
+            (Some(url), Some(resolved_ip)) => Some(
+                application
+                    .probe_fresh_connection_latency_ms_resolved(url, resolved_ip)
+                    .await
+                    .is_some(),
+            ),
+            _ => None,
+        }
+    };
+    let (tunnel_latency, direct_succeeded) = tokio::join!(tunnel_probe, direct_probe);
+    let classification = classify_desktop_stall_probe(tunnel_latency.is_some(), direct_succeeded);
+    let classification_code = match classification {
+        DesktopStallClassification::TunnelPathFailed => "tunnel_path_failed_direct_ok",
+        DesktopStallClassification::PhysicalPathFailed => "physical_path_failed",
+        DesktopStallClassification::RecoveredBeforeProbe => "recovered_before_probe",
+        DesktopStallClassification::Ambiguous => "ambiguous",
+    };
+    diagnostics.record_named(
+        "tunnel.stall.classified",
+        Some(&context.session_id),
+        None,
+        Some(classification_code),
+    );
+    match classify_macos_stall_recovery(classification, allow_uncertain_recovery) {
+        MacosStallProbeAction::Complete => return MacosStallRecoveryResult::Complete,
+        MacosStallProbeAction::RetryProbe => {
+            return MacosStallRecoveryResult::DirectProbeUnavailable;
+        }
+        MacosStallProbeAction::Recover => {
+            if classification != DesktopStallClassification::TunnelPathFailed {
+                diagnostics.record_named(
+                    "tunnel.stall.direct_probe_fallback",
+                    Some(&context.session_id),
+                    None,
+                    Some(classification_code),
+                );
+            }
+        }
+    }
+    let mut attempt_unix = current_unix_time();
+    if !limiter.begin_attempt(&context.session_id, attempt_unix) {
+        diagnostics.record_named(
+            "tunnel.stall.recovery_skipped",
+            Some(&context.session_id),
+            None,
+            Some("rate_limited"),
+        );
+        return MacosStallRecoveryResult::RetryAt(
+            limiter
+                .next_attempt_at_unix(&context.session_id)
+                .unwrap_or_else(|| attempt_unix.saturating_add(60)),
+        );
+    }
+
+    let rebind = application
+        .recover_stalled_data_plane(&context.session_id, StalledDataPlaneRecovery::RebindUdp)
+        .await;
+    match rebind {
+        Ok(StalledDataPlaneRecoveryOutcome::Rebound) => {
+            diagnostics.record_named(
+                "tunnel.stall.udp_rebound",
+                Some(&context.session_id),
+                None,
+                None,
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if application
+                .probe_fresh_connection_latency_ms(&tunnel_probe_url)
+                .await
+                .is_some()
+            {
+                diagnostics.record_named(
+                    "tunnel.stall.recovered_after_rebind",
+                    Some(&context.session_id),
+                    None,
+                    None,
+                );
+                return MacosStallRecoveryResult::Complete;
+            }
+        }
+        Ok(StalledDataPlaneRecoveryOutcome::Busy) => {
+            limiter.cancel_attempt(&context.session_id, attempt_unix);
+            diagnostics.record_named(
+                "tunnel.stall.recovery_skipped",
+                Some(&context.session_id),
+                None,
+                Some("connection_busy"),
+            );
+            return MacosStallRecoveryResult::Retry;
+        }
+        Ok(StalledDataPlaneRecoveryOutcome::Skipped) => {
+            limiter.cancel_attempt(&context.session_id, attempt_unix);
+            diagnostics.record_named(
+                "tunnel.stall.recovery_skipped",
+                Some(&context.session_id),
+                None,
+                Some("connection_changed"),
+            );
+            return MacosStallRecoveryResult::Complete;
+        }
+        Ok(StalledDataPlaneRecoveryOutcome::Unsupported) => {
+            diagnostics.record_named(
+                "tunnel.stall.udp_rebind_unavailable",
+                Some(&context.session_id),
+                None,
+                None,
+            );
+        }
+        Ok(StalledDataPlaneRecoveryOutcome::Reconnected) => {
+            return MacosStallRecoveryResult::Complete;
+        }
+        Err(error) => diagnostics.record_named(
+            "tunnel.stall.udp_rebind_failed",
+            Some(&context.session_id),
+            None,
+            Some(&error.to_string()),
+        ),
+    }
+
+    for restart_attempt in 1..=2 {
+        if restart_attempt > 1 {
+            attempt_unix = current_unix_time();
+            if !limiter.begin_attempt(&context.session_id, attempt_unix) {
+                diagnostics.record_named(
+                    "tunnel.stall.local_restart_retry_skipped",
+                    Some(&context.session_id),
+                    None,
+                    Some("rate_limited"),
+                );
+                return MacosStallRecoveryResult::RetryAt(
+                    limiter
+                        .next_attempt_at_unix(&context.session_id)
+                        .unwrap_or_else(|| attempt_unix.saturating_add(60)),
+                );
+            }
+        }
+        match application
+            .recover_stalled_data_plane(
+                &context.session_id,
+                StalledDataPlaneRecovery::RestartLocalTunnel,
+            )
+            .await
+        {
+            Ok(StalledDataPlaneRecoveryOutcome::Reconnected) => {
+                if application
+                    .probe_fresh_connection_latency_ms(&tunnel_probe_url)
+                    .await
+                    .is_some()
+                {
+                    diagnostics.record_named(
+                        "tunnel.stall.local_tunnel_restarted",
+                        Some(&context.session_id),
+                        None,
+                        Some(if restart_attempt == 1 {
+                            "verified_first_attempt"
+                        } else {
+                            "verified_retry"
+                        }),
+                    );
+                    return MacosStallRecoveryResult::Complete;
+                }
+                diagnostics.record_named(
+                    "tunnel.stall.local_restart_verification_failed",
+                    Some(&context.session_id),
+                    None,
+                    Some(if restart_attempt == 1 {
+                        "first_attempt"
+                    } else {
+                        "retry"
+                    }),
+                );
+            }
+            Ok(StalledDataPlaneRecoveryOutcome::Busy) => {
+                limiter.cancel_attempt(&context.session_id, attempt_unix);
+                diagnostics.record_named(
+                    "tunnel.stall.local_restart_skipped",
+                    Some(&context.session_id),
+                    None,
+                    Some("busy"),
+                );
+                return MacosStallRecoveryResult::Retry;
+            }
+            Ok(outcome) => {
+                if outcome == StalledDataPlaneRecoveryOutcome::Skipped {
+                    limiter.cancel_attempt(&context.session_id, attempt_unix);
+                }
+                diagnostics.record_named(
+                    "tunnel.stall.local_restart_skipped",
+                    Some(&context.session_id),
+                    None,
+                    Some(match outcome {
+                        StalledDataPlaneRecoveryOutcome::Skipped => "connection_changed",
+                        StalledDataPlaneRecoveryOutcome::Unsupported => "unsupported",
+                        StalledDataPlaneRecoveryOutcome::Rebound => "unexpected_rebound",
+                        StalledDataPlaneRecoveryOutcome::Busy
+                        | StalledDataPlaneRecoveryOutcome::Reconnected => unreachable!(),
+                    }),
+                );
+                return MacosStallRecoveryResult::Complete;
+            }
+            Err(error) => {
+                diagnostics.record_named(
+                    "tunnel.stall.local_restart_failed",
+                    Some(&context.session_id),
+                    None,
+                    Some(&error.to_string()),
+                );
+                return MacosStallRecoveryResult::Retry;
+            }
+        }
+    }
+    MacosStallRecoveryResult::RetryAt(
+        limiter
+            .next_attempt_at_unix(&context.session_id)
+            .unwrap_or_else(|| current_unix_time().saturating_add(60)),
+    )
 }
 
 fn start_push_registration_scheduler(
@@ -703,6 +1377,197 @@ mod tests {
             false, false, false, false
         ));
     }
+
+    #[test]
+    fn desktop_stall_recovery_requires_a_healthy_direct_path() {
+        assert_eq!(
+            classify_desktop_stall_probe(false, Some(true)),
+            DesktopStallClassification::TunnelPathFailed,
+        );
+        assert_eq!(
+            classify_desktop_stall_probe(false, Some(false)),
+            DesktopStallClassification::PhysicalPathFailed,
+        );
+        assert_eq!(
+            classify_desktop_stall_probe(true, Some(true)),
+            DesktopStallClassification::RecoveredBeforeProbe,
+        );
+        assert_eq!(
+            classify_desktop_stall_probe(false, None),
+            DesktopStallClassification::Ambiguous,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn endpoint_probe_target_is_consumed_before_metrics_are_recorded() {
+        let mut sample = nelomai_client_tunnel::TunnelMetrics {
+            probe_target: Some("192.0.2.10".to_string()),
+            ..nelomai_client_tunnel::TunnelMetrics::default()
+        };
+
+        assert_eq!(
+            take_direct_probe_target(&mut sample),
+            Some("192.0.2.10".parse().unwrap()),
+        );
+        assert_eq!(sample.probe_target, None);
+    }
+
+    #[test]
+    fn macos_open_stall_retries_until_metrics_recover() {
+        use diagnostics::TunnelMetricsObservation;
+
+        let mut episode = MacosStallRecoveryEpisode::default();
+        assert!(episode.should_attempt("lease-a", TunnelMetricsObservation::Detected, 100));
+        episode.complete(MacosStallRecoveryResult::Retry, 100);
+        assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 104));
+        assert!(episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 105));
+        episode.complete(MacosStallRecoveryResult::Retry, 105);
+        assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 119));
+        assert!(episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 120));
+        assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Recovered, 121));
+        assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 200));
+    }
+
+    #[test]
+    fn macos_open_stall_retries_a_failed_direct_probe_and_waits_for_the_limiter() {
+        use diagnostics::TunnelMetricsObservation;
+
+        let mut episode = MacosStallRecoveryEpisode::default();
+        assert!(episode.should_attempt("lease-a", TunnelMetricsObservation::Detected, 100));
+        assert!(!episode.allows_uncertain_recovery());
+
+        episode.complete(MacosStallRecoveryResult::DirectProbeUnavailable, 100);
+        assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 104));
+        assert!(episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 105));
+        assert!(episode.allows_uncertain_recovery());
+
+        episode.complete(MacosStallRecoveryResult::RetryAt(700), 105);
+        assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 699));
+        assert!(episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 700));
+    }
+
+    #[test]
+    fn macos_recovery_uses_a_second_failed_direct_probe_as_endpoint_migration_fallback() {
+        assert_eq!(
+            classify_macos_stall_recovery(DesktopStallClassification::PhysicalPathFailed, false),
+            MacosStallProbeAction::RetryProbe,
+        );
+        assert_eq!(
+            classify_macos_stall_recovery(DesktopStallClassification::PhysicalPathFailed, true),
+            MacosStallProbeAction::Recover,
+        );
+        assert_eq!(
+            classify_macos_stall_recovery(DesktopStallClassification::Ambiguous, true),
+            MacosStallProbeAction::Recover,
+        );
+    }
+
+    #[test]
+    fn windows_service_recovery_only_handles_manager_outages() {
+        use nelomai_client_tunnel::TunnelError;
+
+        assert!(is_windows_service_outage(&TunnelError::Backend(
+            "service_unavailable".to_string(),
+        )));
+        assert!(is_windows_service_outage(&TunnelError::Backend(
+            "service_timeout".to_string(),
+        )));
+        assert!(!is_windows_service_outage(&TunnelError::Backend(
+            "missing_tunnel_metrics".to_string(),
+        )));
+        assert!(!is_windows_service_outage(&TunnelError::InvalidOptions {
+            code: "invalid_options",
+        }));
+    }
+
+    #[test]
+    fn windows_recovery_handles_terminal_endpoint_route_failures() {
+        use nelomai_client_tunnel::TunnelError;
+
+        assert!(should_attempt_windows_service_recovery(
+            &TunnelError::Backend("endpoint_route_lost".to_string()),
+            false,
+        ));
+        assert!(should_attempt_windows_service_recovery(
+            &TunnelError::Backend("endpoint_route_unavailable".to_string()),
+            false,
+        ));
+        assert!(!should_attempt_windows_service_recovery(
+            &TunnelError::Backend("route_conflict".to_string()),
+            false,
+        ));
+    }
+
+    #[test]
+    fn windows_service_recovery_waits_for_a_terminal_tunnel_state() {
+        assert_eq!(
+            classify_windows_service_recovery(None),
+            WindowsServiceRecoveryDecision::Wait,
+        );
+        assert_eq!(
+            classify_windows_service_recovery(Some(TunnelStatus::Starting)),
+            WindowsServiceRecoveryDecision::Wait,
+        );
+        assert_eq!(
+            classify_windows_service_recovery(Some(TunnelStatus::Stopping)),
+            WindowsServiceRecoveryDecision::Wait,
+        );
+        assert_eq!(
+            classify_windows_service_recovery(Some(TunnelStatus::Running)),
+            WindowsServiceRecoveryDecision::NoAction,
+        );
+        assert_eq!(
+            classify_windows_service_recovery(Some(TunnelStatus::Stopped)),
+            WindowsServiceRecoveryDecision::RestartLocalTunnel,
+        );
+        assert_eq!(
+            classify_windows_service_recovery(Some(TunnelStatus::Failed)),
+            WindowsServiceRecoveryDecision::RestartLocalTunnel,
+        );
+    }
+
+    #[test]
+    fn windows_service_outage_has_an_independent_recovery_episode() {
+        let mut episode = WindowsServiceRecoveryEpisode::default();
+        assert!(!episode.is_active());
+        assert!(episode.should_poll(true, 100));
+        episode.complete(false, 100);
+        assert!(episode.is_active());
+        assert!(!episode.should_poll(true, 109));
+        assert!(episode.should_poll(true, 110));
+        episode.complete(true, 110);
+        assert!(episode.should_poll(true, 111));
+        assert!(!episode.should_poll(false, 111));
+    }
+
+    #[test]
+    fn windows_service_outage_episode_resets_for_a_new_lease() {
+        let mut episode = WindowsServiceRecoveryEpisode::default();
+        assert!(episode.first_outage());
+        episode.complete(false, 100);
+        assert!(!episode.first_outage());
+        assert!(!episode.should_poll(true, 101));
+
+        episode.reset();
+        assert!(episode.first_outage());
+        assert!(episode.should_poll(true, 101));
+    }
+
+    #[test]
+    fn windows_busy_local_restart_is_retried_after_the_poll_delay() {
+        let decision = classify_windows_local_restart_outcome(
+            nelomai_client_core::StalledDataPlaneRecoveryOutcome::Busy,
+        );
+        assert!(decision.refund_attempt);
+        assert!(!decision.retry_immediately);
+
+        let mut episode = WindowsServiceRecoveryEpisode::default();
+        episode.complete(decision.retry_immediately, 100);
+        assert!(!episode.should_poll(true, 109));
+        assert!(episode.should_poll(true, 110));
+    }
+
     #[cfg(desktop)]
     use nelomai_client_tunnel::TunnelStatus;
 

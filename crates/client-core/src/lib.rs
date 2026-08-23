@@ -91,6 +91,21 @@ pub struct ConnectionMetricsContext {
     pub probe_url: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StalledDataPlaneRecovery {
+    RebindUdp,
+    RestartLocalTunnel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StalledDataPlaneRecoveryOutcome {
+    Busy,
+    Skipped,
+    Unsupported,
+    Rebound,
+    Reconnected,
+}
+
 impl Default for CoreState {
     fn default() -> Self {
         Self {

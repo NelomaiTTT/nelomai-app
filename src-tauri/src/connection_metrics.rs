@@ -9,6 +9,8 @@ const INITIAL_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const INITIAL_PROBE_SAMPLES: usize = 3;
 const PROBE_WINDOW: usize = 12;
 const OBSERVATION_TTL: Duration = Duration::from_secs(15);
+const STALL_RECOVERY_WINDOW_SECONDS: i64 = 600;
+const MAX_STALL_RECOVERY_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +37,56 @@ struct SessionMetrics {
 pub struct ConnectionMetricsTracker {
     session: Mutex<Option<SessionMetrics>>,
     last_observed_at: Mutex<Option<Instant>>,
+}
+
+#[derive(Default)]
+pub(crate) struct StallRecoveryLimiter {
+    lease_id: String,
+    attempts: VecDeque<i64>,
+}
+
+impl StallRecoveryLimiter {
+    pub(crate) fn begin_attempt(&mut self, lease_id: &str, now_unix: i64) -> bool {
+        if self.lease_id != lease_id {
+            self.lease_id = lease_id.to_string();
+            self.attempts.clear();
+        }
+        let cutoff = now_unix.saturating_sub(STALL_RECOVERY_WINDOW_SECONDS);
+        while self
+            .attempts
+            .front()
+            .is_some_and(|attempt| *attempt <= cutoff)
+        {
+            self.attempts.pop_front();
+        }
+        if self.attempts.len() >= MAX_STALL_RECOVERY_ATTEMPTS {
+            return false;
+        }
+        self.attempts.push_back(now_unix);
+        true
+    }
+
+    pub(crate) fn cancel_attempt(&mut self, lease_id: &str, attempt_unix: i64) {
+        if self.lease_id == lease_id && self.attempts.back().copied() == Some(attempt_unix) {
+            self.attempts.pop_back();
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn next_attempt_at_unix(&self, lease_id: &str) -> Option<i64> {
+        if self.lease_id != lease_id || self.attempts.len() < MAX_STALL_RECOVERY_ATTEMPTS {
+            return None;
+        }
+        self.attempts
+            .front()
+            .copied()
+            .map(|attempt| attempt.saturating_add(STALL_RECOVERY_WINDOW_SECONDS))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.lease_id.clear();
+        self.attempts.clear();
+    }
 }
 
 impl ConnectionMetricsTracker {
@@ -286,5 +338,32 @@ mod tests {
         assert!(tracker.is_observed().await);
         *tracker.last_observed_at.lock().await = Some(Instant::now() - OBSERVATION_TTL);
         assert!(!tracker.is_observed().await);
+    }
+
+    #[test]
+    fn stall_recovery_limiter_prevents_loops_and_resets_for_a_new_lease() {
+        let mut limiter = StallRecoveryLimiter::default();
+
+        assert!(limiter.begin_attempt("lease-a", 1_000));
+        assert!(limiter.begin_attempt("lease-a", 1_100));
+        assert!(!limiter.begin_attempt("lease-a", 1_200));
+        assert_eq!(limiter.next_attempt_at_unix("lease-a"), Some(1_600));
+        assert!(limiter.begin_attempt("lease-a", 1_600));
+        assert!(limiter.begin_attempt("lease-a", 1_700));
+        assert!(limiter.begin_attempt("lease-b", 1_201));
+    }
+
+    #[test]
+    fn stall_recovery_limiter_does_not_charge_cancelled_attempts() {
+        let mut limiter = StallRecoveryLimiter::default();
+
+        assert!(limiter.begin_attempt("lease-a", 1_000));
+        limiter.cancel_attempt("lease-a", 1_000);
+        assert!(limiter.begin_attempt("lease-a", 1_001));
+        limiter.cancel_attempt("lease-a", 1_001);
+
+        assert!(limiter.begin_attempt("lease-a", 1_002));
+        assert!(limiter.begin_attempt("lease-a", 1_003));
+        assert!(!limiter.begin_attempt("lease-a", 1_004));
     }
 }

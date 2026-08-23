@@ -249,4 +249,63 @@ class AutomaticDiagnosticsTest {
             automaticDiagnosticsLegacyProcessName("another.application", packageName),
         )
     }
+
+    @Test
+    fun tunnelStartMemoryDetailGateCapturesOneLargeGrowthOrAbsolutePeak() {
+        val mebibyte = 1024L * 1024L
+        val growing = TunnelStartMemoryDetailGate(100L * mebibyte)
+
+        assertTrue(!growing.shouldCapture(355L * mebibyte))
+        assertTrue(growing.shouldCapture(356L * mebibyte))
+        assertTrue(!growing.shouldCapture(700L * mebibyte))
+
+        val alreadyLarge = TunnelStartMemoryDetailGate(null)
+        assertTrue(alreadyLarge.shouldCapture(512L * mebibyte))
+        assertTrue(!alreadyLarge.shouldCapture(700L * mebibyte))
+    }
+
+    @Test
+    fun tunnelStartMemoryDelayedStagesCoverTransientReleaseWindow() {
+        assertEquals(
+            listOf(
+                "after_backend_100ms" to 100L,
+                "after_backend_1s" to 1_000L,
+                "after_backend_5s" to 5_000L,
+            ),
+            tunnelStartMemoryDelayedStages(),
+        )
+    }
+
+    @Test
+    fun tunnelStartMemoryDiagnosticsCannotAbortTunnelStartup() {
+        val failure = containTunnelStartMemoryDiagnosticsFailure {
+            throw IllegalStateException("diagnostic failure")
+        }
+
+        assertEquals("diagnostic failure", failure?.message)
+    }
+
+    @Test
+    fun optionalTunnelStartupDiagnosticsCannotFailRequiredStartupHooks() {
+        var requiredRan = false
+        var recordedFailure: Throwable? = null
+
+        runTunnelStartupPostActions(
+            required = { requiredRan = true },
+            optionalDiagnostics = { throw IllegalStateException("schedule rejected") },
+            onDiagnosticsFailure = { recordedFailure = it },
+        )
+
+        assertTrue(requiredRan)
+        assertEquals("schedule rejected", recordedFailure?.message)
+    }
+
+    @Test
+    fun optionalTunnelStartupDiagnosticsFailureReporterIsAlsoFailOpen() {
+        runTunnelStartupPostActions(
+            required = {},
+            optionalDiagnostics = { throw IllegalStateException("schedule rejected") },
+            onDiagnosticsFailure = { throw IllegalStateException("logger rejected") },
+        )
+    }
 }
