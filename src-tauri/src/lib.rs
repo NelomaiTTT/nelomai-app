@@ -708,6 +708,7 @@ fn start_connection_metrics_scheduler(
     });
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DesktopStallClassification {
     TunnelPathFailed,
@@ -1024,6 +1025,7 @@ async fn recover_windows_service_outage(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn classify_desktop_stall_probe(
     tunnel_probe_succeeded: bool,
     direct_probe_succeeded: Option<bool>,
@@ -1445,6 +1447,9 @@ mod tests {
         episode.complete(MacosStallRecoveryResult::RetryAt(700), 105);
         assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 699));
         assert!(episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 700));
+
+        episode.complete(MacosStallRecoveryResult::Complete, 700);
+        assert!(!episode.should_attempt("lease-a", TunnelMetricsObservation::Unchanged, 701));
     }
 
     #[test]

@@ -9,7 +9,9 @@ const INITIAL_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const INITIAL_PROBE_SAMPLES: usize = 3;
 const PROBE_WINDOW: usize = 12;
 const OBSERVATION_TTL: Duration = Duration::from_secs(15);
+#[cfg(any(target_os = "macos", windows, test))]
 const STALL_RECOVERY_WINDOW_SECONDS: i64 = 600;
+#[cfg(any(target_os = "macos", windows, test))]
 const MAX_STALL_RECOVERY_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -39,12 +41,14 @@ pub struct ConnectionMetricsTracker {
     last_observed_at: Mutex<Option<Instant>>,
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
 #[derive(Default)]
 pub(crate) struct StallRecoveryLimiter {
     lease_id: String,
     attempts: VecDeque<i64>,
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
 impl StallRecoveryLimiter {
     pub(crate) fn begin_attempt(&mut self, lease_id: &str, now_unix: i64) -> bool {
         if self.lease_id != lease_id {
@@ -351,6 +355,10 @@ mod tests {
         assert!(limiter.begin_attempt("lease-a", 1_600));
         assert!(limiter.begin_attempt("lease-a", 1_700));
         assert!(limiter.begin_attempt("lease-b", 1_201));
+
+        limiter.reset();
+        assert!(limiter.begin_attempt("lease-b", 1_202));
+        assert_eq!(limiter.attempts.len(), 1);
     }
 
     #[test]
