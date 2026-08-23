@@ -100,6 +100,17 @@ describe("native client", () => {
     ).toContain("переустановите последнюю версию");
   });
 
+  it("offers IPv4 when the IPv6 pool is not ready", () => {
+    expect(
+      commandMessage(
+        { code: "ipv6_pool_unavailable", message: "internal" },
+        "start",
+      ),
+    ).toBe(
+      "IPv6-подключение пока недоступно. Выберите IPv4 или попробуйте позже.",
+    );
+  });
+
   it("explains what to change after an AWG3 handshake timeout", () => {
     expect(
       commandMessage(commandError("tunnel_handshake_timeout"), "start"),
@@ -169,6 +180,7 @@ describe("native client", () => {
       preferred_layer: "tic" as const,
       tic_connection_mode: "personal" as const,
       route_mode: "via_tak" as const,
+      egress_mode: "prefer_ipv6" as const,
     };
 
     await client.bindPeer(request);
@@ -180,17 +192,19 @@ describe("native client", () => {
     const invoke = vi.fn().mockResolvedValue({ layer: "stray", probes: [] });
     const client = createNativeClient(invoke);
 
-    await client.refreshProbes("stray");
+    await client.refreshProbes("stray", "ipv4");
     await client.start({
       deviceId: "11111111-1111-4111-8111-111111111111",
       layer: "stray",
       ticConnectionMode: "dynamic",
       routeMode: "standalone",
+      egressMode: "ipv4",
       allowAlternate: true,
     });
 
     expect(invoke).toHaveBeenNthCalledWith(1, "app_refresh_probes", {
       layer: "stray",
+      egressMode: "ipv4",
     });
     expect(invoke).toHaveBeenNthCalledWith(2, "app_start", {
       request: {
@@ -198,6 +212,7 @@ describe("native client", () => {
         layer: "stray",
         ticConnectionMode: "dynamic",
         routeMode: "standalone",
+        egressMode: "ipv4",
         allowAlternate: true,
       },
     });
@@ -250,6 +265,7 @@ describe("native client", () => {
     await client.preferences();
     await client.setCloseToTray(false);
     await client.setDnsProvider("quad9");
+    await client.setTicEgressMode("personal", "prefer_ipv6");
 
     expect(invoke).toHaveBeenNthCalledWith(1, "app_preferences");
     expect(invoke).toHaveBeenNthCalledWith(2, "app_set_close_to_tray", {
@@ -257,6 +273,10 @@ describe("native client", () => {
     });
     expect(invoke).toHaveBeenNthCalledWith(3, "app_set_dns_provider", {
       provider: "quad9",
+    });
+    expect(invoke).toHaveBeenNthCalledWith(4, "app_set_tic_egress_mode", {
+      connectionMode: "personal",
+      egressMode: "prefer_ipv6",
     });
   });
 

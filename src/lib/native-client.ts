@@ -3,6 +3,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
   AppState,
   AppPreferences,
+  EgressMode,
   BindPeerRequest,
   Bootstrap,
   Connection,
@@ -13,6 +14,7 @@ import type {
   Layer,
   DnsProvider,
   StartCommandRequest,
+  TicConnectionMode,
   UpdateStatus,
 } from "./app-model";
 import type {
@@ -129,6 +131,11 @@ export function createNativeClient(
       invoke("app_set_close_to_tray", { enabled }) as Promise<AppPreferences>,
     setDnsProvider: (provider: DnsProvider) =>
       invoke("app_set_dns_provider", { provider }) as Promise<AppPreferences>,
+    setTicEgressMode: (
+      connectionMode: TicConnectionMode,
+      egressMode: EgressMode,
+    ) =>
+      invoke("app_set_tic_egress_mode", { connectionMode, egressMode }) as Promise<AppPreferences>,
     login: (request: LoginRequest) =>
       invoke("app_login", { request }) as Promise<Bootstrap>,
     bootstrap: () => invoke("app_bootstrap") as Promise<Bootstrap>,
@@ -137,8 +144,8 @@ export function createNativeClient(
       invoke("app_bind_peer", { request }) as Promise<SafePeerBindingResponse>,
     unbindPeer: () =>
       invoke("app_unbind_peer") as Promise<SafePeerBindingResponse>,
-    refreshProbes: (layer: Layer) =>
-      invoke("app_refresh_probes", { layer }) as Promise<ProbeResults>,
+    refreshProbes: (layer: Layer, egressMode: EgressMode) =>
+      invoke("app_refresh_probes", { layer, egressMode }) as Promise<ProbeResults>,
     prepareTunnel: (deviceId: string) =>
       invoke("app_prepare_tunnel", { deviceId }) as Promise<void>,
     windowsDefenderStatus: () =>
@@ -336,6 +343,8 @@ export function commandMessage(
       return "Все пиры уже заняты другими устройствами. Освободите один из них в панели или используйте существующее устройство.";
     case "connection_unavailable":
       return "Не удалось подобрать рабочий сервер. Подождите несколько секунд и нажмите «Старт» ещё раз — приложение попробует другой сервер.";
+    case "ipv6_pool_unavailable":
+      return "IPv6-подключение пока недоступно. Выберите IPv4 или попробуйте позже.";
     case "candidate_unavailable":
       return "Выбранный сервер перестал отвечать. Нажмите «Старт» ещё раз — приложение выберет другой.";
     case "configuration_fetch_failed":

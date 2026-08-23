@@ -2,8 +2,8 @@ use std::{fs, path::PathBuf};
 
 use nelomai_contracts::{
     BindPeerRequest, Bootstrap, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, ErrorPayload, PeerBindingResponse, PeerOptions, ProbeResults,
-    ServerCandidatesResponse, ServerSelectionRequest, SplitTunnelApplyResult,
+    ConnectionStartResponse, EgressMode, ErrorPayload, PeerBindingResponse, PeerOptions,
+    ProbeResults, ServerCandidatesResponse, ServerSelectionRequest, SplitTunnelApplyResult,
     SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy, SplitTunnelRevision,
     SplitTunnelSettingsUpdate, UpdateManifest,
 };
@@ -74,6 +74,34 @@ fn shared_valid_fixtures_match_schemas_and_rust_types() {
     );
     check::<ErrorPayload>("valid/error.json", "error.schema.json");
     check::<UpdateManifest>("valid/update-manifest.json", "update-manifest.schema.json");
+}
+
+#[test]
+fn legacy_payloads_without_egress_mode_default_to_ipv4() {
+    let binding_json =
+        fixture("valid/peer-binding.json").replace(",\n    \"egress_mode\": \"prefer_ipv6\"", "");
+    let binding: PeerBindingResponse = serde_json::from_str(&binding_json).unwrap();
+    assert_eq!(binding.binding.unwrap().egress_mode, EgressMode::Ipv4);
+
+    let start_json =
+        fixture("valid/connection-start.json").replace(",\n  \"egress_mode\": \"ipv4\"", "");
+    let start: ConnectionStartRequest = serde_json::from_str(&start_json).unwrap();
+    assert_eq!(start.egress_mode, EgressMode::Ipv4);
+
+    let response_json = fixture("valid/connection-start-response.json")
+        .replace("    \"pool_id\": \"7\",\n", "")
+        .replace(",\n    \"egress_mode\": \"ipv4\"", "");
+    let response: ConnectionStartResponse = serde_json::from_str(&response_json).unwrap();
+    assert_eq!(response.connection.egress_mode, EgressMode::Ipv4);
+    assert_eq!(response.connection.pool_id, None);
+}
+
+#[test]
+fn prefer_ipv6_serializes_as_the_panel_contract_value() {
+    assert_eq!(
+        serde_json::to_string(&EgressMode::PreferIpv6).unwrap(),
+        "\"prefer_ipv6\""
+    );
 }
 
 #[test]

@@ -10,7 +10,7 @@
       "anyOf": [
         {
           "type": "object",
-          "required": ["id", "peer_id", "interface_id", "interface_name", "slot", "preferred_layer", "tic_connection_mode", "route_mode"],
+          "required": ["id", "peer_id", "interface_id", "interface_name", "slot", "preferred_layer", "tic_connection_mode", "route_mode", "egress_mode"],
           "properties": {
             "id": { "$ref": "common.schema.json#/$defs/id" },
             "peer_id": { "$ref": "common.schema.json#/$defs/id" },
@@ -19,7 +19,8 @@
             "slot": { "type": "integer", "minimum": 1 },
             "preferred_layer": { "$ref": "common.schema.json#/$defs/layer" },
             "tic_connection_mode": { "enum": ["personal", "dynamic"] },
-            "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" }
+            "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" },
+            "egress_mode": { "$ref": "common.schema.json#/$defs/egressMode" }
           },
           "additionalProperties": true
         },

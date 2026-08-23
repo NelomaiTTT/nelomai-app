@@ -20,13 +20,16 @@
     "slot": 3,
     "preferred_layer": "stray",
     "tic_connection_mode": "dynamic",
-    "route_mode": "standalone"
+    "route_mode": "standalone",
+    "egress_mode": "ipv4"
   },
   "connection": {
     "lease_id": "11111111-1111-4111-8111-111111111111",
+    "pool_id": "7",
     "layer": "stray",
     "tic_connection_mode": "dynamic",
     "route_mode": "standalone",
+    "egress_mode": "ipv4",
     "status": "warm",
     "pinned": false,
     "stopped_at": "2026-07-26T08:50:00Z"

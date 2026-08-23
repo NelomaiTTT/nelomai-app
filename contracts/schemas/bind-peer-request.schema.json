@@ -2,12 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nelomai.ru/schemas/client/v1/bind-peer-request.schema.json",
   "type": "object",
-  "required": ["peer_id", "preferred_layer", "tic_connection_mode", "route_mode"],
+  "required": ["peer_id", "preferred_layer", "tic_connection_mode", "route_mode", "egress_mode"],
   "properties": {
     "peer_id": { "type": "string", "pattern": "^[1-9][0-9]*$", "maxLength": 20 },
     "preferred_layer": { "$ref": "common.schema.json#/$defs/layer" },
     "tic_connection_mode": { "enum": ["personal", "dynamic"] },
-    "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" }
+    "route_mode": { "$ref": "common.schema.json#/$defs/routeMode" },
+    "egress_mode": { "$ref": "common.schema.json#/$defs/egressMode" }
   },
   "allOf": [
     {
@@ -15,7 +16,8 @@
       "then": {
         "properties": {
           "tic_connection_mode": { "const": "dynamic" },
-          "route_mode": { "const": "standalone" }
+          "route_mode": { "const": "standalone" },
+          "egress_mode": { "const": "ipv4" }
         }
       }
     }

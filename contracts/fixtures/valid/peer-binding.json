@@ -9,7 +9,8 @@
     "slot": 3,
     "preferred_layer": "tic",
     "tic_connection_mode": "personal",
-    "route_mode": "via_tak"
+    "route_mode": "via_tak",
+    "egress_mode": "prefer_ipv6"
   },
   "configuration": "# client configuration\n"
 }

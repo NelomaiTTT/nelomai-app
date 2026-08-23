@@ -1,5 +1,6 @@
 {
   "layer": "stray",
+  "egress_mode": "ipv4",
   "probes": [
     {
       "candidate_id": "opaque-candidate-token-a",

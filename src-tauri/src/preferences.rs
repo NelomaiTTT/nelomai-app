@@ -1,3 +1,4 @@
+use nelomai_contracts::{EgressMode, Layer, RouteMode, TicConnectionMode};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
@@ -40,6 +41,8 @@ impl DnsProvider {
 pub struct AppPreferences {
     pub close_to_tray: bool,
     pub dns_provider: DnsProvider,
+    pub personal_tic_egress_mode: EgressMode,
+    pub dynamic_tic_egress_mode: EgressMode,
 }
 
 impl Default for AppPreferences {
@@ -47,7 +50,25 @@ impl Default for AppPreferences {
         Self {
             close_to_tray: true,
             dns_provider: DnsProvider::Auto,
+            personal_tic_egress_mode: EgressMode::Ipv4,
+            dynamic_tic_egress_mode: EgressMode::Ipv4,
         }
+    }
+}
+
+pub fn connection_egress_mode(
+    layer: Layer,
+    route_mode: RouteMode,
+    connection_mode: TicConnectionMode,
+    preferences: AppPreferences,
+    confirmed_personal_egress_mode: EgressMode,
+) -> EgressMode {
+    if layer != Layer::Tic || route_mode != RouteMode::ViaTak {
+        return EgressMode::Ipv4;
+    }
+    match connection_mode {
+        TicConnectionMode::Personal => confirmed_personal_egress_mode,
+        TicConnectionMode::Dynamic => preferences.dynamic_tic_egress_mode,
     }
 }
 
@@ -95,6 +116,30 @@ impl AppPreferenceStore {
         let preferences = AppPreferences {
             dns_provider: provider,
             ..*current
+        };
+        save(&self.path, preferences)?;
+        *current = preferences;
+        Ok(preferences)
+    }
+
+    pub fn set_tic_egress_mode(
+        &self,
+        connection_mode: TicConnectionMode,
+        egress_mode: EgressMode,
+    ) -> io::Result<AppPreferences> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| io::Error::other("preference lock poisoned"))?;
+        let preferences = match connection_mode {
+            TicConnectionMode::Personal => AppPreferences {
+                personal_tic_egress_mode: egress_mode,
+                ..*current
+            },
+            TicConnectionMode::Dynamic => AppPreferences {
+                dynamic_tic_egress_mode: egress_mode,
+                ..*current
+            },
         };
         save(&self.path, preferences)?;
         *current = preferences;
@@ -174,7 +219,117 @@ mod tests {
 
         assert!(!restored.close_to_tray);
         assert_eq!(restored.dns_provider, DnsProvider::Auto);
+        assert_eq!(
+            restored.personal_tic_egress_mode,
+            nelomai_contracts::EgressMode::Ipv4
+        );
+        assert_eq!(
+            restored.dynamic_tic_egress_mode,
+            nelomai_contracts::EgressMode::Ipv4
+        );
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn personal_and_dynamic_tic_egress_modes_persist_independently() {
+        let directory = std::env::temp_dir().join(format!(
+            "nelomai-egress-preferences-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let path = directory.join("preferences.json");
+        let store = AppPreferenceStore::new(&path);
+
+        store
+            .set_tic_egress_mode(
+                nelomai_contracts::TicConnectionMode::Personal,
+                nelomai_contracts::EgressMode::PreferIpv6,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get().personal_tic_egress_mode,
+            nelomai_contracts::EgressMode::PreferIpv6
+        );
+        assert_eq!(
+            store.get().dynamic_tic_egress_mode,
+            nelomai_contracts::EgressMode::Ipv4
+        );
+
+        store
+            .set_tic_egress_mode(
+                nelomai_contracts::TicConnectionMode::Dynamic,
+                nelomai_contracts::EgressMode::PreferIpv6,
+            )
+            .unwrap();
+        let restored = AppPreferenceStore::new(&path).get();
+        assert_eq!(
+            restored.personal_tic_egress_mode,
+            nelomai_contracts::EgressMode::PreferIpv6
+        );
+        assert_eq!(
+            restored.dynamic_tic_egress_mode,
+            nelomai_contracts::EgressMode::PreferIpv6
+        );
+
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn quick_toggle_forces_ipv4_outside_tic_via_tak() {
+        let preferences = AppPreferences {
+            dynamic_tic_egress_mode: EgressMode::PreferIpv6,
+            ..AppPreferences::default()
+        };
+
+        assert_eq!(
+            connection_egress_mode(
+                nelomai_contracts::Layer::Stray,
+                nelomai_contracts::RouteMode::Standalone,
+                TicConnectionMode::Dynamic,
+                preferences,
+                EgressMode::Ipv4,
+            ),
+            EgressMode::Ipv4,
+        );
+        assert_eq!(
+            connection_egress_mode(
+                nelomai_contracts::Layer::Tic,
+                nelomai_contracts::RouteMode::Standalone,
+                TicConnectionMode::Dynamic,
+                preferences,
+                EgressMode::Ipv4,
+            ),
+            EgressMode::Ipv4,
+        );
+        assert_eq!(
+            connection_egress_mode(
+                nelomai_contracts::Layer::Tic,
+                nelomai_contracts::RouteMode::ViaTak,
+                TicConnectionMode::Dynamic,
+                preferences,
+                EgressMode::Ipv4,
+            ),
+            EgressMode::PreferIpv6,
+        );
+    }
+
+    #[test]
+    fn quick_toggle_uses_the_confirmed_binding_egress_for_personal_tic() {
+        let preferences = AppPreferences {
+            personal_tic_egress_mode: EgressMode::PreferIpv6,
+            ..AppPreferences::default()
+        };
+
+        assert_eq!(
+            connection_egress_mode(
+                Layer::Tic,
+                RouteMode::ViaTak,
+                TicConnectionMode::Personal,
+                preferences,
+                EgressMode::Ipv4,
+            ),
+            EgressMode::Ipv4,
+        );
     }
 
     #[test]

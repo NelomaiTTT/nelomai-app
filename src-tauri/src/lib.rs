@@ -209,6 +209,7 @@ pub fn run() {
             commands::app_preferences,
             commands::app_set_close_to_tray,
             commands::app_set_dns_provider,
+            commands::app_set_tic_egress_mode,
             commands::app_login,
             commands::app_bootstrap,
             commands::app_peer_options,

@@ -3,6 +3,7 @@
   "layer": "stray",
   "tic_connection_mode": "dynamic",
   "route_mode": "standalone",
+  "egress_mode": "ipv4",
   "probes": [
     {
       "candidate_id": "opaque-candidate-token-a",

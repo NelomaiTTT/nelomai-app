@@ -10,8 +10,8 @@ use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, T
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, BindPeerRequest, Bootstrap, BootstrapDefaults,
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, Device, Layer, PeerBinding, PeerBindingResponse, PeerOption,
-    PeerOptions, Platform, RouteMode, ServerCandidatesResponse, TicConnectionMode,
+    ConnectionStartResponse, Device, EgressMode, Layer, PeerBinding, PeerBindingResponse,
+    PeerOption, PeerOptions, Platform, RouteMode, ServerCandidatesResponse, TicConnectionMode,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -119,6 +119,7 @@ impl ApplicationApi for FakeApi {
         &self,
         _access_token: &str,
         _layer: Layer,
+        _egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
         unreachable!("server candidates are not used by this test")
     }
@@ -384,6 +385,7 @@ async fn binding_uses_the_peer_selected_by_the_user() {
         preferred_layer: Layer::Tic,
         tic_connection_mode: TicConnectionMode::Personal,
         route_mode: RouteMode::ViaTak,
+        egress_mode: EgressMode::PreferIpv6,
     };
 
     let response = application.bind_peer(request.clone()).await.unwrap();
@@ -464,9 +466,11 @@ fn previous_account() -> StoredAuth {
         refresh_token: Some("old-refresh".to_string()),
         saved_connection: Some(StoredConnection {
             lease_id: "old-lease".to_string(),
+            pool_id: None,
             layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Dynamic,
             route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
             probe_url: Some("https://5a.example.test/probe".to_string()),
             kind: StoredConnectionKind::Pinned,
             configuration: "PrivateKey = old-account-secret".to_string(),
@@ -520,6 +524,7 @@ fn binding_response(request: &BindPeerRequest) -> PeerBindingResponse {
             preferred_layer: request.preferred_layer,
             tic_connection_mode: request.tic_connection_mode,
             route_mode: request.route_mode,
+            egress_mode: request.egress_mode,
         }),
         configuration: Some("PrivateKey = must-not-reach-ui".to_string()),
     }

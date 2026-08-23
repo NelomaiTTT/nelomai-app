@@ -11,7 +11,7 @@ use nelomai_client_core::{ConnectOptions, NoopLogger, Phase};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
-    BindPeerRequest, Layer, Platform, RouteMode, SplitTunnelAddressRuleScope,
+    BindPeerRequest, EgressMode, Layer, Platform, RouteMode, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
     SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
@@ -146,6 +146,7 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
             preferred_layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Dynamic,
             route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
         })
         .await
         .unwrap();
@@ -157,6 +158,7 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probes: Vec::new(),
         allow_alternate: true,
     };

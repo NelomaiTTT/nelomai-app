@@ -24,6 +24,7 @@ export type AppView =
 export type Layer = "tic" | "stray";
 export type TicConnectionMode = "personal" | "dynamic";
 export type RouteMode = "standalone" | "via_tak";
+export type EgressMode = "ipv4" | "prefer_ipv6";
 export type Platform = "android" | "windows" | "macos" | "linux";
 
 export interface Access {
@@ -48,13 +49,16 @@ export interface PeerBinding {
   preferred_layer: Layer;
   tic_connection_mode: TicConnectionMode;
   route_mode: RouteMode;
+  egress_mode: EgressMode;
 }
 
 export interface Connection {
   lease_id: string;
+  pool_id: string | null;
   layer: Layer;
   tic_connection_mode: TicConnectionMode;
   route_mode: RouteMode;
+  egress_mode: EgressMode;
   status:
     | "allocating"
     | "issued"
@@ -149,6 +153,8 @@ export interface AppPreferences {
   closeToTraySupported: boolean;
   closeToTray: boolean;
   dnsProvider: DnsProvider;
+  personalTicEgressMode: EgressMode;
+  dynamicTicEgressMode: EgressMode;
 }
 
 export type DnsProvider = "auto" | "google" | "yandex" | "quad9";
@@ -158,6 +164,7 @@ export interface BindPeerRequest {
   preferred_layer: Layer;
   tic_connection_mode: TicConnectionMode;
   route_mode: RouteMode;
+  egress_mode: EgressMode;
 }
 
 export interface StartCommandRequest {
@@ -165,11 +172,13 @@ export interface StartCommandRequest {
   layer: Layer;
   ticConnectionMode: TicConnectionMode;
   routeMode: RouteMode;
+  egressMode: EgressMode;
   allowAlternate: boolean;
 }
 
 export interface ProbeResults {
   layer: Layer;
+  egress_mode: EgressMode;
   probes: Array<{
     candidate_id: string;
     latency_ms?: number;
@@ -210,13 +219,35 @@ export function viewForPhase(phase: Phase): AppView {
 export function bindingRequest(
   peerId: string,
   bootstrap: Bootstrap,
+  egressMode: EgressMode,
 ): BindPeerRequest {
+  const effectiveEgressMode =
+    bootstrap.defaults.layer === "tic" &&
+    bootstrap.defaults.route_mode === "via_tak"
+      ? egressMode
+      : "ipv4";
   return {
     peer_id: peerId,
     preferred_layer: bootstrap.defaults.layer,
     tic_connection_mode: bootstrap.defaults.tic_connection_mode,
     route_mode: bootstrap.defaults.route_mode,
+    egress_mode: effectiveEgressMode,
   };
+}
+
+export function bindingPreferencesMatch(
+  binding: PeerBinding,
+  layer: Layer,
+  ticConnectionMode: TicConnectionMode,
+  routeMode: RouteMode,
+  egressMode: EgressMode,
+): boolean {
+  return (
+    binding.preferred_layer === layer &&
+    binding.tic_connection_mode === ticConnectionMode &&
+    binding.route_mode === routeMode &&
+    (ticConnectionMode === "dynamic" || binding.egress_mode === egressMode)
+  );
 }
 
 export function requiresServerProbes(
@@ -228,4 +259,21 @@ export function requiresServerProbes(
 
 export function defaultRouteModeForLayer(layer: Layer): RouteMode {
   return layer === "tic" ? "via_tak" : "standalone";
+}
+
+export function connectionEgressMode(
+  layer: Layer,
+  routeMode: RouteMode,
+  ticConnectionMode: TicConnectionMode,
+  preferences: Pick<
+    AppPreferences,
+    "personalTicEgressMode" | "dynamicTicEgressMode"
+  > | null,
+): EgressMode {
+  if (layer !== "tic" || routeMode !== "via_tak" || !preferences) {
+    return "ipv4";
+  }
+  return ticConnectionMode === "personal"
+    ? preferences.personalTicEgressMode
+    : preferences.dynamicTicEgressMode;
 }

@@ -13,9 +13,10 @@ use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelSto
 use nelomai_client_tunnel::{TunnelController, TunnelError};
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
-    Layer, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode, ProbeResult, ProbeResults,
-    ServerCandidatesResponse, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelPolicy, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    EgressMode, Layer, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode, ProbeResult,
+    ProbeResults, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelPolicy, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
@@ -49,6 +50,7 @@ pub trait ApplicationApi: CoreApi {
         &self,
         access_token: &str,
         layer: Layer,
+        egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError>;
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64>;
     async fn probe_fresh_latency_ms(&self, probe_url: &str) -> Option<f64> {
@@ -145,8 +147,9 @@ impl ApplicationApi for ClientApi {
         &self,
         access_token: &str,
         layer: Layer,
+        egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
-        ClientApi::server_candidates(self, access_token, layer)
+        ClientApi::server_candidates(self, access_token, layer, egress_mode)
             .await
             .map_err(Into::into)
     }
@@ -267,22 +270,25 @@ struct CachedProbes {
 
 #[derive(Default)]
 struct ProbeCache {
-    tic: Option<CachedProbes>,
+    tic_ipv4: Option<CachedProbes>,
+    tic_ipv6: Option<CachedProbes>,
     stray: Option<CachedProbes>,
 }
 
 impl ProbeCache {
-    fn get(&self, layer: Layer) -> Option<&CachedProbes> {
-        match layer {
-            Layer::Tic => self.tic.as_ref(),
-            Layer::Stray => self.stray.as_ref(),
+    fn get(&self, layer: Layer, egress_mode: EgressMode) -> Option<&CachedProbes> {
+        match (layer, egress_mode) {
+            (Layer::Tic, EgressMode::Ipv4) => self.tic_ipv4.as_ref(),
+            (Layer::Tic, EgressMode::PreferIpv6) => self.tic_ipv6.as_ref(),
+            (Layer::Stray, _) => self.stray.as_ref(),
         }
     }
 
-    fn set(&mut self, layer: Layer, value: CachedProbes) {
-        match layer {
-            Layer::Tic => self.tic = Some(value),
-            Layer::Stray => self.stray = Some(value),
+    fn set(&mut self, layer: Layer, egress_mode: EgressMode, value: CachedProbes) {
+        match (layer, egress_mode) {
+            (Layer::Tic, EgressMode::Ipv4) => self.tic_ipv4 = Some(value),
+            (Layer::Tic, EgressMode::PreferIpv6) => self.tic_ipv6 = Some(value),
+            (Layer::Stray, _) => self.stray = Some(value),
         }
     }
 }
@@ -729,15 +735,19 @@ where
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        options = options.normalized_for_layer();
         options.probes = if options.layer == Layer::Tic
             && options.tic_connection_mode == TicConnectionMode::Personal
         {
             Vec::new()
         } else {
-            match self.refresh_probes(options.layer, now_unix).await {
+            match self
+                .refresh_probes(options.layer, options.egress_mode, now_unix)
+                .await
+            {
                 Ok(results) => results.probes,
                 Err(_) => self
-                    .cached_probes(options.layer, now_unix)
+                    .cached_probes(options.layer, options.egress_mode, now_unix)
                     .map(|results| results.probes)
                     .unwrap_or_default(),
             }
@@ -751,6 +761,7 @@ where
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        options = options.normalized_for_layer();
         options.probes.clear();
         self.core.start(options, now_unix).await.map_err(Into::into)
     }
@@ -758,18 +769,19 @@ where
     pub async fn refresh_probes(
         &self,
         layer: Layer,
+        egress_mode: EgressMode,
         now_unix: i64,
     ) -> Result<ProbeResults, ApplicationError> {
-        if let Some(results) = self.fresh_probes(layer, now_unix) {
+        if let Some(results) = self.fresh_probes(layer, egress_mode, now_unix) {
             return Ok(results);
         }
 
         let _guard = self.probe_gate.lock().await;
-        if let Some(results) = self.fresh_probes(layer, now_unix) {
+        if let Some(results) = self.fresh_probes(layer, egress_mode, now_unix) {
             return Ok(results);
         }
 
-        let candidates = self.load_server_candidates(layer).await?;
+        let candidates = self.load_server_candidates(layer, egress_mode).await?;
         let measured_at = timestamp(now_unix)?;
         let candidates = candidates
             .candidates
@@ -824,12 +836,17 @@ where
             .into_iter()
             .map(|(result, _)| result)
             .collect::<Vec<_>>();
-        let results = ProbeResults { layer, probes };
+        let results = ProbeResults {
+            layer,
+            egress_mode,
+            probes,
+        };
         self.probe_cache
             .lock()
             .map_err(|_| ApplicationError::Storage)?
             .set(
                 layer,
+                egress_mode,
                 CachedProbes {
                     measured_at_unix: now_unix,
                     valid_until_unix,
@@ -913,14 +930,19 @@ where
     async fn load_server_candidates(
         &self,
         layer: Layer,
+        egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, ApplicationError> {
         let access_token = self.access_token()?;
-        match self.api.server_candidates(&access_token, layer).await {
+        match self
+            .api
+            .server_candidates(&access_token, layer, egress_mode)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(CoreApiError::Unauthorized) => {
                 let access_token = self.core.refresh_access_token(&access_token).await?;
                 self.api
-                    .server_candidates(&access_token, layer)
+                    .server_candidates(&access_token, layer, egress_mode)
                     .await
                     .map_err(Into::into)
             }
@@ -928,11 +950,16 @@ where
         }
     }
 
-    fn fresh_probes(&self, layer: Layer, now_unix: i64) -> Option<ProbeResults> {
+    fn fresh_probes(
+        &self,
+        layer: Layer,
+        egress_mode: EgressMode,
+        now_unix: i64,
+    ) -> Option<ProbeResults> {
         self.probe_cache
             .lock()
             .ok()?
-            .get(layer)
+            .get(layer, egress_mode)
             .filter(|cached| {
                 now_unix.saturating_sub(cached.measured_at_unix) < PROBE_REFRESH_SECONDS
                     && now_unix < cached.valid_until_unix
@@ -945,11 +972,16 @@ where
             .map(|cached| cached.results.clone())
     }
 
-    fn cached_probes(&self, layer: Layer, now_unix: i64) -> Option<ProbeResults> {
+    fn cached_probes(
+        &self,
+        layer: Layer,
+        egress_mode: EgressMode,
+        now_unix: i64,
+    ) -> Option<ProbeResults> {
         self.probe_cache
             .lock()
             .ok()?
-            .get(layer)
+            .get(layer, egress_mode)
             .filter(|cached| {
                 now_unix < cached.valid_until_unix
                     && cached

@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 pub use nelomai_contracts::{
-    Layer as StoredLayer, RouteMode as StoredRouteMode,
+    EgressMode as StoredEgressMode, Layer as StoredLayer, RouteMode as StoredRouteMode,
     TicConnectionMode as StoredTicConnectionMode,
 };
 use rand::RngCore;
@@ -32,9 +32,13 @@ pub enum StoredConnectionKind {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredConnection {
     pub lease_id: String,
+    #[serde(default)]
+    pub pool_id: Option<String>,
     pub layer: StoredLayer,
     pub tic_connection_mode: StoredTicConnectionMode,
     pub route_mode: StoredRouteMode,
+    #[serde(default)]
+    pub egress_mode: StoredEgressMode,
     #[serde(default)]
     pub probe_url: Option<String>,
     pub kind: StoredConnectionKind,
@@ -47,9 +51,11 @@ impl fmt::Debug for StoredConnection {
         formatter
             .debug_struct("StoredConnection")
             .field("lease_id", &self.lease_id)
+            .field("pool_id", &self.pool_id)
             .field("layer", &self.layer)
             .field("tic_connection_mode", &self.tic_connection_mode)
             .field("route_mode", &self.route_mode)
+            .field("egress_mode", &self.egress_mode)
             .field("probe_url", &self.probe_url)
             .field("kind", &self.kind)
             .field("configuration", &"<redacted>")
@@ -64,6 +70,8 @@ pub struct StoredPendingStart {
     pub layer: StoredLayer,
     pub tic_connection_mode: StoredTicConnectionMode,
     pub route_mode: StoredRouteMode,
+    #[serde(default)]
+    pub egress_mode: StoredEgressMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,15 +454,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_connection_state_defaults_to_ipv4_egress() {
+        let legacy = json!({
+            "install_secret": "legacy-install-secret",
+            "access_token": "access-secret",
+            "refresh_token": "refresh-secret",
+            "saved_connection": {
+                "lease_id": "11111111-1111-4111-8111-111111111111",
+                "layer": "tic",
+                "tic_connection_mode": "dynamic",
+                "route_mode": "via_tak",
+                "kind": "dynamic_warm",
+                "configuration": "redacted",
+                "valid_until_unix": 1800000000
+            },
+            "pending_start": {
+                "operation_id": "22222222-2222-4222-8222-222222222222",
+                "layer": "tic",
+                "tic_connection_mode": "dynamic",
+                "route_mode": "via_tak"
+            }
+        });
+        let stored: StoredAuth = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            stored.saved_connection.unwrap().egress_mode,
+            StoredEgressMode::Ipv4
+        );
+        assert_eq!(
+            stored.pending_start.unwrap().egress_mode,
+            StoredEgressMode::Ipv4
+        );
+    }
+
+    #[test]
     fn debug_output_redacts_every_secret() {
         let mut stored = StoredAuth::new_install();
         stored.access_token = Some("access-secret".to_string());
         stored.refresh_token = Some("refresh-secret".to_string());
         stored.saved_connection = Some(StoredConnection {
             lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            pool_id: Some("7".to_string()),
             layer: StoredLayer::Stray,
             tic_connection_mode: StoredTicConnectionMode::Dynamic,
             route_mode: StoredRouteMode::Standalone,
+            egress_mode: StoredEgressMode::Ipv4,
             probe_url: Some("https://5a.example.test/probe".to_string()),
             kind: StoredConnectionKind::Pinned,
             configuration: "PrivateKey = tunnel-secret".to_string(),
@@ -478,9 +521,11 @@ mod tests {
         let mut stored = StoredAuth::new_install();
         stored.saved_connection = Some(StoredConnection {
             lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            pool_id: Some("7".to_string()),
             layer: StoredLayer::Stray,
             tic_connection_mode: StoredTicConnectionMode::Dynamic,
             route_mode: StoredRouteMode::Standalone,
+            egress_mode: StoredEgressMode::Ipv4,
             probe_url: Some("https://5a.example.test/probe".to_string()),
             kind: StoredConnectionKind::DynamicWarm,
             configuration: "[Interface]\nPrivateKey = secret\n".to_string(),
@@ -488,9 +533,11 @@ mod tests {
         });
         stored.pinned_connection = Some(StoredConnection {
             lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            pool_id: Some("8".to_string()),
             layer: StoredLayer::Stray,
             tic_connection_mode: StoredTicConnectionMode::Dynamic,
             route_mode: StoredRouteMode::Standalone,
+            egress_mode: StoredEgressMode::Ipv4,
             probe_url: Some("https://5b.example.test/probe".to_string()),
             kind: StoredConnectionKind::Pinned,
             configuration: "[Interface]\nPrivateKey = pinned-secret\n".to_string(),

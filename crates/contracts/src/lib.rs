@@ -47,6 +47,14 @@ pub enum RouteMode {
     ViaTak,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressMode {
+    #[default]
+    Ipv4,
+    PreferIpv6,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Platform {
@@ -150,6 +158,8 @@ pub struct BindPeerRequest {
     pub preferred_layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub egress_mode: EgressMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -162,6 +172,8 @@ pub struct PeerBinding {
     pub preferred_layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub egress_mode: EgressMode,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -227,12 +239,16 @@ pub struct ProbeResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeResults {
     pub layer: Layer,
+    #[serde(default)]
+    pub egress_mode: EgressMode,
     pub probes: Vec<ProbeResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerSelectionRequest {
     pub layer: Layer,
+    #[serde(default)]
+    pub egress_mode: EgressMode,
     pub probes: Vec<ProbeResult>,
 }
 
@@ -250,9 +266,13 @@ pub struct ServerSelectionResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Connection {
     pub lease_id: String,
+    #[serde(default)]
+    pub pool_id: Option<String>,
     pub layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub egress_mode: EgressMode,
     #[serde(default)]
     pub probe_url: Option<String>,
     pub status: LeaseStatus,
@@ -304,6 +324,8 @@ pub struct ConnectionStartRequest {
     pub layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
+    #[serde(default)]
+    pub egress_mode: EgressMode,
     pub probes: Vec<ProbeResult>,
     pub allow_alternate: bool,
 }

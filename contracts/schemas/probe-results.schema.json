@@ -2,9 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://nelomai.ru/schemas/client/v1/probe-results.schema.json",
   "type": "object",
-  "required": ["layer", "probes"],
+  "required": ["layer", "egress_mode", "probes"],
   "properties": {
     "layer": { "$ref": "common.schema.json#/$defs/layer" },
+    "egress_mode": { "$ref": "common.schema.json#/$defs/egressMode" },
     "probes": {
       "type": "array",
       "maxItems": 32,

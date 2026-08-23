@@ -2,7 +2,7 @@ use crate::connection_metrics::{ConnectionMetricsResponse, ConnectionMetricsTrac
 use crate::diagnostics::AppDiagnostics;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{
-    preferences::{AppPreferenceStore, DnsProvider},
+    preferences::{connection_egress_mode, AppPreferenceStore, DnsProvider},
     NativeApplication, PushRegistrationScheduler, SplitTunnelScheduler,
 };
 use nelomai_client_api::DiagnosticUploadResponse;
@@ -14,8 +14,8 @@ use nelomai_client_core::{
 use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
-    Layer, PeerBinding, PeerBindingResponse, PeerOptions, Platform, ProbeResults, RouteMode,
-    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelMode,
+    EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions, Platform, ProbeResults,
+    RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelMode,
     SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
@@ -504,6 +504,8 @@ pub struct AppPreferencesResponse {
     close_to_tray_supported: bool,
     close_to_tray: bool,
     dns_provider: DnsProvider,
+    personal_tic_egress_mode: EgressMode,
+    dynamic_tic_egress_mode: EgressMode,
 }
 
 impl AppStateResponse {
@@ -573,6 +575,7 @@ pub struct StartCommandRequest {
     layer: Layer,
     tic_connection_mode: TicConnectionMode,
     route_mode: RouteMode,
+    egress_mode: EgressMode,
     #[serde(default = "default_true")]
     allow_alternate: bool,
 }
@@ -695,6 +698,8 @@ pub fn app_preferences(preferences: State<'_, Arc<AppPreferenceStore>>) -> AppPr
         close_to_tray_supported: cfg!(desktop),
         close_to_tray: current.close_to_tray,
         dns_provider: current.dns_provider,
+        personal_tic_egress_mode: current.personal_tic_egress_mode,
+        dynamic_tic_egress_mode: current.dynamic_tic_egress_mode,
     }
 }
 
@@ -713,6 +718,8 @@ pub fn app_set_close_to_tray(
         close_to_tray_supported: cfg!(desktop),
         close_to_tray: saved.close_to_tray,
         dns_provider: saved.dns_provider,
+        personal_tic_egress_mode: saved.personal_tic_egress_mode,
+        dynamic_tic_egress_mode: saved.dynamic_tic_egress_mode,
     })
 }
 
@@ -740,6 +747,31 @@ pub fn app_set_dns_provider(
         close_to_tray_supported: cfg!(desktop),
         close_to_tray: saved.close_to_tray,
         dns_provider: saved.dns_provider,
+        personal_tic_egress_mode: saved.personal_tic_egress_mode,
+        dynamic_tic_egress_mode: saved.dynamic_tic_egress_mode,
+    })
+}
+
+#[tauri::command]
+pub fn app_set_tic_egress_mode(
+    preferences: State<'_, Arc<AppPreferenceStore>>,
+    connection_mode: TicConnectionMode,
+    egress_mode: EgressMode,
+) -> Result<AppPreferencesResponse, CommandError> {
+    let saved = preferences
+        .set_tic_egress_mode(connection_mode, egress_mode)
+        .map_err(|_| {
+            CommandError::new(
+                "preferences_unavailable",
+                "Не удалось сохранить настройки приложения",
+            )
+        })?;
+    Ok(AppPreferencesResponse {
+        close_to_tray_supported: cfg!(desktop),
+        close_to_tray: saved.close_to_tray,
+        dns_provider: saved.dns_provider,
+        personal_tic_egress_mode: saved.personal_tic_egress_mode,
+        dynamic_tic_egress_mode: saved.dynamic_tic_egress_mode,
     })
 }
 
@@ -764,12 +796,13 @@ pub(crate) async fn quick_toggle(
                     "Срок доступа уже истёк",
                 ));
             }
-            if bootstrap.binding.is_none() {
-                return Err(CommandError::new(
-                    "peer_binding_required",
-                    "Сначала выберите пир в приложении",
-                ));
-            }
+            let binding_egress_mode = bootstrap
+                .binding
+                .as_ref()
+                .map(|binding| binding.egress_mode)
+                .ok_or_else(|| {
+                    CommandError::new("peer_binding_required", "Сначала выберите пир в приложении")
+                })?;
             crate::platform::prepare_tunnel(app.clone())
                 .await
                 .map_err(CommandError::from_tunnel)?;
@@ -784,6 +817,13 @@ pub(crate) async fn quick_toggle(
                 layer: bootstrap.defaults.layer,
                 tic_connection_mode: bootstrap.defaults.tic_connection_mode,
                 route_mode: bootstrap.defaults.route_mode,
+                egress_mode: connection_egress_mode(
+                    bootstrap.defaults.layer,
+                    bootstrap.defaults.route_mode,
+                    bootstrap.defaults.tic_connection_mode,
+                    app.state::<Arc<AppPreferenceStore>>().get(),
+                    binding_egress_mode,
+                ),
                 probes: Vec::new(),
                 allow_alternate: true,
             };
@@ -1133,9 +1173,10 @@ pub async fn app_unbind_peer(
 pub async fn app_refresh_probes(
     application: State<'_, Arc<NativeApplication>>,
     layer: Layer,
+    egress_mode: EgressMode,
 ) -> Result<ProbeResults, CommandError> {
     application
-        .refresh_probes(layer, now_unix())
+        .refresh_probes(layer, egress_mode, now_unix())
         .await
         .map_err(Into::into)
 }
@@ -1360,6 +1401,7 @@ pub async fn app_start(
                     layer: request.layer,
                     tic_connection_mode: request.tic_connection_mode,
                     route_mode: request.route_mode,
+                    egress_mode: request.egress_mode,
                     probes: Vec::new(),
                     allow_alternate: request.allow_alternate,
                 },

@@ -12,6 +12,7 @@
     "layer": { "enum": ["tic", "stray"] },
     "ticConnectionMode": { "enum": ["personal", "dynamic"] },
     "routeMode": { "enum": ["standalone", "via_tak"] },
+    "egressMode": { "enum": ["ipv4", "prefer_ipv6"] },
     "platform": { "enum": ["android", "windows", "macos", "linux"] },
     "leaseStatus": {
       "enum": ["allocating", "issued", "connected", "warm", "released", "failed"]
@@ -20,18 +21,27 @@
       "type": "object",
       "required": [
         "lease_id",
+        "pool_id",
         "layer",
         "tic_connection_mode",
         "route_mode",
+        "egress_mode",
         "status",
         "pinned",
         "stopped_at"
       ],
       "properties": {
         "lease_id": { "$ref": "#/$defs/uuid" },
+        "pool_id": {
+          "anyOf": [
+            { "$ref": "#/$defs/id" },
+            { "type": "null" }
+          ]
+        },
         "layer": { "$ref": "#/$defs/layer" },
         "tic_connection_mode": { "$ref": "#/$defs/ticConnectionMode" },
         "route_mode": { "$ref": "#/$defs/routeMode" },
+        "egress_mode": { "$ref": "#/$defs/egressMode" },
         "status": { "$ref": "#/$defs/leaseStatus" },
         "pinned": { "type": "boolean" },
         "stopped_at": {
@@ -53,7 +63,8 @@
         "slot",
         "preferred_layer",
         "tic_connection_mode",
-        "route_mode"
+        "route_mode",
+        "egress_mode"
       ],
       "properties": {
         "id": { "$ref": "#/$defs/id" },
@@ -63,7 +74,8 @@
         "slot": { "type": "integer", "minimum": 1 },
         "preferred_layer": { "$ref": "#/$defs/layer" },
         "tic_connection_mode": { "$ref": "#/$defs/ticConnectionMode" },
-        "route_mode": { "$ref": "#/$defs/routeMode" }
+        "route_mode": { "$ref": "#/$defs/routeMode" },
+        "egress_mode": { "$ref": "#/$defs/egressMode" }
       },
       "additionalProperties": true
     },

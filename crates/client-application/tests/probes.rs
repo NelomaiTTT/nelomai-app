@@ -6,8 +6,8 @@ use nelomai_client_storage::{SecretStore, StorageError, StoredAuth, StoredCompat
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     ApiVersion, BindPeerRequest, Bootstrap, Connection, ConnectionOperationRequest,
-    ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, Layer,
-    LeaseStatus, PeerBindingResponse, PeerOptions, ProbeResult, RouteMode, ServerCandidate,
+    ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, EgressMode,
+    Layer, LeaseStatus, PeerBindingResponse, PeerOptions, ProbeResult, RouteMode, ServerCandidate,
     ServerCandidatesResponse, TicConnectionMode,
 };
 use std::sync::{
@@ -20,6 +20,7 @@ struct ProbeApi {
     probe_calls: AtomicUsize,
     all_probes_fail: AtomicBool,
     start_request: Mutex<Option<ConnectionStartRequest>>,
+    candidate_modes: Mutex<Vec<EgressMode>>,
 }
 
 #[async_trait]
@@ -43,9 +44,11 @@ impl CoreApi for ProbeApi {
             request_id: "start-request".to_string(),
             connection: Connection {
                 lease_id: "lease-1".to_string(),
+                pool_id: None,
                 layer: request.layer,
                 tic_connection_mode: request.tic_connection_mode,
                 route_mode: request.route_mode,
+                egress_mode: request.egress_mode,
                 probe_url: Some("https://1a.example.test/probe".to_string()),
                 status: LeaseStatus::Issued,
                 pinned: false,
@@ -107,8 +110,10 @@ impl ApplicationApi for ProbeApi {
         &self,
         _access_token: &str,
         layer: Layer,
+        egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
         self.candidate_calls.fetch_add(1, Ordering::SeqCst);
+        self.candidate_modes.lock().unwrap().push(egress_mode);
         Ok(ServerCandidatesResponse {
             api_version: ApiVersion::V1,
             request_id: "candidate-request".to_string(),
@@ -127,6 +132,26 @@ impl ApplicationApi for ProbeApi {
     async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn probe_cache_is_separate_for_ipv4_and_ipv6_pools() {
+    let (application, api) = application();
+
+    application
+        .refresh_probes(Layer::Tic, EgressMode::Ipv4, 1_800_000_000)
+        .await
+        .unwrap();
+    application
+        .refresh_probes(Layer::Tic, EgressMode::PreferIpv6, 1_800_000_001)
+        .await
+        .unwrap();
+
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *api.candidate_modes.lock().unwrap(),
+        vec![EgressMode::Ipv4, EgressMode::PreferIpv6]
+    );
 }
 
 #[derive(Default)]
@@ -170,15 +195,15 @@ async fn probes_are_cached_for_five_minutes_with_failures() {
     let (application, api) = application();
 
     let first = application
-        .refresh_probes(Layer::Stray, 1_800_000_000)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
         .await
         .unwrap();
     let cached = application
-        .refresh_probes(Layer::Stray, 1_800_000_299)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_299)
         .await
         .unwrap();
     let refreshed = application
-        .refresh_probes(Layer::Stray, 1_800_000_300)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_300)
         .await
         .unwrap();
 
@@ -214,8 +239,8 @@ async fn concurrent_refreshes_share_one_measurement() {
     let (application, api) = application();
 
     let (first, second) = tokio::join!(
-        application.refresh_probes(Layer::Stray, 1_800_000_000),
-        application.refresh_probes(Layer::Stray, 1_800_000_000),
+        application.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000),
+        application.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000),
     );
 
     assert_eq!(first.unwrap(), second.unwrap());
@@ -229,11 +254,11 @@ async fn completely_failed_probe_set_is_remeasured_on_next_attempt() {
     api.all_probes_fail.store(true, Ordering::SeqCst);
 
     let first = application
-        .refresh_probes(Layer::Stray, 1_800_000_000)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
         .await
         .unwrap();
     let second = application
-        .refresh_probes(Layer::Stray, 1_800_000_001)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_001)
         .await
         .unwrap();
 
@@ -247,7 +272,7 @@ async fn completely_failed_probe_set_is_remeasured_on_next_attempt() {
 async fn expired_candidate_tokens_are_refreshed_before_connection() {
     let (application, api) = application();
     application
-        .refresh_probes(Layer::Stray, 1_800_000_000)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
         .await
         .unwrap();
 
@@ -257,6 +282,7 @@ async fn expired_candidate_tokens_are_refreshed_before_connection() {
                 layer: Layer::Stray,
                 tic_connection_mode: TicConnectionMode::Dynamic,
                 route_mode: RouteMode::Standalone,
+                egress_mode: EgressMode::Ipv4,
                 probes: Vec::new(),
                 allow_alternate: true,
             },
@@ -272,7 +298,7 @@ async fn expired_candidate_tokens_are_refreshed_before_connection() {
 async fn connection_uses_native_probe_cache_instead_of_webview_values() {
     let (application, api) = application();
     application
-        .refresh_probes(Layer::Stray, 1_800_000_000)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
         .await
         .unwrap();
 
@@ -282,6 +308,7 @@ async fn connection_uses_native_probe_cache_instead_of_webview_values() {
                 layer: Layer::Stray,
                 tic_connection_mode: TicConnectionMode::Dynamic,
                 route_mode: RouteMode::Standalone,
+                egress_mode: EgressMode::Ipv4,
                 probes: vec![ProbeResult {
                     candidate_id: "injected-from-webview".to_string(),
                     latency_ms: Some(0.1),
@@ -318,6 +345,7 @@ async fn personal_tic_connection_skips_server_candidates() {
                 layer: Layer::Tic,
                 tic_connection_mode: TicConnectionMode::Personal,
                 route_mode: RouteMode::ViaTak,
+                egress_mode: EgressMode::Ipv4,
                 probes: Vec::new(),
                 allow_alternate: true,
             },
@@ -342,6 +370,7 @@ async fn quick_connection_sends_no_probes_and_does_not_measure_candidates() {
                 layer: Layer::Stray,
                 tic_connection_mode: TicConnectionMode::Dynamic,
                 route_mode: RouteMode::Standalone,
+                egress_mode: EgressMode::Ipv4,
                 probes: vec![ProbeResult {
                     candidate_id: "must-be-discarded".to_string(),
                     latency_ms: Some(1.0),
@@ -365,13 +394,13 @@ async fn quick_connection_sends_no_probes_and_does_not_measure_candidates() {
 async fn probe_tokens_are_not_reused_after_logout() {
     let (application, _) = application();
     application
-        .refresh_probes(Layer::Stray, 1_800_000_000)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
         .await
         .unwrap();
 
     application.logout().await.unwrap();
     let error = application
-        .refresh_probes(Layer::Stray, 1_800_000_010)
+        .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_010)
         .await
         .unwrap_err();
 
@@ -390,6 +419,7 @@ fn application() -> (
         probe_calls: AtomicUsize::new(0),
         all_probes_fail: AtomicBool::new(false),
         start_request: Mutex::new(None),
+        candidate_modes: Mutex::new(Vec::new()),
     });
     let store = Arc::new(MemoryStore::default());
     let mut auth = StoredAuth::new_install();

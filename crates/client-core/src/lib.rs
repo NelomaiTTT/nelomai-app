@@ -10,8 +10,8 @@ use nelomai_client_tunnel::{
 };
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
-    ConnectionStartRequest, ConnectionStartResponse, Layer, LeaseStatus, ProbeResult, RouteMode,
-    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
+    ConnectionStartRequest, ConnectionStartResponse, EgressMode, Layer, LeaseStatus, ProbeResult,
+    RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
     TicConnectionMode,
 };
@@ -341,6 +341,7 @@ pub struct ConnectOptions {
     pub layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
+    pub egress_mode: EgressMode,
     pub probes: Vec<ProbeResult>,
     pub allow_alternate: bool,
 }
@@ -351,6 +352,9 @@ impl ConnectOptions {
             self.tic_connection_mode = TicConnectionMode::Dynamic;
             self.route_mode = RouteMode::Standalone;
         }
+        if self.layer == Layer::Stray || self.route_mode == RouteMode::Standalone {
+            self.egress_mode = EgressMode::Ipv4;
+        }
         self
     }
 
@@ -359,6 +363,7 @@ impl ConnectOptions {
             layer: Layer::Tic,
             tic_connection_mode: TicConnectionMode::Personal,
             route_mode: RouteMode::ViaTak,
+            egress_mode: EgressMode::Ipv4,
             probes: Vec::new(),
             allow_alternate: true,
         }
@@ -377,6 +382,7 @@ impl ConnectOptions {
             layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Dynamic,
             route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
             probes: Vec::new(),
             allow_alternate: true,
         }
@@ -426,6 +432,7 @@ mod platform_default_tests {
             layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Personal,
             route_mode: RouteMode::ViaTak,
+            egress_mode: EgressMode::PreferIpv6,
             probes: Vec::new(),
             allow_alternate: true,
         }
@@ -433,6 +440,22 @@ mod platform_default_tests {
 
         assert_eq!(options.tic_connection_mode, TicConnectionMode::Dynamic);
         assert_eq!(options.route_mode, RouteMode::Standalone);
+        assert_eq!(options.egress_mode, EgressMode::Ipv4);
+    }
+
+    #[test]
+    fn standalone_tic_never_uses_ipv6_egress_pool() {
+        let options = ConnectOptions {
+            layer: Layer::Tic,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::PreferIpv6,
+            probes: Vec::new(),
+            allow_alternate: true,
+        }
+        .normalized_for_layer();
+
+        assert_eq!(options.egress_mode, EgressMode::Ipv4);
     }
 
     #[test]
@@ -1162,6 +1185,7 @@ where
             layer: connection.layer,
             tic_connection_mode: connection.tic_connection_mode,
             route_mode: connection.route_mode,
+            egress_mode: connection.egress_mode,
             probes: Vec::new(),
             allow_alternate: false,
         };
@@ -1198,9 +1222,11 @@ where
         let kind = stored_connection_kind(&recovered.connection);
         let saved_connection = StoredConnection {
             lease_id: recovered.connection.lease_id.clone(),
+            pool_id: recovered.connection.pool_id.clone(),
             layer: recovered.connection.layer,
             tic_connection_mode: recovered.connection.tic_connection_mode,
             route_mode: recovered.connection.route_mode,
+            egress_mode: recovered.connection.egress_mode,
             probe_url: recovered.connection.probe_url.clone(),
             kind,
             configuration: recovered.configuration,
@@ -1277,12 +1303,25 @@ where
         let mut operation_id = pending_operation_id(&stored, &options)
             .or_else(|| reusable_operation_id(&stored, &options, now_unix))
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        self.logger.record(CoreLogEvent {
+            kind: "connection.egress_selected",
+            operation_id: Some(operation_id.clone()),
+            request_id: None,
+            code: Some(
+                match options.egress_mode {
+                    EgressMode::Ipv4 => "ipv4",
+                    EgressMode::PreferIpv6 => "prefer_ipv6",
+                }
+                .to_string(),
+            ),
+        });
         let mut pending_stored = self.load_auth()?;
         pending_stored.pending_start = Some(StoredPendingStart {
             operation_id: operation_id.clone(),
             layer: options.layer,
             tic_connection_mode: options.tic_connection_mode,
             route_mode: options.route_mode,
+            egress_mode: options.egress_mode,
         });
         self.store
             .save(&pending_stored)
@@ -1293,6 +1332,7 @@ where
             layer: options.layer,
             tic_connection_mode: options.tic_connection_mode,
             route_mode: options.route_mode,
+            egress_mode: options.egress_mode,
             probes: options.probes,
             allow_alternate: options.allow_alternate,
         };
@@ -1318,6 +1358,28 @@ where
                 return Err(error);
             }
         };
+        if response.connection.layer != options.layer
+            || response.connection.tic_connection_mode != options.tic_connection_mode
+            || response.connection.route_mode != options.route_mode
+            || response.connection.egress_mode != options.egress_mode
+        {
+            let error = CoreError::Api(CoreApiError::Rejected {
+                code: "invalid_client_api_response".to_string(),
+                message: "Панель вернула подключение с другими параметрами.".to_string(),
+            });
+            let compensation_error = self
+                .compensate_failed_start(
+                    &access_token,
+                    &response.connection,
+                    &response.request_id,
+                    &operation_id,
+                    FailedStartStage::Preparation,
+                    &error,
+                )
+                .await
+                .err();
+            return Err(compensation_error.unwrap_or(error));
+        }
         self.logger.record_timed(
             CoreLogEvent {
                 kind: "connection.panel_ready",
@@ -1327,6 +1389,18 @@ where
             },
             elapsed_millis(panel_started),
         );
+        self.logger.record(CoreLogEvent {
+            kind: "connection.pool_selected",
+            operation_id: Some(operation_id.clone()),
+            request_id: Some(response.request_id.clone()),
+            code: Some(
+                response
+                    .connection
+                    .pool_id
+                    .clone()
+                    .unwrap_or_else(|| "personal".to_string()),
+            ),
+        });
         *self.state.lock().await = CoreState {
             phase: Phase::Connecting,
             connection: Some(response.connection.clone()),
@@ -1385,9 +1459,11 @@ where
         };
         let saved_connection = StoredConnection {
             lease_id: response.connection.lease_id.clone(),
+            pool_id: response.connection.pool_id.clone(),
             layer: response.connection.layer,
             tic_connection_mode: response.connection.tic_connection_mode,
             route_mode: response.connection.route_mode,
+            egress_mode: response.connection.egress_mode,
             probe_url: response.connection.probe_url.clone(),
             kind,
             configuration: response.configuration.clone(),
@@ -1854,9 +1930,11 @@ where
         let transport = configuration.transport();
         let connection = Connection {
             lease_id: saved.lease_id.clone(),
+            pool_id: saved.pool_id.clone(),
             layer: saved.layer,
             tic_connection_mode: saved.tic_connection_mode,
             route_mode: saved.route_mode,
+            egress_mode: saved.egress_mode,
             probe_url: saved.probe_url.clone(),
             status: nelomai_contracts::LeaseStatus::Connected,
             pinned: saved.kind == StoredConnectionKind::Pinned,
@@ -1901,9 +1979,11 @@ where
                         phase: Phase::Stopping,
                         connection: Some(Connection {
                             lease_id: saved.lease_id.clone(),
+                            pool_id: saved.pool_id.clone(),
                             layer: saved.layer,
                             tic_connection_mode: saved.tic_connection_mode,
                             route_mode: saved.route_mode,
+                            egress_mode: saved.egress_mode,
                             probe_url: saved.probe_url.clone(),
                             status: nelomai_contracts::LeaseStatus::Connected,
                             pinned: saved.kind == StoredConnectionKind::Pinned,
@@ -2557,6 +2637,7 @@ fn reusable_operation_id(
             saved.layer == options.layer
                 && saved.tic_connection_mode == options.tic_connection_mode
                 && saved.route_mode == options.route_mode
+                && saved.egress_mode == options.egress_mode
                 && match saved.kind {
                     StoredConnectionKind::Pinned => {
                         pinned_connection_retry_allowed(saved, now_unix)
@@ -2572,6 +2653,7 @@ fn reusable_operation_id(
                 saved.layer == options.layer
                     && saved.tic_connection_mode == options.tic_connection_mode
                     && saved.route_mode == options.route_mode
+                    && saved.egress_mode == options.egress_mode
                     && pinned_connection_retry_allowed(saved, now_unix)
             })
         })
@@ -2589,6 +2671,7 @@ fn pending_operation_id(
             pending.layer == options.layer
                 && pending.tic_connection_mode == options.tic_connection_mode
                 && pending.route_mode == options.route_mode
+                && pending.egress_mode == options.egress_mode
         })
         .map(|pending| pending.operation_id.clone())
 }

@@ -2,11 +2,11 @@ use futures_util::StreamExt;
 use nelomai_contracts::{
     Access, ApiVersion, AppNotificationList, AppNotificationReadResponse, BindPeerRequest,
     Bootstrap, ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, ErrorPayload, Layer, PeerBindingResponse, PeerOptions, Platform,
-    ProbeFailureCode, PushRegistrationRequest, PushRegistrationResponse, ServerCandidatesResponse,
-    ServerSelectionRequest, ServerSelectionResponse, SplitTunnelAddressRuleScope,
-    SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision,
-    SplitTunnelSettingsUpdate, API_PREFIX,
+    ConnectionStartResponse, EgressMode, ErrorPayload, Layer, PeerBindingResponse, PeerOptions,
+    Platform, ProbeFailureCode, PushRegistrationRequest, PushRegistrationResponse,
+    ServerCandidatesResponse, ServerSelectionRequest, ServerSelectionResponse,
+    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
+    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate, API_PREFIX,
 };
 use reqwest::{
     header::{HeaderValue, InvalidHeaderValue, CONTENT_TYPE},
@@ -649,10 +649,11 @@ impl ClientApi {
         &self,
         access_token: &str,
         layer: Layer,
+        egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, ClientApiError> {
         self.send_json(
             self.http
-                .get(self.server_candidates_endpoint(layer)?)
+                .get(self.server_candidates_endpoint(layer, egress_mode)?)
                 .bearer_auth(access_token),
         )
         .await
@@ -832,13 +833,24 @@ impl ClientApi {
         .await
     }
 
-    fn server_candidates_endpoint(&self, layer: Layer) -> Result<Url, ClientApiError> {
+    fn server_candidates_endpoint(
+        &self,
+        layer: Layer,
+        egress_mode: EgressMode,
+    ) -> Result<Url, ClientApiError> {
         let mut endpoint = self.endpoint("server-candidates")?;
         endpoint.query_pairs_mut().append_pair(
             "layer",
             match layer {
                 Layer::Tic => "tic",
                 Layer::Stray => "stray",
+            },
+        );
+        endpoint.query_pairs_mut().append_pair(
+            "egress_mode",
+            match egress_mode {
+                EgressMode::Ipv4 => "ipv4",
+                EgressMode::PreferIpv6 => "prefer_ipv6",
             },
         );
         Ok(endpoint)
@@ -1040,10 +1052,10 @@ mod tests {
         );
         assert_eq!(
             client
-                .server_candidates_endpoint(Layer::Stray)
+                .server_candidates_endpoint(Layer::Tic, nelomai_contracts::EgressMode::PreferIpv6,)
                 .unwrap()
                 .as_str(),
-            "https://nelomai.ru/api/client/v1/server-candidates?layer=stray"
+            "https://nelomai.ru/api/client/v1/server-candidates?layer=tic&egress_mode=prefer_ipv6"
         );
         for path in [
             "server-selection",
@@ -1066,6 +1078,7 @@ mod tests {
             layer: Layer::Stray,
             tic_connection_mode: TicConnectionMode::Dynamic,
             route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
             probes: Vec::new(),
             allow_alternate: false,
         };

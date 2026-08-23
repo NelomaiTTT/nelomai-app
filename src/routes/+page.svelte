@@ -11,13 +11,16 @@
   } from "$lib/navigation";
 
   import {
+    bindingPreferencesMatch,
     bindingRequest,
+    connectionEgressMode,
     defaultRouteModeForLayer,
     requiresServerProbes,
     viewForPhase,
     type AppView,
     type AppPreferences,
     type DnsProvider,
+    type EgressMode,
     type Bootstrap,
     type Connection,
     type ConnectionMetrics,
@@ -87,6 +90,14 @@
   let notificationsBusy = $state(false);
   let notificationsError = $state<string | null>(null);
   let appPreferences = $state<AppPreferences | null>(null);
+  let selectedEgressMode = $derived(
+    connectionEgressMode(
+      selectedLayer,
+      routeMode,
+      ticConnectionMode,
+      appPreferences,
+    ),
+  );
   let windowsDefender = $state<WindowsDefenderStatus | null>(null);
   let defenderRepairBusy = $state(false);
   let defenderRepairMessage = $state<string | null>(null);
@@ -231,6 +242,9 @@
 
   async function loadAppPreferences() {
     appPreferences = await nativeClient.preferences().catch(() => null);
+    if (appPreferences && bootstrap?.binding && phase === "ready") {
+      void refreshProbes();
+    }
   }
 
   async function refreshWindowsDefender() {
@@ -269,6 +283,21 @@
       .value as DnsProvider;
     try {
       appPreferences = await nativeClient.setDnsProvider(provider);
+    } catch (reason) {
+      error = commandMessage(reason, "preferences");
+    }
+  }
+
+  async function setTicEgressMode(event: Event) {
+    const egressMode = (event.currentTarget as HTMLSelectElement)
+      .value as EgressMode;
+    try {
+      appPreferences = await nativeClient.setTicEgressMode(
+        ticConnectionMode,
+        egressMode,
+      );
+      await syncBindingPreferences();
+      void refreshProbes();
     } catch (reason) {
       error = commandMessage(reason, "preferences");
     }
@@ -435,7 +464,7 @@
     error = null;
     try {
       await nativeClient.bindPeer(
-        bindingRequest(selectedPeerId, bootstrap),
+        bindingRequest(selectedPeerId, bootstrap, selectedEgressMode),
       );
       await restore();
     } catch (reason) {
@@ -475,6 +504,7 @@
           layer: selectedLayer,
           ticConnectionMode: effectiveTicConnectionMode,
           routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
+          egressMode: selectedEgressMode,
           allowAlternate: true,
         });
         antivirusStartFailure = false;
@@ -527,10 +557,20 @@
       selectedLayer === "stray" ? "dynamic" : ticConnectionMode;
     const desiredRoute =
       selectedLayer === "stray" ? "standalone" : routeMode;
+    const desiredEgressMode = connectionEgressMode(
+      selectedLayer,
+      desiredRoute,
+      desiredMode,
+      appPreferences,
+    );
     if (
-      binding.preferred_layer === selectedLayer &&
-      binding.tic_connection_mode === desiredMode &&
-      binding.route_mode === desiredRoute
+      bindingPreferencesMatch(
+        binding,
+        selectedLayer,
+        desiredMode,
+        desiredRoute,
+        desiredEgressMode,
+      )
     ) {
       return;
     }
@@ -539,6 +579,7 @@
       preferred_layer: selectedLayer,
       tic_connection_mode: desiredMode,
       route_mode: desiredRoute,
+      egress_mode: desiredEgressMode,
     });
     if (response.binding && bootstrap) {
       bootstrap = {
@@ -615,10 +656,17 @@
     }
     probeBusy = true;
     const measuredLayer = selectedLayer;
+    const measuredEgressMode = selectedEgressMode;
     if (phase === "ready") phase = "measuring";
     try {
-      const results = await nativeClient.refreshProbes(measuredLayer);
-      if (results.layer === selectedLayer) {
+      const results = await nativeClient.refreshProbes(
+        measuredLayer,
+        measuredEgressMode,
+      );
+      if (
+        results.layer === selectedLayer &&
+        results.egress_mode === selectedEgressMode
+      ) {
         availableCandidates = results.probes.length;
         error = null;
       }
@@ -627,7 +675,12 @@
     } finally {
       probeBusy = false;
       if (phase === "measuring") phase = "ready";
-      if (measuredLayer !== selectedLayer) void refreshProbes();
+      if (
+        measuredLayer !== selectedLayer ||
+        measuredEgressMode !== selectedEgressMode
+      ) {
+        void refreshProbes();
+      }
     }
   }
 
@@ -1284,6 +1337,7 @@
               <span>Маршрут</span>
               <select
                 bind:value={routeMode}
+                onchange={refreshProbes}
                 disabled={busy ||
                   phase === "connecting" ||
                   phase === "connected" ||
@@ -1293,6 +1347,25 @@
                 <option value="standalone">Напрямую</option>
               </select>
             </label>
+            {#if routeMode === "via_tak" && appPreferences}
+              <label class="select-field">
+                <span>Выход в интернет</span>
+                <select
+                  value={selectedEgressMode}
+                  onchange={setTicEgressMode}
+                  disabled={busy ||
+                    phase === "connecting" ||
+                    phase === "connected" ||
+                    phase === "stopping"}
+                >
+                  <option value="ipv4">IPv4</option>
+                  <option value="prefer_ipv6">IPv6, если доступен</option>
+                </select>
+                <small>
+                  Настройка сохраняется отдельно для постоянного и динамического режима
+                </small>
+              </label>
+            {/if}
           {/if}
 
           {#if bootstrap?.binding}

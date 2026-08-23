@@ -14,8 +14,8 @@ use nelomai_client_tunnel::{
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, Device, Layer, LeaseStatus, PeerBinding, Platform, RouteMode,
-    TicConnectionMode, UpdateState,
+    ConnectionStartResponse, Device, EgressMode, Layer, LeaseStatus, PeerBinding, Platform,
+    RouteMode, TicConnectionMode, UpdateState,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -286,6 +286,7 @@ struct MockApi {
     reject_stale_stop: AtomicBool,
     pinned_start: AtomicBool,
     awg3_start: AtomicBool,
+    mismatched_egress: AtomicBool,
     start_lease_override: Mutex<Option<String>>,
     bootstrap_connection: Mutex<Option<Connection>>,
     bootstrap_binding_without_connection: AtomicBool,
@@ -314,6 +315,7 @@ impl MockApi {
             reject_stale_stop: AtomicBool::new(false),
             pinned_start: AtomicBool::new(false),
             awg3_start: AtomicBool::new(false),
+            mismatched_egress: AtomicBool::new(false),
             start_lease_override: Mutex::new(None),
             bootstrap_connection: Mutex::new(None),
             bootstrap_binding_without_connection: AtomicBool::new(false),
@@ -360,6 +362,7 @@ impl CoreApi for MockApi {
                 preferred_layer: Layer::Stray,
                 tic_connection_mode: TicConnectionMode::Dynamic,
                 route_mode: RouteMode::Standalone,
+                egress_mode: EgressMode::Ipv4,
             });
         }
         Ok(response)
@@ -404,6 +407,11 @@ impl CoreApi for MockApi {
         response.connection.layer = request.layer;
         response.connection.tic_connection_mode = request.tic_connection_mode;
         response.connection.route_mode = request.route_mode;
+        if !self.mismatched_egress.load(Ordering::SeqCst) {
+            response.connection.egress_mode = request.egress_mode;
+        }
+        response.connection.pool_id = (request.tic_connection_mode == TicConnectionMode::Dynamic)
+            .then(|| "pool-test".to_string());
         response.connection.pinned = self.pinned_start.load(Ordering::SeqCst);
         Ok(response)
     }
@@ -523,9 +531,11 @@ fn token_response(access_token: &str, refresh_token: &str) -> TokenResponse {
 fn connection(lease_id: &str) -> Connection {
     Connection {
         lease_id: lease_id.to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         status: LeaseStatus::Issued,
         pinned: false,
@@ -587,9 +597,79 @@ fn options() -> ConnectOptions {
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probes: Vec::new(),
         allow_alternate: false,
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_diagnostics_identify_the_egress_mode_and_selected_pool() {
+    let logger = Arc::new(MemoryLogger::default());
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        logger.clone(),
+    );
+
+    core.start(
+        ConnectOptions {
+            layer: Layer::Tic,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::ViaTak,
+            egress_mode: EgressMode::PreferIpv6,
+            probes: Vec::new(),
+            allow_alternate: true,
+        },
+        1_700_000_000,
+    )
+    .await
+    .unwrap();
+
+    let events = logger.0.lock().unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == "connection.egress_selected" && event.code.as_deref() == Some("prefer_ipv6")
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "connection.pool_selected" && event.code.as_deref() == Some("pool-test")
+    }));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn start_rejects_a_silent_ipv6_to_ipv4_server_downgrade() {
+    let api = Arc::new(MockApi::new(0));
+    api.mismatched_egress.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Dynamic,
+                route_mode: RouteMode::ViaTak,
+                egress_mode: EgressMode::PreferIpv6,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_700_000_000,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CoreError::Api(CoreApiError::Rejected { ref code, .. })
+            if code == "invalid_client_api_response"
+    ));
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1293,6 +1373,7 @@ async fn interrupted_start_reuses_its_durable_operation_id() {
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
     });
     let store = Arc::new(MemoryStore::new(stored_auth));
     let core = ClientCore::new(
@@ -1329,6 +1410,7 @@ async fn recovered_fixed_start_uses_a_new_operation_after_stale_cleanup() {
         layer: Layer::Tic,
         tic_connection_mode: TicConnectionMode::Personal,
         route_mode: RouteMode::ViaTak,
+        egress_mode: EgressMode::Ipv4,
         probes: Vec::new(),
         allow_alternate: false,
     };
@@ -1592,9 +1674,11 @@ async fn bootstrap_recovers_configuration_after_external_quick_start_changes_lea
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://old.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: "PrivateKey = stale-secret".to_string(),
@@ -1660,9 +1744,11 @@ async fn running_quick_tunnel_uses_saved_metrics_context_after_bootstrap() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "quick-lease".to_string(),
+        pool_id: None,
         layer: Layer::Tic,
         tic_connection_mode: TicConnectionMode::Personal,
         route_mode: RouteMode::ViaTak,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://1b.example.test/probe".to_string()),
         kind: StoredConnectionKind::Fixed,
         configuration: "[Interface]\nPrivateKey = tunnel-secret\n".to_string(),
@@ -1705,6 +1791,7 @@ async fn failed_fixed_runtime_requires_cleanup_before_it_can_start_again() {
         layer: Layer::Tic,
         tic_connection_mode: TicConnectionMode::Personal,
         route_mode: RouteMode::ViaTak,
+        egress_mode: EgressMode::Ipv4,
         probes: Vec::new(),
         allow_alternate: false,
     };
@@ -1867,6 +1954,7 @@ async fn finished_tic_start_operation_is_replaced_once() {
         layer: Layer::Tic,
         tic_connection_mode: TicConnectionMode::Personal,
         route_mode: RouteMode::ViaTak,
+        egress_mode: EgressMode::Ipv4,
         probes: Vec::new(),
         allow_alternate: false,
     };
@@ -2121,9 +2209,11 @@ async fn valid_saved_stray_starts_offline_but_a_critical_update_blocks_it() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: "[Interface]\nPrivateKey = offline-secret\n".to_string(),
@@ -2166,9 +2256,11 @@ async fn offline_start_exposes_connecting_until_the_tunnel_is_ready() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: "[Interface]\nPrivateKey = offline-secret\n".to_string(),
@@ -2209,9 +2301,11 @@ async fn offline_awg3_handshake_cleanup_failure_remains_stoppable() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: awg3_configuration("offline-secret"),
@@ -2255,9 +2349,11 @@ async fn offline_awg3_handshake_failure_returns_to_ready_after_cleanup() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: awg3_configuration("offline-secret"),
@@ -2295,9 +2391,11 @@ async fn offline_handshake_timeout_surfaces_dynamic_cache_reconciliation_failure
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: awg3_configuration("offline-secret"),
@@ -2347,9 +2445,11 @@ async fn offline_pinned_awg3_handshake_failure_blocks_the_saved_configuration() 
     let mut stored = auth();
     stored.pinned_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::Pinned,
         configuration: awg3_configuration("offline-secret"),
@@ -2394,9 +2494,11 @@ async fn expired_warm_stray_is_not_started_offline() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: "PrivateKey = expired".to_string(),
@@ -2458,9 +2560,11 @@ async fn offline_bootstrap_can_fall_back_to_a_valid_saved_stray() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::Pinned,
         configuration: "PrivateKey = offline".to_string(),
@@ -2524,6 +2628,7 @@ async fn pinned_and_fixed_configurations_are_kept_without_a_synthetic_expiry() {
                 layer: Layer::Tic,
                 tic_connection_mode: TicConnectionMode::Personal,
                 route_mode: RouteMode::ViaTak,
+                egress_mode: EgressMode::Ipv4,
                 probes: Vec::new(),
                 allow_alternate: false,
             },
@@ -2554,6 +2659,7 @@ async fn fixed_connection_uses_a_new_operation_after_stop() {
         layer: Layer::Tic,
         tic_connection_mode: TicConnectionMode::Personal,
         route_mode: RouteMode::ViaTak,
+        egress_mode: EgressMode::Ipv4,
         probes: Vec::new(),
         allow_alternate: false,
     };
@@ -2632,9 +2738,11 @@ async fn alternate_stray_does_not_overwrite_the_saved_pin() {
     let mut stored = auth();
     stored.pinned_connection = Some(StoredConnection {
         lease_id: "pinned-lease".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::Pinned,
         configuration: "PrivateKey = pinned-secret".to_string(),
@@ -2662,9 +2770,11 @@ async fn unbind_clears_dynamic_and_pinned_connections() {
     let mut stored = auth();
     stored.saved_connection = Some(StoredConnection {
         lease_id: "alternate-lease".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::DynamicWarm,
         configuration: "PrivateKey = alternate-secret".to_string(),
@@ -2672,9 +2782,11 @@ async fn unbind_clears_dynamic_and_pinned_connections() {
     });
     stored.pinned_connection = Some(StoredConnection {
         lease_id: "pinned-lease".to_string(),
+        pool_id: None,
         layer: Layer::Stray,
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
         probe_url: Some("https://5a.example.test/probe".to_string()),
         kind: StoredConnectionKind::Pinned,
         configuration: "PrivateKey = pinned-secret".to_string(),
