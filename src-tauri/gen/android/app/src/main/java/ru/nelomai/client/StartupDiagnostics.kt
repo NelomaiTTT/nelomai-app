@@ -102,6 +102,9 @@ internal object StartupDiagnostics {
   }
 }
 
+internal fun startupActivityLifecycleKind(stage: String): String =
+  "startup.android.activity_$stage"
+
 internal fun startupExitReason(reason: Int): String = when (reason) {
   ApplicationExitInfo.REASON_EXIT_SELF -> "exit_self"
   ApplicationExitInfo.REASON_SIGNALED -> "signaled"

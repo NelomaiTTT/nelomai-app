@@ -28,12 +28,22 @@ class MainActivity : TauriActivity() {
 
   override fun onStart() {
     super.onStart()
-    StartupDiagnostics.record(applicationContext, "startup.android.activity_started")
+    StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("started"))
   }
 
   override fun onResume() {
     super.onResume()
-    StartupDiagnostics.record(applicationContext, "startup.android.activity_resumed")
+    StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("resumed"))
+  }
+
+  override fun onPause() {
+    StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("paused"))
+    super.onPause()
+  }
+
+  override fun onStop() {
+    StartupDiagnostics.record(applicationContext, startupActivityLifecycleKind("stopped"))
+    super.onStop()
   }
 
   override fun onWindowFocusChanged(hasFocus: Boolean) {

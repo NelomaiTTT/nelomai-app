@@ -4,6 +4,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class NelomaiVpnServiceTest {
     @Test
@@ -52,6 +56,76 @@ class NelomaiVpnServiceTest {
                 desiredActive = true,
             ),
         )
+    }
+
+    @Test
+    fun aNewServiceCommandCancelsThePendingIdleStop() {
+        val scheduled = mutableListOf<Runnable>()
+        var stops = 0
+        val debounce = IdleStopDebouncer(
+            delayMillis = 400L,
+            schedule = { task, _ -> scheduled += task },
+            cancel = scheduled::remove,
+        )
+
+        debounce.schedule { stops += 1 }
+        debounce.cancel()
+
+        assertTrue(scheduled.isEmpty())
+        assertEquals(0, stops)
+    }
+
+    @Test
+    fun repeatedIdleChecksKeepOnlyTheLatestStop() {
+        val scheduled = mutableListOf<Runnable>()
+        var stops = 0
+        val debounce = IdleStopDebouncer(
+            delayMillis = 400L,
+            schedule = { task, _ -> scheduled += task },
+            cancel = scheduled::remove,
+        )
+
+        debounce.schedule { stops += 1 }
+        debounce.schedule { stops += 1 }
+        assertEquals(1, scheduled.size)
+
+        scheduled.single().run()
+
+        assertEquals(1, stops)
+    }
+
+    @Test
+    fun aConcurrentNewCommandInvalidatesAnOlderIdleStopBeforeItIsPosted() {
+        val scheduled = CopyOnWriteArrayList<Runnable>()
+        val schedulerEnteredCancel = CountDownLatch(1)
+        val releaseScheduler = CountDownLatch(1)
+        val stops = AtomicInteger(0)
+        val debounce = IdleStopDebouncer(
+            delayMillis = 400L,
+            schedule = { task, _ -> scheduled += task },
+            cancel = { task ->
+                scheduled.remove(task)
+                if (Thread.currentThread().name == "stale-idle-stop-scheduler") {
+                    schedulerEnteredCancel.countDown()
+                    check(releaseScheduler.await(2, TimeUnit.SECONDS))
+                }
+            },
+        )
+
+        debounce.schedule { stops.incrementAndGet() }
+        val staleScheduler = Thread(
+            { debounce.schedule { stops.incrementAndGet() } },
+            "stale-idle-stop-scheduler",
+        ).apply { start() }
+        assertTrue(schedulerEnteredCancel.await(2, TimeUnit.SECONDS))
+
+        debounce.cancel()
+        releaseScheduler.countDown()
+        staleScheduler.join(2_000L)
+        assertFalse(staleScheduler.isAlive)
+        scheduled.forEach(Runnable::run)
+
+        assertEquals(0, stops.get())
     }
 
     @Test

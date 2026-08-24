@@ -6,6 +6,14 @@ import org.junit.Test
 
 class StartupDiagnosticsTest {
   @Test
+  fun activityLifecycleMarkersDistinguishForegroundAndBackgroundTransitions() {
+    assertEquals("startup.android.activity_started", startupActivityLifecycleKind("started"))
+    assertEquals("startup.android.activity_resumed", startupActivityLifecycleKind("resumed"))
+    assertEquals("startup.android.activity_paused", startupActivityLifecycleKind("paused"))
+    assertEquals("startup.android.activity_stopped", startupActivityLifecycleKind("stopped"))
+  }
+
+  @Test
   fun exitReasonsKeepNativeCrashesAndMemoryPressureDistinct() {
     assertEquals(
       "native_crash",

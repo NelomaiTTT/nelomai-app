@@ -22,9 +22,65 @@ import org.amnezia.awg.backend.GoBackend
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
 
+private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
+
+internal class IdleStopDebouncer(
+    private val delayMillis: Long,
+    private val schedule: (Runnable, Long) -> Unit,
+    private val cancel: (Runnable) -> Unit,
+) {
+    private val gate = Any()
+    private var pending: Runnable? = null
+    private var generation = 0L
+
+    fun schedule(action: () -> Unit) {
+        val ticket = synchronized(gate) {
+            generation += 1
+            generation
+        }
+        lateinit var task: Runnable
+        task = Runnable {
+            val shouldRun = synchronized(gate) {
+                if (generation != ticket || pending !== task) {
+                    false
+                } else {
+                    pending = null
+                    true
+                }
+            }
+            if (shouldRun) action()
+        }
+        var previous: Runnable? = null
+        val shouldSchedule = synchronized(gate) {
+            if (generation != ticket) {
+                false
+            } else {
+                previous = pending
+                pending = task
+                true
+            }
+        }
+        previous?.let(cancel)
+        if (shouldSchedule) schedule(task, delayMillis)
+    }
+
+    fun cancel() {
+        val previous = synchronized(gate) {
+            generation += 1
+            pending.also { pending = null }
+        }
+        previous?.let(cancel)
+    }
+}
+
 class NelomaiVpnService : GoBackend.VpnService() {
     private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
     private val restoreHandler = Handler(Looper.getMainLooper())
+    private val idleStopDebouncer = IdleStopDebouncer(
+        delayMillis = IDLE_SERVICE_STOP_DELAY_MILLIS,
+        schedule = { task, delay -> restoreHandler.postDelayed(task, delay) },
+        cancel = restoreHandler::removeCallbacks,
+    )
     private var restoreRetryAttempt = 0
     private val restoreRetry = Runnable {
         if (QuickTunnelController.desiredActive(applicationContext)) {
@@ -59,6 +115,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        idleStopDebouncer.cancel()
         if (intent == null || intent.action in FOREGROUND_ACTIONS) {
             promoteToForeground()
         }
@@ -382,6 +439,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     override fun onDestroy() {
+        idleStopDebouncer.cancel()
         cancelRestoreRetry()
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
@@ -478,7 +536,16 @@ class NelomaiVpnService : GoBackend.VpnService() {
         if (TunnelRuntime.state() != SessionState.RUNNING &&
             !QuickTunnelController.desiredActive(applicationContext)
         ) {
-            stopForegroundService()
+            idleStopDebouncer.schedule {
+                if (TunnelRuntime.state() != SessionState.RUNNING &&
+                    !QuickTunnelController.desiredActive(applicationContext)
+                ) {
+                    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }
+        } else {
+            idleStopDebouncer.cancel()
         }
     }
 

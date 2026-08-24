@@ -4,6 +4,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 class AutomaticDiagnosticsTest {
     @Test
@@ -274,6 +279,147 @@ class AutomaticDiagnosticsTest {
             ),
             tunnelStartMemoryDelayedStages(),
         )
+    }
+
+    @Test
+    fun tunnelSessionMemorySamplesCoverEarlyAndLongRunningUiGrowth() {
+        assertEquals(
+            listOf(60L, 5 * 60L, 15 * 60L, 30 * 60L, 60 * 60L, 3 * 60 * 60L),
+            automaticDiagnosticsMemorySampleDelaysSeconds(),
+        )
+    }
+
+    @Test
+    fun androidMemoryStatsAreConvertedFromKibibytesWithoutThrowing() {
+        val stats = mapOf(
+            "summary.graphics" to "123",
+            "summary.native-heap" to "invalid",
+        )
+
+        assertEquals(
+            123L * 1024L,
+            automaticDiagnosticsMemoryStatBytes(stats, "summary.graphics"),
+        )
+        assertNull(automaticDiagnosticsMemoryStatBytes(stats, "summary.native-heap"))
+        assertNull(automaticDiagnosticsMemoryStatBytes(stats, "summary.system"))
+    }
+
+    @Test
+    fun memoryGrowthTrackerCapturesCumulativeGrowthAndResetsAfterRelease() {
+        val mebibyte = 1024L * 1024L
+        val tracker = AutomaticDiagnosticsMemoryGrowthTracker(64L * mebibyte)
+
+        assertTrue(!tracker.observe(100L * mebibyte))
+        assertTrue(!tracker.observe(150L * mebibyte))
+        assertTrue(tracker.observe(164L * mebibyte))
+        assertTrue(!tracker.observe(120L * mebibyte))
+        assertTrue(tracker.observe(184L * mebibyte))
+    }
+
+    @Test
+    fun structuredMemoryComponentsKeepAndroidPssCategories() {
+        val processes = JSONArray().put(
+            JSONObject()
+                .put("processId", 42L)
+                .put("processName", "ru.nelomai.client:vpn")
+                .put("currentResidentMemoryBytes", 400L)
+                .put("pssJavaHeapBytes", 100L)
+                .put("pssNativeHeapBytes", 200L)
+                .put("pssGraphicsBytes", 50L),
+        )
+
+        val component = automaticDiagnosticsResourceComponents(processes).getJSONObject(0)
+
+        assertEquals(100L, component.getLong("pss_java_heap_bytes"))
+        assertEquals(200L, component.getLong("pss_native_heap_bytes"))
+        assertEquals(50L, component.getLong("pss_graphics_bytes"))
+    }
+
+    @Test
+    fun boundedMemoryTimelinePreservesSessionBaselineAndNewestSamples() {
+        val samples = (1L..4L).map { timestamp ->
+            JSONObject()
+                .put("timestamp_unix", timestamp)
+                .put("reason", "sample_$timestamp")
+        }
+
+        val bounded = automaticDiagnosticsBoundMemorySamples(samples, maximum = 3)
+
+        assertEquals(
+            listOf(1L, 3L, 4L),
+            bounded.map { it.getLong("timestamp_unix") },
+        )
+    }
+
+    @Test
+    fun sealedMemoryTimelineKeepsOnlySamplesAfterTheClosedInterval() {
+        val samples = listOf(99L, 100L, 101L).map { timestamp ->
+            JSONObject()
+                .put("timestamp_unix", timestamp)
+                .put("reason", "sample_$timestamp")
+        }
+
+        val retained = automaticDiagnosticsMemorySamplesAfter(samples, endedAt = 100L)
+
+        assertEquals(listOf(101L), retained.map { it.getLong("timestamp_unix") })
+    }
+
+    @Test
+    fun oversizedReportCompactionPreservesMemoryTimeline() {
+        val memorySamples = JSONArray().apply {
+            put(JSONObject().put("timestamp_unix", 1L).put("reason", "baseline"))
+            put(JSONObject().put("timestamp_unix", 2L).put("reason", "peak"))
+        }
+        val payload = JSONObject()
+            .put("application_log", "a".repeat(900))
+            .put("helper_log", "h".repeat(200))
+            .put("network_incidents", "n".repeat(200))
+            .put(
+                "resource_usage",
+                JSONObject().put("memory_samples", memorySamples),
+            )
+
+        val compacted = automaticDiagnosticsCompactReportToBytes(payload, maximum = 700)
+
+        assertTrue(compacted.toString().toByteArray(Charsets.UTF_8).size <= 700)
+        assertEquals(
+            memorySamples.toString(),
+            compacted.getJSONObject("resource_usage").getJSONArray("memory_samples").toString(),
+        )
+        assertEquals("h".repeat(200), compacted.getString("helper_log"))
+        assertEquals("n".repeat(200), compacted.getString("network_incidents"))
+        assertTrue(compacted.getString("application_log").length < 900)
+    }
+
+    @Test
+    fun lifecycleGatePreventsSnapshotFromOverlappingSeal() {
+        val gate = Any()
+        val sealEntered = CountDownLatch(1)
+        val releaseSeal = CountDownLatch(1)
+        val snapshotAttempted = CountDownLatch(1)
+        val snapshotEntered = CountDownLatch(1)
+        val sealThread = thread(start = true) {
+            automaticDiagnosticsRunWithLifecycleGate(gate) {
+                sealEntered.countDown()
+                releaseSeal.await(2, TimeUnit.SECONDS)
+            }
+        }
+        assertTrue(sealEntered.await(2, TimeUnit.SECONDS))
+        val snapshotThread = thread(start = true) {
+            snapshotAttempted.countDown()
+            automaticDiagnosticsRunWithLifecycleGate(gate) {
+                snapshotEntered.countDown()
+            }
+        }
+
+        assertTrue(snapshotAttempted.await(2, TimeUnit.SECONDS))
+        assertTrue(!snapshotEntered.await(100, TimeUnit.MILLISECONDS))
+        releaseSeal.countDown()
+        assertTrue(snapshotEntered.await(2, TimeUnit.SECONDS))
+        sealThread.join(2_000)
+        snapshotThread.join(2_000)
+        assertTrue(!sealThread.isAlive)
+        assertTrue(!snapshotThread.isAlive)
     }
 
     @Test
