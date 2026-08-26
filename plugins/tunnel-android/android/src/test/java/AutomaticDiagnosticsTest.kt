@@ -32,12 +32,18 @@ class AutomaticDiagnosticsTest {
 
     @Test
     fun startFailureRequestRoundTripsItsDurableIdentityAndState() {
+        val memorySamplesJson = JSONArray().put(
+            JSONObject()
+                .put("timestamp_unix", 999L)
+                .put("reason", "tunnel_start_memory_mappings_failure"),
+        ).toString()
         val request = StartFailureRequest(
             reportId = "33333333-3333-4333-8333-333333333333",
             deviceId = "11111111-1111-4111-8111-111111111111",
             errorCode = "configuration_fetch_failed",
             queuedAt = 1_000,
             sent = false,
+            memorySamplesJson = memorySamplesJson,
         )
 
         val restored = StartFailureRequest.fromJson(request.toJson())
@@ -52,6 +58,7 @@ class AutomaticDiagnosticsTest {
             restored.reportName,
         )
         assertTrue(StartFailureRequest.fromJson(request.copy(sent = true).toJson()).sent)
+        assertEquals(memorySamplesJson, restored.memorySamplesJson)
     }
 
     @Test
@@ -258,15 +265,32 @@ class AutomaticDiagnosticsTest {
     @Test
     fun tunnelStartMemoryDetailGateCapturesOneLargeGrowthOrAbsolutePeak() {
         val mebibyte = 1024L * 1024L
-        val growing = TunnelStartMemoryDetailGate(100L * mebibyte)
+        val growing = TunnelStartMemoryDetailGate(0)
 
-        assertTrue(!growing.shouldCapture(355L * mebibyte))
-        assertTrue(growing.shouldCapture(356L * mebibyte))
+        assertTrue(!growing.shouldCapture(255L * mebibyte))
+        assertTrue(growing.shouldCapture(256L * mebibyte))
         assertTrue(!growing.shouldCapture(700L * mebibyte))
 
         val alreadyLarge = TunnelStartMemoryDetailGate(null)
-        assertTrue(alreadyLarge.shouldCapture(512L * mebibyte))
+        assertTrue(!alreadyLarge.shouldCapture(299L * mebibyte))
+        assertTrue(alreadyLarge.shouldCapture(300L * mebibyte))
         assertTrue(!alreadyLarge.shouldCapture(700L * mebibyte))
+        assertTrue(alreadyLarge.hasCaptured())
+    }
+
+    @Test
+    fun sessionMemoryDetailGateCapturesOneGrowthSeriesUntilReset() {
+        val mebibyte = 1024L * 1024L
+        val gate = AutomaticDiagnosticsSessionMemoryDetailGate(64L * mebibyte)
+
+        gate.reset(100L * mebibyte)
+        assertTrue(!gate.shouldCapture(150L * mebibyte))
+        assertTrue(gate.shouldCapture(164L * mebibyte))
+        assertTrue(!gate.shouldCapture(300L * mebibyte))
+
+        gate.reset(300L * mebibyte)
+        assertTrue(!gate.shouldCapture(350L * mebibyte))
+        assertTrue(gate.shouldCapture(364L * mebibyte))
     }
 
     @Test
@@ -279,6 +303,169 @@ class AutomaticDiagnosticsTest {
             ),
             tunnelStartMemoryDelayedStages(),
         )
+    }
+
+    @Test
+    fun memoryPressureConfirmationIsPromptWithoutBlockingTunnelStartup() {
+        assertEquals(
+            listOf(
+                "initial" to 0L,
+                "confirmation" to 500L,
+                "settled" to 5_000L,
+            ),
+            tunnelStartMemoryMappingSamples(),
+        )
+    }
+
+    @Test
+    fun delayedMemoryCaptureFromAnOldAttemptCannotEnterTheNextReport() {
+        val generations = AutomaticDiagnosticsMemoryCaptureGeneration()
+        val first = generations.begin()
+
+        assertTrue(generations.isCurrent(first))
+
+        val second = generations.begin()
+
+        assertTrue(!generations.isCurrent(first))
+        assertTrue(generations.isCurrent(second))
+
+        generations.invalidate()
+
+        assertTrue(!generations.isCurrent(second))
+    }
+
+    @Test
+    fun smapsParserAggregatesSegmentsAndKeepsOnlyPrivacySafeMappingNames() {
+        val smaps = """
+            1000-2000 r--p 00000000 00:00 0 /data/app/secret/base.apk
+            Rss:                  24 kB
+            Pss:                  20 kB
+            Private_Dirty:         4 kB
+            2000-3000 r-xp 00000000 00:00 0 /data/app/secret/lib/arm64/libwg-go.so
+            Rss:                  40 kB
+            Pss:                  30 kB
+            Private_Dirty:         0 kB
+            3000-4000 rw-p 00000000 00:00 0 /data/app/secret/lib/arm64/libwg-go.so
+            Rss:                  20 kB
+            Pss:                  15 kB
+            Private_Dirty:         5 kB
+            4000-5000 rw-p 00000000 00:00 0
+            Rss:                  70 kB
+            Pss:                  60 kB
+            Private_Dirty:        60 kB
+            5000-6000 r--p 00000000 00:00 0 /data/user/0/private/account-name.txt
+            Rss:                  55 kB
+            Pss:                  50 kB
+            Private_Dirty:         0 kB
+        """.trimIndent()
+
+        val mappings = automaticDiagnosticsParseSmaps(smaps.lineSequence(), maximum = 4)
+
+        assertEquals(
+            listOf("[anonymous]", "[file]", "libwg-go.so", "base.apk"),
+            mappings.map { it.name },
+        )
+        assertEquals(60L * 1024L, mappings[0].proportionalBytes)
+        assertEquals(45L * 1024L, mappings[2].proportionalBytes)
+        assertEquals(60L * 1024L, mappings[2].residentBytes)
+        assertEquals(5L * 1024L, mappings[2].privateDirtyBytes)
+        assertTrue(mappings[2].executable)
+        assertTrue(mappings.none { it.name.contains("account-name") })
+        assertTrue(mappings.none { it.name.contains("/data/") })
+    }
+
+    @Test
+    fun smapsParserBoundsOutputAndUsesResidentBytesAsStableTieBreaker() {
+        val smaps = """
+            1000-2000 r--p 00000000 00:00 0 /one/libfirst.so
+            Rss:                  30 kB
+            Pss:                  10 kB
+            2000-3000 r--p 00000000 00:00 0 /two/libsecond.so
+            Rss:                  40 kB
+            Pss:                  10 kB
+            3000-4000 r--p 00000000 00:00 0 /three/libthird.so
+            Rss:                  50 kB
+            Pss:                   5 kB
+        """.trimIndent()
+
+        val mappings = automaticDiagnosticsParseSmaps(smaps.lineSequence(), maximum = 2)
+
+        assertEquals(listOf("libsecond.so", "libfirst.so"), mappings.map { it.name })
+    }
+
+    @Test
+    fun smapsRollupParserKeepsComparableKernelCounters() {
+        val rollup = """
+            1000-9000 ---p 00000000 00:00 0 [rollup]
+            Rss:                 800 kB
+            Pss:                 700 kB
+            Private_Clean:        20 kB
+            Private_Dirty:       500 kB
+            Shared_Clean:        100 kB
+            Shared_Dirty:         10 kB
+            Swap:                 30 kB
+            SwapPss:              15 kB
+        """.trimIndent()
+
+        val metrics = automaticDiagnosticsParseSmapsRollup(rollup.lineSequence())
+
+        assertEquals(800L * 1024L, metrics.residentBytes)
+        assertEquals(700L * 1024L, metrics.proportionalBytes)
+        assertEquals(20L * 1024L, metrics.privateCleanBytes)
+        assertEquals(500L * 1024L, metrics.privateDirtyBytes)
+        assertEquals(100L * 1024L, metrics.sharedCleanBytes)
+        assertEquals(10L * 1024L, metrics.sharedDirtyBytes)
+        assertEquals(30L * 1024L, metrics.swapBytes)
+        assertEquals(15L * 1024L, metrics.swapProportionalBytes)
+    }
+
+    @Test
+    fun smapsSummaryAccountsForMappingsOutsideTheBoundedTopList() {
+        val smaps = """
+            1000-2000 r-xp 00000000 00:00 0 /one/libfirst.so
+            Rss:                 100 kB
+            Pss:                  90 kB
+            Private_Clean:        80 kB
+            Private_Dirty:        10 kB
+            Shared_Clean:         10 kB
+            Shared_Dirty:          0 kB
+            Swap:                   5 kB
+            SwapPss:                2 kB
+            1800-2000 r--p 00000000 00:00 0 /one/libfirst.so
+            Rss:                   10 kB
+            Pss:                    8 kB
+            2000-3000 rw-p 00000000 00:00 0
+            Rss:                  60 kB
+            Pss:                  50 kB
+            Private_Clean:         0 kB
+            Private_Dirty:        50 kB
+            Shared_Clean:          0 kB
+            Shared_Dirty:         10 kB
+            Swap:                   0 kB
+            SwapPss:                0 kB
+        """.trimIndent()
+
+        val summary = automaticDiagnosticsSummarizeSmaps(
+            smaps.lineSequence(),
+            maximumMappings = 1,
+        )
+
+        assertEquals(3, summary.mappingCount)
+        assertEquals(2, summary.mappingGroupCount)
+        assertEquals(listOf("libfirst.so"), summary.topMappings.map { it.name })
+        assertEquals(
+            listOf("anonymous", "native_library"),
+            summary.categories.map { it.category },
+        )
+        val anonymous = summary.categories.first { it.category == "anonymous" }
+        assertEquals(60L * 1024L, anonymous.residentBytes)
+        assertEquals(50L * 1024L, anonymous.proportionalBytes)
+        assertEquals(50L * 1024L, anonymous.privateDirtyBytes)
+        val nativeLibrary = summary.categories.first { it.category == "native_library" }
+        assertEquals(80L * 1024L, nativeLibrary.privateCleanBytes)
+        assertEquals(10L * 1024L, nativeLibrary.sharedCleanBytes)
+        assertEquals(5L * 1024L, nativeLibrary.swapBytes)
+        assertEquals(2L * 1024L, nativeLibrary.swapProportionalBytes)
     }
 
     @Test
@@ -352,6 +539,78 @@ class AutomaticDiagnosticsTest {
     }
 
     @Test
+    fun boundedMemoryTimelinePreservesDetailedStartupMappings() {
+        val samples = (1L..40L).map { timestamp ->
+            JSONObject()
+                .put("timestamp_unix", timestamp)
+                .put(
+                    "reason",
+                    when (timestamp) {
+                        2L -> "tunnel_start_memory_mappings_initial"
+                        3L -> "tunnel_start_memory_mappings_confirmation"
+                        4L -> "tunnel_start_memory_mappings_settled"
+                        5L -> "tunnel_start_memory_mappings_failure"
+                        else -> "sample_$timestamp"
+                    },
+                )
+        }
+
+        val bounded = automaticDiagnosticsBoundMemorySamples(samples, maximum = 7)
+
+        assertEquals(
+            listOf(1L, 2L, 3L, 4L, 5L, 39L, 40L),
+            bounded.map { it.getLong("timestamp_unix") },
+        )
+    }
+
+    @Test
+    fun boundedMemoryTimelinePreservesLateSessionMappingSeries() {
+        val samples = (1L..40L).map { timestamp ->
+            JSONObject()
+                .put("timestamp_unix", timestamp)
+                .put(
+                    "reason",
+                    when (timestamp) {
+                        20L -> "tunnel_session_memory_mappings_initial"
+                        21L -> "tunnel_session_memory_mappings_confirmation"
+                        22L -> "tunnel_session_memory_mappings_settled"
+                        else -> "sample_$timestamp"
+                    },
+                )
+        }
+
+        val bounded = automaticDiagnosticsBoundMemorySamples(samples, maximum = 6)
+
+        assertEquals(
+            listOf(1L, 20L, 21L, 22L, 39L, 40L),
+            bounded.map { it.getLong("timestamp_unix") },
+        )
+    }
+
+    @Test
+    fun boundedMemoryTimelinePreservesSessionBaselineWhenMappingsArriveFirst() {
+        val samples = (1L..40L).map { timestamp ->
+            JSONObject()
+                .put("timestamp_unix", timestamp)
+                .put(
+                    "reason",
+                    when (timestamp) {
+                        1L -> "tunnel_start_memory_mappings_initial"
+                        2L -> "tunnel_started"
+                        else -> "sample_$timestamp"
+                    },
+                )
+        }
+
+        val bounded = automaticDiagnosticsBoundMemorySamples(samples, maximum = 3)
+
+        assertEquals(
+            listOf(1L, 2L, 40L),
+            bounded.map { it.getLong("timestamp_unix") },
+        )
+    }
+
+    @Test
     fun sealedMemoryTimelineKeepsOnlySamplesAfterTheClosedInterval() {
         val samples = listOf(99L, 100L, 101L).map { timestamp ->
             JSONObject()
@@ -362,6 +621,46 @@ class AutomaticDiagnosticsTest {
         val retained = automaticDiagnosticsMemorySamplesAfter(samples, endedAt = 100L)
 
         assertEquals(listOf(101L), retained.map { it.getLong("timestamp_unix") })
+    }
+
+    @Test
+    fun startFailureReportUsesCapturedAttemptInsteadOfNextRetryTimeline() {
+        val capturedAttempt = listOf(
+            JSONObject()
+                .put("timestamp_unix", 100L)
+                .put("reason", "tunnel_start_memory_mappings_failure"),
+        )
+        val finalSample = JSONObject()
+            .put("timestamp_unix", 100L)
+            .put("reason", "connection_start_failed")
+
+        val durableRequest = StartFailureRequest(
+            reportId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            deviceId = "11111111-1111-4111-8111-111111111111",
+            errorCode = "connection_start_failed",
+            queuedAt = 100L,
+            sent = false,
+            memorySamplesJson = automaticDiagnosticsEncodeMemorySamples(capturedAttempt),
+        )
+        val restoredRequest = StartFailureRequest.fromJson(durableRequest.toJson())
+        capturedAttempt.single().put("reason", "retry_was_mutated_after_snapshot")
+        val reportSamples = automaticDiagnosticsMemorySamplesForReport(
+            samples = automaticDiagnosticsDecodeMemorySamples(
+                checkNotNull(restoredRequest.memorySamplesJson),
+            ),
+            startedAt = 90L,
+            endedAt = 100L,
+            finalSample = finalSample,
+            maximum = 32,
+        )
+
+        assertEquals(
+            listOf(
+                "tunnel_start_memory_mappings_failure",
+                "connection_start_failed",
+            ),
+            reportSamples.map { it.getString("reason") },
+        )
     }
 
     @Test
@@ -452,6 +751,38 @@ class AutomaticDiagnosticsTest {
             required = {},
             optionalDiagnostics = { throw IllegalStateException("schedule rejected") },
             onDiagnosticsFailure = { throw IllegalStateException("logger rejected") },
+        )
+    }
+
+    @Test
+    fun failedTunnelCapturesDiagnosticsBeforeStoppingItsService() {
+        val actions = mutableListOf<String>()
+
+        runTunnelFailureCleanup(
+            optionalDiagnostics = { actions += "diagnostics" },
+            requiredCleanup = { actions += "service_stop" },
+            onDiagnosticsFailure = { actions += "diagnostics_failure" },
+        )
+
+        assertEquals(listOf("diagnostics", "service_stop"), actions)
+    }
+
+    @Test
+    fun failedTunnelStillStopsItsServiceWhenDiagnosticsThrow() {
+        val actions = mutableListOf<String>()
+
+        runTunnelFailureCleanup(
+            optionalDiagnostics = {
+                actions += "diagnostics"
+                throw IllegalStateException("smaps unavailable")
+            },
+            requiredCleanup = { actions += "service_stop" },
+            onDiagnosticsFailure = { actions += "diagnostics_failure" },
+        )
+
+        assertEquals(
+            listOf("diagnostics", "diagnostics_failure", "service_stop"),
+            actions,
         )
     }
 }

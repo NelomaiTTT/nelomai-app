@@ -11,6 +11,56 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class NelomaiVpnServiceTest {
     @Test
+    fun backgroundToggleLeavesTransitionStateToTheAcceptedRuntimeOperation() {
+        val events = mutableListOf<String>()
+
+        dispatchBackgroundToggle(
+            desiredActive = false,
+            start = { events += "start" },
+            stop = { events += "stop" },
+        )
+
+        assertEquals(listOf("start"), events)
+    }
+
+    @Test
+    fun backgroundFailureIsShownBeforeDiagnosticsFinish() {
+        val events = mutableListOf<String>()
+        var diagnosticsComplete: (() -> Unit)? = null
+
+        completeBackgroundFailureWithDiagnostics(
+            queueDiagnostics = { onComplete ->
+                events += "diagnostics_queued"
+                diagnosticsComplete = onComplete
+            },
+            finishUserAction = { events += "failure_shown" },
+            finishDeferredServiceStop = { events += "service_stopped" },
+        )
+
+        assertEquals(listOf("failure_shown", "diagnostics_queued"), events)
+
+        diagnosticsComplete?.invoke()
+
+        assertEquals(
+            listOf("failure_shown", "diagnostics_queued", "service_stopped"),
+            events,
+        )
+    }
+
+    @Test
+    fun diagnosticsQueueFailureDoesNotKeepTheForegroundServiceAlive() {
+        val events = mutableListOf<String>()
+
+        completeBackgroundFailureWithDiagnostics(
+            queueDiagnostics = { error("diagnostics executor unavailable") },
+            finishUserAction = { events += "failure_shown" },
+            finishDeferredServiceStop = { events += "service_stopped" },
+        )
+
+        assertEquals(listOf("failure_shown", "service_stopped"), events)
+    }
+
+    @Test
     fun diagnosticBackendVersionReplacesUnhelpfulLocalBuildMarkers() {
         assertEquals("git-08d68cd", diagnosticBackendVersion("(devel)"))
         assertEquals("git-08d68cd", diagnosticBackendVersion("unknown"))

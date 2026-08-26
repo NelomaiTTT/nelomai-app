@@ -396,6 +396,7 @@ internal fun QuickConnectionArgs.toBundle(): Bundle = Bundle().apply {
     putString("layer", layer)
     putString("tic_connection_mode", ticConnectionMode)
     putString("route_mode", routeMode)
+    putString("egress_mode", egressMode)
     putBoolean("allow_alternate", allowAlternate)
 }
 
@@ -404,5 +405,6 @@ internal fun Bundle.toQuickConnection(): QuickConnectionArgs = QuickConnectionAr
     it.layer = requireNotNull(getString("layer"))
     it.ticConnectionMode = requireNotNull(getString("tic_connection_mode"))
     it.routeMode = requireNotNull(getString("route_mode"))
+    it.egressMode = getString("egress_mode") ?: "ipv4"
     it.allowAlternate = getBoolean("allow_alternate")
 }

@@ -41,6 +41,151 @@ const ANDROID_QUICK_RECONCILE_RETRY_SECONDS: i64 = 15;
 
 const STARTUP_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(45);
 
+#[cfg(any(target_os = "android", test))]
+fn should_attempt_android_background_recovery(
+    error: &ApplicationError,
+    background_configured: bool,
+) -> bool {
+    background_configured && matches!(error, ApplicationError::Core(CoreError::SignedOut))
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AndroidBackgroundRecoveryFailure {
+    AccessExpired,
+    ClearAndFallbackRefresh,
+    FallbackRefresh,
+    Retryable,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn classify_android_background_recovery_error(code: &str) -> AndroidBackgroundRecoveryFailure {
+    match code {
+        "invalid_background_token" | "invalid_background_recovery" => {
+            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh
+        }
+        "background_recovery_unsupported" => AndroidBackgroundRecoveryFailure::FallbackRefresh,
+        "app_access_unavailable" => AndroidBackgroundRecoveryFailure::AccessExpired,
+        _ => AndroidBackgroundRecoveryFailure::Retryable,
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn await_detached_on_cancellation<F, T>(future: F) -> Result<T, tokio::task::JoinError>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(future).await
+}
+
+async fn bootstrap_application_for_startup(
+    app: &AppHandle,
+    application: &NativeApplication,
+    diagnostics: &AppDiagnostics,
+    now_unix: i64,
+) -> Result<Bootstrap, CommandError> {
+    #[cfg(target_os = "android")]
+    {
+        let first_error = match application.bootstrap_without_refresh(now_unix).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        if !matches!(first_error, ApplicationError::Core(CoreError::SignedOut)) {
+            return Err(first_error.into());
+        }
+        let background_configured = app
+            .tunnel_android()
+            .background_credential_status()
+            .map_err(|_| {
+                CommandError::new(
+                    "background_storage_unavailable",
+                    "Не удалось проверить сохранённую сессию. Повторите запуск приложения",
+                )
+            })?
+            .configured;
+        if !should_attempt_android_background_recovery(&first_error, background_configured) {
+            return application.bootstrap(now_unix).await.map_err(Into::into);
+        }
+
+        diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
+        let install_secret = application.install_secret().map_err(CommandError::from)?;
+        let recovery_app = app.clone();
+        let recovered = await_detached_on_cancellation(async move {
+            recovery_app
+                .tunnel_android()
+                .recover_background_session(
+                    tauri_plugin_tunnel_android::BackgroundSessionRecoveryRequest {
+                        install_secret,
+                    },
+                )
+                .await
+        })
+        .await
+        .map_err(|_| {
+            CommandError::new(
+                "session_recovery_failed",
+                "Не удалось завершить восстановление сессии. Повторите запуск приложения",
+            )
+        })?
+        .map_err(|_| {
+            CommandError::new(
+                "session_recovery_failed",
+                "Не удалось восстановить сессию. Проверьте сеть и повторите запуск приложения",
+            )
+        })?;
+        if let Some(code) = recovered.error_code.as_deref() {
+            return match classify_android_background_recovery_error(code) {
+                AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh => {
+                    app.tunnel_android().clear_background().map_err(|_| {
+                        CommandError::new(
+                            "background_storage_unavailable",
+                            "Не удалось очистить недействительную сессию. Повторите запуск приложения",
+                        )
+                    })?;
+                    application.bootstrap(now_unix).await.map_err(Into::into)
+                }
+                AndroidBackgroundRecoveryFailure::FallbackRefresh => {
+                    application.bootstrap(now_unix).await.map_err(Into::into)
+                }
+                AndroidBackgroundRecoveryFailure::AccessExpired => {
+                    Err(CommandError::from_core(CoreError::AccessExpired))
+                }
+                AndroidBackgroundRecoveryFailure::Retryable => Err(CommandError::new(
+                    code,
+                    "Не удалось восстановить сессию. Проверьте сеть и повторите запуск приложения",
+                )),
+            };
+        }
+        let access_token = recovered.access_token.as_deref().ok_or_else(|| {
+            CommandError::new(
+                "invalid_background_recovery_response",
+                "Панель вернула неполный ответ. Повторите запуск приложения",
+            )
+        })?;
+        let refresh_token = recovered.refresh_token.as_deref().ok_or_else(|| {
+            CommandError::new(
+                "invalid_background_recovery_response",
+                "Панель вернула неполный ответ. Повторите запуск приложения",
+            )
+        })?;
+        application
+            .replace_session_tokens(access_token, refresh_token)
+            .await
+            .map_err(CommandError::from)?;
+        diagnostics.record_named("startup.auth_recovery.completed", None, None, None);
+        application
+            .bootstrap_without_refresh(now_unix)
+            .await
+            .map_err(Into::into)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (app, diagnostics);
+        application.bootstrap(now_unix).await.map_err(Into::into)
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
@@ -948,36 +1093,42 @@ pub async fn app_bootstrap(
 ) -> Result<Bootstrap, CommandError> {
     diagnostics.record_named("startup.bootstrap.begin", None, None, None);
     let bootstrap_started = Instant::now();
-    let response =
-        match tokio::time::timeout(STARTUP_BOOTSTRAP_TIMEOUT, application.bootstrap(now_unix()))
-            .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) => {
-                let error = CommandError::from(error);
-                diagnostics.record_timed_named(
-                    "startup.bootstrap.failed",
-                    None,
-                    None,
-                    Some(error.code()),
-                    bootstrap_started.elapsed(),
-                );
-                return Err(error);
-            }
-            Err(_) => {
-                diagnostics.record_timed_named(
-                    "startup.bootstrap.failed",
-                    None,
-                    None,
-                    Some("startup_timeout"),
-                    bootstrap_started.elapsed(),
-                );
-                return Err(CommandError::new(
-                    "startup_timeout",
-                    "Не удалось завершить запуск вовремя. Проверьте сеть и повторите попытку",
-                ));
-            }
-        };
+    let response = match tokio::time::timeout(
+        STARTUP_BOOTSTRAP_TIMEOUT,
+        bootstrap_application_for_startup(
+            &app,
+            application.inner(),
+            diagnostics.inner(),
+            now_unix(),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            diagnostics.record_timed_named(
+                "startup.bootstrap.failed",
+                None,
+                None,
+                Some(error.code()),
+                bootstrap_started.elapsed(),
+            );
+            return Err(error);
+        }
+        Err(_) => {
+            diagnostics.record_timed_named(
+                "startup.bootstrap.failed",
+                None,
+                None,
+                Some("startup_timeout"),
+                bootstrap_started.elapsed(),
+            );
+            return Err(CommandError::new(
+                "startup_timeout",
+                "Не удалось завершить запуск вовремя. Проверьте сеть и повторите попытку",
+            ));
+        }
+    };
     diagnostics.record_timed_named(
         "startup.bootstrap.ready",
         None,
@@ -2342,5 +2493,67 @@ mod tests {
         let stage: StartupStage = serde_json::from_str("\"frontend_first_frame\"").unwrap();
         assert_eq!(stage.event_name(), "startup.frontend.first_frame");
         assert!(serde_json::from_str::<StartupStage>("\"arbitrary_event\"").is_err());
+    }
+
+    #[test]
+    fn background_recovery_is_limited_to_a_configured_signed_out_android_session() {
+        assert!(should_attempt_android_background_recovery(
+            &ApplicationError::Core(CoreError::SignedOut),
+            true,
+        ));
+        assert!(!should_attempt_android_background_recovery(
+            &ApplicationError::Core(CoreError::SignedOut),
+            false,
+        ));
+        assert!(!should_attempt_android_background_recovery(
+            &ApplicationError::Core(CoreError::Api(CoreApiError::Retryable)),
+            true,
+        ));
+    }
+
+    #[test]
+    fn invalid_background_recovery_falls_back_but_missing_route_keeps_the_credential() {
+        assert_eq!(
+            classify_android_background_recovery_error("invalid_background_token"),
+            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh,
+        );
+        assert_eq!(
+            classify_android_background_recovery_error("invalid_background_recovery"),
+            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh,
+        );
+        assert_eq!(
+            classify_android_background_recovery_error("background_recovery_unsupported"),
+            AndroidBackgroundRecoveryFailure::FallbackRefresh,
+        );
+        assert_eq!(
+            classify_android_background_recovery_error("background_transport_unavailable"),
+            AndroidBackgroundRecoveryFailure::Retryable,
+        );
+    }
+
+    #[test]
+    fn unavailable_application_access_is_terminal_instead_of_a_network_retry() {
+        assert_eq!(
+            classify_android_background_recovery_error("app_access_unavailable"),
+            AndroidBackgroundRecoveryFailure::AccessExpired,
+        );
+    }
+
+    #[tokio::test]
+    async fn outer_timeout_does_not_cancel_a_detached_mobile_operation() {
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let operation = await_detached_on_cancellation(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = completed_tx.send(());
+            42
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(1), operation)
+            .await
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(1), completed_rx)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

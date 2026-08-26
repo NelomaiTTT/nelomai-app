@@ -105,6 +105,16 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub async fn recover_background_session(
+        &self,
+        request: BackgroundSessionRecoveryRequest,
+    ) -> crate::Result<BackgroundSessionRecoveryResponse> {
+        self.0
+            .run_mobile_plugin_async("recoverBackgroundSession", request)
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn take_quick_state_change(&self) -> crate::Result<QuickStateChangeResponse> {
         self.0
             .run_mobile_plugin::<QuickStateChangeResponse>("takeQuickStateChange", EmptyRequest {})

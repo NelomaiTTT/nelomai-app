@@ -2,6 +2,8 @@ package ru.nelomai.tunnel
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -9,6 +11,115 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 class BackgroundConnectionClientTest {
+    @Test
+    fun backgroundStartFailureIsReportedBeforeLeaseCleanupRuns() {
+        val events = mutableListOf<String>()
+        var scheduledCleanup: (() -> Unit)? = null
+
+        scheduleBackgroundStartFailure(
+            scheduleCleanup = { task ->
+                events += "cleanup_scheduled"
+                scheduledCleanup = task
+            },
+            cleanupLease = { events += "lease_cleaned" },
+            notifyFailure = { events += "failure_reported" },
+            completeOperation = { events += "operation_completed" },
+            onCleanupFailure = { fail("cleanup must not fail") },
+        )
+
+        assertEquals(listOf("failure_reported", "cleanup_scheduled"), events)
+        assertNotNull(scheduledCleanup)
+
+        scheduledCleanup?.invoke()
+
+        assertEquals(
+            listOf(
+                "failure_reported",
+                "cleanup_scheduled",
+                "lease_cleaned",
+                "operation_completed",
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun failedLeaseCleanupStillCompletesTheBackgroundOperation() {
+        val events = mutableListOf<String>()
+
+        scheduleBackgroundStartFailure(
+            scheduleCleanup = { task -> task() },
+            cleanupLease = {
+                events += "cleanup_started"
+                error("panel unavailable")
+            },
+            notifyFailure = { events += "failure_reported" },
+            completeOperation = { events += "operation_completed" },
+            onCleanupFailure = { events += "cleanup_failed" },
+        )
+
+        assertEquals(
+            listOf(
+                "failure_reported",
+                "cleanup_started",
+                "cleanup_failed",
+                "operation_completed",
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun cleanupFailureLoggingCannotLeaveTheBackgroundOperationLocked() {
+        val events = mutableListOf<String>()
+        var scheduledCleanup: (() -> Unit)? = null
+
+        scheduleBackgroundStartFailure(
+            scheduleCleanup = { task -> scheduledCleanup = task },
+            cleanupLease = { error("panel unavailable") },
+            notifyFailure = { events += "failure_reported" },
+            completeOperation = { events += "operation_completed" },
+            onCleanupFailure = { error("logger unavailable") },
+        )
+
+        scheduledCleanup?.invoke()
+
+        assertEquals(listOf("failure_reported", "operation_completed"), events)
+    }
+
+    @Test
+    fun rejectedLeaseCleanupSchedulingStillCompletesTheBackgroundOperation() {
+        val events = mutableListOf<String>()
+
+        scheduleBackgroundStartFailure(
+            scheduleCleanup = {
+                events += "cleanup_rejected"
+                error("executor unavailable")
+            },
+            cleanupLease = { fail("rejected cleanup must not run") },
+            notifyFailure = { events += "failure_reported" },
+            completeOperation = { events += "operation_completed" },
+            onCleanupFailure = { events += "cleanup_failed" },
+        )
+
+        assertEquals(
+            listOf(
+                "failure_reported",
+                "cleanup_rejected",
+                "cleanup_failed",
+                "operation_completed",
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun backgroundStartTreatsEveryNonRunningResultAsFailure() {
+        assertNull(backgroundStartFailureCode(SessionState.RUNNING))
+        assertEquals("connection_start_failed", backgroundStartFailureCode(SessionState.FAILED))
+        assertEquals("connection_start_failed", backgroundStartFailureCode(SessionState.STOPPED))
+    }
+
     @Test
     fun currentPanelPolicyReplacesCachedPackagesAndRoutes() {
         val fallback = TunnelOptionsArgs().apply {

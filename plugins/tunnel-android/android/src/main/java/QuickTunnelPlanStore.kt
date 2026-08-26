@@ -16,7 +16,7 @@ private const val QUICK_PLAN_KEY_ALIAS = "nelomai-quick-tunnel-plan"
 private const val QUICK_PLAN_PREFERENCES = "nelomai-quick-tunnel-plan"
 private const val QUICK_PLAN_CIPHERTEXT = "ciphertext"
 private const val QUICK_PLAN_IV = "iv"
-private const val QUICK_PLAN_FORMAT = 2
+private const val QUICK_PLAN_FORMAT = 3
 
 internal data class QuickTunnelTemplate(
     val options: TunnelOptionsArgs,
@@ -58,7 +58,8 @@ internal object QuickTunnelPlanStore {
                 clear(context)
                 return null
             }
-            val connection = payload.optJSONObject("connection")?.toQuickConnection() ?: return null
+            val connection = payload.optJSONObject("connection")?.toStoredQuickConnection()
+                ?: return null
             QuickTunnelTemplate(
                 options = TunnelOptionsArgs.fromJson(payload.getJSONObject("options")),
                 connection = connection,
@@ -158,13 +159,15 @@ private fun QuickConnectionArgs.toJson(): JSONObject = JSONObject().apply {
     put("layer", layer)
     put("ticConnectionMode", ticConnectionMode)
     put("routeMode", routeMode)
+    put("egressMode", egressMode)
     put("allowAlternate", allowAlternate)
 }
 
-private fun JSONObject.toQuickConnection(): QuickConnectionArgs = QuickConnectionArgs().apply {
+internal fun JSONObject.toStoredQuickConnection(): QuickConnectionArgs = QuickConnectionArgs().apply {
     leaseId = getString("leaseId")
     layer = getString("layer")
     ticConnectionMode = getString("ticConnectionMode")
     routeMode = getString("routeMode")
+    egressMode = getString("egressMode")
     allowAlternate = optBoolean("allowAlternate", false)
 }

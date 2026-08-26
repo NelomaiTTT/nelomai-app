@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use nelomai_contracts::{Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
+use nelomai_contracts::{EgressMode, Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
@@ -188,6 +188,7 @@ pub struct QuickConnection {
     pub layer: Layer,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
+    pub egress_mode: EgressMode,
     pub allow_alternate: bool,
 }
 

@@ -124,6 +124,7 @@ class QuickConnectionArgs {
     lateinit var layer: String
     lateinit var ticConnectionMode: String
     lateinit var routeMode: String
+    var egressMode: String = "ipv4"
     var allowAlternate: Boolean = false
 }
 
@@ -134,6 +135,11 @@ class BackgroundCredentialArgs {
     lateinit var panelBase: String
     lateinit var token: String
     var expiresAtUnix: Long = 0
+}
+
+@InvokeArg
+class BackgroundSessionRecoveryArgs {
+    lateinit var installSecret: String
 }
 
 @InvokeArg
@@ -579,8 +585,9 @@ internal object TunnelRuntime {
         val watchdog = armOperationWatchdog(applicationContext, "start")
         executor.execute {
             val startedAt = System.nanoTime()
-            val startMemoryDiagnostics = TunnelStartMemoryDiagnostics()
-            startMemoryDiagnostics.record(applicationContext, "start_begin")
+            val memoryBaselineRssBytes = processRssBytes(android.os.Process.myPid())
+            var memoryDiagnosticsForFailure: TunnelStartMemoryDiagnostics? = null
+            var startTransport: String? = null
             TunnelLog.info(
                 "start.begin",
                 mapOf(
@@ -613,6 +620,14 @@ internal object TunnelRuntime {
                         .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
                     logStage("start.previous_tunnel_stopped", replaceStartedAt)
                 }
+                val memoryCaptureGeneration =
+                    AutomaticDiagnostics.onTunnelStartAttempt(applicationContext)
+                val startMemoryDiagnostics = TunnelStartMemoryDiagnostics(
+                    memoryCaptureGeneration,
+                    memoryBaselineRssBytes,
+                )
+                memoryDiagnosticsForFailure = startMemoryDiagnostics
+                startMemoryDiagnostics.record(applicationContext, "start_begin")
                 val parseStartedAt = System.nanoTime()
                 startMemoryDiagnostics.record(applicationContext, "before_configuration_parse")
                 val originalConfig = TunnelPayload.consume(args.configuration) { payload ->
@@ -644,6 +659,7 @@ internal object TunnelRuntime {
                 } else {
                     "wireguard"
                 }
+                startTransport = transport
                 val preparedAwg3Profile = if (transport == "amneziawg_3") {
                     Awg3ProfileSnapshot.fromInterface(config.getInterface())
                 } else {
@@ -851,6 +867,7 @@ internal object TunnelRuntime {
                         AutomaticDiagnostics.onTunnelStarted(
                             applicationContext,
                             args.quickConnection?.leaseId,
+                            transport,
                         )
                     }
                         .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
@@ -869,7 +886,26 @@ internal object TunnelRuntime {
                 } else {
                     quickPlan?.configuration?.fill(0)
                     if (!keepForegroundServiceOnFailure) {
-                        NelomaiVpnService.stopForegroundService()
+                        runTunnelFailureCleanup(
+                            optionalDiagnostics = {
+                                startMemoryDiagnostics.recordFailure(
+                                    applicationContext,
+                                    transport,
+                                )
+                            },
+                            requiredCleanup = NelomaiVpnService::stopForegroundService,
+                            onDiagnosticsFailure = {
+                                TunnelLog.warning(
+                                    "diagnostics.memory_failure_capture_failed",
+                                    error = it,
+                                )
+                            },
+                        )
+                    } else {
+                        startMemoryDiagnostics.recordFailure(
+                            applicationContext,
+                            transport,
+                        )
                     }
                 }
                 logStage("start.completed", startedAt, "state=${resolved.wireName}")
@@ -882,7 +918,26 @@ internal object TunnelRuntime {
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
                 if (!keepForegroundServiceOnFailure) {
-                    NelomaiVpnService.stopForegroundService()
+                    runTunnelFailureCleanup(
+                        optionalDiagnostics = {
+                            memoryDiagnosticsForFailure?.recordFailure(
+                                applicationContext,
+                                startTransport,
+                            )
+                        },
+                        requiredCleanup = NelomaiVpnService::stopForegroundService,
+                        onDiagnosticsFailure = {
+                            TunnelLog.warning(
+                                "diagnostics.memory_failure_capture_failed",
+                                error = it,
+                            )
+                        },
+                    )
+                } else {
+                    memoryDiagnosticsForFailure?.recordFailure(
+                        applicationContext,
+                        startTransport,
+                    )
                 }
                 val code = errorCode(error)
                 TunnelLog.warning(
@@ -1002,36 +1057,41 @@ internal object TunnelRuntime {
                     quickActionValidUntilUnix = null
                     quickConnection = result.connection
                 }
+                fun finishFailedStart(code: String) {
+                    scheduleBackgroundStartFailure(
+                        scheduleCleanup = backgroundExecutor::execute,
+                        cleanupLease = {
+                            BackgroundConnectionClient.stop(
+                                credential,
+                                result.connection.leaseId,
+                            )
+                        },
+                        notifyFailure = { onError(code) },
+                        completeOperation = backgroundOperationGate::complete,
+                        onCleanupFailure = { error ->
+                            TunnelLog.warning(
+                                "background_start.cleanup_failed",
+                                (error as? BackgroundConnectionException)?.code,
+                            )
+                        },
+                    )
+                }
                 start(
                     applicationContext,
                     args,
                     { state, duration ->
-                        try {
-                            onSuccess(state, duration)
-                        } finally {
-                            backgroundOperationGate.complete()
-                        }
-                    },
-                    { code ->
-                        backgroundExecutor.execute {
-                            runCatching {
-                                BackgroundConnectionClient.stop(
-                                    credential,
-                                    result.connection.leaseId,
-                                )
-                            }.onFailure { error ->
-                                TunnelLog.warning(
-                                    "background_start.cleanup_failed",
-                                    (error as? BackgroundConnectionException)?.code,
-                                )
-                            }
+                        val failureCode = backgroundStartFailureCode(state)
+                        if (failureCode == null) {
                             try {
-                                onError(code)
+                                onSuccess(state, duration)
                             } finally {
                                 backgroundOperationGate.complete()
                             }
+                        } else {
+                            finishFailedStart(failureCode)
                         }
                     },
+                    ::finishFailedStart,
                     keepForegroundServiceOnFailure = true,
                 )
             } catch (error: Throwable) {
@@ -1047,6 +1107,26 @@ internal object TunnelRuntime {
                 } finally {
                     backgroundOperationGate.complete()
                 }
+            }
+        }
+    }
+
+    fun recoverBackgroundSession(
+        context: Context,
+        installSecret: String,
+        onSuccess: (BackgroundSessionRecoveryResult) -> Unit,
+        onError: (String) -> Unit,
+    ) {
+        val applicationContext = context.applicationContext
+        val credential = BackgroundCredentialStore.load(applicationContext) ?: run {
+            onError("background_recovery_unavailable")
+            return
+        }
+        backgroundExecutor.execute {
+            try {
+                onSuccess(BackgroundConnectionClient.recoverSession(credential, installSecret))
+            } catch (error: Throwable) {
+                onError((error as? BackgroundConnectionException)?.code ?: errorCode(error))
             }
         }
     }
@@ -2204,6 +2284,39 @@ internal object TunnelRuntime {
 
 }
 
+internal fun backgroundStartFailureCode(state: SessionState): String? =
+    "connection_start_failed".takeUnless { state == SessionState.RUNNING }
+
+internal fun scheduleBackgroundStartFailure(
+    scheduleCleanup: (() -> Unit) -> Unit,
+    cleanupLease: () -> Unit,
+    notifyFailure: () -> Unit,
+    completeOperation: () -> Unit,
+    onCleanupFailure: (Throwable) -> Unit,
+) {
+    try {
+        notifyFailure()
+    } finally {
+        try {
+            scheduleCleanup {
+                try {
+                    runCatching(cleanupLease).onFailure { error ->
+                        runCatching { onCleanupFailure(error) }
+                    }
+                } finally {
+                    completeOperation()
+                }
+            }
+        } catch (error: Throwable) {
+            try {
+                runCatching { onCleanupFailure(error) }
+            } finally {
+                completeOperation()
+            }
+        }
+    }
+}
+
 internal fun counterDelta(previous: Long?, current: Long): Long = when {
     previous == null -> current
     current >= previous -> current - previous
@@ -2325,6 +2438,7 @@ private fun QuickConnectionArgs.copy(): QuickConnectionArgs = QuickConnectionArg
     copy.layer = layer
     copy.ticConnectionMode = ticConnectionMode
     copy.routeMode = routeMode
+    copy.egressMode = egressMode
     copy.allowAlternate = allowAlternate
 }
 
@@ -2553,6 +2667,38 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             activity.applicationContext,
             { activity.runOnUiThread { invoke.resolve() } },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun recoverBackgroundSession(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(BackgroundSessionRecoveryArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_background_recovery")
+            return
+        }
+        TunnelRuntime.recoverBackgroundSession(
+            activity.applicationContext,
+            args.installSecret,
+            { recovered ->
+                activity.runOnUiThread {
+                    val response = JSObject()
+                    response.put("accessToken", recovered.accessToken)
+                    response.put("refreshToken", recovered.refreshToken)
+                    response.put("errorCode", null)
+                    invoke.resolve(response)
+                }
+            },
+            { code ->
+                activity.runOnUiThread {
+                    val response = JSObject()
+                    response.put("accessToken", null)
+                    response.put("refreshToken", null)
+                    response.put("errorCode", code)
+                    invoke.resolve(response)
+                }
+            },
         )
     }
 

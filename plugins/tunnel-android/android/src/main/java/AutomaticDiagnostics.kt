@@ -45,6 +45,9 @@ private const val MEMORY_GROWTH_POLL_SECONDS = 30L
 private const val MEMORY_GROWTH_THRESHOLD_BYTES = 64L * 1024L * 1024L
 private const val MAX_MEMORY_TIMELINE_SAMPLES = 32
 private const val MAX_MEMORY_TIMELINE_FILE_BYTES = 128 * 1024L
+private const val MAX_START_FAILURE_MEMORY_SNAPSHOT_BYTES =
+    MAX_MEMORY_TIMELINE_FILE_BYTES + 2
+private const val MAX_START_FAILURE_REQUEST_BYTES = MAX_MEMORY_TIMELINE_FILE_BYTES + 8 * 1024L
 private const val NETWORK_MEMORY_SAMPLE_COOLDOWN_SECONDS = 60L
 private const val UI_REMOVED_SETTLE_SECONDS = 5L
 private const val START_FAILURE_WINDOW_SECONDS = 15 * 60L
@@ -57,7 +60,8 @@ private const val MAX_HELPER_LOG_BYTES = 64 * 1024
 private const val MAX_NETWORK_INCIDENT_LOG_BYTES = 48 * 1024
 private const val MAX_REPORT_BYTES = 512 * 1024
 private const val TUNNEL_START_MEMORY_GROWTH_THRESHOLD_BYTES = 256L * 1024L * 1024L
-private const val TUNNEL_START_MEMORY_ABSOLUTE_THRESHOLD_BYTES = 512L * 1024L * 1024L
+private const val TUNNEL_START_MEMORY_ABSOLUTE_THRESHOLD_BYTES = 300L * 1024L * 1024L
+private const val TUNNEL_START_MEMORY_TOP_MAPPINGS = 12
 private const val AUTOMATIC_DIAGNOSTICS_JOB_ID = 0x4e444941
 private val RETRY_DELAYS_SECONDS = longArrayOf(5 * 60L, 30 * 60L, 2 * 60 * 60L, 6 * 60 * 60L)
 
@@ -108,6 +112,9 @@ internal object AutomaticDiagnostics {
     private val executor = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "nelomai-automatic-diagnostics").apply { isDaemon = true }
     }
+    private val memoryDetailExecutor = Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "nelomai-memory-diagnostics").apply { isDaemon = true }
+    }
     private val startFailureExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "nelomai-start-failure-diagnostics").apply { isDaemon = true }
     }
@@ -118,10 +125,59 @@ internal object AutomaticDiagnostics {
     private val memoryGrowthTracker = AutomaticDiagnosticsMemoryGrowthTracker(
         MEMORY_GROWTH_THRESHOLD_BYTES,
     )
+    private val sessionMemoryDetailGate = AutomaticDiagnosticsSessionMemoryDetailGate(
+        MEMORY_GROWTH_THRESHOLD_BYTES,
+    )
+    private val memoryCaptureGeneration = AutomaticDiagnosticsMemoryCaptureGeneration()
     private var lastNetworkMemorySampleAt = 0L
+    private var sessionTransport: String? = null
 
     fun hasActiveUpload(): Boolean =
         uploadQueued.get() || systemJobRunning.get() || immediateUploadPending.get()
+
+    fun scheduleOptionalMemoryCapture(
+        captureGeneration: Long,
+        delayMillis: Long,
+        capture: () -> Unit,
+    ) {
+        memoryDetailExecutor.schedule(
+            {
+                if (!memoryCaptureGeneration.isCurrent(captureGeneration)) {
+                    return@schedule
+                }
+                containTunnelStartMemoryDiagnosticsFailure(capture)
+                    ?.let { failure ->
+                        TunnelLog.warning("diagnostics.memory_mappings_failed", error = failure)
+                    }
+            },
+            delayMillis.coerceAtLeast(0),
+            TimeUnit.MILLISECONDS,
+        )
+    }
+
+    fun onTunnelStartAttempt(context: Context): Long {
+        val generation = memoryCaptureGeneration.begin()
+        containTunnelStartMemoryDiagnosticsFailure {
+            synchronized(memoryTimelineGate) {
+                clearMemoryTimeline(context.applicationContext)
+            }
+        }?.let { failure ->
+            runCatching {
+                TunnelLog.warning("diagnostics.memory_timeline_reset_failed", error = failure)
+            }
+        }
+        return generation
+    }
+
+    fun recordMemoryMappingSample(
+        context: Context,
+        captureGeneration: Long,
+        sample: JSONObject,
+    ) = synchronized(memoryTimelineGate) {
+        if (memoryCaptureGeneration.isCurrent(captureGeneration)) {
+            appendMemoryTimelineSample(context.applicationContext, sample)
+        }
+    }
 
     fun initialize(context: Context) {
         val applicationContext = context.applicationContext
@@ -144,7 +200,11 @@ internal object AutomaticDiagnostics {
         }
     }
 
-    fun onTunnelStarted(context: Context, connectionLeaseId: String?) {
+    fun onTunnelStarted(
+        context: Context,
+        connectionLeaseId: String?,
+        transport: String,
+    ) {
         val applicationContext = context.applicationContext
         synchronized(gate) {
             val preferences = preferences(applicationContext)
@@ -160,8 +220,9 @@ internal object AutomaticDiagnostics {
             }
             val now = nowUnix()
             val deviceId = BackgroundCredentialStore.load(applicationContext)?.deviceId
-            clearMemoryTimeline(applicationContext)
             memoryGrowthTracker.reset()
+            sessionMemoryDetailGate.reset(processRssBytes(Process.myPid()))
+            sessionTransport = transport.take(32)
             check(
                 preferences.edit()
                     .putString(KEY_SESSION_ID, UUID.randomUUID().toString())
@@ -186,6 +247,8 @@ internal object AutomaticDiagnostics {
     fun onTunnelStopped(context: Context) {
         val applicationContext = context.applicationContext
         synchronized(gate) {
+            memoryCaptureGeneration.invalidate()
+            sessionTransport = null
             checkpointFuture?.cancel(false)
             checkpointFuture = null
             cancelMemorySeriesLocked()
@@ -230,10 +293,20 @@ internal object AutomaticDiagnostics {
         onComplete: (Throwable?) -> Unit,
     ) {
         val applicationContext = context.applicationContext
+        val capturedMemorySamples = runCatching {
+            snapshotMemoryTimeline(applicationContext)
+        }.onFailure { error ->
+            TunnelLog.warning("diagnostics.memory_timeline_snapshot_failed", error = error)
+        }.getOrElse { emptyList() }
         startFailureExecutor.execute {
             val failure = runCatching {
                 synchronized(gate) {
-                    queueConnectionStartFailure(applicationContext, deviceId, errorCode)
+                    queueConnectionStartFailure(
+                        applicationContext,
+                        deviceId,
+                        errorCode,
+                        capturedMemorySamples,
+                    )
                 }
             }
             failure.exceptionOrNull()?.let { error ->
@@ -477,6 +550,7 @@ internal object AutomaticDiagnostics {
         context: Context,
         deviceId: String,
         errorCode: String,
+        capturedMemorySamples: List<JSONObject>?,
     ) {
         ensureDirectories(context)
         TunnelLog.warning("diagnostics.connection_start_failed", errorCode.take(80))
@@ -500,6 +574,9 @@ internal object AutomaticDiagnostics {
                     errorCode = errorCode.take(80),
                     queuedAt = now,
                     sent = false,
+                    memorySamplesJson = automaticDiagnosticsEncodeMemorySamples(
+                        capturedMemorySamples.orEmpty(),
+                    ),
                 ).also {
                     writeStartFailureRequest(requestFile, it)
                     // Persist the OS job immediately after the durable marker. Report
@@ -524,7 +601,10 @@ internal object AutomaticDiagnostics {
             )
         }
         try {
-            materializeStartFailureRequest(context, deviceId)
+            materializeStartFailureRequest(
+                context,
+                deviceId,
+            )
         } finally {
             scheduleSystemUpload(context, delaySeconds = 0)
         }
@@ -545,7 +625,10 @@ internal object AutomaticDiagnostics {
             val pendingReport = File(pendingDirectory(context), request.reportName)
             if (pendingReport.isFile) return@withStartFailureLock
             if (File(sentDirectory(context), request.reportName).isFile) {
-                writeStartFailureRequest(requestFile, request.copy(sent = true))
+                writeStartFailureRequest(
+                    requestFile,
+                    request.copy(sent = true, memorySamplesJson = null),
+                )
                 return@withStartFailureLock
             }
             TunnelLog.info(
@@ -559,6 +642,7 @@ internal object AutomaticDiagnostics {
                     request.reportId,
                     request.queuedAt,
                     request.errorCode,
+                    request.memorySamplesJson?.let(::automaticDiagnosticsDecodeMemorySamples),
                 ),
             )
         }
@@ -569,10 +653,16 @@ internal object AutomaticDiagnostics {
         reportId: String,
         endedAt: Long,
         errorCode: String,
+        capturedMemorySamples: List<JSONObject>?,
     ): JSONObject {
         val startedAt = (endedAt - START_FAILURE_WINDOW_SECONDS).coerceAtLeast(0)
         val processes = androidProcessMemory(context)
         logMemorySnapshot(context.packageName, processes, "connection_start_failed")
+        val finalMemorySample = automaticDiagnosticsMemorySample(
+            processes,
+            "connection_start_failed",
+            endedAt,
+        )
         return JSONObject().apply {
             put("report_id", reportId)
             put("trigger", "connection_start_failed")
@@ -591,6 +681,16 @@ internal object AutomaticDiagnostics {
                     put("measurement_mode", "session_delta")
                     put("session_duration_ms", 0)
                     put("components", automaticDiagnosticsResourceComponents(processes))
+                    put(
+                        "memory_samples",
+                        memoryTimelineForReport(
+                            context,
+                            startedAt,
+                            endedAt,
+                            finalMemorySample,
+                            capturedMemorySamples,
+                        ),
+                    )
                 },
             )
         }
@@ -711,6 +811,13 @@ internal object AutomaticDiagnostics {
                                     processes,
                                 )
                             }
+                            if (
+                                sessionMemoryDetailGate.shouldCapture(
+                                    processRssBytes(Process.myPid()),
+                                )
+                            ) {
+                                scheduleSessionMemoryMappingSeries(context)
+                            }
                         }
                         .onFailure {
                             TunnelLog.warning("diagnostics.memory_watch_failed", error = it)
@@ -726,6 +833,25 @@ internal object AutomaticDiagnostics {
     private fun cancelMemoryGrowthWatchLocked() {
         memoryGrowthFuture?.cancel(false)
         memoryGrowthFuture = null
+    }
+
+    private fun scheduleSessionMemoryMappingSeries(context: Context) {
+        val captureGeneration = memoryCaptureGeneration.current()
+        if (captureGeneration <= 0) return
+        val capturedAtElapsedMillis = SystemClock.elapsedRealtime()
+        val diagnostics = TunnelStartMemoryDiagnostics(captureGeneration, baselineRssBytes = null)
+        tunnelStartMemoryMappingSamples().forEach { (sample, delayMillis) ->
+            scheduleOptionalMemoryCapture(captureGeneration, delayMillis) {
+                diagnostics.recordMappingSample(
+                    context = context.applicationContext,
+                    stage = "session_memory_growth",
+                    transport = sessionTransport,
+                    sample = sample,
+                    capturedAtElapsedMillis = capturedAtElapsedMillis,
+                    reasonPrefix = "tunnel_session_memory_mappings",
+                )
+            }
+        }
     }
 
     private fun recordMemorySnapshot(
@@ -1008,6 +1134,13 @@ internal object AutomaticDiagnostics {
             .filter { it.optLong("timestamp_unix", -1L) >= 0L }
     }
 
+    private fun snapshotMemoryTimeline(context: Context): List<JSONObject> =
+        synchronized(memoryTimelineGate) {
+            readMemoryTimelineSamples(context).map { sample ->
+                JSONObject(sample.toString())
+            }
+        }
+
     private fun writeMemoryTimelineSamples(context: Context, samples: List<JSONObject>) {
         ensureDirectories(context)
         val file = memoryTimelineFile(context)
@@ -1050,18 +1183,15 @@ internal object AutomaticDiagnostics {
         startedAt: Long,
         endedAt: Long,
         finalSample: JSONObject,
+        capturedMemorySamples: List<JSONObject>? = null,
     ): JSONArray = synchronized(memoryTimelineGate) {
-        val unique = linkedMapOf<String, JSONObject>()
-        (readMemoryTimelineSamples(context) + finalSample)
-            .filter { sample -> sample.optLong("timestamp_unix", -1L) in startedAt..endedAt }
-            .forEach { sample ->
-                val key = "${sample.optLong("timestamp_unix")}:${sample.optString("reason")}"
-                unique[key] = sample
-            }
         JSONArray(
-            automaticDiagnosticsBoundMemorySamples(
-                unique.values.toList(),
-                MAX_MEMORY_TIMELINE_SAMPLES,
+            automaticDiagnosticsMemorySamplesForReport(
+                samples = capturedMemorySamples ?: readMemoryTimelineSamples(context),
+                startedAt = startedAt,
+                endedAt = endedAt,
+                finalSample = finalSample,
+                maximum = MAX_MEMORY_TIMELINE_SAMPLES,
             ),
         )
     }
@@ -1112,7 +1242,9 @@ internal object AutomaticDiagnostics {
         expectedDeviceId: String,
     ): StartFailureRequest? {
         if (!file.isFile) return null
-        check(file.length() <= 4 * 1024L) { "automatic_diagnostics_start_failure_request_too_large" }
+        check(file.length() <= MAX_START_FAILURE_REQUEST_BYTES) {
+            "automatic_diagnostics_start_failure_request_too_large"
+        }
         return StartFailureRequest.fromJson(file.readText(StandardCharsets.UTF_8)).also {
             check(it.deviceId == expectedDeviceId) {
                 "automatic_diagnostics_start_failure_request_device_mismatch"
@@ -1150,6 +1282,9 @@ internal object AutomaticDiagnostics {
         val temporaryFile = File(requireNotNull(file.parentFile), ".${file.name}.part")
         val encoded = request.toJson().toByteArray(StandardCharsets.UTF_8)
         try {
+            check(encoded.size <= MAX_START_FAILURE_REQUEST_BYTES) {
+                "automatic_diagnostics_start_failure_request_too_large"
+            }
             FileOutputStream(temporaryFile).use { output ->
                 output.write(encoded)
                 output.flush()
@@ -1177,7 +1312,10 @@ internal object AutomaticDiagnostics {
             val request = readStartFailureRequestOrQuarantine(context, file, deviceId)
                 ?: return@withStartFailureLock
             if (!request.sent && request.reportName == reportName) {
-                writeStartFailureRequest(file, request.copy(sent = true))
+                writeStartFailureRequest(
+                    file,
+                    request.copy(sent = true, memorySamplesJson = null),
+                )
             }
         }
     }
@@ -1320,6 +1458,20 @@ internal data class AutomaticDiagnosticsProcessMemory(
     val proportionalBytes: Long?,
 )
 
+internal class AutomaticDiagnosticsMemoryCaptureGeneration {
+    private val current = AtomicLong(0)
+
+    fun begin(): Long = current.incrementAndGet()
+
+    fun isCurrent(generation: Long): Boolean = generation > 0 && current.get() == generation
+
+    fun current(): Long = current.get()
+
+    fun invalidate() {
+        current.incrementAndGet()
+    }
+}
+
 internal class AutomaticDiagnosticsMemoryGrowthTracker(
     private val thresholdBytes: Long,
 ) {
@@ -1348,6 +1500,27 @@ internal class AutomaticDiagnosticsMemoryGrowthTracker(
     }
 }
 
+internal class AutomaticDiagnosticsSessionMemoryDetailGate(
+    thresholdBytes: Long,
+) {
+    private val growthTracker = AutomaticDiagnosticsMemoryGrowthTracker(thresholdBytes)
+    private var captured = false
+
+    @Synchronized
+    fun shouldCapture(currentBytes: Long?): Boolean {
+        val thresholdReached = growthTracker.observe(currentBytes)
+        if (!thresholdReached || captured) return false
+        captured = true
+        return true
+    }
+
+    @Synchronized
+    fun reset(currentBytes: Long? = null) {
+        growthTracker.reset(currentBytes)
+        captured = false
+    }
+}
+
 internal fun automaticDiagnosticsBoundMemorySamples(
     samples: List<JSONObject>,
     maximum: Int,
@@ -1355,7 +1528,72 @@ internal fun automaticDiagnosticsBoundMemorySamples(
     if (maximum <= 0 || samples.isEmpty()) return emptyList()
     if (samples.size <= maximum) return samples
     if (maximum == 1) return listOf(samples.first())
-    return listOf(samples.first()) + samples.takeLast(maximum - 1)
+    val sessionBaselineIndex = samples.indexOfFirst { sample ->
+        sample.optString("reason") == "tunnel_started"
+    }.takeIf { it >= 0 } ?: 0
+    val selectedIndexes = linkedSetOf(sessionBaselineIndex)
+    samples.forEachIndexed { index, sample ->
+        if (
+            selectedIndexes.size < maximum &&
+            automaticDiagnosticsIsDetailedMemoryMappingSample(sample.optString("reason"))
+        ) {
+            selectedIndexes += index
+        }
+    }
+    for (index in samples.lastIndex downTo 0) {
+        if (selectedIndexes.size >= maximum) break
+        selectedIndexes += index
+    }
+    return selectedIndexes.sorted().map(samples::get)
+}
+
+internal fun automaticDiagnosticsIsDetailedMemoryMappingSample(reason: String): Boolean =
+    reason.startsWith("tunnel_start_memory_mappings_") ||
+        reason.startsWith("tunnel_session_memory_mappings_")
+
+internal fun automaticDiagnosticsMemorySamplesForReport(
+    samples: List<JSONObject>,
+    startedAt: Long,
+    endedAt: Long,
+    finalSample: JSONObject,
+    maximum: Int,
+): List<JSONObject> {
+    val unique = linkedMapOf<String, JSONObject>()
+    (samples + finalSample)
+        .filter { sample -> sample.optLong("timestamp_unix", -1L) in startedAt..endedAt }
+        .forEach { sample ->
+            val key = "${sample.optLong("timestamp_unix")}:${sample.optString("reason")}"
+            unique[key] = sample
+        }
+    return automaticDiagnosticsBoundMemorySamples(unique.values.toList(), maximum)
+}
+
+internal fun automaticDiagnosticsEncodeMemorySamples(samples: List<JSONObject>): String =
+    JSONArray(
+        automaticDiagnosticsBoundMemorySamples(samples, MAX_MEMORY_TIMELINE_SAMPLES),
+    ).toString().also { encoded ->
+        check(
+            encoded.toByteArray(StandardCharsets.UTF_8).size <=
+                MAX_START_FAILURE_MEMORY_SNAPSHOT_BYTES,
+        ) {
+            "automatic_diagnostics_memory_snapshot_too_large"
+        }
+    }
+
+internal fun automaticDiagnosticsDecodeMemorySamples(encoded: String): List<JSONObject> {
+    check(
+        encoded.toByteArray(StandardCharsets.UTF_8).size <=
+            MAX_START_FAILURE_MEMORY_SNAPSHOT_BYTES,
+    ) {
+        "automatic_diagnostics_memory_snapshot_too_large"
+    }
+    val payload = JSONArray(encoded)
+    check(payload.length() <= MAX_MEMORY_TIMELINE_SAMPLES) {
+        "automatic_diagnostics_memory_snapshot_too_many_samples"
+    }
+    return (0 until payload.length()).map { index ->
+        JSONObject(payload.getJSONObject(index).toString())
+    }
 }
 
 internal fun automaticDiagnosticsMemorySamplesAfter(
@@ -1444,12 +1682,20 @@ internal class TunnelStartMemoryDetailGate(
             growth?.let { it >= TUNNEL_START_MEMORY_GROWTH_THRESHOLD_BYTES } == true
         return thresholdReached && captured.compareAndSet(false, true)
     }
+
+    fun hasCaptured(): Boolean = captured.get()
 }
 
 internal fun tunnelStartMemoryDelayedStages(): List<Pair<String, Long>> = listOf(
     "after_backend_100ms" to 100L,
     "after_backend_1s" to 1_000L,
     "after_backend_5s" to 5_000L,
+)
+
+internal fun tunnelStartMemoryMappingSamples(): List<Pair<String, Long>> = listOf(
+    "initial" to 0L,
+    "confirmation" to 500L,
+    "settled" to 5_000L,
 )
 
 internal fun containTunnelStartMemoryDiagnosticsFailure(block: () -> Unit): Throwable? =
@@ -1465,9 +1711,21 @@ internal fun runTunnelStartupPostActions(
         ?.let { failure -> runCatching { onDiagnosticsFailure(failure) } }
 }
 
-internal class TunnelStartMemoryDiagnostics {
+internal fun runTunnelFailureCleanup(
+    optionalDiagnostics: () -> Unit,
+    requiredCleanup: () -> Unit,
+    onDiagnosticsFailure: (Throwable) -> Unit,
+) {
+    containTunnelStartMemoryDiagnosticsFailure(optionalDiagnostics)
+        ?.let { failure -> runCatching { onDiagnosticsFailure(failure) } }
+    requiredCleanup()
+}
+
+internal class TunnelStartMemoryDiagnostics(
+    private val captureGeneration: Long,
+    private val baselineRssBytes: Long?,
+) {
     private val processId = Process.myPid()
-    private val baselineRssBytes = processRssBytes(processId)
     private val detailGate = TunnelStartMemoryDetailGate(baselineRssBytes)
     private val startedAtElapsedMillis = SystemClock.elapsedRealtime()
 
@@ -1478,6 +1736,53 @@ internal class TunnelStartMemoryDiagnostics {
         if (failure != null) {
             runCatching {
                 TunnelLog.warning("diagnostics.memory_start_failed", error = failure)
+            }
+        }
+    }
+
+    fun recordFailure(context: Context, transport: String? = null) {
+        val rssBytes = processRssBytes(processId)
+        if (detailGate.shouldCapture(rssBytes)) {
+            containTunnelStartMemoryDiagnosticsFailure {
+                recordDetailedMemory(context, "start_failed", transport, rssBytes)
+            }?.let { failure ->
+                runCatching {
+                    TunnelLog.warning("diagnostics.memory_start_failed", error = failure)
+                }
+            }
+        }
+        if (!detailGate.hasCaptured()) return
+        recordMappingSample(
+            context = context.applicationContext,
+            stage = "start_failed",
+            transport = transport,
+            sample = "failure",
+            capturedAtElapsedMillis = SystemClock.elapsedRealtime(),
+            reasonPrefix = "tunnel_start_memory_mappings",
+        )
+    }
+
+    fun recordMappingSample(
+        context: Context,
+        stage: String,
+        transport: String?,
+        sample: String,
+        capturedAtElapsedMillis: Long,
+        reasonPrefix: String = "tunnel_start_memory_mappings",
+    ) {
+        val failure = containTunnelStartMemoryDiagnosticsFailure {
+            recordMemoryMappings(
+                context,
+                stage,
+                transport,
+                sample,
+                capturedAtElapsedMillis,
+                reasonPrefix,
+            )
+        }
+        if (failure != null) {
+            runCatching {
+                TunnelLog.warning("diagnostics.memory_mappings_failed", error = failure)
             }
         }
     }
@@ -1502,6 +1807,22 @@ internal class TunnelStartMemoryDiagnostics {
         )
         if (detailGate.shouldCapture(rssBytes)) {
             recordDetailedMemory(context, stage, transport, rssBytes)
+            val applicationContext = context.applicationContext
+            val capturedAtElapsedMillis = SystemClock.elapsedRealtime()
+            tunnelStartMemoryMappingSamples().forEach { (sample, delayMillis) ->
+                AutomaticDiagnostics.scheduleOptionalMemoryCapture(
+                    captureGeneration,
+                    delayMillis,
+                ) {
+                    recordMappingSample(
+                        applicationContext,
+                        stage,
+                        transport,
+                        sample,
+                        capturedAtElapsedMillis,
+                    )
+                }
+            }
         }
     }
 
@@ -1543,6 +1864,150 @@ internal class TunnelStartMemoryDiagnostics {
                 "pss_private_other_bytes" to statBytes("summary.private-other"),
                 "pss_system_bytes" to statBytes("summary.system"),
             ),
+        )
+    }
+
+    private fun recordMemoryMappings(
+        context: Context,
+        stage: String,
+        transport: String?,
+        sample: String,
+        capturedAtElapsedMillis: Long,
+        reasonPrefix: String,
+    ) {
+        val activityManager = context.getSystemService(ActivityManager::class.java)
+        val info = activityManager.getProcessMemoryInfo(intArrayOf(processId)).firstOrNull()
+        val memoryStats = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            info?.memoryStats.orEmpty()
+        } else {
+            emptyMap()
+        }
+        val rollupResult = runCatching {
+            File("/proc/$processId/smaps_rollup").bufferedReader().useLines {
+                automaticDiagnosticsParseSmapsRollup(it)
+            }
+        }
+        val rollup = rollupResult.getOrNull()
+        val smapsResult = runCatching {
+            File("/proc/$processId/smaps").bufferedReader().useLines {
+                automaticDiagnosticsSummarizeSmaps(it, TUNNEL_START_MEMORY_TOP_MAPPINGS)
+            }
+        }
+        val smaps = smapsResult.getOrDefault(
+            AutomaticDiagnosticsSmapsSummary(0, 0, emptyList(), emptyList()),
+        )
+        val smapsErrorType = smapsResult.exceptionOrNull()?.javaClass?.simpleName?.take(96)
+        val rollupErrorType = rollupResult.exceptionOrNull()?.javaClass?.simpleName?.take(96)
+        val encodedMappings = JSONArray().apply {
+            smaps.topMappings.forEach { mapping ->
+                put(JSONObject().apply {
+                    put("category", mapping.category)
+                    put("name", mapping.name)
+                    put("resident_bytes", mapping.residentBytes)
+                    put("proportional_bytes", mapping.proportionalBytes)
+                    put("private_clean_bytes", mapping.privateCleanBytes)
+                    put("private_dirty_bytes", mapping.privateDirtyBytes)
+                    put("shared_clean_bytes", mapping.sharedCleanBytes)
+                    put("shared_dirty_bytes", mapping.sharedDirtyBytes)
+                    put("swap_bytes", mapping.swapBytes)
+                    put("swap_proportional_bytes", mapping.swapProportionalBytes)
+                    put("executable", mapping.executable)
+                })
+            }
+        }
+        val encodedCategories = JSONArray().apply {
+            smaps.categories.forEach { category ->
+                put(JSONObject().apply {
+                    put("category", category.category)
+                    put("resident_bytes", category.residentBytes)
+                    put("proportional_bytes", category.proportionalBytes)
+                    put("private_clean_bytes", category.privateCleanBytes)
+                    put("private_dirty_bytes", category.privateDirtyBytes)
+                    put("shared_clean_bytes", category.sharedCleanBytes)
+                    put("shared_dirty_bytes", category.sharedDirtyBytes)
+                    put("swap_bytes", category.swapBytes)
+                    put("swap_proportional_bytes", category.swapProportionalBytes)
+                })
+            }
+        }
+        val elapsedSincePressureMillis = (
+            SystemClock.elapsedRealtime() - capturedAtElapsedMillis
+        ).coerceAtLeast(0)
+        val rssBytes = processRssBytes(processId)
+        val peakRssBytes = processPeakRssBytes(processId)
+        val pssBytes = info?.totalPss?.toLong()?.times(1024L)
+        val pssCodeBytes = automaticDiagnosticsMemoryStatBytes(memoryStats, "summary.code")
+        TunnelLog.info(
+            "diagnostics.memory_mappings",
+            mapOf(
+                "stage" to stage.take(64),
+                "transport" to transport,
+                "sample" to sample,
+                "pid" to processId,
+                "elapsed_since_pressure_ms" to elapsedSincePressureMillis,
+                "rss_bytes" to rssBytes,
+                "peak_rss_bytes" to peakRssBytes,
+                "pss_bytes" to pssBytes,
+                "pss_code_bytes" to pssCodeBytes,
+                "smaps_available" to smapsResult.isSuccess,
+                "smaps_rollup_available" to rollupResult.isSuccess,
+                "smaps_mapping_count" to smaps.mappingCount,
+                "smaps_mapping_group_count" to smaps.mappingGroupCount,
+                "smaps_error_type" to smapsErrorType,
+                "smaps_rollup_error_type" to rollupErrorType,
+                "smaps_rss_bytes" to rollup?.residentBytes,
+                "smaps_pss_bytes" to rollup?.proportionalBytes,
+                "smaps_private_clean_bytes" to rollup?.privateCleanBytes,
+                "smaps_private_dirty_bytes" to rollup?.privateDirtyBytes,
+                "smaps_shared_clean_bytes" to rollup?.sharedCleanBytes,
+                "smaps_shared_dirty_bytes" to rollup?.sharedDirtyBytes,
+                "smaps_swap_bytes" to rollup?.swapBytes,
+                "smaps_swap_pss_bytes" to rollup?.swapProportionalBytes,
+                "mapping_categories" to encodedCategories,
+                "top_mappings" to encodedMappings,
+            ),
+        )
+        AutomaticDiagnostics.recordMemoryMappingSample(
+            context,
+            captureGeneration,
+            JSONObject().apply {
+                put("timestamp_unix", nowUnix())
+                put("reason", "${reasonPrefix}_$sample")
+                put("stage", stage.take(64))
+                put("transport", transport)
+                put("sample", sample)
+                put("elapsed_since_pressure_ms", elapsedSincePressureMillis)
+                put("smaps_available", smapsResult.isSuccess)
+                put("smaps_rollup_available", rollupResult.isSuccess)
+                put("smaps_mapping_count", smaps.mappingCount)
+                put("smaps_mapping_group_count", smaps.mappingGroupCount)
+                smapsErrorType?.let { put("smaps_error_type", it) }
+                rollupErrorType?.let { put("smaps_rollup_error_type", it) }
+                put(
+                    "components",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("component", "android_vpn_process")
+                            put("source", "android_smaps")
+                            put("process_id", processId)
+                            putNullable("current_resident_memory_bytes", rssBytes)
+                            putNullable("peak_resident_memory_bytes", peakRssBytes)
+                            putNullable("current_proportional_memory_bytes", pssBytes)
+                            putNullable("pss_code_bytes", pssCodeBytes)
+                        },
+                    ),
+                )
+                putNullable("smaps_rss_bytes", rollup?.residentBytes)
+                putNullable("smaps_pss_bytes", rollup?.proportionalBytes)
+                putNullable("smaps_private_clean_bytes", rollup?.privateCleanBytes)
+                putNullable("smaps_private_dirty_bytes", rollup?.privateDirtyBytes)
+                putNullable("smaps_shared_clean_bytes", rollup?.sharedCleanBytes)
+                putNullable("smaps_shared_dirty_bytes", rollup?.sharedDirtyBytes)
+                putNullable("smaps_swap_bytes", rollup?.swapBytes)
+                putNullable("smaps_swap_pss_bytes", rollup?.swapProportionalBytes)
+                put("mapping_categories", encodedCategories)
+                put("top_mappings", encodedMappings)
+            },
         )
     }
 }
@@ -1737,7 +2202,7 @@ private fun currentProcessName(context: Context): String {
     return automaticDiagnosticsLegacyProcessName(commandLine, context.packageName)
 }
 
-private fun processRssBytes(processId: Int): Long? = runCatching {
+internal fun processRssBytes(processId: Int): Long? = runCatching {
     automaticDiagnosticsStatusMemoryBytes(File("/proc/$processId/status").readText(), "VmRSS")
 }.getOrNull()
 
@@ -1818,6 +2283,7 @@ internal data class StartFailureRequest(
     val errorCode: String,
     val queuedAt: Long,
     val sent: Boolean,
+    val memorySamplesJson: String? = null,
 ) {
     val reportName: String
         get() = automaticDiagnosticsPendingReportName(queuedAt, deviceId, reportId)
@@ -1829,6 +2295,7 @@ internal data class StartFailureRequest(
         put("error_code", errorCode)
         put("queued_at", queuedAt)
         put("sent", sent)
+        memorySamplesJson?.let { put("memory_samples", JSONArray(it)) }
     }.toString()
 
     companion object {
@@ -1845,6 +2312,13 @@ internal data class StartFailureRequest(
                 errorCode = payload.getString("error_code").take(80),
                 queuedAt = payload.getLong("queued_at").coerceAtLeast(0),
                 sent = payload.getBoolean("sent"),
+                memorySamplesJson = payload.optJSONArray("memory_samples")?.let { samples ->
+                    automaticDiagnosticsEncodeMemorySamples(
+                        (0 until samples.length()).map { index ->
+                            JSONObject(samples.getJSONObject(index).toString())
+                        },
+                    )
+                },
             )
         }
     }

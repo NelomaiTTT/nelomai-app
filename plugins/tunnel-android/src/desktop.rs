@@ -74,6 +74,17 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(())
     }
 
+    pub async fn recover_background_session(
+        &self,
+        _request: BackgroundSessionRecoveryRequest,
+    ) -> crate::Result<BackgroundSessionRecoveryResponse> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Android background session recovery is unavailable on desktop",
+        )
+        .into())
+    }
+
     pub fn take_quick_state_change(&self) -> crate::Result<QuickStateChangeResponse> {
         Ok(QuickStateChangeResponse::default())
     }

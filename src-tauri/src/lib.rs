@@ -450,17 +450,46 @@ async fn upload_automatic_diagnostics(
                 Some("invalid_diagnostics_response"),
             );
         }
-        Err(_) => {
+        Err(error) => {
             let _ = diagnostics.automatic_upload_failed(current_unix_time());
             diagnostics.record_named(
                 "diagnostics.automatic_upload_failed",
                 candidate.report.tunnel_session_id.as_deref(),
                 None,
-                Some("upload_failed"),
+                Some(&automatic_upload_error_code(&error)),
             );
         }
     }
     true
+}
+
+#[cfg(desktop)]
+fn automatic_upload_error_code(error: &ApplicationError) -> String {
+    use nelomai_client_core::{CoreApiError, CoreError};
+
+    fn api_code(error: &CoreApiError) -> String {
+        match error {
+            CoreApiError::Unauthorized => "signed_out".to_string(),
+            CoreApiError::AccessExpired => "access_expired".to_string(),
+            CoreApiError::Retryable => "temporary_network_error".to_string(),
+            CoreApiError::Rejected { code, .. } => code.clone(),
+        }
+    }
+
+    match error {
+        ApplicationError::Storage => "storage_unavailable".to_string(),
+        ApplicationError::Clock => "clock_unavailable".to_string(),
+        ApplicationError::Api(error) => api_code(error),
+        ApplicationError::Core(error) => match error {
+            CoreError::SignedOut => "signed_out".to_string(),
+            CoreError::AccessExpired => "access_expired".to_string(),
+            CoreError::UpdateRequired => "update_required".to_string(),
+            CoreError::SavedConnectionUnavailable => "saved_connection_unavailable".to_string(),
+            CoreError::Storage => "storage_unavailable".to_string(),
+            CoreError::Api(error) => api_code(error),
+            CoreError::Tunnel(code) | CoreError::SplitTunnel(code) => code.clone(),
+        },
+    }
 }
 
 fn start_split_tunnel_scheduler(
@@ -1372,6 +1401,25 @@ fn connection_metrics_poll_required(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_upload_diagnostics_preserves_the_stable_failure_reason() {
+        assert_eq!(
+            automatic_upload_error_code(&ApplicationError::Api(
+                nelomai_client_core::CoreApiError::Retryable,
+            )),
+            "temporary_network_error",
+        );
+        assert_eq!(
+            automatic_upload_error_code(&ApplicationError::Api(
+                nelomai_client_core::CoreApiError::Rejected {
+                    code: "diagnostics_rate_limited".to_string(),
+                    message: "retry later".to_string(),
+                },
+            )),
+            "diagnostics_rate_limited",
+        );
+    }
 
     #[test]
     fn desktop_incident_sampling_does_not_depend_on_visible_metrics() {

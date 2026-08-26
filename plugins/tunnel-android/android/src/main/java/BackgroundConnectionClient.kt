@@ -21,6 +21,11 @@ internal data class BackgroundStartResult(
     val options: TunnelOptionsArgs,
 )
 
+internal data class BackgroundSessionRecoveryResult(
+    val accessToken: String,
+    val refreshToken: String,
+)
+
 internal class BackgroundConnectionException(val code: String) : RuntimeException(code)
 
 internal object BackgroundConnectionClient {
@@ -61,14 +66,7 @@ internal object BackgroundConnectionClient {
         operationId: String,
         context: Context,
     ): BackgroundStartResult {
-        val request = JSONObject().apply {
-            put("operation_id", operationId)
-            put("layer", template.connection.layer)
-            put("tic_connection_mode", template.connection.ticConnectionMode)
-            put("route_mode", template.connection.routeMode)
-            put("probes", JSONArray())
-            put("allow_alternate", template.connection.allowAlternate)
-        }
+        val request = backgroundStartPayload(template, operationId)
         val payload = execute(credential, "background/connections/start", request)
         val connection = payload.getJSONObject("connection").toQuickConnection()
         connection.allowAlternate = template.connection.allowAlternate
@@ -98,6 +96,21 @@ internal object BackgroundConnectionClient {
         credential: BackgroundCredential,
         payload: JSONObject,
     ): JSONObject = execute(credential, "background/diagnostics", payload)
+
+    fun recoverSession(
+        credential: BackgroundCredential,
+        installSecret: String,
+    ): BackgroundSessionRecoveryResult {
+        val payload = execute(
+            credential,
+            "background/auth/recover",
+            backgroundRecoveryPayload(installSecret),
+        )
+        return BackgroundSessionRecoveryResult(
+            accessToken = payload.getString("access_token"),
+            refreshToken = payload.getString("refresh_token"),
+        )
+    }
 
     private fun execute(
         credential: BackgroundCredential,
@@ -141,8 +154,11 @@ internal object BackgroundConnectionClient {
             val json = runCatching { JSONObject(body) }.getOrNull()
             if (status !in 200..299) {
                 throw BackgroundConnectionException(
-                    json?.optString("code")?.takeIf(String::isNotBlank)
-                        ?: "background_panel_error",
+                    backgroundPanelErrorCode(
+                        endpoint,
+                        status,
+                        json?.optString("code")?.takeIf(String::isNotBlank),
+                    ),
                 )
             }
             json ?: throw BackgroundConnectionException("invalid_background_response")
@@ -154,6 +170,34 @@ internal object BackgroundConnectionClient {
             connection.disconnect()
         }
     }
+}
+
+internal fun backgroundPanelErrorCode(
+    endpoint: String,
+    status: Int,
+    panelCode: String?,
+): String = panelCode?.takeIf(String::isNotBlank)
+    ?: if (endpoint == "background/auth/recover" && status == 404) {
+        "background_recovery_unsupported"
+    } else {
+        "background_panel_error"
+    }
+
+internal fun backgroundRecoveryPayload(installSecret: String): JSONObject = JSONObject().apply {
+    put("install_secret", installSecret)
+}
+
+internal fun backgroundStartPayload(
+    template: QuickTunnelTemplate,
+    operationId: String,
+): JSONObject = JSONObject().apply {
+    put("operation_id", operationId)
+    put("layer", template.connection.layer)
+    put("tic_connection_mode", template.connection.ticConnectionMode)
+    put("route_mode", template.connection.routeMode)
+    put("egress_mode", template.connection.egressMode)
+    put("probes", JSONArray())
+    put("allow_alternate", template.connection.allowAlternate)
 }
 
 private fun JSONObject.toTunnelOptions(
@@ -268,6 +312,7 @@ internal fun shouldRetryBackgroundStart(
     errorCode: String,
 ): Boolean = previousLeaseId.isNotBlank() && (
     errorCode == "connection_no_longer_active" ||
+        errorCode == "operation_id_conflict" ||
         (allowAlternate && errorCode in setOf(
             "saved_connection_unavailable",
             "saved_stray_unavailable",
@@ -279,5 +324,6 @@ private fun JSONObject.toQuickConnection(): QuickConnectionArgs = QuickConnectio
     layer = getString("layer")
     ticConnectionMode = getString("tic_connection_mode")
     routeMode = getString("route_mode")
+    egressMode = optString("egress_mode", "ipv4")
     allowAlternate = false
 }

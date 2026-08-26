@@ -214,6 +214,7 @@ jobs:
           NELOMAI_FIREBASE_APPLICATION_ID: ${{ secrets.NELOMAI_FIREBASE_APPLICATION_ID }}
           NELOMAI_FIREBASE_API_KEY: ${{ secrets.NELOMAI_FIREBASE_API_KEY }}
           NELOMAI_FIREBASE_PROJECT_ID: ${{ secrets.NELOMAI_FIREBASE_PROJECT_ID }}
+          CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
           test -n "$NELOMAI_FIREBASE_APPLICATION_ID"
           test -n "$NELOMAI_FIREBASE_API_KEY"
@@ -225,6 +226,20 @@ jobs:
           test -f "$apk"
           apksigner="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
           "$apksigner" verify --verbose "$apk"
+          native_directory="$RUNNER_TEMP/android-release-native"
+          mkdir -p "$native_directory"
+          mapfile -t native_entries < <(
+            unzip -Z1 "$apk" | grep -E '^lib/arm64-v8a/[^/]+\.so$'
+          )
+          test "${#native_entries[@]}" -gt 0
+          for native_entry in "${native_entries[@]}"; do
+            extracted_library="$native_directory/$(basename "$native_entry")"
+            unzip -p "$apk" "$native_entry" > "$extracted_library"
+            if readelf -S --wide "$extracted_library" | grep -Eq '\.debug_|\.symtab'; then
+              echo "Android release library keeps debug or static symbols: $native_entry" >&2
+              exit 1
+            fi
+          done
           native_library="$RUNNER_TEMP/libwg-go-release.so"
           unzip -p "$apk" lib/arm64-v8a/libwg-go.so > "$native_library"
           native_symbols="$RUNNER_TEMP/libwg-go-release.symbols"

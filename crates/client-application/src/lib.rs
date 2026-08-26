@@ -729,6 +729,37 @@ where
         self.core.bootstrap(now_unix).await.map_err(Into::into)
     }
 
+    pub async fn bootstrap_without_refresh(
+        &self,
+        now_unix: i64,
+    ) -> Result<Bootstrap, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core
+            .bootstrap_without_refresh(now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub fn install_secret(&self) -> Result<String, ApplicationError> {
+        self.store
+            .load()
+            .map_err(|_| ApplicationError::Storage)?
+            .map(|stored| stored.install_secret)
+            .ok_or(ApplicationError::Core(CoreError::SignedOut))
+    }
+
+    pub async fn replace_session_tokens(
+        &self,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> Result<(), ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core
+            .replace_session_tokens(access_token, refresh_token)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn start(
         &self,
         mut options: ConnectOptions,

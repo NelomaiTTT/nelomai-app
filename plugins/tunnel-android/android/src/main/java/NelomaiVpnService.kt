@@ -21,6 +21,7 @@ import androidx.core.content.ContextCompat
 import org.amnezia.awg.backend.GoBackend
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
 
@@ -494,21 +495,21 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun performBackgroundToggle() {
-        val targetActive = !QuickTunnelController.desiredActive(applicationContext)
-        QuickTunnelController.updateState(
-            applicationContext,
-            if (targetActive) SessionState.STARTING else SessionState.STOPPING,
-            desiredActive = targetActive,
+        dispatchBackgroundToggle(
+            desiredActive = QuickTunnelController.desiredActive(applicationContext),
+            start = { performBackgroundStart(restoring = false) },
+            stop = {
+                TunnelRuntime.backgroundStop(
+                    applicationContext,
+                    onSuccess = { state, _ ->
+                        completeBackgroundAction(state, null, false, false)
+                    },
+                    onError = {
+                        completeBackgroundAction(TunnelRuntime.state(), it, false, false)
+                    },
+                )
+            },
         )
-        if (targetActive) {
-            performBackgroundStart(restoring = false)
-        } else {
-            TunnelRuntime.backgroundStop(
-                applicationContext,
-                onSuccess = { state, _ -> completeBackgroundAction(state, null, false, false) },
-                onError = { completeBackgroundAction(TunnelRuntime.state(), it, false, false) },
-            )
-        }
     }
 
     private fun performBackgroundStart(restoring: Boolean) {
@@ -566,9 +567,29 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 "background_start.failed",
                 errorCode,
             )
-            queueBackgroundStartFailureDiagnostics(errorCode) {
-                finishBackgroundAction(state, errorCode, restoring)
-            }
+            var stopServiceAfterDiagnostics = false
+            completeBackgroundFailureWithDiagnostics(
+                queueDiagnostics = { onComplete ->
+                    queueBackgroundStartFailureDiagnostics(errorCode, onComplete)
+                },
+                finishUserAction = {
+                    stopServiceAfterDiagnostics = finishBackgroundAction(
+                        state,
+                        errorCode,
+                        restoring,
+                        deferErrorServiceStop = true,
+                    )
+                },
+                finishDeferredServiceStop = {
+                    if (stopServiceAfterDiagnostics) stopForegroundService()
+                },
+                onDiagnosticsQueueFailure = { failure ->
+                    TunnelLog.warning(
+                        "diagnostics.start_failure_report_queue_failed",
+                        error = failure,
+                    )
+                },
+            )
             return
         }
         finishBackgroundAction(state, errorCode, restoring)
@@ -578,7 +599,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
         state: SessionState,
         errorCode: String?,
         restoring: Boolean,
-    ) {
+        deferErrorServiceStop: Boolean = false,
+    ): Boolean {
         val retryRestore = errorCode != null && restoring && shouldRetryServiceRestore(errorCode)
         if (retryRestore) {
             QuickTunnelController.updateState(
@@ -590,7 +612,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             TunnelLog.warning("service.restore_deferred", errorCode)
             scheduleRestoreRetry()
             TunnelPlugin.refreshQuickTile(applicationContext)
-            return
+            return false
         }
         cancelRestoreRetry()
         QuickTunnelController.updateState(
@@ -600,15 +622,21 @@ class NelomaiVpnService : GoBackend.VpnService() {
             changed = true,
         )
         TunnelPlugin.refreshQuickTile(applicationContext)
+        var deferredServiceStop = false
         errorCode?.let { code ->
             TunnelLog.warning("quick_toggle.failed", code)
             if (state != SessionState.RUNNING) {
-                stopForegroundService()
+                if (deferErrorServiceStop) {
+                    deferredServiceStop = true
+                } else {
+                    stopForegroundService()
+                }
             }
             android.os.Handler(mainLooper).post {
                 Toast.makeText(applicationContext, quickActionError(code), Toast.LENGTH_LONG).show()
             }
         }
+        return deferredServiceStop
     }
 
     private fun queueBackgroundStartFailureDiagnostics(
@@ -778,6 +806,36 @@ internal fun shouldQueueBackgroundStartFailureDiagnostics(
     starting: Boolean,
     errorCode: String?,
 ): Boolean = starting && errorCode != null && errorCode != "tunnel_operation_in_progress"
+
+internal fun dispatchBackgroundToggle(
+    desiredActive: Boolean,
+    start: () -> Unit,
+    stop: () -> Unit,
+) {
+    val targetActive = !desiredActive
+    if (targetActive) start() else stop()
+}
+
+internal fun completeBackgroundFailureWithDiagnostics(
+    queueDiagnostics: (() -> Unit) -> Unit,
+    finishUserAction: () -> Unit,
+    finishDeferredServiceStop: () -> Unit,
+    onDiagnosticsQueueFailure: (Throwable) -> Unit = {},
+) {
+    finishUserAction()
+    val pendingServiceStop = AtomicBoolean(true)
+    val finishServiceStopOnce = {
+        if (pendingServiceStop.compareAndSet(true, false)) {
+            finishDeferredServiceStop()
+        }
+    }
+    try {
+        queueDiagnostics(finishServiceStopOnce)
+    } catch (error: Throwable) {
+        runCatching { onDiagnosticsQueueFailure(error) }
+        finishServiceStopOnce()
+    }
+}
 
 private fun ResultReceiver?.sendOperation(state: SessionState, durationMillis: Long) {
     this?.send(

@@ -3,7 +3,7 @@ use nelomai_client_tunnel::{
     QuickReconnect, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
     TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
-use nelomai_contracts::{Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
+use nelomai_contracts::{EgressMode, Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
@@ -127,6 +127,11 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                     route_mode: match quick.route_mode {
                         RouteMode::Standalone => "standalone",
                         RouteMode::ViaTak => "via_tak",
+                    }
+                    .to_string(),
+                    egress_mode: match quick.egress_mode {
+                        EgressMode::Ipv4 => "ipv4",
+                        EgressMode::PreferIpv6 => "prefer_ipv6",
                     }
                     .to_string(),
                     allow_alternate: quick.allow_alternate,

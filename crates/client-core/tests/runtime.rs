@@ -1237,6 +1237,59 @@ async fn bootstrap_refreshes_an_expired_access_token_without_signing_out() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn bootstrap_without_refresh_preserves_a_stale_session_for_external_recovery() {
+    let api = Arc::new(MockApi::new(0));
+    api.reject_stale_bootstrap.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    let error = core
+        .bootstrap_without_refresh(1_700_000_000)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, CoreError::SignedOut));
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 0);
+    let stored = store.load().unwrap().unwrap();
+    assert_eq!(stored.access_token.as_deref(), Some("stale-access"));
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-secret"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn replacing_session_tokens_preserves_device_state() {
+    let api = Arc::new(MockApi::new(0));
+    let mut original = auth();
+    original.compatibility = Some(StoredCompatibility {
+        update_required: false,
+        observed_at_unix: 1_700_000_000,
+    });
+    let expected_install_secret = original.install_secret.clone();
+    let expected_compatibility = original.compatibility.clone();
+    let store = Arc::new(MemoryStore::new(original));
+    let core = ClientCore::new(
+        api,
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.replace_session_tokens("recovered-access", "recovered-refresh")
+        .await
+        .unwrap();
+
+    let stored = store.load().unwrap().unwrap();
+    assert_eq!(stored.install_secret, expected_install_secret);
+    assert_eq!(stored.compatibility, expected_compatibility);
+    assert_eq!(stored.access_token.as_deref(), Some("recovered-access"));
+    assert_eq!(stored.refresh_token.as_deref(), Some("recovered-refresh"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn start_refreshes_once_and_reuses_the_same_operation() {
     let api = Arc::new(MockApi::new(0));
     api.reject_stale_start.store(true, Ordering::SeqCst);

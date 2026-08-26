@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.json.JSONObject
 
 class TunnelPayloadTest {
     @Test
@@ -163,6 +164,65 @@ class TunnelPayloadTest {
                 false,
                 "connection_no_longer_active",
             ),
+        )
+        assertTrue(
+            shouldRetryBackgroundStart(
+                "saved-lease",
+                false,
+                "operation_id_conflict",
+            ),
+        )
+    }
+
+    @Test
+    fun legacyQuickPlanWithoutEgressModeIsRejectedInsteadOfAssumingIpv4() {
+        val legacy = JSONObject().apply {
+            put("leaseId", "lease-ipv6")
+            put("layer", "tic")
+            put("ticConnectionMode", "dynamic")
+            put("routeMode", "via_tak")
+            put("allowAlternate", true)
+        }
+
+        assertTrue(runCatching { legacy.toStoredQuickConnection() }.isFailure)
+    }
+
+    @Test
+    fun backgroundStartPreservesTheSelectedEgressMode() {
+        val connection = QuickConnectionArgs().apply {
+            leaseId = "lease-ipv6"
+            layer = "tic"
+            ticConnectionMode = "dynamic"
+            routeMode = "via_tak"
+            egressMode = "prefer_ipv6"
+            allowAlternate = true
+        }
+        val payload = backgroundStartPayload(
+            QuickTunnelTemplate(TunnelOptionsArgs(), connection),
+            "operation-ipv6",
+        )
+
+        assertEquals("prefer_ipv6", payload.getString("egress_mode"))
+        assertEquals("operation-ipv6", payload.getString("operation_id"))
+    }
+
+    @Test
+    fun backgroundRecoveryUsesTheInstallSecretExpectedByThePanel() {
+        val payload = backgroundRecoveryPayload("install-secret")
+
+        assertEquals("install-secret", payload.getString("install_secret"))
+        assertEquals(1, payload.length())
+    }
+
+    @Test
+    fun missingBackgroundRecoveryEndpointHasANonTransientCompatibilityCode() {
+        assertEquals(
+            "background_recovery_unsupported",
+            backgroundPanelErrorCode("background/auth/recover", 404, null),
+        )
+        assertEquals(
+            "background_panel_error",
+            backgroundPanelErrorCode("background/connections/start", 404, null),
         )
     }
 }

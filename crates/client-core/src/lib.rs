@@ -1062,6 +1062,25 @@ where
         Ok(response.access_token)
     }
 
+    pub async fn replace_session_tokens(
+        &self,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> Result<(), CoreError> {
+        let _guard = self.refresh_gate.lock().await;
+        let mut stored = self.load_auth()?;
+        stored.access_token = Some(access_token.to_string());
+        stored.refresh_token = Some(refresh_token.to_string());
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        self.logger.record(CoreLogEvent {
+            kind: "auth.background_recovered",
+            operation_id: None,
+            request_id: None,
+            code: None,
+        });
+        Ok(())
+    }
+
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {
         let stored = self.load_auth()?;
         let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
@@ -1082,6 +1101,27 @@ where
                 return Err(error.into());
             }
         };
+        self.complete_bootstrap(response, now_unix).await
+    }
+
+    pub async fn bootstrap_without_refresh(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {
+        let stored = self.load_auth()?;
+        let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let response = match self.api.bootstrap(&access_token).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.set_phase(phase_for_api_error(&error)).await;
+                return Err(error.into());
+            }
+        };
+        self.complete_bootstrap(response, now_unix).await
+    }
+
+    async fn complete_bootstrap(
+        &self,
+        response: Bootstrap,
+        now_unix: i64,
+    ) -> Result<Bootstrap, CoreError> {
         let mut current_stored = self.load_auth()?;
         current_stored.compatibility = Some(StoredCompatibility {
             update_required: response.update.required,
@@ -1511,6 +1551,7 @@ where
                     layer: response.connection.layer,
                     tic_connection_mode: response.connection.tic_connection_mode,
                     route_mode: response.connection.route_mode,
+                    egress_mode: response.connection.egress_mode,
                     allow_alternate: options.allow_alternate,
                 }),
             })
@@ -1960,6 +2001,7 @@ where
                     layer: saved.layer,
                     tic_connection_mode: saved.tic_connection_mode,
                     route_mode: saved.route_mode,
+                    egress_mode: saved.egress_mode,
                     allow_alternate: false,
                 }),
             })

@@ -144,6 +144,7 @@ pub struct QuickConnectionRequest {
     pub layer: String,
     pub tic_connection_mode: String,
     pub route_mode: String,
+    pub egress_mode: String,
     pub allow_alternate: bool,
 }
 
@@ -224,6 +225,46 @@ pub struct BackgroundCredentialStatusResponse {
     pub configured: bool,
     pub device_id: Option<String>,
     pub expires_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundSessionRecoveryRequest {
+    pub install_secret: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundSessionRecoveryResponse {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub error_code: Option<String>,
+}
+
+impl fmt::Debug for BackgroundSessionRecoveryRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackgroundSessionRecoveryRequest")
+            .field("install_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Debug for BackgroundSessionRecoveryResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackgroundSessionRecoveryResponse")
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("error_code", &self.error_code)
+            .finish()
+    }
 }
 
 impl fmt::Debug for BackgroundCredentialRequest {
@@ -333,6 +374,23 @@ mod tests {
     }
 
     #[test]
+    fn quick_connection_preserves_the_selected_egress_mode() {
+        let quick: QuickConnectionRequest = serde_json::from_value(serde_json::json!({
+            "leaseId": "lease-ipv6",
+            "layer": "tic",
+            "ticConnectionMode": "dynamic",
+            "routeMode": "via_tak",
+            "egressMode": "prefer_ipv6",
+            "allowAlternate": true
+        }))
+        .unwrap();
+
+        let value = serde_json::to_value(quick).unwrap();
+
+        assert_eq!(value["egressMode"], "prefer_ipv6");
+    }
+
+    #[test]
     fn start_failure_diagnostics_uses_the_mobile_command_field_name() {
         let value = serde_json::to_value(StartFailureDiagnosticsRequest {
             device_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -360,6 +418,43 @@ mod tests {
         assert!(debug.contains("11111111-1111-4111-8111-111111111111"));
         assert!(!debug.contains("never-log-this-token"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn background_session_recovery_redacts_every_session_secret() {
+        let request = BackgroundSessionRecoveryRequest {
+            install_secret: "never-log-install-secret".to_string(),
+        };
+        let response: BackgroundSessionRecoveryResponse =
+            serde_json::from_value(serde_json::json!({
+                "accessToken": "never-log-access",
+                "refreshToken": "never-log-refresh",
+                "errorCode": null
+            }))
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["installSecret"],
+            "never-log-install-secret"
+        );
+        assert!(!format!("{request:?}").contains("never-log-install-secret"));
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("never-log-access"));
+        assert!(!debug.contains("never-log-refresh"));
+    }
+
+    #[test]
+    fn background_session_recovery_can_return_a_stable_error_without_tokens() {
+        let response: BackgroundSessionRecoveryResponse =
+            serde_json::from_value(serde_json::json!({"errorCode": "invalid_background_token"}))
+                .unwrap();
+
+        assert_eq!(
+            response.error_code.as_deref(),
+            Some("invalid_background_token")
+        );
+        assert!(response.access_token.is_none());
+        assert!(response.refresh_token.is_none());
     }
 
     #[test]
