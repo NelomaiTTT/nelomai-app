@@ -156,6 +156,25 @@ def run() -> None:
             raise RuntimeError(
                 "Windows AmneziaWG runtime does not isolate the Nelomai data directory"
             )
+    for token in (
+        "$WireGuardBuildMaximumAttempts = 3",
+        "for ($wireGuardBuildAttempt = 1;",
+        "WireGuard tunnel.dll build attempt",
+        "Start-Sleep -Seconds",
+    ):
+        if token not in windows_runtime_script:
+            raise RuntimeError(
+                f"Windows WireGuard bootstrap does not have bounded retry: {token}"
+            )
+
+    android_network_patch = (
+        ROOT / "patches" / "amneziawg-android-network-telemetry.patch"
+    ).read_text(encoding="utf-8")
+    if (
+        '-ldflags="-s -w -X github.com/amnezia-vpn/amneziawg-go/'
+        not in android_network_patch
+    ):
+        raise RuntimeError("Android libwg-go release build retains Go symbols")
 
     version_script = (ROOT / "scripts" / "set-release-version.py").read_text(
         encoding="utf-8"

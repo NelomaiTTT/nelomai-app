@@ -29,9 +29,19 @@ git init $source
 git -C $source remote add origin https://github.com/WireGuard/wireguard-windows.git
 git -C $source fetch --depth 1 origin $WireGuardWindowsCommit
 git -C $source checkout --detach FETCH_HEAD
-& cmd.exe /c (Join-Path $source "embeddable-dll-service/build.bat")
-if ($LASTEXITCODE -ne 0) {
-    throw "WireGuard tunnel.dll build failed with exit code $LASTEXITCODE"
+$wireGuardBuild = Join-Path $source "embeddable-dll-service/build.bat"
+$WireGuardBuildMaximumAttempts = 3
+for ($wireGuardBuildAttempt = 1; $wireGuardBuildAttempt -le $WireGuardBuildMaximumAttempts; $wireGuardBuildAttempt++) {
+    & cmd.exe /d /c $wireGuardBuild
+    $wireGuardBuildExitCode = $LASTEXITCODE
+    if ($wireGuardBuildExitCode -eq 0) {
+        break
+    }
+    if ($wireGuardBuildAttempt -eq $WireGuardBuildMaximumAttempts) {
+        throw "WireGuard tunnel.dll build failed after $WireGuardBuildMaximumAttempts attempts with exit code $wireGuardBuildExitCode"
+    }
+    Write-Warning "WireGuard tunnel.dll build attempt $wireGuardBuildAttempt failed with exit code $wireGuardBuildExitCode; retrying cached bootstrap"
+    Start-Sleep -Seconds (5 * $wireGuardBuildAttempt)
 }
 
 git init $amneziaSource
