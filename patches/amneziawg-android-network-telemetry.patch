@@ -681,3 +681,16 @@ index 237043e5..e18bf9c7 100644
  JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env, jclass c)
  {
  	jstring ret;
+diff --git a/tunnel/tools/CMakeLists.txt b/tunnel/tools/CMakeLists.txt
+index 8557c5ab..3480c49a 100644
+--- a/tunnel/tools/CMakeLists.txt
++++ b/tunnel/tools/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_link_options(LINKER:--build-id=none)
+ add_link_options(-Wl,-z,max-page-size=16384)
+ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+ add_compile_options(-Wall -Werror)
++set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO} -Wl,--strip-all")
+-
++
+ add_executable(libwg-quick.so amneziawg-tools/src/wg-quick/android.c ndk-compat/compat.c)
+ target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DAWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")

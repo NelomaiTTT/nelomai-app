@@ -175,6 +175,14 @@ def run() -> None:
         not in android_network_patch
     ):
         raise RuntimeError("Android libwg-go release build retains Go symbols")
+    for token in (
+        "CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO",
+        "-Wl,--strip-all",
+    ):
+        if token not in android_network_patch:
+            raise RuntimeError(
+                f"Android C runtime release build retains symbols: {token}"
+            )
 
     version_script = (ROOT / "scripts" / "set-release-version.py").read_text(
         encoding="utf-8"
