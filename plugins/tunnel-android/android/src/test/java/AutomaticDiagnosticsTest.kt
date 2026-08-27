@@ -420,6 +420,51 @@ class AutomaticDiagnosticsTest {
     }
 
     @Test
+    fun detailedMemoryComponentPrefersSmapsRollupOverCachedActivityManager() {
+        val component = automaticDiagnosticsDetailedMemoryComponent(
+            processId = 42,
+            liveResidentBytes = 200L,
+            peakResidentBytes = 900L,
+            activityManagerPssBytes = 800L,
+            activityManagerCodePssBytes = 700L,
+            rollup = AutomaticDiagnosticsSmapsRollup(
+                residentBytes = 120L,
+                proportionalBytes = 100L,
+                privateCleanBytes = 10L,
+                privateDirtyBytes = 60L,
+                sharedCleanBytes = 40L,
+                sharedDirtyBytes = 10L,
+                swapBytes = 5L,
+                swapProportionalBytes = 2L,
+            ),
+        )
+
+        assertEquals("android_smaps", component.getString("source"))
+        assertEquals(120L, component.getLong("current_resident_memory_bytes"))
+        assertEquals(100L, component.getLong("current_proportional_memory_bytes"))
+        assertEquals(900L, component.getLong("peak_resident_memory_bytes"))
+        assertTrue(!component.has("pss_code_bytes"))
+    }
+
+    @Test
+    fun detailedMemoryComponentFallsBackWhenSmapsRollupIsUnavailable() {
+        val component = automaticDiagnosticsDetailedMemoryComponent(
+            processId = 42,
+            liveResidentBytes = 200L,
+            peakResidentBytes = 900L,
+            activityManagerPssBytes = 180L,
+            activityManagerCodePssBytes = 70L,
+            rollup = null,
+        )
+
+        assertEquals("android_activity_manager_memory_info", component.getString("source"))
+        assertEquals(200L, component.getLong("current_resident_memory_bytes"))
+        assertEquals(180L, component.getLong("current_proportional_memory_bytes"))
+        assertEquals(70L, component.getLong("pss_code_bytes"))
+        assertEquals(900L, component.getLong("peak_resident_memory_bytes"))
+    }
+
+    @Test
     fun smapsSummaryAccountsForMappingsOutsideTheBoundedTopList() {
         val smaps = """
             1000-2000 r-xp 00000000 00:00 0 /one/libfirst.so

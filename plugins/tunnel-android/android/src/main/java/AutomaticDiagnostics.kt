@@ -1458,6 +1458,29 @@ internal data class AutomaticDiagnosticsProcessMemory(
     val proportionalBytes: Long?,
 )
 
+internal fun automaticDiagnosticsDetailedMemoryComponent(
+    processId: Int,
+    liveResidentBytes: Long?,
+    peakResidentBytes: Long?,
+    activityManagerPssBytes: Long?,
+    activityManagerCodePssBytes: Long?,
+    rollup: AutomaticDiagnosticsSmapsRollup?,
+): JSONObject = JSONObject().apply {
+    put("component", "android_vpn_process")
+    put("process_id", processId)
+    putNullable("peak_resident_memory_bytes", peakResidentBytes)
+    if (rollup != null) {
+        put("source", "android_smaps")
+        put("current_resident_memory_bytes", rollup.residentBytes)
+        put("current_proportional_memory_bytes", rollup.proportionalBytes)
+    } else {
+        put("source", "android_activity_manager_memory_info")
+        putNullable("current_resident_memory_bytes", liveResidentBytes)
+        putNullable("current_proportional_memory_bytes", activityManagerPssBytes)
+        putNullable("pss_code_bytes", activityManagerCodePssBytes)
+    }
+}
+
 internal class AutomaticDiagnosticsMemoryCaptureGeneration {
     private val current = AtomicLong(0)
 
@@ -1986,15 +2009,14 @@ internal class TunnelStartMemoryDiagnostics(
                 put(
                     "components",
                     JSONArray().put(
-                        JSONObject().apply {
-                            put("component", "android_vpn_process")
-                            put("source", "android_smaps")
-                            put("process_id", processId)
-                            putNullable("current_resident_memory_bytes", rssBytes)
-                            putNullable("peak_resident_memory_bytes", peakRssBytes)
-                            putNullable("current_proportional_memory_bytes", pssBytes)
-                            putNullable("pss_code_bytes", pssCodeBytes)
-                        },
+                        automaticDiagnosticsDetailedMemoryComponent(
+                            processId = processId,
+                            liveResidentBytes = rssBytes,
+                            peakResidentBytes = peakRssBytes,
+                            activityManagerPssBytes = pssBytes,
+                            activityManagerCodePssBytes = pssCodeBytes,
+                            rollup = rollup,
+                        ),
                     ),
                 )
                 putNullable("smaps_rss_bytes", rollup?.residentBytes)
