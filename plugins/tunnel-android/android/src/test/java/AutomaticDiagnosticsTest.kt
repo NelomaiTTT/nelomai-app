@@ -309,12 +309,61 @@ class AutomaticDiagnosticsTest {
     fun memoryPressureConfirmationIsPromptWithoutBlockingTunnelStartup() {
         assertEquals(
             listOf(
-                "initial" to 0L,
-                "confirmation" to 500L,
-                "settled" to 5_000L,
+                AutomaticDiagnosticsMemoryCaptureRequest(
+                    sample = "initial",
+                    delayMillis = 0L,
+                    mode = AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
+                ),
+                AutomaticDiagnosticsMemoryCaptureRequest(
+                    sample = "confirmation",
+                    delayMillis = 500L,
+                    mode = AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
+                ),
+                AutomaticDiagnosticsMemoryCaptureRequest(
+                    sample = "settled",
+                    delayMillis = 5_000L,
+                    mode = AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
+                ),
             ),
             tunnelStartMemoryMappingSamples(),
         )
+    }
+
+    @Test
+    fun automaticMemoryPressureSeriesDoesNotReadFullSmaps() {
+        var rollupReads = 0
+        var mappingReads = 0
+        val expectedRollup = AutomaticDiagnosticsSmapsRollup(
+            residentBytes = 800L,
+            proportionalBytes = 700L,
+            privateCleanBytes = 20L,
+            privateDirtyBytes = 500L,
+            sharedCleanBytes = 100L,
+            sharedDirtyBytes = 10L,
+            swapBytes = 30L,
+            swapProportionalBytes = 15L,
+        )
+
+        tunnelStartMemoryMappingSamples().forEach { request ->
+            val capture = automaticDiagnosticsCaptureSmaps(
+                mode = request.mode,
+                readRollup = {
+                    rollupReads += 1
+                    expectedRollup
+                },
+                readMappings = {
+                    mappingReads += 1
+                    AutomaticDiagnosticsSmapsSummary(0, 0, emptyList(), emptyList())
+                },
+            )
+
+            assertEquals(expectedRollup, capture.rollup)
+            assertNull(capture.mappings)
+            assertTrue(!capture.mappingsRequested)
+        }
+
+        assertEquals(3, rollupReads)
+        assertEquals(0, mappingReads)
     }
 
     @Test

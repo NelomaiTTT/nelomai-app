@@ -346,6 +346,7 @@ private data class ActiveTunnelSession(
     var lastDiagnosticsReceivedBytes: Long? = null,
     var lastDiagnosticsSentBytes: Long? = null,
     var lastNetworkTelemetry: NetworkTelemetry? = null,
+    var lastNetworkTelemetryPollElapsedMillis: Long? = null,
     val recentNetworkTelemetry: ArrayDeque<JSONObject> = ArrayDeque(),
     var lastTunActivityElapsedMillis: Long = startedAtElapsedMillis,
     var lastTunWriteActivityElapsedMillis: Long = startedAtElapsedMillis,
@@ -372,6 +373,33 @@ internal enum class UdpControlProbeAction {
     RETRY,
     STOP,
 }
+
+internal enum class NetworkTelemetryMode {
+    DISABLED,
+    PASSIVE,
+    UDP_RECOVERY,
+}
+
+internal fun networkTelemetryMode(transport: String): NetworkTelemetryMode = when (transport) {
+    "wireguard" -> NetworkTelemetryMode.PASSIVE
+    "amneziawg_3" -> NetworkTelemetryMode.UDP_RECOVERY
+    else -> NetworkTelemetryMode.DISABLED
+}
+
+internal fun shouldPollNetworkTelemetry(
+    mode: NetworkTelemetryMode,
+    nowElapsedMillis: Long,
+    lastPollElapsedMillis: Long?,
+): Boolean = when (mode) {
+    NetworkTelemetryMode.DISABLED -> false
+    NetworkTelemetryMode.UDP_RECOVERY -> true
+    NetworkTelemetryMode.PASSIVE -> lastPollElapsedMillis == null ||
+        nowElapsedMillis < lastPollElapsedMillis ||
+        nowElapsedMillis - lastPollElapsedMillis >= PASSIVE_NETWORK_TELEMETRY_INTERVAL_MILLIS
+}
+
+internal fun shouldPersistPeriodicNetworkTelemetry(mode: NetworkTelemetryMode): Boolean =
+    mode == NetworkTelemetryMode.PASSIVE
 
 private data class PendingUdpControlProbe(
     val stage: UdpControlProbeStage,
@@ -473,6 +501,33 @@ internal data class NetworkTelemetry(
             )
         }
     }
+}
+
+internal fun networkTelemetrySnapshotDetails(
+    reason: String,
+    sample: NetworkTelemetry?,
+    recentSamples: List<JSONObject>?,
+): Map<String, Any?> = buildMap {
+    put("reason", reason.take(64))
+    put("local_port", sample?.localPort)
+    put("last_udp_send_error", sample?.lastUdpSendError)
+    put("last_udp_receive_error", sample?.lastUdpReceiveError)
+    put("last_udp_send_errno", sample?.lastUdpSendErrno)
+    put("last_udp_receive_errno", sample?.lastUdpReceiveErrno)
+    put("go_heap_alloc_bytes", sample?.goHeapAllocBytes)
+    put("go_heap_sys_bytes", sample?.goHeapSysBytes)
+    put("go_heap_idle_bytes", sample?.goHeapIdleBytes)
+    put("go_heap_inuse_bytes", sample?.goHeapInuseBytes)
+    put("go_heap_released_bytes", sample?.goHeapReleasedBytes)
+    put("go_stack_inuse_bytes", sample?.goStackInuseBytes)
+    put("go_gc_cycles", sample?.goGcCycles)
+    put("go_memory_limit_bytes", sample?.goMemoryLimitBytes)
+    put("go_device_starts", sample?.goDeviceStarts)
+    put("go_device_start_failures", sample?.goDeviceStartFailures)
+    put("go_device_closes", sample?.goDeviceCloses)
+    put("go_devices_starting", sample?.goDevicesStarting)
+    put("go_active_devices", sample?.goActiveDevices)
+    recentSamples?.let { put("samples", JSONArray(it)) }
 }
 
 private data class TunnelOperationWatchdog(
@@ -1703,6 +1758,18 @@ internal object TunnelRuntime {
                                 DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS * 1_000L
                             ) {
                                 logDataPlaneSnapshot(session, "periodic")
+                                if (
+                                    shouldPersistPeriodicNetworkTelemetry(
+                                        networkTelemetryMode(session.transport),
+                                    )
+                                ) {
+                                    logNetworkTelemetrySnapshot(
+                                        session = session,
+                                        reason = "periodic",
+                                        refresh = false,
+                                        includeRecentSamples = false,
+                                    )
+                                }
                                 session.lastDataPlaneSnapshotElapsedMillis = now
                             }
                         }
@@ -1738,8 +1805,18 @@ internal object TunnelRuntime {
     }
 
     private fun inspectNetworkTelemetry(session: ActiveTunnelSession) {
-        if (session.transport != "amneziawg_3") return
+        val telemetryMode = networkTelemetryMode(session.transport)
         val now = SystemClock.elapsedRealtime()
+        if (
+            !shouldPollNetworkTelemetry(
+                mode = telemetryMode,
+                nowElapsedMillis = now,
+                lastPollElapsedMillis = session.lastNetworkTelemetryPollElapsedMillis,
+            )
+        ) {
+            return
+        }
+        session.lastNetworkTelemetryPollElapsedMillis = now
         val sample = try {
             networkTelemetry() ?: return
         } catch (error: Throwable) {
@@ -1794,6 +1871,8 @@ internal object TunnelRuntime {
         }
 
         appendNetworkTelemetrySample(session, now, previous, sample)
+
+        if (telemetryMode == NetworkTelemetryMode.PASSIVE) return
 
         session.pendingUdpControlProbe
             ?.takeIf { now >= it.evaluateAtElapsedMillis }
@@ -2161,40 +2240,35 @@ internal object TunnelRuntime {
         }
     }
 
-    private fun logNetworkTelemetrySnapshot(session: ActiveTunnelSession, reason: String) {
-        if (session.transport != "amneziawg_3") return
+    private fun logNetworkTelemetrySnapshot(
+        session: ActiveTunnelSession,
+        reason: String,
+        refresh: Boolean = true,
+        includeRecentSamples: Boolean = true,
+    ) {
+        if (networkTelemetryMode(session.transport) == NetworkTelemetryMode.DISABLED) return
         val now = SystemClock.elapsedRealtime()
-        val sample = runCatching { networkTelemetry() }
-            .onFailure {
-                TunnelLog.warning("tunnel.network_telemetry_snapshot_failed", error = it)
-            }
-            .getOrNull()
-        if (sample != null) {
+        val sample = if (refresh) {
+            runCatching { networkTelemetry() }
+                .onFailure {
+                    TunnelLog.warning("tunnel.network_telemetry_snapshot_failed", error = it)
+                }
+                .getOrNull()
+        } else {
+            session.lastNetworkTelemetry
+        }
+        if (refresh && sample != null) {
             val previous = session.lastNetworkTelemetry
             session.lastNetworkTelemetry = sample
             appendNetworkTelemetrySample(session, now, previous, sample)
         }
         TunnelLog.info(
             "tunnel.network_telemetry_snapshot",
-            mapOf(
-                "reason" to reason.take(64),
-                "local_port" to sample?.localPort,
-                "last_udp_send_error" to sample?.lastUdpSendError,
-                "last_udp_receive_error" to sample?.lastUdpReceiveError,
-                "last_udp_send_errno" to sample?.lastUdpSendErrno,
-                "last_udp_receive_errno" to sample?.lastUdpReceiveErrno,
-                "go_heap_alloc_bytes" to sample?.goHeapAllocBytes,
-                "go_heap_sys_bytes" to sample?.goHeapSysBytes,
-                "go_heap_idle_bytes" to sample?.goHeapIdleBytes,
-                "go_heap_released_bytes" to sample?.goHeapReleasedBytes,
-                "go_gc_cycles" to sample?.goGcCycles,
-                "go_memory_limit_bytes" to sample?.goMemoryLimitBytes,
-                "go_device_starts" to sample?.goDeviceStarts,
-                "go_device_start_failures" to sample?.goDeviceStartFailures,
-                "go_device_closes" to sample?.goDeviceCloses,
-                "go_devices_starting" to sample?.goDevicesStarting,
-                "go_active_devices" to sample?.goActiveDevices,
-                "samples" to JSONArray(session.recentNetworkTelemetry.toList()),
+            networkTelemetrySnapshotDetails(
+                reason = reason,
+                sample = sample,
+                recentSamples = session.recentNetworkTelemetry.toList()
+                    .takeIf { includeRecentSamples },
             ),
         )
     }
@@ -2375,6 +2449,7 @@ internal fun udpControlProbeStartFailureAction(
 
 private const val DATA_PLANE_DIAGNOSTICS_INTERVAL_SECONDS = 5L * 60L
 private const val NETWORK_TELEMETRY_INTERVAL_SECONDS = 1L
+private const val PASSIVE_NETWORK_TELEMETRY_INTERVAL_MILLIS = 10_000L
 private const val NETWORK_TELEMETRY_RING_SAMPLES = 45
 private const val MAX_DETAILED_NETWORK_INCIDENTS = 3
 private const val NETWORK_TELEMETRY_ERROR_LOG_INTERVAL_MILLIS = 60_000L

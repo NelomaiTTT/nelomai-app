@@ -44,6 +44,42 @@ internal data class AutomaticDiagnosticsSmapsSummary(
     val categories: List<AutomaticDiagnosticsMemoryCategory>,
 )
 
+internal enum class AutomaticDiagnosticsMemoryCaptureMode {
+    ROLLUP,
+    MAPPINGS,
+}
+
+internal data class AutomaticDiagnosticsMemoryCaptureRequest(
+    val sample: String,
+    val delayMillis: Long,
+    val mode: AutomaticDiagnosticsMemoryCaptureMode,
+)
+
+internal data class AutomaticDiagnosticsSmapsCapture(
+    val rollup: AutomaticDiagnosticsSmapsRollup?,
+    val mappings: AutomaticDiagnosticsSmapsSummary?,
+    val rollupErrorType: String?,
+    val mappingsErrorType: String?,
+    val mappingsRequested: Boolean,
+)
+
+internal fun automaticDiagnosticsCaptureSmaps(
+    mode: AutomaticDiagnosticsMemoryCaptureMode,
+    readRollup: () -> AutomaticDiagnosticsSmapsRollup,
+    readMappings: () -> AutomaticDiagnosticsSmapsSummary,
+): AutomaticDiagnosticsSmapsCapture {
+    val rollupResult = runCatching(readRollup)
+    val mappingsRequested = mode == AutomaticDiagnosticsMemoryCaptureMode.MAPPINGS
+    val mappingsResult = if (mappingsRequested) runCatching(readMappings) else null
+    return AutomaticDiagnosticsSmapsCapture(
+        rollup = rollupResult.getOrNull(),
+        mappings = mappingsResult?.getOrNull(),
+        rollupErrorType = rollupResult.exceptionOrNull()?.javaClass?.simpleName?.take(96),
+        mappingsErrorType = mappingsResult?.exceptionOrNull()?.javaClass?.simpleName?.take(96),
+        mappingsRequested = mappingsRequested,
+    )
+}
+
 private data class MutableAutomaticDiagnosticsMemoryMapping(
     val category: String,
     val name: String,

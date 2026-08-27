@@ -840,15 +840,16 @@ internal object AutomaticDiagnostics {
         if (captureGeneration <= 0) return
         val capturedAtElapsedMillis = SystemClock.elapsedRealtime()
         val diagnostics = TunnelStartMemoryDiagnostics(captureGeneration, baselineRssBytes = null)
-        tunnelStartMemoryMappingSamples().forEach { (sample, delayMillis) ->
-            scheduleOptionalMemoryCapture(captureGeneration, delayMillis) {
+        tunnelStartMemoryMappingSamples().forEach { request ->
+            scheduleOptionalMemoryCapture(captureGeneration, request.delayMillis) {
                 diagnostics.recordMappingSample(
                     context = context.applicationContext,
                     stage = "session_memory_growth",
                     transport = sessionTransport,
-                    sample = sample,
+                    sample = request.sample,
                     capturedAtElapsedMillis = capturedAtElapsedMillis,
                     reasonPrefix = "tunnel_session_memory_mappings",
+                    captureMode = request.mode,
                 )
             }
         }
@@ -1715,10 +1716,22 @@ internal fun tunnelStartMemoryDelayedStages(): List<Pair<String, Long>> = listOf
     "after_backend_5s" to 5_000L,
 )
 
-internal fun tunnelStartMemoryMappingSamples(): List<Pair<String, Long>> = listOf(
-    "initial" to 0L,
-    "confirmation" to 500L,
-    "settled" to 5_000L,
+internal fun tunnelStartMemoryMappingSamples(): List<AutomaticDiagnosticsMemoryCaptureRequest> = listOf(
+    AutomaticDiagnosticsMemoryCaptureRequest(
+        sample = "initial",
+        delayMillis = 0L,
+        mode = AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
+    ),
+    AutomaticDiagnosticsMemoryCaptureRequest(
+        sample = "confirmation",
+        delayMillis = 500L,
+        mode = AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
+    ),
+    AutomaticDiagnosticsMemoryCaptureRequest(
+        sample = "settled",
+        delayMillis = 5_000L,
+        mode = AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
+    ),
 )
 
 internal fun containTunnelStartMemoryDiagnosticsFailure(block: () -> Unit): Throwable? =
@@ -1782,6 +1795,7 @@ internal class TunnelStartMemoryDiagnostics(
             sample = "failure",
             capturedAtElapsedMillis = SystemClock.elapsedRealtime(),
             reasonPrefix = "tunnel_start_memory_mappings",
+            captureMode = AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
         )
     }
 
@@ -1792,6 +1806,8 @@ internal class TunnelStartMemoryDiagnostics(
         sample: String,
         capturedAtElapsedMillis: Long,
         reasonPrefix: String = "tunnel_start_memory_mappings",
+        captureMode: AutomaticDiagnosticsMemoryCaptureMode =
+            AutomaticDiagnosticsMemoryCaptureMode.ROLLUP,
     ) {
         val failure = containTunnelStartMemoryDiagnosticsFailure {
             recordMemoryMappings(
@@ -1801,6 +1817,7 @@ internal class TunnelStartMemoryDiagnostics(
                 sample,
                 capturedAtElapsedMillis,
                 reasonPrefix,
+                captureMode,
             )
         }
         if (failure != null) {
@@ -1832,17 +1849,18 @@ internal class TunnelStartMemoryDiagnostics(
             recordDetailedMemory(context, stage, transport, rssBytes)
             val applicationContext = context.applicationContext
             val capturedAtElapsedMillis = SystemClock.elapsedRealtime()
-            tunnelStartMemoryMappingSamples().forEach { (sample, delayMillis) ->
+            tunnelStartMemoryMappingSamples().forEach { request ->
                 AutomaticDiagnostics.scheduleOptionalMemoryCapture(
                     captureGeneration,
-                    delayMillis,
+                    request.delayMillis,
                 ) {
                     recordMappingSample(
                         applicationContext,
                         stage,
                         transport,
-                        sample,
+                        request.sample,
                         capturedAtElapsedMillis,
+                        captureMode = request.mode,
                     )
                 }
             }
@@ -1897,6 +1915,7 @@ internal class TunnelStartMemoryDiagnostics(
         sample: String,
         capturedAtElapsedMillis: Long,
         reasonPrefix: String,
+        captureMode: AutomaticDiagnosticsMemoryCaptureMode,
     ) {
         val activityManager = context.getSystemService(ActivityManager::class.java)
         val info = activityManager.getProcessMemoryInfo(intArrayOf(processId)).firstOrNull()
@@ -1905,22 +1924,24 @@ internal class TunnelStartMemoryDiagnostics(
         } else {
             emptyMap()
         }
-        val rollupResult = runCatching {
-            File("/proc/$processId/smaps_rollup").bufferedReader().useLines {
-                automaticDiagnosticsParseSmapsRollup(it)
-            }
-        }
-        val rollup = rollupResult.getOrNull()
-        val smapsResult = runCatching {
-            File("/proc/$processId/smaps").bufferedReader().useLines {
-                automaticDiagnosticsSummarizeSmaps(it, TUNNEL_START_MEMORY_TOP_MAPPINGS)
-            }
-        }
-        val smaps = smapsResult.getOrDefault(
-            AutomaticDiagnosticsSmapsSummary(0, 0, emptyList(), emptyList()),
+        val capture = automaticDiagnosticsCaptureSmaps(
+            mode = captureMode,
+            readRollup = {
+                File("/proc/$processId/smaps_rollup").bufferedReader().useLines {
+                    automaticDiagnosticsParseSmapsRollup(it)
+                }
+            },
+            readMappings = {
+                File("/proc/$processId/smaps").bufferedReader().useLines {
+                    automaticDiagnosticsSummarizeSmaps(it, TUNNEL_START_MEMORY_TOP_MAPPINGS)
+                }
+            },
         )
-        val smapsErrorType = smapsResult.exceptionOrNull()?.javaClass?.simpleName?.take(96)
-        val rollupErrorType = rollupResult.exceptionOrNull()?.javaClass?.simpleName?.take(96)
+        val rollup = capture.rollup
+        val smaps = capture.mappings
+            ?: AutomaticDiagnosticsSmapsSummary(0, 0, emptyList(), emptyList())
+        val smapsErrorType = capture.mappingsErrorType
+        val rollupErrorType = capture.rollupErrorType
         val encodedMappings = JSONArray().apply {
             smaps.topMappings.forEach { mapping ->
                 put(JSONObject().apply {
@@ -1972,8 +1993,9 @@ internal class TunnelStartMemoryDiagnostics(
                 "peak_rss_bytes" to peakRssBytes,
                 "pss_bytes" to pssBytes,
                 "pss_code_bytes" to pssCodeBytes,
-                "smaps_available" to smapsResult.isSuccess,
-                "smaps_rollup_available" to rollupResult.isSuccess,
+                "smaps_requested" to capture.mappingsRequested,
+                "smaps_available" to (capture.mappings != null),
+                "smaps_rollup_available" to (rollup != null),
                 "smaps_mapping_count" to smaps.mappingCount,
                 "smaps_mapping_group_count" to smaps.mappingGroupCount,
                 "smaps_error_type" to smapsErrorType,
@@ -2000,8 +2022,9 @@ internal class TunnelStartMemoryDiagnostics(
                 put("transport", transport)
                 put("sample", sample)
                 put("elapsed_since_pressure_ms", elapsedSincePressureMillis)
-                put("smaps_available", smapsResult.isSuccess)
-                put("smaps_rollup_available", rollupResult.isSuccess)
+                put("smaps_requested", capture.mappingsRequested)
+                put("smaps_available", capture.mappings != null)
+                put("smaps_rollup_available", rollup != null)
                 put("smaps_mapping_count", smaps.mappingCount)
                 put("smaps_mapping_group_count", smaps.mappingGroupCount)
                 smapsErrorType?.let { put("smaps_error_type", it) }
