@@ -313,13 +313,6 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
         if !preferences.automatic {
             return Ok(self.phase());
         }
-        if matches!(self.phase(), UpdatePhase::AwaitingInstallation { .. }) {
-            return Ok(self.phase());
-        }
-        self.install_now(access_token).await
-    }
-
-    pub async fn install_now(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
         let _guard = self.install_gate.lock().await;
         if matches!(
             self.phase(),
@@ -327,6 +320,18 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
         ) {
             return Ok(self.phase());
         }
+        self.install_locked(access_token).await
+    }
+
+    pub async fn install_now(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
+        let _guard = self.install_gate.lock().await;
+        if matches!(self.phase(), UpdatePhase::ReadyToRestart { .. }) {
+            return Ok(self.phase());
+        }
+        self.install_locked(access_token).await
+    }
+
+    async fn install_locked(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
         let Some(offer) = self
             .offer
             .lock()
