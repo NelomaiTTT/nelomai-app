@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_client_api::{AuthDevice, LoginRequest, TokenResponse};
 use nelomai_client_application::{ApplicationApi, ClientApplication, LoginParameters};
-use nelomai_client_core::{CoreApi, CoreApiError, NoopLogger};
+use nelomai_client_core::{CoreApi, CoreApiError, NoopLogger, Phase};
 use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
     StoredConnectionKind,
@@ -12,6 +12,7 @@ use nelomai_contracts::{
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
     ConnectionStartResponse, Device, EgressMode, Layer, PeerBinding, PeerBindingResponse,
     PeerOption, PeerOptions, Platform, RouteMode, ServerCandidatesResponse, TicConnectionMode,
+    UpdateState,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -21,19 +22,71 @@ use std::sync::{
 struct FakeApi {
     login_request: Mutex<Option<LoginRequest>>,
     bind_request: Mutex<Option<BindPeerRequest>>,
-    bootstrap: Bootstrap,
+    bootstrap: Mutex<Bootstrap>,
+    bootstrap_calls: AtomicUsize,
+    refresh_calls: AtomicUsize,
+    reject_first_bootstrap: bool,
     logout_fails: bool,
     unbind_fails: bool,
+}
+
+impl FakeApi {
+    fn new(bootstrap: Bootstrap) -> Self {
+        Self {
+            login_request: Mutex::new(None),
+            bind_request: Mutex::new(None),
+            bootstrap: Mutex::new(bootstrap),
+            bootstrap_calls: AtomicUsize::new(0),
+            refresh_calls: AtomicUsize::new(0),
+            reject_first_bootstrap: false,
+            logout_fails: false,
+            unbind_fails: false,
+        }
+    }
+
+    fn rejecting_first_bootstrap(mut self) -> Self {
+        self.reject_first_bootstrap = true;
+        self
+    }
+
+    fn with_logout_failure(mut self) -> Self {
+        self.logout_fails = true;
+        self
+    }
+
+    fn with_unbind_failure(mut self) -> Self {
+        self.unbind_fails = true;
+        self
+    }
 }
 
 #[async_trait]
 impl CoreApi for FakeApi {
     async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
-        unreachable!("refresh is not used by this test")
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(TokenResponse {
+            api_version: ApiVersion::V1,
+            request_id: "refresh-request".to_string(),
+            token_type: "Bearer".to_string(),
+            access_token: "fresh-access".to_string(),
+            access_expires_in: 900,
+            refresh_token: "fresh-refresh".to_string(),
+            refresh_expires_in: 7_776_000,
+            access: active_access(),
+            device: AuthDevice {
+                id: "device-1".to_string(),
+                name: "Laptop".to_string(),
+                platform: Platform::Macos,
+            },
+        })
     }
 
     async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
-        Ok(self.bootstrap.clone())
+        let call = self.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_first_bootstrap && call == 0 {
+            return Err(CoreApiError::Unauthorized);
+        }
+        Ok(self.bootstrap.lock().unwrap().clone())
     }
 
     async fn start_connection(
@@ -215,13 +268,7 @@ impl TunnelController for TrackingTunnel {
 
 #[tokio::test]
 async fn login_preserves_install_identity_but_drops_previous_account_state() {
-    let api = Arc::new(FakeApi {
-        login_request: Mutex::new(None),
-        bind_request: Mutex::new(None),
-        bootstrap: bootstrap(),
-        logout_fails: false,
-        unbind_fails: false,
-    });
+    let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let tunnel = Arc::new(TrackingTunnel::default());
@@ -268,13 +315,7 @@ async fn login_preserves_install_identity_but_drops_previous_account_state() {
 
 #[tokio::test]
 async fn unavailable_tunnel_service_does_not_block_login() {
-    let api = Arc::new(FakeApi {
-        login_request: Mutex::new(None),
-        bind_request: Mutex::new(None),
-        bootstrap: bootstrap(),
-        logout_fails: false,
-        unbind_fails: false,
-    });
+    let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     let application = ClientApplication::new(
         api,
@@ -313,13 +354,7 @@ async fn unavailable_tunnel_service_does_not_block_login() {
 
 #[tokio::test]
 async fn peer_selection_lists_unused_peers_first_and_preserves_comments() {
-    let api = Arc::new(FakeApi {
-        login_request: Mutex::new(None),
-        bind_request: Mutex::new(None),
-        bootstrap: bootstrap(),
-        logout_fails: false,
-        unbind_fails: false,
-    });
+    let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let application =
@@ -343,13 +378,7 @@ async fn peer_selection_lists_unused_peers_first_and_preserves_comments() {
 
 #[tokio::test]
 async fn background_token_is_not_issued_for_a_stale_device_scope() {
-    let api = Arc::new(FakeApi {
-        login_request: Mutex::new(None),
-        bind_request: Mutex::new(None),
-        bootstrap: bootstrap(),
-        logout_fails: false,
-        unbind_fails: false,
-    });
+    let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let application =
@@ -365,13 +394,7 @@ async fn background_token_is_not_issued_for_a_stale_device_scope() {
 
 #[tokio::test]
 async fn binding_uses_the_peer_selected_by_the_user() {
-    let api = Arc::new(FakeApi {
-        login_request: Mutex::new(None),
-        bind_request: Mutex::new(None),
-        bootstrap: bootstrap(),
-        logout_fails: false,
-        unbind_fails: false,
-    });
+    let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let application = ClientApplication::new(
@@ -402,13 +425,7 @@ async fn binding_uses_the_peer_selected_by_the_user() {
 
 #[tokio::test]
 async fn failed_unbind_keeps_the_local_tunnel_and_saved_configuration() {
-    let api = Arc::new(FakeApi {
-        login_request: Mutex::new(None),
-        bind_request: Mutex::new(None),
-        bootstrap: bootstrap(),
-        logout_fails: false,
-        unbind_fails: true,
-    });
+    let api = Arc::new(FakeApi::new(bootstrap()).with_unbind_failure());
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let tunnel = Arc::new(TrackingTunnel::default());
@@ -430,13 +447,7 @@ async fn failed_unbind_keeps_the_local_tunnel_and_saved_configuration() {
 
 #[tokio::test]
 async fn logout_clears_account_and_stops_tunnel_when_server_is_unavailable() {
-    let api = Arc::new(FakeApi {
-        login_request: Mutex::new(None),
-        bind_request: Mutex::new(None),
-        bootstrap: bootstrap(),
-        logout_fails: true,
-        unbind_fails: false,
-    });
+    let api = Arc::new(FakeApi::new(bootstrap()).with_logout_failure());
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let tunnel = Arc::new(TrackingTunnel::default());
@@ -457,6 +468,86 @@ async fn logout_clears_account_and_stops_tunnel_when_server_is_unavailable() {
         application.state().await.phase,
         nelomai_client_core::Phase::SignedOut
     );
+}
+
+#[tokio::test]
+async fn refresh_update_state_returns_required_offer_without_changing_core_phase() {
+    let api = Arc::new(FakeApi::new(bootstrap()));
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let application = ClientApplication::new(
+        api.clone(),
+        store,
+        Arc::new(StoppedTunnel),
+        Arc::new(NoopLogger),
+    );
+    application.bootstrap(1_800_000_000).await.unwrap();
+    let initial_state = application.state().await;
+    let required_update = UpdateState {
+        current_version: Some("0.1.0".to_string()),
+        minimum_version: Some("0.2.0".to_string()),
+        update_available: true,
+        required: true,
+        release_notes: Some("Обязательное обновление".to_string()),
+    };
+    api.bootstrap.lock().unwrap().update = required_update.clone();
+
+    let update = application.refresh_update_state().await.unwrap();
+
+    assert_eq!(update, required_update);
+    assert_eq!(application.state().await, initial_state);
+}
+
+#[tokio::test]
+async fn refresh_update_state_refreshes_an_expired_access_token_once() {
+    let api = Arc::new(FakeApi::new(bootstrap()).rejecting_first_bootstrap());
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let application = ClientApplication::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(StoppedTunnel),
+        Arc::new(NoopLogger),
+    );
+
+    application.refresh_update_state().await.unwrap();
+
+    assert_eq!(api.bootstrap_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(api.refresh_calls.load(Ordering::SeqCst), 1);
+    let stored = store.value.lock().unwrap().clone().unwrap();
+    assert_eq!(stored.access_token.as_deref(), Some("fresh-access"));
+    assert_eq!(stored.refresh_token.as_deref(), Some("fresh-refresh"));
+}
+
+#[tokio::test]
+async fn cold_bootstrap_applies_update_required_after_warm_refresh_does_not() {
+    let api = Arc::new(FakeApi::new(bootstrap()));
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let application = ClientApplication::new(
+        api.clone(),
+        store,
+        Arc::new(StoppedTunnel),
+        Arc::new(NoopLogger),
+    );
+    application.bootstrap(1_800_000_000).await.unwrap();
+    let phase_before_refresh = application.state().await.phase;
+    assert_ne!(phase_before_refresh, Phase::UpdateRequired);
+    api.bootstrap.lock().unwrap().update = UpdateState {
+        current_version: Some("0.1.0".to_string()),
+        minimum_version: Some("0.2.0".to_string()),
+        update_available: true,
+        required: true,
+        release_notes: Some("Обязательное обновление".to_string()),
+    };
+
+    let update = application.refresh_update_state().await.unwrap();
+    assert!(update.required);
+    assert_eq!(application.state().await.phase, phase_before_refresh);
+
+    let bootstrap = application.bootstrap(1_800_000_001).await.unwrap();
+    assert!(bootstrap.update.required);
+    assert_eq!(application.state().await.phase, Phase::UpdateRequired);
 }
 
 fn previous_account() -> StoredAuth {

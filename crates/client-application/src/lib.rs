@@ -16,7 +16,7 @@ use nelomai_contracts::{
     EgressMode, Layer, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode, ProbeResult,
     ProbeResults, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelPolicy, SplitTunnelSelectedPackage,
-    SplitTunnelSettingsUpdate, TicConnectionMode,
+    SplitTunnelSettingsUpdate, TicConnectionMode, UpdateState,
 };
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
@@ -699,6 +699,22 @@ where
 
     pub async fn state(&self) -> CoreState {
         self.core.state().await
+    }
+
+    pub async fn refresh_update_state(&self) -> Result<UpdateState, ApplicationError> {
+        let access_token = self.access_token()?;
+        match self.api.bootstrap(&access_token).await {
+            Ok(response) => Ok(response.update),
+            Err(CoreApiError::Unauthorized) => {
+                let access_token = self.core.refresh_access_token(&access_token).await?;
+                self.api
+                    .bootstrap(&access_token)
+                    .await
+                    .map(|response| response.update)
+                    .map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn connection_metrics_context(&self) -> Option<ConnectionMetricsContext> {
