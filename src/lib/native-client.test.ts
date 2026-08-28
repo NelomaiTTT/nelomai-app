@@ -344,16 +344,18 @@ describe("native client", () => {
     const client = createNativeClient(invoke);
 
     await client.updateStatus();
+    await client.refreshUpdate();
     await client.setAutomaticUpdates(false);
     await client.installUpdate();
     await client.restartForUpdate();
 
     expect(invoke).toHaveBeenNthCalledWith(1, "app_update_status");
-    expect(invoke).toHaveBeenNthCalledWith(2, "app_update_set_automatic", {
+    expect(invoke).toHaveBeenNthCalledWith(2, "app_update_refresh");
+    expect(invoke).toHaveBeenNthCalledWith(3, "app_update_set_automatic", {
       enabled: false,
     });
-    expect(invoke).toHaveBeenNthCalledWith(3, "app_update_install");
-    expect(invoke).toHaveBeenNthCalledWith(4, "app_update_restart");
+    expect(invoke).toHaveBeenNthCalledWith(4, "app_update_install");
+    expect(invoke).toHaveBeenNthCalledWith(5, "app_update_restart");
   });
 
   it("routes every split-tunnel mutation through native commands", async () => {

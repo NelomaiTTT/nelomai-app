@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { chromium } from "playwright-core";
 
 const baseUrl = process.env.APP_URL ?? "http://127.0.0.1:1420";
@@ -76,12 +78,38 @@ const peers = {
   ],
 };
 
-const browser = await chromium.launch({
-  executablePath,
-  headless: true,
-});
+let vite = null;
+let viteOutput = "";
+let browser = null;
 
 try {
+  if (!process.env.APP_URL) {
+    vite = spawn(
+      process.execPath,
+      [
+        "node_modules/vite/bin/vite.js",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "1420",
+        "--strictPort",
+      ],
+      {
+        cwd: process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const recordViteOutput = (chunk) => {
+      viteOutput = `${viteOutput}${chunk}`.slice(-20_000);
+    };
+    vite.stdout.on("data", recordViteOutput);
+    vite.stderr.on("data", recordViteOutput);
+    await waitForServer(baseUrl, vite, () => viteOutput);
+  }
+  browser = await chromium.launch({
+    executablePath,
+    headless: true,
+  });
   await capture("sign-in", { width: 390, height: 844 }, "signed_out");
   await capture("peers-mobile", { width: 390, height: 844 }, "peers");
   await capture("connection-mobile", { width: 390, height: 844 }, "connection");
@@ -89,7 +117,11 @@ try {
   await capture("pinned-stray-mobile", { width: 390, height: 844 }, "pinned-stray");
   await capture("connection-desktop", { width: 1280, height: 800 }, "connection");
 } finally {
-  await browser.close();
+  try {
+    await browser?.close();
+  } finally {
+    await stopChild(vite);
+  }
 }
 
 async function capture(name, viewport, scenario) {
@@ -173,6 +205,22 @@ async function capture(name, viewport, scenario) {
               ],
             };
           }
+          if (
+            command === "app_update_status" ||
+            command === "app_update_refresh"
+          ) {
+            return {
+              supported: true,
+              automatic: false,
+              phase: "idle",
+              version: null,
+              notes: null,
+              required: false,
+              downloaded: 0,
+              total: null,
+              errorCode: null,
+            };
+          }
           return {};
         },
       };
@@ -187,6 +235,27 @@ async function capture(name, viewport, scenario) {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.waitForTimeout(100);
+  if (scenario !== "signed_out") {
+    await page.waitForFunction(
+      () =>
+        (window.__TAURI_CALLS__ ?? []).some(
+          (call) => call.command === "app_update_status",
+        ),
+      undefined,
+      { timeout: 5_000 },
+    );
+    await page.evaluate(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await page.waitForFunction(
+      () =>
+        (window.__TAURI_CALLS__ ?? []).some(
+          (call) => call.command === "app_update_refresh",
+        ),
+      undefined,
+      { timeout: 5_000 },
+    );
+  }
 
   const dimensions = await page.evaluate(() => ({
     viewport: window.innerWidth,
@@ -255,4 +324,47 @@ async function lastCall(page, command) {
     const calls = window.__TAURI_CALLS__ ?? [];
     return [...calls].reverse().find((call) => call.command === expected) ?? null;
   }, command);
+}
+
+async function waitForServer(url, child, output) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(
+        `Vite exited before readiness with code ${child.exitCode}:\n${output()}`,
+      );
+    }
+    try {
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(1_000),
+      });
+      if (response.ok) return;
+    } catch {
+      // Vite has not started listening yet.
+    }
+    await delay(100);
+  }
+  throw new Error(`Vite did not become ready within 15 seconds:\n${output()}`);
+}
+
+async function stopChild(child) {
+  if (!child || child.exitCode !== null) return;
+  child.kill("SIGTERM");
+  if (await waitForExit(child, 3_000)) return;
+  child.kill("SIGKILL");
+  if (!(await waitForExit(child, 3_000))) {
+    throw new Error("Vite did not stop after SIGKILL");
+  }
+}
+
+async function waitForExit(child, timeout) {
+  if (child.exitCode !== null) return true;
+  return Promise.race([
+    once(child, "exit").then(() => true),
+    delay(timeout).then(() => false),
+  ]);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

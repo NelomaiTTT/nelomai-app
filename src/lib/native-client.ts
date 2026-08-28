@@ -181,6 +181,8 @@ export function createNativeClient(
       invoke("app_register_push_token", { token }) as Promise<void>,
     updateStatus: () =>
       invoke("app_update_status") as Promise<UpdateStatus>,
+    refreshUpdate: () =>
+      invoke("app_update_refresh") as Promise<UpdateStatus>,
     setAutomaticUpdates: (enabled: boolean) =>
       invoke("app_update_set_automatic", { enabled }) as Promise<UpdateStatus>,
     installUpdate: () =>

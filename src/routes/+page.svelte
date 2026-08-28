@@ -50,6 +50,7 @@
     type SplitTunnelAddressRule,
     type SplitTunnelState,
   } from "$lib/split-tunnel";
+  import { UpdateOfferRefresher } from "$lib/update-offer-refresher";
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
@@ -69,6 +70,7 @@
   let diagnosticsBusy = $state(false);
   let diagnosticsStatus = $state<string | null>(null);
   let updateStatus = $state<UpdateStatus | null>(null);
+  const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
   let updateBusy = $state(false);
   let updateTimer: number | null = null;
   let stateTimer: number | null = null;
@@ -196,7 +198,10 @@
       if (document.visibilityState === "visible") {
         void synchronizeRuntimeState();
         void refreshProbes();
-        if (bootstrap) void refreshNotifications(false, true);
+        if (bootstrap) {
+          void refreshNotifications(false, true);
+          void refreshUpdateOffer();
+        }
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
@@ -820,6 +825,23 @@
     } catch {
       updateStatus = null;
     }
+  }
+
+  async function refreshUpdateOffer() {
+    if (!bootstrap) return;
+    await updateOfferRefresher.run(
+      () => nativeClient.refreshUpdate(),
+      (status) => {
+        updateStatus = status;
+        if (
+          status.phase === "downloading" ||
+          (status.supported && status.automatic && status.phase === "available")
+        ) {
+          clearUpdateTimer();
+          updateTimer = window.setTimeout(refreshUpdateStatus, 500);
+        }
+      },
+    );
   }
 
   async function installUpdate() {
