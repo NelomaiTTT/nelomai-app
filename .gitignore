@@ -9,6 +9,7 @@ target/
 /plugins/amneziawg-android-tunnel/.cxx/
 /plugins/amneziawg-android-tunnel/build/
 /.nelomai-locks/
+/.worktrees/
 .env
 .env.*
 !.env.example
