@@ -31,6 +31,24 @@ def run() -> None:
     workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
     )
+    panel_gate_errors = []
+    for token in (
+        "panel_notification_ready:",
+        "Подтверждаю, что панель с producer уведомлений уже развёрнута",
+        "Проверить готовность панели к уведомлению",
+        "inputs.panel_notification_ready",
+    ):
+        if token not in workflow:
+            panel_gate_errors.append(
+                f"release workflow misses panel-first gate: {token}"
+            )
+    release_triggers = workflow.split("permissions:", 1)[0]
+    if "push:" in release_triggers or "tags:" in release_triggers:
+        panel_gate_errors.append(
+            "release workflow must not bypass the panel-first gate via a tag push"
+        )
+    if panel_gate_errors:
+        raise RuntimeError("\n".join(panel_gate_errors))
     windows_workflow = (
         ROOT / ".github" / "workflows" / "windows-build.yml"
     ).read_text(encoding="utf-8")

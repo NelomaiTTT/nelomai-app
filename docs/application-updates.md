@@ -14,6 +14,15 @@ installation, and failed.
 Critical compatibility remains controlled by the bootstrap `required` flag;
 the existing client core refuses new connections while it is set.
 
+When an authenticated process returns to the foreground, it requests only the
+current `Bootstrap.update` state through the native application layer. This
+does not run core bootstrap, change the current screen, stop a tunnel, or
+replace connection and binding state. Concurrent foreground events share one
+refresh. A temporary request failure preserves the last visible update status.
+If automatic updates are enabled, the refreshed offer enters the same
+serialized installation flow as login/bootstrap; otherwise it remains
+available for manual installation.
+
 ## Desktop
 
 Windows, macOS, and Linux use the official Tauri updater. Release builds create
@@ -72,10 +81,10 @@ from the APK alone.
 - Store a separate raw 32-byte Ed25519 seed in
   `NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64`; configure the matching public key
   on the panel as `CLIENT_RELEASE_MANIFEST_PUBLIC_KEY_B64`.
-- The `release` GitHub Actions workflow builds Linux x86_64, Windows x86_64,
-  and macOS aarch64 updater artifacts, plus a signed Android aarch64 APK, for a
-  stable `v*` tag or a manual version. Intel macOS builds are not published.
-  It publishes only after every build job succeeds.
+- The `release` GitHub Actions workflow is started only through guarded manual
+  dispatch. It builds Linux x86_64, Windows x86_64, and macOS aarch64 updater
+  artifacts, plus a signed Android aarch64 APK. Intel macOS builds are not
+  published. It publishes only after every build job succeeds.
 - The workflow publishes a deterministic JSON manifest, its detached Ed25519
   signature, and Tauri-signed packages. Draft and prerelease GitHub releases
   are not consumed by the panel.
@@ -87,3 +96,35 @@ from the APK alone.
 - Exercise a signed update on Windows, macOS, Linux, and a physical Android
   device. Android must show its system confirmation UI; silent installation is
   neither requested nor supported.
+
+## Panel-first release order
+
+The panel release sync, not GitHub publication by itself, is the source of the
+`app_release_available` notification. Release notification production and the
+new `AppRelease` are committed atomically after the panel verifies and stores
+all signed artifacts.
+
+For every application release:
+
+1. Deploy the compatible panel change through the guarded panel updater.
+2. Verify panel health and release-sync readiness without running production
+   preflight against the working database.
+3. Start the manual `release` workflow with
+   `panel_notification_ready=true`. The acknowledgement confirms that the
+   notification producer is already deployed; it is not a remote capability
+   probe.
+4. Let the guarded workflow create the version tag and GitHub release.
+5. Wait for normal panel release sync and verify the notification audit event.
+
+A pushed `v*` tag no longer starts release publication. This closes the path
+that could publish an application before the panel notification producer was
+ready.
+
+There is no automatic notification backfill for a version that the panel
+already published. The first release containing foreground refresh remains
+compatible with older clients, but an older warm process can show the inbox
+message without refreshing its update offer until the next cold bootstrap.
+After that release is installed, subsequent foreground resumes refresh the
+offer without disturbing an active tunnel. A required offer is displayed on
+warm refresh, while the core `UpdateRequired` gate is still applied only by a
+cold bootstrap.

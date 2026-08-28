@@ -1,9 +1,6 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
@@ -24,6 +21,11 @@ on:
         required: false
         default: false
         type: boolean
+      panel_notification_ready:
+        description: "Подтверждаю, что панель с producer уведомлений уже развёрнута"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -36,6 +38,11 @@ jobs:
     name: Обязательные проверки
     runs-on: ubuntu-22.04
     steps:
+      - name: Проверить готовность панели к уведомлению
+        if: github.event_name == 'workflow_dispatch' && inputs.panel_notification_ready != true
+        run: |
+          echo "Сначала разверните и проверьте panel notification producer" >&2
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
