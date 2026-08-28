@@ -24,7 +24,8 @@ server-side policy.
 - Keep Nelomai control traffic available for recovery and diagnostics.
 - Remove protection after an explicit user Stop or after the user disables the
   preference.
-- Avoid infinite recovery loops.
+- Avoid hot or overlapping recovery loops; passive retry remains rate-capped
+  until explicit Stop or a terminal failure.
 - Leave the device unblocked after an operating-system reboot.
 
 ## Non-goals

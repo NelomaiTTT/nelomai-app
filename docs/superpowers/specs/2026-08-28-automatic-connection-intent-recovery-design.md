@@ -44,8 +44,8 @@
 - изменение поведения Android Quick Settings для пользователя: существующие
   `On/Off` и sticky restore сохраняются, но их persisted state становится
   единственным владельцем Android intent;
-- изменение серверного API сверх узкого additive-контракта для сообщения о
-  зависшем data plane и гарантированной замены его dynamic lease;
+- изменение серверного API сверх additive-контракта recovery: capability gate,
+  measured background start и сообщение о зависшем data plane;
 - Android CPU telemetry — это следующий отдельный этап.
 
 ## Основной принцип
@@ -64,10 +64,14 @@
 но не WireGuard-конфигурацию, ключи или session token. Background credential
 остаётся в существующем отдельном защищённом хранилище.
 
-Android intent привязан к текущей загрузке ОС. При boot он очищается до любого
-sticky restore, поэтому новое поведение не включает VPN после reboot и не
-изменяет требование `reboot -> off`. Успешное подключение по-прежнему использует
-существующее защищённое хранение конфигурации и platform restore.
+Android intent привязан к текущей загрузке ОС. Store записывает системный
+`BOOT_COUNT` вместе с intent и проверяет его при каждом read, status, tile action
+и service restore. Несовпавшая запись атомарно инвалидируется,
+`desired_active` становится `false`, а VPN и kill switch остаются `off`.
+Порядок запуска BootReceiver, tile и service не является частью корректности.
+Если boot identity нельзя безопасно прочитать, restore не выполняется и intent
+очищается fail-closed относительно автоматического запуска. Reusable quick plan
+можно сохранить для следующего явного `Старт/On`, но он не включает VPN сам.
 
 ## Архитектура
 
@@ -89,13 +93,38 @@ Android использует ту же state-machine semantics, но её авт
 Android использует новый `AndroidConnectionIntentStore`, отдельный от
 UI-state, но разделяющий generation с `QuickTunnelController`. До первой
 попытки UI передаёт в `:vpn` нормализованный intent template и убеждается, что
-существующий `BackgroundCredentialStore` готов. `BackgroundConnectionClient`
-расширяется так, чтобы выполнять initial и recovery start из этого template
-через существующий background transport; успешное предыдущее подключение для
-создания template не требуется. Полученная WireGuard-конфигурация передаётся
-напрямую в `TunnelRuntime` и обнуляется после использования, как в действующем
-background start. Ошибка атомарного сохранения intent является терминальной и
-происходит до выдачи lease или запуска туннеля.
+существующий `BackgroundCredentialStore` готов. Ошибка атомарного сохранения
+intent является терминальной и происходит до выдачи lease или запуска туннеля.
+
+`BackgroundCredentialStore` расширяется install secret текущего устройства.
+Он шифруется Android Keystore отдельно от intent, никогда не попадает в
+события, логи или UI и очищается при logout/revoke вместе с background token.
+Пока token ещё действителен, `:vpn` обновляет его до начала заданного сервером
+expiry window через новый additive `POST /background/token/rotate`. Endpoint
+требует ещё действующий background token и совпадающий install secret, выдаёт
+новый background token и не создаёт и не вращает основную access/refresh пару
+Tauri-сессии. Один rotate выполняется за раз, предыдущий token принимает только
+в рамках короткого server-side overlap. Уже истёкший, отозванный или не
+восстановленный token становится терминальным
+`background_credential_unavailable` и просит открыть приложение; intent не
+продолжает неавторизованные запросы. Existing `/background/auth/recover`
+остаётся UI-owned путём восстановления основной сессии.
+
+Для dynamic режима `BackgroundConnectionClient` получает кандидатов через
+новый additive `GET /background/server-candidates` с background auth, но
+измеряет их HTTPS probe URL без authorization header по тем же правилам, что
+native core: не более четырёх параллельных запросов, timeout три секунды и cache
+не дольше пяти минут или earliest candidate expiry. Новый probe snapshot
+собирается после смены сети и истечения cache. Background start отправляет
+результаты и `require_measured_selection=true`; панель применяет те же правила
+freshness/selection, что обычный `/connections/start`. Старый Quick Settings
+клиент, не передающий поле, сохраняет legacy unmeasured fallback. Personal Tic
+использует bound peer и не запрашивает кандидатов.
+
+`BackgroundConnectionClient` выполняет initial и recovery start из intent
+template; успешное предыдущее подключение для создания template не требуется.
+Полученная WireGuard-конфигурация передаётся напрямую в `TunnelRuntime` и
+обнуляется после использования, как в действующем background start.
 
 Coordinator сериализует все start/recovery-операции. Новый `Старт` при уже
 активном совпадающем намерении является идемпотентным. Изменить параметры
@@ -164,6 +193,27 @@ Broadcast revision сообщает Tauri уже принятое состоян
 является владельцем отмены. Новый Android intent после `Off` возможен только
 после следующего явного `Старт` или Quick Settings `On`.
 
+Если stale callback уже получил lease и конфигурацию, он обязан:
+
+1. не передавать конфигурацию в backend и немедленно обнулить её;
+2. до завершения текущей operation записать lease ID и новый stop operation ID
+   в защищённый `AndroidPendingLeaseCleanupStore`;
+3. после освобождения operation gate выполнить background stop с
+   `failure_code=null`;
+4. при transport/server failure повторять тот же idempotent stop каждые 30
+   секунд до подтверждения панели;
+5. очистить pending record только после подтверждённого stop.
+
+Если background credential уже недоступен, pending cleanup не удаляется. После
+следующего открытия приложения credential/session recovery и pending stop
+выполняются до принятия нового `Старт`; server-side lease expiry остаётся
+дополнительной страховкой, но не заменяет клиентскую compensation.
+
+Explicit `Off/Стоп` не ждёт возможности войти в занятый start gate, чтобы
+инвалидировать generation. Он сразу публикует `desired_active=false`, затем
+показывает `Stopping` до завершения локального stop и server compensation.
+Поздний lease не остаётся активным в панели и не превращается в новое intent.
+
 ### 4. Классификация ошибок
 
 Автоматически повторяются только ошибки, для которых повтор не требует нового
@@ -185,6 +235,7 @@ Broadcast revision сообщает Tauri уже принятое состоян
   после проверки фактического состояния;
 - `service_unavailable` только после одной неинтерактивной попытки восстановить
   локальный service; повтор того же кода становится терминальным;
+- `android_service_dispatch_unavailable` после state reconciliation и backoff;
 - `udp_rebind_failed` и `udp_rebind_timeout` не выходят наружу как общий
   service failure, а переводят текущую AWG recovery-транзакцию на ступень
   локального restart;
@@ -223,6 +274,12 @@ Broadcast revision сообщает Tauri уже принятое состоян
 ошибки. Coordinator классифицирует исходный стабильный service code до
 преобразования в `CommandError`; UI получает уже выбранное состояние recovery
 или terminal action.
+
+Android dispatch больше не возвращает raw-код `tunnel_service_unavailable`:
+ошибка запуска/bind к foreground service имеет стабильный source code
+`android_service_dispatch_unavailable`. Presentation layer может показать её
+тем же пользовательским текстом, но не меняет source code, по которому
+принимается recovery-решение.
 
 Личный пир повторяется только как личный пир. Coordinator никогда не меняет
 его на динамический режим без отдельного выбора пользователя. Динамическое
@@ -283,22 +340,67 @@ Stray сохраняется существующий cooldown и запрет �
 stall ранее подключённого AWG3, неуспешных rebind/local restart и завершённого
 локального stop.
 
-Для dynamic lease панель независимо от ранее наблюдавшегося handshake:
+Клиент отправляет эту причину только для unpinned dynamic pool-backed AWG3.
+Personal Tic и pinned Stray используют обычный stop с `failure_code=null` и
+сохраняют выбранный peer; автоматический переход в dynamic запрещён.
+
+Панель не доверяет клиентской классификации и принимает причину только если:
+
+- lease принадлежит текущему device и привязан к pool peer;
+- lease unpinned, dynamic и использует эффективный transport AWG3;
+- lease имеет статус `Issued/Connected`, не завершён и всё ещё привязан к тому
+  же peer/device;
+- agent runtime подтверждает handshake либо traffic после `issued_at`, то есть
+  это не initial handshake failure.
+
+Если runtime-проверка временно недоступна, панель возвращает retryable `503
+connection_stall_verification_unavailable` и не меняет lease. Для personal,
+pinned, non-AWG3, never-connected или уже завершённого lease возвращается
+стабильный `409 connection_stall_not_recyclable`; peer не переводится в recycle.
+
+Для прошедшего проверки dynamic lease панель независимо от ранее
+наблюдавшегося handshake:
 
 1. переводит lease в `Failed`;
 2. отправляет его pool peer в recycle и не возвращает тот же peer новой выдаче;
-3. сохраняет idempotency по паре operation ID и failure code;
-4. применяет существующие device/session rate limits к повторным сообщениям.
+3. использует operation ID как единственный idempotency key: replay разрешён
+   только для того же device, lease и failure code, иначе возвращается
+   `operation_id_conflict`;
+4. учитывает не более трёх новых stalled-recycle операций на device за 15
+   минут; idempotent replay не расходует budget. При превышении возвращаются
+   `429 connection_stall_recycle_rate_limited` и `Retry-After`, а peer не
+   изменяется.
 
 Следующий start использует новый operation ID и `allow_alternate=true`; новый
 lease не может ссылаться на отправленный в recycle peer. Другой peer того же
 здорового pool допустим, а действующие probe/runtime-policy могут выбрать
-другой сервер. Для personal/pinned lease причина не отвязывает peer и не
-разрешает динамический fallback: сохраняются binding и действующий cooldown.
+другой сервер.
 
-Это единственное изменение client API и панели в рамках задачи. Поля остаются
-additive, старые клиенты продолжают отправлять `failure_code=null` или
-`tunnel_handshake_timeout`.
+Все поля и background endpoint additive. Старые клиенты продолжают отправлять
+`failure_code=null` или `tunnel_handshake_timeout`, не передают
+`require_measured_selection` и сохраняют прежнюю семантику.
+
+#### Capability gate и rollout
+
+До server rollout действующий `docs/panel_contract.md` остаётся источником
+истины, и клиент не отправляет новые поля или failure code. Реализация выходит
+в следующем порядке:
+
+1. панель добавляет schema/fixtures/tests, оба `/connections/stop` и
+   `/background/connections/stop`, background candidates, measured background
+   start, background-token rotate, rate limit и bootstrap capability
+   `connection_intent_recovery_v1=false/true`;
+2. тот же panel commit обновляет `docs/panel_contract.md`, после чего панель
+   выкатывается guarded self-updater и capability проверяется на production;
+3. только затем выпускается клиент. Он включает новый server contract лишь при
+   `connection_intent_recovery_v1=true`;
+4. при отсутствующей capability клиент не отправляет новые значения и остаётся
+   на прежнем start/stop contract без `422`; UI может повторять существующие
+   безопасные операции, но не заявляет гарантированный background recovery или
+   recycle stalled peer.
+
+Частично выкаченная панель не публикует capability. Новая схема, routes и
+behavior должны быть доступны атомарно до её включения.
 
 ### 7. Kill switch
 
@@ -407,10 +509,19 @@ Operation ID, request ID и lease ID остаются в существующи�
 - завершение Android UI-процесса не уничтожает intent и native retry;
 - Android initial retry работает из persisted template до первого успешного
   подключения и не сохраняет WireGuard-конфигурацию;
+- Android dynamic background start отправляет свежие probes и не использует
+  legacy unmeasured fallback;
+- background token обновляется до expiry без UI и без изменения основной
+  access/refresh-сессии; истёкший или отозванный token становится terminal без
+  цикла неавторизованных запросов;
 - ошибка сохранения Android intent не выдаёт lease и не запускает туннель;
 - Android Quick Settings `Off` инвалидирует generation до stop, а поздний
-  Tauri/native callback не восстанавливает туннель;
-- reboot очищает Android intent до restore и оставляет VPN/kill switch `off`;
+  Tauri/native callback не восстанавливает туннель, обнуляет конфигурацию и
+  ставит поздний lease в pending compensation;
+- неуспешная stale compensation переживает process death и повторяется с тем же
+  operation ID до подтверждённого stop;
+- несовпавший `BOOT_COUNT` отклоняется при первом read независимо от того,
+  первым после reboot запущен tile, service или UI;
 - временные service-коды повторяются, а incompatible/security-коды становятся
   терминальными;
 - смена сети объединяет несколько wakeup в одну попытку.
@@ -420,7 +531,13 @@ Operation ID, request ID и lease ID остаются в существующи�
 - существующие start/stop, compensation, pinned, split-tunnel, quick reconnect,
   diagnostics, updater и AWG3 handshake tests остаются зелёными;
 - `tunnel_data_plane_stalled` идемпотентно переводит dynamic lease в `Failed`,
-  отправляет peer в recycle и не применяется к personal binding;
+  отправляет peer в recycle и отвергается для personal/pinned/non-AWG3;
+- новый stalled operation ID нельзя повторно использовать с другим lease или
+  failure code;
+- четвёртый stalled recycle за 15 минут получает `429` без изменения peer;
+- клиент без `connection_intent_recovery_v1` не отправляет новый contract;
+- background-token rotate сохраняет основную Tauri-сессию и принимает старый
+  token только в пределах заданного overlap;
 - terminal recovery ранее `armed`-сессии сохраняет `blocked` и доступный
   подтверждённый `Стоп`;
 - конфигурация и секреты не появляются в UI, событиях или логах;
