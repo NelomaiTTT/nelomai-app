@@ -77,9 +77,12 @@ An explicit Stop differs from an internal reconnect. The tunnel abstraction
 must carry this intent so policy refresh, physical-network changes, route
 changes, server changes, and recovery cannot accidentally disarm protection.
 
-After automatic recovery exhausts its bounded attempts, the state remains
-`blocked`. The app emits one notification and waits for either `Retry` or
-`Stop`. It must not start an unbounded reconnect loop.
+Each active automatic recovery burst has bounded attempts and remains
+`blocked` when it does not recover. The app emits one notification and moves to
+a passive retry no more often than once every five minutes while connection
+intent remains active. `Retry` may wake one immediate attempt and `Stop` cancels
+the intent. Attempts are serialized and the app must not start a hot or
+overlapping reconnect loop.
 
 ## Rule precedence
 
@@ -248,9 +251,16 @@ The connection card displays:
 
 The blocked notification and card expose:
 
-- `Повторить` — run one bounded recovery episode;
+- `Повторить` — wake one immediate bounded recovery attempt without creating a
+  parallel operation;
 - `Стоп` — explicitly stop the session, remove enforcement, and restore direct
   connectivity.
+
+For a transient failure, passive retry continues at the capped interval without
+requiring `Повторить`. For a terminal failure, automatic retry stops but the
+card remains `blocked`, explains the required action, and keeps both
+`Повторить` for use after the action and `Стоп` until enforcement is explicitly
+removed.
 
 An enforcement installation failure during initial start uses:
 
@@ -263,14 +273,15 @@ package IDs, tunnel configuration, or credentials:
 
 - `kill_switch.arm_started`, `armed`, `arm_failed`;
 - `kill_switch.blocked`, with the tunnel failure code;
-- `kill_switch.recovery_started`, `recovered`, `recovery_exhausted`;
+- `kill_switch.recovery_started`, `recovered`, `recovery_slow`,
+  `recovery_terminal`;
 - `kill_switch.disarm_started`, `disarmed`, `disarm_failed`;
 - platform reconciliation and stale-state cleanup results;
 - counts of application/address exemptions, never their values.
 
 One automatic diagnostic report is queued when entering `blocked` and another
-when recovery succeeds or is exhausted. Existing report deduplication and
-rate limits remain in force.
+when recovery succeeds, first enters passive slow recovery, or becomes
+terminal. Existing report deduplication and rate limits remain in force.
 
 ## Security and failure handling
 
@@ -302,7 +313,10 @@ rate limits remain in force.
 - Explicit Stop always attempts to remove protection and reports removal
   failure instead of claiming success.
 - Enabling/disabling while connected does not restart the tunnel.
-- Recovery exhaustion produces one notification and no reconnect loop.
+- Slow recovery produces one notification, serialized passive retry no more
+  often than once every five minutes, and no hot or overlapping reconnect loop.
+- Terminal recovery remains `blocked` with an available explicit `Stop` until
+  enforcement removal is confirmed.
 - Reboot starts with tunnel off and kill switch runtime state off.
 - Existing split-tunnel, quick tile, updater, diagnostics, and AWG3 recovery
   tests continue to pass.

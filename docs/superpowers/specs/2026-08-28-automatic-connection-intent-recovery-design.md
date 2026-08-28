@@ -25,10 +25,13 @@
 
 ## Цель
 
-Одно нажатие `Старт` создаёт действующее до явного `Стоп` намерение оставаться
-подключённым. Приложение самостоятельно повторяет все безопасные операции,
-заменяет неработающий динамический lease и восстанавливает туннель после
-временных сбоев без горячего цикла и без повторных действий пользователя.
+Одно нажатие `Старт` создаёт в текущей process/boot session намерение оставаться
+подключённым. Пока причины остаются retryable, оно действует до явного `Стоп`
+или Android Quick Settings `Off`. Приложение самостоятельно повторяет все
+безопасные операции, заменяет неработающий динамический lease и восстанавливает
+туннель после временных сбоев без горячего цикла и без повторных действий
+пользователя. Reboot и терминальная причина завершают intent по явно описанным
+ниже правилам.
 
 ## Не входит в задачу
 
@@ -38,10 +41,11 @@
 - автоматическое исправление конфликтов другого VPN, антивируса, прав
   администратора, истёкшего доступа или обязательного обновления;
 - сохранение нового намерения подключения после перезапуска ОС;
-- переписывание существующего Android Quick Settings/sticky-restore контура:
-  он сохраняет собственный уже автоматический background retry и не запускает
-  параллельный Tauri coordinator;
-- изменение серверного API или production-панели;
+- изменение поведения Android Quick Settings для пользователя: существующие
+  `On/Off` и sticky restore сохраняются, но их persisted state становится
+  единственным владельцем Android intent;
+- изменение серверного API сверх узкого additive-контракта для сообщения о
+  зависшем data plane и гарантированной замены его dynamic lease;
 - Android CPU telemetry — это следующий отдельный этап.
 
 ## Основной принцип
@@ -53,17 +57,27 @@
 Стоп  -> desired=disconnected -> текущая попытка отменяется, туннель очищается
 ```
 
-Намерение хранится только в памяти процесса приложения. Успешное подключение
-по-прежнему использует существующее защищённое хранение конфигурации и
-существующие механизмы platform restore. Новое намерение не переживает reboot
-и само по себе не включает VPN после нового запуска ОС.
+На desktop намерение хранится только в памяти процесса приложения. На Android
+оно атомарно хранится в Android Keystore-backed store процесса `:vpn`, чтобы
+переживать обычное завершение UI/Tauri-процесса. Store содержит generation,
+нормализованный выбор подключения, безопасные tunnel options и retry metadata,
+но не WireGuard-конфигурацию, ключи или session token. Background credential
+остаётся в существующем отдельном защищённом хранилище.
+
+Android intent привязан к текущей загрузке ОС. При boot он очищается до любого
+sticky restore, поэтому новое поведение не включает VPN после reboot и не
+изменяет требование `reboot -> off`. Успешное подключение по-прежнему использует
+существующее защищённое хранение конфигурации и platform restore.
 
 ## Архитектура
 
 ### 1. Connection intent coordinator
 
-Общий для desktop и Android UI coordinator живёт над `NativeApplication` в
-нативном Tauri-слое. Он владеет:
+Desktop coordinator живёт над `NativeApplication` в нативном Tauri-слое.
+Android использует ту же state-machine semantics, но её авторитетный owner
+живёт в `NelomaiVpnService` процесса `:vpn`; Tauri передаёт ему intent и
+наблюдает состояние, а не планирует собственные Android retry. Coordinator
+владеет:
 
 - поколением операции для защиты от поздних результатов;
 - нормализованными `ConnectOptions` и идентификатором устройства;
@@ -71,6 +85,17 @@
 - номером попытки и временем следующего повтора;
 - последним безопасным кодом ошибки;
 - признаком отправленного уведомления текущего recovery episode.
+
+Android использует новый `AndroidConnectionIntentStore`, отдельный от
+UI-state, но разделяющий generation с `QuickTunnelController`. До первой
+попытки UI передаёт в `:vpn` нормализованный intent template и убеждается, что
+существующий `BackgroundCredentialStore` готов. `BackgroundConnectionClient`
+расширяется так, чтобы выполнять initial и recovery start из этого template
+через существующий background transport; успешное предыдущее подключение для
+создания template не требуется. Полученная WireGuard-конфигурация передаётся
+напрямую в `TunnelRuntime` и обнуляется после использования, как в действующем
+background start. Ошибка атомарного сохранения intent является терминальной и
+происходит до выдачи lease или запуска туннеля.
 
 Coordinator сериализует все start/recovery-операции. Новый `Старт` при уже
 активном совпадающем намерении является идемпотентным. Изменить параметры
@@ -83,10 +108,11 @@ Coordinator сериализует все start/recovery-операции. Но�
 WireGuard-конфигурацию.
 
 Metrics scheduler больше не выполняет многоступенчатый restart самостоятельно.
-Он передаёт coordinator типизированный stall trigger с текущим lease, после
-чего coordinator выполняет одну сериализованную recovery-транзакцию. Android
-native background restore остаётся отдельным владельцем своего процесса и не
-конкурирует с Tauri intent.
+Он передаёт платформенному coordinator типизированный stall trigger с текущим
+lease, после чего coordinator выполняет одну сериализованную
+recovery-транзакцию. На Android native background restore, Quick Settings и
+обычный UI-start используют один persisted intent, одну generation и один
+operation gate процесса `:vpn`; параллельного Tauri recovery не существует.
 
 ### 2. Результат команды Start
 
@@ -96,12 +122,19 @@ native background restore остаётся отдельным владельце
 - `connected` с установленным `Connection`;
 - `recovering`, когда intent принят и следующая попытка запланирована.
 
+`AppStateResponse` и native state event получают отдельное поле
+`connection_intent_status` со значениями `none`, `recovering` и
+`blocked_terminal`, а для `recovering` — опциональное время следующей попытки.
+Это поле не является новой core phase.
+
 Терминальные ошибки по-прежнему возвращаются как `CommandError`. UI оставляет
 phase `connecting` для `recovering`, показывает «Восстанавливаем подключение»
 и предоставляет `Стоп`, а не заблокированную кнопку или повторный `Старт`.
-Пока intent активен, `AppStateResponse` накладывает `connecting` поверх
-промежуточных core-фаз `Ready/ServerUnavailable/Stopping`; исходная core-фаза
-остаётся доступна только внутреннему recovery для принятия решений.
+Пока `connection_intent_status=recovering`, `AppStateResponse` накладывает
+`connecting` поверх промежуточных core-фаз
+`Ready/ServerUnavailable/Stopping`; исходная core-фаза остаётся доступна только
+внутреннему recovery для принятия решений. Для `blocked_terminal` core phase и
+kill-switch state не маскируются.
 
 Успех, длительное ожидание и терминальная ошибка фонового восстановления
 доставляются существующим событием изменения native-состояния с расширенным
@@ -123,9 +156,13 @@ phase `connecting` для `recovering`, показывает «Восстана�
 Logout, update shutdown и явное завершение приложения сначала отменяют intent,
 а затем используют существующий stop path.
 
-Android Quick Settings `Off` продолжает отменять native quick plan и sticky
-restore существующим путём. При следующей синхронизации UI принимает
-фактическое отключённое состояние и очищает совпадающий Tauri intent.
+Android Quick Settings `Off` до начала stop атомарно увеличивает persisted
+generation, устанавливает `desired_active=false` и отменяет native retry.
+Каждый callback start/recovery сверяет generation до установки туннеля и до
+публикации успеха. Поэтому поздний результат не может снова включить VPN.
+Broadcast revision сообщает Tauri уже принятое состояние; UI-синхронизация не
+является владельцем отмены. Новый Android intent после `Off` возможен только
+после следующего явного `Старт` или Quick Settings `On`.
 
 ### 4. Классификация ошибок
 
@@ -144,8 +181,13 @@ restore существующим путём. При следующей синх�
 - `probe_results_required` после нового probe snapshot;
 - `saved_connection_unavailable` для динамического режима через онлайн-выдачу;
 - `tunnel_handshake_timeout` после полного compensation stop;
-- `tunnel_service_unavailable` и конечные service timeout после проверки
-  фактического состояния;
+- исходные `service_timeout`, `tunnel_service_timeout` и `service_stopping`
+  после проверки фактического состояния;
+- `service_unavailable` только после одной неинтерактивной попытки восстановить
+  локальный service; повтор того же кода становится терминальным;
+- `udp_rebind_failed` и `udp_rebind_timeout` не выходят наружу как общий
+  service failure, а переводят текущую AWG recovery-транзакцию на ступень
+  локального restart;
 - `endpoint_route_lost` и `endpoint_route_unavailable` после изменения сети
   либо backoff;
 - `physical_network_monitor_unavailable`, `physical_egress_unavailable` и
@@ -168,11 +210,19 @@ restore существующим путём. При следующей синх�
 - VPN permission required/denied;
 - Defender/антивирус и отсутствующий AWG-компонент;
 - helper install/authorization errors;
+- `service_outdated`, `unsupported_protocol`, `missing_service_version`;
+- `unauthorized_client` и `truncated_frame`;
 - route conflict с другим VPN;
 - повреждение или недоступность защищённого хранилища;
 - некорректный ответ API;
 - явная отмена системного диалога;
 - ошибки, не входящие в allowlist автоматического recovery.
+
+Нормализованный UI-код `tunnel_service_unavailable` не используется для
+решения о retry, потому что он объединяет временные, несовместимые и security
+ошибки. Coordinator классифицирует исходный стабильный service code до
+преобразования в `CommandError`; UI получает уже выбранное состояние recovery
+или terminal action.
 
 Личный пир повторяется только как личный пир. Coordinator никогда не меняет
 его на динамический режим без отдельного выбора пользователя. Динамическое
@@ -187,9 +237,11 @@ restore существующим путём. При следующей синх�
 ```
 
 После достижения 300 секунд приложение остаётся в пассивном ожидании и
-повторяет попытку не чаще одного раза в 5 минут, пока intent не отменён.
-Это не горячий бесконечный цикл: одновременно существует только одна попытка,
-а частота имеет жёсткий верхний предел.
+повторяет попытку не чаще одного раза в 5 минут, пока intent не отменён и
+последняя причина остаётся retryable. Терминальная причина переводит intent в
+`none` либо `blocked_terminal` и прекращает scheduler. Это не горячий
+бесконечный цикл: одновременно существует только одна попытка, а частота имеет
+жёсткий верхний предел.
 
 Смена физической сети, восстановление network reachability или возврат
 приложения на экран могут один раз обнулить текущую задержку. Несколько
@@ -207,7 +259,8 @@ Recovery работающего AWG3 выполняется по ступеня�
 2. выполнить UDP rebind и проверить tunnel probe/handshake;
 3. выполнить один локальный restart и проверить handshake;
 4. если локальный restart не помог, полностью остановить backend;
-5. освободить или пометить failed старый lease через idempotent API operation;
+5. после подтверждённого локального stop завершить старый lease через
+   idempotent API operation с типизированной причиной;
 6. очистить только динамический offline cache старого lease;
 7. запросить новый lease с теми же layer/mode/route/egress и
    `allow_alternate=true`;
@@ -223,6 +276,30 @@ Metrics scheduler может остановить наблюдение стар�
 Stray сохраняется существующий cooldown и запрет обхода server-side recycle
 через offline cache.
 
+#### Additive server contract
+
+`ClientConnectionStopRequest.failure_code` расширяется значением
+`tunnel_data_plane_stalled`. Оно отправляется только после подтверждённого
+stall ранее подключённого AWG3, неуспешных rebind/local restart и завершённого
+локального stop.
+
+Для dynamic lease панель независимо от ранее наблюдавшегося handshake:
+
+1. переводит lease в `Failed`;
+2. отправляет его pool peer в recycle и не возвращает тот же peer новой выдаче;
+3. сохраняет idempotency по паре operation ID и failure code;
+4. применяет существующие device/session rate limits к повторным сообщениям.
+
+Следующий start использует новый operation ID и `allow_alternate=true`; новый
+lease не может ссылаться на отправленный в recycle peer. Другой peer того же
+здорового pool допустим, а действующие probe/runtime-policy могут выбрать
+другой сервер. Для personal/pinned lease причина не отвязывает peer и не
+разрешает динамический fallback: сохраняются binding и действующий cooldown.
+
+Это единственное изменение client API и панели в рамках задачи. Поля остаются
+additive, старые клиенты продолжают отправлять `failure_code=null` или
+`tunnel_handshake_timeout`.
+
 ### 7. Kill switch
 
 Явный `Стоп` отличается от внутреннего recovery:
@@ -233,14 +310,23 @@ Stray сохраняется существующий cooldown и запрет �
 - пользовательский `Стоп` снимает intent и переводит защиту в `off` только
   через существующий подтверждённый cleanup.
 
-Это уточняет прежнее требование «после исчерпания попыток ждать ручного Retry»:
-ограниченным остаётся каждый активный burst, после него coordinator переходит
-в пассивный пяти минутный backoff. Пользователь не обязан нажимать Retry, но
-может в любой момент нажать `Стоп`.
+Действующая scoped kill-switch спецификация обновляется вместе с этим
+документом: ограниченным остаётся каждый активный burst, после него coordinator
+переходит в пассивный пяти минутный backoff. Это заменяет требование ждать
+ручного `Retry`, но сохраняет запрет hot loop, состояние `blocked`, одну
+попытку одновременно и доступный в любой момент `Стоп`.
+
+Терминальная ошибка первоначального запуска до `armed` очищает intent и
+оставляет kill switch `off`. Терминальная ошибка recovery ранее `armed`-сессии
+при включённом kill switch устанавливает
+`connection_intent_status=blocked_terminal`: автоматические попытки
+прекращаются, но recovery context и защита сохраняются. UI показывает причину,
+требуемое действие, `Повторить` и `Стоп`; только подтверждённый `Стоп` снимает
+защиту.
 
 ### 8. UI и тексты
 
-Пока intent активен:
+Пока `connection_intent_status=recovering`:
 
 - заголовок: «Восстанавливаем подключение»;
 - кнопка: `Стоп`;
@@ -249,12 +335,16 @@ Stray сохраняется существующий cooldown и запрет �
 - инструкция «нажмите Старт ещё раз» не показывается для allowlist recovery.
 
 Тексты с ручным действием сохраняются только для терминальных ошибок. После
-терминальной ошибки intent очищается, phase становится соответствующим
-`Ready/Error/AccessExpired/UpdateRequired`, и кнопка снова становится `Старт`.
+терминальной ошибки initial start intent очищается, phase становится
+соответствующим `Ready/Error/AccessExpired/UpdateRequired`, и кнопка снова
+становится `Старт`. После терминальной ошибки ранее защищённой сессии
+`connection_intent_status` остаётся `blocked_terminal`, исходная core phase и
+kill-switch state `blocked` сохраняются, а UI предоставляет `Повторить` и
+`Стоп`, пока защита не снята подтверждённым cleanup.
 
-Tray показывает «Отключить VPN» как для `Connected`, так и для активного
-`connecting/recovering`, чтобы пользователь мог отменить намерение без открытия
-окна.
+Tray показывает «Отключить VPN» для `Connected`, активного
+`connecting/recovering` и `blocked_terminal`, чтобы пользователь мог отменить
+намерение или снять fail-closed защиту без открытия окна.
 
 ### 9. Диагностика и уведомления
 
@@ -313,14 +403,26 @@ Operation ID, request ID и lease ID остаются в существующи�
 - phase `connecting` предоставляет `Стоп`;
 - `Стоп` отменяет coordinator и очищает частичное состояние;
 - terminal error показывает конкретное пользовательское действие;
-- desktop tray отменяет активный intent, а Android Quick Settings не создаёт
-  конкурирующий Tauri recovery;
+- desktop tray отменяет активный intent;
+- завершение Android UI-процесса не уничтожает intent и native retry;
+- Android initial retry работает из persisted template до первого успешного
+  подключения и не сохраняет WireGuard-конфигурацию;
+- ошибка сохранения Android intent не выдаёт lease и не запускает туннель;
+- Android Quick Settings `Off` инвалидирует generation до stop, а поздний
+  Tauri/native callback не восстанавливает туннель;
+- reboot очищает Android intent до restore и оставляет VPN/kill switch `off`;
+- временные service-коды повторяются, а incompatible/security-коды становятся
+  терминальными;
 - смена сети объединяет несколько wakeup в одну попытку.
 
 ### Регрессии
 
 - существующие start/stop, compensation, pinned, split-tunnel, quick reconnect,
   diagnostics, updater и AWG3 handshake tests остаются зелёными;
+- `tunnel_data_plane_stalled` идемпотентно переводит dynamic lease в `Failed`,
+  отправляет peer в recycle и не применяется к personal binding;
+- terminal recovery ранее `armed`-сессии сохраняет `blocked` и доступный
+  подтверждённый `Стоп`;
 - конфигурация и секреты не появляются в UI, событиях или логах;
 - production preflight и production-БД для проверки не используются.
 
