@@ -4,10 +4,11 @@ use nelomai_client_updater::{
     UpdateCoordinator, UpdateOffer, UpdatePhase, UpdatePreferences,
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
+use tokio::sync::Notify;
 
 struct RecordingBackend {
     calls: AtomicUsize,
@@ -81,6 +82,63 @@ impl UpdateBackend for RecordingBackend {
     }
 }
 
+struct BlockingBackend {
+    calls: AtomicUsize,
+    started: Notify,
+    released: AtomicBool,
+    release: Notify,
+    opens_installer: bool,
+}
+
+impl BlockingBackend {
+    fn installed() -> Self {
+        Self::new(false)
+    }
+
+    fn opening_installer() -> Self {
+        Self::new(true)
+    }
+
+    fn new(opens_installer: bool) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            started: Notify::new(),
+            released: AtomicBool::new(false),
+            release: Notify::new(),
+            opens_installer,
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl UpdateBackend for BlockingBackend {
+    async fn install(
+        &self,
+        _access_token: &str,
+        expected_version: &str,
+        _progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
+    ) -> Result<InstallResult, UpdateBackendError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.started.notify_one();
+        while !self.released.load(Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        let installed = InstalledUpdate {
+            version: expected_version.to_string(),
+        };
+        Ok(if self.opens_installer {
+            InstallResult::InstallerOpened(installed)
+        } else {
+            InstallResult::Installed(installed)
+        })
+    }
+}
+
 fn offer() -> UpdateOffer {
     offer_for("0.2.0")
 }
@@ -131,6 +189,76 @@ async fn automatic_update_reports_progress_and_finishes_once() {
         backend.expected_versions.lock().unwrap().as_slice(),
         ["0.2.0"]
     );
+}
+
+#[tokio::test]
+async fn concurrent_automatic_installs_call_backend_once_after_install() {
+    let backend = Arc::new(BlockingBackend::installed());
+    let coordinator = Arc::new(UpdateCoordinator::new(backend.clone()));
+    coordinator.observe(Some(offer()));
+
+    let first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .install_automatically("access-secret", UpdatePreferences::default())
+                .await
+        })
+    };
+    backend.started.notified().await;
+    let second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .install_automatically("access-secret", UpdatePreferences::default())
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    backend.release();
+
+    let (first, second) = tokio::join!(first, second);
+    let expected = UpdatePhase::ReadyToRestart {
+        version: "0.2.0".to_string(),
+    };
+    assert_eq!(first.unwrap().unwrap(), expected);
+    assert_eq!(second.unwrap().unwrap(), expected);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_automatic_installs_open_android_installer_once() {
+    let backend = Arc::new(BlockingBackend::opening_installer());
+    let coordinator = Arc::new(UpdateCoordinator::new(backend.clone()));
+    coordinator.observe(Some(offer()));
+
+    let first = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .install_automatically("access-secret", UpdatePreferences::default())
+                .await
+        })
+    };
+    backend.started.notified().await;
+    let second = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .install_automatically("access-secret", UpdatePreferences::default())
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    backend.release();
+
+    let (first, second) = tokio::join!(first, second);
+    let expected = UpdatePhase::AwaitingInstallation {
+        version: "0.2.0".to_string(),
+    };
+    assert_eq!(first.unwrap().unwrap(), expected);
+    assert_eq!(second.unwrap().unwrap(), expected);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

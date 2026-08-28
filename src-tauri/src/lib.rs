@@ -228,6 +228,7 @@ pub fn run() {
             commands::app_send_diagnostics,
             commands::app_record_startup_stage,
             commands::app_update_status,
+            commands::app_update_refresh,
             commands::app_update_set_automatic,
             commands::app_update_install,
             commands::app_update_restart,

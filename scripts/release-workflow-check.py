@@ -218,6 +218,7 @@ def run() -> None:
     )
     for command in (
         "app_update_status",
+        "app_update_refresh",
         "app_update_set_automatic",
         "app_update_install",
         "app_update_restart",

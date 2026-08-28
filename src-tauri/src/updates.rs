@@ -5,13 +5,43 @@ use nelomai_client_updater::{
 };
 use nelomai_contracts::UpdateState;
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tauri::{AppHandle, Manager, Wry};
+
+#[derive(Default)]
+struct UpdateRefreshGate {
+    in_flight: AtomicBool,
+}
+
+impl UpdateRefreshGate {
+    fn try_begin(&self) -> Option<UpdateRefreshGuard<'_>> {
+        self.in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| UpdateRefreshGuard {
+                in_flight: &self.in_flight,
+            })
+    }
+}
+
+pub struct UpdateRefreshGuard<'a> {
+    in_flight: &'a AtomicBool,
+}
+
+impl Drop for UpdateRefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
 
 pub struct NativeUpdater {
     preferences: FileUpdatePreferenceStore,
     current_preferences: Mutex<UpdatePreferences>,
     observed_offer: Mutex<Option<UpdateOffer>>,
+    refresh_gate: UpdateRefreshGate,
     #[cfg(desktop)]
     coordinator: Option<UpdateCoordinator<platform::updater::DesktopUpdateBackend<Wry>>>,
     #[cfg(target_os = "android")]
@@ -54,6 +84,7 @@ impl NativeUpdater {
             preferences,
             current_preferences: Mutex::new(current_preferences),
             observed_offer: Mutex::new(None),
+            refresh_gate: UpdateRefreshGate::default(),
             #[cfg(any(desktop, target_os = "android"))]
             coordinator,
         })
@@ -127,6 +158,17 @@ impl NativeUpdater {
             .lock()
             .map_err(|_| "update preference lock poisoned".to_string())? = preferences;
         self.status()
+    }
+
+    pub fn try_begin_refresh(&self) -> Option<UpdateRefreshGuard<'_>> {
+        self.refresh_gate.try_begin()
+    }
+
+    pub fn automatic_enabled(&self) -> Result<bool, String> {
+        self.current_preferences
+            .lock()
+            .map(|preferences| preferences.automatic)
+            .map_err(|_| "update preference lock poisoned".to_string())
     }
 
     pub async fn install_automatically(
@@ -225,6 +267,17 @@ fn status_from_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_refresh_gate_rejects_overlap_and_reopens_after_drop() {
+        let gate = UpdateRefreshGate::default();
+
+        let first = gate.try_begin().expect("first refresh must start");
+        assert!(gate.try_begin().is_none());
+
+        drop(first);
+        assert!(gate.try_begin().is_some());
+    }
 
     fn offer() -> UpdateOffer {
         UpdateOffer {

@@ -1766,6 +1766,25 @@ pub fn app_update_status(
 }
 
 #[tauri::command]
+pub async fn app_update_refresh(
+    application: State<'_, Arc<NativeApplication>>,
+    updater: State<'_, Arc<NativeUpdater>>,
+) -> Result<UpdateStatusResponse, CommandError> {
+    let Some(_refresh_guard) = updater.try_begin_refresh() else {
+        return updater.status().map_err(update_command_error);
+    };
+    let update = application
+        .refresh_update_state()
+        .await
+        .map_err(CommandError::from)?;
+    updater.observe(&update).map_err(update_command_error)?;
+    if updater.automatic_enabled().map_err(update_command_error)? {
+        schedule_automatic_update(application.inner().clone(), updater.inner().clone());
+    }
+    updater.status().map_err(update_command_error)
+}
+
+#[tauri::command]
 pub fn app_update_set_automatic(
     application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,

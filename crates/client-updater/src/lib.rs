@@ -321,7 +321,10 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
 
     pub async fn install_now(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
         let _guard = self.install_gate.lock().await;
-        if matches!(self.phase(), UpdatePhase::ReadyToRestart { .. }) {
+        if matches!(
+            self.phase(),
+            UpdatePhase::ReadyToRestart { .. } | UpdatePhase::AwaitingInstallation { .. }
+        ) {
             return Ok(self.phase());
         }
         let Some(offer) = self
