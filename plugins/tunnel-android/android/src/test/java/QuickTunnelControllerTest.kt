@@ -7,6 +7,34 @@ import org.junit.Test
 
 class QuickTunnelControllerTest {
     @Test
+    fun desiredActiveProjectionUsesTheRecoveryEnvelopeGeneration() {
+        val backend = QuickFakeEncryptedRecordBackend()
+        val store = AndroidRecoveryStore(backend, BootIdentityProvider { 9 })
+
+        val enabled = QuickDesiredActiveProjection.update(store, true).successIntent()
+        val disabled = QuickDesiredActiveProjection.update(store, false).successIntent()
+
+        assertTrue(enabled.desiredActive)
+        assertEquals(1, enabled.generation)
+        assertFalse(disabled.desiredActive)
+        assertEquals(2, disabled.generation)
+        assertFalse(QuickDesiredActiveProjection.read(store).successIntent().desiredActive)
+    }
+
+    @Test
+    fun failedRecoveryCommitRejectsQuickOnWithoutPublishingIntent() {
+        val backend = QuickFakeEncryptedRecordBackend(failWrites = true)
+        val store = AndroidRecoveryStore(backend, BootIdentityProvider { 9 })
+
+        val result = QuickDesiredActiveProjection.update(store, true)
+
+        assertTrue(result is RecoveryStoreResult.Failure)
+        assertEquals("recovery_record_write_failed", (result as RecoveryStoreResult.Failure).code)
+        backend.failWrites = false
+        assertFalse(QuickDesiredActiveProjection.read(store).successIntent().desiredActive)
+    }
+
+    @Test
     fun broadcastGateAvoidsPollingTheVpnServiceForPersistedChanges() {
         val gate = QuickStateChangeGate()
 
@@ -97,4 +125,23 @@ class QuickTunnelControllerTest {
             ),
         )
     }
+}
+
+private class QuickFakeEncryptedRecordBackend(
+    var failWrites: Boolean = false,
+) : EncryptedRecordBackend {
+    private var record: ByteArray? = null
+
+    override fun read(): ByteArray? = record?.copyOf()
+
+    override fun write(plaintext: ByteArray): Boolean {
+        if (failWrites) return false
+        record = plaintext.copyOf()
+        return true
+    }
+}
+
+private fun RecoveryStoreResult<AndroidConnectionIntent>.successIntent(): AndroidConnectionIntent {
+    assertTrue(this is RecoveryStoreResult.Success)
+    return (this as RecoveryStoreResult.Success).value
 }

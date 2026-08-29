@@ -12,6 +12,27 @@ internal data class QuickStateAcknowledgeResult(
     val pendingRevision: Long,
 )
 
+internal object QuickDesiredActiveProjection {
+    fun read(store: AndroidRecoveryStore): RecoveryStoreResult<AndroidConnectionIntent> =
+        when (val result = store.read()) {
+            is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(result.value.intent)
+            is RecoveryStoreResult.Failure -> result
+        }
+
+    fun update(
+        store: AndroidRecoveryStore,
+        desiredActive: Boolean,
+    ): RecoveryStoreResult<AndroidConnectionIntent> {
+        val current = read(store)
+        if (current is RecoveryStoreResult.Failure) return current
+        val intent = (current as RecoveryStoreResult.Success).value
+        return when (val result = store.setDesiredActive(intent.generation, desiredActive)) {
+            is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(result.value.intent)
+            is RecoveryStoreResult.Failure -> result
+        }
+    }
+}
+
 object QuickTunnelController {
     internal const val ACTION_STATE_CHANGED = "ru.nelomai.tunnel.STATE_CHANGED"
     internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
@@ -21,6 +42,7 @@ object QuickTunnelController {
     private const val STATE_VALUE = "state"
     private const val STATE_UPDATED_AT_MILLIS = "state-updated-at-millis"
     private const val DESIRED_ACTIVE = "desired-active"
+    private const val RECOVERY_PROJECTION_MIGRATED = "recovery-projection-migrated"
     internal const val TRANSITION_TIMEOUT_MILLIS = 120_000L
 
     @JvmStatic
@@ -64,6 +86,17 @@ object QuickTunnelController {
         changed: Boolean = false,
     ): Boolean {
         val preferences = preferences(context)
+        if (desiredActive != null) {
+            if (!sealRecoveryProjectionMigration(preferences)) return false
+            val recoveryResult = QuickDesiredActiveProjection.update(
+                AndroidRecoveryStores.open(context),
+                desiredActive,
+            )
+            if (recoveryResult is RecoveryStoreResult.Failure) {
+                TunnelLog.warning("quick_state.recovery_save_failed", recoveryResult.code)
+                return false
+            }
+        }
         val changedRevision = if (changed) {
             val storedRevision = preferences.getLong(STATE_CHANGE_REVISION, 0L)
             val currentRevision = if (preferences.getBoolean(STATE_CHANGED, false)) {
@@ -78,7 +111,10 @@ object QuickTunnelController {
         val saved = preferences.edit().apply {
             putString(STATE_VALUE, state.wireName)
             putLong(STATE_UPDATED_AT_MILLIS, System.currentTimeMillis())
-            desiredActive?.let { putBoolean(DESIRED_ACTIVE, it) }
+            desiredActive?.let {
+                remove(DESIRED_ACTIVE)
+                putBoolean(RECOVERY_PROJECTION_MIGRATED, true)
+            }
             if (changed) {
                 putBoolean(STATE_CHANGED, true)
                 putLong(STATE_CHANGE_REVISION, changedRevision)
@@ -97,11 +133,34 @@ object QuickTunnelController {
                 TunnelLog.warning("quick_state.broadcast_failed", "broadcast_failed", error)
             }
         }
-        return saved
+        // The encrypted intent is authoritative. Once it matches the requested value,
+        // a best-effort display-state failure must not turn an accepted action into a
+        // reported rejection that the service could later restore unexpectedly.
+        return saved || desiredActive != null
     }
 
-    internal fun desiredActive(context: Context): Boolean =
-        preferences(context).getBoolean(DESIRED_ACTIVE, false)
+    internal fun desiredActive(context: Context): Boolean {
+        if (!migrateLegacyDesiredActive(context)) return false
+        return when (
+            val result = QuickDesiredActiveProjection.read(AndroidRecoveryStores.open(context))
+        ) {
+            is RecoveryStoreResult.Success -> result.value.desiredActive
+            is RecoveryStoreResult.Failure -> {
+                TunnelLog.warning("quick_state.recovery_read_failed", result.code)
+                false
+            }
+        }
+    }
+
+    internal fun generation(context: Context): Long? {
+        if (!migrateLegacyDesiredActive(context)) return null
+        return when (
+            val result = QuickDesiredActiveProjection.read(AndroidRecoveryStores.open(context))
+        ) {
+            is RecoveryStoreResult.Success -> result.value.generation
+            is RecoveryStoreResult.Failure -> null
+        }
+    }
 
     @JvmStatic
     fun takeStateChange(context: Context): Boolean = takeStateChangeRevision(context) > 0L
@@ -145,6 +204,14 @@ object QuickTunnelController {
     @Synchronized
     fun clearStateChange(context: Context): Boolean {
         val preferences = preferences(context)
+        val recoveryResult = QuickDesiredActiveProjection.update(
+            AndroidRecoveryStores.open(context),
+            desiredActive = false,
+        )
+        if (recoveryResult is RecoveryStoreResult.Failure) {
+            TunnelLog.warning("quick_state.recovery_clear_failed", recoveryResult.code)
+            return false
+        }
         val revision = preferences.getLong(STATE_CHANGE_REVISION, 0L)
         val saved = preferences.edit().clear().apply {
             if (revision > 0L) putLong(STATE_CHANGE_REVISION, revision)
@@ -179,6 +246,41 @@ object QuickTunnelController {
 
     private fun preferences(context: Context) =
         context.applicationContext.getSharedPreferences(STATE_PREFERENCES, Context.MODE_PRIVATE)
+
+    @Synchronized
+    private fun migrateLegacyDesiredActive(context: Context): Boolean {
+        val preferences = preferences(context)
+        if (preferences.getBoolean(RECOVERY_PROJECTION_MIGRATED, false)) return true
+        val legacyDesiredActive = preferences.getBoolean(DESIRED_ACTIVE, false)
+        if (!sealRecoveryProjectionMigration(preferences)) return false
+        if (legacyDesiredActive) {
+            val result = QuickDesiredActiveProjection.update(
+                AndroidRecoveryStores.open(context),
+                desiredActive = true,
+            )
+            if (result is RecoveryStoreResult.Failure) {
+                TunnelLog.warning("quick_state.recovery_migration_failed", result.code)
+                return false
+            }
+        }
+        if (!preferences.edit().remove(DESIRED_ACTIVE).commit()) {
+            TunnelLog.warning("quick_state.legacy_cleanup_failed")
+        }
+        return true
+    }
+
+    private fun sealRecoveryProjectionMigration(
+        preferences: android.content.SharedPreferences,
+    ): Boolean {
+        if (preferences.getBoolean(RECOVERY_PROJECTION_MIGRATED, false)) return true
+        val saved = preferences.edit()
+            .putBoolean(RECOVERY_PROJECTION_MIGRATED, true)
+            .commit()
+        if (!saved) {
+            TunnelLog.warning("quick_state.recovery_migration_marker_failed")
+        }
+        return saved
+    }
 }
 
 internal class QuickStateChangeGate(initialRevision: Long = 0L) {
