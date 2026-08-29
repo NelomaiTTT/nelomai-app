@@ -23,7 +23,16 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+mod connection_intent;
 mod split_tunnel;
+
+pub use connection_intent::{
+    classify_recovery, stall_recovery_plan, ConnectionIntentStatus, IntentGeneration,
+    RecoveryDecision, RecoveryPolicyContext, RecoveryTransport, RetrySchedule, StallRecoveryPlan,
+    StallTrigger,
+};
+#[cfg(not(target_os = "android"))]
+pub use connection_intent::{ConnectionIntentCoordinator, ConnectionIntentError, StartDisposition};
 
 const INITIAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const UDP_REBIND_TIMEOUT: Duration = Duration::from_millis(3_500);
@@ -89,6 +98,20 @@ pub struct ConnectionMetricsContext {
     pub session_id: String,
     pub layer: Layer,
     pub probe_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveRecoveryEpisode {
+    metrics: ConnectionMetricsContext,
+    options: ConnectOptions,
+    armed: bool,
+    stop_operation_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionStartContract {
+    Legacy,
+    RecoveryV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -778,6 +801,8 @@ pub struct ClientCore<A, S, T, L> {
     tunnel: Arc<T>,
     logger: Arc<L>,
     state: Mutex<CoreState>,
+    intent_recovery_gate: Mutex<()>,
+    active_recovery_episode: Mutex<Option<ActiveRecoveryEpisode>>,
     refresh_gate: Mutex<()>,
     connection_gate: Mutex<()>,
     split_tunnel_store: Arc<dyn SplitTunnelStore>,
@@ -821,6 +846,8 @@ where
             tunnel,
             logger,
             state: Mutex::new(CoreState::default()),
+            intent_recovery_gate: Mutex::new(()),
+            active_recovery_episode: Mutex::new(None),
             refresh_gate: Mutex::new(()),
             connection_gate: Mutex::new(()),
             split_tunnel_store,
@@ -945,23 +972,36 @@ where
 
     pub async fn connection_metrics_context(&self) -> Option<ConnectionMetricsContext> {
         let state = self.state.lock().await.clone();
-        if state.phase != Phase::Connected {
-            return None;
-        }
-        if let Some(connection) = state.connection {
+        if state.phase == Phase::Connected {
+            if let Some(connection) = state.connection {
+                return Some(ConnectionMetricsContext {
+                    session_id: connection.lease_id,
+                    layer: connection.layer,
+                    probe_url: connection.probe_url,
+                });
+            }
+            let stored = self.load_auth().ok()?;
+            let connection = stored.saved_connection.or(stored.pinned_connection)?;
             return Some(ConnectionMetricsContext {
                 session_id: connection.lease_id,
                 layer: connection.layer,
                 probe_url: connection.probe_url,
             });
         }
-        let stored = self.load_auth().ok()?;
-        let connection = stored.saved_connection.or(stored.pinned_connection)?;
-        Some(ConnectionMetricsContext {
-            session_id: connection.lease_id,
-            layer: connection.layer,
-            probe_url: connection.probe_url,
-        })
+        self.active_recovery_episode
+            .lock()
+            .await
+            .as_ref()
+            .filter(|episode| episode.armed)
+            .map(|episode| episode.metrics.clone())
+    }
+
+    pub async fn active_recovery_options(&self) -> Option<ConnectOptions> {
+        self.active_recovery_episode
+            .lock()
+            .await
+            .as_ref()
+            .map(|episode| episode.options.clone())
     }
 
     pub async fn reconcile_external_tunnel_state(&self) -> CoreState {
@@ -1000,6 +1040,7 @@ where
     }
 
     pub async fn sign_out(&self) -> Result<(), CoreError> {
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _connection_guard = self.connection_gate.lock().await;
         let _refresh_guard = self.refresh_gate.lock().await;
@@ -1030,6 +1071,7 @@ where
         self.clear_all_split_tunnel_warnings().await;
         self.physical_network_change.lock().await.reset();
         self.clear_all_offline_connection_quarantines();
+        *self.active_recovery_episode.lock().await = None;
         *self.state.lock().await = CoreState::default();
         self.logger.record(CoreLogEvent {
             kind: "auth.signed_out",
@@ -1309,6 +1351,34 @@ where
         options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        self.start_internal(options, now_unix, true, ConnectionStartContract::Legacy)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn connection_intent_attempt(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, CoreError> {
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        self.start_internal(
+            options,
+            now_unix,
+            false,
+            ConnectionStartContract::RecoveryV1,
+        )
+        .await
+    }
+
+    async fn start_internal(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        allow_internal_retry: bool,
+        contract: ConnectionStartContract,
+    ) -> Result<Connection, CoreError> {
         let options = options.normalized_for_layer();
         let total_started = Instant::now();
         let _split_guard = self.split_tunnel_gate.lock().await;
@@ -1370,6 +1440,12 @@ where
             .save(&pending_stored)
             .map_err(|_| CoreError::Storage)?;
         self.set_phase(Phase::Connecting).await;
+        let require_measured_selection = contract == ConnectionStartContract::RecoveryV1
+            && (options.layer != Layer::Tic
+                || options.tic_connection_mode == TicConnectionMode::Dynamic);
+        let request_fingerprint = (contract == ConnectionStartContract::RecoveryV1).then(|| {
+            connection_intent::request_fingerprint_v1(&options, require_measured_selection)
+        });
         let mut request = ConnectionStartRequest {
             operation_id: operation_id.clone(),
             layer: options.layer,
@@ -1378,12 +1454,14 @@ where
             egress_mode: options.egress_mode,
             probes: options.probes,
             allow_alternate: options.allow_alternate,
-            require_measured_selection: false,
-            recovery_contract_version: None,
-            request_fingerprint: None,
+            require_measured_selection,
+            recovery_contract_version: request_fingerprint.as_ref().map(|_| 1),
+            request_fingerprint,
         };
         let panel_started = Instant::now();
-        let start_result = self.retry_start(&access_token, &mut request).await;
+        let start_result = self
+            .retry_start(&access_token, &mut request, allow_internal_retry)
+            .await;
         operation_id.clone_from(&request.operation_id);
         let response = match start_result {
             Ok(response) => response,
@@ -1703,18 +1781,30 @@ where
     }
 
     pub async fn stop(&self) -> Result<Connection, CoreError> {
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        self.stop_internal(None, true, None).await
+    }
+
+    async fn stop_internal(
+        &self,
+        failure_code: Option<&str>,
+        clear_recovery_episode: bool,
+        operation_id: Option<&str>,
+    ) -> Result<Connection, CoreError> {
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         let current_state = self.state.lock().await.clone();
         let current = current_state
             .connection
             .ok_or(CoreError::SavedConnectionUnavailable)?;
+        if clear_recovery_episode {
+            *self.active_recovery_episode.lock().await = None;
+        }
         let panel_connection_finished = matches!(
             current.status,
-            nelomai_contracts::LeaseStatus::Warm
-                | nelomai_contracts::LeaseStatus::Released
-                | nelomai_contracts::LeaseStatus::Failed
-        );
+            nelomai_contracts::LeaseStatus::Released | nelomai_contracts::LeaseStatus::Failed
+        ) || (failure_code.is_none()
+            && current.status == nelomai_contracts::LeaseStatus::Warm);
         self.set_phase(Phase::Stopping).await;
         let tunnel_status = self.tunnel.status().await.unwrap_or(TunnelStatus::Running);
         if tunnel_status != TunnelStatus::Stopped {
@@ -1753,9 +1843,11 @@ where
         let stored = self.load_auth()?;
         let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
         let request = ConnectionOperationRequest {
-            operation_id: Uuid::new_v4().to_string(),
+            operation_id: operation_id
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
             lease_id: current.lease_id.clone(),
-            failure_code: None,
+            failure_code: failure_code.map(str::to_string),
         };
         let response = match self
             .retry_operation(&access_token, &request, ConnectionOperation::Stop)
@@ -1797,6 +1889,96 @@ where
             code: None,
         });
         Ok(response.connection)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn compensate_stale_connection_intent_result(&self) -> Result<(), CoreError> {
+        match self.stop().await {
+            Ok(_) | Err(CoreError::SavedConnectionUnavailable) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn replace_stalled_connection(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, CoreError> {
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        let options = options.normalized_for_layer();
+        let current = self
+            .state
+            .lock()
+            .await
+            .connection
+            .clone()
+            .ok_or(CoreError::SavedConnectionUnavailable)?;
+        let stored = self.load_auth()?;
+        let saved = stored
+            .saved_connection
+            .as_ref()
+            .into_iter()
+            .chain(stored.pinned_connection.as_ref())
+            .find(|saved| saved.lease_id == current.lease_id)
+            .ok_or(CoreError::SavedConnectionUnavailable)?;
+        let transport = TunnelConfiguration::new(saved.configuration.clone()).transport();
+        let recovery_transport = if transport == TunnelTransport::AmneziaWg3 {
+            RecoveryTransport::AmneziaWg3
+        } else {
+            RecoveryTransport::Other
+        };
+        self.begin_recovery_episode(&current, options.clone()).await;
+        let stop_operation_id = self
+            .active_recovery_episode
+            .lock()
+            .await
+            .as_ref()
+            .map(|episode| episode.stop_operation_id.clone())
+            .ok_or(CoreError::Storage)?;
+        let plan = stall_recovery_plan(&options, current.pinned, recovery_transport);
+        let failure_code = match plan {
+            StallRecoveryPlan::ReplaceDynamic { failure_code, .. } => Some(failure_code),
+            StallRecoveryPlan::PreservePeer => None,
+        };
+        let stopped = self
+            .stop_internal(failure_code, false, Some(&stop_operation_id))
+            .await?;
+        let terminal = match plan {
+            StallRecoveryPlan::ReplaceDynamic { .. } => {
+                matches!(stopped.status, LeaseStatus::Released | LeaseStatus::Failed)
+            }
+            StallRecoveryPlan::PreservePeer => matches!(
+                stopped.status,
+                LeaseStatus::Warm | LeaseStatus::Released | LeaseStatus::Failed
+            ),
+        };
+        if !terminal {
+            return Err(CoreError::Api(CoreApiError::Rejected {
+                code: "connection_release_failed".to_string(),
+                message: "Панель ещё не завершила предыдущее подключение.".to_string(),
+            }));
+        }
+        if matches!(plan, StallRecoveryPlan::ReplaceDynamic { .. }) {
+            self.remove_dynamic_recovery_cache(&current.lease_id)?;
+        }
+        let mut replacement_options = options;
+        if let StallRecoveryPlan::ReplaceDynamic {
+            allow_alternate, ..
+        } = plan
+        {
+            replacement_options.allow_alternate = allow_alternate;
+        }
+        let replacement = self
+            .start_internal(
+                replacement_options,
+                now_unix,
+                false,
+                ConnectionStartContract::RecoveryV1,
+            )
+            .await?;
+        *self.active_recovery_episode.lock().await = None;
+        Ok(replacement)
     }
 
     pub async fn pin_stray(&self) -> Result<Connection, CoreError> {
@@ -2234,6 +2416,41 @@ where
         Ok(())
     }
 
+    async fn begin_recovery_episode(&self, connection: &Connection, options: ConnectOptions) {
+        let mut active = self.active_recovery_episode.lock().await;
+        if let Some(episode) = active
+            .as_mut()
+            .filter(|episode| episode.metrics.session_id == connection.lease_id)
+        {
+            episode.options = options;
+            episode.armed = true;
+            return;
+        }
+        *active = Some(ActiveRecoveryEpisode {
+            metrics: ConnectionMetricsContext {
+                session_id: connection.lease_id.clone(),
+                layer: connection.layer,
+                probe_url: connection.probe_url.clone(),
+            },
+            options,
+            armed: true,
+            stop_operation_id: Uuid::new_v4().to_string(),
+        });
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn remove_dynamic_recovery_cache(&self, lease_id: &str) -> Result<(), CoreError> {
+        let mut stored = self.load_auth()?;
+        if stored.saved_connection.as_ref().is_some_and(|saved| {
+            saved.lease_id == lease_id && saved.kind == StoredConnectionKind::DynamicWarm
+        }) {
+            stored.saved_connection = None;
+            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        }
+        self.clear_offline_connection_quarantine(lease_id);
+        Ok(())
+    }
+
     fn reconcile_handshake_timeout_storage(
         &self,
         operation_id: &str,
@@ -2584,8 +2801,13 @@ where
         &self,
         access_token: &str,
         request: &mut ConnectionStartRequest,
+        allow_internal_retry: bool,
     ) -> Result<ConnectionStartResponse, CoreError> {
-        let delays = self.retry_policy.delays_millis();
+        let delays = if allow_internal_retry {
+            self.retry_policy.delays_millis()
+        } else {
+            Vec::new()
+        };
         let mut retry_index = 0;
         let mut access_token = access_token.to_string();
         let mut refreshed = false;
@@ -2605,7 +2827,9 @@ where
                     }
                 }
                 Err(CoreApiError::Rejected { ref code, .. })
-                    if code == "connection_no_longer_active" && !replaced_finished_operation =>
+                    if allow_internal_retry
+                        && code == "connection_no_longer_active"
+                        && !replaced_finished_operation =>
                 {
                     let previous_operation_id = request.operation_id.clone();
                     let replacement_operation_id = Uuid::new_v4().to_string();

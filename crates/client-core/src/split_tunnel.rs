@@ -927,6 +927,9 @@ where
         lease_id: &str,
         recovery: crate::StalledDataPlaneRecovery,
     ) -> Result<crate::StalledDataPlaneRecoveryOutcome, CoreError> {
+        let Ok(_intent_recovery_guard) = self.intent_recovery_gate.try_lock() else {
+            return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
+        };
         let Ok(_split_guard) = self.split_tunnel_gate.try_lock() else {
             return Ok(crate::StalledDataPlaneRecoveryOutcome::Busy);
         };
@@ -943,7 +946,6 @@ where
         let Some(connection) = connection else {
             return Ok(crate::StalledDataPlaneRecoveryOutcome::Skipped);
         };
-
         if recovery == crate::StalledDataPlaneRecovery::RebindUdp {
             let rebound =
                 tokio::time::timeout(std::time::Duration::from_secs(3), self.tunnel.rebind_udp())
@@ -967,6 +969,20 @@ where
         let Some(configuration) = configuration else {
             return Ok(crate::StalledDataPlaneRecoveryOutcome::Skipped);
         };
+        self.begin_recovery_episode(
+            &connection,
+            crate::ConnectOptions {
+                layer: connection.layer,
+                tic_connection_mode: connection.tic_connection_mode,
+                route_mode: connection.route_mode,
+                egress_mode: connection.egress_mode,
+                probes: Vec::new(),
+                allow_alternate: !connection.pinned
+                    && connection.tic_connection_mode
+                        == nelomai_contracts::TicConnectionMode::Dynamic,
+            },
+        )
+        .await;
         let transport =
             nelomai_client_tunnel::TunnelConfiguration::new(configuration.clone()).transport();
         let options = self.split_tunnel_options.lock().await.clone();
@@ -1027,6 +1043,7 @@ where
         };
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
             .await;
+        *self.active_recovery_episode.lock().await = None;
         Ok(crate::StalledDataPlaneRecoveryOutcome::Reconnected)
     }
 

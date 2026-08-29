@@ -12,6 +12,7 @@ nelomai-client-api = { path = "../client-api" }
 nelomai-client-storage = { path = "../client-storage" }
 nelomai-client-tunnel = { path = "../client-tunnel" }
 nelomai-contracts = { path = "../contracts" }
+sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
@@ -20,4 +21,5 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "test-util", "time"] }

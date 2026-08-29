@@ -1,8 +1,11 @@
 use async_trait::async_trait;
 use nelomai_client_api::{AuthDevice, TokenResponse};
 use nelomai_client_core::{
-    ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLogEvent, CoreLogger, Phase,
-    RetryPolicy, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
+    classify_recovery, stall_recovery_plan, ClientCore, ConnectOptions,
+    ConnectionIntentCoordinator, CoreApi, CoreApiError, CoreError, CoreLogEvent, CoreLogger, Phase,
+    RecoveryDecision, RecoveryPolicyContext, RecoveryTransport, RetryPolicy, RetrySchedule,
+    StallRecoveryPlan, StallTrigger, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
+    StartDisposition,
 };
 use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
@@ -123,6 +126,7 @@ struct MemoryTunnel {
     start_delay_millis: AtomicU64,
     status_failures: AtomicUsize,
     metrics_supported: AtomicBool,
+    metrics_calls: AtomicUsize,
     metric_successes_before_failures: AtomicUsize,
     metric_failures: AtomicUsize,
     fail_tunnel_on_metrics_error: AtomicBool,
@@ -218,6 +222,7 @@ impl TunnelController for MemoryTunnel {
     }
 
     async fn metrics(&self, _probe: bool) -> Result<Option<TunnelMetrics>, TunnelError> {
+        self.metrics_calls.fetch_add(1, Ordering::SeqCst);
         let delay_millis = self.metrics_delay_millis.load(Ordering::SeqCst);
         if delay_millis > 0 {
             tokio::time::sleep(Duration::from_millis(delay_millis)).await;
@@ -274,6 +279,7 @@ struct MockApi {
     start_calls: AtomicUsize,
     start_failures: AtomicUsize,
     start_errors: Mutex<VecDeque<CoreApiError>>,
+    start_requests: Mutex<Vec<ConnectionStartRequest>>,
     operation_ids: Mutex<Vec<String>>,
     stop_calls: AtomicUsize,
     stop_failures: AtomicUsize,
@@ -286,6 +292,7 @@ struct MockApi {
     reject_stale_stop: AtomicBool,
     pinned_start: AtomicBool,
     awg3_start: AtomicBool,
+    warm_start: AtomicBool,
     mismatched_egress: AtomicBool,
     start_lease_override: Mutex<Option<String>>,
     bootstrap_connection: Mutex<Option<Connection>>,
@@ -303,6 +310,7 @@ impl MockApi {
             start_calls: AtomicUsize::new(0),
             start_failures: AtomicUsize::new(start_failures),
             start_errors: Mutex::new(VecDeque::new()),
+            start_requests: Mutex::new(Vec::new()),
             operation_ids: Mutex::new(Vec::new()),
             stop_calls: AtomicUsize::new(0),
             stop_failures: AtomicUsize::new(0),
@@ -315,6 +323,7 @@ impl MockApi {
             reject_stale_stop: AtomicBool::new(false),
             pinned_start: AtomicBool::new(false),
             awg3_start: AtomicBool::new(false),
+            warm_start: AtomicBool::new(false),
             mismatched_egress: AtomicBool::new(false),
             start_lease_override: Mutex::new(None),
             bootstrap_connection: Mutex::new(None),
@@ -374,6 +383,7 @@ impl CoreApi for MockApi {
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
+        self.start_requests.lock().unwrap().push(request.clone());
         self.operation_ids
             .lock()
             .unwrap()
@@ -413,6 +423,9 @@ impl CoreApi for MockApi {
         response.connection.pool_id = (request.tic_connection_mode == TicConnectionMode::Dynamic)
             .then(|| "pool-test".to_string());
         response.connection.pinned = self.pinned_start.load(Ordering::SeqCst);
+        if self.warm_start.load(Ordering::SeqCst) {
+            response.connection.status = LeaseStatus::Warm;
+        }
         Ok(response)
     }
 
@@ -451,7 +464,11 @@ impl CoreApi for MockApi {
             request_id: "req-stop".to_string(),
             connection: Connection {
                 lease_id: request.lease_id.clone(),
-                status: LeaseStatus::Warm,
+                status: if request.failure_code.as_deref() == Some("tunnel_data_plane_stalled") {
+                    LeaseStatus::Failed
+                } else {
+                    LeaseStatus::Warm
+                },
                 stopped_at: Some("2026-07-26T10:00:00Z".to_string()),
                 ..connection(&request.lease_id)
             },
@@ -2863,4 +2880,482 @@ async fn unbind_clears_dynamic_and_pinned_connections() {
     assert!(stored.pinned_connection.is_none());
     assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
     assert_eq!(core.state().await.phase, Phase::NeedsPeerBinding);
+}
+
+#[test]
+fn connection_intent_backoff_and_network_wakeup_are_bounded_and_coalesced() {
+    assert_eq!(
+        RetrySchedule::default().delays_seconds(),
+        [0, 2, 5, 15, 30, 60, 300]
+    );
+
+    let mut coordinator = ConnectionIntentCoordinator::default();
+    assert!(matches!(
+        coordinator.start_or_resume(options(), 1_000).unwrap(),
+        StartDisposition::Recovering { .. }
+    ));
+    let generation = coordinator.generation();
+    assert!(coordinator.wake_for_network_change());
+    assert!(!coordinator.wake_for_network_change());
+    assert!(coordinator.take_network_wakeup());
+    assert!(!coordinator.take_network_wakeup());
+
+    let expected = [1_000, 1_002, 1_005, 1_015, 1_030, 1_060, 1_300, 1_300];
+    for next_retry_at in expected {
+        assert_eq!(
+            coordinator.schedule_retry(generation, 1_000),
+            Some(next_retry_at)
+        );
+    }
+    assert!(coordinator.wake_for_network_change());
+    assert!(coordinator.take_network_wakeup());
+    assert_eq!(coordinator.schedule_retry(generation, 1_000), Some(1_002));
+}
+
+#[test]
+fn connection_intent_has_one_attempt_and_late_success_is_compensated_after_cancel() {
+    let mut coordinator = ConnectionIntentCoordinator::default();
+    coordinator.start_or_resume(options(), 1_000).unwrap();
+    let old_generation = coordinator.generation();
+    assert!(coordinator.begin_attempt(old_generation));
+    assert!(!coordinator.begin_attempt(old_generation));
+    assert!(coordinator.cancel_intent(old_generation));
+    assert_eq!(
+        coordinator.accept_result(old_generation),
+        RecoveryDecision::DiscardAndCompensate
+    );
+    assert_eq!(
+        coordinator.start_or_resume(options(), 1_001),
+        Err(nelomai_client_core::ConnectionIntentError::AttemptStillActive)
+    );
+    assert!(coordinator.complete_compensation(old_generation));
+    assert!(matches!(
+        coordinator.start_or_resume(options(), 1_002).unwrap(),
+        StartDisposition::Recovering { .. }
+    ));
+}
+
+#[test]
+fn connection_intent_explicit_retry_rearms_a_blocked_terminal_intent() {
+    let mut coordinator = ConnectionIntentCoordinator::default();
+    coordinator.start_or_resume(options(), 1_000).unwrap();
+    let blocked_generation = coordinator.generation();
+    assert!(coordinator.begin_attempt(blocked_generation));
+    assert!(coordinator.mark_terminal(blocked_generation, true));
+    assert_eq!(
+        coordinator.status(),
+        nelomai_client_core::ConnectionIntentStatus::BlockedTerminal
+    );
+
+    let disposition = coordinator.start_or_resume(options(), 1_001).unwrap();
+    let StartDisposition::Recovering {
+        generation,
+        next_retry_at_unix,
+    } = disposition
+    else {
+        panic!("blocked intent must be rearmed")
+    };
+    assert_ne!(generation, blocked_generation);
+    assert_eq!(next_retry_at_unix, None);
+    assert_eq!(
+        coordinator.status(),
+        nelomai_client_core::ConnectionIntentStatus::Recovering
+    );
+    assert!(coordinator.begin_attempt(generation));
+}
+
+#[test]
+fn connection_intent_classifier_matches_the_shared_policy_fixture() {
+    let raw = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../contracts/fixtures/valid/connection-intent-error-policy.json"),
+    )
+    .unwrap();
+    let policy: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    for case in policy["cases"].as_array().unwrap() {
+        let code = case["code"].as_str().unwrap();
+        let expected = case["decision"].as_str().unwrap();
+        assert_eq!(
+            classify_recovery(code, RecoveryPolicyContext::default()).policy_name(),
+            expected,
+            "wrong decision for {code}"
+        );
+    }
+    assert_eq!(
+        classify_recovery("future_unknown_error", RecoveryPolicyContext::default()),
+        RecoveryDecision::Terminal
+    );
+}
+
+#[test]
+fn connection_intent_bounded_retries_and_retry_after_do_not_loop() {
+    assert_eq!(
+        classify_recovery("service_unavailable", RecoveryPolicyContext::default()),
+        RecoveryDecision::RetryOnce
+    );
+    assert_eq!(
+        classify_recovery(
+            "service_unavailable",
+            RecoveryPolicyContext {
+                service_recovery_attempted: true,
+                ..RecoveryPolicyContext::default()
+            }
+        ),
+        RecoveryDecision::Terminal
+    );
+    assert_eq!(
+        classify_recovery(
+            "amneziawg_profile_mismatch",
+            RecoveryPolicyContext {
+                profile_reissue_attempted: true,
+                ..RecoveryPolicyContext::default()
+            }
+        ),
+        RecoveryDecision::Terminal
+    );
+    assert_eq!(
+        classify_recovery(
+            "connection_stall_not_recyclable",
+            RecoveryPolicyContext {
+                stalled_reconcile_attempted: true,
+                ..RecoveryPolicyContext::default()
+            }
+        ),
+        RecoveryDecision::Terminal
+    );
+    assert_eq!(
+        classify_recovery(
+            "connection_stall_recycle_rate_limited",
+            RecoveryPolicyContext {
+                retry_after_seconds: Some(10_000),
+                ..RecoveryPolicyContext::default()
+            }
+        ),
+        RecoveryDecision::RetryAfter(900)
+    );
+    assert_eq!(
+        classify_recovery(
+            "connection_stall_recycle_rate_limited",
+            RecoveryPolicyContext::default()
+        ),
+        RecoveryDecision::RetryAfter(300)
+    );
+}
+
+#[test]
+fn connection_intent_stall_plan_replaces_only_unpinned_dynamic_awg3() {
+    assert_eq!(
+        stall_recovery_plan(&options(), false, RecoveryTransport::AmneziaWg3),
+        StallRecoveryPlan::ReplaceDynamic {
+            failure_code: "tunnel_data_plane_stalled",
+            allow_alternate: true,
+        }
+    );
+
+    let mut personal = options();
+    personal.layer = Layer::Tic;
+    personal.tic_connection_mode = TicConnectionMode::Personal;
+    personal.route_mode = RouteMode::ViaTak;
+    assert_eq!(
+        stall_recovery_plan(&personal, false, RecoveryTransport::AmneziaWg3),
+        StallRecoveryPlan::PreservePeer
+    );
+    assert_eq!(
+        stall_recovery_plan(&options(), true, RecoveryTransport::AmneziaWg3),
+        StallRecoveryPlan::PreservePeer
+    );
+    assert_eq!(
+        stall_recovery_plan(&options(), false, RecoveryTransport::Other),
+        StallRecoveryPlan::PreservePeer
+    );
+}
+
+#[test]
+fn connection_intent_handle_stall_keeps_the_same_intent_generation() {
+    let mut coordinator = ConnectionIntentCoordinator::default();
+    coordinator.start_or_resume(options(), 1_000).unwrap();
+    let generation = coordinator.generation();
+    assert!(coordinator.begin_attempt(generation));
+    assert_eq!(
+        coordinator.mark_connected(
+            generation,
+            connection("11111111-1111-4111-8111-111111111111"),
+        ),
+        RecoveryDecision::Accept
+    );
+
+    assert_eq!(
+        coordinator
+            .handle_stall(StallTrigger {
+                options: options(),
+                pinned: false,
+                transport: RecoveryTransport::AmneziaWg3,
+            })
+            .unwrap(),
+        StallRecoveryPlan::ReplaceDynamic {
+            failure_code: "tunnel_data_plane_stalled",
+            allow_alternate: true,
+        }
+    );
+    assert_eq!(coordinator.generation(), generation);
+    assert_eq!(
+        coordinator.status(),
+        nelomai_client_core::ConnectionIntentStatus::Recovering
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn connection_intent_core_attempt_leaves_retries_to_the_coordinator() {
+    let api = Arc::new(MockApi::new(1));
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    assert!(matches!(
+        core.connection_intent_attempt(options(), 1_700_000_000)
+            .await,
+        Err(CoreError::Api(CoreApiError::Retryable))
+    ));
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    let request = api.start_requests.lock().unwrap()[0].clone();
+    assert!(request.require_measured_selection);
+    assert_eq!(request.recovery_contract_version, Some(1));
+    assert_eq!(
+        request.request_fingerprint.as_deref(),
+        Some("b359819586b12285e3c8636ac51d823ade7f87a084f4097bf3f3735bae8c3c39")
+    );
+}
+
+#[tokio::test]
+async fn connection_intent_metrics_context_survives_a_failed_local_recovery() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+    tunnel.fail_next_starts.store(2, Ordering::SeqCst);
+
+    assert!(core
+        .recover_stalled_data_plane(
+            &connection.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await
+        .is_err());
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert_eq!(
+        core.connection_metrics_context()
+            .await
+            .map(|context| context.session_id),
+        Some(connection.lease_id)
+    );
+    core.stop().await.unwrap();
+    assert!(core.connection_metrics_context().await.is_none());
+}
+
+#[tokio::test]
+async fn connection_intent_missing_local_configuration_does_not_arm_recovery_metrics() {
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = ClientCore::new(
+        Arc::new(MockApi::new(0)),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    let connection = core.start(options(), 1_700_000_000).await.unwrap();
+    let mut stored = store.load().unwrap().unwrap();
+    stored.saved_connection = None;
+    stored.pinned_connection = None;
+    store.save(&stored).unwrap();
+
+    assert_eq!(
+        core.recover_stalled_data_plane(
+            &connection.lease_id,
+            StalledDataPlaneRecovery::RestartLocalTunnel,
+        )
+        .await
+        .unwrap(),
+        StalledDataPlaneRecoveryOutcome::Skipped
+    );
+    assert!(core.active_recovery_options().await.is_none());
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn connection_intent_cancel_during_api_local_start_and_handshake_compensates_late_success() {
+    for stage in ["api", "local_start", "handshake"] {
+        let api = Arc::new(MockApi::new(0));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        match stage {
+            "local_start" => tunnel.start_delay_millis.store(100, Ordering::SeqCst),
+            "handshake" => {
+                api.awg3_start.store(true, Ordering::SeqCst);
+                tunnel.metrics_supported.store(true, Ordering::SeqCst);
+                tunnel.handshake_before_rebind.store(true, Ordering::SeqCst);
+                tunnel.metrics_delay_millis.store(100, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        let core = Arc::new(ClientCore::new(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let mut coordinator = ConnectionIntentCoordinator::default();
+        coordinator
+            .start_or_resume(options(), 1_700_000_000)
+            .unwrap();
+        let generation = coordinator.generation();
+        assert!(coordinator.begin_attempt(generation));
+
+        let attempt_core = core.clone();
+        let attempt = tokio::spawn(async move {
+            attempt_core
+                .connection_intent_attempt(options(), 1_700_000_000)
+                .await
+        });
+        loop {
+            let reached_stage = match stage {
+                "api" => api.start_calls.load(Ordering::SeqCst) > 0,
+                "local_start" => tunnel.starts.load(Ordering::SeqCst) > 0,
+                "handshake" => tunnel.metrics_calls.load(Ordering::SeqCst) > 0,
+                _ => unreachable!(),
+            };
+            if reached_stage {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(coordinator.cancel_intent(generation));
+        let late_connection = attempt.await.unwrap().unwrap();
+        assert_eq!(
+            coordinator.accept_result(generation),
+            RecoveryDecision::DiscardAndCompensate,
+            "stage={stage} lease={}",
+            late_connection.lease_id,
+        );
+        core.compensate_stale_connection_intent_result()
+            .await
+            .unwrap();
+        assert!(coordinator.complete_compensation(generation));
+        assert_eq!(core.state().await.phase, Phase::Ready);
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn connection_intent_dynamic_stall_stops_terminal_lease_before_new_attempt() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.handshake_before_rebind.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+    let previous = core.start(options(), 1_700_000_000).await.unwrap();
+
+    let replacement = core
+        .replace_stalled_connection(options(), 1_700_000_100)
+        .await
+        .unwrap();
+
+    assert_ne!(replacement.lease_id, previous.lease_id);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        api.stop_failure_codes.lock().unwrap().as_slice(),
+        &[Some("tunnel_data_plane_stalled".to_string())]
+    );
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .unwrap()
+            .saved_connection
+            .unwrap()
+            .lease_id,
+        replacement.lease_id
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn connection_intent_dynamic_warm_stall_is_marked_failed_before_replacement() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    api.warm_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.handshake_before_rebind.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    core.replace_stalled_connection(options(), 1_700_000_100)
+        .await
+        .unwrap();
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        api.stop_failure_codes.lock().unwrap().as_slice(),
+        &[Some("tunnel_data_plane_stalled".to_string())]
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn connection_intent_stalled_stop_retry_reuses_its_operation_id() {
+    let api = Arc::new(MockApi::new(0));
+    api.awg3_start.store(true, Ordering::SeqCst);
+    *api.stop_error.lock().unwrap() = Some(CoreApiError::Rejected {
+        code: "connection_stall_recycle_rate_limited".to_string(),
+        message: "Retry later".to_string(),
+    });
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.metrics_supported.store(true, Ordering::SeqCst);
+    tunnel.handshake_before_rebind.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    assert!(core
+        .replace_stalled_connection(options(), 1_700_000_100)
+        .await
+        .is_err());
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    let first_stop_operation = api.stop_operation_ids.lock().unwrap()[0].clone();
+
+    *api.stop_error.lock().unwrap() = None;
+    core.replace_stalled_connection(options(), 1_700_000_400)
+        .await
+        .unwrap();
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        api.stop_operation_ids.lock().unwrap().as_slice(),
+        [first_stop_operation.as_str(), first_stop_operation.as_str()]
+    );
 }
