@@ -37,10 +37,13 @@ internal const val EXTRA_EXPIRES_AT_UNIX = "expires_at_unix"
 internal const val EXTRA_CONFIGURED = "configured"
 internal const val EXTRA_CREDENTIAL_REVISION = "credential_revision"
 internal const val EXTRA_INSTALL_SECRET = "install_secret"
+internal const val EXTRA_ACCESS_TOKEN = "access_token"
+internal const val EXTRA_REFRESH_TOKEN = "refresh_token"
 internal const val EXTRA_CAPABILITY_REVISION = "capability_revision"
 internal const val EXTRA_CAPABILITY_ENABLED = "capability_enabled"
 internal const val EXTRA_CAPABILITY_EXPIRES_AT = "capability_expires_at"
 internal const val EXTRA_MUTATION_READY = "mutation_ready"
+internal const val EXTRA_MUTATION_PENDING = "mutation_pending"
 internal const val EXTRA_CHANGED = "changed"
 internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
 internal const val EXTRA_DNS_SERVERS = "dns_servers"
@@ -50,6 +53,13 @@ private const val METRICS_REQUEST_TIMEOUT_MILLIS = 1_800L
 private const val UDP_REBIND_REQUEST_TIMEOUT_MILLIS = 3_250L
 private const val SERVICE_REQUEST_TIMEOUT_MILLIS = 30_000L
 private const val SERVICE_REQUEST_TIMEOUT_ERROR = "tunnel_service_timeout"
+private const val CREDENTIAL_MUTATION_NETWORK_STEPS = 3L
+private const val CREDENTIAL_MUTATION_COMPLETION_SLACK_MILLIS = 5_000L
+
+internal fun backgroundCredentialMutationTimeoutMillis(): Long =
+    CREDENTIAL_MUTATION_NETWORK_STEPS *
+        (BACKGROUND_CONNECT_TIMEOUT_MILLIS + BACKGROUND_READ_TIMEOUT_MILLIS).toLong() +
+        CREDENTIAL_MUTATION_COMPLETION_SLACK_MILLIS
 
 internal class ServiceRequestCompletion {
     private val completed = AtomicBoolean(false)
@@ -210,7 +220,7 @@ internal object TunnelServiceClient {
 
     fun backgroundCredentialStatus(
         context: Context,
-        onSuccess: (Boolean, Long, Boolean, Boolean, Long?, String?, Long?) -> Unit,
+        onSuccess: (Boolean, Long, Boolean, Boolean, Boolean, Long?, String?, Long?) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
@@ -222,6 +232,7 @@ internal object TunnelServiceClient {
                 configured,
                 it.getLong(EXTRA_CREDENTIAL_REVISION),
                 it.getBoolean(EXTRA_MUTATION_READY),
+                it.getBoolean(EXTRA_MUTATION_PENDING),
                 it.getBoolean(EXTRA_CAPABILITY_ENABLED),
                 it.getLong(EXTRA_CAPABILITY_EXPIRES_AT).takeIf { value ->
                     value != Long.MIN_VALUE
@@ -245,7 +256,50 @@ internal object TunnelServiceClient {
             .putExtra(EXTRA_CREDENTIAL_REVISION, expectedRevision),
         { onSuccess() },
         onError,
-        timeoutMillis = 60_000L,
+        timeoutMillis = backgroundCredentialMutationTimeoutMillis(),
+    )
+
+    fun provisionBackground(
+        context: Context,
+        args: BackgroundUiProvisionArgs,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_PROVISION_BACKGROUND)
+            .putExtra(EXTRA_API_VERSION, args.apiVersion)
+            .putExtra(EXTRA_CREDENTIAL_REVISION, args.expectedRevision)
+            .putExtra(EXTRA_DEVICE_ID, args.deviceId)
+            .putExtra(EXTRA_PANEL_BASE, args.panelBase)
+            .putExtra(EXTRA_ACCESS_TOKEN, args.accessToken)
+            .putExtra(EXTRA_INSTALL_SECRET, args.installSecret)
+            .putExtra(EXTRA_CAPABILITY_REVISION, args.capabilityRevision)
+            .putExtra(EXTRA_CAPABILITY_ENABLED, args.capabilityEnabled)
+            .putExtra(EXTRA_CAPABILITY_EXPIRES_AT, args.capabilityExpiresAt),
+        { onSuccess() },
+        onError,
+        timeoutMillis = backgroundCredentialMutationTimeoutMillis(),
+    )
+
+    fun recoverBackgroundSession(
+        context: Context,
+        installSecret: String,
+        onSuccess: (String, String) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_RECOVER_BACKGROUND_SESSION)
+            .putExtra(EXTRA_INSTALL_SECRET, installSecret),
+        { result ->
+            onSuccess(
+                requireNotNull(result.getString(EXTRA_ACCESS_TOKEN)),
+                requireNotNull(result.getString(EXTRA_REFRESH_TOKEN)),
+            )
+        },
+        onError,
+        timeoutMillis = backgroundCredentialMutationTimeoutMillis(),
     )
 
     fun clearBackground(

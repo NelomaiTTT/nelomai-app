@@ -100,6 +100,12 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub fn provision_background(&self, request: BackgroundUiProvisionRequest) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("provisionBackground", request)
+            .map_err(Into::into)
+    }
+
     pub fn background_credential_status(
         &self,
     ) -> crate::Result<BackgroundCredentialStatusResponse> {

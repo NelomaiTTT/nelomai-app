@@ -71,6 +71,13 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(())
     }
 
+    pub fn provision_background(
+        &self,
+        _request: BackgroundUiProvisionRequest,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
     pub fn background_credential_status(
         &self,
     ) -> crate::Result<BackgroundCredentialStatusResponse> {

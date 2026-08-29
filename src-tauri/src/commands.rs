@@ -33,7 +33,7 @@ static ANDROID_BACKGROUND_PROVISION_GATE: tokio::sync::Mutex<()> =
 #[cfg(target_os = "android")]
 static ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX: AtomicI64 = AtomicI64::new(0);
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 const ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[cfg(target_os = "android")]
@@ -59,12 +59,71 @@ enum AndroidBackgroundRecoveryFailure {
 }
 
 #[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AndroidBackgroundProvisionMode {
+    Noop,
+    UiAuthenticatedTwoPhase,
+    RefreshStoredCapability,
+    Legacy,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_background_provision_mode(
+    status: &tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse,
+    device_id: &str,
+    desired_capability_enabled: bool,
+    now: i64,
+) -> AndroidBackgroundProvisionMode {
+    let same_device = status.device_id.as_deref() == Some(device_id);
+    let token_is_fresh = status.expires_at_unix.is_some_and(|expires_at| {
+        expires_at > now.saturating_add(ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS)
+    });
+    if status.mutation_pending {
+        AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase
+    } else if status.configured
+        && status.mutation_ready
+        && same_device
+        && status.capability_enabled == desired_capability_enabled
+        && (!status.capability_enabled
+            || status
+                .capability_expires_at_unix
+                .is_some_and(|expires_at| expires_at > now))
+        && token_is_fresh
+    {
+        AndroidBackgroundProvisionMode::Noop
+    } else if status.configured && status.mutation_ready && same_device && token_is_fresh {
+        AndroidBackgroundProvisionMode::RefreshStoredCapability
+    } else if desired_capability_enabled {
+        AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase
+    } else {
+        AndroidBackgroundProvisionMode::Legacy
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_background_rotation_fallback(
+    desired_capability_enabled: bool,
+) -> Option<AndroidBackgroundProvisionMode> {
+    desired_capability_enabled.then_some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_background_legacy_fallback_after_ui_failure(
+    desired_capability_enabled: bool,
+    latest_status: &tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse,
+) -> bool {
+    !desired_capability_enabled && !latest_status.mutation_pending
+}
+
+#[cfg(any(target_os = "android", test))]
 fn classify_android_background_recovery_error(code: &str) -> AndroidBackgroundRecoveryFailure {
     match code {
         "invalid_background_token" | "invalid_background_recovery" => {
             AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh
         }
-        "background_recovery_unsupported" => AndroidBackgroundRecoveryFailure::FallbackRefresh,
+        "activation_not_applied" | "background_recovery_unsupported" => {
+            AndroidBackgroundRecoveryFailure::FallbackRefresh
+        }
         "app_access_unavailable" => AndroidBackgroundRecoveryFailure::AccessExpired,
         _ => AndroidBackgroundRecoveryFailure::Retryable,
     }
@@ -1335,7 +1394,7 @@ async fn provision_android_background(
     #[cfg(target_os = "android")]
     {
         let now = now_unix();
-        let status = app
+        let mut status = app
             .tunnel_android()
             .background_credential_status()
             .map_err(|_| {
@@ -1346,39 +1405,91 @@ async fn provision_android_background(
             })?;
         let desired_capability_enabled =
             capability.is_some_and(|value| value.connection_intent_recovery_v1);
-        let token_is_fresh = status.expires_at_unix.is_some_and(|expires_at| {
-            expires_at > now.saturating_add(ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS)
-        });
-        if status.configured
-            && status.mutation_ready
-            && status.device_id.as_deref() == Some(device_id)
-            && status.capability_enabled == desired_capability_enabled
-            && (!status.capability_enabled
-                || status
-                    .capability_expires_at_unix
-                    .is_some_and(|expires_at| expires_at > now))
-            && token_is_fresh
+        let provision_with_ui_authentication =
+            |expected_revision: i64| -> Result<(), CommandError> {
+                let access_token = application
+                    .current_access_token()
+                    .map_err(CommandError::from)?;
+                let install_secret = application.install_secret().map_err(CommandError::from)?;
+                app.tunnel_android()
+                    .provision_background(
+                        tauri_plugin_tunnel_android::BackgroundUiProvisionRequest {
+                            api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                            expected_revision,
+                            device_id: device_id.to_string(),
+                            panel_base: crate::PANEL_BASE.to_string(),
+                            access_token,
+                            install_secret,
+                            capability_revision: capability
+                                .map(|value| i64::from(value.revision))
+                                .unwrap_or(0),
+                            capability_enabled: capability
+                                .is_some_and(|value| value.connection_intent_recovery_v1),
+                            capability_expires_at: capability
+                                .map(|value| value.expires_at.clone())
+                                .unwrap_or_else(|| "1970-01-01T00:00:01Z".to_string()),
+                        },
+                    )
+                    .map_err(|_| {
+                        CommandError::new(
+                            "background_credential_provision_failed",
+                            "Не удалось безопасно подготовить фоновое подключение",
+                        )
+                    })
+            };
+        match android_background_provision_mode(&status, device_id, desired_capability_enabled, now)
         {
-            return Ok(());
-        }
-        if status.configured
-            && status.mutation_ready
-            && status.device_id.as_deref() == Some(device_id)
-            && (desired_capability_enabled || token_is_fresh)
-        {
-            app.tunnel_android()
-                .rotate_background(
+            AndroidBackgroundProvisionMode::Noop => return Ok(()),
+            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase => {
+                let error = match provision_with_ui_authentication(status.credential_revision) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => error,
+                };
+                let latest_status = app
+                    .tunnel_android()
+                    .background_credential_status()
+                    .map_err(|_| {
+                        CommandError::new(
+                            "background_storage_unavailable",
+                            "Не удалось повторно проверить фоновое подключение",
+                        )
+                    })?;
+                if !android_background_legacy_fallback_after_ui_failure(
+                    desired_capability_enabled,
+                    &latest_status,
+                ) {
+                    return Err(error);
+                }
+                status = latest_status;
+            }
+            AndroidBackgroundProvisionMode::RefreshStoredCapability => {
+                let refresh = app.tunnel_android().rotate_background(
                     tauri_plugin_tunnel_android::BackgroundCredentialMutationRequest {
                         expected_revision: status.credential_revision,
                     },
-                )
-                .map_err(|_| {
-                    CommandError::new(
-                        "background_credential_rotation_failed",
-                        "Не удалось обновить фоновое подключение",
-                    )
-                })?;
-            return Ok(());
+                );
+                if refresh.is_ok() {
+                    return Ok(());
+                }
+                if android_background_rotation_fallback(desired_capability_enabled).is_some() {
+                    let latest_revision = app
+                        .tunnel_android()
+                        .background_credential_status()
+                        .map_err(|_| {
+                            CommandError::new(
+                                "background_storage_unavailable",
+                                "Не удалось повторно проверить фоновое подключение",
+                            )
+                        })?
+                        .credential_revision;
+                    return provision_with_ui_authentication(latest_revision);
+                }
+                return Err(CommandError::new(
+                    "background_credential_rotation_failed",
+                    "Не удалось обновить фоновое подключение",
+                ));
+            }
+            AndroidBackgroundProvisionMode::Legacy => {}
         }
         let token = application
             .background_token_for_device(device_id, now)
@@ -2870,6 +2981,10 @@ mod tests {
             AndroidBackgroundRecoveryFailure::FallbackRefresh,
         );
         assert_eq!(
+            classify_android_background_recovery_error("activation_not_applied"),
+            AndroidBackgroundRecoveryFailure::FallbackRefresh,
+        );
+        assert_eq!(
             classify_android_background_recovery_error("background_transport_unavailable"),
             AndroidBackgroundRecoveryFailure::Retryable,
         );
@@ -2881,6 +2996,91 @@ mod tests {
             classify_android_background_recovery_error("app_access_unavailable"),
             AndroidBackgroundRecoveryFailure::AccessExpired,
         );
+    }
+
+    #[test]
+    fn enabled_recovery_with_an_expired_device_token_uses_ui_authenticated_provision() {
+        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            configured: true,
+            credential_revision: 7,
+            mutation_ready: true,
+            mutation_pending: false,
+            capability_enabled: true,
+            capability_expires_at_unix: Some(200),
+            device_id: Some("device-1".to_string()),
+            expires_at_unix: Some(100),
+        };
+
+        assert_eq!(
+            android_background_provision_mode(&status, "device-1", true, 150),
+            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase,
+        );
+    }
+
+    #[test]
+    fn pending_activation_is_replayed_even_while_the_old_local_token_looks_fresh() {
+        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            configured: true,
+            credential_revision: 8,
+            mutation_ready: true,
+            mutation_pending: true,
+            capability_enabled: true,
+            capability_expires_at_unix: Some(300),
+            device_id: Some("device-1".to_string()),
+            expires_at_unix: Some(2_000_000),
+        };
+
+        assert_eq!(
+            android_background_provision_mode(&status, "device-1", true, 150),
+            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase,
+        );
+    }
+
+    #[test]
+    fn expired_capability_with_a_fresh_device_token_only_refreshes_the_snapshot() {
+        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            configured: true,
+            credential_revision: 9,
+            mutation_ready: true,
+            mutation_pending: false,
+            capability_enabled: true,
+            capability_expires_at_unix: Some(100),
+            device_id: Some("device-1".to_string()),
+            expires_at_unix: Some(2_000_000),
+        };
+
+        assert_eq!(
+            android_background_provision_mode(&status, "device-1", true, 150),
+            AndroidBackgroundProvisionMode::RefreshStoredCapability,
+        );
+    }
+
+    #[test]
+    fn failed_device_refresh_uses_available_ui_authentication_only_for_enabled_recovery() {
+        assert_eq!(
+            android_background_rotation_fallback(true),
+            Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase),
+        );
+        assert_eq!(android_background_rotation_fallback(false), None);
+    }
+
+    #[test]
+    fn capability_downgrade_returns_to_legacy_only_after_the_journal_is_clear() {
+        let mut status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            mutation_pending: true,
+            ..Default::default()
+        };
+        assert!(!android_background_legacy_fallback_after_ui_failure(
+            false, &status,
+        ));
+
+        status.mutation_pending = false;
+        assert!(android_background_legacy_fallback_after_ui_failure(
+            false, &status,
+        ));
+        assert!(!android_background_legacy_fallback_after_ui_failure(
+            true, &status,
+        ));
     }
 
     #[tokio::test]

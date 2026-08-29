@@ -12,8 +12,8 @@ import javax.net.ssl.HttpsURLConnection
 import org.json.JSONArray
 import org.json.JSONObject
 
-private const val BACKGROUND_CONNECT_TIMEOUT_MILLIS = 10_000
-private const val BACKGROUND_READ_TIMEOUT_MILLIS = 20_000
+internal const val BACKGROUND_CONNECT_TIMEOUT_MILLIS = 10_000
+internal const val BACKGROUND_READ_TIMEOUT_MILLIS = 20_000
 private const val BACKGROUND_MAX_RESPONSE_BYTES = 1024 * 1024
 
 internal data class BackgroundStartResult(
@@ -25,9 +25,17 @@ internal data class BackgroundStartResult(
 internal data class BackgroundSessionRecoveryResult(
     val accessToken: String,
     val refreshToken: String,
-)
+) {
+    override fun toString(): String =
+        "BackgroundSessionRecoveryResult(accessToken=<redacted>, refreshToken=<redacted>)"
+}
 
 internal class BackgroundConnectionException(val code: String) : RuntimeException(code)
+
+internal enum class BackgroundAuthorization(val wireName: String) {
+    DEVICE("Device"),
+    BEARER("Bearer"),
+}
 
 internal interface BackgroundApiTransport {
     fun execute(
@@ -35,6 +43,7 @@ internal interface BackgroundApiTransport {
         method: String,
         endpoint: String,
         payload: JSONObject? = null,
+        authorization: BackgroundAuthorization = BackgroundAuthorization.DEVICE,
     ): JSONObject
 }
 
@@ -64,6 +73,226 @@ internal data class BackgroundLogoutFinalizeResult(
     val code: String,
     val cleanupJobs: Int,
 )
+
+internal data class BackgroundUiProvisionRequest(
+    val expectedRevision: Long,
+    val deviceId: String,
+    val panelBase: String,
+    val accessToken: String,
+    val installSecret: String,
+    val installGeneration: Long,
+    val capability: BackgroundCapabilitySnapshot,
+) {
+    override fun toString(): String =
+        "BackgroundUiProvisionRequest(expectedRevision=$expectedRevision, deviceId=$deviceId, panelBase=$panelBase, accessToken=<redacted>, installSecret=<redacted>, installGeneration=$installGeneration, capability=$capability)"
+}
+
+internal fun provisionBackgroundCredential(
+    store: BackgroundCredentialStore,
+    request: BackgroundUiProvisionRequest,
+    nowUnix: Long,
+    operationIds: () -> Pair<String, String>,
+    prepare: (BackgroundCredential, String, String, String) -> BackgroundPendingToken,
+    activate: (
+        BackgroundCredential,
+        BackgroundPendingToken,
+        String,
+    ) -> BackgroundActivationResult,
+): BackgroundCredentialEnvelope {
+    var envelope = store.read().provisionEnvelopeOrThrow()
+    if (envelope.revision != request.expectedRevision) {
+        throw BackgroundConnectionException("background_credential_revision_conflict")
+    }
+    if (envelope.logoutState != null) {
+        throw BackgroundConnectionException("background_credential_logout_pending")
+    }
+    if (envelope.reservation != null || envelope.pending != null) {
+        if (envelope.deviceId != request.deviceId || envelope.panelBase != request.panelBase ||
+            envelope.installSecret != request.installSecret ||
+            envelope.installGeneration != request.installGeneration
+        ) {
+            throw BackgroundConnectionException("background_credential_mutation_conflict")
+        }
+        if (envelope.pending == null) {
+            val storedCapability = envelope.capability
+            val effectiveCapability = if (
+                storedCapability == null || request.capability.revision >= storedCapability.revision
+            ) {
+                request.capability
+            } else {
+                storedCapability
+            }
+            if (!effectiveCapability.enabled || effectiveCapability.expiresAtUnix <= nowUnix) {
+                store.cancelUncommittedReservation(
+                    envelope.revision,
+                    effectiveCapability,
+                ).provisionEnvelopeOrThrow()
+                throw BackgroundConnectionException("background_credential_capability_unavailable")
+            }
+            if (effectiveCapability != storedCapability) {
+                envelope = store.updateCapability(
+                    envelope.revision,
+                    effectiveCapability,
+                ).provisionEnvelopeOrThrow()
+            }
+        }
+    } else {
+        val (prepareOperationId, activationOperationId) = operationIds()
+        envelope = store.reserveProvision(
+            expectedRevision = envelope.revision,
+            provision = BackgroundCredentialProvisionReservation(
+                deviceId = request.deviceId,
+                panelBase = request.panelBase,
+                installSecret = request.installSecret,
+                installGeneration = request.installGeneration,
+                capability = request.capability,
+            ),
+            mutationId = prepareOperationId,
+            activationOperationId = activationOperationId,
+            expiresAtUnix = nowUnix + 10L * 60,
+            nowUnix = nowUnix,
+        ).provisionEnvelopeOrThrow()
+    }
+
+    val preparedState = prepareBackgroundTokenDurably(
+        store = store,
+        envelope = envelope,
+        credential = BackgroundCredential(
+            request.deviceId,
+            request.panelBase,
+            request.accessToken,
+            Long.MAX_VALUE,
+        ),
+        installSecret = request.installSecret,
+        nowUnix = nowUnix,
+        operationIds = operationIds,
+        prepare = prepare,
+    )
+    envelope = preparedState.envelope
+    val pendingToken = preparedState.pending
+    val activationCredential = stagedBackgroundCredential(envelope, pendingToken)
+    val activation = try {
+        activate(activationCredential, pendingToken, request.installSecret)
+    } catch (error: BackgroundConnectionException) {
+        if (error.code == "activation_not_applied") {
+            store.discardNotApplied(
+                envelope.revision,
+                pendingToken.activationOperationId,
+            ).provisionEnvelopeOrThrow()
+        }
+        throw error
+    }
+    return store.promotePending(
+        envelope.revision,
+        pendingToken.activationOperationId,
+        activation.activeExpiresAtUnix,
+    ).provisionEnvelopeOrThrow()
+}
+
+internal data class PreparedBackgroundCredentialState(
+    val envelope: BackgroundCredentialEnvelope,
+    val pending: BackgroundPendingToken,
+)
+
+internal fun backgroundCredentialForSessionRecovery(
+    store: BackgroundCredentialStore,
+    replayPending: (BackgroundCredentialEnvelope) -> BackgroundCredentialEnvelope,
+): BackgroundCredential {
+    var envelope = store.read().provisionEnvelopeOrThrow()
+    var authoritativeDiscard: BackgroundConnectionException? = null
+    if (envelope.pending != null) {
+        envelope = try {
+            replayPending(envelope)
+        } catch (error: BackgroundConnectionException) {
+            if (error.code != "activation_not_applied") throw error
+            authoritativeDiscard = error
+            store.read().provisionEnvelopeOrThrow()
+        }
+    }
+    return envelope.active ?: throw authoritativeDiscard
+        ?: BackgroundConnectionException("background_recovery_unavailable")
+}
+
+internal fun stagedBackgroundCredential(
+    envelope: BackgroundCredentialEnvelope,
+    pending: BackgroundPendingToken,
+): BackgroundCredential = BackgroundCredential(
+    deviceId = envelope.deviceId
+        ?: throw BackgroundConnectionException("background_credential_unavailable"),
+    panelBase = envelope.panelBase
+        ?: throw BackgroundConnectionException("background_credential_unavailable"),
+    token = pending.token,
+    expiresAtUnix = pending.stagedExpiresAtUnix,
+)
+
+internal fun prepareBackgroundTokenDurably(
+    store: BackgroundCredentialStore,
+    envelope: BackgroundCredentialEnvelope,
+    credential: BackgroundCredential,
+    installSecret: String,
+    nowUnix: Long,
+    operationIds: () -> Pair<String, String>,
+    prepare: (BackgroundCredential, String, String, String) -> BackgroundPendingToken,
+): PreparedBackgroundCredentialState {
+    var current = envelope
+    current.pending?.let { return PreparedBackgroundCredentialState(current, it) }
+    val capability = current.capability
+    if (capability == null || !capability.enabled || capability.expiresAtUnix <= nowUnix) {
+        throw BackgroundConnectionException("background_credential_capability_unavailable")
+    }
+    var reservation = current.reservation
+    if (reservation == null || reservation.expiresAtUnix <= nowUnix) {
+        val (prepareOperationId, activationOperationId) = operationIds()
+        current = store.reserveMutation(
+            current.revision,
+            prepareOperationId,
+            credential.deviceId,
+            nowUnix + 10L * 60,
+            nowUnix,
+            activationOperationId,
+        ).provisionEnvelopeOrThrow()
+        reservation = requireNotNull(current.reservation)
+    }
+    val prepared = try {
+        prepare(
+            credential,
+            reservation.mutationId,
+            reservation.activationOperationId,
+            installSecret,
+        )
+    } catch (error: BackgroundConnectionException) {
+        if (error.code != "operation_id_conflict") throw error
+        val (prepareOperationId, activationOperationId) = operationIds()
+        current = store.replaceUncommittedReservation(
+            current.revision,
+            reservation.mutationId,
+            prepareOperationId,
+            activationOperationId,
+            nowUnix + 10L * 60,
+            nowUnix,
+        ).provisionEnvelopeOrThrow()
+        reservation = requireNotNull(current.reservation)
+        prepare(
+            credential,
+            reservation.mutationId,
+            reservation.activationOperationId,
+            installSecret,
+        )
+    }
+    current = store.savePendingToken(
+        current.revision,
+        reservation.mutationId,
+        prepared,
+        nowUnix,
+    ).provisionEnvelopeOrThrow()
+    return PreparedBackgroundCredentialState(current, prepared)
+}
+
+private fun CredentialStoreResult<BackgroundCredentialEnvelope>.provisionEnvelopeOrThrow():
+    BackgroundCredentialEnvelope = when (this) {
+    is CredentialStoreResult.Success -> value
+    is CredentialStoreResult.Failure -> throw BackgroundConnectionException(code)
+}
 
 internal class BackgroundOperationClient(
     private val transport: BackgroundApiTransport,
@@ -157,6 +386,33 @@ internal class BackgroundOperationClient(
         prepareOperationId: String,
         activationOperationId: String,
         installSecret: String,
+    ): BackgroundPendingToken = prepareToken(
+        credential,
+        prepareOperationId,
+        activationOperationId,
+        installSecret,
+        BackgroundAuthorization.DEVICE,
+    )
+
+    fun prepareTokenWithBearer(
+        credential: BackgroundCredential,
+        prepareOperationId: String,
+        activationOperationId: String,
+        installSecret: String,
+    ): BackgroundPendingToken = prepareToken(
+        credential,
+        prepareOperationId,
+        activationOperationId,
+        installSecret,
+        BackgroundAuthorization.BEARER,
+    )
+
+    private fun prepareToken(
+        credential: BackgroundCredential,
+        prepareOperationId: String,
+        activationOperationId: String,
+        installSecret: String,
+        authorization: BackgroundAuthorization,
     ): BackgroundPendingToken {
         requireUuid(prepareOperationId)
         requireUuid(activationOperationId)
@@ -170,6 +426,7 @@ internal class BackgroundOperationClient(
                 put("activation_operation_id", activationOperationId)
                 put("install_secret", installSecret)
             },
+            authorization,
         )
         return parseResponse {
             require(payload.getString("prepare_operation_id") == prepareOperationId)
@@ -275,6 +532,7 @@ private class UrlConnectionBackgroundApiTransport : BackgroundApiTransport {
         method: String,
         endpoint: String,
         payload: JSONObject?,
+        authorization: BackgroundAuthorization,
     ): JSONObject {
         val base = URI(credential.panelBase)
         val url = base.resolve("/api/client/v1/$endpoint").toURL()
@@ -285,7 +543,10 @@ private class UrlConnectionBackgroundApiTransport : BackgroundApiTransport {
             connection.instanceFollowRedirects = false
             connection.connectTimeout = BACKGROUND_CONNECT_TIMEOUT_MILLIS
             connection.readTimeout = BACKGROUND_READ_TIMEOUT_MILLIS
-            connection.setRequestProperty("Authorization", "Device ${credential.token}")
+            connection.setRequestProperty(
+                "Authorization",
+                "${authorization.wireName} ${credential.token}",
+            )
             connection.setRequestProperty("Accept", "application/json")
             if (payload != null) {
                 connection.doOutput = true
@@ -472,6 +733,18 @@ internal object BackgroundConnectionClient {
         installSecret,
     )
 
+    fun prepareTokenWithBearer(
+        credential: BackgroundCredential,
+        prepareOperationId: String,
+        activationOperationId: String,
+        installSecret: String,
+    ): BackgroundPendingToken = operations.prepareTokenWithBearer(
+        credential,
+        prepareOperationId,
+        activationOperationId,
+        installSecret,
+    )
+
     fun activateToken(
         credential: BackgroundCredential,
         pending: BackgroundPendingToken,
@@ -507,12 +780,28 @@ internal fun backgroundPanelErrorCode(
     endpoint: String,
     status: Int,
     panelCode: String?,
-): String = panelCode?.takeIf(String::isNotBlank)
-    ?: if (endpoint == "background/auth/recover" && status == 404) {
+): String = when {
+    endpoint == "background/auth/recover" && status == 404 ->
         "background_recovery_unsupported"
-    } else {
-        "background_panel_error"
-    }
+    endpoint == "background/capabilities" && status == 404 ->
+        "recovery_contract_unsupported"
+    else -> panelCode?.takeIf(String::isNotBlank) ?: "background_panel_error"
+}
+
+internal fun refreshBackgroundCapability(
+    current: BackgroundCapabilitySnapshot?,
+    nowUnix: Long,
+    fetch: () -> BackgroundCapabilitySnapshot,
+): BackgroundCapabilitySnapshot = try {
+    fetch()
+} catch (error: BackgroundConnectionException) {
+    if (error.code != "recovery_contract_unsupported") throw error
+    BackgroundCapabilitySnapshot(
+        revision = current?.revision ?: 0,
+        enabled = false,
+        expiresAtUnix = nowUnix,
+    )
+}
 
 internal fun backgroundRecoveryPayload(installSecret: String): JSONObject = JSONObject().apply {
     put("install_secret", installSecret)

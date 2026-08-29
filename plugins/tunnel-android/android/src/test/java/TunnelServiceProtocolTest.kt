@@ -16,4 +16,9 @@ class TunnelServiceProtocolTest {
 
         assertEquals(1, callbacks)
     }
+
+    @Test
+    fun credentialMutationTimeoutOutlivesThreeWorstCaseNetworkSteps() {
+        assertTrue(backgroundCredentialMutationTimeoutMillis() > 90_000L)
+    }
 }

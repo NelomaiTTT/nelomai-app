@@ -148,6 +148,19 @@ class BackgroundCredentialMutationArgs {
 }
 
 @InvokeArg
+class BackgroundUiProvisionArgs {
+    var apiVersion: Int = 0
+    var expectedRevision: Long = -1
+    lateinit var deviceId: String
+    lateinit var panelBase: String
+    lateinit var accessToken: String
+    lateinit var installSecret: String
+    var capabilityRevision: Long = 0
+    var capabilityEnabled: Boolean = false
+    lateinit var capabilityExpiresAt: String
+}
+
+@InvokeArg
 class BackgroundSessionRecoveryArgs {
     lateinit var installSecret: String
 }
@@ -1172,26 +1185,6 @@ internal object TunnelRuntime {
                 } finally {
                     backgroundOperationGate.complete()
                 }
-            }
-        }
-    }
-
-    fun recoverBackgroundSession(
-        context: Context,
-        installSecret: String,
-        onSuccess: (BackgroundSessionRecoveryResult) -> Unit,
-        onError: (String) -> Unit,
-    ) {
-        val applicationContext = context.applicationContext
-        val credential = BackgroundCredentialStore.load(applicationContext) ?: run {
-            onError("background_recovery_unavailable")
-            return
-        }
-        backgroundExecutor.execute {
-            try {
-                onSuccess(BackgroundConnectionClient.recoverSession(credential, installSecret))
-            } catch (error: Throwable) {
-                onError((error as? BackgroundConnectionException)?.code ?: errorCode(error))
             }
         }
     }
@@ -2746,6 +2739,22 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun provisionBackground(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(BackgroundUiProvisionArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_background_credential")
+            return
+        }
+        TunnelServiceClient.provisionBackground(
+            activity.applicationContext,
+            args,
+            { activity.runOnUiThread { invoke.resolve() } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
     fun backgroundCredentialStatus(invoke: Invoke) {
         TunnelServiceClient.backgroundCredentialStatus(
             activity.applicationContext,
@@ -2753,6 +2762,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
                     configured,
                     credentialRevision,
                     mutationReady,
+                    mutationPending,
                     capabilityEnabled,
                     capabilityExpiresAtUnix,
                     deviceId,
@@ -2763,6 +2773,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
                     response.put("configured", configured)
                     response.put("credentialRevision", credentialRevision)
                     response.put("mutationReady", mutationReady)
+                    response.put("mutationPending", mutationPending)
                     response.put("capabilityEnabled", capabilityEnabled)
                     response.put("capabilityExpiresAtUnix", capabilityExpiresAtUnix)
                     response.put("deviceId", deviceId)
@@ -2791,14 +2802,14 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("invalid_background_recovery")
             return
         }
-        TunnelRuntime.recoverBackgroundSession(
+        TunnelServiceClient.recoverBackgroundSession(
             activity.applicationContext,
             args.installSecret,
-            { recovered ->
+            { accessToken, refreshToken ->
                 activity.runOnUiThread {
                     val response = JSObject()
-                    response.put("accessToken", recovered.accessToken)
-                    response.put("refreshToken", recovered.refreshToken)
+                    response.put("accessToken", accessToken)
+                    response.put("refreshToken", refreshToken)
                     response.put("errorCode", null)
                     invoke.resolve(response)
                 }

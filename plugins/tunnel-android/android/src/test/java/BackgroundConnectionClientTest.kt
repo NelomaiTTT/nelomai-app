@@ -12,6 +12,369 @@ import org.json.JSONObject
 
 class BackgroundConnectionClientTest {
     @Test
+    fun missingCapabilityEndpointIsAStableUnsupportedResponse() {
+        assertEquals(
+            "recovery_contract_unsupported",
+            backgroundPanelErrorCode("background/capabilities", 404, "not_found"),
+        )
+    }
+
+    @Test
+    fun stableUnsupportedCapabilityRefreshPersistsADisabledSnapshot() {
+        val previous = BackgroundCapabilitySnapshot(7, enabled = true, expiresAtUnix = 100)
+
+        val refreshed = refreshBackgroundCapability(previous, nowUnix = 200) {
+            throw BackgroundConnectionException("recovery_contract_unsupported")
+        }
+
+        assertEquals(7, refreshed.revision)
+        assertFalse(refreshed.enabled)
+        assertEquals(200, refreshed.expiresAtUnix)
+    }
+
+    @Test
+    fun transportFailureDoesNotBecomeACapabilityDowngrade() {
+        try {
+            refreshBackgroundCapability(null, nowUnix = 200) {
+                throw BackgroundConnectionException("background_transport_unavailable")
+            }
+            fail("transport failure must remain retryable")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_transport_unavailable", error.code)
+        }
+    }
+
+    @Test
+    fun recoveredSessionDebugOutputRedactsBothTokens() {
+        val result = BackgroundSessionRecoveryResult("secret-access", "secret-refresh")
+
+        assertFalse(result.toString().contains("secret-access"))
+        assertFalse(result.toString().contains("secret-refresh"))
+        assertTrue(result.toString().contains("<redacted>"))
+    }
+
+    @Test
+    fun uiAuthenticatedProvisionPersistsStagedTokenBeforeActivationWithoutAnActiveToken() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        var pendingWasDurableAtActivation = false
+
+        val provisioned = provisionBackgroundCredential(
+            store = store,
+            request = BackgroundUiProvisionRequest(
+                expectedRevision = 0,
+                deviceId = DEVICE_ID,
+                panelBase = "https://nelomai.test",
+                accessToken = "ui-access-token",
+                installSecret = INSTALL_SECRET,
+                installGeneration = 1,
+                capability = BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+            nowUnix = 100,
+            operationIds = { PREPARE_ID to ACTIVATE_ID },
+            prepare = { credential, prepareId, activateId, installSecret ->
+                assertEquals("ui-access-token", credential.token)
+                assertEquals(PREPARE_ID, prepareId)
+                assertEquals(ACTIVATE_ID, activateId)
+                assertEquals(INSTALL_SECRET, installSecret)
+                pendingToken()
+            },
+            activate = { _, pending, _ ->
+                pendingWasDurableAtActivation =
+                    store.read().successProvisionEnvelope().pending == pending
+                BackgroundActivationResult(2, 10_000)
+            },
+        )
+
+        assertTrue(pendingWasDurableAtActivation)
+        assertEquals("staged-token", provisioned.active?.token)
+        assertNull(provisioned.pending)
+    }
+
+    @Test
+    fun rotatingProvisionAuthenticatesActivationWithTheStagedToken() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val configured = store.configure(
+            expectedRevision = 0,
+            provision = BackgroundCredentialProvision(
+                deviceId = DEVICE_ID,
+                panelBase = "https://nelomai.test",
+                token = "old-active-token",
+                expiresAtUnix = 10_000,
+                installSecret = INSTALL_SECRET,
+                installGeneration = 1,
+                capability = BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+        ).successProvisionEnvelope()
+
+        provisionBackgroundCredential(
+            store = store,
+            request = uiProvisionRequest(configured.revision),
+            nowUnix = 100,
+            operationIds = { PREPARE_ID to ACTIVATE_ID },
+            prepare = { _, _, _, _ -> pendingToken() },
+            activate = { credential, pending, _ ->
+                assertEquals(pending.token, credential.token)
+                assertEquals(pending.stagedExpiresAtUnix, credential.expiresAtUnix)
+                BackgroundActivationResult(2, 10_000)
+            },
+        )
+    }
+
+    @Test
+    fun recoveryFallsBackToTheOldActiveTokenAfterAuthoritativePendingDiscard() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val configured = store.configure(
+            0,
+            BackgroundCredentialProvision(
+                DEVICE_ID,
+                "https://nelomai.test",
+                "old-active-token",
+                10_000,
+                INSTALL_SECRET,
+                1,
+                BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+        ).successProvisionEnvelope()
+        store.reserveMutation(
+            configured.revision,
+            PREPARE_ID,
+            DEVICE_ID,
+            500,
+            100,
+            ACTIVATE_ID,
+        ).successProvisionEnvelope()
+        store.savePendingToken(configured.revision, PREPARE_ID, pendingToken(), 100)
+            .successProvisionEnvelope()
+
+        val credential = backgroundCredentialForSessionRecovery(store) { envelope ->
+            store.discardNotApplied(envelope.revision, ACTIVATE_ID)
+                .successProvisionEnvelope()
+            throw BackgroundConnectionException("activation_not_applied")
+        }
+
+        assertEquals("old-active-token", credential.token)
+    }
+
+    @Test
+    fun initialPendingDiscardPreservesActivationNotAppliedForNormalAuthFallback() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val reserved = store.reserveProvision(
+            0,
+            provisionReservation(),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            500,
+            100,
+        ).successProvisionEnvelope()
+        store.savePendingToken(reserved.revision, PREPARE_ID, pendingToken(), 100)
+            .successProvisionEnvelope()
+
+        try {
+            backgroundCredentialForSessionRecovery(store) { envelope ->
+                store.discardNotApplied(envelope.revision, ACTIVATE_ID)
+                    .successProvisionEnvelope()
+                throw BackgroundConnectionException("activation_not_applied")
+            }
+            fail("initial pending discard must fall back to normal authentication")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("activation_not_applied", error.code)
+        }
+    }
+
+    @Test
+    fun expiredUiProvisionReservationStartsANewPrepareOperation() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val reserved = store.reserveProvision(
+            0,
+            provisionReservation(),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            expiresAtUnix = 101,
+            nowUnix = 100,
+        ).successProvisionEnvelope()
+
+        val provisioned = provisionBackgroundCredential(
+            store = store,
+            request = uiProvisionRequest(reserved.revision),
+            nowUnix = 150,
+            operationIds = { SECOND_PREPARE_ID to SECOND_ACTIVATE_ID },
+            prepare = { _, prepareId, activateId, _ ->
+                assertEquals(SECOND_PREPARE_ID, prepareId)
+                assertEquals(SECOND_ACTIVATE_ID, activateId)
+                pendingToken(prepareId, activateId)
+            },
+            activate = { _, _, _ -> BackgroundActivationResult(2, 10_000) },
+        )
+
+        assertEquals("staged-token", provisioned.active?.token)
+    }
+
+    @Test
+    fun freshUiCapabilityUnblocksReplacementOfAnExpiredPrepareReservation() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val reserved = store.reserveProvision(
+            0,
+            provisionReservation(
+                BackgroundCapabilitySnapshot(1, enabled = true, expiresAtUnix = 101),
+            ),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            expiresAtUnix = 101,
+            nowUnix = 100,
+        ).successProvisionEnvelope()
+
+        val provisioned = provisionBackgroundCredential(
+            store = store,
+            request = uiProvisionRequest(
+                reserved.revision,
+                BackgroundCapabilitySnapshot(2, enabled = true, expiresAtUnix = 500),
+            ),
+            nowUnix = 150,
+            operationIds = { SECOND_PREPARE_ID to SECOND_ACTIVATE_ID },
+            prepare = { _, prepareId, activateId, _ ->
+                pendingToken(prepareId, activateId)
+            },
+            activate = { _, _, _ -> BackgroundActivationResult(2, 10_000) },
+        )
+
+        assertEquals(2L, provisioned.capability?.revision)
+        assertEquals("staged-token", provisioned.active?.token)
+    }
+
+    @Test
+    fun capabilityDowngradeDiscardsUncommittedReservationWithoutAnotherPrepare() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val configured = store.configure(
+            0,
+            BackgroundCredentialProvision(
+                DEVICE_ID,
+                "https://nelomai.test",
+                "old-active-token",
+                10_000,
+                INSTALL_SECRET,
+                1,
+                BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+        ).successProvisionEnvelope()
+        val reserved = store.reserveMutation(
+            configured.revision,
+            PREPARE_ID,
+            DEVICE_ID,
+            500,
+            100,
+            ACTIVATE_ID,
+        ).successProvisionEnvelope()
+        var prepareCalls = 0
+
+        try {
+            provisionBackgroundCredential(
+                store = store,
+                request = uiProvisionRequest(
+                    reserved.revision,
+                    BackgroundCapabilitySnapshot(2, false, 500),
+                ),
+                nowUnix = 110,
+                operationIds = { SECOND_PREPARE_ID to SECOND_ACTIVATE_ID },
+                prepare = { _, _, _, _ ->
+                    prepareCalls += 1
+                    pendingToken()
+                },
+                activate = { _, _, _ -> BackgroundActivationResult(2, 10_000) },
+            )
+            fail("capability downgrade must stop an uncommitted prepare")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_credential_capability_unavailable", error.code)
+        }
+
+        val downgraded = store.read().successProvisionEnvelope()
+        assertEquals(0, prepareCalls)
+        assertFalse(downgraded.capability?.enabled ?: true)
+        assertNull(downgraded.reservation)
+        assertEquals("old-active-token", downgraded.active?.token)
+    }
+
+    @Test
+    fun expiredStoredCapabilityBlocksServicePrepareFromAnExistingReservation() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val configured = store.configure(
+            0,
+            BackgroundCredentialProvision(
+                DEVICE_ID,
+                "https://nelomai.test",
+                "old-active-token",
+                10_000,
+                INSTALL_SECRET,
+                1,
+                BackgroundCapabilitySnapshot(1, true, 101),
+            ),
+        ).successProvisionEnvelope()
+        val reserved = store.reserveMutation(
+            configured.revision,
+            PREPARE_ID,
+            DEVICE_ID,
+            500,
+            100,
+            ACTIVATE_ID,
+        ).successProvisionEnvelope()
+        var prepareCalls = 0
+
+        try {
+            prepareBackgroundTokenDurably(
+                store,
+                reserved,
+                requireNotNull(reserved.active),
+                INSTALL_SECRET,
+                nowUnix = 150,
+                operationIds = { SECOND_PREPARE_ID to SECOND_ACTIVATE_ID },
+                prepare = { _, _, _, _ ->
+                    prepareCalls += 1
+                    pendingToken()
+                },
+            )
+            fail("expired capability must block a service prepare")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_credential_capability_unavailable", error.code)
+        }
+
+        assertEquals(0, prepareCalls)
+        assertEquals(PREPARE_ID, store.read().successProvisionEnvelope().reservation?.mutationId)
+    }
+
+    @Test
+    fun authoritativePrepareConflictReplacesOnlyTheUncommittedReservation() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val reserved = store.reserveProvision(
+            0,
+            provisionReservation(),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            expiresAtUnix = 500,
+            nowUnix = 100,
+        ).successProvisionEnvelope()
+        var prepareCalls = 0
+
+        val provisioned = provisionBackgroundCredential(
+            store = store,
+            request = uiProvisionRequest(reserved.revision),
+            nowUnix = 110,
+            operationIds = { SECOND_PREPARE_ID to SECOND_ACTIVATE_ID },
+            prepare = { _, prepareId, activateId, _ ->
+                prepareCalls += 1
+                if (prepareCalls == 1) {
+                    assertEquals(PREPARE_ID, prepareId)
+                    throw BackgroundConnectionException("operation_id_conflict")
+                }
+                assertEquals(SECOND_PREPARE_ID, prepareId)
+                pendingToken(prepareId, activateId)
+            },
+            activate = { _, _, _ -> BackgroundActivationResult(2, 10_000) },
+        )
+
+        assertEquals(2, prepareCalls)
+        assertEquals("staged-token", provisioned.active?.token)
+    }
+
+    @Test
     fun typedCredentialRotationUsesExactOperationIdsAndInstallSecret() {
         val transport = RecordingBackgroundTransport(
             JSONObject().apply {
@@ -38,6 +401,26 @@ class BackgroundConnectionClientTest {
         assertEquals(ACTIVATE_ID, transport.payloads[1]?.getString("activation_operation_id"))
         assertEquals(INSTALL_SECRET, transport.payloads[0]?.getString("install_secret"))
         assertEquals(INSTALL_SECRET, transport.payloads[1]?.getString("install_secret"))
+    }
+
+    @Test
+    fun uiPrepareUsesBearerAuthorizationInsteadOfTheExpiredDeviceToken() {
+        val transport = RecordingBackgroundTransport(JSONObject().apply {
+            put("token", "staged-token")
+            put("staged_expires_at", "2026-08-29T12:00:00Z")
+            put("token_generation", 2)
+            put("prepare_operation_id", PREPARE_ID)
+            put("activation_operation_id", ACTIVATE_ID)
+        })
+
+        BackgroundOperationClient(transport).prepareTokenWithBearer(
+            credential().copy(token = "ui-access-token"),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            INSTALL_SECRET,
+        )
+
+        assertEquals(listOf(BackgroundAuthorization.BEARER), transport.authorizations)
     }
 
     @Test
@@ -374,10 +757,47 @@ class BackgroundConnectionClientTest {
         1_900_000_000,
     )
 
+    private fun pendingToken(
+        prepareOperationId: String = PREPARE_ID,
+        activationOperationId: String = ACTIVATE_ID,
+    ) = BackgroundPendingToken(
+        token = "staged-token",
+        stagedExpiresAtUnix = 200,
+        tokenGeneration = 2,
+        prepareOperationId = prepareOperationId,
+        activationOperationId = activationOperationId,
+        contractVersion = 1,
+    )
+
+    private fun provisionReservation(
+        capability: BackgroundCapabilitySnapshot = BackgroundCapabilitySnapshot(1, true, 500),
+    ) = BackgroundCredentialProvisionReservation(
+        deviceId = DEVICE_ID,
+        panelBase = "https://nelomai.test",
+        installSecret = INSTALL_SECRET,
+        installGeneration = 1,
+        capability = capability,
+    )
+
+    private fun uiProvisionRequest(
+        expectedRevision: Long,
+        capability: BackgroundCapabilitySnapshot = BackgroundCapabilitySnapshot(1, true, 500),
+    ) = BackgroundUiProvisionRequest(
+        expectedRevision = expectedRevision,
+        deviceId = DEVICE_ID,
+        panelBase = "https://nelomai.test",
+        accessToken = "ui-access-token",
+        installSecret = INSTALL_SECRET,
+        installGeneration = 1,
+        capability = capability,
+    )
+
     companion object {
         private const val DEVICE_ID = "11111111-1111-4111-8111-111111111111"
         private const val PREPARE_ID = "22222222-2222-4222-8222-222222222222"
         private const val ACTIVATE_ID = "33333333-3333-4333-8333-333333333333"
+        private const val SECOND_PREPARE_ID = "66666666-6666-4666-8666-666666666666"
+        private const val SECOND_ACTIVATE_ID = "77777777-7777-4777-8777-777777777777"
         private const val OPERATION_ID = "44444444-4444-4444-8444-444444444444"
         private const val LOGOUT_ID = "55555555-5555-4555-8555-555555555555"
         private const val INSTALL_SECRET =
@@ -387,6 +807,23 @@ class BackgroundConnectionClientTest {
     }
 }
 
+private class ProvisionCredentialBackend : EncryptedRecordBackend {
+    private var record: ByteArray? = null
+
+    override fun read(): ByteArray? = record?.copyOf()
+
+    override fun write(plaintext: ByteArray): Boolean {
+        record = plaintext.copyOf()
+        return true
+    }
+}
+
+private fun CredentialStoreResult<BackgroundCredentialEnvelope>.successProvisionEnvelope():
+    BackgroundCredentialEnvelope {
+    assertTrue(this is CredentialStoreResult.Success)
+    return (this as CredentialStoreResult.Success).value
+}
+
 private class RecordingBackgroundTransport(
     vararg responses: JSONObject,
 ) : BackgroundApiTransport {
@@ -394,16 +831,19 @@ private class RecordingBackgroundTransport(
     val methods = mutableListOf<String>()
     val endpoints = mutableListOf<String>()
     val payloads = mutableListOf<JSONObject?>()
+    val authorizations = mutableListOf<BackgroundAuthorization>()
 
     override fun execute(
         credential: BackgroundCredential,
         method: String,
         endpoint: String,
         payload: JSONObject?,
+        authorization: BackgroundAuthorization,
     ): JSONObject {
         methods += method
         endpoints += endpoint
         payloads += payload
+        authorizations += authorization
         return queued.removeFirst()
     }
 }

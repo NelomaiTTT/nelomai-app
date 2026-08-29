@@ -44,6 +44,17 @@ internal data class BackgroundCredentialProvision(
         "BackgroundCredentialProvision(deviceId=$deviceId, panelBase=$panelBase, token=<redacted>, expiresAtUnix=$expiresAtUnix, installSecret=<redacted>, installGeneration=$installGeneration, capability=$capability)"
 }
 
+internal data class BackgroundCredentialProvisionReservation(
+    val deviceId: String,
+    val panelBase: String,
+    val installSecret: String,
+    val installGeneration: Long,
+    val capability: BackgroundCapabilitySnapshot,
+) {
+    override fun toString(): String =
+        "BackgroundCredentialProvisionReservation(deviceId=$deviceId, panelBase=$panelBase, installSecret=<redacted>, installGeneration=$installGeneration, capability=$capability)"
+}
+
 internal data class BackgroundMutationReservation(
     val mutationId: String,
     val activationOperationId: String,
@@ -99,6 +110,10 @@ internal data class BackgroundCredentialEnvelope(
     override fun toString(): String =
         "BackgroundCredentialEnvelope(formatVersion=$formatVersion, revision=$revision, deviceId=$deviceId, panelBase=$panelBase, installSecret=${if (installSecret == null) null else "<redacted>"}, installGeneration=$installGeneration, active=${active?.copy(token = "<redacted>")}, previous=${previous?.copy(token = "<redacted>")}, pending=${pending?.copy(token = "<redacted>")}, capability=$capability, reservation=$reservation, cleanupCredential=${cleanupCredential?.copy(token = "<redacted>")}, logoutState=$logoutState)"
 }
+
+internal fun hasRecoverableBackgroundCredential(
+    envelope: BackgroundCredentialEnvelope,
+): Boolean = envelope.active != null || envelope.pending != null
 
 internal object BackgroundCredentialEnvelopeCodec {
     fun encode(envelope: BackgroundCredentialEnvelope): ByteArray {
@@ -184,12 +199,12 @@ internal object BackgroundCredentialEnvelopeCodec {
         }
         envelope.pending?.let { pending ->
             val reservation = requireNotNull(envelope.reservation)
-            require(envelope.active != null && envelope.installSecret != null)
+            require(envelope.installSecret != null)
             require(pending.prepareOperationId == reservation.mutationId)
             require(pending.activationOperationId == reservation.activationOperationId)
         }
         if (envelope.reservation != null) {
-            require(envelope.active != null && envelope.installSecret != null)
+            require(envelope.installSecret != null)
         }
         if (envelope.previous != null) require(envelope.active != null)
         if (envelope.logoutState?.phase == BackgroundLogoutPhase.PENDING) {
@@ -359,6 +374,56 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         }
     }
 
+    fun reserveProvision(
+        expectedRevision: Long,
+        provision: BackgroundCredentialProvisionReservation,
+        mutationId: String,
+        activationOperationId: String,
+        expiresAtUnix: Long,
+        nowUnix: Long,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        mutate(expectedRevision, advancesRevision = true) { current ->
+            if (current.logoutState != null) {
+                throw MutationFailure("background_credential_logout_pending")
+            }
+            if (current.pending != null || current.reservation != null) {
+                throw MutationFailure("background_credential_mutation_in_progress")
+            }
+            val deviceId = BackgroundCredentialEnvelopeCodec.normalizeDeviceId(
+                provision.deviceId,
+            )
+            val panelBase = BackgroundCredentialEnvelopeCodec.normalizePanelBase(
+                provision.panelBase,
+            )
+            if (!provision.capability.enabled ||
+                provision.capability.expiresAtUnix <= nowUnix
+            ) {
+                throw MutationFailure("background_credential_capability_unavailable")
+            }
+            val replacesDevice = current.deviceId != null &&
+                (current.deviceId != deviceId || current.panelBase != panelBase)
+            BackgroundCredentialEnvelopeCodec.requireSafeValue(mutationId)
+            BackgroundCredentialEnvelopeCodec.requireSafeValue(activationOperationId)
+            require(expiresAtUnix > nowUnix)
+            current.copy(
+                revision = current.revision.incrementRevision(),
+                deviceId = deviceId,
+                panelBase = panelBase,
+                installSecret = provision.installSecret,
+                installGeneration = provision.installGeneration,
+                active = current.active.takeUnless { replacesDevice },
+                previous = current.previous.takeUnless { replacesDevice },
+                capability = provision.capability,
+                reservation = BackgroundMutationReservation(
+                    mutationId,
+                    activationOperationId,
+                    deviceId,
+                    expiresAtUnix,
+                ),
+            )
+        }
+    }
+
     fun replaceLegacyCredential(
         expectedRevision: Long,
         credential: BackgroundCredential,
@@ -413,7 +478,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         activationOperationId: String = mutationId,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = false) { current ->
-            requireUsable(current)
+            requireMutationReady(current)
             if (current.logoutState != null) throw MutationFailure(
                 "background_credential_logout_pending",
             )
@@ -429,7 +494,9 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
                 if (existing.mutationId != mutationId ||
                     existing.activationOperationId != activationOperationId
                 ) {
-                    throw MutationFailure("background_credential_mutation_in_progress")
+                    if (current.pending != null || existing.expiresAtUnix > nowUnix) {
+                        throw MutationFailure("background_credential_mutation_in_progress")
+                    }
                 }
             }
             BackgroundCredentialEnvelopeCodec.requireSafeValue(mutationId)
@@ -443,6 +510,63 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         }
     }
 
+    fun replaceUncommittedReservation(
+        expectedRevision: Long,
+        previousMutationId: String,
+        mutationId: String,
+        activationOperationId: String,
+        expiresAtUnix: Long,
+        nowUnix: Long,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        mutate(expectedRevision, advancesRevision = false) { current ->
+            requireMutationReady(current)
+            if (current.pending != null) {
+                throw MutationFailure("background_credential_mutation_in_progress")
+            }
+            val reservation = current.reservation
+                ?: throw MutationFailure("background_credential_mutation_conflict")
+            if (reservation.mutationId != previousMutationId) {
+                throw MutationFailure("background_credential_mutation_conflict")
+            }
+            val capability = current.capability
+            if (capability == null || !capability.enabled || capability.expiresAtUnix <= nowUnix) {
+                throw MutationFailure("background_credential_capability_unavailable")
+            }
+            BackgroundCredentialEnvelopeCodec.requireSafeValue(mutationId)
+            BackgroundCredentialEnvelopeCodec.requireSafeValue(activationOperationId)
+            require(expiresAtUnix > nowUnix)
+            current.copy(
+                reservation = BackgroundMutationReservation(
+                    mutationId,
+                    activationOperationId,
+                    requireNotNull(current.deviceId),
+                    expiresAtUnix,
+                ),
+            )
+        }
+    }
+
+    fun cancelUncommittedReservation(
+        expectedRevision: Long,
+        capability: BackgroundCapabilitySnapshot,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        mutate(expectedRevision, advancesRevision = true) { current ->
+            if (current.pending != null) {
+                throw MutationFailure("background_credential_mutation_in_progress")
+            }
+            current.reservation
+                ?: throw MutationFailure("background_credential_mutation_conflict")
+            current.capability?.let { existing ->
+                require(capability.revision >= existing.revision)
+            }
+            current.copy(
+                revision = current.revision.incrementRevision(),
+                capability = capability,
+                reservation = null,
+            )
+        }
+    }
+
     fun savePendingToken(
         expectedRevision: Long,
         mutationId: String,
@@ -451,7 +575,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         nowUnix: Long,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = false) { current ->
-            requireUsable(current)
+            requireMutationReady(current)
             if (current.logoutState != null) throw MutationFailure(
                 "background_credential_logout_pending",
             )
@@ -518,10 +642,18 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             }
             require(activeExpiresAtUnix > 0)
             val active = current.active
-                ?: throw MutationFailure("background_credential_active_absent")
+            val deviceId = current.deviceId
+                ?: throw MutationFailure("background_credential_device_mismatch")
+            val panelBase = current.panelBase
+                ?: throw MutationFailure("background_credential_device_mismatch")
             current.copy(
                 revision = current.revision.incrementRevision(),
-                active = active.copy(token = pending.token, expiresAtUnix = activeExpiresAtUnix),
+                active = BackgroundCredential(
+                    deviceId = deviceId,
+                    panelBase = panelBase,
+                    token = pending.token,
+                    expiresAtUnix = activeExpiresAtUnix,
+                ),
                 previous = active,
                 pending = null,
                 reservation = null,
@@ -667,8 +799,10 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         }
     }
 
-    private fun requireUsable(envelope: BackgroundCredentialEnvelope) {
-        if (envelope.active == null || envelope.installSecret == null) {
+    private fun requireMutationReady(envelope: BackgroundCredentialEnvelope) {
+        if (envelope.deviceId == null || envelope.panelBase == null ||
+            envelope.installSecret == null
+        ) {
             throw MutationFailure("background_credential_unavailable")
         }
     }

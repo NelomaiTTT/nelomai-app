@@ -21,6 +21,110 @@ class BackgroundCredentialStoreTest {
     }
 
     @Test
+    fun firstTwoPhaseProvisionPersistsPendingBeforePublishingAnActiveToken() {
+        val store = BackgroundCredentialStore(CredentialFakeBackend())
+        val reserved = store.reserveProvision(
+            expectedRevision = 0,
+            provision = provisionReservation(),
+            mutationId = PREPARE_ID,
+            activationOperationId = ACTIVATE_ID,
+            expiresAtUnix = 150,
+            nowUnix = 100,
+        ).successCredential()
+
+        val staged = store.savePendingToken(
+            reserved.revision,
+            PREPARE_ID,
+            pending(),
+            110,
+        ).successCredential()
+
+        assertNull(staged.active)
+        assertEquals("staged-token", staged.pending?.token)
+        assertEquals("install-secret", staged.installSecret)
+
+        val promoted = store.promotePending(
+            staged.revision,
+            ACTIVATE_ID,
+            activeExpiresAtUnix = 10_000,
+        ).successCredential()
+
+        assertEquals("staged-token", promoted.active?.token)
+        assertNull(promoted.previous)
+        assertNull(promoted.pending)
+    }
+
+    @Test
+    fun pendingTokenWithoutAnActiveTokenIsStillRecoverableAtStartup() {
+        val store = BackgroundCredentialStore(CredentialFakeBackend())
+        val reserved = store.reserveProvision(
+            0,
+            provisionReservation(),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            150,
+            100,
+        ).successCredential()
+        val staged = store.savePendingToken(
+            reserved.revision,
+            PREPARE_ID,
+            pending(),
+            110,
+        ).successCredential()
+
+        assertFalse(hasRecoverableBackgroundCredential(reserved))
+        assertTrue(hasRecoverableBackgroundCredential(staged))
+    }
+
+    @Test
+    fun initialProvisionRequiresAFreshEnabledCapability() {
+        val store = BackgroundCredentialStore(CredentialFakeBackend())
+
+        val disabled = store.reserveProvision(
+            0,
+            provisionReservation(
+                BackgroundCapabilitySnapshot(1, enabled = false, expiresAtUnix = 500),
+            ),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            150,
+            100,
+        ).failureCredential()
+        val expired = store.reserveProvision(
+            0,
+            provisionReservation(
+                BackgroundCapabilitySnapshot(1, enabled = true, expiresAtUnix = 100),
+            ),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            150,
+            100,
+        ).failureCredential()
+
+        assertEquals("background_credential_capability_unavailable", disabled.code)
+        assertEquals("background_credential_capability_unavailable", expired.code)
+    }
+
+    @Test
+    fun newDeviceProvisionAtomicallyDropsTheOldDevicesCredential() {
+        val store = configuredStore()
+
+        val reserved = store.reserveProvision(
+            1,
+            provisionReservation(deviceId = SECOND_DEVICE_ID),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            150,
+            100,
+        ).successCredential()
+
+        assertEquals(SECOND_DEVICE_ID, reserved.deviceId)
+        assertNull(reserved.active)
+        assertNull(reserved.previous)
+        assertEquals(PREPARE_ID, reserved.reservation?.mutationId)
+    }
+
+    @Test
     fun uiReservationSerializesProvisionAgainstServiceRotation() {
         val store = configuredStore()
         val reserved = store.reserveMutation(
@@ -188,7 +292,7 @@ class BackgroundCredentialStoreTest {
     }
 
     @Test
-    fun expiredReservationCannotReplaceAnUnknownPrepareOperation() {
+    fun expiredReservationWithoutPendingCanStartANewPrepareOperation() {
         val store = configuredStore()
         store.reserveMutation(
             1,
@@ -199,19 +303,23 @@ class BackgroundCredentialStoreTest {
             ACTIVATE_ID,
         ).successCredential()
 
-        val conflict = store.reserveMutation(
+        val replacement = store.reserveMutation(
             1,
             "44444444-4444-4444-8444-444444444444",
             DEVICE_ID,
             200,
             150,
             "55555555-5555-4555-8555-555555555555",
-        ).failureCredential()
+        ).successCredential()
 
-        assertEquals("background_credential_mutation_in_progress", conflict.code)
-        val reservation = store.read().successCredential().reservation
-        assertEquals(PREPARE_ID, reservation?.mutationId)
-        assertEquals(ACTIVATE_ID, reservation?.activationOperationId)
+        assertEquals(
+            "44444444-4444-4444-8444-444444444444",
+            replacement.reservation?.mutationId,
+        )
+        assertEquals(
+            "55555555-5555-4555-8555-555555555555",
+            replacement.reservation?.activationOperationId,
+        )
     }
 
     private fun configuredStore(
@@ -252,6 +360,21 @@ class BackgroundCredentialStoreTest {
         capability = capability,
     )
 
+    private fun provisionReservation(
+        capability: BackgroundCapabilitySnapshot = BackgroundCapabilitySnapshot(
+            revision = 1,
+            enabled = true,
+            expiresAtUnix = 500,
+        ),
+        deviceId: String = DEVICE_ID,
+    ) = BackgroundCredentialProvisionReservation(
+        deviceId = deviceId,
+        panelBase = "https://nelomai.test",
+        installSecret = "install-secret",
+        installGeneration = 1,
+        capability = capability,
+    )
+
     private fun pending(stagedExpiresAtUnix: Long = 200) = BackgroundPendingToken(
         token = "staged-token",
         stagedExpiresAtUnix = stagedExpiresAtUnix,
@@ -263,6 +386,7 @@ class BackgroundCredentialStoreTest {
 
     companion object {
         private const val DEVICE_ID = "11111111-1111-4111-8111-111111111111"
+        private const val SECOND_DEVICE_ID = "99999999-9999-4999-8999-999999999999"
         private const val PREPARE_ID = "prepare-operation"
         private const val ACTIVATE_ID = "activate-operation"
     }

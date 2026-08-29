@@ -27,7 +27,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
 private const val BACKGROUND_REFRESH_WINDOW_SECONDS = 7L * 24 * 60 * 60
-private const val BACKGROUND_MUTATION_RESERVATION_SECONDS = 10L * 60
 
 internal class IdleStopDebouncer(
     private val delayMillis: Long,
@@ -143,6 +142,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_CLIENT_REBIND_UDP -> handleClientRebindUdp(intent)
             intent?.action == ACTION_CONFIGURE_BACKGROUND -> handleConfigureBackground(intent)
             intent?.action == ACTION_ROTATE_BACKGROUND -> handleRotateBackground(intent)
+            intent?.action == ACTION_PROVISION_BACKGROUND -> handleProvisionBackground(intent)
+            intent?.action == ACTION_RECOVER_BACKGROUND_SESSION -> {
+                handleRecoverBackgroundSession(intent)
+            }
             intent?.action == ACTION_BACKGROUND_STATUS -> handleBackgroundStatus(intent)
             intent?.action == ACTION_CLEAR_BACKGROUND -> handleClearBackground(intent)
             intent?.action == ACTION_CLEAR_QUICK_PLAN -> handleClearQuickPlan(intent)
@@ -392,11 +395,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
         intent.resultReceiver()?.send(
             SERVICE_RESULT_OK,
             Bundle().apply {
-                putBoolean(EXTRA_CONFIGURED, credential != null)
+                putBoolean(EXTRA_CONFIGURED, hasRecoverableBackgroundCredential(envelope))
                 putLong(EXTRA_CREDENTIAL_REVISION, envelope.revision)
                 putBoolean(
                     EXTRA_MUTATION_READY,
                     envelope.installSecret != null && envelope.capability != null,
+                )
+                putBoolean(
+                    EXTRA_MUTATION_PENDING,
+                    envelope.pending != null || envelope.reservation != null,
                 )
                 putBoolean(EXTRA_CAPABILITY_ENABLED, envelope.capability?.enabled == true)
                 putLong(
@@ -431,6 +438,68 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
     }
 
+    private fun handleProvisionBackground(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        val request = try {
+            require(intent.getIntExtra(EXTRA_API_VERSION, 0) == TUNNEL_API_VERSION)
+            val store = AndroidBackgroundCredentialStores.open(applicationContext)
+            val current = store.read().credentialOrThrow()
+            val installGeneration = if (
+                current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED
+            ) {
+                Math.addExact(requireNotNull(current.installGeneration), 1)
+            } else {
+                current.installGeneration ?: 1
+            }
+            BackgroundUiProvisionRequest(
+                expectedRevision = intent.getLongExtra(EXTRA_CREDENTIAL_REVISION, -1),
+                deviceId = requireNotNull(intent.getStringExtra(EXTRA_DEVICE_ID)),
+                panelBase = requireNotNull(intent.getStringExtra(EXTRA_PANEL_BASE)),
+                accessToken = requireNotNull(intent.getStringExtra(EXTRA_ACCESS_TOKEN)),
+                installSecret = requireNotNull(intent.getStringExtra(EXTRA_INSTALL_SECRET)),
+                installGeneration = installGeneration,
+                capability = BackgroundCapabilitySnapshot(
+                    revision = intent.getLongExtra(EXTRA_CAPABILITY_REVISION, -1),
+                    enabled = intent.getBooleanExtra(EXTRA_CAPABILITY_ENABLED, false),
+                    expiresAtUnix = Instant.parse(
+                        requireNotNull(intent.getStringExtra(EXTRA_CAPABILITY_EXPIRES_AT)),
+                    ).epochSecond,
+                ),
+            )
+        } catch (error: CredentialRotationFailure) {
+            receiver.sendError(error.code)
+            stopIfIdle()
+            return
+        } catch (_: Throwable) {
+            receiver.sendError("invalid_background_credential")
+            stopIfIdle()
+            return
+        }
+        credentialExecutor.execute {
+            try {
+                provisionBackgroundCredential(
+                    store = AndroidBackgroundCredentialStores.open(applicationContext),
+                    request = request,
+                    nowUnix = System.currentTimeMillis() / 1_000,
+                    operationIds = { UUID.randomUUID().toString() to UUID.randomUUID().toString() },
+                    prepare = BackgroundConnectionClient::prepareTokenWithBearer,
+                    activate = BackgroundConnectionClient::activateToken,
+                )
+                runCatching { AutomaticDiagnostics.credentialUpdated(applicationContext) }
+                    .onFailure {
+                        TunnelLog.warning("diagnostics.credential_update_failed", error = it)
+                    }
+                receiver.sendSuccess()
+            } catch (error: BackgroundConnectionException) {
+                receiver.sendError(error.code)
+            } catch (_: Throwable) {
+                receiver.sendError("background_credential_provision_failed")
+            } finally {
+                stopIfIdle()
+            }
+        }
+    }
+
     private fun rotateBackgroundCredential(expectedRevision: Long) {
         val store = AndroidBackgroundCredentialStores.open(applicationContext)
         var envelope = store.read().credentialOrThrow()
@@ -447,43 +516,27 @@ class NelomaiVpnService : GoBackend.VpnService() {
         val nowUnix = System.currentTimeMillis() / 1_000
 
         if (envelope.pending == null && envelope.reservation == null) {
-            val capability = BackgroundConnectionClient.capabilities(credential)
+            val capability = refreshBackgroundCapability(envelope.capability, nowUnix) {
+                BackgroundConnectionClient.capabilities(credential)
+            }
             envelope = store.updateCapability(envelope.revision, capability).credentialOrThrow()
             if (!capability.enabled || capability.expiresAtUnix <= nowUnix) return
             if (credential.expiresAtUnix > nowUnix + BACKGROUND_REFRESH_WINDOW_SECONDS) return
         }
 
-        var pending = envelope.pending
-        if (pending == null) {
-            val reservation = envelope.reservation ?: run {
-                val prepareOperationId = UUID.randomUUID().toString()
-                val activationOperationId = UUID.randomUUID().toString()
-                envelope = store.reserveMutation(
-                    expectedRevision = envelope.revision,
-                    mutationId = prepareOperationId,
-                    deviceId = credential.deviceId,
-                    expiresAtUnix = nowUnix + BACKGROUND_MUTATION_RESERVATION_SECONDS,
-                    nowUnix = nowUnix,
-                    activationOperationId = activationOperationId,
-                ).credentialOrThrow()
-                requireNotNull(envelope.reservation)
-            }
-            pending = BackgroundConnectionClient.prepareToken(
-                credential,
-                reservation.mutationId,
-                reservation.activationOperationId,
-                installSecret,
-            )
-            envelope = store.savePendingToken(
-                expectedRevision = envelope.revision,
-                mutationId = reservation.mutationId,
-                pending = pending,
-                nowUnix = System.currentTimeMillis() / 1_000,
-            ).credentialOrThrow()
-        }
+        val preparedState = prepareBackgroundTokenDurably(
+            store = store,
+            envelope = envelope,
+            credential = credential,
+            installSecret = installSecret,
+            nowUnix = nowUnix,
+            operationIds = { UUID.randomUUID().toString() to UUID.randomUUID().toString() },
+            prepare = BackgroundConnectionClient::prepareToken,
+        )
+        envelope = preparedState.envelope
+        val pending = preparedState.pending
 
-        credential = envelope.active
-            ?: throw CredentialRotationFailure("background_credential_active_absent")
+        credential = stagedBackgroundCredential(envelope, pending)
         val activation = try {
             BackgroundConnectionClient.activateToken(credential, pending, installSecret)
         } catch (error: BackgroundConnectionException) {
@@ -500,6 +553,60 @@ class NelomaiVpnService : GoBackend.VpnService() {
             activationOperationId = pending.activationOperationId,
             activeExpiresAtUnix = activation.activeExpiresAtUnix,
         ).credentialOrThrow()
+    }
+
+    private fun handleRecoverBackgroundSession(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        val installSecret = intent.getStringExtra(EXTRA_INSTALL_SECRET) ?: run {
+            receiver.sendError("invalid_background_recovery")
+            stopIfIdle()
+            return
+        }
+        credentialExecutor.execute {
+            try {
+                val store = AndroidBackgroundCredentialStores.open(applicationContext)
+                val credential = backgroundCredentialForSessionRecovery(store) { envelope ->
+                    provisionBackgroundCredential(
+                        store = store,
+                        request = BackgroundUiProvisionRequest(
+                            expectedRevision = envelope.revision,
+                            deviceId = requireNotNull(envelope.deviceId),
+                            panelBase = requireNotNull(envelope.panelBase),
+                            accessToken = "pending-activation-replay",
+                            installSecret = installSecret,
+                            installGeneration = requireNotNull(envelope.installGeneration),
+                            capability = envelope.capability
+                                ?: BackgroundCapabilitySnapshot(0, false, 1),
+                        ),
+                        nowUnix = System.currentTimeMillis() / 1_000,
+                        operationIds = { error("pending activation must not mint operation IDs") },
+                        prepare = { _, _, _, _ ->
+                            error("pending activation must not prepare another token")
+                        },
+                        activate = BackgroundConnectionClient::activateToken,
+                    )
+                }
+                val recovered = BackgroundConnectionClient.recoverSession(
+                    credential,
+                    installSecret,
+                )
+                receiver?.send(
+                    SERVICE_RESULT_OK,
+                    Bundle().apply {
+                        putString(EXTRA_ACCESS_TOKEN, recovered.accessToken)
+                        putString(EXTRA_REFRESH_TOKEN, recovered.refreshToken)
+                    },
+                )
+            } catch (error: BackgroundConnectionException) {
+                receiver.sendError(error.code)
+            } catch (error: CredentialRotationFailure) {
+                receiver.sendError(error.code)
+            } catch (_: Throwable) {
+                receiver.sendError("invalid_background_recovery")
+            } finally {
+                stopIfIdle()
+            }
+        }
     }
 
     private fun handleClearBackground(intent: Intent) {
@@ -842,6 +949,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
         internal const val ACTION_CLIENT_REBIND_UDP = "ru.nelomai.tunnel.CLIENT_REBIND_UDP"
         internal const val ACTION_CONFIGURE_BACKGROUND = "ru.nelomai.tunnel.CONFIGURE_BACKGROUND"
         internal const val ACTION_ROTATE_BACKGROUND = "ru.nelomai.tunnel.ROTATE_BACKGROUND"
+        internal const val ACTION_PROVISION_BACKGROUND = "ru.nelomai.tunnel.PROVISION_BACKGROUND"
+        internal const val ACTION_RECOVER_BACKGROUND_SESSION =
+            "ru.nelomai.tunnel.RECOVER_BACKGROUND_SESSION"
         internal const val ACTION_BACKGROUND_STATUS = "ru.nelomai.tunnel.BACKGROUND_STATUS"
         internal const val ACTION_CLEAR_BACKGROUND = "ru.nelomai.tunnel.CLEAR_BACKGROUND"
         internal const val ACTION_CLEAR_QUICK_PLAN = "ru.nelomai.tunnel.CLEAR_QUICK_PLAN"
