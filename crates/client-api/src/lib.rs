@@ -1,15 +1,17 @@
 use futures_util::StreamExt;
 use nelomai_contracts::{
     Access, ApiVersion, AppNotificationList, AppNotificationReadResponse, BindPeerRequest,
-    Bootstrap, ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, EgressMode, ErrorPayload, Layer, PeerBindingResponse, PeerOptions,
-    Platform, ProbeFailureCode, PushRegistrationRequest, PushRegistrationResponse,
-    ServerCandidatesResponse, ServerSelectionRequest, ServerSelectionResponse,
-    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
-    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate, API_PREFIX,
+    Bootstrap, ConnectionIntentCapabilityResponse, ConnectionOperationRequest,
+    ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, EgressMode,
+    ErrorPayload, Layer, OperationReconcileRequest, OperationReconcileResponse,
+    PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode, PushRegistrationRequest,
+    PushRegistrationResponse, ServerCandidatesResponse, ServerSelectionRequest,
+    ServerSelectionResponse, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
+    SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate,
+    API_PREFIX,
 };
 use reqwest::{
-    header::{HeaderValue, InvalidHeaderValue, CONTENT_TYPE},
+    header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION, CONTENT_TYPE},
     Client as HttpClient, RequestBuilder, Response, StatusCode, Url,
 };
 use serde::{Deserialize, Serialize};
@@ -262,6 +264,17 @@ impl ClientApiError {
             Self::InvalidPayload { code } | Self::PayloadTooLarge { code, .. } => Some(code),
             _ => None,
         }
+    }
+
+    pub fn disables_new_connection_intent_operations(&self) -> bool {
+        matches!(
+            self,
+            Self::Api { status, .. } | Self::InvalidErrorResponse { status }
+                if *status == StatusCode::NOT_FOUND
+        ) || matches!(
+            self.stable_code(),
+            Some("recovery_contract_unavailable" | "recovery_contract_unsupported")
+        )
     }
 }
 
@@ -659,6 +672,49 @@ impl ClientApi {
         .await
     }
 
+    pub async fn background_capabilities(
+        &self,
+        background_token: &str,
+    ) -> Result<ConnectionIntentCapabilityResponse, ClientApiError> {
+        self.send_json(self.device_request(
+            self.http.get(self.endpoint("background/capabilities")?),
+            background_token,
+        ))
+        .await
+    }
+
+    pub async fn background_candidates(
+        &self,
+        background_token: &str,
+        layer: Layer,
+        egress_mode: EgressMode,
+    ) -> Result<ServerCandidatesResponse, ClientApiError> {
+        self.send_json(
+            self.device_request(
+                self.http
+                    .get(self.background_candidates_endpoint(layer, egress_mode)?),
+                background_token,
+            ),
+        )
+        .await
+    }
+
+    pub async fn reconcile_background_operation(
+        &self,
+        background_token: &str,
+        request: &OperationReconcileRequest,
+    ) -> Result<OperationReconcileResponse, ClientApiError> {
+        self.send_json(
+            self.device_request(
+                self.http
+                    .post(self.endpoint("background/operations/reconcile")?),
+                background_token,
+            )
+            .json(request),
+        )
+        .await
+    }
+
     pub async fn select_server(
         &self,
         access_token: &str,
@@ -838,7 +894,24 @@ impl ClientApi {
         layer: Layer,
         egress_mode: EgressMode,
     ) -> Result<Url, ClientApiError> {
-        let mut endpoint = self.endpoint("server-candidates")?;
+        self.candidates_endpoint("server-candidates", layer, egress_mode)
+    }
+
+    fn background_candidates_endpoint(
+        &self,
+        layer: Layer,
+        egress_mode: EgressMode,
+    ) -> Result<Url, ClientApiError> {
+        self.candidates_endpoint("background/server-candidates", layer, egress_mode)
+    }
+
+    fn candidates_endpoint(
+        &self,
+        path: &str,
+        layer: Layer,
+        egress_mode: EgressMode,
+    ) -> Result<Url, ClientApiError> {
+        let mut endpoint = self.endpoint(path)?;
         endpoint.query_pairs_mut().append_pair(
             "layer",
             match layer {
@@ -854,6 +927,10 @@ impl ClientApi {
             },
         );
         Ok(endpoint)
+    }
+
+    fn device_request(&self, request: RequestBuilder, background_token: &str) -> RequestBuilder {
+        request.header(AUTHORIZATION, format!("Device {background_token}"))
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, ClientApiError> {
@@ -1081,11 +1158,28 @@ mod tests {
             egress_mode: EgressMode::Ipv4,
             probes: Vec::new(),
             allow_alternate: false,
+            require_measured_selection: false,
+            recovery_contract_version: None,
+            request_fingerprint: None,
         };
-        let value = serde_json::to_value(start).unwrap();
+        let value = serde_json::to_value(&start).unwrap();
         assert_eq!(value["tic_connection_mode"], "dynamic");
         assert!(value.get("mode").is_none());
         assert!(value.get("api_version").is_none());
+        assert!(value.get("require_measured_selection").is_none());
+        assert!(value.get("recovery_contract_version").is_none());
+        assert!(value.get("request_fingerprint").is_none());
+
+        let recovery_start = ConnectionStartRequest {
+            require_measured_selection: true,
+            recovery_contract_version: Some(1),
+            request_fingerprint: Some("a".repeat(64)),
+            ..start
+        };
+        let recovery_value = serde_json::to_value(recovery_start).unwrap();
+        assert_eq!(recovery_value["require_measured_selection"], true);
+        assert_eq!(recovery_value["recovery_contract_version"], 1);
+        assert_eq!(recovery_value["request_fingerprint"], "a".repeat(64));
 
         let operation = ConnectionOperationRequest {
             operation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -1113,6 +1207,43 @@ mod tests {
                 "failure_code": "tunnel_handshake_timeout"
             })
         );
+
+        let stalled_operation = ConnectionOperationRequest {
+            operation_id: "44444444-4444-4444-8444-444444444444".to_string(),
+            lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            failure_code: Some("tunnel_data_plane_stalled".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_value(stalled_operation).unwrap()["failure_code"],
+            "tunnel_data_plane_stalled"
+        );
+    }
+
+    #[test]
+    fn connection_intent_capability_absence_and_unsupported_errors_disable_only_new_work() {
+        let missing = ClientApiError::Api {
+            status: StatusCode::NOT_FOUND,
+            request_id: "req-missing".to_string(),
+            code: "not_found".to_string(),
+            message: "Not found".to_string(),
+        };
+        assert!(missing.disables_new_connection_intent_operations());
+
+        let unsupported = ClientApiError::Api {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            request_id: "req-unsupported".to_string(),
+            code: "recovery_contract_unsupported".to_string(),
+            message: "Unsupported".to_string(),
+        };
+        assert!(unsupported.disables_new_connection_intent_operations());
+
+        let malformed_missing = ClientApiError::InvalidErrorResponse {
+            status: StatusCode::NOT_FOUND,
+        };
+        assert!(malformed_missing.disables_new_connection_intent_operations());
+
+        let transport = ClientApiError::InvalidBaseUrl("offline".to_string());
+        assert!(!transport.disables_new_connection_intent_operations());
     }
 
     #[test]

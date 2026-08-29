@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod split_tunnel;
 
@@ -316,6 +317,38 @@ pub struct Bootstrap {
     pub pinned_stray: Option<Connection>,
     pub defaults: BootstrapDefaults,
     pub update: UpdateState,
+    #[serde(default)]
+    pub capabilities: Option<ConnectionIntentCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ConnectionIntentCapability {
+    pub revision: u32,
+    pub expires_at: String,
+    pub connection_intent_recovery_v1: bool,
+}
+
+impl ConnectionIntentCapability {
+    pub fn is_recovery_enabled_at(&self, now_unix: i64) -> bool {
+        self.connection_intent_recovery_v1
+            && OffsetDateTime::parse(&self.expires_at, &Rfc3339)
+                .is_ok_and(|expires_at| expires_at.unix_timestamp() > now_unix)
+    }
+}
+
+pub fn allows_new_connection_intent_operation(
+    capability: Option<&ConnectionIntentCapability>,
+    now_unix: i64,
+) -> bool {
+    capability.is_some_and(|capability| capability.is_recovery_enabled_at(now_unix))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ConnectionIntentCapabilityResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    #[serde(flatten)]
+    pub capability: ConnectionIntentCapability,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -328,6 +361,12 @@ pub struct ConnectionStartRequest {
     pub egress_mode: EgressMode,
     pub probes: Vec<ProbeResult>,
     pub allow_alternate: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_measured_selection: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_fingerprint: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -365,6 +404,60 @@ pub struct ConnectionOperationResponse {
     pub api_version: ApiVersion,
     pub request_id: String,
     pub connection: Connection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    Start,
+    StalledStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationState {
+    NotFound,
+    Pending,
+    Applying,
+    Compensating,
+    Applied,
+    Terminal,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OperationReconcileRequest {
+    pub operation_id: String,
+    pub kind: OperationKind,
+    #[serde(default = "default_recovery_contract_version")]
+    pub contract_version: u32,
+    pub request_fingerprint: String,
+    #[serde(default)]
+    pub cancel_if_absent: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OperationReconcileResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub state: OperationState,
+    pub cancel_requested: bool,
+    #[serde(default)]
+    pub lease_id: Option<String>,
+    #[serde(default)]
+    pub lease_status: Option<LeaseStatus>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub next_attempt_at: Option<String>,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+const fn default_recovery_contract_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

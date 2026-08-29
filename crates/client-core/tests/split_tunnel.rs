@@ -2100,6 +2100,7 @@ impl CoreApi for CoordinatorApi {
                 required: false,
                 release_notes: None,
             },
+            capabilities: None,
         })
     }
 

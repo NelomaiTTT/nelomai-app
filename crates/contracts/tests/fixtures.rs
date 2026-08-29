@@ -1,11 +1,12 @@
 use std::{fs, path::PathBuf};
 
 use nelomai_contracts::{
-    BindPeerRequest, Bootstrap, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, EgressMode, ErrorPayload, PeerBindingResponse, PeerOptions,
-    ProbeResults, ServerCandidatesResponse, ServerSelectionRequest, SplitTunnelApplyResult,
-    SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelPolicy, SplitTunnelRevision,
-    SplitTunnelSettingsUpdate, UpdateManifest,
+    allows_new_connection_intent_operation, BindPeerRequest, Bootstrap, ConnectionIntentCapability,
+    ConnectionIntentCapabilityResponse, ConnectionOperationResponse, ConnectionStartRequest,
+    ConnectionStartResponse, EgressMode, ErrorPayload, OperationReconcileResponse, OperationState,
+    PeerBindingResponse, PeerOptions, ProbeResults, ServerCandidatesResponse,
+    ServerSelectionRequest, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
+    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate, UpdateManifest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -130,6 +131,94 @@ fn common_error_payload_rejects_secret_fields() {
     assert!(serde_json::from_str::<ErrorPayload>(&raw).is_err());
     let value: Value = serde_json::from_str(&raw).unwrap();
     assert!(!schema_is_valid("error.schema.json", &value));
+}
+
+#[test]
+fn connection_intent_fixtures_match_schema_and_tolerant_rust_types() {
+    check::<ConnectionIntentCapabilityResponse>(
+        "valid/connection-intent-capability.json",
+        "connection-intent-capability.schema.json",
+    );
+    check::<OperationReconcileResponse>(
+        "valid/connection-operation-reconcile.json",
+        "connection-operation-reconcile.schema.json",
+    );
+    check::<ErrorPayload>(
+        "valid/connection-operation-reconcile-conflict.json",
+        "error.schema.json",
+    );
+
+    assert_eq!(
+        serde_json::from_str::<OperationState>(r#""compensating""#).unwrap(),
+        OperationState::Compensating,
+    );
+    let start: ConnectionStartRequest =
+        serde_json::from_str(&fixture("valid/connection-start.json")).unwrap();
+    assert!(!start.require_measured_selection);
+
+    let bootstrap: Bootstrap = serde_json::from_str(&fixture("valid/bootstrap.json")).unwrap();
+    assert!(bootstrap.capabilities.is_some());
+}
+
+#[test]
+fn connection_intent_error_policy_is_complete_and_unambiguous() {
+    let policy: Value =
+        serde_json::from_str(&fixture("valid/connection-intent-error-policy.json")).unwrap();
+    let cases = policy["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+
+    let mut codes = std::collections::BTreeSet::new();
+    for case in cases {
+        assert!(codes.insert(case["code"].as_str().unwrap()));
+        assert!(matches!(
+            case["decision"].as_str().unwrap(),
+            "retry_same_operation"
+                | "retry_new_operation"
+                | "retry_after"
+                | "retry_once"
+                | "reconcile_then_retry"
+                | "reconcile_once"
+                | "local_restart"
+                | "terminal"
+        ));
+    }
+    for required in [
+        "connection_unavailable",
+        "service_unavailable",
+        "connection_stall_recycle_rate_limited",
+        "operation_id_conflict",
+        "ipv6_pool_unavailable",
+    ] {
+        assert!(codes.contains(required), "missing policy for {required}");
+    }
+    assert_eq!(policy["retry_after"]["minimum_seconds"], 1);
+    assert_eq!(policy["retry_after"]["maximum_seconds"], 900);
+    assert_eq!(policy["retry_after"]["fallback_seconds"], 300);
+    assert_eq!(policy["unknown_decision"], "terminal");
+}
+
+#[test]
+fn connection_intent_capability_requires_a_present_enabled_unexpired_snapshot() {
+    let capability = ConnectionIntentCapability {
+        revision: 1,
+        expires_at: "2026-08-28T18:05:00Z".to_string(),
+        connection_intent_recovery_v1: true,
+    };
+    assert!(allows_new_connection_intent_operation(
+        Some(&capability),
+        1_787_940_299,
+    ));
+    assert!(!allows_new_connection_intent_operation(
+        Some(&capability),
+        1_787_940_300,
+    ));
+    assert!(!allows_new_connection_intent_operation(None, 0));
+
+    let disabled = ConnectionIntentCapability {
+        connection_intent_recovery_v1: false,
+        ..capability
+    };
+    assert!(!allows_new_connection_intent_operation(Some(&disabled), 0,));
 }
 
 #[test]

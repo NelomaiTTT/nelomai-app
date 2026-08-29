@@ -46,5 +46,10 @@
     "update_available": false,
     "required": false,
     "release_notes": null
+  },
+  "capabilities": {
+    "revision": 1,
+    "expires_at": "2026-12-31T21:05:00Z",
+    "connection_intent_recovery_v1": true
   }
 }

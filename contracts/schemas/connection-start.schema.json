@@ -22,7 +22,14 @@
       "maxItems": 32,
       "items": { "$ref": "common.schema.json#/$defs/probe" }
     },
-    "allow_alternate": { "type": "boolean" }
+    "allow_alternate": { "type": "boolean" },
+    "require_measured_selection": { "type": "boolean", "default": false },
+    "recovery_contract_version": { "type": "integer", "minimum": 1, "maximum": 32 },
+    "request_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  },
+  "dependentRequired": {
+    "recovery_contract_version": ["request_fingerprint"],
+    "request_fingerprint": ["recovery_contract_version"]
   },
   "additionalProperties": false
 }

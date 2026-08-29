@@ -1228,6 +1228,9 @@ where
             egress_mode: connection.egress_mode,
             probes: Vec::new(),
             allow_alternate: false,
+            require_measured_selection: false,
+            recovery_contract_version: None,
+            request_fingerprint: None,
         };
         let mut recovered = self.api.start_connection(&access_token, &request).await;
         if matches!(recovered, Err(CoreApiError::Unauthorized)) {
@@ -1375,6 +1378,9 @@ where
             egress_mode: options.egress_mode,
             probes: options.probes,
             allow_alternate: options.allow_alternate,
+            require_measured_selection: false,
+            recovery_contract_version: None,
+            request_fingerprint: None,
         };
         let panel_started = Instant::now();
         let start_result = self.retry_start(&access_token, &mut request).await;

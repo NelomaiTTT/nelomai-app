@@ -1,0 +1,7 @@
+{
+  "api_version": "1",
+  "request_id": "req_capability_01",
+  "revision": 1,
+  "expires_at": "2026-08-28T18:05:00Z",
+  "connection_intent_recovery_v1": true
+}

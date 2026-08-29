@@ -11,9 +11,10 @@ use nelomai_client_core::{ConnectOptions, NoopLogger, Phase};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
-    BindPeerRequest, EgressMode, Layer, Platform, RouteMode, SplitTunnelAddressRuleScope,
-    SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
-    SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    BindPeerRequest, EgressMode, Layer, OperationKind, OperationReconcileRequest, OperationState,
+    Platform, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
+    SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde_json::{json, Value};
 use std::{
@@ -393,6 +394,66 @@ async fn split_tunnel_settings_limits_are_enforced_before_transmission() {
     server.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_intent_background_routes_use_device_auth_but_probes_do_not() {
+    let panel_state = Arc::new(MockPanelState::default());
+    let router = Router::new()
+        .route(
+            "/api/client/v1/background/capabilities",
+            get(background_capabilities),
+        )
+        .route(
+            "/api/client/v1/background/server-candidates",
+            get(background_server_candidates),
+        )
+        .route(
+            "/api/client/v1/background/operations/reconcile",
+            post(background_operation_reconcile),
+        )
+        .route("/probe/background", get(background_probe))
+        .with_state(panel_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    *panel_state.base_url.lock().unwrap() = base_url.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let api = ClientApi::new(&base_url).unwrap();
+
+    let capability = api
+        .background_capabilities("background-token")
+        .await
+        .unwrap();
+    assert!(capability.capability.connection_intent_recovery_v1);
+
+    let candidates = api
+        .background_candidates("background-token", Layer::Stray, EgressMode::Ipv4)
+        .await
+        .unwrap();
+    assert_eq!(candidates.candidates.len(), 1);
+    api.probe_candidate_latency_ms(&candidates.candidates[0].probe_url)
+        .await
+        .unwrap();
+
+    let reconciled = api
+        .reconcile_background_operation(
+            "background-token",
+            &OperationReconcileRequest {
+                operation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                kind: OperationKind::Start,
+                contract_version: 1,
+                request_fingerprint: "a".repeat(64),
+                cancel_if_absent: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled.state, OperationState::Compensating);
+    assert!(reconciled.cancel_requested);
+
+    server.abort();
+}
+
 async fn login(State(_state): State<Arc<MockPanelState>>, Json(body): Json<Value>) -> Json<Value> {
     assert_eq!(body["login"], "test");
     assert_eq!(body["password"], "password");
@@ -513,6 +574,76 @@ async fn split_tunnel_remove_address_rule(
 async fn oversized_split_tunnel_policy(headers: HeaderMap) -> String {
     assert_authenticated(&headers);
     format!("{{\"com.secret\":\"{}\"}}", "x".repeat(1024 * 1024))
+}
+
+async fn background_capabilities(headers: HeaderMap) -> Json<Value> {
+    assert_device_authenticated(&headers);
+    Json(json!({
+        "api_version": "1",
+        "request_id": "req-background-capability",
+        "revision": 1,
+        "expires_at": "2030-01-01T00:00:00Z",
+        "connection_intent_recovery_v1": true
+    }))
+}
+
+async fn background_server_candidates(
+    State(state): State<Arc<MockPanelState>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    assert_device_authenticated(&headers);
+    assert_eq!(query.get("layer").map(String::as_str), Some("stray"));
+    assert_eq!(query.get("egress_mode").map(String::as_str), Some("ipv4"));
+    Json(json!({
+        "api_version": "1",
+        "request_id": "req-background-candidates",
+        "candidates": [{
+            "candidate_id": "opaque-background-candidate",
+            "layer": "stray",
+            "region_label": "Тест",
+            "probe_url": format!("{}/probe/background", state.base_url.lock().unwrap()),
+            "expires_at": "2030-01-01T00:00:00Z"
+        }]
+    }))
+}
+
+async fn background_operation_reconcile(
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_device_authenticated(&headers);
+    assert_eq!(body["kind"], "start");
+    assert_eq!(body["contract_version"], 1);
+    assert_eq!(body["request_fingerprint"], "a".repeat(64));
+    assert_eq!(body["cancel_if_absent"], true);
+    Json(json!({
+        "api_version": "1",
+        "request_id": "req-background-reconcile",
+        "state": "compensating",
+        "cancel_requested": true,
+        "lease_id": LEASE_ID,
+        "lease_status": "issued",
+        "retry_count": 2,
+        "next_attempt_at": "2030-01-01T00:00:30Z"
+    }))
+}
+
+async fn background_probe(headers: HeaderMap) -> StatusCode {
+    assert!(
+        headers.get(AUTHORIZATION).is_none(),
+        "probe endpoint must not receive a background token"
+    );
+    StatusCode::NO_CONTENT
+}
+
+fn assert_device_authenticated(headers: &HeaderMap) {
+    assert_eq!(
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Device background-token")
+    );
 }
 
 fn split_tunnel_policy_json() -> Value {

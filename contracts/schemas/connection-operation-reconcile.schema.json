@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/connection-operation-reconcile.schema.json",
+  "type": "object",
+  "required": [
+    "api_version",
+    "request_id",
+    "state",
+    "cancel_requested",
+    "lease_id",
+    "lease_status",
+    "retry_count",
+    "next_attempt_at"
+  ],
+  "properties": {
+    "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+    "request_id": { "$ref": "common.schema.json#/$defs/id" },
+    "state": {
+      "enum": [
+        "not_found",
+        "pending",
+        "applying",
+        "compensating",
+        "applied",
+        "terminal",
+        "cancelled"
+      ]
+    },
+    "cancel_requested": { "type": "boolean" },
+    "lease_id": {
+      "anyOf": [
+        { "$ref": "common.schema.json#/$defs/uuid" },
+        { "type": "null" }
+      ]
+    },
+    "lease_status": {
+      "anyOf": [
+        { "$ref": "common.schema.json#/$defs/leaseStatus" },
+        { "type": "null" }
+      ]
+    },
+    "retry_count": { "type": "integer", "minimum": 0 },
+    "next_attempt_at": {
+      "anyOf": [
+        { "$ref": "common.schema.json#/$defs/timestamp" },
+        { "type": "null" }
+      ]
+    }
+  },
+  "additionalProperties": true
+}

@@ -589,6 +589,7 @@ fn bootstrap() -> Bootstrap {
             required: false,
             release_notes: None,
         },
+        capabilities: None,
     }
 }
 

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/connection-intent-capability.schema.json",
+  "type": "object",
+  "required": [
+    "api_version",
+    "request_id",
+    "revision",
+    "expires_at",
+    "connection_intent_recovery_v1"
+  ],
+  "properties": {
+    "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+    "request_id": { "$ref": "common.schema.json#/$defs/id" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "expires_at": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "connection_intent_recovery_v1": { "type": "boolean" }
+  },
+  "additionalProperties": true
+}

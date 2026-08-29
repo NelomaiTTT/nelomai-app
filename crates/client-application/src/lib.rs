@@ -13,8 +13,9 @@ use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelSto
 use nelomai_client_tunnel::{TunnelController, TunnelError};
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
-    EgressMode, Layer, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode, ProbeResult,
-    ProbeResults, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
+    ConnectionIntentCapabilityResponse, EgressMode, Layer, OperationReconcileRequest,
+    OperationReconcileResponse, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode,
+    ProbeResult, ProbeResults, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelPolicy, SplitTunnelSelectedPackage,
     SplitTunnelSettingsUpdate, TicConnectionMode, UpdateState,
 };
@@ -73,6 +74,27 @@ pub trait ApplicationApi: CoreApi {
         &self,
         _access_token: &str,
     ) -> Result<BackgroundTokenResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_capabilities(
+        &self,
+        _background_token: &str,
+    ) -> Result<ConnectionIntentCapabilityResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_candidates(
+        &self,
+        _background_token: &str,
+        _layer: Layer,
+        _egress_mode: EgressMode,
+    ) -> Result<ServerCandidatesResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn reconcile_background_operation(
+        &self,
+        _background_token: &str,
+        _request: &OperationReconcileRequest,
+    ) -> Result<OperationReconcileResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn upload_diagnostics(
@@ -186,6 +208,36 @@ impl ApplicationApi for ClientApi {
         access_token: &str,
     ) -> Result<BackgroundTokenResponse, CoreApiError> {
         ClientApi::background_token(self, access_token)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_capabilities(
+        &self,
+        background_token: &str,
+    ) -> Result<ConnectionIntentCapabilityResponse, CoreApiError> {
+        ClientApi::background_capabilities(self, background_token)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_candidates(
+        &self,
+        background_token: &str,
+        layer: Layer,
+        egress_mode: EgressMode,
+    ) -> Result<ServerCandidatesResponse, CoreApiError> {
+        ClientApi::background_candidates(self, background_token, layer, egress_mode)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn reconcile_background_operation(
+        &self,
+        background_token: &str,
+        request: &OperationReconcileRequest,
+    ) -> Result<OperationReconcileResponse, CoreApiError> {
+        ClientApi::reconcile_background_operation(self, background_token, request)
             .await
             .map_err(Into::into)
     }

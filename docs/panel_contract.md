@@ -44,6 +44,36 @@ pin, stop, warm reconnect, unpin, peer unbinding, and logout through the real
 `ClientApi` serialization boundary. It never uses production accounts, peers,
 or endpoints.
 
+### Connection-intent recovery
+
+The additive recovery contract is gated by
+`connection_intent_recovery_v1`. Authenticated bootstrap includes a capability
+snapshot, and an Android background client can refresh the same snapshot with
+`GET /api/client/v1/background/capabilities` using
+`Authorization: Device <background token>`. A client may create a new recovery
+operation only while the snapshot is present, enabled, and unexpired. Missing,
+expired, explicitly disabled, `404`, and stable unsupported responses all mean
+disabled for new work. They do not block exact replay, reconciliation,
+cancellation, or cleanup of an operation already stored with its original
+contract version and fingerprint.
+
+Dynamic background recovery obtains candidates from
+`GET /api/client/v1/background/server-candidates` with Device authorization.
+The subsequent HTTPS probe requests never carry either Bearer or Device
+authorization. A measured recovery start sends
+`require_measured_selection: true`; legacy starts omit the field and retain the
+existing default `false`. Recovery-aware starts also send
+`recovery_contract_version` and the matching SHA-256 `request_fingerprint`.
+
+`POST /api/client/v1/background/operations/reconcile` accepts the original
+operation ID, kind (`start` or `stalled_stop`), contract version, fingerprint,
+and `cancel_if_absent`. Its state is one of `not_found`, `pending`, `applying`,
+`compensating`, `applied`, `terminal`, or `cancelled`; optional lease and retry
+fields are authoritative server state. `operation_id_conflict` remains a common
+error payload and is terminal. A verified dynamic AWG3 stall may be reported by
+the stop request as `tunnel_data_plane_stalled`; other stop semantics remain
+unchanged.
+
 A pinned Stray configuration and a temporary alternate lease are stored in
 separate protected slots. Starting an alternate connection must never replace
 the pinned configuration. Unbinding stops the local tunnel and clears both
