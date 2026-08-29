@@ -62,7 +62,11 @@
 переживать обычное завершение UI/Tauri-процесса. Store содержит generation,
 нормализованный выбор подключения, безопасные tunnel options и retry metadata,
 но не WireGuard-конфигурацию, ключи или session token. Background credential
-остаётся в существующем отдельном защищённом хранилище.
+остаётся отдельным от lease lifecycle. Незавершённый start, active-lease
+checkpoint и ожидающий cleanup являются фазами одного атомарного
+Keystore-backed `AndroidLeaseTransactionStore` процесса `:vpn`; переход фазы не
+требует согласованного commit нескольких файлов. Lease envelope несёт generation
+intent, а credential использует собственную монотонную revision.
 
 Android intent привязан к текущей загрузке ОС. Store записывает системный
 `BOOT_COUNT` вместе с intent и проверяет его при каждом read, status, tile action
@@ -72,6 +76,16 @@ Android intent привязан к текущей загрузке ОС. Store �
 Если boot identity нельзя безопасно прочитать, restore не выполняется и intent
 очищается fail-closed относительно автоматического запуска. Reusable quick plan
 можно сохранить для следующего явного `Старт/On`, но он не включает VPN сам.
+
+Каждая фаза lease transaction также хранит `BOOT_COUNT`, но mismatch не удаляет
+незавершённую server transaction. Intent
+инвалидируется, а такие записи атомарно переводятся в `stale_cleanup`: они
+никогда не устанавливают конфигурацию и не включают VPN или kill switch.
+Pending start проверяется через operation reconciliation; обнаруженный lease
+переводится в pending stop, а уже известный lease освобождается тем же
+idempotent stop. Новый `On/Старт` блокируется до подтверждённого cleanup. Если
+background credential недоступен, записи сохраняются до открытия приложения;
+server-side expiry остаётся последней страховкой, но не заменяет cleanup.
 
 ## Архитектура
 
@@ -96,19 +110,195 @@ UI-state, но разделяющий generation с `QuickTunnelController`. Д�
 существующий `BackgroundCredentialStore` готов. Ошибка атомарного сохранения
 intent является терминальной и происходит до выдачи lease или запуска туннеля.
 
-`BackgroundCredentialStore` расширяется install secret текущего устройства.
-Он шифруется Android Keystore отдельно от intent, никогда не попадает в
-события, логи или UI и очищается при logout/revoke вместе с background token.
-Пока token ещё действителен, `:vpn` обновляет его до начала заданного сервером
-expiry window через новый additive `POST /background/token/rotate`. Endpoint
-требует ещё действующий background token и совпадающий install secret, выдаёт
-новый background token и не создаёт и не вращает основную access/refresh пару
-Tauri-сессии. Один rotate выполняется за раз, предыдущий token принимает только
-в рамках короткого server-side overlap. Уже истёкший, отозванный или не
-восстановленный token становится терминальным
-`background_credential_unavailable` и просит открыть приложение; intent не
-продолжает неавторизованные запросы. Existing `/background/auth/recover`
-остаётся UI-owned путём восстановления основной сессии.
+Перед каждым panel start процесс `:vpn` атомарно записывает в
+`AndroidLeaseTransactionStore` фазу `start_pending`: generation, `BOOT_COUNT`,
+start operation ID, device/account scope, contract version, нормализованный
+replayable request и его fingerprint. Envelope не содержит
+WireGuard-конфигурацию, private key или token. Только после успешного commit
+отправляется запрос панели. Operation ID не создаётся внутри сетевого вызова и
+не меняется при transport timeout, отмене или восстановлении процесса.
+
+Успешный ответ сначала переводит pending start в durable фазу
+`lease_acquired`, атомарно связывая её с lease ID, после чего coordinator
+повторно проверяет generation, `BOOT_COUNT` и `desired_active`. Запись остаётся
+в этой фазе во время `TunnelRuntime.start`, handshake gate и публикации
+результата. При stale generation/reboot или локальной ошибке она до освобождения
+operation gate атомарно переходит в `cleanup_pending`.
+
+После успешного handshake coordinator одним commit переводит тот же lease
+envelope в фазу `active_checkpoint`. Она сохраняет lease ID, start operation ID,
+device/account scope, contract version, исходный нормализованный request и
+fingerprint; отдельного удаления pending record нет. Если `:vpn` завершился
+после commit, но локальный tunnel отсутствует, restore имеет полный exact-replay
+request и не создаёт новый lease. При `BOOT_COUNT` mismatch эта фаза становится
+`stale_cleanup`, а не удаляется вместе с intent. Envelope очищается только после
+подтверждённого server stop или authoritative terminal lease state.
+
+Если результат start неизвестен или `:vpn` завершился до сохранения lease ID,
+следующий restore сначала использует background operation reconciliation. Пока
+lease активен, exact replay возвращает тот же idempotent start result, включая
+пригодную к немедленному использованию конфигурацию. Если lease уже terminal,
+панель возвращает authoritative terminal state. Exact replay ни при каком
+состоянии не создаёт новый lease. Coordinator очищает pending start после
+terminal result и только при всё ещё активном intent создаёт следующую start
+operation с новым ID. До reconciliation, active checkpoint либо подтверждённого
+cleanup новый пользовательский `Старт` не принимается.
+
+`BackgroundCredentialStore` расширяется install secret текущего устройства,
+монотонной `credential_revision`, server capability snapshot с expiry,
+authorization tombstone и отдельным encrypted pending-token slot. Секреты
+шифруются Android Keystore отдельно от intent, никогда не попадают во frontend,
+события или логи и очищаются при logout/revoke. Все `configure`, token
+`prepare/activate` и `clear` выполняются процессом `:vpn` через один mutation
+gate и compare-and-swap ожидаемой revision.
+
+UI provision до server-запроса резервирует mutation в `:vpn` и получает
+mutation ID с ожидаемой revision. Пока reservation жива, background rotation не
+начинается; logout/revoke может её отменить немедленно. Поздний UI response
+принимается только с тем же mutation ID, device и revision. Reservation имеет
+короткий timeout и не меняет действующий credential. Начало logout увеличивает
+revision, отменяет mutation и сохраняет `logout_pending`, но переносит active
+token в cleanup-only slot вместо немедленного удаления. Он допускает только
+operation reconcile/cancel, compensation stop и logout finalize. После
+подтверждённого cleanup `clear/logout finalize/revoke`, а также стабильный server
+response об уже отозванном token, сохраняют final tombstone и удаляют active и
+pending секреты. Поздний результат старой revision не может восстановить
+credential.
+
+Новый capability-gated token protocol двухфазный:
+
+1. `POST /background/token/prepare` под normal client auth для UI provision
+   либо current background auth плюс install secret для `:vpn` rotation создаёт
+   короткоживущий staged token, но не меняет active/previous token. Панель
+   хранит staged hash, prepare operation ID и один staged slot на device; новый
+   prepare может заменить неприменённый staged token без влияния на active
+   credential.
+2. Получив response, `:vpn` до любого activate атомарно сохраняет staged secret,
+   expiry, server generation, prepare/mutation ID и activation operation ID в
+   encrypted pending slot. Mutation reservation принимает только response
+   последнего prepare ID. Потерянный prepare response безопасно повторяется
+   новой prepare operation: неизвестный staged token истечёт, а active token
+   продолжает работать. После durable pending commit новый prepare запрещён до
+   activate либо явного discard этой записи.
+3. `POST /background/token/activate` аутентифицируется staged token и install
+   secret. Запрос несёт activation operation ID; его специальный auth path под
+   device lock сначала ищет immutable activation journal по точной сигнатуре
+   `{device, activation operation ID, install secret fingerprint, token hash}` и
+   только для неизвестной операции проверяет staged state и expiry. Панель
+   переводит staged token в active, прежний active — в короткий previous overlap,
+   и одной транзакцией сохраняет исходные generation/expiry в journal. Replay
+   того же activation с уже active token, в том числе после исходного staged
+   expiry, возвращает этот результат и не создаёт новое поколение. Applied
+   activation record хранится как минимум до окончания срока выданного active
+   credential; после его expiry восстановление всё равно требует UI-owned auth.
+4. Только после подтверждённого activate `:vpn` CAS-promotes pending token в
+   active и увеличивает `credential_revision`. При потерянном activate response
+   pending slot переживает process death и повторяет тот же activation; при
+   logout tombstone запрещает позднее promotion.
+
+Server logout, logout-all и device revoke под device lock сначала принимают
+durable cancellation/lease-cleanup jobs для незавершённых операций устройства и
+только затем отзывают active, previous и staged token вместе с незавершённой
+activation operation.
+
+Legacy `POST /background/token` сохраняет прежнюю однофазную семантику только
+для старых клиентов. Новый клиент при свежей capability использует исключительно
+prepare/activate, поэтому server mutation не может обесценить локальный token до
+durable local commit. Ни prepare, ни activate не создают и не вращают основную
+access/refresh пару Tauri-сессии. Истечение локально сохранённого staged expiry
+не разрешает discard: оно запускает exact activation replay, поскольку
+неполученный ответ мог уже сделать token активным. CAS-discard pending slot и
+новый prepare допустимы только после authoritative ответа journal-aware activate
+`activation_not_applied`, который однозначно означает, что операция не была
+применена и staged token истёк либо отклонён. Такой исход не делает credential
+терминальным, если прежний active token и capability ещё действительны.
+`background_credential_unavailable` возникает только когда active token истёк,
+отозван или не восстановлен и authoritative activation reconciliation не
+подтвердил, что pending token уже стал active; тогда intent просит открыть
+приложение и не продолжает неавторизованные запросы. Существующий
+`/background/auth/recover` остаётся UI-owned путём восстановления основной
+сессии.
+
+Capability процесса `:vpn` не зависит от жизни UI. Новый additive
+`GET /background/capabilities` с background auth возвращает
+`connection_intent_recovery_v1`, capability revision и server expiry. UI
+provision передаёт первоначальный snapshot вместе с credential, а `:vpn`
+обновляет его перед первым использованием нового контракта и после expiry.
+Snapshot хранится с credential, но не продлевается локально; отсутствие,
+истечение, `false`, `404` или стабильный `unsupported` означают `false`. Такой
+downgrade атомарно запрещает создание новых feature operations, поля и failure
+code нового контракта, включая подготовку нового token, но не capability
+discovery, legacy background start/stop и exact reconciliation уже сохранённой
+operation с её исходными contract version и fingerprint. Transport failure при
+refresh не превращает ранее истёкший snapshot в `true`.
+
+Для reconciliation без UI панель добавляет additive
+`POST /background/operations/reconcile` с background auth. Запрос содержит
+operation ID, kind (`start` или `stalled_stop`), исходный request fingerprint и
+`cancel_if_absent`; ответ без конфигурации и секретов возвращает состояние
+`not_found/pending/applying/compensating/applied/terminal/cancelled`, признак
+`cancel_requested`, lease ID и authoritative lease status, когда lease
+существует. Lookup выполняется под тем же device lock и по той же journal
+signature, что исходная операция.
+
+Start handler до lease mutation резервирует journal record с contract version и
+fingerprint в состоянии `pending`. Перед первым pool/lease/agent side effect он
+под device и journal row locks выполняет CAS `pending→applying`; это
+linearization point операции. `cancel_if_absent=true` создаёт cancellation
+tombstone для `not_found` или CAS `pending→cancelled`. Для `applying` он только
+устанавливает durable `cancel_requested=true` и ждёт terminal result, не заявляя,
+что lease отсутствует.
+
+До каждого внешнего agent action `applying` record атомарно сохраняет его
+durable execution step, зарезервированный lease/peer и idempotency key. Поэтому
+повтор handler или server recovery worker после process crash может безопасно
+проверить authoritative agent state либо повторить тот же action, не создавая
+второй lease или peer. Start handler повторно проверяет journal под row lock
+перед каждым DB commit, который публикует pool/lease mutation, и после каждого
+внешнего agent action.
+
+Увидев `cancel_requested`, handler не возвращает конфигурацию: операция либо
+завершается `cancelled` до side effect, либо одной транзакцией переходит в
+`compensating` и сохраняет lease ID, детерминированный compensation stop
+operation ID, retry count и время следующей попытки. Server recovery worker
+сканирует незавершённые `applying` и `compensating` records, под теми же locks
+возобновляет idempotent agent/stop action с ограниченным backoff и является
+владельцем повторов независимо от жизни исходного HTTP handler и Android
+клиента. `applying` с `cancel_requested` после recovery никогда не продолжает
+выдачу конфигурации, а переводится в `cancelled` либо `compensating`.
+
+Lease/pool mutation и соответствующий journal transition входят в одну
+DB-транзакцию; промежуточный commit без journal state запрещён. `compensating`
+переходит в `terminal` только после authoritative terminal lease result;
+transient agent/stop failure оставляет record retryable, а reconcile возвращает
+lease ID, retry state и следующий срок попытки. Для `applied` cancel возвращает
+lease ID для обычного client compensation stop. Cancellation tombstone хранится
+не менее 24 часов и всегда дольше максимального proxy/application request
+lifetime; GC запрещён, пока связанный lease не terminal.
+
+Для unknown start при всё ещё активном intent coordinator сначала вызывает
+reconcile. `pending/applying/compensating` повторяет status с backoff;
+`not_found` отправляет исходный start с тем же operation ID; `applied` active
+делает exact replay того же start, чтобы повторно получить конфигурацию.
+`terminal/cancelled` завершает старую транзакцию; после этого допустима новая
+start operation. При explicit `Off`, reboot mismatch или logout используется
+`cancel_if_absent=true`: если операция ещё не применена, tombstone блокирует
+позднюю выдачу. Для `applying/compensating` server worker является единственным
+владельцем stop, а клиент только опрашивает journal и не запускает конкурирующую
+compensation. Для `applied` ответ возвращает lease ID, после чего клиент
+сохраняет обычный pending stop. В обоих случаях завершение подтверждает только
+authoritative terminal lease state. Для stalled-stop `409` coordinator тем же
+endpoint получает authoritative lease state и не зависит от common error body.
+
+Capability gate применяется только к созданию новой logical operation. Панель
+до первого `true` устанавливает постоянный compatibility floor: tolerant schema,
+operation journal, exact replay и reconcile/cancel surface не удаляются
+обычным rollback и поддерживают ранее принятые contract versions. Guarded
+self-updater отклоняет rollback artifact ниже этого floor. Если этот инвариант
+всё же нарушен, клиент не повторяет measured start как legacy unmeasured start:
+для известного lease он выполняет новый legacy compensation stop с
+`failure_code=null`, а unknown start сохраняет для UI recovery и показывает
+`recovery_contract_unavailable` без выдачи нового lease.
 
 Для dynamic режима `BackgroundConnectionClient` получает кандидатов через
 новый additive `GET /background/server-candidates` с background auth, но
@@ -185,6 +375,46 @@ kill-switch state не маскируются.
 Logout, update shutdown и явное завершение приложения сначала отменяют intent,
 а затем используют существующий stop path.
 
+Logout на Android имеет обязательный cleanup-before-revoke protocol:
+
+1. `:vpn` атомарно устанавливает `desired_active=false`, инвалидирует generation
+   и token mutation, переводит lease envelope в cancel/cleanup и credential в
+   `logout_pending` с cleanup-only token;
+2. локальный tunnel останавливается, затем с ещё действующим cleanup-only auth
+   выполняются operation reconcile/cancel и все известные compensation stop;
+3. после terminal cleanup обычный `/auth/logout` либо новый idempotent
+   `POST /background/auth/logout-finalize` отзывает device sessions и все
+   background token; только после success `:vpn` удаляет cleanup-only secret и
+   сохраняет final logout tombstone;
+4. если cleanup временно не завершён, UI-сессия может быть очищена локально, но
+   `:vpn` сохраняет scoped `logout_pending` и продолжает только cleanup. Новый
+   background provision и `On/Старт` блокируются до finalize;
+5. если клиент просит немедленный server logout при незавершённом cleanup,
+   finalize под device lock сначала записывает durable server-side cancellation
+   и lease-cleanup jobs, затем отзывает credential в той же транзакции. Ответ без
+   принятого job является retryable и не разрешает клиенту удалить cleanup auth.
+
+Logout finalize несёт logout operation ID и install secret. После revoke панель
+хранит ограниченный finalization tombstone с точной сигнатурой `{device, logout
+operation ID, install secret fingerprint, hash прежнего cleanup-only token}`.
+Он авторизует только exact replay того же finalize и возвращает исходный success,
+не восстанавливая доступ к другим background routes. Tombstone не удаляется по
+времени: он живёт до подтверждённого provision следующего credential generation
+того же device либо окончательного удаления device record. Устройство после
+неограниченного офлайна поэтому может завершить durable `logout_pending`, даже
+если исходный finalize response был потерян. Новый provision допускается только
+после того, как `:vpn` получил этот success и удалил локальный cleanup-only
+secret; provision следующего поколения затем разрешает GC старого tombstone.
+
+Удалённый logout-all/device revoke аналогично сохраняет authoritative device
+cleanup tombstone и принимает через finalize route проверку install secret. Он
+возвращает отдельный стабильный `device_revoked_cleanup_accepted` только после
+durable принятия всех cancellation/lease-cleanup jobs; общий `401`, неизвестный
+token или истёкший credential таким подтверждением не считаются и не разрешают
+клиенту снять `logout_pending`. Этот server-side порядок не зависит от
+доступности клиента. Update shutdown и обычное закрытие приложения не отзывают
+background auth и оставляют durable cleanup доступным.
+
 Android Quick Settings `Off` до начала stop атомарно увеличивает persisted
 generation, устанавливает `desired_active=false` и отменяет native retry.
 Каждый callback start/recovery сверяет generation до установки туннеля и до
@@ -193,11 +423,18 @@ Broadcast revision сообщает Tauri уже принятое состоян
 является владельцем отмены. Новый Android intent после `Off` возможен только
 после следующего явного `Старт` или Quick Settings `On`.
 
+Если `Off` произошёл при неизвестном результате start, pending-start запись не
+удаляется. После освобождения gate либо следующего service restore `:vpn`
+вызывает operation reconcile с `cancel_if_absent=true`, не повторяет start и не
+устанавливает конфигурацию. Cancellation tombstone блокирует позднюю выдачу, а
+обнаруженный lease атомарно переводится в pending stop. До подтверждённого
+cancel/stop `On/Старт` остаётся недоступен, а UI показывает `Stopping`.
+
 Если stale callback уже получил lease и конфигурацию, он обязан:
 
 1. не передавать конфигурацию в backend и немедленно обнулить её;
 2. до завершения текущей operation записать lease ID и новый stop operation ID
-   в защищённый `AndroidPendingLeaseCleanupStore`;
+   переводом `AndroidLeaseTransactionStore` в фазу `cleanup_pending`;
 3. после освобождения operation gate выполнить background stop с
    `failure_code=null`;
 4. при transport/server failure повторять тот же idempotent stop каждые 30
@@ -236,6 +473,10 @@ Explicit `Off/Стоп` не ждёт возможности войти в за�
 - `service_unavailable` только после одной неинтерактивной попытки восстановить
   локальный service; повтор того же кода становится терминальным;
 - `android_service_dispatch_unavailable` после state reconciliation и backoff;
+- `connection_stall_verification_unavailable` с сохранением lease и того же
+  stalled-stop operation ID;
+- `connection_stall_recycle_rate_limited` с тем же operation ID и задержкой из
+  валидного `Retry-After`;
 - `udp_rebind_failed` и `udp_rebind_timeout` не выходят наружу как общий
   service failure, а переводят текущую AWG recovery-транзакцию на ступень
   локального restart;
@@ -266,8 +507,24 @@ Explicit `Off/Стоп` не ждёт возможности войти в за�
 - route conflict с другим VPN;
 - повреждение или недоступность защищённого хранилища;
 - некорректный ответ API;
+- `operation_id_conflict` как нарушение client invariant с одним
+  диагностическим отчётом;
 - явная отмена системного диалога;
 - ошибки, не входящие в allowlist автоматического recovery.
+
+Для additive stalled-recycle contract действуют точные переходы:
+
+| Ответ | Состояние клиента | Следующее действие |
+| --- | --- | --- |
+| `503 connection_stall_verification_unavailable` | lease и pending stalled stop сохраняются, новый start запрещён | повторить тот же stop operation ID по обычному backoff |
+| `429 connection_stall_recycle_rate_limited` | lease и pending stalled stop сохраняются, новый start запрещён | повторить тот же operation ID не раньше валидного `Retry-After`; панель ограничивает header диапазоном `1..900` секунд, при отсутствующем/некорректном header используется 300 секунд |
+| `409 connection_stall_not_recyclable` | выполнить один `POST /background/operations/reconcile` для stalled-stop operation | если lease уже `Failed/Released`, cleanup считается завершённым и разрешается новый dynamic start; если lease остаётся активным, episode становится terminal либо `blocked_terminal` |
+| `409 operation_id_conflict` | terminal invariant failure | автоматический retry прекращается, создаётся один безопасный диагностический отчёт |
+
+`503/429` не создают новый start operation ID, lease или recovery episode.
+Повтор `409 connection_stall_not_recyclable` после единственного reconcile не
+зацикливается. Новый dynamic start после подтверждённого terminal lease получает
+новый operation ID и не предполагает, что прежний peer был отправлен в recycle.
 
 Нормализованный UI-код `tunnel_service_unavailable` не используется для
 решения о retry, потому что он объединяет временные, несовместимые и security
@@ -353,6 +610,26 @@ Personal Tic и pinned Stray используют обычный stop с `failur
 - agent runtime подтверждает handshake либо traffic после `issued_at`, то есть
   это не initial handshake failure.
 
+До этих mutable preconditions панель под device lock ищет operation ID в
+durable operation journal. Запись содержит неизменяемую сигнатуру `{device,
+lease, failure_code}` и состояние `pending/applied/terminal/cancelled`:
+
+1. replay завершённой операции с той же сигнатурой сразу возвращает исходный
+   результат независимо от текущего статуса lease;
+2. тот же operation ID с другой сигнатурой возвращает
+   `operation_id_conflict`;
+3. retryable `pending` с той же сигнатурой продолжает исходную операцию;
+4. только новый operation ID резервируется и переходит к eligibility, runtime
+   verification и rate limit.
+
+Applied result и перевод lease/peer фиксируются одной DB-транзакцией. Ответы
+`503/429`, возникшие до mutation, оставляют journal в retryable `pending` и не
+расходуют recycle budget. Повтор applied operation не запускает agent
+verification, не меняет peer повторно и не расходует budget. Стабильный
+`connection_stall_not_recyclable` атомарно сохраняет `terminal` result вместе с
+authoritative lease status; последующий reconcile не видит его как бесконечный
+`pending`.
+
 Если runtime-проверка временно недоступна, панель возвращает retryable `503
 connection_stall_verification_unavailable` и не меняет lease. Для personal,
 pinned, non-AWG3, never-connected или уже завершённого lease возвращается
@@ -363,8 +640,8 @@ pinned, non-AWG3, never-connected или уже завершённого lease �
 
 1. переводит lease в `Failed`;
 2. отправляет его pool peer в recycle и не возвращает тот же peer новой выдаче;
-3. использует operation ID как единственный idempotency key: replay разрешён
-   только для того же device, lease и failure code, иначе возвращается
+3. завершает зарезервированную operation journal record: replay разрешён только
+   для того же device, lease и failure code, иначе возвращается
    `operation_id_conflict`;
 4. учитывает не более трёх новых stalled-recycle операций на device за 15
    минут; idempotent replay не расходует budget. При превышении возвращаются
@@ -387,20 +664,27 @@ lease не может ссылаться на отправленный в recycl
 в следующем порядке:
 
 1. панель добавляет schema/fixtures/tests, оба `/connections/stop` и
-   `/background/connections/stop`, background candidates, measured background
-   start, background-token rotate, rate limit и bootstrap capability
-   `connection_intent_recovery_v1=false/true`;
+   `/background/connections/stop`, background capabilities/candidates, measured
+   background start, background operation reconcile/cancel, staged-token
+   prepare/activate, background logout finalize и durable cleanup jobs, durable
+   operation journal, compatibility-floor manifest, rate limit и bootstrap
+   capability `connection_intent_recovery_v1=false/true`;
 2. тот же panel commit обновляет `docs/panel_contract.md`, после чего панель
    выкатывается guarded self-updater и capability проверяется на production;
-3. только затем выпускается клиент. Он включает новый server contract лишь при
-   `connection_intent_recovery_v1=true`;
+3. только затем выпускается клиент. UI и `:vpn` включают новый server contract
+   лишь при свежем `connection_intent_recovery_v1=true` из доступного им auth
+   channel;
 4. при отсутствующей capability клиент не отправляет новые значения и остаётся
    на прежнем start/stop contract без `422`; UI может повторять существующие
    безопасные операции, но не заявляет гарантированный background recovery или
    recycle stalled peer.
 
 Частично выкаченная панель не публикует capability. Новая схема, routes и
-behavior должны быть доступны атомарно до её включения.
+behavior должны быть доступны атомарно до её включения. Rollback может
+переключить capability в `false` для новых операций, но guarded updater после
+первого production enable не принимает artifact без compatibility-floor
+manifest и постоянных additive replay/reconcile/cancel routes. Таким образом,
+отключение feature не лишает уже начатую operation пути к terminal state.
 
 ### 7. Kill switch
 
@@ -509,11 +793,37 @@ Operation ID, request ID и lease ID остаются в существующи�
 - завершение Android UI-процесса не уничтожает intent и native retry;
 - Android initial retry работает из persisted template до первого успешного
   подключения и не сохраняет WireGuard-конфигурацию;
+- потерянный ответ background start переживает process death: restore сначала
+  reconciles operation, делает exact replay только применённого active start и
+  не создаёт второй lease;
+- смерть `:vpn` после получения lease, но до local start/handshake сохраняет
+  фазу `lease_acquired` и завершает либо tunnel recovery, либо compensation;
+- `active_checkpoint` наследует полный replay request/fingerprint из
+  `lease_acquired`, переживает очистку intent как `stale_cleanup` и позволяет
+  exact replay после process death;
+- Quick Settings `Off` при неизвестном результате start оставляет durable
+  pending start, создаёт cancellation tombstone через `cancel_if_absent` и не
+  разрешает новый `On` до подтверждённого cancel/cleanup;
 - Android dynamic background start отправляет свежие probes и не использует
   legacy unmeasured fallback;
-- background token обновляется до expiry без UI и без изменения основной
-  access/refresh-сессии; истёкший или отозванный token становится terminal без
-  цикла неавторизованных запросов;
+- background token обновляется через staged prepare/activate без UI и без
+  изменения основной access/refresh-сессии; prepare не инвалидирует active
+  token;
+- потерянный prepare response, смерть UI до передачи staged token и CAS conflict
+  не сокращают срок действия локального active credential;
+- потерянный activate response переживает process death и офлайн дольше staged
+  TTL: journal-aware replay тем же operation ID выполняется до expiry validation,
+  возвращает применённый active credential и не создаёт следующее поколение;
+- локальный staged expiry сам по себе не удаляет pending slot; только
+  authoritative `activation_not_applied` разрешает CAS-discard и новый prepare
+  при действующем active token без terminal credential error;
+- late prepare/activate response после UI provision или logout отвергается по
+  mutation ID и `credential_revision`; logout tombstone не даёт восстановить
+  старый credential;
+- `:vpn` получает capability без UI, истёкший snapshot не использует как
+  `true`, а `false/404/unsupported` отключают новый contract без цикла `422`;
+- capability downgrade запрещает только новые feature operations: pending
+  operation сохраняет exact replay/reconcile/cancel до terminal state;
 - ошибка сохранения Android intent не выдаёт lease и не запускает туннель;
 - Android Quick Settings `Off` инвалидирует generation до stop, а поздний
   Tauri/native callback не восстанавливает туннель, обнуляет конфигурацию и
@@ -522,6 +832,14 @@ Operation ID, request ID и lease ID остаются в существующи�
   operation ID до подтверждённого stop;
 - несовпавший `BOOT_COUNT` отклоняется при первом read независимо от того,
   первым после reboot запущен tile, service или UI;
+- pending start/stop и active-lease checkpoint с прежним `BOOT_COUNT` становятся
+  stale cleanup, не устанавливают туннель и блокируют новый `On` до cleanup;
+- Android logout сохраняет cleanup-only auth до terminal reconcile/stop;
+  offline logout завершается через durable server cleanup job и finalize до
+  удаления последнего background credential;
+- потерянный logout-finalize response после офлайна дольше 24 часов возвращает
+  exact success по finalization tombstone, тогда как общий `401` не снимает
+  `logout_pending`;
 - временные service-коды повторяются, а incompatible/security-коды становятся
   терминальными;
 - смена сети объединяет несколько wakeup в одну попытку.
@@ -534,10 +852,32 @@ Operation ID, request ID и lease ID остаются в существующи�
   отправляет peer в recycle и отвергается для personal/pinned/non-AWG3;
 - новый stalled operation ID нельзя повторно использовать с другим lease или
   failure code;
+- applied stalled-stop replay после перевода lease в `Failed` возвращает
+  исходный success до eligibility/runtime/rate-limit checks и не расходует
+  budget повторно;
+- `503 connection_stall_verification_unavailable` и `429
+  connection_stall_recycle_rate_limited` сохраняют тот же pending operation ID;
+  `429` соблюдает валидный `Retry-After`;
+- `409 connection_stall_not_recyclable` выполняет ровно один reconcile и не
+  разрешает новый start при всё ещё активном lease;
 - четвёртый stalled recycle за 15 минут получает `429` без изменения peer;
 - клиент без `connection_intent_recovery_v1` не отправляет новый contract;
-- background-token rotate сохраняет основную Tauri-сессию и принимает старый
-  token только в пределах заданного overlap;
+- Android background service без свежей capability также не отправляет новый
+  logical operation, даже если UI-процесс ранее видел `true`; exact replay
+  сохранённой operation при этом остаётся доступен;
+- staged-token prepare/activate сохраняет основную Tauri-сессию, не инвалидирует
+  active token до durable pending commit и идемпотентно повторяет activate;
+- background operation reconcile возвращает authoritative lease state для
+  start и stalled stop, а `cancel_if_absent` блокирует позднюю выдачу lease;
+- start journal CAS `pending→applying` линеаризует выдачу с cancel; cancel во
+  время `applying` приводит к server compensation, и ни один промежуточный
+  pool/lease commit не выполняется без согласованного journal transition;
+- падение start handler в `applying/compensating` и временная ошибка agent stop
+  восстанавливаются server worker с тем же idempotency key до authoritative
+  terminal lease; Android-клиент не запускает конкурирующий stop;
+- logout/logout-all/device revoke принимают durable cleanup до token revoke;
+  finalization tombstone не удаляется по TTL и очищается только следующим
+  подтверждённым provision либо удалением device record;
 - terminal recovery ранее `armed`-сессии сохраняет `blocked` и доступный
   подтверждённый `Стоп`;
 - конфигурация и секреты не появляются в UI, событиях или логах;
