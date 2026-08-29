@@ -64,6 +64,13 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(())
     }
 
+    pub fn rotate_background(
+        &self,
+        _request: BackgroundCredentialMutationRequest,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
     pub fn background_credential_status(
         &self,
     ) -> crate::Result<BackgroundCredentialStatusResponse> {

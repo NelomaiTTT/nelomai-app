@@ -60,7 +60,11 @@ internal class AndroidSecureEnvelopeBackend(
         try {
             try {
                 Cipher.getInstance("AES/GCM/NoPadding").run {
-                    init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
+                    init(
+                        Cipher.DECRYPT_MODE,
+                        androidEnvelopeSecretKey(keyAlias),
+                        GCMParameterSpec(GCM_TAG_BITS, iv),
+                    )
                     updateAAD(recordIdentity())
                     doFinal(ciphertext)
                 }
@@ -78,7 +82,7 @@ internal class AndroidSecureEnvelopeBackend(
 
     override fun write(plaintext: ByteArray): Boolean = synchronized(gate) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply {
-            init(Cipher.ENCRYPT_MODE, secretKey())
+            init(Cipher.ENCRYPT_MODE, androidEnvelopeSecretKey(keyAlias))
             updateAAD(recordIdentity())
         }
         val ciphertext = cipher.doFinal(plaintext)
@@ -102,26 +106,26 @@ internal class AndroidSecureEnvelopeBackend(
         }
     }
 
-    private fun secretKey(): SecretKey {
-        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (keyStore.getKey(keyAlias, null) as? SecretKey)?.let { return it }
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
-            init(
-                KeyGenParameterSpec.Builder(
-                    keyAlias,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
-                )
-                    .setKeySize(256)
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .build(),
-            )
-            generateKey()
-        }
-    }
-
     private fun recordIdentity(): ByteArray = "$preferenceName\u0000$recordName"
         .toByteArray(Charsets.UTF_8)
+}
+
+internal fun androidEnvelopeSecretKey(keyAlias: String): SecretKey {
+    val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    (keyStore.getKey(keyAlias, null) as? SecretKey)?.let { return it }
+    return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
+        init(
+            KeyGenParameterSpec.Builder(
+                keyAlias,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+            )
+                .setKeySize(256)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .build(),
+        )
+        generateKey()
+    }
 }
 
 internal class AndroidBootIdentityProvider(context: Context) : BootIdentityProvider {

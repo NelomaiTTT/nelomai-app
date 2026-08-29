@@ -131,10 +131,20 @@ class QuickConnectionArgs {
 @InvokeArg
 class BackgroundCredentialArgs {
     var apiVersion: Int = 0
+    var expectedRevision: Long = 0
     lateinit var deviceId: String
     lateinit var panelBase: String
     lateinit var token: String
     var expiresAtUnix: Long = 0
+    lateinit var installSecret: String
+    var capabilityRevision: Long = 0
+    var capabilityEnabled: Boolean = false
+    lateinit var capabilityExpiresAt: String
+}
+
+@InvokeArg
+class BackgroundCredentialMutationArgs {
+    var expectedRevision: Long = -1
 }
 
 @InvokeArg
@@ -1152,7 +1162,7 @@ internal object TunnelRuntime {
             } catch (error: Throwable) {
                 val code = (error as? BackgroundConnectionException)?.code ?: errorCode(error)
                 if (code == "invalid_background_token" &&
-                    !BackgroundCredentialStore.clear(applicationContext)
+                    !BackgroundCredentialStore.clearInvalidCredential(applicationContext)
                 ) {
                     TunnelLog.warning("background_token.clear_failed")
                 }
@@ -2720,13 +2730,41 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun rotateBackground(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(BackgroundCredentialMutationArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_background_credential")
+            return
+        }
+        TunnelServiceClient.rotateBackground(
+            activity.applicationContext,
+            args.expectedRevision,
+            { activity.runOnUiThread { invoke.resolve() } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
     fun backgroundCredentialStatus(invoke: Invoke) {
         TunnelServiceClient.backgroundCredentialStatus(
             activity.applicationContext,
-            { configured, deviceId, expiresAtUnix ->
+            {
+                    configured,
+                    credentialRevision,
+                    mutationReady,
+                    capabilityEnabled,
+                    capabilityExpiresAtUnix,
+                    deviceId,
+                    expiresAtUnix,
+                ->
                 activity.runOnUiThread {
                     val response = JSObject()
                     response.put("configured", configured)
+                    response.put("credentialRevision", credentialRevision)
+                    response.put("mutationReady", mutationReady)
+                    response.put("capabilityEnabled", capabilityEnabled)
+                    response.put("capabilityExpiresAtUnix", capabilityExpiresAtUnix)
                     response.put("deviceId", deviceId)
                     response.put("expiresAtUnix", expiresAtUnix)
                     invoke.resolve(response)

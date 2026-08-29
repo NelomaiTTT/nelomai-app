@@ -14,9 +14,9 @@ use nelomai_client_core::{
 use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
-    EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions, Platform, ProbeResults,
-    RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelMode,
-    SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    ConnectionIntentCapability, EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
+    Platform, ProbeResults, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
+    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "android")]
@@ -881,6 +881,7 @@ pub async fn app_state(
                     application.inner().clone(),
                     diagnostics.inner().clone(),
                     response.device.id,
+                    response.capabilities,
                 )
                 .await;
                 if app
@@ -1213,6 +1214,7 @@ pub async fn app_login(
         application.inner().clone(),
         diagnostics.inner().clone(),
         response.device.id.clone(),
+        response.capabilities.clone(),
     )
     .await;
     schedule_startup_split_tunnel_refresh(
@@ -1301,6 +1303,7 @@ pub async fn app_bootstrap(
         application.inner().clone(),
         diagnostics.inner().clone(),
         response.device.id.clone(),
+        response.capabilities.clone(),
     );
     observe_and_schedule_update(
         application.inner().clone(),
@@ -1327,6 +1330,7 @@ async fn provision_android_background(
     app: &AppHandle,
     application: &NativeApplication,
     device_id: &str,
+    capability: Option<&ConnectionIntentCapability>,
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     {
@@ -1340,12 +1344,40 @@ async fn provision_android_background(
                     "Не удалось проверить фоновое подключение",
                 )
             })?;
+        let desired_capability_enabled =
+            capability.is_some_and(|value| value.connection_intent_recovery_v1);
+        let token_is_fresh = status.expires_at_unix.is_some_and(|expires_at| {
+            expires_at > now.saturating_add(ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS)
+        });
         if status.configured
+            && status.mutation_ready
             && status.device_id.as_deref() == Some(device_id)
-            && status.expires_at_unix.is_some_and(|expires_at| {
-                expires_at > now.saturating_add(ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS)
-            })
+            && status.capability_enabled == desired_capability_enabled
+            && (!status.capability_enabled
+                || status
+                    .capability_expires_at_unix
+                    .is_some_and(|expires_at| expires_at > now))
+            && token_is_fresh
         {
+            return Ok(());
+        }
+        if status.configured
+            && status.mutation_ready
+            && status.device_id.as_deref() == Some(device_id)
+            && (desired_capability_enabled || token_is_fresh)
+        {
+            app.tunnel_android()
+                .rotate_background(
+                    tauri_plugin_tunnel_android::BackgroundCredentialMutationRequest {
+                        expected_revision: status.credential_revision,
+                    },
+                )
+                .map_err(|_| {
+                    CommandError::new(
+                        "background_credential_rotation_failed",
+                        "Не удалось обновить фоновое подключение",
+                    )
+                })?;
             return Ok(());
         }
         let token = application
@@ -1359,13 +1391,24 @@ async fn provision_android_background(
                 )
             })?;
         let expires_at_unix = now.saturating_add(token.expires_in.min(i64::MAX as u64) as i64);
+        let install_secret = application.install_secret().map_err(CommandError::from)?;
         app.tunnel_android()
             .configure_background(tauri_plugin_tunnel_android::BackgroundCredentialRequest {
                 api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                expected_revision: status.credential_revision,
                 device_id: device_id.to_string(),
                 panel_base: crate::PANEL_BASE.to_string(),
                 token: token.token,
                 expires_at_unix,
+                install_secret,
+                capability_revision: capability
+                    .map(|value| i64::from(value.revision))
+                    .unwrap_or(0),
+                capability_enabled: capability
+                    .is_some_and(|value| value.connection_intent_recovery_v1),
+                capability_expires_at: capability
+                    .map(|value| value.expires_at.clone())
+                    .unwrap_or_else(|| "1970-01-01T00:00:01Z".to_string()),
             })
             .map_err(|_| {
                 CommandError::new(
@@ -1375,7 +1418,7 @@ async fn provision_android_background(
             })?;
     }
     #[cfg(not(target_os = "android"))]
-    let _ = (app, application, device_id);
+    let _ = (app, application, device_id, capability);
     Ok(())
 }
 
@@ -1384,8 +1427,15 @@ async fn provision_android_background_resilient(
     application: Arc<NativeApplication>,
     diagnostics: Arc<AppDiagnostics>,
     device_id: String,
+    capability: Option<ConnectionIntentCapability>,
 ) {
-    let Err(error) = provision_android_background_serialized(&app, &application, &device_id).await
+    let Err(error) = provision_android_background_serialized(
+        &app,
+        &application,
+        &device_id,
+        capability.as_ref(),
+    )
+    .await
     else {
         return;
     };
@@ -1400,7 +1450,14 @@ async fn provision_android_background_resilient(
     tauri::async_runtime::spawn(async move {
         for delay_seconds in [5, 30, 120] {
             tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
-            match provision_android_background_serialized(&app, &application, &device_id).await {
+            match provision_android_background_serialized(
+                &app,
+                &application,
+                &device_id,
+                capability.as_ref(),
+            )
+            .await
+            {
                 Ok(()) => {
                     diagnostics.record_named("background.provision_recovered", None, None, None);
                     return;
@@ -1416,7 +1473,7 @@ async fn provision_android_background_resilient(
     });
 
     #[cfg(not(target_os = "android"))]
-    let _ = (app, application, device_id);
+    let _ = (app, application, device_id, capability);
 }
 
 fn schedule_android_background_provision(
@@ -1424,9 +1481,17 @@ fn schedule_android_background_provision(
     application: Arc<NativeApplication>,
     diagnostics: Arc<AppDiagnostics>,
     device_id: String,
+    capability: Option<ConnectionIntentCapability>,
 ) {
     tauri::async_runtime::spawn(async move {
-        provision_android_background_resilient(app, application, diagnostics, device_id).await;
+        provision_android_background_resilient(
+            app,
+            application,
+            diagnostics,
+            device_id,
+            capability,
+        )
+        .await;
     });
 }
 
@@ -1434,10 +1499,11 @@ async fn provision_android_background_serialized(
     app: &AppHandle,
     application: &NativeApplication,
     device_id: &str,
+    capability: Option<&ConnectionIntentCapability>,
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     let _guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
-    provision_android_background(app, application, device_id).await
+    provision_android_background(app, application, device_id, capability).await
 }
 
 #[tauri::command]

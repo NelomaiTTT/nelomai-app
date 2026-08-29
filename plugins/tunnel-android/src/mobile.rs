@@ -91,6 +91,15 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub fn rotate_background(
+        &self,
+        request: BackgroundCredentialMutationRequest,
+    ) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("rotateBackground", request)
+            .map_err(Into::into)
+    }
+
     pub fn background_credential_status(
         &self,
     ) -> crate::Result<BackgroundCredentialStatusResponse> {

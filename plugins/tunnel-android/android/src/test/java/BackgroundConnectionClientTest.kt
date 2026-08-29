@@ -12,6 +12,118 @@ import org.json.JSONObject
 
 class BackgroundConnectionClientTest {
     @Test
+    fun typedCredentialRotationUsesExactOperationIdsAndInstallSecret() {
+        val transport = RecordingBackgroundTransport(
+            JSONObject().apply {
+                put("token", "staged-token")
+                put("staged_expires_at", "2026-08-29T12:00:00Z")
+                put("token_generation", 2)
+                put("prepare_operation_id", PREPARE_ID)
+                put("activation_operation_id", ACTIVATE_ID)
+            },
+            JSONObject().apply {
+                put("token_generation", 2)
+                put("active_expires_at", "2026-09-29T12:00:00Z")
+            },
+        )
+        val client = BackgroundOperationClient(transport)
+
+        val prepared = client.prepareToken(credential(), PREPARE_ID, ACTIVATE_ID, INSTALL_SECRET)
+        val activated = client.activateToken(credential(), prepared, INSTALL_SECRET)
+
+        assertEquals("staged-token", prepared.token)
+        assertEquals(2, activated.tokenGeneration)
+        assertEquals(listOf("background/token/prepare", "background/token/activate"), transport.endpoints)
+        assertEquals(PREPARE_ID, transport.payloads[0]?.getString("prepare_operation_id"))
+        assertEquals(ACTIVATE_ID, transport.payloads[1]?.getString("activation_operation_id"))
+        assertEquals(INSTALL_SECRET, transport.payloads[0]?.getString("install_secret"))
+        assertEquals(INSTALL_SECRET, transport.payloads[1]?.getString("install_secret"))
+    }
+
+    @Test
+    fun typedCapabilityAndCandidatesUseDeviceAuthenticatedGets() {
+        val transport = RecordingBackgroundTransport(
+            JSONObject().apply {
+                put("revision", 7)
+                put("expires_at", "2026-08-29T12:00:00Z")
+                put("connection_intent_recovery_v1", true)
+            },
+            JSONObject().apply {
+                put("candidates", JSONArray().put(JSONObject().apply {
+                    put("candidate_id", "candidate-1")
+                    put("layer", "tic")
+                    put("region_label", "Moscow")
+                    put("probe_url", "https://probe.example/health")
+                    put("expires_at", "2026-08-29T12:00:00Z")
+                }))
+            },
+        )
+        val client = BackgroundOperationClient(transport)
+
+        val capability = client.capabilities(credential())
+        val candidates = client.serverCandidates(credential(), "tic", "prefer_ipv6")
+
+        assertTrue(capability.enabled)
+        assertEquals(7, capability.revision)
+        assertEquals("candidate-1", candidates.single().candidateId)
+        assertEquals(listOf("GET", "GET"), transport.methods)
+        assertEquals(
+            "background/server-candidates?layer=tic&egress_mode=prefer_ipv6",
+            transport.endpoints[1],
+        )
+    }
+
+    @Test
+    fun reconcileAndLogoutFinalizePreserveImmutableSignature() {
+        val transport = RecordingBackgroundTransport(
+            JSONObject().apply {
+                put("state", "applying")
+                put("cancel_requested", true)
+                put("retry_count", 3)
+            },
+            JSONObject().apply {
+                put("code", "device_revoked_cleanup_accepted")
+                put("cleanup_jobs", 2)
+            },
+        )
+        val client = BackgroundOperationClient(transport)
+
+        val reconciled = client.reconcile(
+            credential(), OPERATION_ID, "start", 1, FINGERPRINT, cancelIfAbsent = true,
+        )
+        val finalized = client.finalizeLogout(
+            credential(), DEVICE_ID, 4, LOGOUT_ID, INSTALL_SECRET,
+        )
+
+        assertEquals("applying", reconciled.state)
+        assertTrue(reconciled.cancelRequested)
+        assertEquals(2, finalized.cleanupJobs)
+        assertEquals(FINGERPRINT, transport.payloads[0]?.getString("request_fingerprint"))
+        assertEquals(4L, transport.payloads[1]?.getLong("install_generation"))
+        assertEquals(LOGOUT_ID, transport.payloads[1]?.getString("operation_id"))
+    }
+
+    @Test
+    fun prepareRejectsMismatchedEchoWithoutPublishingToken() {
+        val client = BackgroundOperationClient(RecordingBackgroundTransport(
+            JSONObject().apply {
+                put("token", "staged-token")
+                put("staged_expires_at", "2026-08-29T12:00:00Z")
+                put("token_generation", 2)
+                put("prepare_operation_id", OPERATION_ID)
+                put("activation_operation_id", ACTIVATE_ID)
+            },
+        ))
+
+        try {
+            client.prepareToken(credential(), PREPARE_ID, ACTIVATE_ID, INSTALL_SECRET)
+            fail("mismatched operation echo must fail")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("invalid_background_response", error.code)
+        }
+    }
+
+    @Test
     fun backgroundStartFailureIsReportedBeforeLeaseCleanupRuns() {
         val events = mutableListOf<String>()
         var scheduledCleanup: (() -> Unit)? = null
@@ -253,5 +365,45 @@ class BackgroundConnectionClientTest {
         assertTrue(shouldRetryServiceRestore("connection_unavailable"))
         assertFalse(shouldRetryServiceRestore("invalid_background_token"))
         assertFalse(shouldRetryServiceRestore("vpn_permission_required"))
+    }
+
+    private fun credential() = BackgroundCredential(
+        DEVICE_ID,
+        "https://nelomai.example",
+        "device-token",
+        1_900_000_000,
+    )
+
+    companion object {
+        private const val DEVICE_ID = "11111111-1111-4111-8111-111111111111"
+        private const val PREPARE_ID = "22222222-2222-4222-8222-222222222222"
+        private const val ACTIVATE_ID = "33333333-3333-4333-8333-333333333333"
+        private const val OPERATION_ID = "44444444-4444-4444-8444-444444444444"
+        private const val LOGOUT_ID = "55555555-5555-4555-8555-555555555555"
+        private const val INSTALL_SECRET =
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        private const val FINGERPRINT =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+}
+
+private class RecordingBackgroundTransport(
+    vararg responses: JSONObject,
+) : BackgroundApiTransport {
+    private val queued = ArrayDeque(responses.toList())
+    val methods = mutableListOf<String>()
+    val endpoints = mutableListOf<String>()
+    val payloads = mutableListOf<JSONObject?>()
+
+    override fun execute(
+        credential: BackgroundCredential,
+        method: String,
+        endpoint: String,
+        payload: JSONObject?,
+    ): JSONObject {
+        methods += method
+        endpoints += endpoint
+        payloads += payload
+        return queued.removeFirst()
     }
 }

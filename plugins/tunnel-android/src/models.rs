@@ -213,18 +213,33 @@ impl Serialize for StartTunnelRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundCredentialRequest {
     pub api_version: u16,
+    pub expected_revision: i64,
     pub device_id: String,
     pub panel_base: String,
     pub token: String,
     pub expires_at_unix: i64,
+    pub install_secret: String,
+    pub capability_revision: i64,
+    pub capability_enabled: bool,
+    pub capability_expires_at: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundCredentialStatusResponse {
     pub configured: bool,
+    pub credential_revision: i64,
+    pub mutation_ready: bool,
+    pub capability_enabled: bool,
+    pub capability_expires_at_unix: Option<i64>,
     pub device_id: Option<String>,
     pub expires_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundCredentialMutationRequest {
+    pub expected_revision: i64,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -272,10 +287,15 @@ impl fmt::Debug for BackgroundCredentialRequest {
         formatter
             .debug_struct("BackgroundCredentialRequest")
             .field("api_version", &self.api_version)
+            .field("expected_revision", &self.expected_revision)
             .field("device_id", &self.device_id)
             .field("panel_base", &self.panel_base)
             .field("token", &"<redacted>")
             .field("expires_at_unix", &self.expires_at_unix)
+            .field("install_secret", &"<redacted>")
+            .field("capability_revision", &self.capability_revision)
+            .field("capability_enabled", &self.capability_enabled)
+            .field("capability_expires_at", &self.capability_expires_at)
             .finish()
     }
 }
@@ -406,10 +426,15 @@ mod tests {
     fn background_credential_is_device_scoped_and_redacts_the_token() {
         let request = BackgroundCredentialRequest {
             api_version: TUNNEL_API_VERSION,
+            expected_revision: 3,
             device_id: "11111111-1111-4111-8111-111111111111".to_string(),
             panel_base: "https://nelomai.example".to_string(),
             token: "never-log-this-token".to_string(),
             expires_at_unix: 1_785_700_000,
+            install_secret: "never-log-install-secret".to_string(),
+            capability_revision: 1,
+            capability_enabled: true,
+            capability_expires_at: "2026-08-29T12:00:00Z".to_string(),
         };
 
         let value = serde_json::to_value(&request).unwrap();
@@ -417,6 +442,7 @@ mod tests {
         let debug = format!("{request:?}");
         assert!(debug.contains("11111111-1111-4111-8111-111111111111"));
         assert!(!debug.contains("never-log-this-token"));
+        assert!(!debug.contains("never-log-install-secret"));
         assert!(debug.contains("<redacted>"));
     }
 

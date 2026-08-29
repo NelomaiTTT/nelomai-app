@@ -35,6 +35,12 @@ internal const val EXTRA_TOKEN = "token"
 internal const val EXTRA_DEVICE_ID = "device_id"
 internal const val EXTRA_EXPIRES_AT_UNIX = "expires_at_unix"
 internal const val EXTRA_CONFIGURED = "configured"
+internal const val EXTRA_CREDENTIAL_REVISION = "credential_revision"
+internal const val EXTRA_INSTALL_SECRET = "install_secret"
+internal const val EXTRA_CAPABILITY_REVISION = "capability_revision"
+internal const val EXTRA_CAPABILITY_ENABLED = "capability_enabled"
+internal const val EXTRA_CAPABILITY_EXPIRES_AT = "capability_expires_at"
+internal const val EXTRA_MUTATION_READY = "mutation_ready"
 internal const val EXTRA_CHANGED = "changed"
 internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
 internal const val EXTRA_DNS_SERVERS = "dns_servers"
@@ -189,17 +195,22 @@ internal object TunnelServiceClient {
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_CONFIGURE_BACKGROUND)
             .putExtra(EXTRA_API_VERSION, args.apiVersion)
+            .putExtra(EXTRA_CREDENTIAL_REVISION, args.expectedRevision)
             .putExtra(EXTRA_DEVICE_ID, args.deviceId)
             .putExtra(EXTRA_PANEL_BASE, args.panelBase)
             .putExtra(EXTRA_TOKEN, args.token)
-            .putExtra(EXTRA_EXPIRES_AT_UNIX, args.expiresAtUnix),
+            .putExtra(EXTRA_EXPIRES_AT_UNIX, args.expiresAtUnix)
+            .putExtra(EXTRA_INSTALL_SECRET, args.installSecret)
+            .putExtra(EXTRA_CAPABILITY_REVISION, args.capabilityRevision)
+            .putExtra(EXTRA_CAPABILITY_ENABLED, args.capabilityEnabled)
+            .putExtra(EXTRA_CAPABILITY_EXPIRES_AT, args.capabilityExpiresAt),
         { onSuccess() },
         onError,
     )
 
     fun backgroundCredentialStatus(
         context: Context,
-        onSuccess: (Boolean, String?, Long?) -> Unit,
+        onSuccess: (Boolean, Long, Boolean, Boolean, Long?, String?, Long?) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
@@ -209,11 +220,32 @@ internal object TunnelServiceClient {
             val configured = it.getBoolean(EXTRA_CONFIGURED)
             onSuccess(
                 configured,
+                it.getLong(EXTRA_CREDENTIAL_REVISION),
+                it.getBoolean(EXTRA_MUTATION_READY),
+                it.getBoolean(EXTRA_CAPABILITY_ENABLED),
+                it.getLong(EXTRA_CAPABILITY_EXPIRES_AT).takeIf { value ->
+                    value != Long.MIN_VALUE
+                },
                 if (configured) it.getString(EXTRA_DEVICE_ID) else null,
                 if (configured) it.getLong(EXTRA_EXPIRES_AT_UNIX) else null,
             )
         },
         onError,
+    )
+
+    fun rotateBackground(
+        context: Context,
+        expectedRevision: Long,
+        onSuccess: () -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_ROTATE_BACKGROUND)
+            .putExtra(EXTRA_CREDENTIAL_REVISION, expectedRevision),
+        { onSuccess() },
+        onError,
+        timeoutMillis = 60_000L,
     )
 
     fun clearBackground(

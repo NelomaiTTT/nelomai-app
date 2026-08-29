@@ -5,6 +5,7 @@ import java.net.URI
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.nio.charset.StandardCharsets
+import java.time.Instant
 import java.util.Locale
 import java.util.UUID
 import javax.net.ssl.HttpsURLConnection
@@ -28,7 +29,325 @@ internal data class BackgroundSessionRecoveryResult(
 
 internal class BackgroundConnectionException(val code: String) : RuntimeException(code)
 
+internal interface BackgroundApiTransport {
+    fun execute(
+        credential: BackgroundCredential,
+        method: String,
+        endpoint: String,
+        payload: JSONObject? = null,
+    ): JSONObject
+}
+
+internal data class BackgroundServerCandidate(
+    val candidateId: String,
+    val layer: String,
+    val regionLabel: String,
+    val probeUrl: String,
+    val expiresAtUnix: Long,
+)
+
+internal data class BackgroundActivationResult(
+    val tokenGeneration: Long,
+    val activeExpiresAtUnix: Long,
+)
+
+internal data class BackgroundReconcileResult(
+    val state: String,
+    val cancelRequested: Boolean,
+    val leaseId: String?,
+    val leaseStatus: String?,
+    val retryCount: Int,
+    val nextAttemptAtUnix: Long?,
+)
+
+internal data class BackgroundLogoutFinalizeResult(
+    val code: String,
+    val cleanupJobs: Int,
+)
+
+internal class BackgroundOperationClient(
+    private val transport: BackgroundApiTransport,
+) {
+    fun capabilities(credential: BackgroundCredential): BackgroundCapabilitySnapshot {
+        val payload = transport.execute(credential, "GET", "background/capabilities")
+        return parseResponse {
+            BackgroundCapabilitySnapshot(
+                revision = payload.getLong("revision").also { require(it >= 0) },
+                enabled = payload.getBoolean("connection_intent_recovery_v1"),
+                expiresAtUnix = parseTimestamp(payload.getString("expires_at")),
+            )
+        }
+    }
+
+    fun serverCandidates(
+        credential: BackgroundCredential,
+        layer: String,
+        egressMode: String,
+    ): List<BackgroundServerCandidate> {
+        require(layer in setOf("tic", "stray"))
+        require(egressMode in setOf("ipv4", "prefer_ipv6"))
+        val payload = transport.execute(
+            credential,
+            "GET",
+            "background/server-candidates?layer=$layer&egress_mode=$egressMode",
+        )
+        return parseResponse {
+            val candidates = payload.getJSONArray("candidates")
+            (0 until candidates.length()).map { index ->
+                val item = candidates.getJSONObject(index)
+                val probeUrl = item.getString("probe_url")
+                require(URI(probeUrl).scheme.equals("https", ignoreCase = true))
+                BackgroundServerCandidate(
+                    candidateId = item.getString("candidate_id").also(::requireWireValue),
+                    layer = item.getString("layer").also {
+                        require(it in setOf("tic", "stray"))
+                    },
+                    regionLabel = item.getString("region_label").also(::requireWireValue),
+                    probeUrl = probeUrl,
+                    expiresAtUnix = parseTimestamp(item.getString("expires_at")),
+                )
+            }
+        }
+    }
+
+    fun reconcile(
+        credential: BackgroundCredential,
+        operationId: String,
+        kind: String,
+        contractVersion: Int,
+        requestFingerprint: String,
+        cancelIfAbsent: Boolean,
+    ): BackgroundReconcileResult {
+        requireUuid(operationId)
+        require(kind in setOf("start", "stalled_stop"))
+        require(contractVersion in 1..32)
+        require(requestFingerprint.matches(Regex("[0-9a-f]{64}")))
+        val payload = transport.execute(
+            credential,
+            "POST",
+            "background/operations/reconcile",
+            JSONObject().apply {
+                put("operation_id", operationId)
+                put("kind", kind)
+                put("contract_version", contractVersion)
+                put("request_fingerprint", requestFingerprint)
+                put("cancel_if_absent", cancelIfAbsent)
+            },
+        )
+        return parseResponse {
+            val state = payload.getString("state").also {
+                require(it in setOf(
+                    "not_found", "pending", "applying", "compensating",
+                    "applied", "terminal", "cancelled",
+                ))
+            }
+            BackgroundReconcileResult(
+                state = state,
+                cancelRequested = payload.getBoolean("cancel_requested"),
+                leaseId = payload.optionalString("lease_id")?.also(::requireWireValue),
+                leaseStatus = payload.optionalString("lease_status")?.also(::requireWireValue),
+                retryCount = payload.optInt("retry_count", 0).also { require(it >= 0) },
+                nextAttemptAtUnix = payload.optionalString("next_attempt_at")?.let(::parseTimestamp),
+            )
+        }
+    }
+
+    fun prepareToken(
+        credential: BackgroundCredential,
+        prepareOperationId: String,
+        activationOperationId: String,
+        installSecret: String,
+    ): BackgroundPendingToken {
+        requireUuid(prepareOperationId)
+        requireUuid(activationOperationId)
+        requireSecret(installSecret)
+        val payload = transport.execute(
+            credential,
+            "POST",
+            "background/token/prepare",
+            JSONObject().apply {
+                put("prepare_operation_id", prepareOperationId)
+                put("activation_operation_id", activationOperationId)
+                put("install_secret", installSecret)
+            },
+        )
+        return parseResponse {
+            require(payload.getString("prepare_operation_id") == prepareOperationId)
+            require(payload.getString("activation_operation_id") == activationOperationId)
+            BackgroundPendingToken(
+                token = payload.getString("token").also(::requireSecret),
+                stagedExpiresAtUnix = parseTimestamp(payload.getString("staged_expires_at")),
+                tokenGeneration = payload.getLong("token_generation").also { require(it > 0) },
+                prepareOperationId = prepareOperationId,
+                activationOperationId = activationOperationId,
+                contractVersion = 1,
+            )
+        }
+    }
+
+    fun activateToken(
+        credential: BackgroundCredential,
+        pending: BackgroundPendingToken,
+        installSecret: String,
+    ): BackgroundActivationResult {
+        requireUuid(pending.activationOperationId)
+        requireSecret(pending.token)
+        requireSecret(installSecret)
+        val payload = transport.execute(
+            credential,
+            "POST",
+            "background/token/activate",
+            JSONObject().apply {
+                put("activation_operation_id", pending.activationOperationId)
+                put("token", pending.token)
+                put("install_secret", installSecret)
+            },
+        )
+        return parseResponse {
+            val generation = payload.getLong("token_generation").also {
+                require(it == pending.tokenGeneration)
+            }
+            BackgroundActivationResult(
+                generation,
+                parseTimestamp(payload.getString("active_expires_at")),
+            )
+        }
+    }
+
+    fun finalizeLogout(
+        credential: BackgroundCredential,
+        deviceId: String,
+        installGeneration: Long,
+        operationId: String,
+        installSecret: String,
+    ): BackgroundLogoutFinalizeResult {
+        val normalizedDeviceId = UUID.fromString(deviceId).toString()
+        require(installGeneration > 0)
+        requireUuid(operationId)
+        requireSecret(installSecret)
+        val payload = transport.execute(
+            credential,
+            "POST",
+            "background/auth/logout-finalize",
+            JSONObject().apply {
+                put("device_id", normalizedDeviceId)
+                put("install_generation", installGeneration)
+                put("operation_id", operationId)
+                put("install_secret", installSecret)
+            },
+        )
+        return parseResponse {
+            val code = payload.getString("code")
+            require(code == "device_revoked_cleanup_accepted")
+            BackgroundLogoutFinalizeResult(
+                code,
+                payload.getInt("cleanup_jobs").also { require(it >= 0) },
+            )
+        }
+    }
+
+    private fun parseTimestamp(value: String): Long = Instant.parse(value).epochSecond
+
+    private fun requireUuid(value: String) {
+        require(UUID.fromString(value).toString() == value.lowercase(Locale.ROOT))
+    }
+
+    private fun requireWireValue(value: String) {
+        require(value.isNotBlank() && value.length <= 2048 && !value.contains('\u0000'))
+    }
+
+    private fun requireSecret(value: String) {
+        require(value.isNotBlank() && value.length <= 4096 && !value.contains('\u0000'))
+    }
+
+    private inline fun <T> parseResponse(block: () -> T): T = try {
+        block()
+    } catch (error: BackgroundConnectionException) {
+        throw error
+    } catch (_: Throwable) {
+        throw BackgroundConnectionException("invalid_background_response")
+    }
+}
+
+private class UrlConnectionBackgroundApiTransport : BackgroundApiTransport {
+    override fun execute(
+        credential: BackgroundCredential,
+        method: String,
+        endpoint: String,
+        payload: JSONObject?,
+    ): JSONObject {
+        val base = URI(credential.panelBase)
+        val url = base.resolve("/api/client/v1/$endpoint").toURL()
+        val connection = (url.openConnection() as? HttpsURLConnection)
+            ?: throw BackgroundConnectionException("background_transport_unavailable")
+        return try {
+            connection.requestMethod = method
+            connection.instanceFollowRedirects = false
+            connection.connectTimeout = BACKGROUND_CONNECT_TIMEOUT_MILLIS
+            connection.readTimeout = BACKGROUND_READ_TIMEOUT_MILLIS
+            connection.setRequestProperty("Authorization", "Device ${credential.token}")
+            connection.setRequestProperty("Accept", "application/json")
+            if (payload != null) {
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/json")
+                val encoded = payload.toString().toByteArray(StandardCharsets.UTF_8)
+                try {
+                    connection.outputStream.use { it.write(encoded) }
+                } finally {
+                    encoded.fill(0)
+                }
+            }
+            val status = connection.responseCode
+            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
+            val body = stream?.use { input ->
+                val buffer = ByteArray(8 * 1024)
+                val output = java.io.ByteArrayOutputStream()
+                try {
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        if (output.size() + count > BACKGROUND_MAX_RESPONSE_BYTES) {
+                            throw BackgroundConnectionException("background_response_too_large")
+                        }
+                        output.write(buffer, 0, count)
+                    }
+                    val responseBytes = output.toByteArray()
+                    try {
+                        responseBytes.toString(StandardCharsets.UTF_8)
+                    } finally {
+                        responseBytes.fill(0)
+                    }
+                } finally {
+                    buffer.fill(0)
+                }
+            }.orEmpty()
+            val json = runCatching { JSONObject(body) }.getOrNull()
+            if (status !in 200..299) {
+                throw BackgroundConnectionException(
+                    backgroundPanelErrorCode(
+                        endpoint.substringBefore('?'),
+                        status,
+                        json?.optString("code")?.takeIf(String::isNotBlank),
+                    ),
+                )
+            }
+            json ?: throw BackgroundConnectionException("invalid_background_response")
+        } catch (error: BackgroundConnectionException) {
+            throw error
+        } catch (_: Throwable) {
+            throw BackgroundConnectionException("background_transport_unavailable")
+        } finally {
+            connection.disconnect()
+        }
+    }
+}
+
+private fun JSONObject.optionalString(name: String): String? =
+    if (has(name) && !isNull(name)) getString(name) else null
+
 internal object BackgroundConnectionClient {
+    private val transport: BackgroundApiTransport = UrlConnectionBackgroundApiTransport()
+    private val operations = BackgroundOperationClient(transport)
     fun start(
         context: Context,
         credential: BackgroundCredential,
@@ -112,64 +431,76 @@ internal object BackgroundConnectionClient {
         )
     }
 
+    fun capabilities(credential: BackgroundCredential): BackgroundCapabilitySnapshot =
+        operations.capabilities(credential)
+
+    fun serverCandidates(
+        credential: BackgroundCredential,
+        layer: String,
+        egressMode: String,
+    ): List<BackgroundServerCandidate> = operations.serverCandidates(
+        credential,
+        layer,
+        egressMode,
+    )
+
+    fun reconcile(
+        credential: BackgroundCredential,
+        operationId: String,
+        kind: String,
+        contractVersion: Int,
+        requestFingerprint: String,
+        cancelIfAbsent: Boolean,
+    ): BackgroundReconcileResult = operations.reconcile(
+        credential,
+        operationId,
+        kind,
+        contractVersion,
+        requestFingerprint,
+        cancelIfAbsent,
+    )
+
+    fun prepareToken(
+        credential: BackgroundCredential,
+        prepareOperationId: String,
+        activationOperationId: String,
+        installSecret: String,
+    ): BackgroundPendingToken = operations.prepareToken(
+        credential,
+        prepareOperationId,
+        activationOperationId,
+        installSecret,
+    )
+
+    fun activateToken(
+        credential: BackgroundCredential,
+        pending: BackgroundPendingToken,
+        installSecret: String,
+    ): BackgroundActivationResult = operations.activateToken(
+        credential,
+        pending,
+        installSecret,
+    )
+
+    fun finalizeLogout(
+        credential: BackgroundCredential,
+        deviceId: String,
+        installGeneration: Long,
+        operationId: String,
+        installSecret: String,
+    ): BackgroundLogoutFinalizeResult = operations.finalizeLogout(
+        credential,
+        deviceId,
+        installGeneration,
+        operationId,
+        installSecret,
+    )
+
     private fun execute(
         credential: BackgroundCredential,
         endpoint: String,
         payload: JSONObject,
-    ): JSONObject {
-        val base = URI(credential.panelBase)
-        val url = base.resolve("/api/client/v1/$endpoint").toURL()
-        val connection = (url.openConnection() as? HttpsURLConnection)
-            ?: throw BackgroundConnectionException("background_transport_unavailable")
-        return try {
-            connection.requestMethod = "POST"
-            connection.instanceFollowRedirects = false
-            connection.connectTimeout = BACKGROUND_CONNECT_TIMEOUT_MILLIS
-            connection.readTimeout = BACKGROUND_READ_TIMEOUT_MILLIS
-            connection.doOutput = true
-            connection.setRequestProperty("Authorization", "Device ${credential.token}")
-            connection.setRequestProperty("Content-Type", "application/json")
-            connection.setRequestProperty("Accept", "application/json")
-            val encoded = payload.toString().toByteArray(StandardCharsets.UTF_8)
-            try {
-                connection.outputStream.use { it.write(encoded) }
-            } finally {
-                encoded.fill(0)
-            }
-            val status = connection.responseCode
-            val stream = if (status in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.use { input ->
-                val buffer = ByteArray(8 * 1024)
-                val output = java.io.ByteArrayOutputStream()
-                while (true) {
-                    val count = input.read(buffer)
-                    if (count < 0) break
-                    if (output.size() + count > BACKGROUND_MAX_RESPONSE_BYTES) {
-                        throw BackgroundConnectionException("background_response_too_large")
-                    }
-                    output.write(buffer, 0, count)
-                }
-                output.toByteArray().toString(StandardCharsets.UTF_8)
-            }.orEmpty()
-            val json = runCatching { JSONObject(body) }.getOrNull()
-            if (status !in 200..299) {
-                throw BackgroundConnectionException(
-                    backgroundPanelErrorCode(
-                        endpoint,
-                        status,
-                        json?.optString("code")?.takeIf(String::isNotBlank),
-                    ),
-                )
-            }
-            json ?: throw BackgroundConnectionException("invalid_background_response")
-        } catch (error: BackgroundConnectionException) {
-            throw error
-        } catch (_: Throwable) {
-            throw BackgroundConnectionException("background_transport_unavailable")
-        } finally {
-            connection.disconnect()
-        }
-    }
+    ): JSONObject = transport.execute(credential, "POST", endpoint, payload)
 }
 
 internal fun backgroundPanelErrorCode(

@@ -19,11 +19,15 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.amnezia.awg.backend.GoBackend
+import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
+private const val BACKGROUND_REFRESH_WINDOW_SECONDS = 7L * 24 * 60 * 60
+private const val BACKGROUND_MUTATION_RESERVATION_SECONDS = 10L * 60
 
 internal class IdleStopDebouncer(
     private val delayMillis: Long,
@@ -77,6 +81,9 @@ internal class IdleStopDebouncer(
 class NelomaiVpnService : GoBackend.VpnService() {
     private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
     private val restoreHandler = Handler(Looper.getMainLooper())
+    private val credentialExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "nelomai-background-credential").apply { isDaemon = true }
+    }
     private val idleStopDebouncer = IdleStopDebouncer(
         delayMillis = IDLE_SERVICE_STOP_DELAY_MILLIS,
         schedule = { task, delay -> restoreHandler.postDelayed(task, delay) },
@@ -135,6 +142,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_CLIENT_METRICS -> handleClientMetrics(intent)
             intent?.action == ACTION_CLIENT_REBIND_UDP -> handleClientRebindUdp(intent)
             intent?.action == ACTION_CONFIGURE_BACKGROUND -> handleConfigureBackground(intent)
+            intent?.action == ACTION_ROTATE_BACKGROUND -> handleRotateBackground(intent)
             intent?.action == ACTION_BACKGROUND_STATUS -> handleBackgroundStatus(intent)
             intent?.action == ACTION_CLEAR_BACKGROUND -> handleClearBackground(intent)
             intent?.action == ACTION_CLEAR_QUICK_PLAN -> handleClearQuickPlan(intent)
@@ -320,15 +328,45 @@ class NelomaiVpnService : GoBackend.VpnService() {
             if (apiVersion != TUNNEL_API_VERSION || expiresAtUnix <= 0) {
                 throw IllegalArgumentException("invalid background credential")
             }
-            BackgroundCredentialStore.save(
-                applicationContext,
-                BackgroundCredential(
-                    requireNotNull(intent.getStringExtra(EXTRA_DEVICE_ID)),
-                    requireNotNull(intent.getStringExtra(EXTRA_PANEL_BASE)),
-                    requireNotNull(intent.getStringExtra(EXTRA_TOKEN)),
-                    expiresAtUnix,
+            val store = AndroidBackgroundCredentialStores.open(applicationContext)
+            val current = when (val result = store.read()) {
+                is CredentialStoreResult.Success -> result.value
+                is CredentialStoreResult.Failure -> {
+                    receiver.sendError(result.code)
+                    return
+                }
+            }
+            val installGeneration = if (
+                current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED
+            ) {
+                requireNotNull(current.installGeneration) + 1
+            } else {
+                current.installGeneration ?: 1
+            }
+            val configured = store.configure(
+                expectedRevision = intent.getLongExtra(EXTRA_CREDENTIAL_REVISION, -1),
+                provision = BackgroundCredentialProvision(
+                    deviceId = requireNotNull(intent.getStringExtra(EXTRA_DEVICE_ID)),
+                    panelBase = requireNotNull(intent.getStringExtra(EXTRA_PANEL_BASE)),
+                    token = requireNotNull(intent.getStringExtra(EXTRA_TOKEN)),
+                    expiresAtUnix = expiresAtUnix,
+                    installSecret = requireNotNull(
+                        intent.getStringExtra(EXTRA_INSTALL_SECRET),
+                    ),
+                    installGeneration = installGeneration,
+                    capability = BackgroundCapabilitySnapshot(
+                        revision = intent.getLongExtra(EXTRA_CAPABILITY_REVISION, -1),
+                        enabled = intent.getBooleanExtra(EXTRA_CAPABILITY_ENABLED, false),
+                        expiresAtUnix = Instant.parse(
+                            requireNotNull(intent.getStringExtra(EXTRA_CAPABILITY_EXPIRES_AT)),
+                        ).epochSecond,
+                    ),
                 ),
             )
+            if (configured is CredentialStoreResult.Failure) {
+                receiver.sendError(configured.code)
+                return
+            }
             runCatching { AutomaticDiagnostics.credentialUpdated(applicationContext) }
                 .onFailure { TunnelLog.warning("diagnostics.credential_update_failed", error = it) }
             receiver.sendSuccess()
@@ -340,11 +378,31 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun handleBackgroundStatus(intent: Intent) {
-        val credential = BackgroundCredentialStore.load(applicationContext)
+        val envelope = when (
+            val result = AndroidBackgroundCredentialStores.open(applicationContext).read()
+        ) {
+            is CredentialStoreResult.Success -> result.value
+            is CredentialStoreResult.Failure -> {
+                intent.resultReceiver().sendError(result.code)
+                stopIfIdle()
+                return
+            }
+        }
+        val credential = envelope.active
         intent.resultReceiver()?.send(
             SERVICE_RESULT_OK,
             Bundle().apply {
                 putBoolean(EXTRA_CONFIGURED, credential != null)
+                putLong(EXTRA_CREDENTIAL_REVISION, envelope.revision)
+                putBoolean(
+                    EXTRA_MUTATION_READY,
+                    envelope.installSecret != null && envelope.capability != null,
+                )
+                putBoolean(EXTRA_CAPABILITY_ENABLED, envelope.capability?.enabled == true)
+                putLong(
+                    EXTRA_CAPABILITY_EXPIRES_AT,
+                    envelope.capability?.expiresAtUnix ?: Long.MIN_VALUE,
+                )
                 credential?.let {
                     putString(EXTRA_DEVICE_ID, it.deviceId)
                     putLong(EXTRA_EXPIRES_AT_UNIX, it.expiresAtUnix)
@@ -352,6 +410,96 @@ class NelomaiVpnService : GoBackend.VpnService() {
             },
         )
         stopIfIdle()
+    }
+
+    private fun handleRotateBackground(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        val expectedRevision = intent.getLongExtra(EXTRA_CREDENTIAL_REVISION, -1)
+        credentialExecutor.execute {
+            try {
+                rotateBackgroundCredential(expectedRevision)
+                receiver.sendSuccess()
+            } catch (error: BackgroundConnectionException) {
+                receiver.sendError(error.code)
+            } catch (error: CredentialRotationFailure) {
+                receiver.sendError(error.code)
+            } catch (_: Throwable) {
+                receiver.sendError("background_credential_rotation_failed")
+            } finally {
+                stopIfIdle()
+            }
+        }
+    }
+
+    private fun rotateBackgroundCredential(expectedRevision: Long) {
+        val store = AndroidBackgroundCredentialStores.open(applicationContext)
+        var envelope = store.read().credentialOrThrow()
+        if (envelope.revision != expectedRevision) {
+            throw CredentialRotationFailure("background_credential_revision_conflict")
+        }
+        if (envelope.logoutState != null) {
+            throw CredentialRotationFailure("background_credential_logout_pending")
+        }
+        var credential = envelope.active
+            ?: throw CredentialRotationFailure("background_credential_active_absent")
+        val installSecret = envelope.installSecret
+            ?: throw CredentialRotationFailure("background_credential_unavailable")
+        val nowUnix = System.currentTimeMillis() / 1_000
+
+        if (envelope.pending == null && envelope.reservation == null) {
+            val capability = BackgroundConnectionClient.capabilities(credential)
+            envelope = store.updateCapability(envelope.revision, capability).credentialOrThrow()
+            if (!capability.enabled || capability.expiresAtUnix <= nowUnix) return
+            if (credential.expiresAtUnix > nowUnix + BACKGROUND_REFRESH_WINDOW_SECONDS) return
+        }
+
+        var pending = envelope.pending
+        if (pending == null) {
+            val reservation = envelope.reservation ?: run {
+                val prepareOperationId = UUID.randomUUID().toString()
+                val activationOperationId = UUID.randomUUID().toString()
+                envelope = store.reserveMutation(
+                    expectedRevision = envelope.revision,
+                    mutationId = prepareOperationId,
+                    deviceId = credential.deviceId,
+                    expiresAtUnix = nowUnix + BACKGROUND_MUTATION_RESERVATION_SECONDS,
+                    nowUnix = nowUnix,
+                    activationOperationId = activationOperationId,
+                ).credentialOrThrow()
+                requireNotNull(envelope.reservation)
+            }
+            pending = BackgroundConnectionClient.prepareToken(
+                credential,
+                reservation.mutationId,
+                reservation.activationOperationId,
+                installSecret,
+            )
+            envelope = store.savePendingToken(
+                expectedRevision = envelope.revision,
+                mutationId = reservation.mutationId,
+                pending = pending,
+                nowUnix = System.currentTimeMillis() / 1_000,
+            ).credentialOrThrow()
+        }
+
+        credential = envelope.active
+            ?: throw CredentialRotationFailure("background_credential_active_absent")
+        val activation = try {
+            BackgroundConnectionClient.activateToken(credential, pending, installSecret)
+        } catch (error: BackgroundConnectionException) {
+            if (error.code == "activation_not_applied") {
+                store.discardNotApplied(
+                    envelope.revision,
+                    pending.activationOperationId,
+                ).credentialOrThrow()
+            }
+            throw error
+        }
+        store.promotePending(
+            expectedRevision = envelope.revision,
+            activationOperationId = pending.activationOperationId,
+            activeExpiresAtUnix = activation.activeExpiresAtUnix,
+        ).credentialOrThrow()
     }
 
     private fun handleClearBackground(intent: Intent) {
@@ -442,6 +590,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     override fun onDestroy() {
         idleStopDebouncer.cancel()
         cancelRestoreRetry()
+        credentialExecutor.shutdownNow()
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
         activeService = null
@@ -692,6 +841,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         internal const val ACTION_CLIENT_METRICS = "ru.nelomai.tunnel.CLIENT_METRICS"
         internal const val ACTION_CLIENT_REBIND_UDP = "ru.nelomai.tunnel.CLIENT_REBIND_UDP"
         internal const val ACTION_CONFIGURE_BACKGROUND = "ru.nelomai.tunnel.CONFIGURE_BACKGROUND"
+        internal const val ACTION_ROTATE_BACKGROUND = "ru.nelomai.tunnel.ROTATE_BACKGROUND"
         internal const val ACTION_BACKGROUND_STATUS = "ru.nelomai.tunnel.BACKGROUND_STATUS"
         internal const val ACTION_CLEAR_BACKGROUND = "ru.nelomai.tunnel.CLEAR_BACKGROUND"
         internal const val ACTION_CLEAR_QUICK_PLAN = "ru.nelomai.tunnel.CLEAR_QUICK_PLAN"
@@ -800,6 +950,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
             .apply { pendingIntent?.let(::setContentIntent) }
             .build()
     }
+}
+
+private class CredentialRotationFailure(val code: String) : RuntimeException(code)
+
+private fun CredentialStoreResult<BackgroundCredentialEnvelope>.credentialOrThrow():
+    BackgroundCredentialEnvelope = when (this) {
+    is CredentialStoreResult.Success -> value
+    is CredentialStoreResult.Failure -> throw CredentialRotationFailure(code)
 }
 
 internal fun shouldQueueBackgroundStartFailureDiagnostics(
