@@ -1,6 +1,8 @@
 #[cfg(desktop)]
 mod automatic_diagnostics;
 mod commands;
+#[cfg(not(target_os = "android"))]
+mod connection_intent;
 mod connection_metrics;
 #[cfg(desktop)]
 mod desktop;
@@ -169,6 +171,12 @@ pub fn run() {
         let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
         let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
         let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
+        #[cfg(not(target_os = "android"))]
+        let connection_intent = Arc::new(connection_intent::DesktopConnectionIntent::new(
+            app.handle().clone(),
+            application.clone(),
+            diagnostics.clone(),
+        ));
         app.manage(diagnostics.clone());
         app.manage(application.clone());
         app.manage(tunnel.clone());
@@ -176,13 +184,21 @@ pub fn run() {
         app.manage(push_registration_scheduler.clone());
         app.manage(preferences);
         app.manage(connection_metrics.clone());
+        #[cfg(not(target_os = "android"))]
+        app.manage(connection_intent.clone());
         app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
         #[cfg(desktop)]
         desktop::setup_tray(app)?;
         start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
+        #[cfg(not(target_os = "android"))]
+        start_physical_network_scheduler(application.clone(), connection_intent.clone());
+        #[cfg(target_os = "android")]
         start_physical_network_scheduler(application.clone());
         start_pending_stop_scheduler(application.clone());
+        #[cfg(not(target_os = "android"))]
+        connection_intent.spawn();
         start_connection_metrics_scheduler(
+            app.handle().clone(),
             application.clone(),
             tunnel.clone(),
             connection_metrics,
@@ -223,6 +239,7 @@ pub fn run() {
             commands::app_start,
             commands::app_start_saved_stray,
             commands::app_stop,
+            commands::app_wake_connection_intent,
             commands::app_pin_stray,
             commands::app_unpin_stray,
             commands::app_send_diagnostics,
@@ -244,18 +261,18 @@ pub fn run() {
             commands::app_register_push_token,
             commands::app_logout,
         ])
-        .on_window_event(|window, event| {
+        .on_window_event(|_window, _event| {
             #[cfg(desktop)]
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = _event {
                 use tauri::Manager;
 
-                let preferences = window.state::<Arc<preferences::AppPreferenceStore>>();
+                let preferences = _window.state::<Arc<preferences::AppPreferenceStore>>();
                 if preferences.get().close_to_tray {
                     api.prevent_close();
-                    desktop::hide_window(window);
+                    desktop::hide_window(_window);
                 } else {
                     api.prevent_close();
-                    desktop::quit_application(window.app_handle().clone());
+                    desktop::quit_application(_window.app_handle().clone());
                 }
             }
         })
@@ -509,6 +526,7 @@ fn start_split_tunnel_scheduler(
     });
 }
 
+#[cfg(target_os = "android")]
 fn start_physical_network_scheduler(application: Arc<NativeApplication>) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(PHYSICAL_NETWORK_POLL_INTERVAL);
@@ -516,6 +534,26 @@ fn start_physical_network_scheduler(application: Arc<NativeApplication>) {
         loop {
             interval.tick().await;
             let _ = application.poll_physical_network(current_unix_time()).await;
+        }
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn start_physical_network_scheduler(
+    application: Arc<NativeApplication>,
+    connection_intent: Arc<connection_intent::DesktopConnectionIntent>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(PHYSICAL_NETWORK_POLL_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if matches!(
+                application.poll_physical_network(current_unix_time()).await,
+                Ok(nelomai_client_core::PhysicalNetworkPollOutcome::Reconnected)
+            ) {
+                connection_intent.wake_for_network_change().await;
+            }
         }
     });
 }
@@ -533,6 +571,7 @@ fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
 }
 
 fn start_connection_metrics_scheduler(
+    _app: tauri::AppHandle,
     application: Arc<NativeApplication>,
     tunnel: Arc<platform::PlatformTunnelController>,
     tracker: Arc<connection_metrics::ConnectionMetricsTracker>,
@@ -652,6 +691,7 @@ fn start_connection_metrics_scheduler(
                                 current_unix_time(),
                             ) {
                                 let result = diagnose_and_recover_macos_stall(
+                                    &_app,
                                     application.as_ref(),
                                     diagnostics.as_ref(),
                                     &context,
@@ -1107,6 +1147,7 @@ fn take_direct_probe_target(
 
 #[cfg(target_os = "macos")]
 async fn diagnose_and_recover_macos_stall(
+    app: &tauri::AppHandle,
     application: &NativeApplication,
     diagnostics: &diagnostics::AppDiagnostics,
     context: &nelomai_client_core::ConnectionMetricsContext,
@@ -1157,6 +1198,17 @@ async fn diagnose_and_recover_macos_stall(
                     Some(classification_code),
                 );
             }
+        }
+    }
+    {
+        use tauri::Manager;
+
+        let runtime = app
+            .state::<Arc<connection_intent::DesktopConnectionIntent>>()
+            .inner()
+            .clone();
+        if runtime.handle_stall(&context.session_id).await {
+            return MacosStallRecoveryResult::Complete;
         }
     }
     let mut attempt_unix = current_unix_time();
@@ -1416,6 +1468,7 @@ mod tests {
                 nelomai_client_core::CoreApiError::Rejected {
                     code: "diagnostics_rate_limited".to_string(),
                     message: "retry later".to_string(),
+                    retry_after_seconds: None,
                 },
             )),
             "diagnostics_rate_limited",

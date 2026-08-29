@@ -11,7 +11,7 @@ use nelomai_contracts::{
     API_PREFIX,
 };
 use reqwest::{
-    header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION, CONTENT_TYPE},
+    header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     Client as HttpClient, RequestBuilder, Response, StatusCode, Url,
 };
 use serde::{Deserialize, Serialize};
@@ -245,6 +245,7 @@ pub enum ClientApiError {
         request_id: String,
         code: String,
         message: String,
+        retry_after_seconds: Option<u64>,
     },
     #[error("panel returned an invalid error response ({status})")]
     InvalidErrorResponse { status: StatusCode },
@@ -262,6 +263,16 @@ impl ClientApiError {
         match self {
             Self::Api { code, .. } => Some(code),
             Self::InvalidPayload { code } | Self::PayloadTooLarge { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        match self {
+            Self::Api {
+                retry_after_seconds,
+                ..
+            } => *retry_after_seconds,
             _ => None,
         }
     }
@@ -1007,6 +1018,7 @@ impl ClientApi {
     }
 
     async fn api_error(response: Response, status: StatusCode) -> ClientApiError {
+        let retry_after_seconds = parse_retry_after_seconds(response.headers().get(RETRY_AFTER));
         let payload = response
             .json::<ErrorPayload>()
             .await
@@ -1017,10 +1029,18 @@ impl ClientApi {
                 request_id: payload.request_id,
                 code: payload.code,
                 message: payload.message,
+                retry_after_seconds,
             },
             Err(error) => error,
         }
     }
+}
+
+fn parse_retry_after_seconds(value: Option<&HeaderValue>) -> Option<u64> {
+    value
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=900).contains(seconds))
 }
 
 #[cfg(test)]
@@ -1226,6 +1246,7 @@ mod tests {
             request_id: "req-missing".to_string(),
             code: "not_found".to_string(),
             message: "Not found".to_string(),
+            retry_after_seconds: None,
         };
         assert!(missing.disables_new_connection_intent_operations());
 
@@ -1234,6 +1255,7 @@ mod tests {
             request_id: "req-unsupported".to_string(),
             code: "recovery_contract_unsupported".to_string(),
             message: "Unsupported".to_string(),
+            retry_after_seconds: None,
         };
         assert!(unsupported.disables_new_connection_intent_operations());
 
@@ -1244,6 +1266,26 @@ mod tests {
 
         let transport = ClientApiError::InvalidBaseUrl("offline".to_string());
         assert!(!transport.disables_new_connection_intent_operations());
+    }
+
+    #[test]
+    fn retry_after_accepts_only_the_bounded_delta_seconds_contract() {
+        assert_eq!(
+            parse_retry_after_seconds(Some(&HeaderValue::from_static("120"))),
+            Some(120),
+        );
+        assert_eq!(
+            parse_retry_after_seconds(Some(&HeaderValue::from_static("0"))),
+            None,
+        );
+        assert_eq!(
+            parse_retry_after_seconds(Some(&HeaderValue::from_static("901"))),
+            None,
+        );
+        assert_eq!(
+            parse_retry_after_seconds(Some(&HeaderValue::from_static("invalid"))),
+            None,
+        );
     }
 
     #[test]

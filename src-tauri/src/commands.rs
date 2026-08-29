@@ -250,7 +250,7 @@ impl From<ApplicationError> for CommandError {
 }
 
 impl CommandError {
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -268,7 +268,7 @@ impl CommandError {
             CoreApiError::Retryable => {
                 Self::new("temporarily_unavailable", "Не удалось связаться с панелью")
             }
-            CoreApiError::Rejected { code, message } => Self::new(code, message),
+            CoreApiError::Rejected { code, message, .. } => Self::new(code, message),
         }
     }
 
@@ -474,14 +474,18 @@ fn repairable_stop_error(error: &ApplicationError) -> bool {
 async fn stop_connection(
     app: &AppHandle,
     application: &NativeApplication,
-) -> Result<Connection, CommandError> {
+) -> Result<Option<Connection>, CommandError> {
+    let intent_cancelled = cancel_desktop_connection_intent(app).await;
     let result = match application.stop().await {
-        Ok(connection) => Ok(connection),
+        Ok(connection) => Ok(Some(connection)),
+        Err(ApplicationError::Core(CoreError::SavedConnectionUnavailable)) if intent_cancelled => {
+            Ok(None)
+        }
         Err(error) if repairable_stop_error(&error) => {
             crate::platform::prepare_tunnel_for_stop(app.clone())
                 .await
                 .map_err(CommandError::from_tunnel)?;
-            application.stop().await.map_err(Into::into)
+            application.stop().await.map(Some).map_err(Into::into)
         }
         Err(error) => Err(error.into()),
     };
@@ -496,16 +500,17 @@ pub(crate) async fn stop_for_shutdown(
     app: &AppHandle,
     application: &NativeApplication,
 ) -> Result<(), CommandError> {
+    let intent_cancelled = cancel_desktop_connection_intent(app).await;
     let state = application.state().await;
-    if !matches!(
-        state.phase,
-        Phase::Connected | Phase::Connecting | Phase::Stopping
-    ) {
+    if !shutdown_requires_stop(&state, intent_cancelled) {
         return Ok(());
     }
 
     let result = match application.stop_for_shutdown().await {
         Ok(_) => Ok(()),
+        Err(ApplicationError::Core(CoreError::SavedConnectionUnavailable)) if intent_cancelled => {
+            Ok(())
+        }
         Err(error) if repairable_stop_error(&error) => {
             crate::platform::prepare_tunnel_for_stop(app.clone())
                 .await
@@ -523,6 +528,31 @@ pub(crate) async fn stop_for_shutdown(
         queue_desktop_tunnel_stopped(app).await;
     }
     result
+}
+
+fn shutdown_requires_stop(state: &CoreState, intent_cancelled: bool) -> bool {
+    intent_cancelled
+        || state.connection.is_some()
+        || matches!(
+            state.phase,
+            Phase::Connected | Phase::Connecting | Phase::Stopping
+        )
+}
+
+#[cfg(not(target_os = "android"))]
+async fn cancel_desktop_connection_intent(app: &AppHandle) -> bool {
+    use tauri::Manager;
+
+    let runtime = app
+        .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+        .inner()
+        .clone();
+    runtime.cancel().await
+}
+
+#[cfg(target_os = "android")]
+async fn cancel_desktop_connection_intent(_app: &AppHandle) -> bool {
+    false
 }
 
 #[cfg(desktop)]
@@ -639,8 +669,37 @@ async fn prepare_desktop_logout(
 pub struct AppStateResponse {
     phase: &'static str,
     connection: Option<Connection>,
+    connection_intent_status: &'static str,
+    next_retry_at_unix: Option<i64>,
     warning: Option<String>,
     metrics: Option<ConnectionMetricsResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StartCommandResponse {
+    status: &'static str,
+    connection: Option<Connection>,
+    next_retry_at_unix: Option<i64>,
+}
+
+impl StartCommandResponse {
+    pub(crate) fn connected(connection: Connection) -> Self {
+        Self {
+            status: "connected",
+            connection: Some(connection),
+            next_retry_at_unix: None,
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn recovering(next_retry_at_unix: Option<i64>) -> Self {
+        Self {
+            status: "recovering",
+            connection: None,
+            next_retry_at_unix,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -658,13 +717,37 @@ impl AppStateResponse {
         state: CoreState,
         warning: Option<String>,
         metrics: Option<ConnectionMetricsResponse>,
+        connection_intent_status: nelomai_client_core::ConnectionIntentStatus,
+        next_retry_at_unix: Option<i64>,
     ) -> Self {
+        let phase = if connection_intent_status
+            == nelomai_client_core::ConnectionIntentStatus::Recovering
+            && matches!(
+                state.phase,
+                Phase::Ready | Phase::Connecting | Phase::Stopping | Phase::ServerUnavailable
+            ) {
+            "connecting"
+        } else {
+            phase_name(state.phase)
+        };
         Self {
-            phase: phase_name(state.phase),
+            phase,
             connection: state.connection,
+            connection_intent_status: connection_intent_status_name(connection_intent_status),
+            next_retry_at_unix,
             warning,
             metrics,
         }
+    }
+}
+
+fn connection_intent_status_name(
+    status: nelomai_client_core::ConnectionIntentStatus,
+) -> &'static str {
+    match status {
+        nelomai_client_core::ConnectionIntentStatus::None => "none",
+        nelomai_client_core::ConnectionIntentStatus::Recovering => "recovering",
+        nelomai_client_core::ConnectionIntentStatus::BlockedTerminal => "blocked_terminal",
     }
 }
 
@@ -673,6 +756,26 @@ async fn current_connection_metrics(
     context: Option<&nelomai_client_core::ConnectionMetricsContext>,
 ) -> Option<ConnectionMetricsResponse> {
     tracker.snapshot(&context?.session_id).await
+}
+
+#[cfg(not(target_os = "android"))]
+async fn current_connection_intent(
+    app: &AppHandle,
+) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
+    use tauri::Manager;
+
+    let snapshot = app
+        .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+        .snapshot()
+        .await;
+    (snapshot.status, snapshot.next_retry_at_unix)
+}
+
+#[cfg(target_os = "android")]
+async fn current_connection_intent(
+    _app: &AppHandle,
+) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
+    (nelomai_client_core::ConnectionIntentStatus::None, None)
 }
 
 #[cfg(desktop)]
@@ -804,7 +907,14 @@ pub async fn app_state(
     let warning = application.split_tunnel_warning().await;
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    Ok(AppStateResponse::new(state, warning, current_metrics))
+    let (intent_status, next_retry_at_unix) = current_connection_intent(&app).await;
+    Ok(AppStateResponse::new(
+        state,
+        warning,
+        current_metrics,
+        intent_status,
+        next_retry_at_unix,
+    ))
 }
 
 #[cfg(target_os = "android")]
@@ -926,97 +1036,132 @@ pub(crate) async fn quick_toggle(
     skip_probe_refresh: bool,
 ) -> Result<AppStateResponse, CommandError> {
     let state = application.state().await;
-    match state.phase {
-        Phase::Connected => {
-            stop_connection(app, application).await?;
-        }
-        Phase::Ready | Phase::Error | Phase::ServerUnavailable => {
-            let bootstrap = application
-                .bootstrap(now_unix())
-                .await
-                .map_err(CommandError::from)?;
-            if !bootstrap.access.can_connect {
+    let (intent_status, _) = current_connection_intent(app).await;
+    if intent_status != nelomai_client_core::ConnectionIntentStatus::None {
+        stop_connection(app, application).await?;
+    } else {
+        match state.phase {
+            Phase::Connected => {
+                stop_connection(app, application).await?;
+            }
+            Phase::Ready | Phase::Error | Phase::ServerUnavailable => {
+                let bootstrap = application
+                    .bootstrap(now_unix())
+                    .await
+                    .map_err(CommandError::from)?;
+                if !bootstrap.access.can_connect {
+                    return Err(CommandError::new(
+                        "access_expired",
+                        "Срок доступа уже истёк",
+                    ));
+                }
+                let binding_egress_mode = bootstrap
+                    .binding
+                    .as_ref()
+                    .map(|binding| binding.egress_mode)
+                    .ok_or_else(|| {
+                        CommandError::new(
+                            "peer_binding_required",
+                            "Сначала выберите пир в приложении",
+                        )
+                    })?;
+                crate::platform::prepare_tunnel(app.clone())
+                    .await
+                    .map_err(CommandError::from_tunnel)?;
+                refresh_installed_applications_before_start(
+                    app,
+                    application,
+                    bootstrap.defaults.layer,
+                    bootstrap.defaults.route_mode,
+                )
+                .await?;
+                let options = ConnectOptions {
+                    layer: bootstrap.defaults.layer,
+                    tic_connection_mode: bootstrap.defaults.tic_connection_mode,
+                    route_mode: bootstrap.defaults.route_mode,
+                    egress_mode: connection_egress_mode(
+                        bootstrap.defaults.layer,
+                        bootstrap.defaults.route_mode,
+                        bootstrap.defaults.tic_connection_mode,
+                        app.state::<Arc<AppPreferenceStore>>().get(),
+                        binding_egress_mode,
+                    ),
+                    probes: Vec::new(),
+                    allow_alternate: true,
+                };
+                #[cfg(not(target_os = "android"))]
+                let connection = if nelomai_contracts::allows_new_connection_intent_operation(
+                    bootstrap.capabilities.as_ref(),
+                    now_unix(),
+                ) {
+                    app.state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+                        .start_or_resume(options, now_unix())
+                        .await?
+                        .connection
+                } else if skip_probe_refresh {
+                    Some(
+                        application
+                            .start_without_probe_refresh(options, now_unix())
+                            .await
+                            .map_err(CommandError::from)?,
+                    )
+                } else {
+                    Some(
+                        application
+                            .start(options, now_unix())
+                            .await
+                            .map_err(CommandError::from)?,
+                    )
+                };
+                #[cfg(target_os = "android")]
+                let connection = Some(if skip_probe_refresh {
+                    application
+                        .start_without_probe_refresh(options, now_unix())
+                        .await
+                        .map_err(CommandError::from)?
+                } else {
+                    application
+                        .start(options, now_unix())
+                        .await
+                        .map_err(CommandError::from)?
+                });
+                #[cfg(desktop)]
+                if let Some(connection) = &connection {
+                    begin_desktop_tunnel_diagnostics(app, &connection.lease_id);
+                }
+                #[cfg(not(desktop))]
+                let _ = connection;
+            }
+            Phase::Connecting | Phase::Stopping | Phase::Measuring | Phase::Authenticating => {
+                return Err(CommandError::new(
+                    "connection_busy",
+                    "Дождитесь завершения текущего действия",
+                ));
+            }
+            Phase::SignedOut => {
+                return Err(CommandError::new(
+                    "signed_out",
+                    "Нужно снова войти в приложение",
+                ));
+            }
+            Phase::NeedsPeerBinding => {
+                return Err(CommandError::new(
+                    "peer_binding_required",
+                    "Сначала выберите пир в приложении",
+                ));
+            }
+            Phase::AccessExpired => {
                 return Err(CommandError::new(
                     "access_expired",
                     "Срок доступа уже истёк",
                 ));
             }
-            let binding_egress_mode = bootstrap
-                .binding
-                .as_ref()
-                .map(|binding| binding.egress_mode)
-                .ok_or_else(|| {
-                    CommandError::new("peer_binding_required", "Сначала выберите пир в приложении")
-                })?;
-            crate::platform::prepare_tunnel(app.clone())
-                .await
-                .map_err(CommandError::from_tunnel)?;
-            refresh_installed_applications_before_start(
-                app,
-                application,
-                bootstrap.defaults.layer,
-                bootstrap.defaults.route_mode,
-            )
-            .await?;
-            let options = ConnectOptions {
-                layer: bootstrap.defaults.layer,
-                tic_connection_mode: bootstrap.defaults.tic_connection_mode,
-                route_mode: bootstrap.defaults.route_mode,
-                egress_mode: connection_egress_mode(
-                    bootstrap.defaults.layer,
-                    bootstrap.defaults.route_mode,
-                    bootstrap.defaults.tic_connection_mode,
-                    app.state::<Arc<AppPreferenceStore>>().get(),
-                    binding_egress_mode,
-                ),
-                probes: Vec::new(),
-                allow_alternate: true,
-            };
-            let connection = if skip_probe_refresh {
-                application
-                    .start_without_probe_refresh(options, now_unix())
-                    .await
-                    .map_err(CommandError::from)?
-            } else {
-                application
-                    .start(options, now_unix())
-                    .await
-                    .map_err(CommandError::from)?
-            };
-            #[cfg(desktop)]
-            begin_desktop_tunnel_diagnostics(app, &connection.lease_id);
-            #[cfg(not(desktop))]
-            let _ = connection;
-        }
-        Phase::Connecting | Phase::Stopping | Phase::Measuring | Phase::Authenticating => {
-            return Err(CommandError::new(
-                "connection_busy",
-                "Дождитесь завершения текущего действия",
-            ));
-        }
-        Phase::SignedOut => {
-            return Err(CommandError::new(
-                "signed_out",
-                "Нужно снова войти в приложение",
-            ));
-        }
-        Phase::NeedsPeerBinding => {
-            return Err(CommandError::new(
-                "peer_binding_required",
-                "Сначала выберите пир в приложении",
-            ));
-        }
-        Phase::AccessExpired => {
-            return Err(CommandError::new(
-                "access_expired",
-                "Срок доступа уже истёк",
-            ));
-        }
-        Phase::UpdateRequired => {
-            return Err(CommandError::new(
-                "update_required",
-                "Для продолжения необходимо обновить приложение",
-            ));
+            Phase::UpdateRequired => {
+                return Err(CommandError::new(
+                    "update_required",
+                    "Для продолжения необходимо обновить приложение",
+                ));
+            }
         }
     }
     let state = application.state().await;
@@ -1024,7 +1169,14 @@ pub(crate) async fn quick_toggle(
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>();
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    Ok(AppStateResponse::new(state, warning, current_metrics))
+    let (intent_status, next_retry_at_unix) = current_connection_intent(app).await;
+    Ok(AppStateResponse::new(
+        state,
+        warning,
+        current_metrics,
+        intent_status,
+        next_retry_at_unix,
+    ))
 }
 
 #[tauri::command]
@@ -1532,7 +1684,7 @@ pub async fn app_start(
     application: State<'_, Arc<NativeApplication>>,
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     request: StartCommandRequest,
-) -> Result<Connection, CommandError> {
+) -> Result<StartCommandResponse, CommandError> {
     let device_id = request.device_id;
     let start_result = async {
         #[cfg(windows)]
@@ -1546,27 +1698,64 @@ pub async fn app_start(
             request.route_mode,
         )
         .await?;
-        application
-            .start(
-                ConnectOptions {
-                    layer: request.layer,
-                    tic_connection_mode: request.tic_connection_mode,
-                    route_mode: request.route_mode,
-                    egress_mode: request.egress_mode,
-                    probes: Vec::new(),
-                    allow_alternate: request.allow_alternate,
-                },
-                now_unix(),
-            )
-            .await
-            .map_err(CommandError::from)
+        let options = ConnectOptions {
+            layer: request.layer,
+            tic_connection_mode: request.tic_connection_mode,
+            route_mode: request.route_mode,
+            egress_mode: request.egress_mode,
+            probes: Vec::new(),
+            allow_alternate: request.allow_alternate,
+        };
+        #[cfg(not(target_os = "android"))]
+        {
+            use tauri::Manager;
+
+            let now = now_unix();
+            let bootstrap = application
+                .bootstrap(now)
+                .await
+                .map_err(CommandError::from)?;
+            if bootstrap.device.id != device_id {
+                return Err(CommandError::new(
+                    "device_mismatch",
+                    "Подключение запрошено для другого устройства",
+                ));
+            }
+            let runtime = app
+                .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+                .inner()
+                .clone();
+            if runtime.snapshot().await.status != nelomai_client_core::ConnectionIntentStatus::None
+                || nelomai_contracts::allows_new_connection_intent_operation(
+                    bootstrap.capabilities.as_ref(),
+                    now,
+                )
+            {
+                return runtime.start_or_resume(options, now).await;
+            }
+            application
+                .start(options, now)
+                .await
+                .map(StartCommandResponse::connected)
+                .map_err(CommandError::from)
+        }
+        #[cfg(target_os = "android")]
+        {
+            application
+                .start(options, now_unix())
+                .await
+                .map(StartCommandResponse::connected)
+                .map_err(CommandError::from)
+        }
     }
     .await;
     match start_result {
-        Ok(connection) => {
+        Ok(response) => {
             #[cfg(desktop)]
-            begin_desktop_tunnel_diagnostics(&app, &connection.lease_id);
-            Ok(connection)
+            if let Some(connection) = &response.connection {
+                begin_desktop_tunnel_diagnostics(&app, &connection.lease_id);
+            }
+            Ok(response)
         }
         Err(command_error) => {
             schedule_start_failure_diagnostics(
@@ -1667,8 +1856,23 @@ pub async fn app_start_saved_stray(
 pub async fn app_stop(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
-) -> Result<Connection, CommandError> {
+) -> Result<Option<Connection>, CommandError> {
     stop_connection(&app, &application).await
+}
+
+#[tauri::command]
+pub async fn app_wake_connection_intent(app: AppHandle) -> Result<(), CommandError> {
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri::Manager;
+
+        app.state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+            .wake_for_network_change()
+            .await;
+    }
+    #[cfg(target_os = "android")]
+    let _ = app;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1821,8 +2025,9 @@ pub async fn app_update_install(
 }
 
 #[tauri::command]
-pub fn app_update_restart(
+pub async fn app_update_restart(
     app: AppHandle,
+    application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<(), CommandError> {
     if !updater.ready_to_restart() {
@@ -1831,6 +2036,7 @@ pub fn app_update_restart(
             "Обновление ещё не готово к перезапуску",
         ));
     }
+    stop_for_shutdown(&app, &application).await?;
     app.restart();
 }
 
@@ -2074,6 +2280,7 @@ pub async fn app_logout(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
 ) -> Result<(), CommandError> {
+    cancel_desktop_connection_intent(&app).await;
     #[cfg(desktop)]
     prepare_desktop_logout(&app, &application, &diagnostics).await;
     let logout_result = push_registration_scheduler.logout(&app, &application).await;
@@ -2417,6 +2624,58 @@ mod tests {
 
         assert!(!json.contains("PrivateKey"));
         assert!(!json.contains("configuration"));
+    }
+
+    #[test]
+    fn connection_intent_state_projection_masks_only_recovering_as_connecting() {
+        let recovering = AppStateResponse::new(
+            CoreState {
+                phase: Phase::ServerUnavailable,
+                connection: None,
+            },
+            None,
+            None,
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+            Some(1_700_000_123),
+        );
+        let value = serde_json::to_value(recovering).unwrap();
+        assert_eq!(value["phase"], "connecting");
+        assert_eq!(value["connectionIntentStatus"], "recovering");
+        assert_eq!(value["nextRetryAtUnix"], 1_700_000_123_i64);
+
+        let blocked = AppStateResponse::new(
+            CoreState {
+                phase: Phase::Error,
+                connection: None,
+            },
+            None,
+            None,
+            nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
+            None,
+        );
+        let value = serde_json::to_value(blocked).unwrap();
+        assert_eq!(value["phase"], "error");
+        assert_eq!(value["connectionIntentStatus"], "blocked_terminal");
+        assert!(value["nextRetryAtUnix"].is_null());
+    }
+
+    #[test]
+    fn connection_intent_start_response_distinguishes_recovery_from_success() {
+        let value = serde_json::to_value(StartCommandResponse::recovering(Some(42))).unwrap();
+        assert_eq!(value["status"], "recovering");
+        assert!(value["connection"].is_null());
+        assert_eq!(value["nextRetryAtUnix"], 42);
+    }
+
+    #[test]
+    fn shutdown_stops_a_blocked_connection_even_after_core_enters_error() {
+        assert!(shutdown_requires_stop(
+            &CoreState {
+                phase: Phase::Error,
+                connection: None,
+            },
+            true,
+        ));
     }
 
     #[test]

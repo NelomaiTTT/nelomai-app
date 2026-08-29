@@ -500,7 +500,11 @@ pub enum CoreApiError {
     #[error("временная ошибка сети")]
     Retryable,
     #[error("панель отклонила запрос: {code}: {message}")]
-    Rejected { code: String, message: String },
+    Rejected {
+        code: String,
+        message: String,
+        retry_after_seconds: Option<u64>,
+    },
 }
 
 impl From<ClientApiError> for CoreApiError {
@@ -508,15 +512,35 @@ impl From<ClientApiError> for CoreApiError {
         match error {
             ClientApiError::Transport(_) => Self::Retryable,
             ClientApiError::Api { code, message, .. } if code == "invalid_credentials" => {
-                Self::Rejected { code, message }
+                Self::Rejected {
+                    code,
+                    message,
+                    retry_after_seconds: None,
+                }
             }
             ClientApiError::Api { status, .. } if status.as_u16() == 401 => Self::Unauthorized,
             ClientApiError::Api { code, .. } if code == "access_expired" => Self::AccessExpired,
-            ClientApiError::Api { code, message, .. } if code == "configuration_fetch_failed" => {
-                Self::Rejected { code, message }
-            }
+            ClientApiError::Api {
+                code,
+                message,
+                retry_after_seconds,
+                ..
+            } if preserves_structured_recovery_error(&code) => Self::Rejected {
+                code,
+                message,
+                retry_after_seconds,
+            },
             ClientApiError::Api { status, .. } if status.is_server_error() => Self::Retryable,
-            ClientApiError::Api { code, message, .. } => Self::Rejected { code, message },
+            ClientApiError::Api {
+                code,
+                message,
+                retry_after_seconds,
+                ..
+            } => Self::Rejected {
+                code,
+                message,
+                retry_after_seconds,
+            },
             ClientApiError::InvalidErrorResponse { status } if status.is_server_error() => {
                 Self::Retryable
             }
@@ -524,15 +548,24 @@ impl From<ClientApiError> for CoreApiError {
             | ClientApiError::PayloadTooLarge { code, .. } => Self::Rejected {
                 code: code.to_string(),
                 message: "Панель вернула некорректные данные split-tunnel.".to_string(),
+                retry_after_seconds: None,
             },
             ClientApiError::InvalidBaseUrl(_)
             | ClientApiError::InvalidAppVersion(_)
             | ClientApiError::InvalidErrorResponse { .. } => Self::Rejected {
                 code: "invalid_client_api_response".to_string(),
                 message: "Панель вернула некорректный ответ.".to_string(),
+                retry_after_seconds: None,
             },
         }
     }
+}
+
+fn preserves_structured_recovery_error(code: &str) -> bool {
+    matches!(
+        code,
+        "configuration_fetch_failed" | "connection_stall_verification_unavailable"
+    )
 }
 
 #[async_trait]
@@ -1002,6 +1035,29 @@ where
             .await
             .as_ref()
             .map(|episode| episode.options.clone())
+    }
+
+    pub fn connection_recovery_transport(
+        &self,
+        lease_id: &str,
+    ) -> Result<RecoveryTransport, CoreError> {
+        let stored = self.load_auth()?;
+        let saved = stored
+            .saved_connection
+            .as_ref()
+            .into_iter()
+            .chain(stored.pinned_connection.as_ref())
+            .find(|saved| saved.lease_id == lease_id)
+            .ok_or(CoreError::SavedConnectionUnavailable)?;
+        Ok(
+            if TunnelConfiguration::new(saved.configuration.clone()).transport()
+                == TunnelTransport::AmneziaWg3
+            {
+                RecoveryTransport::AmneziaWg3
+            } else {
+                RecoveryTransport::Other
+            },
+        )
     }
 
     pub async fn reconcile_external_tunnel_state(&self) -> CoreState {
@@ -1490,6 +1546,7 @@ where
             let error = CoreError::Api(CoreApiError::Rejected {
                 code: "invalid_client_api_response".to_string(),
                 message: "Панель вернула подключение с другими параметрами.".to_string(),
+                retry_after_seconds: None,
             });
             let compensation_error = self
                 .compensate_failed_start(
@@ -1957,6 +2014,7 @@ where
             return Err(CoreError::Api(CoreApiError::Rejected {
                 code: "connection_release_failed".to_string(),
                 message: "Панель ещё не завершила предыдущее подключение.".to_string(),
+                retry_after_seconds: None,
             }));
         }
         if matches!(plan, StallRecoveryPlan::ReplaceDynamic { .. }) {
@@ -3142,6 +3200,7 @@ mod tests {
             request_id: "req".to_string(),
             code: "access_expired".to_string(),
             message: "expired".to_string(),
+            retry_after_seconds: None,
         };
         assert_eq!(CoreApiError::from(error), CoreApiError::AccessExpired);
     }
@@ -3153,6 +3212,7 @@ mod tests {
             request_id: "req".to_string(),
             code: "invalid_credentials".to_string(),
             message: "Неверный логин или пароль.".to_string(),
+            retry_after_seconds: None,
         };
 
         assert_eq!(
@@ -3160,6 +3220,7 @@ mod tests {
             CoreApiError::Rejected {
                 code: "invalid_credentials".to_string(),
                 message: "Неверный логин или пароль.".to_string(),
+                retry_after_seconds: None,
             },
         );
     }
@@ -3171,6 +3232,7 @@ mod tests {
             request_id: "req".to_string(),
             code: "invalid_access_token".to_string(),
             message: "Недействительный токен доступа.".to_string(),
+            retry_after_seconds: None,
         };
 
         assert_eq!(CoreApiError::from(error), CoreApiError::Unauthorized);
@@ -3183,12 +3245,14 @@ mod tests {
             request_id: "req".to_string(),
             code: "connection_active".to_string(),
             message: "Сначала остановите текущее подключение.".to_string(),
+            retry_after_seconds: None,
         };
         assert_eq!(
             CoreApiError::from(error),
             CoreApiError::Rejected {
                 code: "connection_active".to_string(),
                 message: "Сначала остановите текущее подключение.".to_string(),
+                retry_after_seconds: None,
             },
         );
     }
@@ -3200,6 +3264,7 @@ mod tests {
             request_id: "req".to_string(),
             code: "configuration_fetch_failed".to_string(),
             message: "Не удалось получить конфигурацию. Повторите попытку.".to_string(),
+            retry_after_seconds: None,
         };
 
         assert_eq!(
@@ -3207,8 +3272,45 @@ mod tests {
             CoreApiError::Rejected {
                 code: "configuration_fetch_failed".to_string(),
                 message: "Не удалось получить конфигурацию. Повторите попытку.".to_string(),
+                retry_after_seconds: None,
             },
         );
+    }
+
+    #[test]
+    fn structured_recovery_service_error_keeps_its_stable_code() {
+        let error = ClientApiError::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            request_id: "req".to_string(),
+            code: "connection_stall_verification_unavailable".to_string(),
+            message: "Retry later".to_string(),
+            retry_after_seconds: None,
+        };
+
+        assert!(matches!(
+            CoreApiError::from(error),
+            CoreApiError::Rejected { ref code, .. }
+                if code == "connection_stall_verification_unavailable"
+        ));
+    }
+
+    #[test]
+    fn structured_rate_limit_keeps_bounded_retry_after() {
+        let error = ClientApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            request_id: "req".to_string(),
+            code: "connection_stall_recycle_rate_limited".to_string(),
+            message: "Retry later".to_string(),
+            retry_after_seconds: Some(120),
+        };
+
+        assert!(matches!(
+            CoreApiError::from(error),
+            CoreApiError::Rejected {
+                retry_after_seconds: Some(120),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3216,6 +3318,7 @@ mod tests {
         let error = CoreApiError::Rejected {
             code: "critical_update_required".to_string(),
             message: "Для подключения необходимо обновить приложение.".to_string(),
+            retry_after_seconds: None,
         };
 
         assert!(matches!(CoreError::from(error), CoreError::UpdateRequired));

@@ -485,6 +485,7 @@ impl CoreApi for MockApi {
             return Err(CoreApiError::Rejected {
                 code: "connection_not_pinnable".to_string(),
                 message: "Подключение нельзя закрепить.".to_string(),
+                retry_after_seconds: None,
             });
         }
         Ok(ConnectionOperationResponse {
@@ -2011,6 +2012,7 @@ async fn finished_tic_start_operation_is_replaced_once() {
         .push_back(CoreApiError::Rejected {
             code: "connection_no_longer_active".to_string(),
             message: "Это подключение уже завершено. Начните новое.".to_string(),
+            retry_after_seconds: None,
         });
     let store = Arc::new(MemoryStore::new(auth()));
     let logger = Arc::new(MemoryLogger::default());
@@ -2053,6 +2055,7 @@ async fn finished_stray_start_operation_is_replaced_once() {
         .push_back(CoreApiError::Rejected {
             code: "connection_no_longer_active".to_string(),
             message: "Это подключение уже завершено. Начните новое.".to_string(),
+            retry_after_seconds: None,
         });
     let store = Arc::new(MemoryStore::new(auth()));
     let logger = Arc::new(MemoryLogger::default());
@@ -2087,6 +2090,7 @@ async fn configuration_fetch_failure_does_not_retry_a_finished_operation() {
         .push_back(CoreApiError::Rejected {
             code: "configuration_fetch_failed".to_string(),
             message: "Не удалось получить конфигурацию. Повторите попытку.".to_string(),
+            retry_after_seconds: None,
         });
     let store = Arc::new(MemoryStore::new(auth()));
     let core = ClientCore::new(
@@ -3330,6 +3334,7 @@ async fn connection_intent_stalled_stop_retry_reuses_its_operation_id() {
     *api.stop_error.lock().unwrap() = Some(CoreApiError::Rejected {
         code: "connection_stall_recycle_rate_limited".to_string(),
         message: "Retry later".to_string(),
+        retry_after_seconds: Some(120),
     });
     let tunnel = Arc::new(MemoryTunnel::default());
     tunnel.metrics_supported.store(true, Ordering::SeqCst);

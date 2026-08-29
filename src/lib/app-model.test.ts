@@ -5,8 +5,12 @@ import {
   bindingRequest,
   connectionEgressMode,
   defaultRouteModeForLayer,
+  hasSecondaryStop,
+  primaryAction,
+  recoveryCopy,
   requiresServerProbes,
   viewForPhase,
+  viewForAppState,
   type Bootstrap,
   type BootstrapDefaults,
   type Connection,
@@ -152,5 +156,43 @@ describe("connectionEgressMode", () => {
     expect(connectionEgressMode("tic", "standalone", "personal", preferences)).toBe(
       "ipv4",
     );
+  });
+});
+
+describe("connection intent recovery", () => {
+  it("keeps Stop available while the native coordinator is recovering", () => {
+    expect(
+      primaryAction({
+        phase: "connecting",
+        connectionIntentStatus: "recovering",
+      }),
+    ).toBe("stop");
+    expect(recoveryCopy("recovering")).not.toContain("Старт ещё раз");
+  });
+
+  it("keeps Stop available for a legacy connection still being established", () => {
+    expect(
+      primaryAction({
+        phase: "connecting",
+        connectionIntentStatus: "none",
+      }),
+    ).toBe("stop");
+  });
+
+  it("offers an explicit retry or stop after terminal recovery", () => {
+    expect(
+      primaryAction({
+        phase: "error",
+        connectionIntentStatus: "blocked_terminal",
+      }),
+    ).toBe("retry");
+    expect(recoveryCopy("blocked_terminal")).toContain("Повторить");
+    expect(
+      viewForAppState({
+        phase: "error",
+        connectionIntentStatus: "blocked_terminal",
+      }),
+    ).toBe("connection");
+    expect(hasSecondaryStop({ connectionIntentStatus: "blocked_terminal" })).toBe(true);
   });
 });

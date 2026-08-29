@@ -15,7 +15,11 @@
     bindingRequest,
     connectionEgressMode,
     defaultRouteModeForLayer,
+    hasSecondaryStop,
+    primaryAction,
+    recoveryCopy,
     requiresServerProbes,
+    viewForAppState,
     viewForPhase,
     type AppView,
     type AppPreferences,
@@ -23,6 +27,7 @@
     type EgressMode,
     type Bootstrap,
     type Connection,
+    type ConnectionIntentStatus,
     type ConnectionMetrics,
     type Layer,
     type PeerOption,
@@ -64,6 +69,15 @@
   let probeBusy = $state(false);
   let availableCandidates = $state(0);
   let connection = $state<Connection | null>(null);
+  let connectionIntentStatus = $state<ConnectionIntentStatus>("none");
+  let nextRetryAtUnix = $state<number | null>(null);
+  let connectionAction = $derived(
+    primaryAction({ phase, connectionIntentStatus }),
+  );
+  let connectionHasSecondaryStop = $derived(
+    hasSecondaryStop({ connectionIntentStatus }),
+  );
+  let connectionRecoveryCopy = $derived(recoveryCopy(connectionIntentStatus));
   let connectionMetrics = $state<ConnectionMetrics | null>(null);
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
@@ -196,6 +210,7 @@
     }, 60_000);
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
+        void nativeClient.wakeConnectionIntent();
         void synchronizeRuntimeState();
         void refreshProbes();
         if (bootstrap) {
@@ -205,6 +220,10 @@
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
+    const handleOnline = () => {
+      void nativeClient.wakeConnectionIntent();
+    };
+    window.addEventListener("online", handleOnline);
     const handleHistoryChange = () => {
       const overlay = overlayFromHistoryState(window.history.state);
       splitTunnelOpen = overlay === "split_tunnel" && splitTunnelState !== null;
@@ -219,6 +238,7 @@
       if (startupTimer !== null) window.clearTimeout(startupTimer);
       if (startupKickoffTimer !== null) window.clearTimeout(startupKickoffTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("online", handleOnline);
       window.removeEventListener("popstate", handleHistoryChange);
       clearUpdateTimer();
       nativeStateUnlisten?.();
@@ -324,15 +344,18 @@
       if (!current) return;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
+      connectionIntentStatus = current.connectionIntentStatus;
+      nextRetryAtUnix = current.nextRetryAtUnix;
       if (current.phase === phase) {
         connection = current.connection;
         return;
       }
       phase = current.phase;
       connection = current.connection;
-      view = viewForPhase(current.phase);
+      view = viewForAppState(current);
       if (
         (previous === "connected" || previous === "connecting") &&
+        current.connectionIntentStatus === "none" &&
         current.phase !== "connected" &&
         current.phase !== "connecting" &&
         current.phase !== "stopping"
@@ -410,9 +433,11 @@
     const state = await nativeClient.state();
     phase = state.phase;
     connection = state.connection;
+    connectionIntentStatus = state.connectionIntentStatus;
+    nextRetryAtUnix = state.nextRetryAtUnix;
     connectionMetrics = state.metrics;
     runtimeWarning = state.warning;
-    view = viewForPhase(state.phase);
+    view = viewForAppState(state);
     await loadSplitTunnel(false);
     if (state.phase === "ready") void refreshProbes();
   }
@@ -479,13 +504,13 @@
     }
   }
 
-  async function toggleConnection() {
+  async function toggleConnection(forceStop = false) {
     if (busy) return;
-    if (phase !== "connected" && splitTunnelBlocksStart) {
+    if (!forceStop && connectionAction === "start" && splitTunnelBlocksStart) {
       showOverlay("split_tunnel");
       return;
     }
-    const stopping = phase === "connected" || phase === "stopping";
+    const stopping = forceStop || connectionAction === "stop";
     const startDeviceId = bootstrap?.device.id;
     if (!stopping && !startDeviceId) return;
     let shouldReportStartFailure = !stopping;
@@ -495,6 +520,8 @@
       if (stopping) {
         connection = await nativeClient.stop();
         connectionMetrics = null;
+        connectionIntentStatus = "none";
+        nextRetryAtUnix = null;
         phase = "ready";
       } else {
         if (!startDeviceId) return;
@@ -504,7 +531,7 @@
         await syncBindingPreferences();
         const effectiveTicConnectionMode =
           selectedLayer === "stray" ? "dynamic" : ticConnectionMode;
-        connection = await nativeClient.start({
+        const startResult = await nativeClient.start({
           deviceId: startDeviceId,
           layer: selectedLayer,
           ticConnectionMode: effectiveTicConnectionMode,
@@ -512,9 +539,12 @@
           egressMode: selectedEgressMode,
           allowAlternate: true,
         });
+        connection = startResult.connection;
+        connectionIntentStatus = startResult.status === "recovering" ? "recovering" : "none";
+        nextRetryAtUnix = startResult.nextRetryAtUnix;
         antivirusStartFailure = false;
         shouldReportStartFailure = false;
-        phase = "connected";
+        phase = startResult.status === "connected" ? "connected" : "connecting";
       }
       view = "connection";
       const current = await nativeClient.state();
@@ -534,14 +564,19 @@
       const current = await nativeClient.state().catch(() => null);
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
+      connectionIntentStatus = current?.connectionIntentStatus ?? connectionIntentStatus;
+      nextRetryAtUnix = current?.nextRetryAtUnix ?? nextRetryAtUnix;
       connectionMetrics = current?.metrics ?? connectionMetrics;
       runtimeWarning = current?.warning ?? runtimeWarning;
-      error = commandMessage(reason, stopping ? "stop" : "start", {
-        personalPeer:
-          !stopping &&
-          selectedLayer === "tic" &&
-          ticConnectionMode === "personal",
-      });
+      error =
+        failureCode === "connection_intent_cancelled"
+          ? null
+          : commandMessage(reason, stopping ? "stop" : "start", {
+              personalPeer:
+                !stopping &&
+                selectedLayer === "tic" &&
+                ticConnectionMode === "personal",
+            });
       if (
         failureCode === "defender_exclusion_missing" ||
         failureCode === "amneziawg_component_missing" ||
@@ -932,8 +967,10 @@
       if (current) {
         phase = current.phase;
         connection = current.connection;
+        connectionIntentStatus = current.connectionIntentStatus;
+        nextRetryAtUnix = current.nextRetryAtUnix;
         connectionMetrics = current.metrics;
-        view = viewForPhase(current.phase);
+        view = viewForAppState(current);
       }
       await loadSplitTunnel(false);
       throw reason;
@@ -1219,10 +1256,14 @@
           <div>
             <p class="eyebrow">Подключение</p>
             <h1>
-              {phase === "connected"
+              {connectionIntentStatus === "recovering"
+                ? "Восстанавливаем подключение"
+                : connectionIntentStatus === "blocked_terminal"
+                  ? "Нужно ваше действие"
+                : phase === "connected"
                 ? "Интернет защищён"
                 : phase === "connecting"
-                  ? "Восстанавливаем подключение"
+                  ? "Подключаемся"
                 : phase === "stopping"
                   ? "Завершаем подключение"
                   : "Готово к запуску"}
@@ -1230,36 +1271,51 @@
           </div>
 
           <button
-            class:stop={phase === "connected" || phase === "stopping"}
+            class:stop={connectionAction === "stop"}
             class="connect-button"
             type="button"
-            onclick={toggleConnection}
+            onclick={() => toggleConnection()}
             disabled={busy ||
-              phase === "connecting" ||
-              (!splitTunnelLoaded &&
-                phase !== "connected" &&
-                phase !== "stopping") ||
-              (splitTunnelBlocksStart &&
-                phase !== "connected" &&
-                phase !== "stopping")}
+              (connectionAction === "start" &&
+                (!splitTunnelLoaded || splitTunnelBlocksStart))}
           >
             <span>
-              {phase === "connected"
+              {connectionAction === "stop"
                 ? "Стоп"
-                : phase === "connecting"
-                  ? "Подключаемся"
-                : phase === "stopping"
+                : connectionAction === "retry"
                   ? "Повторить"
                   : "Старт"}
             </span>
             <small>
               {busy
                 ? phaseLabels[phase]
-                : phase === "stopping"
-                  ? "Завершить отключение"
+                : connectionAction === "stop"
+                  ? "Остановить и отменить повторы"
+                  : connectionAction === "retry"
+                    ? "Возобновить восстановление"
                   : "Нажмите для переключения"}
             </small>
           </button>
+
+          {#if connectionHasSecondaryStop}
+            <button
+              class="secondary-button blocked-stop-button"
+              type="button"
+              onclick={() => toggleConnection(true)}
+              disabled={busy}
+            >
+              Стоп
+            </button>
+          {/if}
+
+          {#if connectionRecoveryCopy}
+            <p class:warning-message={connectionIntentStatus === "blocked_terminal"}>
+              {connectionRecoveryCopy}
+              {#if connectionIntentStatus === "recovering" && nextRetryAtUnix !== null}
+                Следующая попытка запланирована автоматически.
+              {/if}
+            </p>
+          {/if}
 
           {#if phase === "connected"}
             <dl class="connection-metrics" aria-label="Показатели подключения">
@@ -1313,6 +1369,7 @@
 
           <fieldset
             disabled={busy ||
+              connectionIntentStatus !== "none" ||
               phase === "connecting" ||
               phase === "connected" ||
               phase === "stopping"}
@@ -1347,6 +1404,7 @@
                 bind:value={ticConnectionMode}
                 onchange={refreshProbes}
                 disabled={busy ||
+                  connectionIntentStatus !== "none" ||
                   phase === "connecting" ||
                   phase === "connected" ||
                   phase === "stopping"}
@@ -1361,6 +1419,7 @@
                 bind:value={routeMode}
                 onchange={refreshProbes}
                 disabled={busy ||
+                  connectionIntentStatus !== "none" ||
                   phase === "connecting" ||
                   phase === "connected" ||
                   phase === "stopping"}
@@ -1376,6 +1435,7 @@
                   value={selectedEgressMode}
                   onchange={setTicEgressMode}
                   disabled={busy ||
+                    connectionIntentStatus !== "none" ||
                     phase === "connecting" ||
                     phase === "connected" ||
                     phase === "stopping"}
@@ -1413,6 +1473,7 @@
                 value={appPreferences.dnsProvider}
                 onchange={setDnsProvider}
                 disabled={busy ||
+                  connectionIntentStatus !== "none" ||
                   phase === "connecting" ||
                   phase === "connected" ||
                   phase === "stopping"}
@@ -1845,6 +1906,10 @@
     color: #effaf8;
     border: 1px solid #3a8075;
     background: #173d38;
+  }
+
+  .blocked-stop-button {
+    width: 100%;
   }
 
   .quiet-button {

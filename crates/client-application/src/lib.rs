@@ -865,6 +865,81 @@ where
         self.core.start(options, now_unix).await.map_err(Into::into)
     }
 
+    #[cfg(not(target_os = "android"))]
+    pub async fn connection_intent_attempt(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        options = options.normalized_for_layer();
+        options.probes = if options.layer == Layer::Tic
+            && options.tic_connection_mode == TicConnectionMode::Personal
+        {
+            Vec::new()
+        } else {
+            match self
+                .refresh_probes(options.layer, options.egress_mode, now_unix)
+                .await
+            {
+                Ok(results) => results.probes,
+                Err(_) => self
+                    .cached_probes(options.layer, options.egress_mode, now_unix)
+                    .map(|results| results.probes)
+                    .unwrap_or_default(),
+            }
+        };
+        self.core
+            .connection_intent_attempt(options, now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn compensate_stale_connection_intent_result(&self) -> Result<(), ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core
+            .compensate_stale_connection_intent_result()
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn replace_stalled_connection(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        options = options.normalized_for_layer();
+        options.probes = if options.layer == Layer::Tic
+            && options.tic_connection_mode == TicConnectionMode::Personal
+        {
+            Vec::new()
+        } else {
+            self.refresh_probes(options.layer, options.egress_mode, now_unix)
+                .await?
+                .probes
+        };
+        self.core
+            .replace_stalled_connection(options, now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn active_recovery_options(&self) -> Option<ConnectOptions> {
+        self.core.active_recovery_options().await
+    }
+
+    pub fn connection_recovery_transport(
+        &self,
+        lease_id: &str,
+    ) -> Result<nelomai_client_core::RecoveryTransport, ApplicationError> {
+        self.core
+            .connection_recovery_transport(lease_id)
+            .map_err(Into::into)
+    }
+
     pub async fn refresh_probes(
         &self,
         layer: Layer,

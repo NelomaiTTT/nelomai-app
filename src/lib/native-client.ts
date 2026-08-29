@@ -14,6 +14,7 @@ import type {
   Layer,
   DnsProvider,
   StartCommandRequest,
+  StartCommandResponse,
   TicConnectionMode,
   UpdateStatus,
 } from "./app-model";
@@ -158,10 +159,11 @@ export function createNativeClient(
         errorCode,
       }) as Promise<void>,
     start: (request: StartCommandRequest) =>
-      invoke("app_start", { request }) as Promise<Connection>,
+      invoke("app_start", { request }) as Promise<StartCommandResponse>,
     startSavedStray: () =>
       invoke("app_start_saved_stray") as Promise<string>,
-    stop: () => invoke("app_stop") as Promise<Connection>,
+    stop: () => invoke("app_stop") as Promise<Connection | null>,
+    wakeConnectionIntent: () => invoke("app_wake_connection_intent") as Promise<void>,
     pinStray: () => invoke("app_pin_stray") as Promise<Connection>,
     unpinStray: (leaseId: string) =>
       invoke("app_unpin_stray", {

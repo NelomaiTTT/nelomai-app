@@ -124,6 +124,13 @@ async fn refresh_tray(app: &AppHandle) {
     let application = app.state::<Arc<NativeApplication>>().inner().clone();
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>().inner().clone();
     let state = application.state().await;
+    let intent = app
+        .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+        .snapshot()
+        .await;
+    let disconnect_action = state.phase == Phase::Connected
+        || matches!(state.phase, Phase::Connecting | Phase::Stopping)
+        || intent.status != nelomai_client_core::ConnectionIntentStatus::None;
     let presentation = if state.phase == Phase::Connected {
         metrics.mark_observed().await;
         let traffic_text = match state.connection.as_ref() {
@@ -143,6 +150,11 @@ async fn refresh_tray(app: &AppHandle) {
         TrayPresentation {
             toggle_text: "Отключить VPN",
             traffic_text,
+        }
+    } else if disconnect_action {
+        TrayPresentation {
+            toggle_text: "Отключить VPN",
+            traffic_text: "Трафик сессии: подключение восстанавливается".to_string(),
         }
     } else {
         TrayPresentation {
@@ -239,10 +251,15 @@ fn toggle_connection(app: AppHandle) {
     }
     tauri::async_runtime::spawn(async move {
         let application = app.state::<Arc<NativeApplication>>().inner().clone();
+        let intent = app
+            .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+            .snapshot()
+            .await;
         let action = if matches!(
             application.state().await.phase,
             Phase::Connected | Phase::Stopping
-        ) {
+        ) || intent.status != nelomai_client_core::ConnectionIntentStatus::None
+        {
             "stop"
         } else {
             "start"

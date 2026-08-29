@@ -26,6 +26,8 @@ export type TicConnectionMode = "personal" | "dynamic";
 export type RouteMode = "standalone" | "via_tak";
 export type EgressMode = "ipv4" | "prefer_ipv6";
 export type Platform = "android" | "windows" | "macos" | "linux";
+export type ConnectionIntentStatus = "none" | "recovering" | "blocked_terminal";
+export type PrimaryConnectionAction = "start" | "stop" | "retry";
 
 export interface Access {
   state: "active" | "expired";
@@ -114,6 +116,13 @@ export interface Bootstrap {
   pinned_stray: Connection | null;
   defaults: BootstrapDefaults;
   update: UpdateState;
+  capabilities: ConnectionIntentCapability | null;
+}
+
+export interface ConnectionIntentCapability {
+  revision: number;
+  expires_at: string;
+  connection_intent_recovery_v1: boolean;
 }
 
 export interface PeerOption {
@@ -138,8 +147,36 @@ export interface PeerOptions {
 export interface AppState {
   phase: Phase;
   connection: Connection | null;
+  connectionIntentStatus: ConnectionIntentStatus;
+  nextRetryAtUnix: number | null;
   warning: string | null;
   metrics: ConnectionMetrics | null;
+}
+
+export function primaryAction(state: {
+  phase: Phase;
+  connectionIntentStatus: ConnectionIntentStatus;
+}): PrimaryConnectionAction {
+  if (state.connectionIntentStatus === "recovering") return "stop";
+  if (state.connectionIntentStatus === "blocked_terminal") return "retry";
+  return ["connecting", "connected", "stopping"].includes(state.phase) ? "stop" : "start";
+}
+
+export function hasSecondaryStop(state: {
+  connectionIntentStatus: ConnectionIntentStatus;
+}): boolean {
+  return state.connectionIntentStatus === "blocked_terminal";
+}
+
+export function recoveryCopy(status: ConnectionIntentStatus): string {
+  switch (status) {
+    case "recovering":
+      return "Сеть пока недоступна. Следующая попытка будет выполнена автоматически.";
+    case "blocked_terminal":
+      return "Автоматическое восстановление остановлено. Нажмите «Повторить» или «Стоп».";
+    default:
+      return "";
+  }
 }
 
 export interface ConnectionMetrics {
@@ -174,6 +211,12 @@ export interface StartCommandRequest {
   routeMode: RouteMode;
   egressMode: EgressMode;
   allowAlternate: boolean;
+}
+
+export interface StartCommandResponse {
+  status: "connected" | "recovering";
+  connection: Connection | null;
+  nextRetryAtUnix: number | null;
 }
 
 export interface ProbeResults {
@@ -214,6 +257,12 @@ export function viewForPhase(phase: Phase): AppView {
     default:
       return "connection";
   }
+}
+
+export function viewForAppState(
+  state: Pick<AppState, "phase" | "connectionIntentStatus">,
+): AppView {
+  return state.connectionIntentStatus === "none" ? viewForPhase(state.phase) : "connection";
 }
 
 export function bindingRequest(

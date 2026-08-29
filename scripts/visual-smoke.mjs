@@ -45,6 +45,7 @@ const bootstrap = {
     required: false,
     release_notes: null,
   },
+  capabilities: null,
 };
 
 const peers = {
@@ -181,7 +182,30 @@ async function capture(name, viewport, scenario) {
             return fixture;
           }
           if (command === "app_state") {
-            return { phase: "ready", connection: null };
+            return {
+              phase: "ready",
+              connection: null,
+              connectionIntentStatus: "none",
+              nextRetryAtUnix: null,
+              warning: null,
+              metrics: null,
+            };
+          }
+          if (command === "app_start") {
+            return {
+              status: "connected",
+              connection: {
+                lease_id: "preview-lease",
+                layer: "stray",
+                tic_connection_mode: "dynamic",
+                route_mode: "standalone",
+                egress_mode: "ipv4",
+                status: "connected",
+                pinned: false,
+                stopped_at: null,
+              },
+              nextRetryAtUnix: null,
+            };
           }
           if (command === "app_preferences") {
             return {
