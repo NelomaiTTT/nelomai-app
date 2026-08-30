@@ -12,6 +12,9 @@ describe("overlay history", () => {
     expect(overlayFromHistoryState({ nelomaiOverlay: "notifications" })).toBe(
       "notifications",
     );
+    expect(overlayFromHistoryState({ nelomaiOverlay: "changelog" })).toBe(
+      "changelog",
+    );
     expect(overlayFromHistoryState({ nelomaiOverlay: "unknown" })).toBeNull();
     expect(overlayFromHistoryState(null)).toBeNull();
   });
@@ -20,6 +23,13 @@ describe("overlay history", () => {
     expect(historyStateForOverlay({ index: 3 }, "split_tunnel")).toEqual({
       index: 3,
       nelomaiOverlay: "split_tunnel",
+    });
+  });
+
+  it("creates history state for the changelog overlay", () => {
+    expect(historyStateForOverlay({ index: 5 }, "changelog")).toEqual({
+      index: 5,
+      nelomaiOverlay: "changelog",
     });
   });
 });

@@ -70,6 +70,23 @@ The package signing certificate is provisioned in GitHub Secrets. Its SHA-256
 fingerprint is authenticated by the signed release manifest; it is not trusted
 from the APK alone.
 
+## In-app changelog
+
+The bundled changelog starts with version `0.2.13` and is maintained in
+`src/lib/changelog.ts`. Entries are ordered newest first and contain concise
+Russian descriptions of changes that matter to users.
+
+After a push, update the pending version only when the pushed result changes
+observable application behavior. Merge changes of the same nature into the
+existing item instead of adding near-duplicates. Do not add separate items for
+workflow/build fixes, test-only changes, refactoring, implementation plans,
+documentation, or other internal work without a user-visible result.
+
+Freeze the entry when its version is released. Later user-visible changes are
+collected under the next version rather than rewriting a published entry.
+Avoid implementation details, internal component names, incident identifiers,
+and claims about functionality that is not yet present in the release branch.
+
 ## Release gates
 
 - Version `0.1.4` is the one-time updater bridge and must be installed manually

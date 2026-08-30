@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import ChangelogPanel from "$lib/ChangelogPanel.svelte";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
+  import { CHANGELOG } from "$lib/changelog";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
   import { clearOwnedConnectionIntentNotice } from "$lib/connection-intent-notice";
   import {
@@ -115,6 +117,7 @@
   let notificationNextCursor = $state<number | null>(null);
   let notificationHistoryExpanded = $state(false);
   let notificationsOpen = $state(false);
+  let changelogOpen = $state(false);
   let notificationsBusy = $state(false);
   let notificationsError = $state<string | null>(null);
   let appPreferences = $state<AppPreferences | null>(null);
@@ -250,9 +253,12 @@
     };
     window.addEventListener("online", handleOnline);
     const handleHistoryChange = () => {
-      const overlay = overlayFromHistoryState(window.history.state);
+      const overlay = bootstrap
+        ? overlayFromHistoryState(window.history.state)
+        : null;
       splitTunnelOpen = overlay === "split_tunnel" && splitTunnelState !== null;
       notificationsOpen = overlay === "notifications";
+      changelogOpen = overlay === "changelog";
     };
     window.addEventListener("popstate", handleHistoryChange);
     return () => {
@@ -272,6 +278,7 @@
   });
 
   function showOverlay(overlay: AppOverlay) {
+    if (!bootstrap) return;
     if (overlayFromHistoryState(window.history.state) !== overlay) {
       window.history.pushState(
         historyStateForOverlay(window.history.state, overlay),
@@ -280,6 +287,7 @@
     }
     splitTunnelOpen = overlay === "split_tunnel";
     notificationsOpen = overlay === "notifications";
+    changelogOpen = overlay === "changelog";
   }
 
   function closeOverlay(overlay: AppOverlay) {
@@ -288,7 +296,8 @@
       return;
     }
     if (overlay === "split_tunnel") splitTunnelOpen = false;
-    else notificationsOpen = false;
+    else if (overlay === "notifications") notificationsOpen = false;
+    else changelogOpen = false;
   }
 
   async function loadAppPreferences() {
@@ -786,6 +795,7 @@
       notificationNextCursor = null;
       notificationHistoryExpanded = false;
       notificationsOpen = false;
+      changelogOpen = false;
       clearUpdateTimer();
       phase = "signed_out";
       view = "sign_in";
@@ -842,6 +852,10 @@
   async function openNotifications() {
     showOverlay("notifications");
     await refreshNotifications(false);
+  }
+
+  function openChangelog() {
+    showOverlay("changelog");
   }
 
   async function markNotificationRead(messageId: number) {
@@ -1067,6 +1081,11 @@
         <span aria-hidden="true"></span>
         {phaseLabels[phase]}
       </span>
+      {#if bootstrap}
+        <button class="quiet-button" type="button" onclick={openChangelog}>
+          Что нового
+        </button>
+      {/if}
       {#if view !== "loading" && view !== "sign_in"}
         <button
           class="quiet-button notification-button"
@@ -1675,6 +1694,13 @@
     onread={markNotificationRead}
     onreadall={markAllNotificationsRead}
     onloadmore={() => refreshNotifications(true)}
+  />
+{/if}
+
+{#if changelogOpen}
+  <ChangelogPanel
+    entries={CHANGELOG}
+    onclose={() => closeOverlay("changelog")}
   />
 {/if}
 
@@ -2340,7 +2366,7 @@
       width: 100%;
       order: 2;
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 8px;
     }
 

@@ -1,11 +1,13 @@
-export type AppOverlay = "split_tunnel" | "notifications";
+export type AppOverlay = "split_tunnel" | "notifications" | "changelog";
 
 const OVERLAY_HISTORY_KEY = "nelomaiOverlay";
 
 export function overlayFromHistoryState(state: unknown): AppOverlay | null {
   if (!state || typeof state !== "object") return null;
   const overlay = (state as Record<string, unknown>)[OVERLAY_HISTORY_KEY];
-  return overlay === "split_tunnel" || overlay === "notifications"
+  return overlay === "split_tunnel" ||
+    overlay === "notifications" ||
+    overlay === "changelog"
     ? overlay
     : null;
 }

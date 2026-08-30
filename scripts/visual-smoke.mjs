@@ -112,6 +112,11 @@ try {
     headless: true,
   });
   await capture("sign-in", { width: 390, height: 844 }, "signed_out");
+  await capture(
+    "bootstrap-error",
+    { width: 390, height: 844 },
+    "server-unavailable",
+  );
   await capture("peers-mobile", { width: 390, height: 844 }, "peers");
   await capture("connection-mobile", { width: 390, height: 844 }, "connection");
   await capture("personal-tic-mobile", { width: 390, height: 844 }, "personal-tic");
@@ -144,6 +149,12 @@ async function capture(name, viewport, scenario) {
               throw {
                 code: "signed_out",
                 message: "Нужно снова войти в приложение",
+              };
+            }
+            if (currentScenario === "server-unavailable") {
+              throw {
+                code: "server_unavailable",
+                message: "Панель временно недоступна",
               };
             }
             if (currentScenario === "peers") {
@@ -259,7 +270,7 @@ async function capture(name, viewport, scenario) {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.waitForTimeout(100);
-  if (scenario !== "signed_out") {
+  if (scenario !== "signed_out" && scenario !== "server-unavailable") {
     await page.waitForFunction(
       () =>
         (window.__TAURI_CALLS__ ?? []).some(
@@ -294,6 +305,13 @@ async function capture(name, viewport, scenario) {
   if (scenario === "signed_out") {
     await page.getByRole("heading", { name: "Вход в Nelomai" }).waitFor();
     await page.getByRole("button", { name: "Войти" }).waitFor();
+  } else if (scenario === "server-unavailable") {
+    await page
+      .getByRole("heading", { name: "Сейчас сервис недоступен" })
+      .waitFor();
+    if (await page.getByRole("button", { name: "Что нового" }).isVisible()) {
+      throw new Error("changelog is visible without an authenticated bootstrap");
+    }
   } else if (scenario === "peers") {
     await page.getByRole("heading", { name: "Выберите пир" }).waitFor();
     const button = page.getByRole("button", { name: "Использовать этот пир" });
@@ -334,6 +352,9 @@ async function capture(name, viewport, scenario) {
     if (!(await lastCall(page, "app_pin_stray"))) {
       throw new Error("saved Stray action did not call app_pin_stray");
     }
+    if (name === "connection-desktop") {
+      await verifyChangelogLifecycle(page);
+    }
   }
 
   await page.screenshot({
@@ -341,6 +362,42 @@ async function capture(name, viewport, scenario) {
     fullPage: true,
   });
   await context.close();
+}
+
+async function verifyChangelogLifecycle(page) {
+  const opener = page.getByRole("button", { name: "Что нового" });
+  await opener.click();
+
+  const dialog = page.getByRole("dialog", { name: "Что нового" });
+  await dialog.waitFor();
+  const close = page.getByRole("button", { name: "Закрыть" });
+  if (!(await close.evaluate((element) => element === document.activeElement))) {
+    throw new Error("changelog did not move focus into the modal dialog");
+  }
+
+  await page.keyboard.press("Tab");
+  if (!(await dialog.evaluate((element) => element.contains(document.activeElement)))) {
+    throw new Error("changelog allowed focus to leave the modal dialog");
+  }
+
+  await page.screenshot({
+    path: "/tmp/nelomai-changelog-desktop.png",
+    fullPage: true,
+  });
+
+  await page.keyboard.press("Escape");
+  await dialog.waitFor({ state: "hidden" });
+  if (!(await opener.evaluate((element) => element === document.activeElement))) {
+    throw new Error("changelog did not restore focus to its opener");
+  }
+
+  await page.getByRole("button", { name: "Выйти" }).click();
+  await page.getByRole("heading", { name: "Вход в Nelomai" }).waitFor();
+  await page.evaluate(() => window.history.forward());
+  await page.waitForTimeout(100);
+  if (await dialog.isVisible()) {
+    throw new Error("changelog reopened from history after logout");
+  }
 }
 
 async function lastCall(page, command) {
