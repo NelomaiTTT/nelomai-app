@@ -43,6 +43,7 @@ impl fmt::Debug for OwnedRoute {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RouteScope {
     Unscoped,
+    #[cfg(any(target_os = "macos", test))]
     InterfaceScoped,
 }
 
