@@ -12,8 +12,12 @@ use nelomai_client_application::ApplicationError;
 use nelomai_client_core::{
     classify_recovery, ConnectOptions, ConnectionIntentCoordinator, ConnectionIntentStatus,
     CoreApiError, CoreError, CoreState, IntentGeneration, Phase, RecoveryDecision,
-    RecoveryPolicyContext, RecoveryTransport, StallRecoveryPlan, StallTrigger,
-    StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome, StartDisposition,
+    RecoveryPolicyContext, StartDisposition,
+};
+#[cfg(any(target_os = "macos", test))]
+use nelomai_client_core::{
+    RecoveryTransport, StallRecoveryPlan, StallTrigger, StalledDataPlaneRecovery,
+    StalledDataPlaneRecoveryOutcome,
 };
 use nelomai_contracts::{
     allows_new_connection_intent_operation, BindPeerRequest, Connection,
@@ -343,6 +347,7 @@ impl DesktopConnectionIntent {
         woke
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) async fn handle_stall(&self, lease_id: &str) -> bool {
         let (options, generation) = {
             let state = self.state.lock().await;
@@ -410,6 +415,7 @@ impl DesktopConnectionIntent {
         true
     }
 
+    #[cfg(any(target_os = "macos", test))]
     async fn recover_current_connection_locally(
         &self,
         generation: IntentGeneration,
@@ -461,6 +467,7 @@ impl DesktopConnectionIntent {
         None
     }
 
+    #[cfg(any(target_os = "macos", test))]
     async fn accept_local_recovery(
         &self,
         generation: IntentGeneration,
@@ -1116,6 +1123,7 @@ fn connection_matches_core_state(state: &CoreState, connection: &Connection) -> 
             .is_some_and(|current| current.lease_id == connection.lease_id)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn can_begin_stall_recovery(status: ConnectionIntentStatus, armed: bool) -> bool {
     armed && status == ConnectionIntentStatus::None
 }
@@ -1133,6 +1141,7 @@ fn attempt_is_current_after_async_boundary(
     false
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn attempt_kind_for_stall_plan(plan: StallRecoveryPlan) -> AttemptKind {
     match plan {
         StallRecoveryPlan::ReplaceDynamic { .. } | StallRecoveryPlan::PreservePeer => {
@@ -1208,6 +1217,7 @@ fn initial_desktop_preflight_action(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn local_recovery_connection(
     core_state: &CoreState,
     expected_generation: IntentGeneration,
