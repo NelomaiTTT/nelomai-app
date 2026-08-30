@@ -69,6 +69,18 @@ impl RecoveryDecision {
             Self::DiscardAndCompensate => "discard_and_compensate",
         }
     }
+
+    pub const fn preserves_operation(self) -> bool {
+        matches!(
+            self,
+            Self::RetrySameOperation
+                | Self::RetryAfter(_)
+                | Self::RetryOnce
+                | Self::ReconcileThenRetry
+                | Self::ReconcileOnce
+                | Self::RestartLocalTunnel
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,7 +125,9 @@ pub fn classify_recovery(code: &str, context: RecoveryPolicyContext) -> Recovery
         | "connection_unavailable"
         | "candidate_unavailable"
         | "configuration_fetch_failed"
+        | "binding_sync_failed"
         | "connection_release_failed"
+        | "connection_stop_failed"
         | "probe_results_required"
         | "saved_connection_unavailable"
         | "saved_stray_unavailable"
@@ -122,11 +136,14 @@ pub fn classify_recovery(code: &str, context: RecoveryPolicyContext) -> Recovery
         | "endpoint_route_unavailable"
         | "physical_network_monitor_unavailable"
         | "physical_egress_unavailable"
-        | "local_networks_unavailable" => RecoveryDecision::RetrySameOperation,
+        | "local_networks_unavailable"
+        | "installed_applications_unavailable" => RecoveryDecision::RetrySameOperation,
         "connection_no_longer_active" | "tunnel_handshake_timeout" => {
             RecoveryDecision::RetryNewOperation
         }
-        "connection_stall_recycle_rate_limited" => {
+        "connection_stall_recycle_rate_limited"
+        | "operation_in_progress"
+        | "device_operation_busy" => {
             RecoveryDecision::RetryAfter(context.retry_after_seconds.unwrap_or(300).clamp(1, 900))
         }
         "service_unavailable" => {
@@ -233,6 +250,23 @@ pub(crate) fn request_fingerprint_v1(
             nelomai_contracts::TicConnectionMode::Personal => "personal",
             nelomai_contracts::TicConnectionMode::Dynamic => "dynamic",
         },
+    );
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut fingerprint = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    fingerprint
+}
+
+pub(crate) fn stalled_stop_request_fingerprint_v1(lease_id: &str) -> String {
+    let canonical = format!(
+        concat!(
+            "{{\"failure_code\":\"tunnel_data_plane_stalled\",",
+            "\"kind\":\"stalled_stop\",",
+            "\"lease_id\":\"{}\"}}"
+        ),
+        lease_id
     );
     let digest = Sha256::digest(canonical.as_bytes());
     let mut fingerprint = String::with_capacity(64);
@@ -386,13 +420,29 @@ impl ConnectionIntentCoordinator {
         true
     }
 
+    pub fn replace_active_options(
+        &mut self,
+        generation: IntentGeneration,
+        options: ConnectOptions,
+    ) -> bool {
+        if generation != self.generation
+            || self.desired.is_none()
+            || self.attempt_generation != Some(generation)
+        {
+            return false;
+        }
+        self.desired = Some(IntentTemplate::from(options.normalized_for_layer()));
+        true
+    }
+
     pub fn handle_stall(
         &mut self,
+        generation: IntentGeneration,
         trigger: StallTrigger,
     ) -> Result<StallRecoveryPlan, ConnectionIntentError> {
         let options = trigger.options.normalized_for_layer();
         let template = IntentTemplate::from(options.clone());
-        if self.desired.as_ref() != Some(&template) {
+        if generation != self.generation || self.desired.as_ref() != Some(&template) {
             return Err(ConnectionIntentError::DifferentIntentActive);
         }
         self.connected = None;

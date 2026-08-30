@@ -25,6 +25,7 @@ struct FakeApi {
     bootstrap: Mutex<Bootstrap>,
     bootstrap_calls: AtomicUsize,
     refresh_calls: AtomicUsize,
+    logout_calls: AtomicUsize,
     reject_first_bootstrap: bool,
     logout_fails: bool,
     unbind_fails: bool,
@@ -38,6 +39,7 @@ impl FakeApi {
             bootstrap: Mutex::new(bootstrap),
             bootstrap_calls: AtomicUsize::new(0),
             refresh_calls: AtomicUsize::new(0),
+            logout_calls: AtomicUsize::new(0),
             reject_first_bootstrap: false,
             logout_fails: false,
             unbind_fails: false,
@@ -182,6 +184,7 @@ impl ApplicationApi for FakeApi {
     }
 
     async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
+        self.logout_calls.fetch_add(1, Ordering::SeqCst);
         if self.logout_fails {
             Err(CoreApiError::Retryable)
         } else {
@@ -471,6 +474,71 @@ async fn logout_clears_account_and_stops_tunnel_when_server_is_unavailable() {
 }
 
 #[tokio::test]
+async fn local_logout_clears_account_without_calling_remote_revoke() {
+    let api = Arc::new(FakeApi::new(bootstrap()));
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let tunnel = Arc::new(TrackingTunnel::default());
+    let application = ClientApplication::new(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(NoopLogger),
+    );
+
+    application.logout_local().await.unwrap();
+
+    assert_eq!(api.logout_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stop_calls.load(Ordering::SeqCst), 1);
+    let stored = store.value.lock().unwrap().clone().unwrap();
+    assert!(stored.access_token.is_none());
+    assert!(stored.refresh_token.is_none());
+    assert_eq!(application.state().await.phase, Phase::SignedOut);
+}
+
+#[tokio::test]
+async fn remote_logout_success_revokes_without_clearing_local_authentication() {
+    let api = Arc::new(FakeApi::new(bootstrap()));
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let application = ClientApplication::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(TrackingTunnel::default()),
+        Arc::new(NoopLogger),
+    );
+
+    application.logout_remote().await.unwrap();
+
+    assert_eq!(api.logout_calls.load(Ordering::SeqCst), 1);
+    let stored = store.value.lock().unwrap().clone().unwrap();
+    assert!(stored.access_token.is_some());
+    assert!(stored.refresh_token.is_some());
+    assert!(application.current_access_token().is_ok());
+}
+
+#[tokio::test]
+async fn remote_logout_failure_keeps_local_authentication_for_retry() {
+    let api = Arc::new(FakeApi::new(bootstrap()).with_logout_failure());
+    let store = Arc::new(MemoryStore::default());
+    *store.value.lock().unwrap() = Some(previous_account());
+    let application = ClientApplication::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(TrackingTunnel::default()),
+        Arc::new(NoopLogger),
+    );
+
+    assert!(application.logout_remote().await.is_err());
+
+    assert_eq!(api.logout_calls.load(Ordering::SeqCst), 1);
+    let stored = store.value.lock().unwrap().clone().unwrap();
+    assert!(stored.access_token.is_some());
+    assert!(stored.refresh_token.is_some());
+    assert!(application.current_access_token().is_ok());
+}
+
+#[tokio::test]
 async fn refresh_update_state_returns_required_offer_without_changing_core_phase() {
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
@@ -569,6 +637,8 @@ fn previous_account() -> StoredAuth {
         }),
         pinned_connection: None,
         pending_start: None,
+        pending_stalled_stop: None,
+        pending_compensation_stop: None,
         compatibility: Some(StoredCompatibility {
             update_required: true,
             observed_at_unix: 1_700_000_000,

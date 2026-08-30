@@ -2,6 +2,40 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+const MAX_CANDIDATES_OR_PROBES: usize = 20;
+
+mod bounded_connection_items {
+    use super::MAX_CANDIDATES_OR_PROBES;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T, S>(items: &[T], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        if items.len() > MAX_CANDIDATES_OR_PROBES {
+            return Err(<S::Error as serde::ser::Error>::custom(
+                "connection item count exceeds 20",
+            ));
+        }
+        items.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
+    where
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let items = Vec::<T>::deserialize(deserializer)?;
+        if items.len() > MAX_CANDIDATES_OR_PROBES {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "connection item count exceeds 20",
+            ));
+        }
+        Ok(items)
+    }
+}
+
 mod split_tunnel;
 
 pub use split_tunnel::{
@@ -213,6 +247,7 @@ pub struct ServerCandidate {
 pub struct ServerCandidatesResponse {
     pub api_version: ApiVersion,
     pub request_id: String,
+    #[serde(with = "bounded_connection_items")]
     pub candidates: Vec<ServerCandidate>,
 }
 
@@ -242,6 +277,7 @@ pub struct ProbeResults {
     pub layer: Layer,
     #[serde(default)]
     pub egress_mode: EgressMode,
+    #[serde(with = "bounded_connection_items")]
     pub probes: Vec<ProbeResult>,
 }
 
@@ -250,6 +286,7 @@ pub struct ServerSelectionRequest {
     pub layer: Layer,
     #[serde(default)]
     pub egress_mode: EgressMode,
+    #[serde(with = "bounded_connection_items")]
     pub probes: Vec<ProbeResult>,
 }
 
@@ -323,16 +360,24 @@ pub struct Bootstrap {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConnectionIntentCapability {
-    pub revision: u32,
+    pub revision: i64,
     pub expires_at: String,
     pub connection_intent_recovery_v1: bool,
 }
 
 impl ConnectionIntentCapability {
+    pub fn expires_at_unix(&self) -> Option<i64> {
+        OffsetDateTime::parse(&self.expires_at, &Rfc3339)
+            .ok()
+            .map(|expires_at| expires_at.unix_timestamp())
+    }
+
     pub fn is_recovery_enabled_at(&self, now_unix: i64) -> bool {
-        self.connection_intent_recovery_v1
-            && OffsetDateTime::parse(&self.expires_at, &Rfc3339)
-                .is_ok_and(|expires_at| expires_at.unix_timestamp() > now_unix)
+        self.revision > 0
+            && self.connection_intent_recovery_v1
+            && self
+                .expires_at_unix()
+                .is_some_and(|expires_at| expires_at > now_unix)
     }
 }
 
@@ -359,6 +404,7 @@ pub struct ConnectionStartRequest {
     pub route_mode: RouteMode,
     #[serde(default)]
     pub egress_mode: EgressMode,
+    #[serde(with = "bounded_connection_items")]
     pub probes: Vec<ProbeResult>,
     pub allow_alternate: bool,
     #[serde(default, skip_serializing_if = "is_false")]

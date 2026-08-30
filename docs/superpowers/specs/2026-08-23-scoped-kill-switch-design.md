@@ -64,7 +64,7 @@ tunnel starts and protection installs atomically        -> armed
 armed tunnel loses its backend or enters an internal
 reconnect                                                -> blocked
 blocked tunnel recovers                                  -> armed
-user presses Stop from armed or blocked                  -> off
+confirmed user Stop cleanup from armed or blocked        -> off
 user disables preference while tunnel is running         -> off, tunnel remains running
 user disables preference while blocked                   -> off, failed tunnel is stopped
 OS reboot                                                -> off
@@ -84,6 +84,19 @@ a passive retry no more often than once every five minutes while connection
 intent remains active. `Retry` may wake one immediate attempt and `Stop` cancels
 the intent. Attempts are serialized and the app must not start a hot or
 overlapping reconnect loop.
+
+`connection_intent_status` refines these transitions without adding a new
+firewall state. While it is `recovering`, a previously `armed` session remains
+`blocked`; internal lease cleanup, restart, replacement, and passive backoff do
+not disarm it. `blocked_terminal` stops automatic retries but preserves the
+same recovery context and `blocked` enforcement. `Повторить` may begin a new
+bounded recovery attempt after the required action. Within automatic-recovery
+state transitions, only a user-requested Stop whose existing tunnel and
+enforcement cleanup has been confirmed may transition the kill switch to
+`off`. Separately, explicitly disabling the kill-switch preference remains an
+approved user transition to `off` under the rules above. A terminal failure,
+cancellation callback, failed cleanup, or coordinator shutdown alone must not
+do so.
 
 ## Rule precedence
 
@@ -258,8 +271,9 @@ The blocked notification and card expose:
   connectivity.
 
 For a transient failure, passive retry continues at the capped interval without
-requiring `Повторить`. For a terminal failure, automatic retry stops but the
-card remains `blocked`, explains the required action, and keeps both
+requiring `Повторить`. For a terminal failure, automatic retry stops and the
+connection intent becomes `blocked_terminal`; the card remains `blocked`,
+explains the required action, and keeps both
 `Повторить` for use after the action and `Стоп` until enforcement is explicitly
 removed.
 
@@ -317,7 +331,7 @@ terminal. Existing report deduplication and rate limits remain in force.
 - Slow recovery produces one notification, serialized passive retry no more
   often than once every five minutes, and no hot or overlapping reconnect loop.
 - Terminal recovery remains `blocked` with an available explicit `Stop` until
-  enforcement removal is confirmed.
+  enforcement removal is confirmed; `blocked_terminal` itself never disarms it.
 - Reboot starts with tunnel off and kill switch runtime state off.
 - Existing split-tunnel, quick tile, updater, diagnostics, and AWG3 recovery
   tests continue to pass.

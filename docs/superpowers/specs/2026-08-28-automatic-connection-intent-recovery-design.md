@@ -232,6 +232,15 @@ discovery, legacy background start/stop и exact reconciliation уже сохр�
 operation с её исходными contract version и fingerprint. Transport failure при
 refresh не превращает ранее истёкший snapshot в `true`.
 
+Для genuinely new Android Quick Settings `On` свежий authoritative `true`
+выбирает recovery coordinator, а `false`, expiry, отсутствие snapshot/plan или
+`404/unsupported` выбирают ровно один существующий legacy background start без
+feature operation ID, `START_PENDING` и recovery diagnostics episode. После
+выбора recovery неоднозначная transport-ошибка не разрешает legacy fallback.
+Уже сохранённая lease/operation остаётся service-owned независимо от downgrade;
+legacy desired-state projection по-прежнему переводит следующий `Off` в
+durable `legacy_runtime_stop`.
+
 Для reconciliation без UI панель добавляет additive
 `POST /background/operations/reconcile` с background auth. Запрос содержит
 operation ID, kind (`start` или `stalled_stop`), исходный request fingerprint и
@@ -393,6 +402,15 @@ Logout на Android имеет обязательный cleanup-before-revoke pr
    finalize под device lock сначала записывает durable server-side cancellation
    и lease-cleanup jobs, затем отзывает credential в той же транзакции. Ответ без
    принятого job является retryable и не разрешает клиенту удалить cleanup auth.
+
+Перед локальным удалением Tauri-сессии `begin_background_logout` возвращает
+типизированное владение `native` или `not_owned`. `native` допустим только после
+durable tombstone для active/pending/cleanup credential; тогда legacy remote
+logout не вызывается. Пустое состояние и одна reservation без подготовленного
+token атомарно инвалидируются и возвращают `not_owned`; только тогда Tauri
+выполняет существующий legacy remote logout и после его success очищает локальную
+сессию. Ошибка legacy revoke сохраняет локальную auth для retry, а ошибка или
+потерянный ответ native handoff fail-closed и не запускает второго владельца.
 
 Logout finalize несёт logout operation ID и install secret. После revoke панель
 хранит ограниченный finalization tombstone с точной сигнатурой `{device, logout
@@ -822,6 +840,9 @@ Operation ID, request ID и lease ID остаются в существующи�
   старый credential;
 - `:vpn` получает capability без UI, истёкший snapshot не использует как
   `true`, а `false/404/unsupported` отключают новый contract без цикла `422`;
+- новый Quick Settings `On` при `false`/expiry/отсутствии capability или plan
+  вызывает legacy start ровно один раз без recovery operation; transport failure
+  после проверки и выбранный recovery не дублируются legacy fallback;
 - capability downgrade запрещает только новые feature operations: pending
   operation сохраняет exact replay/reconcile/cancel до terminal state;
 - ошибка сохранения Android intent не выдаёт lease и не запускает туннель;
@@ -837,6 +858,9 @@ Operation ID, request ID и lease ID остаются в существующи�
 - Android logout сохраняет cleanup-only auth до terminal reconcile/stop;
   offline logout завершается через durable server cleanup job и finalize до
   удаления последнего background credential;
+- Android logout без usable/reserved credential получает `not_owned`, выполняет
+  legacy remote revoke до local sign-out и сохраняет локальную auth при его
+  ошибке; native-owned и ambiguous handoff никогда не вызывают legacy revoke;
 - потерянный logout-finalize response после офлайна дольше 24 часов возвращает
   exact success по finalization tombstone, тогда как общий `401` не снимает
   `logout_pending`;

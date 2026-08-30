@@ -8,7 +8,7 @@
     "egress_mode": { "$ref": "common.schema.json#/$defs/egressMode" },
     "probes": {
       "type": "array",
-      "maxItems": 32,
+      "maxItems": 20,
       "items": { "$ref": "common.schema.json#/$defs/probe" }
     }
   },

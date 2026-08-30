@@ -21,4 +21,24 @@ class TunnelServiceProtocolTest {
     fun credentialMutationTimeoutOutlivesThreeWorstCaseNetworkSteps() {
         assertTrue(backgroundCredentialMutationTimeoutMillis() > 90_000L)
     }
+
+    @Test
+    fun foregroundServiceDispatchKeepsItsStableAndroidSourceCode() {
+        assertEquals(
+            "android_service_dispatch_unavailable",
+            androidServiceDispatchErrorCode(),
+        )
+    }
+
+    @Test
+    fun userStopProtocolCarriesNoStatusDerivedGeneration() {
+        val current = cancelConnectionIntentServiceRequest(generation = null)
+        val exact = cancelConnectionIntentServiceRequest(generation = 17L)
+
+        assertEquals(NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT, current.action)
+        assertEquals(null, current.generation)
+        assertEquals(NelomaiVpnService.ACTION_CANCEL_CONNECTION_INTENT, exact.action)
+        assertEquals(17L, exact.generation)
+    }
+
 }

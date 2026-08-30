@@ -1483,6 +1483,21 @@ where
         result
     }
 
+    pub async fn connection_intent_tunnel_options(
+        &self,
+        layer: Layer,
+        route_mode: RouteMode,
+        now_unix: i64,
+    ) -> Result<TunnelOptions, CoreError> {
+        match self.cached_policy_for_start()? {
+            Some(policy) => {
+                self.effective_tunnel_options(&policy, layer, route_mode, now_unix, false)
+                    .await
+            }
+            None => Ok(self.with_dns_servers(TunnelOptions::default())),
+        }
+    }
+
     pub(crate) async fn record_started_split_tunnel_policy(
         &self,
         policy: &SplitTunnelPolicy,

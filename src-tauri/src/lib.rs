@@ -98,6 +98,28 @@ impl PushRegistrationScheduler {
         let _ = app;
         application.logout().await
     }
+
+    #[cfg(target_os = "android")]
+    pub(crate) async fn logout_remote(
+        &self,
+        application: &NativeApplication,
+    ) -> Result<(), ApplicationError> {
+        let _guard = self.gate.lock().await;
+        application.logout_remote().await
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) async fn logout_local(
+        &self,
+        app: &tauri::AppHandle,
+        application: &NativeApplication,
+    ) -> Result<(), ApplicationError> {
+        let _guard = self.gate.lock().await;
+        use tauri_plugin_push_android::PushAndroidExt;
+
+        let _ = app.push_android().disable();
+        application.logout_local().await
+    }
 }
 
 fn current_unix_time() -> i64 {
@@ -126,7 +148,9 @@ pub fn run() {
         .plugin(tauri_plugin_updater_android::init());
 
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    let builder = builder
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build());
 
     let builder = builder.setup(|app| {
         use tauri::Manager;
@@ -503,6 +527,7 @@ fn automatic_upload_error_code(error: &ApplicationError) -> String {
             CoreError::AccessExpired => "access_expired".to_string(),
             CoreError::UpdateRequired => "update_required".to_string(),
             CoreError::SavedConnectionUnavailable => "saved_connection_unavailable".to_string(),
+            CoreError::StartCancelled => "connection_intent_cancelled".to_string(),
             CoreError::Storage => "storage_unavailable".to_string(),
             CoreError::Api(error) => api_code(error),
             CoreError::Tunnel(code) | CoreError::SplitTunnel(code) => code.clone(),

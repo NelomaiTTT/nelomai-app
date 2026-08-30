@@ -57,6 +57,26 @@ disabled for new work. They do not block exact replay, reconciliation,
 cancellation, or cleanup of an operation already stored with its original
 contract version and fingerprint.
 
+Before an Android recovery coordinator sends each genuinely new background
+start, it synchronizes the preferences from its durable intent template through
+`POST /api/client/v1/background/device/sync-binding`. The route accepts only an
+active Device credential (never the cleanup-only credential), infers the
+device's existing binding and peer, and returns a success marker without tunnel
+configuration, keys, or other secrets. An exact preference replay is a no-op,
+including while that binding has an active lease; a conflicting active lease,
+missing or invalid binding, or invalid preferences are terminal. A transient
+agent mutation failure is the retryable stable code `binding_sync_failed`.
+Reconciliation must precede this preflight: applied/exact replay operations skip
+it, while `not_found` operations synchronize immediately before the panel start.
+The durable coordinator retries the step and rechecks its generation after it,
+so Stop can cancel without allowing a late start.
+
+The capability `revision` is an opaque, persistent, monotonically increasing
+server generation independent of wall-clock time. A greater revision replaces
+an older snapshot. Equal revisions represent the same server generation and
+are merged conservatively: `false` and the earlier expiry win. Clients must not
+derive time from the revision.
+
 Dynamic background recovery obtains candidates from
 `GET /api/client/v1/background/server-candidates` with Device authorization.
 The subsequent HTTPS probe requests never carry either Bearer or Device
@@ -73,6 +93,23 @@ fields are authoritative server state. `operation_id_conflict` remains a common
 error payload and is terminal. A verified dynamic AWG3 stall may be reported by
 the stop request as `tunnel_data_plane_stalled`; other stop semantics remain
 unchanged.
+
+Connection-intent diagnostics use only the following stable event names:
+
+- `connection.intent.started`;
+- `connection.intent.retry_scheduled`;
+- `connection.intent.network_wakeup`;
+- `connection.intent.lease_replacement_started`;
+- `connection.intent.recovered`;
+- `connection.intent.cancelled`;
+- `connection.intent.terminal_failure`;
+- `connection.intent.slow_recovery_notified`.
+
+`retry_scheduled` carries only a numeric attempt, a bounded delay in seconds,
+and a stable reason class. Terminal and notification events carry only the
+stable reason class. Unknown source codes map to `other`; raw error messages,
+configuration, keys, credentials, endpoint addresses, and arbitrary source
+codes are never copied into these event payloads.
 
 A pinned Stray configuration and a temporary alternate lease are stored in
 separate protected slots. Starting an alternate connection must never replace
@@ -150,6 +187,17 @@ kernel peak RSS for the UI and VPN processes. A bounded memory time series is
 written to the existing rotating native log at tunnel start, fixed uptime
 milestones, UI task removal, and physical-network changes; it does not create
 extra reports or change the six-hour upload interval.
+
+One connection-intent report is queued for an episode at the first scheduled
+backoff of at least 300 seconds or, if that has not happened, at the first
+terminal failure. Its payload contains only the safe `connection.intent.*`
+events above and omits helper logs, incident snapshots, configuration, secrets,
+addresses, and full error messages. The first slow backoff may also emit one
+user notification. Repeated retries and a later terminal result cannot create
+another report or notification for that episode. A successful handshake or a
+new explicit Start resets suppression. Existing device/session upload rate
+limits still apply.
+
 Tunnel-session reports may also carry the dynamic `connection_lease_id` and a
 bounded incident snapshot. Desktop keeps at most three detailed stalls per
 session and aggregates later occurrences; Android writes the same bounded

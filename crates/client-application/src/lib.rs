@@ -7,7 +7,7 @@ use nelomai_client_api::{
 use nelomai_client_core::{
     ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError, CoreError,
     CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
-    StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
+    StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome, StartCancellationEpoch,
 };
 use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError};
@@ -15,7 +15,7 @@ use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
     ConnectionIntentCapabilityResponse, EgressMode, Layer, OperationReconcileRequest,
     OperationReconcileResponse, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode,
-    ProbeResult, ProbeResults, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
+    ProbeResult, ProbeResults, RouteMode, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelPolicy, SplitTunnelSelectedPackage,
     SplitTunnelSettingsUpdate, TicConnectionMode, UpdateState,
 };
@@ -436,6 +436,8 @@ where
                 saved_connection: None,
                 pinned_connection: None,
                 pending_start: None,
+                pending_stalled_stop: None,
+                pending_compensation_stop: None,
                 compatibility: None,
             })
             .map_err(|_| ApplicationError::Storage)?;
@@ -559,6 +561,18 @@ where
             .map_err(Into::into)
     }
 
+    pub async fn connection_intent_tunnel_options(
+        &self,
+        layer: Layer,
+        route_mode: RouteMode,
+        now_unix: i64,
+    ) -> Result<nelomai_client_tunnel::TunnelOptions, ApplicationError> {
+        self.core
+            .connection_intent_tunnel_options(layer, route_mode, now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn split_tunnel_settings_require_reconnect(
         &self,
         request: &SplitTunnelSettingsUpdate,
@@ -618,6 +632,33 @@ where
         result.map_err(Into::into)
     }
 
+    /// Revokes the server-side UI session without changing local authentication.
+    ///
+    /// Android uses this only after native background cleanup explicitly reports
+    /// that it did not take ownership. A failure must leave local credentials in
+    /// place so the user can retry the same revoke safely.
+    pub async fn logout_remote(&self) -> Result<(), ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let _probe_guard = self.probe_gate.lock().await;
+        let access_token = self.access_token()?;
+        let _ = self.api.unregister_push_token(&access_token).await;
+        self.api.logout(&access_token).await.map_err(Into::into)
+    }
+
+    /// Clears local account state without revoking server-side credentials.
+    ///
+    /// Android uses this after it has durably handed remote cleanup to the
+    /// native background logout coordinator. Calling the legacy remote logout
+    /// here would race that coordinator and revoke the credential it still
+    /// needs to finish exact cleanup.
+    pub async fn logout_local(&self) -> Result<(), ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let _probe_guard = self.probe_gate.lock().await;
+        let result = self.core.sign_out().await;
+        self.clear_probe_cache()?;
+        result.map_err(Into::into)
+    }
+
     pub async fn background_token_for_device(
         &self,
         expected_device_id: &str,
@@ -629,12 +670,11 @@ where
             return Ok(None);
         }
         let access_token = self.access_token()?;
-        match self.api.background_token(&access_token).await {
+        match ApplicationApi::background_token(self.api.as_ref(), &access_token).await {
             Ok(response) => Ok(Some(response)),
             Err(CoreApiError::Unauthorized) => {
                 let access_token = self.core.refresh_access_token(&access_token).await?;
-                self.api
-                    .background_token(&access_token)
+                ApplicationApi::background_token(self.api.as_ref(), &access_token)
                     .await
                     .map(Some)
                     .map_err(Into::into)
@@ -792,6 +832,15 @@ where
         self.core.reconcile_external_tunnel_state().await
     }
 
+    #[cfg(not(target_os = "android"))]
+    pub async fn reconcile_pending_operation_for_retry(&self) -> Result<(), ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.core
+            .reconcile_pending_operation_for_retry()
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.bootstrap(now_unix).await.map_err(Into::into)
@@ -830,46 +879,30 @@ where
 
     pub async fn start(
         &self,
-        mut options: ConnectOptions,
+        options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
-        let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        options = options.normalized_for_layer();
-        options.probes = if options.layer == Layer::Tic
-            && options.tic_connection_mode == TicConnectionMode::Personal
-        {
-            Vec::new()
-        } else {
-            match self
-                .refresh_probes(options.layer, options.egress_mode, now_unix)
-                .await
-            {
-                Ok(results) => results.probes,
-                Err(_) => self
-                    .cached_probes(options.layer, options.egress_mode, now_unix)
-                    .map(|results| results.probes)
-                    .unwrap_or_default(),
-            }
-        };
-        self.core.start(options, now_unix).await.map_err(Into::into)
+        let cancel_epoch = self.core.begin_start_attempt();
+        let result = self
+            .start_with_cancellation_epoch(options, now_unix, cancel_epoch)
+            .await;
+        self.core.finish_start_attempt();
+        result
     }
 
-    pub async fn start_without_probe_refresh(
+    pub fn begin_start_attempt(&self) -> StartCancellationEpoch {
+        self.core.begin_start_attempt()
+    }
+
+    pub fn finish_start_attempt(&self) {
+        self.core.finish_start_attempt();
+    }
+
+    pub async fn start_with_cancellation_epoch(
         &self,
         mut options: ConnectOptions,
         now_unix: i64,
-    ) -> Result<Connection, ApplicationError> {
-        let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        options = options.normalized_for_layer();
-        options.probes.clear();
-        self.core.start(options, now_unix).await.map_err(Into::into)
-    }
-
-    #[cfg(not(target_os = "android"))]
-    pub async fn connection_intent_attempt(
-        &self,
-        mut options: ConnectOptions,
-        now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
     ) -> Result<Connection, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         options = options.normalized_for_layer();
@@ -890,9 +923,59 @@ where
             }
         };
         self.core
-            .connection_intent_attempt(options, now_unix)
+            .start_with_cancellation_epoch(options, now_unix, cancel_epoch)
             .await
             .map_err(Into::into)
+    }
+
+    pub async fn start_without_probe_refresh(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let cancel_epoch = self.core.begin_start_attempt();
+        options = options.normalized_for_layer();
+        options.probes.clear();
+        let result = self
+            .core
+            .start_with_cancellation_epoch(options, now_unix, cancel_epoch)
+            .await;
+        self.core.finish_start_attempt();
+        result.map_err(Into::into)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn connection_intent_attempt(
+        &self,
+        mut options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let cancel_epoch = self.core.begin_start_attempt();
+        options = options.normalized_for_layer();
+        options.probes = if options.layer == Layer::Tic
+            && options.tic_connection_mode == TicConnectionMode::Personal
+        {
+            Vec::new()
+        } else {
+            match self
+                .refresh_probes(options.layer, options.egress_mode, now_unix)
+                .await
+            {
+                Ok(results) => results.probes,
+                Err(_) => self
+                    .cached_probes(options.layer, options.egress_mode, now_unix)
+                    .map(|results| results.probes)
+                    .unwrap_or_default(),
+            }
+        };
+        let result = self
+            .core
+            .connection_intent_attempt_with_cancellation_epoch(options, now_unix, cancel_epoch)
+            .await;
+        self.core.finish_start_attempt();
+        result.map_err(Into::into)
     }
 
     #[cfg(not(target_os = "android"))]
@@ -911,20 +994,26 @@ where
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        options = options.normalized_for_layer();
-        options.probes = if options.layer == Layer::Tic
-            && options.tic_connection_mode == TicConnectionMode::Personal
-        {
-            Vec::new()
-        } else {
-            self.refresh_probes(options.layer, options.egress_mode, now_unix)
-                .await?
-                .probes
-        };
-        self.core
-            .replace_stalled_connection(options, now_unix)
-            .await
-            .map_err(Into::into)
+        let cancel_epoch = self.core.begin_start_attempt();
+        let result = async {
+            options = options.normalized_for_layer();
+            options.probes = if options.layer == Layer::Tic
+                && options.tic_connection_mode == TicConnectionMode::Personal
+            {
+                Vec::new()
+            } else {
+                self.refresh_probes(options.layer, options.egress_mode, now_unix)
+                    .await?
+                    .probes
+            };
+            self.core
+                .replace_stalled_connection_with_cancellation_epoch(options, now_unix, cancel_epoch)
+                .await
+                .map_err(Into::into)
+        }
+        .await;
+        self.core.finish_start_attempt();
+        result
     }
 
     pub async fn active_recovery_options(&self) -> Option<ConnectOptions> {
@@ -1031,8 +1120,13 @@ where
     }
 
     pub async fn stop(&self) -> Result<Connection, ApplicationError> {
+        self.core.signal_start_cancellation();
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.stop().await.map_err(Into::into)
+    }
+
+    pub fn signal_start_cancellation(&self) -> bool {
+        self.core.signal_start_cancellation()
     }
 
     pub async fn retry_pending_stop(&self) -> Result<Option<Connection>, ApplicationError> {
@@ -1044,14 +1138,10 @@ where
     }
 
     pub async fn stop_for_shutdown(&self) -> Result<Option<Connection>, ApplicationError> {
+        let cancelled_pending_start = self.core.signal_start_cancellation();
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let state = self.core.state().await;
-        if matches!(
-            state.phase,
-            nelomai_client_core::Phase::Connected
-                | nelomai_client_core::Phase::Connecting
-                | nelomai_client_core::Phase::Stopping
-        ) {
+        if shutdown_requires_core_stop(state.phase, cancelled_pending_start) {
             return self.core.stop().await.map(Some).map_err(Into::into);
         }
         Ok(None)
@@ -1181,4 +1271,25 @@ fn timestamp(now_unix: i64) -> Result<String, ApplicationError> {
         .map_err(|_| ApplicationError::Clock)?
         .format(&Rfc3339)
         .map_err(|_| ApplicationError::Clock)
+}
+
+fn shutdown_requires_core_stop(phase: Phase, cancelled_pending_start: bool) -> bool {
+    cancelled_pending_start
+        || matches!(
+            phase,
+            Phase::Connected | Phase::Connecting | Phase::Stopping
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutdown_requires_core_stop;
+    use nelomai_client_core::Phase;
+
+    #[test]
+    fn shutdown_stops_unresolved_start_even_when_the_visible_phase_is_not_connecting() {
+        assert!(shutdown_requires_core_stop(Phase::Ready, true));
+        assert!(shutdown_requires_core_stop(Phase::ServerUnavailable, true));
+        assert!(!shutdown_requires_core_stop(Phase::Ready, false));
+    }
 }

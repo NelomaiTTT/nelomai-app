@@ -56,4 +56,6 @@ nelomai-unix-service = { path = "../crates/unix-service" }
 libc = "0.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+notify-rust = "=4.11.7"
+tauri-plugin-notification = "2"
 tauri-plugin-updater = "=2.10.1"

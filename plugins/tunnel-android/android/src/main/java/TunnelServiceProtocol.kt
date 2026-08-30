@@ -14,6 +14,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal const val SERVICE_RESULT_OK = 1
 internal const val SERVICE_RESULT_ERROR = 2
 
+internal fun androidServiceDispatchErrorCode(): String =
+    "android_service_dispatch_unavailable"
+
 internal const val EXTRA_RESULT_RECEIVER = "result_receiver"
 internal const val EXTRA_API_VERSION = "api_version"
 internal const val EXTRA_START_SOURCE = "start_source"
@@ -48,6 +51,20 @@ internal const val EXTRA_CHANGED = "changed"
 internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
 internal const val EXTRA_DNS_SERVERS = "dns_servers"
 internal const val EXTRA_CLIENT_OPERATION_ID = "client_operation_id"
+internal const val EXTRA_GENERATION = "generation"
+internal const val EXTRA_DESIRED_ACTIVE = "desired_active"
+internal const val EXTRA_CONNECTION_INTENT_STATUS = "connection_intent_status"
+internal const val EXTRA_LEASE_PHASE = "lease_phase"
+internal const val EXTRA_NEXT_RETRY_AT_UNIX = "next_retry_at_unix"
+internal const val EXTRA_LAST_ERROR_CODE = "last_error_code"
+internal const val EXTRA_LOGOUT_OWNERSHIP = "logout_ownership"
+internal const val EXTRA_ACCOUNT_SCOPE = "account_scope"
+internal const val EXTRA_LAYER = "layer"
+internal const val EXTRA_TIC_CONNECTION_MODE = "tic_connection_mode"
+internal const val EXTRA_ROUTE_MODE = "route_mode"
+internal const val EXTRA_EGRESS_MODE = "egress_mode"
+internal const val EXTRA_ALLOW_ALTERNATE = "allow_alternate"
+internal const val EXTRA_SYNC_BINDING_PREFERENCES = "sync_binding_preferences"
 private const val QUICK_DNS_UPDATE_TIMEOUT_MILLIS = 3_000L
 private const val METRICS_REQUEST_TIMEOUT_MILLIS = 1_800L
 private const val UDP_REBIND_REQUEST_TIMEOUT_MILLIS = 3_250L
@@ -61,6 +78,18 @@ internal fun backgroundCredentialMutationTimeoutMillis(): Long =
         (BACKGROUND_CONNECT_TIMEOUT_MILLIS + BACKGROUND_READ_TIMEOUT_MILLIS).toLong() +
         CREDENTIAL_MUTATION_COMPLETION_SLACK_MILLIS
 
+internal enum class BackgroundLogoutOwnership(val wireName: String) {
+    NATIVE("native"),
+    NOT_OWNED("not_owned"),
+    ;
+
+    companion object {
+        fun fromWireName(value: String?): BackgroundLogoutOwnership = values().firstOrNull {
+            it.wireName == value
+        } ?: throw IllegalArgumentException("invalid_background_logout_ownership")
+    }
+}
+
 internal class ServiceRequestCompletion {
     private val completed = AtomicBoolean(false)
 
@@ -71,7 +100,112 @@ internal class ServiceRequestCompletion {
     }
 }
 
+internal data class ConnectionIntentCancelServiceRequest(
+    val action: String,
+    val generation: Long?,
+)
+
+internal fun cancelConnectionIntentServiceRequest(
+    generation: Long?,
+): ConnectionIntentCancelServiceRequest = ConnectionIntentCancelServiceRequest(
+    action = if (generation == null) {
+        NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT
+    } else {
+        NelomaiVpnService.ACTION_CANCEL_CONNECTION_INTENT
+    },
+    generation = generation,
+)
+
 internal object TunnelServiceClient {
+    fun toggleConnectionIntent(
+        context: Context,
+        onSuccess: (ConnectionIntentServiceStatus) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_QUICK_TOGGLE),
+        { onSuccess(it.toConnectionIntentServiceStatus()) },
+        onError,
+        foreground = true,
+    )
+
+    fun beginConnectionIntent(
+        context: Context,
+        args: BeginConnectionIntentArgs,
+        onSuccess: (ConnectionIntentServiceStatus) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_BEGIN_CONNECTION_INTENT)
+            .putExtra(EXTRA_API_VERSION, args.apiVersion)
+            .putExtra(EXTRA_DEVICE_ID, args.template.deviceId)
+            .putExtra(EXTRA_ACCOUNT_SCOPE, args.template.accountScope)
+            .putExtra(EXTRA_LAYER, args.template.layer)
+            .putExtra(EXTRA_TIC_CONNECTION_MODE, args.template.ticConnectionMode)
+            .putExtra(EXTRA_ROUTE_MODE, args.template.routeMode)
+            .putExtra(EXTRA_EGRESS_MODE, args.template.egressMode)
+            .putExtra(EXTRA_ALLOW_ALTERNATE, args.template.allowAlternate)
+            .putExtra(
+                EXTRA_SYNC_BINDING_PREFERENCES,
+                args.template.syncBindingPreferences,
+            )
+            .putExtra(EXTRA_OPTIONS, args.template.options.toBundle()),
+        { onSuccess(it.toConnectionIntentServiceStatus()) },
+        onError,
+        foreground = true,
+    )
+
+    fun cancelConnectionIntent(
+        context: Context,
+        generation: Long,
+        onSuccess: (ConnectionIntentServiceStatus) -> Unit,
+        onError: (String) -> Unit,
+    ) = cancelConnectionIntent(
+        context,
+        cancelConnectionIntentServiceRequest(generation),
+        onSuccess,
+        onError,
+    )
+
+    fun cancelCurrentConnectionIntent(
+        context: Context,
+        onSuccess: (ConnectionIntentServiceStatus) -> Unit,
+        onError: (String) -> Unit,
+    ) = cancelConnectionIntent(
+        context,
+        cancelConnectionIntentServiceRequest(generation = null),
+        onSuccess,
+        onError,
+    )
+
+    private fun cancelConnectionIntent(
+        context: Context,
+        request: ConnectionIntentCancelServiceRequest,
+        onSuccess: (ConnectionIntentServiceStatus) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(request.action)
+            .apply { request.generation?.let { putExtra(EXTRA_GENERATION, it) } },
+        { onSuccess(it.toConnectionIntentServiceStatus()) },
+        onError,
+    )
+
+    fun connectionIntentStatus(
+        context: Context,
+        onSuccess: (ConnectionIntentServiceStatus) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS),
+        { onSuccess(it.toConnectionIntentServiceStatus()) },
+        onError,
+    )
+
     fun start(
         context: Context,
         args: StartTunnelArgs,
@@ -220,7 +354,7 @@ internal object TunnelServiceClient {
 
     fun backgroundCredentialStatus(
         context: Context,
-        onSuccess: (Boolean, Long, Boolean, Boolean, Boolean, Long?, String?, Long?) -> Unit,
+        onSuccess: (Boolean, Long, Boolean, Boolean, Long, Boolean, Long?, String?, Long?) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
@@ -233,6 +367,7 @@ internal object TunnelServiceClient {
                 it.getLong(EXTRA_CREDENTIAL_REVISION),
                 it.getBoolean(EXTRA_MUTATION_READY),
                 it.getBoolean(EXTRA_MUTATION_PENDING),
+                it.getLong(EXTRA_CAPABILITY_REVISION),
                 it.getBoolean(EXTRA_CAPABILITY_ENABLED),
                 it.getLong(EXTRA_CAPABILITY_EXPIRES_AT).takeIf { value ->
                     value != Long.MIN_VALUE
@@ -312,6 +447,25 @@ internal object TunnelServiceClient {
             .setAction(NelomaiVpnService.ACTION_CLEAR_BACKGROUND),
         { onSuccess() },
         onError,
+    )
+
+    fun beginBackgroundLogout(
+        context: Context,
+        onSuccess: (BackgroundLogoutOwnership) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_BEGIN_BACKGROUND_LOGOUT),
+        { result ->
+            onSuccess(
+                BackgroundLogoutOwnership.fromWireName(
+                    result.getString(EXTRA_LOGOUT_OWNERSHIP),
+                ),
+            )
+        },
+        onError,
+        foreground = true,
     )
 
     fun clearQuickPlan(
@@ -442,7 +596,7 @@ internal object TunnelServiceClient {
                 context.applicationContext.startService(intent)
             }
         } catch (_: Throwable) {
-            onError("tunnel_service_unavailable")
+            onError(androidServiceDispatchErrorCode())
         }
     }
 }
@@ -454,6 +608,26 @@ internal fun Intent.resultReceiver(): ResultReceiver? =
         @Suppress("DEPRECATION")
         getParcelableExtra(EXTRA_RESULT_RECEIVER)
     }
+
+internal fun ConnectionIntentServiceStatus.toBundle(): Bundle = Bundle().apply {
+    putLong(EXTRA_GENERATION, generation)
+    putBoolean(EXTRA_DESIRED_ACTIVE, desiredActive)
+    putString(EXTRA_CONNECTION_INTENT_STATUS, status)
+    leasePhase?.let { putString(EXTRA_LEASE_PHASE, it) }
+    nextRetryAtUnix?.let { putLong(EXTRA_NEXT_RETRY_AT_UNIX, it) }
+    lastErrorCode?.let { putString(EXTRA_LAST_ERROR_CODE, it) }
+}
+
+internal fun Bundle.toConnectionIntentServiceStatus() = ConnectionIntentServiceStatus(
+    generation = getLong(EXTRA_GENERATION),
+    desiredActive = getBoolean(EXTRA_DESIRED_ACTIVE),
+    status = getString(EXTRA_CONNECTION_INTENT_STATUS) ?: "none",
+    leasePhase = getString(EXTRA_LEASE_PHASE),
+    nextRetryAtUnix = getLong(EXTRA_NEXT_RETRY_AT_UNIX).takeIf {
+        containsKey(EXTRA_NEXT_RETRY_AT_UNIX)
+    },
+    lastErrorCode = getString(EXTRA_LAST_ERROR_CODE),
+)
 
 internal fun TunnelOptionsArgs.toBundle(): Bundle = Bundle().apply {
     putBoolean("split_active", splitActive)

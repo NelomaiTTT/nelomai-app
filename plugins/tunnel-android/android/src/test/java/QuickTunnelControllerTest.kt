@@ -7,6 +7,24 @@ import org.junit.Test
 
 class QuickTunnelControllerTest {
     @Test
+    fun legacyQuickOnMigrationFailsClosedWithoutBareActiveIntent() {
+        val backend = QuickFakeEncryptedRecordBackend()
+        val store = AndroidRecoveryStore(backend, BootIdentityProvider { 9 })
+
+        val migrated = migrateLegacyQuickDesiredActive(store, true).successIntent()
+        val restored = AndroidRecoveryStore(backend, BootIdentityProvider { 9 })
+            .read().let { result ->
+                assertTrue(result is RecoveryStoreResult.Success)
+                (result as RecoveryStoreResult.Success).value.intent
+            }
+
+        assertFalse(migrated.desiredActive)
+        assertEquals(1, migrated.generation)
+        assertEquals(null, migrated.template)
+        assertFalse(restored.desiredActive)
+    }
+
+    @Test
     fun desiredActiveProjectionUsesTheRecoveryEnvelopeGeneration() {
         val backend = QuickFakeEncryptedRecordBackend()
         val store = AndroidRecoveryStore(backend, BootIdentityProvider { 9 })

@@ -2,7 +2,7 @@ use crate::connection_metrics::{ConnectionMetricsResponse, ConnectionMetricsTrac
 use crate::diagnostics::AppDiagnostics;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{
-    preferences::{connection_egress_mode, AppPreferenceStore, DnsProvider},
+    preferences::{AppPreferenceStore, DnsProvider},
     NativeApplication, PushRegistrationScheduler, SplitTunnelScheduler,
 };
 use nelomai_client_api::DiagnosticUploadResponse;
@@ -32,9 +32,159 @@ static ANDROID_BACKGROUND_PROVISION_GATE: tokio::sync::Mutex<()> =
 
 #[cfg(target_os = "android")]
 static ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX: AtomicI64 = AtomicI64::new(0);
+#[cfg(target_os = "android")]
+static ANDROID_UI_START_STOP_COORDINATOR: AndroidUiStartStopCoordinator =
+    AndroidUiStartStopCoordinator::new();
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Clone, Copy)]
+struct AndroidUiStartTicket(u64);
+
+#[cfg(any(target_os = "android", test))]
+struct AndroidUiStartStopCoordinator {
+    epoch: std::sync::atomic::AtomicU64,
+    start_gate: tokio::sync::Mutex<()>,
+    side_effect_gate: std::sync::Mutex<()>,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl AndroidUiStartStopCoordinator {
+    const fn new() -> Self {
+        Self {
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            start_gate: tokio::sync::Mutex::const_new(()),
+            side_effect_gate: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn start_ticket(&self) -> AndroidUiStartTicket {
+        AndroidUiStartTicket(self.epoch.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    async fn run_start<F, Fut, T>(
+        &self,
+        ticket: AndroidUiStartTicket,
+        start: F,
+    ) -> Result<T, CommandError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, CommandError>>,
+    {
+        let _gate = self.start_gate.lock().await;
+        self.ensure_current(ticket)?;
+        let result = start().await;
+        self.ensure_current(ticket)?;
+        result
+    }
+
+    async fn run_stop<F, Fut, T>(&self, stop: F) -> Result<T, CommandError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, CommandError>>,
+    {
+        {
+            let _side_effect_gate = self
+                .side_effect_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        stop().await
+    }
+
+    fn run_start_side_effect<Fut, T>(
+        &self,
+        ticket: AndroidUiStartTicket,
+        future: Fut,
+    ) -> AndroidUiStartSideEffect<'_, Fut>
+    where
+        Fut: std::future::Future<Output = Result<T, CommandError>>,
+    {
+        AndroidUiStartSideEffect {
+            coordinator: self,
+            ticket,
+            future: Box::pin(future),
+            first_poll: true,
+        }
+    }
+
+    fn ensure_current(&self, ticket: AndroidUiStartTicket) -> Result<(), CommandError> {
+        if android_start_epoch_is_current(
+            ticket.0,
+            self.epoch.load(std::sync::atomic::Ordering::SeqCst),
+        ) {
+            Ok(())
+        } else {
+            Err(CommandError::new(
+                "connection_intent_cancelled",
+                "Подключение отменено",
+            ))
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+struct AndroidUiStartSideEffect<'a, Fut> {
+    coordinator: &'a AndroidUiStartStopCoordinator,
+    ticket: AndroidUiStartTicket,
+    future: std::pin::Pin<Box<Fut>>,
+    first_poll: bool,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl<Fut, T> std::future::Future for AndroidUiStartSideEffect<'_, Fut>
+where
+    Fut: std::future::Future<Output = Result<T, CommandError>>,
+{
+    type Output = Result<T, CommandError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.first_poll {
+            let _side_effect_gate = this
+                .coordinator
+                .side_effect_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Err(error) = this.coordinator.ensure_current(this.ticket) {
+                return std::task::Poll::Ready(Err(error));
+            }
+            this.first_poll = false;
+            return this.future.as_mut().poll(context);
+        }
+        this.future.as_mut().poll(context)
+    }
+}
+
+#[cfg(target_os = "android")]
+struct AndroidLegacyStartAttempt {
+    application: Arc<NativeApplication>,
+    epoch: nelomai_client_core::StartCancellationEpoch,
+}
+
+#[cfg(target_os = "android")]
+impl AndroidLegacyStartAttempt {
+    fn new(application: Arc<NativeApplication>) -> Self {
+        let epoch = application.begin_start_attempt();
+        Self { application, epoch }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Drop for AndroidLegacyStartAttempt {
+    fn drop(&mut self) {
+        self.application.finish_start_attempt();
+    }
+}
 
 #[cfg(any(target_os = "android", test))]
 const ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+#[cfg(any(target_os = "android", test))]
+const ANDROID_DISABLED_CAPABILITY_EXPIRES_AT: &str = "1970-01-01T00:00:01Z";
 
 #[cfg(target_os = "android")]
 const ANDROID_QUICK_RECONCILE_RETRY_SECONDS: i64 = 15;
@@ -68,22 +218,74 @@ enum AndroidBackgroundProvisionMode {
 }
 
 #[cfg(any(target_os = "android", test))]
+struct AndroidBackgroundCapabilitySnapshot {
+    revision: i64,
+    enabled: bool,
+    expires_at: String,
+    expires_at_unix: i64,
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_background_capability_snapshot(
+    capability: Option<&ConnectionIntentCapability>,
+    now: i64,
+) -> AndroidBackgroundCapabilitySnapshot {
+    let enabled = capability.is_some_and(|value| value.is_recovery_enabled_at(now));
+    let expires_at_unix = if enabled {
+        capability
+            .and_then(ConnectionIntentCapability::expires_at_unix)
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    AndroidBackgroundCapabilitySnapshot {
+        revision: capability
+            .filter(|value| value.revision > 0)
+            .map(|value| value.revision)
+            .unwrap_or(0),
+        enabled,
+        expires_at: if enabled {
+            capability
+                .map(|value| value.expires_at.clone())
+                .unwrap_or_else(|| ANDROID_DISABLED_CAPABILITY_EXPIRES_AT.to_string())
+        } else {
+            ANDROID_DISABLED_CAPABILITY_EXPIRES_AT.to_string()
+        },
+        expires_at_unix,
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_background_capability_matches(
+    status: &tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse,
+    desired: &AndroidBackgroundCapabilitySnapshot,
+) -> bool {
+    status.capability_revision == desired.revision
+        && status.capability_enabled == desired.enabled
+        && (!desired.enabled || status.capability_expires_at_unix == Some(desired.expires_at_unix))
+}
+
+#[cfg(any(target_os = "android", test))]
 fn android_background_provision_mode(
     status: &tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse,
     device_id: &str,
-    desired_capability_enabled: bool,
+    desired_capability: &AndroidBackgroundCapabilitySnapshot,
     now: i64,
 ) -> AndroidBackgroundProvisionMode {
     let same_device = status.device_id.as_deref() == Some(device_id);
     let token_is_fresh = status.expires_at_unix.is_some_and(|expires_at| {
         expires_at > now.saturating_add(ANDROID_BACKGROUND_REFRESH_WINDOW_SECONDS)
     });
+    let stored_capability_available = status.capability_enabled
+        && status
+            .capability_expires_at_unix
+            .is_some_and(|expires_at| expires_at > now);
     if status.mutation_pending {
         AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase
     } else if status.configured
         && status.mutation_ready
         && same_device
-        && status.capability_enabled == desired_capability_enabled
+        && android_background_capability_matches(status, desired_capability)
         && (!status.capability_enabled
             || status
                 .capability_expires_at_unix
@@ -93,7 +295,7 @@ fn android_background_provision_mode(
         AndroidBackgroundProvisionMode::Noop
     } else if status.configured && status.mutation_ready && same_device && token_is_fresh {
         AndroidBackgroundProvisionMode::RefreshStoredCapability
-    } else if desired_capability_enabled {
+    } else if desired_capability.enabled || stored_capability_available {
         AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase
     } else {
         AndroidBackgroundProvisionMode::Legacy
@@ -101,18 +303,31 @@ fn android_background_provision_mode(
 }
 
 #[cfg(any(target_os = "android", test))]
-fn android_background_rotation_fallback(
-    desired_capability_enabled: bool,
-) -> Option<AndroidBackgroundProvisionMode> {
-    desired_capability_enabled.then_some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase)
+fn android_background_rotation_fallback() -> Option<AndroidBackgroundProvisionMode> {
+    Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase)
 }
 
 #[cfg(any(target_os = "android", test))]
 fn android_background_legacy_fallback_after_ui_failure(
-    desired_capability_enabled: bool,
+    failure_code: Option<&str>,
     latest_status: &tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse,
+    now: i64,
 ) -> bool {
-    !desired_capability_enabled && !latest_status.mutation_pending
+    if latest_status.mutation_pending {
+        return false;
+    }
+    let latest_capability_unavailable = !latest_status.capability_enabled
+        || latest_status
+            .capability_expires_at_unix
+            .is_none_or(|expires_at| expires_at <= now);
+    failure_code == Some("background_credential_capability_unavailable")
+        && latest_capability_unavailable
+}
+
+#[cfg(target_os = "android")]
+struct AndroidBackgroundProvisionFailure {
+    command_error: CommandError,
+    rejection_code: Option<String>,
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -343,6 +558,9 @@ impl CommandError {
                 "saved_connection_unavailable",
                 "Сохранённое подключение сейчас недоступно",
             ),
+            CoreError::StartCancelled => {
+                Self::new("connection_intent_cancelled", "Подключение отменено")
+            }
             CoreError::Storage => Self::new(
                 "storage_unavailable",
                 "Защищённое хранилище временно недоступно",
@@ -534,32 +752,119 @@ async fn stop_connection(
     app: &AppHandle,
     application: &NativeApplication,
 ) -> Result<Option<Connection>, CommandError> {
-    let intent_cancelled = cancel_desktop_connection_intent(app).await;
-    let result = match application.stop().await {
-        Ok(connection) => Ok(Some(connection)),
-        Err(ApplicationError::Core(CoreError::SavedConnectionUnavailable)) if intent_cancelled => {
-            Ok(None)
-        }
-        Err(error) if repairable_stop_error(&error) => {
-            crate::platform::prepare_tunnel_for_stop(app.clone())
+    #[cfg(target_os = "android")]
+    {
+        ANDROID_UI_START_STOP_COORDINATOR
+            .run_stop(|| async {
+                route_android_connection_stop_with_legacy(
+                    || {
+                        application.signal_start_cancellation();
+                    },
+                    || async {
+                        app.tunnel_android()
+                            .cancel_current_connection_intent()
+                            .map_err(|_| {
+                                CommandError::new(
+                                    "android_service_dispatch_unavailable",
+                                    "Не удалось передать отмену службе подключения",
+                                )
+                            })
+                    },
+                    || async {
+                        match application.stop().await {
+                            Ok(_) | Err(ApplicationError::Core(
+                                CoreError::SavedConnectionUnavailable,
+                            )) => Ok(()),
+                            Err(error) if repairable_stop_error(&error) => {
+                                crate::platform::prepare_tunnel_for_stop(app.clone())
+                                    .await
+                                    .map_err(CommandError::from_tunnel)?;
+                                application
+                                    .stop()
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(CommandError::from)
+                            }
+                            Err(error) => Err(error.into()),
+                        }
+                    },
+                )
                 .await
-                .map_err(CommandError::from_tunnel)?;
-            application.stop().await.map(Some).map_err(Into::into)
-        }
-        Err(error) => Err(error.into()),
-    };
-    #[cfg(desktop)]
-    if result.is_ok() {
-        queue_desktop_tunnel_stopped(app).await;
+            })
+            .await?;
+        return Ok(None);
     }
-    result
+    #[cfg(not(target_os = "android"))]
+    {
+        let runtime_cancelled = cancel_desktop_connection_intent(app).await;
+        let pending_cancelled = application.signal_start_cancellation();
+        let intent_cancelled = runtime_cancelled || pending_cancelled;
+        let result = match application.stop().await {
+            Ok(connection) => Ok(Some(connection)),
+            Err(ApplicationError::Core(CoreError::SavedConnectionUnavailable))
+                if intent_cancelled =>
+            {
+                Ok(None)
+            }
+            Err(error) if repairable_stop_error(&error) => {
+                crate::platform::prepare_tunnel_for_stop(app.clone())
+                    .await
+                    .map_err(CommandError::from_tunnel)?;
+                application.stop().await.map(Some).map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        };
+        #[cfg(desktop)]
+        if result.is_ok() {
+            queue_desktop_tunnel_stopped(app).await;
+        }
+        result
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_connection_stop<F, Fut>(
+    service_cancel_current: F,
+) -> Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>,
+    >,
+{
+    service_cancel_current().await
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_connection_stop_with_legacy<C, F, Fut, L, LFut>(
+    cancel_pending_legacy_start: C,
+    service_cancel_current: F,
+    legacy_stop: L,
+) -> Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>
+where
+    C: FnOnce(),
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>,
+    >,
+    L: FnOnce() -> LFut,
+    LFut: std::future::Future<Output = Result<(), CommandError>>,
+{
+    cancel_pending_legacy_start();
+    let cancelled = route_android_connection_stop(service_cancel_current).await?;
+    if cancelled.lease_phase.is_none() {
+        legacy_stop().await?;
+    }
+    Ok(cancelled)
 }
 
 pub(crate) async fn stop_for_shutdown(
     app: &AppHandle,
     application: &NativeApplication,
 ) -> Result<(), CommandError> {
-    let intent_cancelled = cancel_desktop_connection_intent(app).await;
+    let runtime_cancelled = cancel_desktop_connection_intent(app).await;
+    let pending_cancelled = application.signal_start_cancellation();
+    let intent_cancelled = runtime_cancelled || pending_cancelled;
     let state = application.state().await;
     if !shutdown_requires_stop(&state, intent_cancelled) {
         return Ok(());
@@ -751,7 +1056,6 @@ impl StartCommandResponse {
         }
     }
 
-    #[cfg(not(target_os = "android"))]
     pub(crate) fn recovering(next_retry_at_unix: Option<i64>) -> Self {
         Self {
             status: "recovering",
@@ -759,6 +1063,128 @@ impl StartCommandResponse {
             next_retry_at_unix,
         }
     }
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_app_start<F, Fut, P, PFut>(
+    request: tauri_plugin_tunnel_android::BeginConnectionIntentRequest,
+    begin: F,
+    rust_panel_start: P,
+) -> Result<StartCommandResponse, CommandError>
+where
+    F: FnOnce(tauri_plugin_tunnel_android::BeginConnectionIntentRequest) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>,
+    >,
+    P: FnOnce() -> PFut,
+    PFut: std::future::Future<Output = Result<Connection, CommandError>>,
+{
+    // Ownership is selected here. Keeping the Rust start collaborator in this boundary makes
+    // tests prove that Android never polls it while still exercising the production route.
+    let _rust_panel_start = rust_panel_start;
+    let acknowledged = begin(request).await?;
+    if !android_start_acknowledgement_is_durable(&acknowledged) {
+        return Err(CommandError::new(
+            "connection_intent_persist_failed",
+            "Не удалось сохранить намерение подключения",
+        ));
+    }
+    Ok(StartCommandResponse::recovering(
+        acknowledged.next_retry_at_unix,
+    ))
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_app_start_with_capability<R, RFut, F, Fut, P, PFut>(
+    current: &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse,
+    capability: Option<&ConnectionIntentCapability>,
+    now_unix: i64,
+    build_recovery_request: R,
+    begin: F,
+    rust_panel_start: P,
+) -> Result<StartCommandResponse, CommandError>
+where
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<
+        Output = Result<tauri_plugin_tunnel_android::BeginConnectionIntentRequest, CommandError>,
+    >,
+    F: FnOnce(tauri_plugin_tunnel_android::BeginConnectionIntentRequest) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>,
+    >,
+    P: FnOnce() -> PFut,
+    PFut: std::future::Future<Output = Result<Connection, CommandError>>,
+{
+    if current.lease_phase.is_none()
+        && !nelomai_contracts::allows_new_connection_intent_operation(capability, now_unix)
+    {
+        return rust_panel_start()
+            .await
+            .map(StartCommandResponse::connected);
+    }
+    let request = build_recovery_request().await?;
+    route_android_app_start(request, begin, rust_panel_start).await
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_logout<B, L, LFut, R, RFut>(
+    begin_native_logout: B,
+    local_sign_out: L,
+    legacy_remote_logout: R,
+) -> Result<(), CommandError>
+where
+    B: FnOnce() -> Result<
+        tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse,
+        CommandError,
+    >,
+    L: FnOnce() -> LFut,
+    LFut: std::future::Future<Output = Result<(), CommandError>>,
+    R: FnOnce() -> RFut,
+    RFut: std::future::Future<Output = Result<(), CommandError>>,
+{
+    let ownership = begin_native_logout()?;
+    if ownership.ownership == tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned {
+        legacy_remote_logout().await?;
+    }
+    local_sign_out().await
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_start_acknowledgement_is_durable(
+    acknowledged: &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse,
+) -> bool {
+    if !acknowledged.desired_active {
+        return false;
+    }
+    matches!(
+        (
+            acknowledged.lease_phase.as_deref(),
+            acknowledged.status.as_str(),
+        ),
+        (Some("start_pending" | "lease_acquired"), "recovering")
+            | (Some("cleanup_pending" | "stale_cleanup"), "stopping")
+            | (Some("active_checkpoint"), "none")
+    )
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_quick_toggle<F, Fut, B, BFut, S, SFut>(
+    service_toggle: F,
+    rust_bootstrap: B,
+    rust_start: S,
+) -> Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = Result<tauri_plugin_tunnel_android::ConnectionIntentStatusResponse, CommandError>,
+    >,
+    B: FnOnce() -> BFut,
+    BFut: std::future::Future<Output = Result<(), CommandError>>,
+    S: FnOnce() -> SFut,
+    SFut: std::future::Future<Output = Result<(), CommandError>>,
+{
+    let (_rust_bootstrap, _rust_start) = (rust_bootstrap, rust_start);
+    service_toggle().await
 }
 
 #[derive(Serialize)]
@@ -832,9 +1258,20 @@ async fn current_connection_intent(
 
 #[cfg(target_os = "android")]
 async fn current_connection_intent(
-    _app: &AppHandle,
+    app: &AppHandle,
 ) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
-    (nelomai_client_core::ConnectionIntentStatus::None, None)
+    let Ok(status) = app.tunnel_android().connection_intent_status() else {
+        return (
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+            None,
+        );
+    };
+    let projected = match status.status.as_str() {
+        "recovering" => nelomai_client_core::ConnectionIntentStatus::Recovering,
+        "blocked_terminal" => nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
+        _ => nelomai_client_core::ConnectionIntentStatus::None,
+    };
+    (projected, status.next_retry_at_unix)
 }
 
 #[cfg(desktop)]
@@ -879,6 +1316,8 @@ pub struct LoginCommandRequest {
 #[serde(rename_all = "camelCase")]
 pub struct StartCommandRequest {
     device_id: String,
+    #[serde(default)]
+    binding_request: Option<BindPeerRequest>,
     layer: Layer,
     tic_connection_mode: TicConnectionMode,
     route_mode: RouteMode,
@@ -1095,132 +1534,146 @@ pub(crate) async fn quick_toggle(
     application: &NativeApplication,
     skip_probe_refresh: bool,
 ) -> Result<AppStateResponse, CommandError> {
-    let state = application.state().await;
-    let (intent_status, _) = current_connection_intent(app).await;
-    if intent_status != nelomai_client_core::ConnectionIntentStatus::None {
-        stop_connection(app, application).await?;
-    } else {
-        match state.phase {
-            Phase::Connected => {
-                stop_connection(app, application).await?;
-            }
-            Phase::Ready | Phase::Error | Phase::ServerUnavailable => {
-                let bootstrap = application
+    #[cfg(target_os = "android")]
+    {
+        let _ = skip_probe_refresh;
+        route_android_quick_toggle(
+            || async {
+                app.tunnel_android()
+                    .toggle_connection_intent()
+                    .map_err(|_| {
+                        CommandError::new(
+                            "android_service_dispatch_unavailable",
+                            "Не удалось передать команду службе подключения",
+                        )
+                    })
+            },
+            || async {
+                application
                     .bootstrap(now_unix())
                     .await
-                    .map_err(CommandError::from)?;
-                if !bootstrap.access.can_connect {
+                    .map(|_| ())
+                    .map_err(CommandError::from)
+            },
+            || async {
+                application
+                    .start_saved_stray_offline(now_unix())
+                    .await
+                    .map(|_| ())
+                    .map_err(CommandError::from)
+            },
+        )
+        .await?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let state = application.state().await;
+        let (intent_status, _) = current_connection_intent(app).await;
+        if intent_status != nelomai_client_core::ConnectionIntentStatus::None {
+            stop_connection(app, application).await?;
+        } else {
+            match state.phase {
+                Phase::Connected => {
+                    stop_connection(app, application).await?;
+                }
+                Phase::Ready | Phase::Error | Phase::ServerUnavailable => {
+                    #[cfg(not(target_os = "android"))]
+                    let connection = app
+                        .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+                        .start_or_resume_quick_toggle(skip_probe_refresh, now_unix())
+                        .await?
+                        .connection;
+                    #[cfg(target_os = "android")]
+                    let connection: Option<Connection> = {
+                        let _ = skip_probe_refresh;
+                        let tunnel_options = application
+                            .connection_intent_tunnel_options(
+                                options.layer,
+                                options.route_mode,
+                                now_unix(),
+                            )
+                            .await
+                            .map(tauri_plugin_tunnel_android::connection_intent_tunnel_options)
+                            .map_err(CommandError::from)?;
+                        app.tunnel_android()
+                        .begin_connection_intent(
+                            tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
+                                api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                                template:
+                                    tauri_plugin_tunnel_android::ConnectionIntentTemplateRequest {
+                                        device_id: bootstrap.device.id.clone(),
+                                        account_scope: bootstrap.device.id.clone(),
+                                        layer: match options.layer {
+                                            Layer::Tic => "tic",
+                                            Layer::Stray => "stray",
+                                        }
+                                        .to_string(),
+                                        tic_connection_mode: match options.tic_connection_mode {
+                                            TicConnectionMode::Personal => "personal",
+                                            TicConnectionMode::Dynamic => "dynamic",
+                                        }
+                                        .to_string(),
+                                        route_mode: match options.route_mode {
+                                            RouteMode::Standalone => "standalone",
+                                            RouteMode::ViaTak => "via_tak",
+                                        }
+                                        .to_string(),
+                                        egress_mode: match options.egress_mode {
+                                            EgressMode::Ipv4 => "ipv4",
+                                            EgressMode::PreferIpv6 => "prefer_ipv6",
+                                        }
+                                        .to_string(),
+                                        allow_alternate: options.allow_alternate,
+                                        sync_binding_preferences: false,
+                                        options: tunnel_options,
+                                    },
+                            },
+                        )
+                        .map_err(|_| {
+                            CommandError::new(
+                                "android_service_dispatch_unavailable",
+                                "Не удалось передать намерение службе подключения",
+                            )
+                        })?;
+                        None
+                    };
+                    #[cfg(desktop)]
+                    if let Some(connection) = &connection {
+                        begin_desktop_tunnel_diagnostics(app, &connection.lease_id);
+                    }
+                    #[cfg(not(desktop))]
+                    let _ = connection;
+                }
+                Phase::Connecting | Phase::Stopping | Phase::Measuring | Phase::Authenticating => {
+                    return Err(CommandError::new(
+                        "connection_busy",
+                        "Дождитесь завершения текущего действия",
+                    ));
+                }
+                Phase::SignedOut => {
+                    return Err(CommandError::new(
+                        "signed_out",
+                        "Нужно снова войти в приложение",
+                    ));
+                }
+                Phase::NeedsPeerBinding => {
+                    return Err(CommandError::new(
+                        "peer_binding_required",
+                        "Сначала выберите пир в приложении",
+                    ));
+                }
+                Phase::AccessExpired => {
                     return Err(CommandError::new(
                         "access_expired",
                         "Срок доступа уже истёк",
                     ));
                 }
-                let binding_egress_mode = bootstrap
-                    .binding
-                    .as_ref()
-                    .map(|binding| binding.egress_mode)
-                    .ok_or_else(|| {
-                        CommandError::new(
-                            "peer_binding_required",
-                            "Сначала выберите пир в приложении",
-                        )
-                    })?;
-                crate::platform::prepare_tunnel(app.clone())
-                    .await
-                    .map_err(CommandError::from_tunnel)?;
-                refresh_installed_applications_before_start(
-                    app,
-                    application,
-                    bootstrap.defaults.layer,
-                    bootstrap.defaults.route_mode,
-                )
-                .await?;
-                let options = ConnectOptions {
-                    layer: bootstrap.defaults.layer,
-                    tic_connection_mode: bootstrap.defaults.tic_connection_mode,
-                    route_mode: bootstrap.defaults.route_mode,
-                    egress_mode: connection_egress_mode(
-                        bootstrap.defaults.layer,
-                        bootstrap.defaults.route_mode,
-                        bootstrap.defaults.tic_connection_mode,
-                        app.state::<Arc<AppPreferenceStore>>().get(),
-                        binding_egress_mode,
-                    ),
-                    probes: Vec::new(),
-                    allow_alternate: true,
-                };
-                #[cfg(not(target_os = "android"))]
-                let connection = if nelomai_contracts::allows_new_connection_intent_operation(
-                    bootstrap.capabilities.as_ref(),
-                    now_unix(),
-                ) {
-                    app.state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
-                        .start_or_resume(options, now_unix())
-                        .await?
-                        .connection
-                } else if skip_probe_refresh {
-                    Some(
-                        application
-                            .start_without_probe_refresh(options, now_unix())
-                            .await
-                            .map_err(CommandError::from)?,
-                    )
-                } else {
-                    Some(
-                        application
-                            .start(options, now_unix())
-                            .await
-                            .map_err(CommandError::from)?,
-                    )
-                };
-                #[cfg(target_os = "android")]
-                let connection = Some(if skip_probe_refresh {
-                    application
-                        .start_without_probe_refresh(options, now_unix())
-                        .await
-                        .map_err(CommandError::from)?
-                } else {
-                    application
-                        .start(options, now_unix())
-                        .await
-                        .map_err(CommandError::from)?
-                });
-                #[cfg(desktop)]
-                if let Some(connection) = &connection {
-                    begin_desktop_tunnel_diagnostics(app, &connection.lease_id);
+                Phase::UpdateRequired => {
+                    return Err(CommandError::new(
+                        "update_required",
+                        "Для продолжения необходимо обновить приложение",
+                    ));
                 }
-                #[cfg(not(desktop))]
-                let _ = connection;
-            }
-            Phase::Connecting | Phase::Stopping | Phase::Measuring | Phase::Authenticating => {
-                return Err(CommandError::new(
-                    "connection_busy",
-                    "Дождитесь завершения текущего действия",
-                ));
-            }
-            Phase::SignedOut => {
-                return Err(CommandError::new(
-                    "signed_out",
-                    "Нужно снова войти в приложение",
-                ));
-            }
-            Phase::NeedsPeerBinding => {
-                return Err(CommandError::new(
-                    "peer_binding_required",
-                    "Сначала выберите пир в приложении",
-                ));
-            }
-            Phase::AccessExpired => {
-                return Err(CommandError::new(
-                    "access_expired",
-                    "Срок доступа уже истёк",
-                ));
-            }
-            Phase::UpdateRequired => {
-                return Err(CommandError::new(
-                    "update_required",
-                    "Для продолжения необходимо обновить приложение",
-                ));
             }
         }
     }
@@ -1266,6 +1719,7 @@ pub async fn app_login(
         .map_err(CommandError::from)?;
     #[cfg(desktop)]
     diagnostics.set_automatic_device(&response.device.id);
+    #[cfg(not(target_os = "android"))]
     let _ = app.tunnel_android().clear_background();
     let _ = app.tunnel_android().clear_quick_plan();
     provision_android_background_resilient(
@@ -1403,48 +1857,44 @@ async fn provision_android_background(
                     "Не удалось проверить фоновое подключение",
                 )
             })?;
-        let desired_capability_enabled =
-            capability.is_some_and(|value| value.connection_intent_recovery_v1);
+        let desired_capability = android_background_capability_snapshot(capability, now);
         let provision_with_ui_authentication =
-            |expected_revision: i64| -> Result<(), CommandError> {
-                let access_token = application
-                    .current_access_token()
-                    .map_err(CommandError::from)?;
-                let install_secret = application.install_secret().map_err(CommandError::from)?;
-                app.tunnel_android()
-                    .provision_background(
-                        tauri_plugin_tunnel_android::BackgroundUiProvisionRequest {
-                            api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
-                            expected_revision,
-                            device_id: device_id.to_string(),
-                            panel_base: crate::PANEL_BASE.to_string(),
-                            access_token,
-                            install_secret,
-                            capability_revision: capability
-                                .map(|value| i64::from(value.revision))
-                                .unwrap_or(0),
-                            capability_enabled: capability
-                                .is_some_and(|value| value.connection_intent_recovery_v1),
-                            capability_expires_at: capability
-                                .map(|value| value.expires_at.clone())
-                                .unwrap_or_else(|| "1970-01-01T00:00:01Z".to_string()),
-                        },
-                    )
-                    .map_err(|_| {
-                        CommandError::new(
-                            "background_credential_provision_failed",
-                            "Не удалось безопасно подготовить фоновое подключение",
-                        )
-                    })
+            |expected_revision: i64| -> Result<(), AndroidBackgroundProvisionFailure> {
+                let access_token = application.current_access_token().map_err(|error| {
+                    AndroidBackgroundProvisionFailure {
+                        command_error: CommandError::from(error),
+                        rejection_code: None,
+                    }
+                })?;
+                let install_secret = application.install_secret().map_err(|error| {
+                    AndroidBackgroundProvisionFailure {
+                        command_error: CommandError::from(error),
+                        rejection_code: None,
+                    }
+                })?;
+                let result = app.tunnel_android().provision_background(
+                    tauri_plugin_tunnel_android::BackgroundUiProvisionRequest {
+                        api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                        expected_revision,
+                        device_id: device_id.to_string(),
+                        panel_base: crate::PANEL_BASE.to_string(),
+                        access_token,
+                        install_secret,
+                        capability_revision: desired_capability.revision,
+                        capability_enabled: desired_capability.enabled,
+                        capability_expires_at: desired_capability.expires_at.clone(),
+                    },
+                );
+                result.map_err(|error| AndroidBackgroundProvisionFailure {
+                    rejection_code: error.rejection_code().map(str::to_owned),
+                    command_error: CommandError::new(
+                        "background_credential_provision_failed",
+                        "Не удалось безопасно подготовить фоновое подключение",
+                    ),
+                })
             };
-        match android_background_provision_mode(&status, device_id, desired_capability_enabled, now)
-        {
-            AndroidBackgroundProvisionMode::Noop => return Ok(()),
-            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase => {
-                let error = match provision_with_ui_authentication(status.credential_revision) {
-                    Ok(()) => return Ok(()),
-                    Err(error) => error,
-                };
+        let legacy_status_after_ui_failure =
+            |failure: AndroidBackgroundProvisionFailure| -> Result<_, CommandError> {
                 let latest_status = app
                     .tunnel_android()
                     .background_credential_status()
@@ -1454,13 +1904,24 @@ async fn provision_android_background(
                             "Не удалось повторно проверить фоновое подключение",
                         )
                     })?;
-                if !android_background_legacy_fallback_after_ui_failure(
-                    desired_capability_enabled,
+                if android_background_legacy_fallback_after_ui_failure(
+                    failure.rejection_code.as_deref(),
                     &latest_status,
+                    now,
                 ) {
-                    return Err(error);
+                    Ok(latest_status)
+                } else {
+                    Err(failure.command_error)
                 }
-                status = latest_status;
+            };
+        match android_background_provision_mode(&status, device_id, &desired_capability, now) {
+            AndroidBackgroundProvisionMode::Noop => return Ok(()),
+            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase => {
+                let failure = match provision_with_ui_authentication(status.credential_revision) {
+                    Ok(()) => return Ok(()),
+                    Err(failure) => failure,
+                };
+                status = legacy_status_after_ui_failure(failure)?;
             }
             AndroidBackgroundProvisionMode::RefreshStoredCapability => {
                 let refresh = app.tunnel_android().rotate_background(
@@ -1471,7 +1932,7 @@ async fn provision_android_background(
                 if refresh.is_ok() {
                     return Ok(());
                 }
-                if android_background_rotation_fallback(desired_capability_enabled).is_some() {
+                if android_background_rotation_fallback().is_some() {
                     let latest_revision = app
                         .tunnel_android()
                         .background_credential_status()
@@ -1482,12 +1943,17 @@ async fn provision_android_background(
                             )
                         })?
                         .credential_revision;
-                    return provision_with_ui_authentication(latest_revision);
+                    let failure = match provision_with_ui_authentication(latest_revision) {
+                        Ok(()) => return Ok(()),
+                        Err(failure) => failure,
+                    };
+                    status = legacy_status_after_ui_failure(failure)?;
+                } else {
+                    return Err(CommandError::new(
+                        "background_credential_rotation_failed",
+                        "Не удалось обновить фоновое подключение",
+                    ));
                 }
-                return Err(CommandError::new(
-                    "background_credential_rotation_failed",
-                    "Не удалось обновить фоновое подключение",
-                ));
             }
             AndroidBackgroundProvisionMode::Legacy => {}
         }
@@ -1512,14 +1978,9 @@ async fn provision_android_background(
                 token: token.token,
                 expires_at_unix,
                 install_secret,
-                capability_revision: capability
-                    .map(|value| i64::from(value.revision))
-                    .unwrap_or(0),
-                capability_enabled: capability
-                    .is_some_and(|value| value.connection_intent_recovery_v1),
-                capability_expires_at: capability
-                    .map(|value| value.expires_at.clone())
-                    .unwrap_or_else(|| "1970-01-01T00:00:01Z".to_string()),
+                capability_revision: desired_capability.revision,
+                capability_enabled: desired_capability.enabled,
+                capability_expires_at: desired_capability.expires_at,
             })
             .map_err(|_| {
                 CommandError::new(
@@ -1837,20 +2298,18 @@ fn defender_state_name(state: nelomai_windows_service::DefenderExclusionState) -
 }
 
 #[cfg(windows)]
-async fn ensure_defender_ready_for_awg(diagnostics: &AppDiagnostics) -> Result<(), CommandError> {
+pub(crate) async fn ensure_defender_ready_for_awg(
+    diagnostics: &AppDiagnostics,
+) -> Result<(), ApplicationError> {
     let defender = crate::platform::windows::defender_status()
         .await
-        .map_err(CommandError::from_tunnel)?;
+        .map_err(CoreError::from)?;
     record_defender_status(diagnostics, "windows.defender.before_awg_start", &defender);
     if !defender.dll_present {
-        return Err(CommandError::from_tunnel(
-            nelomai_client_tunnel::TunnelError::Backend("amneziawg_component_missing".to_string()),
-        ));
+        return Err(CoreError::Tunnel("amneziawg_component_missing".to_string()).into());
     }
     if defender.state == nelomai_windows_service::DefenderExclusionState::Missing {
-        return Err(CommandError::from_tunnel(
-            nelomai_client_tunnel::TunnelError::Backend("defender_exclusion_missing".to_string()),
-        ));
+        return Err(CoreError::Tunnel("defender_exclusion_missing".to_string()).into());
     }
     Ok(())
 }
@@ -1863,18 +2322,13 @@ pub async fn app_start(
     request: StartCommandRequest,
 ) -> Result<StartCommandResponse, CommandError> {
     let device_id = request.device_id;
-    let start_result = async {
-        #[cfg(windows)]
-        if request.layer == Layer::Stray {
-            ensure_defender_ready_for_awg(&diagnostics).await?;
-        }
-        refresh_installed_applications_before_start(
-            &app,
-            &application,
-            request.layer,
-            request.route_mode,
-        )
-        .await?;
+    let failure_device_id = device_id.clone();
+    let binding_request = request.binding_request;
+    #[cfg(target_os = "android")]
+    let android_start_ticket = ANDROID_UI_START_STOP_COORDINATOR.start_ticket();
+    #[cfg(not(target_os = "android"))]
+    let _ = &application;
+    let start_result: Result<StartCommandResponse, CommandError> = async {
         let options = ConnectOptions {
             layer: request.layer,
             tic_connection_mode: request.tic_connection_mode,
@@ -1888,41 +2342,163 @@ pub async fn app_start(
             use tauri::Manager;
 
             let now = now_unix();
-            let bootstrap = application
-                .bootstrap(now)
-                .await
-                .map_err(CommandError::from)?;
-            if bootstrap.device.id != device_id {
-                return Err(CommandError::new(
-                    "device_mismatch",
-                    "Подключение запрошено для другого устройства",
-                ));
-            }
             let runtime = app
                 .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
                 .inner()
                 .clone();
-            if runtime.snapshot().await.status != nelomai_client_core::ConnectionIntentStatus::None
-                || nelomai_contracts::allows_new_connection_intent_operation(
-                    bootstrap.capabilities.as_ref(),
+            runtime
+                .start_or_resume_with_initial_preflight(
+                    options,
+                    device_id.clone(),
+                    binding_request,
                     now,
                 )
-            {
-                return runtime.start_or_resume(options, now).await;
-            }
-            application
-                .start(options, now)
                 .await
-                .map(StartCommandResponse::connected)
-                .map_err(CommandError::from)
         }
         #[cfg(target_os = "android")]
         {
-            application
-                .start(options, now_unix())
-                .await
-                .map(StartCommandResponse::connected)
-                .map_err(CommandError::from)
+            let service_app = app.clone();
+            let rust_application = application.inner().clone();
+            let response = ANDROID_UI_START_STOP_COORDINATOR
+                .run_start(android_start_ticket, || async move {
+                    let now = now_unix();
+                    let current_intent = service_app
+                        .tunnel_android()
+                        .connection_intent_status()
+                        .map_err(|_| {
+                            CommandError::new(
+                                "android_service_status_unavailable",
+                                "Не удалось проверить состояние службы подключения",
+                            )
+                        })?;
+                    let legacy_start_attempt = current_intent
+                        .lease_phase
+                        .is_none()
+                        .then(|| AndroidLegacyStartAttempt::new(rust_application.clone()));
+                    let legacy_start_epoch =
+                        legacy_start_attempt.as_ref().map(|attempt| attempt.epoch);
+                    let current_bootstrap = if current_intent.lease_phase.is_some() {
+                        None
+                    } else {
+                        let bootstrap = rust_application
+                            .bootstrap(now)
+                            .await
+                            .map_err(CommandError::from)?;
+                        if bootstrap.device.id != device_id {
+                            return Err(CommandError::new(
+                                "device_mismatch",
+                                "Подключение запрошено для другого устройства",
+                            ));
+                        }
+                        Some(bootstrap)
+                    };
+                    let begin_app = service_app.clone();
+                    let recovery_application = rust_application.clone();
+                    let recovery_device_id = device_id.clone();
+                    let recovery_layer = request.layer;
+                    let recovery_tic_connection_mode = request.tic_connection_mode;
+                    let recovery_route_mode = request.route_mode;
+                    let recovery_egress_mode = request.egress_mode;
+                    let recovery_allow_alternate = request.allow_alternate;
+                    let recovery_sync_binding_preferences = binding_request.is_some();
+                    let recovery_capability = current_bootstrap
+                        .as_ref()
+                        .and_then(|bootstrap| bootstrap.capabilities.as_ref());
+                    let response = route_android_app_start_with_capability(
+                        &current_intent,
+                        recovery_capability,
+                        now,
+                        move || async move {
+                            let tunnel_options = recovery_application
+                                .connection_intent_tunnel_options(
+                                    recovery_layer,
+                                    recovery_route_mode,
+                                    now,
+                                )
+                                .await
+                                .map(tauri_plugin_tunnel_android::connection_intent_tunnel_options)
+                                .map_err(CommandError::from)?;
+                            Ok(tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
+                                api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                                template:
+                                    tauri_plugin_tunnel_android::ConnectionIntentTemplateRequest {
+                                        device_id: recovery_device_id.clone(),
+                                        account_scope: recovery_device_id,
+                                        layer: match recovery_layer {
+                                            Layer::Tic => "tic",
+                                            Layer::Stray => "stray",
+                                        }
+                                        .to_string(),
+                                        tic_connection_mode: match recovery_tic_connection_mode {
+                                            TicConnectionMode::Personal => "personal",
+                                            TicConnectionMode::Dynamic => "dynamic",
+                                        }
+                                        .to_string(),
+                                        route_mode: match recovery_route_mode {
+                                            RouteMode::Standalone => "standalone",
+                                            RouteMode::ViaTak => "via_tak",
+                                        }
+                                        .to_string(),
+                                        egress_mode: match recovery_egress_mode {
+                                            EgressMode::Ipv4 => "ipv4",
+                                            EgressMode::PreferIpv6 => "prefer_ipv6",
+                                        }
+                                        .to_string(),
+                                        allow_alternate: recovery_allow_alternate,
+                                        sync_binding_preferences: recovery_sync_binding_preferences,
+                                        options: tunnel_options,
+                                    },
+                            })
+                        },
+                        move |request| async move {
+                            ANDROID_UI_START_STOP_COORDINATOR
+                                .run_start_side_effect(android_start_ticket, async move {
+                                    begin_app
+                                        .tunnel_android()
+                                        .begin_connection_intent_async(request)
+                                        .await
+                                        .map_err(|_| {
+                                            CommandError::new(
+                                                "android_service_dispatch_unavailable",
+                                                "Не удалось передать намерение службе подключения",
+                                            )
+                                        })
+                                })
+                                .await
+                        },
+                        move || async move {
+                            let legacy_start_epoch = legacy_start_epoch.ok_or_else(|| {
+                                CommandError::new(
+                                    "connection_intent_generation_conflict",
+                                    "Не удалось подтвердить устаревшее подключение",
+                                )
+                            })?;
+                            ANDROID_UI_START_STOP_COORDINATOR
+                                .run_start_side_effect(android_start_ticket, async move {
+                                    if let Some(binding_request) = binding_request {
+                                        rust_application
+                                            .bind_peer(binding_request)
+                                            .await
+                                            .map_err(CommandError::from)?;
+                                    }
+                                    rust_application
+                                        .start_with_cancellation_epoch(
+                                            options,
+                                            now,
+                                            legacy_start_epoch,
+                                        )
+                                        .await
+                                        .map_err(CommandError::from)
+                                })
+                                .await
+                        },
+                    )
+                    .await;
+                    drop(legacy_start_attempt);
+                    response
+                })
+                .await?;
+            Ok(response)
         }
     }
     .await;
@@ -1939,13 +2515,18 @@ pub async fn app_start(
                 app,
                 diagnostics.inner().clone(),
                 tauri_plugin_tunnel_android::StartFailureDiagnosticsRequest {
-                    device_id,
+                    device_id: failure_device_id,
                     error_code: command_error.code().to_string(),
                 },
             );
             Err(command_error)
         }
     }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn android_start_epoch_is_current(expected: u64, current: u64) -> bool {
+    expected == current
 }
 
 #[tauri::command]
@@ -2458,10 +3039,38 @@ pub async fn app_logout(
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
 ) -> Result<(), CommandError> {
     cancel_desktop_connection_intent(&app).await;
+    #[cfg(target_os = "android")]
+    let _background_provision_guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
+    #[cfg(target_os = "android")]
+    let logout_result = route_android_logout(
+        || {
+            app.tunnel_android().begin_background_logout().map_err(|_| {
+                CommandError::new(
+                    "background_storage_unavailable",
+                    "Не удалось сохранить безопасное завершение фонового подключения",
+                )
+            })
+        },
+        || async {
+            push_registration_scheduler
+                .logout_local(&app, &application)
+                .await
+                .map_err(CommandError::from)
+        },
+        || async {
+            push_registration_scheduler
+                .logout_remote(&application)
+                .await
+                .map_err(CommandError::from)
+        },
+    )
+    .await;
     #[cfg(desktop)]
     prepare_desktop_logout(&app, &application, &diagnostics).await;
+    #[cfg(not(target_os = "android"))]
     let logout_result = push_registration_scheduler.logout(&app, &application).await;
     let quick_plan_result = app.tunnel_android().clear_quick_plan();
+    #[cfg(not(target_os = "android"))]
     let background_result = app.tunnel_android().clear_background();
 
     if let Err(error) = logout_result {
@@ -2477,6 +3086,7 @@ pub async fn app_logout(
             "Не удалось очистить данные быстрого подключения",
         )
     })?;
+    #[cfg(not(target_os = "android"))]
     background_result.map_err(|_| {
         CommandError::new(
             "background_storage_unavailable",
@@ -2678,19 +3288,14 @@ fn schedule_startup_split_tunnel_refresh(
     });
 }
 
-async fn refresh_installed_applications_before_start(
+pub(crate) async fn refresh_installed_applications_before_start(
     app: &AppHandle,
     application: &NativeApplication,
     layer: Layer,
     route_mode: RouteMode,
-) -> Result<(), CommandError> {
-    let capabilities = application
-        .split_tunnel_capabilities()
-        .await
-        .map_err(CommandError::from)?;
-    let policy = application
-        .cached_split_tunnel_policy()
-        .map_err(CommandError::from)?;
+) -> Result<(), ApplicationError> {
+    let capabilities = application.split_tunnel_capabilities().await?;
+    let policy = application.cached_split_tunnel_policy()?;
     let inventory_required = capabilities.application_split_tunnel
         && policy.as_ref().is_some_and(|policy| {
             split_tunnel_active(SplitTunnelContext {
@@ -2702,11 +3307,21 @@ async fn refresh_installed_applications_before_start(
             })
         });
     if inventory_required {
-        if refresh_installed_applications(app, application)?.is_empty() {
-            return Err(CommandError::new(
-                "installed_applications_unavailable",
-                "Не удалось получить список приложений",
-            ));
+        let applications = refresh_installed_applications(app, application).map_err(|_| {
+            ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                code: "installed_applications_unavailable".to_string(),
+                message: "Не удалось получить список приложений".to_string(),
+                retry_after_seconds: None,
+            }))
+        })?;
+        if applications.is_empty() {
+            return Err(ApplicationError::Core(CoreError::Api(
+                CoreApiError::Rejected {
+                    code: "installed_applications_unavailable".to_string(),
+                    message: "Не удалось получить список приложений".to_string(),
+                    retry_after_seconds: None,
+                },
+            )));
         }
     } else {
         let _ = refresh_installed_applications(app, application);
@@ -2760,7 +3375,24 @@ fn current_platform() -> Platform {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nelomai_contracts::{ApiVersion, PeerBinding};
+    use nelomai_contracts::{ApiVersion, LeaseStatus, PeerBinding};
+
+    fn background_capability_snapshot(
+        revision: i64,
+        enabled: bool,
+        expires_at_unix: i64,
+    ) -> AndroidBackgroundCapabilitySnapshot {
+        AndroidBackgroundCapabilitySnapshot {
+            revision,
+            enabled,
+            expires_at: if enabled {
+                "2099-01-01T00:00:00Z".to_string()
+            } else {
+                ANDROID_DISABLED_CAPABILITY_EXPIRES_AT.to_string()
+            },
+            expires_at_unix,
+        }
+    }
 
     #[test]
     fn manual_diagnostics_uses_only_an_unchanged_connection_lease() {
@@ -3005,6 +3637,7 @@ mod tests {
             credential_revision: 7,
             mutation_ready: true,
             mutation_pending: false,
+            capability_revision: 1,
             capability_enabled: true,
             capability_expires_at_unix: Some(200),
             device_id: Some("device-1".to_string()),
@@ -3012,7 +3645,37 @@ mod tests {
         };
 
         assert_eq!(
-            android_background_provision_mode(&status, "device-1", true, 150),
+            android_background_provision_mode(
+                &status,
+                "device-1",
+                &background_capability_snapshot(1, true, 200),
+                150,
+            ),
+            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase,
+        );
+    }
+
+    #[test]
+    fn stored_enabled_capability_prevents_stale_desired_legacy_provisioning() {
+        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            configured: true,
+            credential_revision: 7,
+            mutation_ready: true,
+            mutation_pending: false,
+            capability_revision: 1,
+            capability_enabled: true,
+            capability_expires_at_unix: Some(200),
+            device_id: Some("device-1".to_string()),
+            expires_at_unix: Some(100),
+        };
+
+        assert_eq!(
+            android_background_provision_mode(
+                &status,
+                "device-1",
+                &background_capability_snapshot(2, false, 1),
+                150,
+            ),
             AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase,
         );
     }
@@ -3024,6 +3687,7 @@ mod tests {
             credential_revision: 8,
             mutation_ready: true,
             mutation_pending: true,
+            capability_revision: 1,
             capability_enabled: true,
             capability_expires_at_unix: Some(300),
             device_id: Some("device-1".to_string()),
@@ -3031,7 +3695,12 @@ mod tests {
         };
 
         assert_eq!(
-            android_background_provision_mode(&status, "device-1", true, 150),
+            android_background_provision_mode(
+                &status,
+                "device-1",
+                &background_capability_snapshot(1, true, 300),
+                150,
+            ),
             AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase,
         );
     }
@@ -3043,6 +3712,7 @@ mod tests {
             credential_revision: 9,
             mutation_ready: true,
             mutation_pending: false,
+            capability_revision: 1,
             capability_enabled: true,
             capability_expires_at_unix: Some(100),
             device_id: Some("device-1".to_string()),
@@ -3050,36 +3720,177 @@ mod tests {
         };
 
         assert_eq!(
-            android_background_provision_mode(&status, "device-1", true, 150),
+            android_background_provision_mode(
+                &status,
+                "device-1",
+                &background_capability_snapshot(2, true, 300),
+                150,
+            ),
             AndroidBackgroundProvisionMode::RefreshStoredCapability,
         );
     }
 
     #[test]
-    fn failed_device_refresh_uses_available_ui_authentication_only_for_enabled_recovery() {
+    fn newer_same_enabled_capability_refreshes_the_android_snapshot() {
+        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            configured: true,
+            credential_revision: 9,
+            mutation_ready: true,
+            mutation_pending: false,
+            capability_revision: 10,
+            capability_enabled: true,
+            capability_expires_at_unix: Some(200),
+            device_id: Some("device-1".to_string()),
+            expires_at_unix: Some(2_000_000),
+        };
+        let desired = AndroidBackgroundCapabilitySnapshot {
+            revision: 11,
+            enabled: true,
+            expires_at: "1970-01-01T00:05:00Z".to_string(),
+            expires_at_unix: 300,
+        };
+
         assert_eq!(
-            android_background_rotation_fallback(true),
-            Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase),
+            android_background_provision_mode(&status, "device-1", &desired, 150),
+            AndroidBackgroundProvisionMode::RefreshStoredCapability,
         );
-        assert_eq!(android_background_rotation_fallback(false), None);
     }
 
     #[test]
-    fn capability_downgrade_returns_to_legacy_only_after_the_journal_is_clear() {
+    fn changed_enabled_capability_expiry_refreshes_the_android_snapshot() {
+        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            configured: true,
+            credential_revision: 9,
+            mutation_ready: true,
+            mutation_pending: false,
+            capability_revision: 10,
+            capability_enabled: true,
+            capability_expires_at_unix: Some(200),
+            device_id: Some("device-1".to_string()),
+            expires_at_unix: Some(2_000_000),
+        };
+        let desired = android_background_capability_snapshot(
+            Some(&ConnectionIntentCapability {
+                revision: 10,
+                expires_at: "1970-01-01T00:05:00Z".to_string(),
+                connection_intent_recovery_v1: true,
+            }),
+            150,
+        );
+
+        assert_eq!(
+            android_background_provision_mode(&status, "device-1", &desired, 150),
+            AndroidBackgroundProvisionMode::RefreshStoredCapability,
+        );
+    }
+
+    #[test]
+    fn capability_expiring_now_is_disabled_for_android_provisioning() {
+        let capability = ConnectionIntentCapability {
+            revision: 7,
+            expires_at: "1970-01-01T00:02:30Z".to_string(),
+            connection_intent_recovery_v1: true,
+        };
+
+        let snapshot = android_background_capability_snapshot(Some(&capability), 150);
+
+        assert_eq!(snapshot.revision, 7);
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.expires_at, "1970-01-01T00:00:01Z");
+    }
+
+    #[test]
+    fn malformed_capability_expiry_is_disabled_for_android_provisioning() {
+        let capability = ConnectionIntentCapability {
+            revision: 8,
+            expires_at: "not-a-timestamp".to_string(),
+            connection_intent_recovery_v1: true,
+        };
+
+        let snapshot = android_background_capability_snapshot(Some(&capability), 150);
+
+        assert_eq!(snapshot.revision, 8);
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.expires_at, "1970-01-01T00:00:01Z");
+    }
+
+    #[test]
+    fn invalid_capability_revision_uses_the_disabled_android_sentinel() {
+        let capability = ConnectionIntentCapability {
+            revision: -1,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            connection_intent_recovery_v1: true,
+        };
+
+        let snapshot = android_background_capability_snapshot(Some(&capability), 150);
+
+        assert_eq!(snapshot.revision, 0);
+        assert!(!snapshot.enabled);
+        assert_eq!(snapshot.expires_at, ANDROID_DISABLED_CAPABILITY_EXPIRES_AT);
+    }
+
+    #[test]
+    fn failed_device_refresh_uses_ui_authentication_to_persist_disabled_recovery() {
+        assert_eq!(
+            android_background_rotation_fallback(),
+            Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase),
+        );
+    }
+
+    #[test]
+    fn legacy_fallback_requires_an_authoritative_capability_rejection() {
         let mut status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
             mutation_pending: true,
             ..Default::default()
         };
         assert!(!android_background_legacy_fallback_after_ui_failure(
-            false, &status,
+            Some("background_credential_capability_unavailable"),
+            &status,
+            100,
         ));
 
         status.mutation_pending = false;
-        assert!(android_background_legacy_fallback_after_ui_failure(
-            false, &status,
+        assert!(!android_background_legacy_fallback_after_ui_failure(
+            None, &status, 100,
         ));
         assert!(!android_background_legacy_fallback_after_ui_failure(
-            true, &status,
+            Some("background_transport_unavailable"),
+            &status,
+            100,
+        ));
+        assert!(android_background_legacy_fallback_after_ui_failure(
+            Some("background_credential_capability_unavailable"),
+            &status,
+            100,
+        ));
+
+        status.capability_enabled = true;
+        status.capability_expires_at_unix = Some(500);
+        assert!(!android_background_legacy_fallback_after_ui_failure(
+            Some("background_credential_capability_unavailable"),
+            &status,
+            100,
+        ));
+    }
+
+    #[test]
+    fn authoritative_newer_capability_downgrade_allows_legacy_fallback() {
+        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
+            mutation_pending: false,
+            capability_enabled: false,
+            capability_expires_at_unix: Some(500),
+            ..Default::default()
+        };
+
+        assert!(android_background_legacy_fallback_after_ui_failure(
+            Some("background_credential_capability_unavailable"),
+            &status,
+            100,
+        ));
+        assert!(!android_background_legacy_fallback_after_ui_failure(
+            Some("background_transport_unavailable"),
+            &status,
+            100,
         ));
     }
 
@@ -3099,5 +3910,938 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn android_ui_start_waits_for_durable_service_ack_without_panel_start() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        assert!(android_start_epoch_is_current(7, 7));
+        assert!(!android_start_epoch_is_current(7, 8));
+
+        let service_calls = Arc::new(AtomicUsize::new(0));
+        let panel_start_calls = Arc::new(AtomicUsize::new(0));
+        let durable = Arc::new(AtomicBool::new(false));
+        let request = tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
+            api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+            template: tauri_plugin_tunnel_android::ConnectionIntentTemplateRequest {
+                device_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                account_scope: "11111111-1111-4111-8111-111111111111".to_string(),
+                layer: "stray".to_string(),
+                tic_connection_mode: "dynamic".to_string(),
+                route_mode: "standalone".to_string(),
+                egress_mode: "ipv4".to_string(),
+                allow_alternate: true,
+                sync_binding_preferences: false,
+                options: Default::default(),
+            },
+        };
+        let calls = service_calls.clone();
+        let acknowledged = durable.clone();
+        let panel_calls = panel_start_calls.clone();
+
+        let response = route_android_app_start(
+            request,
+            move |_| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                acknowledged.store(true, Ordering::SeqCst);
+                Ok(
+                    tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                        generation: 1,
+                        desired_active: true,
+                        status: "recovering".to_string(),
+                        lease_phase: Some("start_pending".to_string()),
+                        next_retry_at_unix: None,
+                        last_error_code: None,
+                    },
+                )
+            },
+            move || async move {
+                panel_calls.fetch_add(1, Ordering::SeqCst);
+                Err(CommandError::new("unexpected_panel_start", "unexpected"))
+            },
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => panic!("unexpected Android service rejection: {}", error.code()),
+        };
+
+        assert!(durable.load(Ordering::SeqCst));
+        assert_eq!(service_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(panel_start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(response.status, "recovering");
+    }
+
+    #[tokio::test]
+    async fn android_new_ui_start_uses_legacy_contract_without_a_fresh_enabled_capability() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for capability in [
+            None,
+            Some(ConnectionIntentCapability {
+                revision: 7,
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                connection_intent_recovery_v1: false,
+            }),
+            Some(ConnectionIntentCapability {
+                revision: 8,
+                expires_at: "1970-01-01T00:01:40Z".to_string(),
+                connection_intent_recovery_v1: true,
+            }),
+        ] {
+            let service_calls = Arc::new(AtomicUsize::new(0));
+            let legacy_calls = Arc::new(AtomicUsize::new(0));
+            let recovery_request_calls = Arc::new(AtomicUsize::new(0));
+            let service_observer = Arc::clone(&service_calls);
+            let legacy_observer = Arc::clone(&legacy_calls);
+            let recovery_request_observer = Arc::clone(&recovery_request_calls);
+
+            let response = route_android_app_start_with_capability(
+                &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse::default(),
+                capability.as_ref(),
+                100,
+                move || async move {
+                    recovery_request_observer.fetch_add(1, Ordering::SeqCst);
+                    Ok(android_begin_request())
+                },
+                move |_| async move {
+                    service_observer.fetch_add(1, Ordering::SeqCst);
+                    Err(CommandError::new("unexpected_service_begin", "unexpected"))
+                },
+                move || async move {
+                    legacy_observer.fetch_add(1, Ordering::SeqCst);
+                    Ok(test_connection("legacy-lease"))
+                },
+            )
+            .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => panic!("unexpected legacy route error: {}", error.code()),
+            };
+
+            assert_eq!(response.status, "connected");
+            assert_eq!(
+                response
+                    .connection
+                    .as_ref()
+                    .map(|value| value.lease_id.as_str()),
+                Some("legacy-lease")
+            );
+            assert_eq!(service_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(recovery_request_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn android_fresh_enabled_capability_selects_service_without_legacy_start() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let service_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let service_observer = Arc::clone(&service_calls);
+        let legacy_observer = Arc::clone(&legacy_calls);
+        let capability = ConnectionIntentCapability {
+            revision: 9,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            connection_intent_recovery_v1: true,
+        };
+
+        let response = route_android_app_start_with_capability(
+            &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse::default(),
+            Some(&capability),
+            100,
+            || async { Ok(android_begin_request()) },
+            move |_| async move {
+                service_observer.fetch_add(1, Ordering::SeqCst);
+                Ok(durable_android_start_status())
+            },
+            move || async move {
+                legacy_observer.fetch_add(1, Ordering::SeqCst);
+                Ok(test_connection("unexpected-legacy-lease"))
+            },
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => panic!("unexpected recovery route error: {}", error.code()),
+        };
+
+        assert_eq!(response.status, "recovering");
+        assert_eq!(service_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn android_already_durable_operation_stays_service_owned_after_capability_disable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let service_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let service_observer = Arc::clone(&service_calls);
+        let legacy_observer = Arc::clone(&legacy_calls);
+        let disabled = ConnectionIntentCapability {
+            revision: 10,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            connection_intent_recovery_v1: false,
+        };
+
+        let response = route_android_app_start_with_capability(
+            &durable_android_start_status(),
+            Some(&disabled),
+            100,
+            || async { Ok(android_begin_request()) },
+            move |_| async move {
+                service_observer.fetch_add(1, Ordering::SeqCst);
+                Ok(durable_android_start_status())
+            },
+            move || async move {
+                legacy_observer.fetch_add(1, Ordering::SeqCst);
+                Ok(test_connection("unexpected-legacy-lease"))
+            },
+        )
+        .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => panic!("unexpected durable replay route error: {}", error.code()),
+        };
+
+        assert_eq!(response.status, "recovering");
+        assert_eq!(service_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn android_selected_recovery_failure_never_falls_back_to_duplicate_legacy_start() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_observer = Arc::clone(&legacy_calls);
+        let capability = ConnectionIntentCapability {
+            revision: 11,
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            connection_intent_recovery_v1: true,
+        };
+
+        let error = route_android_app_start_with_capability(
+            &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse::default(),
+            Some(&capability),
+            100,
+            || async { Ok(android_begin_request()) },
+            |_| async {
+                Err(CommandError::new(
+                    "background_transport_unavailable",
+                    "temporarily unavailable",
+                ))
+            },
+            move || async move {
+                legacy_observer.fetch_add(1, Ordering::SeqCst);
+                Ok(test_connection("unsafe-duplicate-legacy-lease"))
+            },
+        )
+        .await;
+        let error = match error {
+            Ok(_) => panic!("a selected recovery path must return its own error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), "background_transport_unavailable");
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn android_ui_start_accepts_every_valid_durable_service_phase_and_projection() {
+        for (phase, status) in [
+            ("start_pending", "recovering"),
+            ("lease_acquired", "recovering"),
+            ("cleanup_pending", "stopping"),
+            ("stale_cleanup", "stopping"),
+            ("active_checkpoint", "none"),
+        ] {
+            let response = route_android_app_start(
+                android_begin_request(),
+                move |_| async move {
+                    Ok(
+                        tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                            generation: 9,
+                            desired_active: true,
+                            status: status.to_string(),
+                            lease_phase: Some(phase.to_string()),
+                            next_retry_at_unix: None,
+                            last_error_code: None,
+                        },
+                    )
+                },
+                || async { Err(CommandError::new("unexpected_panel_start", "unexpected")) },
+            )
+            .await;
+            assert!(response.is_ok(), "phase={phase} status={status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn android_ui_start_rejects_idle_or_inconsistent_service_acknowledgement() {
+        for (desired_active, phase, status) in [
+            (true, None, "none"),
+            (false, Some("start_pending"), "recovering"),
+            (true, Some("lease_acquired"), "none"),
+            (true, Some("cleanup_pending"), "recovering"),
+            (true, Some("active_checkpoint"), "blocked_terminal"),
+            (true, Some("invalid"), "recovering"),
+        ] {
+            let response = route_android_app_start(
+                android_begin_request(),
+                move |_| async move {
+                    Ok(
+                        tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                            generation: 9,
+                            desired_active,
+                            status: status.to_string(),
+                            lease_phase: phase.map(str::to_string),
+                            next_retry_at_unix: None,
+                            last_error_code: None,
+                        },
+                    )
+                },
+                || async { Err(CommandError::new("unexpected_panel_start", "unexpected")) },
+            )
+            .await;
+            assert!(response.is_err(), "phase={phase:?} status={status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn android_stop_invalidates_a_blocked_start_before_its_late_ack() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let coordinator = Arc::new(AndroidUiStartStopCoordinator::new());
+        let begin_calls = Arc::new(AtomicUsize::new(0));
+        let (begin_entered_tx, begin_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_begin_tx, release_begin_rx) = tokio::sync::oneshot::channel();
+        let first_ticket = coordinator.start_ticket();
+        let first_coordinator = Arc::clone(&coordinator);
+        let first_side_effect_coordinator = Arc::clone(&coordinator);
+        let first_begin_calls = Arc::clone(&begin_calls);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .run_start(first_ticket, || async move {
+                    first_side_effect_coordinator
+                        .run_start_side_effect(first_ticket, async move {
+                            route_android_app_start(
+                                android_begin_request(),
+                                move |_| async move {
+                                    first_begin_calls.fetch_add(1, Ordering::SeqCst);
+                                    let _ = begin_entered_tx.send(());
+                                    let _ = release_begin_rx.await;
+                                    Ok(
+                                        tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                                            generation: 1,
+                                            desired_active: true,
+                                            status: "recovering".to_string(),
+                                            lease_phase: Some("start_pending".to_string()),
+                                            next_retry_at_unix: None,
+                                            last_error_code: None,
+                                        },
+                                    )
+                                },
+                                || async {
+                                    Err(CommandError::new("unexpected_panel_start", "unexpected"))
+                                },
+                            )
+                            .await
+                        })
+                        .await
+                })
+                .await
+        });
+        begin_entered_rx.await.unwrap();
+
+        let second_ticket = coordinator.start_ticket();
+        let second_coordinator = Arc::clone(&coordinator);
+        let second_side_effect_coordinator = Arc::clone(&coordinator);
+        let second_begin_calls = Arc::clone(&begin_calls);
+        let (second_waiting_tx, second_waiting_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(async move {
+            let _ = second_waiting_tx.send(());
+            second_coordinator
+                .run_start(second_ticket, || async move {
+                    second_side_effect_coordinator
+                        .run_start_side_effect(second_ticket, async move {
+                            route_android_app_start(
+                                android_begin_request(),
+                                move |_| async move {
+                                    second_begin_calls.fetch_add(1, Ordering::SeqCst);
+                                    Ok(
+                                        tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                                            generation: 2,
+                                            desired_active: true,
+                                            status: "recovering".to_string(),
+                                            lease_phase: Some("start_pending".to_string()),
+                                            next_retry_at_unix: None,
+                                            last_error_code: None,
+                                        },
+                                    )
+                                },
+                                || async {
+                                    Err(CommandError::new("unexpected_panel_start", "unexpected"))
+                                },
+                            )
+                            .await
+                        })
+                        .await
+                })
+                .await
+        });
+        second_waiting_rx.await.unwrap();
+
+        let (cancel_dispatched_tx, cancel_dispatched_rx) = tokio::sync::oneshot::channel();
+        let stop_coordinator = Arc::clone(&coordinator);
+        let cancellation_observer = Arc::clone(&coordinator);
+        let observed_start_ticket = coordinator.start_ticket();
+        let stop = tokio::spawn(async move {
+            stop_coordinator
+                .run_stop(|| async move {
+                    route_android_connection_stop(|| async move {
+                        let invalidated = cancellation_observer
+                            .ensure_current(observed_start_ticket)
+                            .expect_err("Stop must invalidate its epoch before service dispatch");
+                        assert_eq!(invalidated.code(), "connection_intent_cancelled");
+                        let _ = cancel_dispatched_tx.send(());
+                        Ok(
+                            tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                                generation: 2,
+                                desired_active: false,
+                                status: "stopping".to_string(),
+                                lease_phase: Some("start_pending".to_string()),
+                                next_retry_at_unix: None,
+                                last_error_code: None,
+                            },
+                        )
+                    })
+                    .await
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), cancel_dispatched_rx)
+            .await
+            .expect("Stop must dispatch cancellation without waiting for the occupied start gate")
+            .unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), stop)
+            .await
+            .expect("Stop must complete before the blocked begin acknowledgement is released")
+            .unwrap();
+        assert!(stopped.is_ok());
+        let _ = release_begin_tx.send(());
+
+        for result in [first.await.unwrap(), second.await.unwrap()] {
+            let error = match result {
+                Ok(_) => panic!("a Stop-invalidated start must not project recovering"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), "connection_intent_cancelled");
+        }
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn android_stop_before_true_side_effect_prevents_recovery_and_legacy_dispatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for branch in ["recovery", "legacy"] {
+            let coordinator = Arc::new(AndroidUiStartStopCoordinator::new());
+            let side_effects = Arc::new(AtomicUsize::new(0));
+            let (preflight_entered_tx, preflight_entered_rx) = tokio::sync::oneshot::channel();
+            let (release_preflight_tx, release_preflight_rx) = tokio::sync::oneshot::channel();
+            let ticket = coordinator.start_ticket();
+            let start_coordinator = Arc::clone(&coordinator);
+            let side_effect_coordinator = Arc::clone(&coordinator);
+            let side_effect_observer = Arc::clone(&side_effects);
+            let start = tokio::spawn(async move {
+                start_coordinator
+                    .run_start(ticket, || async move {
+                        let _ = preflight_entered_tx.send(());
+                        let _ = release_preflight_rx.await;
+                        side_effect_coordinator
+                            .run_start_side_effect(ticket, async move {
+                                side_effect_observer.fetch_add(1, Ordering::SeqCst);
+                                Ok(branch)
+                            })
+                            .await
+                    })
+                    .await
+            });
+            preflight_entered_rx.await.unwrap();
+
+            if let Err(error) = coordinator.run_stop(|| async { Ok(()) }).await {
+                panic!("unexpected Stop failure: {}", error.code());
+            }
+            let _ = release_preflight_tx.send(());
+
+            let error = start
+                .await
+                .unwrap()
+                .expect_err("Stop completed before dispatch must own both start branches");
+            assert_eq!(error.code(), "connection_intent_cancelled");
+            assert_eq!(
+                side_effects.load(Ordering::SeqCst),
+                0,
+                "stale {branch} side effect dispatched after Stop",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn android_ui_starts_remain_serialized() {
+        let coordinator = Arc::new(AndroidUiStartStopCoordinator::new());
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+        let first_ticket = coordinator.start_ticket();
+        let first_coordinator = Arc::clone(&coordinator);
+        let first = tokio::spawn(async move {
+            first_coordinator
+                .run_start(first_ticket, || async move {
+                    let _ = first_entered_tx.send(());
+                    let _ = release_first_rx.await;
+                    Ok(1)
+                })
+                .await
+        });
+        first_entered_rx.await.unwrap();
+
+        let (second_entered_tx, mut second_entered_rx) = tokio::sync::oneshot::channel();
+        let second_ticket = coordinator.start_ticket();
+        let second_coordinator = Arc::clone(&coordinator);
+        let second = tokio::spawn(async move {
+            second_coordinator
+                .run_start(second_ticket, || async move {
+                    let _ = second_entered_tx.send(());
+                    Ok(2)
+                })
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second_entered_rx)
+                .await
+                .is_err(),
+            "a second Start must wait for the first Start acknowledgement",
+        );
+        let _ = release_first_tx.send(());
+
+        match first.await.unwrap() {
+            Ok(value) => assert_eq!(value, 1),
+            Err(error) => panic!("unexpected first Start error: {}", error.code()),
+        }
+        tokio::time::timeout(Duration::from_secs(1), &mut second_entered_rx)
+            .await
+            .expect("the second Start must run after the first acknowledgement")
+            .unwrap();
+        match second.await.unwrap() {
+            Ok(value) => assert_eq!(value, 2),
+            Err(error) => panic!("unexpected second Start error: {}", error.code()),
+        }
+    }
+
+    #[tokio::test]
+    async fn android_logout_durably_hands_off_before_local_sign_out_without_legacy_revoke() {
+        use std::sync::{Arc, Mutex};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let native_events = events.clone();
+        let local_events = events.clone();
+        let remote_events = events.clone();
+
+        let result = route_android_logout(
+            move || {
+                native_events.lock().unwrap().push("native_handoff");
+                Ok(
+                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
+                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::Native,
+                    },
+                )
+            },
+            move || async move {
+                local_events.lock().unwrap().push("local_sign_out");
+                Ok(())
+            },
+            move || async move {
+                remote_events.lock().unwrap().push("legacy_remote_revoke");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["native_handoff", "local_sign_out"]
+        );
+    }
+
+    #[tokio::test]
+    async fn android_logout_without_native_credential_revokes_legacy_before_local_sign_out() {
+        use std::sync::{Arc, Mutex};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let native_events = events.clone();
+        let local_events = events.clone();
+        let remote_events = events.clone();
+
+        let result = route_android_logout(
+            move || {
+                native_events.lock().unwrap().push("native_not_owned");
+                Ok(
+                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
+                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned,
+                    },
+                )
+            },
+            move || async move {
+                local_events.lock().unwrap().push("local_sign_out");
+                Ok(())
+            },
+            move || async move {
+                remote_events.lock().unwrap().push("legacy_remote_revoke");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["native_not_owned", "legacy_remote_revoke", "local_sign_out"]
+        );
+    }
+
+    #[tokio::test]
+    async fn android_legacy_revoke_failure_preserves_local_session_for_retry() {
+        use std::sync::{Arc, Mutex};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let native_events = events.clone();
+        let local_events = events.clone();
+        let remote_events = events.clone();
+
+        let error = route_android_logout(
+            move || {
+                native_events.lock().unwrap().push("native_not_owned");
+                Ok(
+                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
+                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned,
+                    },
+                )
+            },
+            move || async move {
+                local_events.lock().unwrap().push("local_sign_out");
+                Ok(())
+            },
+            move || async move {
+                remote_events.lock().unwrap().push("legacy_remote_revoke");
+                Err(CommandError::new(
+                    "logout_remote_failed",
+                    "remote logout failed",
+                ))
+            },
+        )
+        .await
+        .expect_err("failed remote revoke must abort local sign out");
+
+        assert_eq!(error.code(), "logout_remote_failed");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["native_not_owned", "legacy_remote_revoke"]
+        );
+    }
+
+    #[tokio::test]
+    async fn android_ambiguous_native_handoff_error_never_duplicates_with_legacy_revoke() {
+        use std::sync::{Arc, Mutex};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let native_events = events.clone();
+        let local_events = events.clone();
+        let remote_events = events.clone();
+
+        let error = route_android_logout(
+            move || {
+                native_events.lock().unwrap().push("native_handoff_lost");
+                Err(CommandError::new(
+                    "android_service_dispatch_unavailable",
+                    "lost response",
+                ))
+            },
+            move || async move {
+                local_events.lock().unwrap().push("local_sign_out");
+                Ok(())
+            },
+            move || async move {
+                remote_events.lock().unwrap().push("legacy_remote_revoke");
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("ambiguous native response must fail closed");
+
+        assert_eq!(error.code(), "android_service_dispatch_unavailable");
+        assert_eq!(events.lock().unwrap().as_slice(), &["native_handoff_lost"]);
+    }
+
+    fn android_begin_request() -> tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
+        tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
+            api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+            template: tauri_plugin_tunnel_android::ConnectionIntentTemplateRequest {
+                device_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                account_scope: "11111111-1111-4111-8111-111111111111".to_string(),
+                layer: "stray".to_string(),
+                tic_connection_mode: "dynamic".to_string(),
+                route_mode: "standalone".to_string(),
+                egress_mode: "ipv4".to_string(),
+                allow_alternate: true,
+                sync_binding_preferences: false,
+                options: Default::default(),
+            },
+        }
+    }
+
+    fn durable_android_start_status() -> tauri_plugin_tunnel_android::ConnectionIntentStatusResponse
+    {
+        tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+            generation: 1,
+            desired_active: true,
+            status: "recovering".to_string(),
+            lease_phase: Some("start_pending".to_string()),
+            next_retry_at_unix: None,
+            last_error_code: None,
+        }
+    }
+
+    fn test_connection(lease_id: &str) -> Connection {
+        Connection {
+            lease_id: lease_id.to_string(),
+            pool_id: None,
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
+            probe_url: None,
+            status: LeaseStatus::Issued,
+            pinned: false,
+            stopped_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn android_quick_toggle_routes_only_to_service_without_rust_bootstrap_or_start() {
+        use std::sync::{Arc, Mutex};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let service_events = events.clone();
+        let bootstrap_events = events.clone();
+        let start_events = events.clone();
+
+        let status = route_android_quick_toggle(
+            move || async move {
+                service_events.lock().unwrap().push("service");
+                Ok(
+                    tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                        generation: 7,
+                        desired_active: true,
+                        status: "recovering".to_string(),
+                        lease_phase: Some("start_pending".to_string()),
+                        next_retry_at_unix: None,
+                        last_error_code: None,
+                    },
+                )
+            },
+            move || async move {
+                bootstrap_events.lock().unwrap().push("rust_bootstrap");
+                Ok(())
+            },
+            move || async move {
+                start_events.lock().unwrap().push("rust_start");
+                Ok(())
+            },
+        )
+        .await;
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => panic!("unexpected route failure: {}", error.code()),
+        };
+
+        assert_eq!(status.generation, 7);
+        assert_eq!(*events.lock().unwrap(), vec!["service"]);
+    }
+
+    #[tokio::test]
+    async fn android_stop_routes_directly_to_atomic_service_cancel() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let service_observed = Arc::clone(&calls);
+        let legacy_observed = Arc::clone(&calls);
+
+        let status = route_android_connection_stop_with_legacy(
+            {
+                let calls = Arc::clone(&calls);
+                move || calls.lock().unwrap().push("cancel_pending_legacy_start")
+            },
+            move || async move {
+                service_observed.lock().unwrap().push("cancel_current");
+                Ok(
+                    tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                        generation: 42,
+                        desired_active: false,
+                        status: "stopping".to_string(),
+                        lease_phase: Some("cleanup_pending".to_string()),
+                        next_retry_at_unix: None,
+                        last_error_code: None,
+                    },
+                )
+            },
+            move || async move {
+                legacy_observed
+                    .lock()
+                    .unwrap()
+                    .push("unexpected_legacy_stop");
+                Ok(())
+            },
+        )
+        .await;
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => panic!("unexpected route failure: {}", error.code()),
+        };
+
+        assert_eq!(status.generation, 42);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["cancel_pending_legacy_start", "cancel_current"]
+        );
+    }
+
+    #[tokio::test]
+    async fn android_service_owned_stop_cancels_an_already_dispatched_legacy_start() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        let coordinator = Arc::new(AndroidUiStartStopCoordinator::new());
+        let ui_start_ticket = coordinator.start_ticket();
+        let legacy_cancel_epoch = Arc::new(AtomicU64::new(0));
+        let captured_legacy_epoch = legacy_cancel_epoch.load(Ordering::SeqCst);
+        let legacy_start_side_effects = Arc::new(AtomicUsize::new(0));
+        let legacy_stops = Arc::new(AtomicUsize::new(0));
+        let (legacy_entered_tx, legacy_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_legacy_tx, release_legacy_rx) = tokio::sync::oneshot::channel();
+        let late_epoch = Arc::clone(&legacy_cancel_epoch);
+        let late_side_effects = Arc::clone(&legacy_start_side_effects);
+        let legacy_start = tokio::spawn(async move {
+            let _ = legacy_entered_tx.send(());
+            let _ = release_legacy_rx.await;
+            if late_epoch.load(Ordering::SeqCst) != captured_legacy_epoch {
+                return Err(CommandError::new(
+                    "connection_intent_cancelled",
+                    "Подключение отменено",
+                ));
+            }
+            late_side_effects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        legacy_entered_rx.await.unwrap();
+
+        let stop_coordinator = Arc::clone(&coordinator);
+        let cancellation_observer = Arc::clone(&coordinator);
+        let stop_epoch = Arc::clone(&legacy_cancel_epoch);
+        let stop_calls = Arc::clone(&legacy_stops);
+        let stopped = stop_coordinator
+            .run_stop(|| async move {
+                route_android_connection_stop_with_legacy(
+                    move || {
+                        let invalidated = cancellation_observer
+                            .ensure_current(ui_start_ticket)
+                            .expect_err("UI epoch must be invalidated before core cancellation");
+                        assert_eq!(invalidated.code(), "connection_intent_cancelled");
+                        stop_epoch.fetch_add(1, Ordering::SeqCst);
+                    },
+                    || async {
+                        Ok(
+                            tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                                generation: 9,
+                                desired_active: false,
+                                status: "stopping".to_string(),
+                                lease_phase: Some("cleanup_pending".to_string()),
+                                next_retry_at_unix: None,
+                                last_error_code: None,
+                            },
+                        )
+                    },
+                    move || async move {
+                        stop_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+            .await;
+        assert!(stopped.is_ok());
+        assert_eq!(legacy_stops.load(Ordering::SeqCst), 0);
+
+        let _ = release_legacy_tx.send(());
+        let error = legacy_start
+            .await
+            .unwrap()
+            .expect_err("a completed mixed-control Stop must invalidate the legacy start epoch");
+        assert_eq!(error.code(), "connection_intent_cancelled");
+        assert_eq!(legacy_start_side_effects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn android_stop_cancels_service_before_stopping_a_legacy_connection() {
+        use std::sync::Mutex;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let service_events = Arc::clone(&events);
+        let legacy_events = Arc::clone(&events);
+
+        let status = route_android_connection_stop_with_legacy(
+            {
+                let events = Arc::clone(&events);
+                move || events.lock().unwrap().push("cancel_pending_legacy_start")
+            },
+            move || async move {
+                service_events.lock().unwrap().push("cancel_current");
+                Ok(
+                    tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                        generation: 7,
+                        desired_active: false,
+                        status: "none".to_string(),
+                        lease_phase: None,
+                        next_retry_at_unix: None,
+                        last_error_code: None,
+                    },
+                )
+            },
+            move || async move {
+                legacy_events.lock().unwrap().push("legacy_stop");
+                Ok(())
+            },
+        )
+        .await;
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => panic!("unexpected legacy stop route error: {}", error.code()),
+        };
+
+        assert_eq!(status.generation, 7);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "cancel_pending_legacy_start",
+                "cancel_current",
+                "legacy_stop"
+            ]
+        );
     }
 }

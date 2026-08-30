@@ -9,13 +9,76 @@ import org.junit.Assert.fail
 import org.junit.Test
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class BackgroundConnectionClientTest {
+    @Test
+    fun bindingPreflightCarriesOnlyPreferencesAndRejectsConfigurationResponses() {
+        val payload = backgroundBindingPreferencesPayload(
+            AndroidIntentTemplate(
+                deviceId = "11111111-1111-4111-8111-111111111111",
+                accountScope = "account-1",
+                layer = "tic",
+                ticConnectionMode = "personal",
+                routeMode = "via_tak",
+                egressMode = "prefer_ipv6",
+                allowAlternate = true,
+                syncBindingPreferences = true,
+            ),
+        )
+
+        assertEquals(
+            setOf("preferred_layer", "tic_connection_mode", "route_mode", "egress_mode"),
+            payload.keys().asSequence().toSet(),
+        )
+        validateBackgroundBindingSyncResponse(JSONObject().put("ok", true))
+        val rejected = runCatching {
+            validateBackgroundBindingSyncResponse(
+                JSONObject().put("ok", true).put("configuration", "secret"),
+            )
+        }.exceptionOrNull() as BackgroundConnectionException
+        assertEquals("invalid_background_response", rejected.code)
+    }
     @Test
     fun missingCapabilityEndpointIsAStableUnsupportedResponse() {
         assertEquals(
             "recovery_contract_unsupported",
             backgroundPanelErrorCode("background/capabilities", 404, "not_found"),
+        )
+    }
+
+    @Test
+    fun unstructuredServerFailureNormalizesToStableHttp5xx() {
+        assertEquals(
+            "http_5xx",
+            backgroundPanelErrorCode("background/connections/stop", 503, null),
+        )
+    }
+
+    @Test
+    fun normalizedServerFailurePreservesRetryAfter() {
+        val error = backgroundPanelException(
+            endpoint = "background/connections/stop",
+            status = 503,
+            panelCode = null,
+            retryAfterHeader = "17",
+        )
+
+        assertEquals("http_5xx", error.code)
+        assertEquals("17", error.retryAfterHeader)
+    }
+
+    @Test
+    fun structuredServerFailurePreservesThePanelCode() {
+        assertEquals(
+            "connection_stop_failed",
+            backgroundPanelErrorCode(
+                "background/connections/stop",
+                503,
+                "connection_stop_failed",
+            ),
         )
     }
 
@@ -91,6 +154,83 @@ class BackgroundConnectionClientTest {
     }
 
     @Test
+    fun finalizedOfflineLogoutSurvivesFailedReplacementAndProcessRecreationUntilPromotion() {
+        val backend = ProvisionCredentialBackend()
+        var store = BackgroundCredentialStore(backend)
+        val configured = store.configure(
+            0,
+            BackgroundCredentialProvision(
+                DEVICE_ID,
+                "https://nelomai.test",
+                "old-background-token",
+                10_000,
+                INSTALL_SECRET,
+                1,
+                BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+        ).successProvisionEnvelope()
+        val pendingLogout = store.beginLogout(
+            configured.revision,
+            LOGOUT_ID,
+            1,
+        ).successProvisionEnvelope()
+        val finalized = store.finalizeLogout(
+            pendingLogout.revision,
+            LOGOUT_ID,
+        ).successProvisionEnvelope()
+
+        store = BackgroundCredentialStore(backend)
+        var replacementPendingWasRecoverable = false
+        try {
+            provisionBackgroundCredential(
+                store,
+                uiProvisionRequest(finalized.revision).copy(
+                    installSecret = "replacement-install-secret",
+                    installGeneration = 2,
+                ),
+                100,
+                { PREPARE_ID to ACTIVATE_ID },
+                { _, _, _, _ -> pendingToken() },
+                { _, _, _ ->
+                    replacementPendingWasRecoverable = hasRecoverableBackgroundCredential(
+                        store.read().successProvisionEnvelope(),
+                    )
+                    throw BackgroundConnectionException("activation_not_applied")
+                },
+            )
+            fail("failed replacement must surface its authoritative activation result")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("activation_not_applied", error.code)
+        }
+        assertTrue(replacementPendingWasRecoverable)
+
+        store = BackgroundCredentialStore(backend)
+        val afterFailure = store.read().successProvisionEnvelope()
+        assertEquals(BackgroundLogoutPhase.FINALIZED, afterFailure.logoutState?.phase)
+        assertNull(afterFailure.active)
+        assertNull(afterFailure.pending)
+        assertNull(afterFailure.reservation)
+
+        val promoted = provisionBackgroundCredential(
+            store,
+            uiProvisionRequest(afterFailure.revision).copy(
+                installSecret = "replacement-install-secret",
+                installGeneration = 2,
+            ),
+            100,
+            { SECOND_PREPARE_ID to SECOND_ACTIVATE_ID },
+            { _, prepareId, activationId, _ ->
+                pendingToken(prepareId, activationId)
+            },
+            { _, _, _ -> BackgroundActivationResult(2, 10_000) },
+        )
+
+        assertEquals("staged-token", promoted.active?.token)
+        assertNull(promoted.logoutState)
+        assertEquals(2L, promoted.installGeneration)
+    }
+
+    @Test
     fun rotatingProvisionAuthenticatesActivationWithTheStagedToken() {
         val store = BackgroundCredentialStore(ProvisionCredentialBackend())
         val configured = store.configure(
@@ -118,6 +258,52 @@ class BackgroundConnectionClientTest {
                 BackgroundActivationResult(2, 10_000)
             },
         )
+    }
+
+    @Test
+    fun pendingActivationPersistsAuthoritativeDowngradeBeforeReplay() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val configured = store.configure(
+            expectedRevision = 0,
+            provision = BackgroundCredentialProvision(
+                deviceId = DEVICE_ID,
+                panelBase = "https://nelomai.test",
+                token = "old-active-token",
+                expiresAtUnix = 10_000,
+                installSecret = INSTALL_SECRET,
+                installGeneration = 1,
+                capability = BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+        ).successProvisionEnvelope()
+        store.reserveMutation(
+            configured.revision,
+            PREPARE_ID,
+            DEVICE_ID,
+            500,
+            100,
+            ACTIVATE_ID,
+        ).successProvisionEnvelope()
+        store.savePendingToken(configured.revision, PREPARE_ID, pendingToken(), 100)
+            .successProvisionEnvelope()
+
+        val provisioned = provisionBackgroundCredential(
+            store = store,
+            request = uiProvisionRequest(
+                configured.revision,
+                BackgroundCapabilitySnapshot(2, enabled = false, expiresAtUnix = 110),
+            ),
+            nowUnix = 105,
+            operationIds = { throw AssertionError("pending replay must reuse operation ids") },
+            prepare = { _, _, _, _ ->
+                throw AssertionError("pending replay must not prepare another token")
+            },
+            activate = { _, _, _ -> BackgroundActivationResult(2, 10_000) },
+        )
+
+        assertEquals("staged-token", provisioned.active?.token)
+        assertNull(provisioned.pending)
+        assertEquals(2L, provisioned.capability?.revision)
+        assertFalse(provisioned.capability?.enabled ?: true)
     }
 
     @Test
@@ -294,6 +480,143 @@ class BackgroundConnectionClientTest {
     }
 
     @Test
+    fun capabilityDowngradeWithoutMutationPersistsLocallyWithoutNetworkCalls() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        store.configure(
+            0,
+            BackgroundCredentialProvision(
+                DEVICE_ID,
+                "https://nelomai.test",
+                "old-active-token",
+                10_000,
+                INSTALL_SECRET,
+                1,
+                BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+        ).successProvisionEnvelope()
+        var operationIdCalls = 0
+        var prepareCalls = 0
+        var activateCalls = 0
+
+        val downgraded = provisionBackgroundCredential(
+            store = store,
+            request = uiProvisionRequest(
+                expectedRevision = 1,
+                capability = BackgroundCapabilitySnapshot(2, false, 500),
+            ),
+            nowUnix = 110,
+            operationIds = {
+                operationIdCalls += 1
+                SECOND_PREPARE_ID to SECOND_ACTIVATE_ID
+            },
+            prepare = { _, _, _, _ ->
+                prepareCalls += 1
+                pendingToken()
+            },
+            activate = { _, _, _ ->
+                activateCalls += 1
+                BackgroundActivationResult(2, 10_000)
+            },
+        )
+
+        assertEquals(2L, downgraded.capability?.revision)
+        assertFalse(downgraded.capability?.enabled ?: true)
+        assertEquals("old-active-token", downgraded.active?.token)
+        assertNull(downgraded.reservation)
+        assertNull(downgraded.pending)
+        assertEquals(0, operationIdCalls)
+        assertEquals(0, prepareCalls)
+        assertEquals(0, activateCalls)
+    }
+
+    @Test
+    fun capabilityOnlyDowngradeRejectsADifferentInstallIdentity() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        store.configure(
+            0,
+            BackgroundCredentialProvision(
+                DEVICE_ID,
+                "https://nelomai.test",
+                "old-active-token",
+                10_000,
+                INSTALL_SECRET,
+                1,
+                BackgroundCapabilitySnapshot(1, true, 500),
+            ),
+        ).successProvisionEnvelope()
+
+        try {
+            provisionBackgroundCredential(
+                store = store,
+                request = uiProvisionRequest(
+                    expectedRevision = 1,
+                    capability = BackgroundCapabilitySnapshot(2, false, 500),
+                ).copy(installSecret = "different-install-secret"),
+                nowUnix = 110,
+                operationIds = { throw AssertionError("identity conflict must not mint IDs") },
+                prepare = { _, _, _, _ ->
+                    throw AssertionError("identity conflict must not prepare")
+                },
+                activate = { _, _, _ ->
+                    throw AssertionError("identity conflict must not activate")
+                },
+            )
+            fail("a different install identity must not mutate the capability")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_credential_mutation_conflict", error.code)
+        }
+
+        val persisted = store.read().successProvisionEnvelope()
+        assertEquals(1L, persisted.capability?.revision)
+        assertTrue(persisted.capability?.enabled ?: false)
+    }
+
+    @Test
+    fun equalRevisionDowngradeBlocksResumedUiProvision() {
+        val store = BackgroundCredentialStore(ProvisionCredentialBackend())
+        val reserved = store.reserveProvision(
+            0,
+            provisionReservation(
+                BackgroundCapabilitySnapshot(1, enabled = true, expiresAtUnix = 500),
+            ),
+            PREPARE_ID,
+            ACTIVATE_ID,
+            expiresAtUnix = 500,
+            nowUnix = 100,
+        ).successProvisionEnvelope()
+        val downgraded = store.updateCapability(
+            reserved.revision,
+            BackgroundCapabilitySnapshot(1, enabled = false, expiresAtUnix = 110),
+        ).successProvisionEnvelope()
+        var prepareCalls = 0
+
+        try {
+            provisionBackgroundCredential(
+                store = store,
+                request = uiProvisionRequest(
+                    downgraded.revision,
+                    BackgroundCapabilitySnapshot(1, enabled = true, expiresAtUnix = 500),
+                ),
+                nowUnix = 105,
+                operationIds = { SECOND_PREPARE_ID to SECOND_ACTIVATE_ID },
+                prepare = { _, _, _, _ ->
+                    prepareCalls += 1
+                    pendingToken()
+                },
+                activate = { _, _, _ -> BackgroundActivationResult(2, 10_000) },
+            )
+            fail("equal-revision downgrade must stop a resumed prepare")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_credential_capability_unavailable", error.code)
+        }
+
+        val persisted = store.read().successProvisionEnvelope()
+        assertEquals(0, prepareCalls)
+        assertFalse(persisted.capability?.enabled ?: true)
+        assertNull(persisted.reservation)
+    }
+
+    @Test
     fun expiredStoredCapabilityBlocksServicePrepareFromAnExistingReservation() {
         val store = BackgroundCredentialStore(ProvisionCredentialBackend())
         val configured = store.configure(
@@ -457,6 +780,57 @@ class BackgroundConnectionClientTest {
     }
 
     @Test
+    fun serverCandidateResponseEnforcesTheInclusiveTwentyMaximum() {
+        fun response(count: Int): JSONObject {
+            val candidates = JSONArray()
+            (1..count).forEach { index ->
+                candidates.put(JSONObject().apply {
+                    put("candidate_id", "candidate-token-123456789$index")
+                    put("layer", "stray")
+                    put("region_label", "Region $index")
+                    put("probe_url", "https://probe$index.example/health")
+                    put("expires_at", "2026-08-29T12:00:00Z")
+                })
+            }
+            return JSONObject().put("candidates", candidates)
+        }
+
+        assertEquals(
+            20,
+            BackgroundOperationClient(RecordingBackgroundTransport(response(20)))
+                .serverCandidates(credential(), "stray", "ipv4").size,
+        )
+
+        try {
+            BackgroundOperationClient(RecordingBackgroundTransport(response(21)))
+                .serverCandidates(credential(), "stray", "ipv4")
+            fail("a server response above the contract maximum must fail closed")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("invalid_background_response", error.code)
+        }
+    }
+
+    @Test
+    fun enabledCapabilityRejectsANonPositiveRevision() {
+        for (revision in listOf(0L, -1L)) {
+            val transport = RecordingBackgroundTransport(
+                JSONObject().apply {
+                    put("revision", revision)
+                    put("expires_at", "2026-08-29T12:00:00Z")
+                    put("connection_intent_recovery_v1", true)
+                },
+            )
+
+            try {
+                BackgroundOperationClient(transport).capabilities(credential())
+                fail("enabled capability with revision $revision must fail closed")
+            } catch (error: BackgroundConnectionException) {
+                assertEquals("invalid_background_response", error.code)
+            }
+        }
+    }
+
+    @Test
     fun reconcileAndLogoutFinalizePreserveImmutableSignature() {
         val transport = RecordingBackgroundTransport(
             JSONObject().apply {
@@ -484,6 +858,288 @@ class BackgroundConnectionClientTest {
         assertEquals(FINGERPRINT, transport.payloads[0]?.getString("request_fingerprint"))
         assertEquals(4L, transport.payloads[1]?.getLong("install_generation"))
         assertEquals(LOGOUT_ID, transport.payloads[1]?.getString("operation_id"))
+    }
+
+    @Test
+    fun cleanupStopAlwaysUsesTheDurableCallerOperationId() {
+        val transport = RecordingBackgroundTransport(JSONObject())
+        val client = BackgroundOperationClient(transport)
+
+        client.stop(credential(), "lease-1", OPERATION_ID)
+
+        assertEquals("background/connections/stop", transport.endpoints.single())
+        assertEquals(OPERATION_ID, transport.payloads.single()?.getString("operation_id"))
+        assertEquals("lease-1", transport.payloads.single()?.getString("lease_id"))
+        assertFalse(requireNotNull(transport.payloads.single()).has("failure_code"))
+    }
+
+    @Test
+    fun stalledCleanupStopCarriesTheTypedDataPlaneFailure() {
+        val transport = RecordingBackgroundTransport(JSONObject())
+
+        BackgroundOperationClient(transport).stop(
+            credential(),
+            "lease-1",
+            OPERATION_ID,
+            "tunnel_data_plane_stalled",
+        )
+
+        assertEquals(
+            "tunnel_data_plane_stalled",
+            transport.payloads.single()?.getString("failure_code"),
+        )
+    }
+
+    @Test
+    fun recoveryStartCarriesMeasuredProbesAndImmutableSignature() {
+        val template = QuickTunnelTemplate(
+            TunnelOptionsArgs(),
+            QuickConnectionArgs().apply {
+                leaseId = ""
+                layer = "stray"
+                ticConnectionMode = "dynamic"
+                routeMode = "standalone"
+                egressMode = "ipv4"
+                allowAlternate = true
+            },
+        )
+        val payload = backgroundStartPayload(
+            template,
+            OPERATION_ID,
+            listOf(
+                BackgroundProbeResult(
+                    "candidate-token-1234567890",
+                    latencyMillis = 12.5,
+                    failureCode = null,
+                    measuredAt = "2026-08-29T12:00:00Z",
+                ),
+            ),
+            contractVersion = 1,
+            requestFingerprint = FINGERPRINT,
+        )
+
+        assertEquals(true, payload.getBoolean("require_measured_selection"))
+        assertEquals(1, payload.getInt("recovery_contract_version"))
+        assertEquals(FINGERPRINT, payload.getString("request_fingerprint"))
+        assertEquals(12.5, payload.getJSONArray("probes").getJSONObject(0).getDouble("latency_ms"), 0.0)
+    }
+
+    @Test
+    fun recoveryStartRejectsMoreThanTwentyProbesBeforeSerialization() {
+        val template = QuickTunnelTemplate(
+            TunnelOptionsArgs(),
+            QuickConnectionArgs().apply {
+                layer = "stray"
+                ticConnectionMode = "dynamic"
+                routeMode = "standalone"
+                egressMode = "ipv4"
+                allowAlternate = true
+            },
+        )
+        val probes = (1..21).map { index ->
+            BackgroundProbeResult(
+                "candidate-token-123456789$index",
+                latencyMillis = 10.0,
+                failureCode = null,
+                measuredAt = "2026-08-29T12:00:00Z",
+            )
+        }
+
+        assertEquals(
+            20,
+            backgroundStartPayload(
+                template,
+                OPERATION_ID,
+                probes.take(20),
+                contractVersion = 1,
+                requestFingerprint = FINGERPRINT,
+            ).getJSONArray("probes").length(),
+        )
+
+        try {
+            backgroundStartPayload(
+                template,
+                OPERATION_ID,
+                probes,
+                contractVersion = 1,
+                requestFingerprint = FINGERPRINT,
+            )
+            fail("an oversized probe request must not be serialized")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("invalid_background_response", error.code)
+        }
+    }
+
+    @Test
+    fun personalTicSkipsMeasuredCandidates() {
+        assertFalse(requiresMeasuredCandidateSelection("tic", "personal"))
+        assertTrue(requiresMeasuredCandidateSelection("tic", "dynamic"))
+        assertTrue(requiresMeasuredCandidateSelection("stray", "dynamic"))
+        assertFalse(
+            requiresMeasuredCandidateSelection(
+                "stray",
+                "dynamic",
+                allowAlternate = false,
+            ),
+        )
+    }
+
+    @Test
+    fun candidateProbesUseAtMostFourConcurrentThreeSecondRequests() {
+        val active = AtomicInteger(0)
+        val maximum = AtomicInteger(0)
+        val entered = CountDownLatch(4)
+        val release = CountDownLatch(1)
+        val timeoutValues = mutableListOf<Int>()
+        val cache = BackgroundCandidateProbeCache(
+            nowMillis = { 1_000L },
+            probe = { candidate, timeoutMillis ->
+                synchronized(timeoutValues) { timeoutValues += timeoutMillis }
+                val current = active.incrementAndGet()
+                maximum.updateAndGet { previous -> maxOf(previous, current) }
+                entered.countDown()
+                check(release.await(2, TimeUnit.SECONDS))
+                active.decrementAndGet()
+                BackgroundProbeResult(
+                    candidate.candidateId,
+                    latencyMillis = 10.0,
+                    failureCode = null,
+                    measuredAt = "1970-01-01T00:00:01Z",
+                )
+            },
+        )
+        val candidates = (1..6).map { index -> candidate(index, expiresAtUnix = 400) }
+        var results: List<BackgroundProbeResult>? = null
+        val measurement = Thread {
+            results = cache.measure("stray", "ipv4", "network-a", candidates)
+        }.apply { start() }
+
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        assertEquals(4, maximum.get())
+        release.countDown()
+        measurement.join(2_000L)
+
+        assertFalse(measurement.isAlive)
+        assertEquals(6, results?.size)
+        assertTrue(timeoutValues.all { it == 3_000 })
+    }
+
+    @Test
+    fun oversizedCandidateBatchIsRejectedBeforeAnyProbeIsAllocated() {
+        var probeCalls = 0
+        val cache = BackgroundCandidateProbeCache(
+            nowMillis = { 1_000L },
+            probe = { candidate, _ ->
+                probeCalls += 1
+                BackgroundProbeResult(
+                    candidate.candidateId,
+                    latencyMillis = 10.0,
+                    failureCode = null,
+                    measuredAt = "1970-01-01T00:00:01Z",
+                )
+            },
+        )
+
+        try {
+            cache.measure(
+                "stray",
+                "ipv4",
+                "network-a",
+                (1..21).map { candidate(it, expiresAtUnix = 400) },
+            )
+            fail("an oversized candidate batch must not allocate probes")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("invalid_background_response", error.code)
+        }
+        assertEquals(0, probeCalls)
+    }
+
+    @Test
+    fun candidateProbeBatchAcceptsExactlyTwenty() {
+        val probeCalls = AtomicInteger(0)
+        val cache = BackgroundCandidateProbeCache(
+            nowMillis = { 1_000L },
+            probe = { candidate, _ ->
+                probeCalls.incrementAndGet()
+                BackgroundProbeResult(
+                    candidate.candidateId,
+                    latencyMillis = 10.0,
+                    failureCode = null,
+                    measuredAt = "1970-01-01T00:00:01Z",
+                )
+            },
+        )
+
+        val results = cache.measure(
+            "stray",
+            "ipv4",
+            "network-a",
+            (1..20).map { candidate(it, expiresAtUnix = 400) },
+        )
+
+        assertEquals(20, results.size)
+        assertEquals(20, probeCalls.get())
+    }
+
+    @Test
+    fun probeBatchEnforcesOneEndToEndDeadlineIncludingQueuedCandidates() {
+        val cache = BackgroundCandidateProbeCache(
+            nowMillis = { 1_000L },
+            deadlineMillis = 40,
+            probe = { candidate, _ ->
+                Thread.sleep(250)
+                BackgroundProbeResult(
+                    candidate.candidateId,
+                    latencyMillis = 250.0,
+                    failureCode = null,
+                    measuredAt = "1970-01-01T00:00:01Z",
+                )
+            },
+        )
+        val started = System.nanoTime()
+
+        val results = cache.measure(
+            "stray",
+            "ipv4",
+            "network-deadline",
+            (1..8).map { candidate(it, expiresAtUnix = 400) },
+        )
+
+        val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+        assertTrue("elapsed=$elapsedMillis", elapsedMillis < 180)
+        assertEquals(8, results.size)
+        assertTrue(results.all { it.failureCode == "timeout" })
+    }
+
+    @Test
+    fun probeCacheExpiresAtFiveMinutesOrEarliestCandidateAndInvalidatesOnNetworkChange() {
+        var nowMillis = 100_000L
+        var probeCalls = 0
+        val cache = BackgroundCandidateProbeCache(
+            nowMillis = { nowMillis },
+            probe = { candidate, _ ->
+                probeCalls += 1
+                BackgroundProbeResult(
+                    candidate.candidateId,
+                    latencyMillis = 7.0,
+                    failureCode = null,
+                    measuredAt = "1970-01-01T00:01:40Z",
+                )
+            },
+        )
+        val candidates = listOf(candidate(1, expiresAtUnix = 120))
+
+        cache.measure("stray", "ipv4", "network-a", candidates)
+        cache.measure("stray", "ipv4", "network-a", candidates)
+        assertEquals(1, probeCalls)
+
+        nowMillis = 121_000L
+        cache.measure("stray", "ipv4", "network-a", candidates)
+        assertEquals(2, probeCalls)
+
+        cache.invalidateNetwork()
+        cache.measure("stray", "ipv4", "network-b", candidates)
+        assertEquals(3, probeCalls)
     }
 
     @Test
@@ -755,6 +1411,14 @@ class BackgroundConnectionClientTest {
         "https://nelomai.example",
         "device-token",
         1_900_000_000,
+    )
+
+    private fun candidate(index: Int, expiresAtUnix: Long) = BackgroundServerCandidate(
+        candidateId = "candidate-token-123456789$index",
+        layer = "stray",
+        regionLabel = "Region $index",
+        probeUrl = "https://probe$index.example/health",
+        expiresAtUnix = expiresAtUnix,
     )
 
     private fun pendingToken(

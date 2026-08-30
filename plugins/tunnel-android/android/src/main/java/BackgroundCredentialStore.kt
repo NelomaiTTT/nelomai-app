@@ -31,6 +31,19 @@ internal data class BackgroundCapabilitySnapshot(
     val expiresAtUnix: Long,
 )
 
+internal fun conservativeBackgroundCapability(
+    current: BackgroundCapabilitySnapshot?,
+    proposed: BackgroundCapabilitySnapshot,
+): BackgroundCapabilitySnapshot = when {
+    current == null || proposed.revision > current.revision -> proposed
+    current.revision > proposed.revision -> current
+    else -> BackgroundCapabilitySnapshot(
+        revision = current.revision,
+        enabled = current.enabled && proposed.enabled,
+        expiresAtUnix = minOf(current.expiresAtUnix, proposed.expiresAtUnix),
+    )
+}
+
 internal data class BackgroundCredentialProvision(
     val deviceId: String,
     val panelBase: String,
@@ -92,6 +105,18 @@ internal data class BackgroundLogoutState(
     val phase: BackgroundLogoutPhase,
 )
 
+internal sealed class BackgroundLogoutBegin {
+    abstract val envelope: BackgroundCredentialEnvelope
+
+    data class Owned(
+        override val envelope: BackgroundCredentialEnvelope,
+    ) : BackgroundLogoutBegin()
+
+    data class NotOwned(
+        override val envelope: BackgroundCredentialEnvelope,
+    ) : BackgroundLogoutBegin()
+}
+
 internal data class BackgroundCredentialEnvelope(
     val formatVersion: Int = BACKGROUND_CREDENTIAL_FORMAT,
     val revision: Long = 0,
@@ -113,7 +138,8 @@ internal data class BackgroundCredentialEnvelope(
 
 internal fun hasRecoverableBackgroundCredential(
     envelope: BackgroundCredentialEnvelope,
-): Boolean = envelope.active != null || envelope.pending != null
+): Boolean = envelope.active != null ||
+    (envelope.pending != null && envelope.logoutState?.phase != BackgroundLogoutPhase.PENDING)
 
 internal object BackgroundCredentialEnvelopeCodec {
     fun encode(envelope: BackgroundCredentialEnvelope): ByteArray {
@@ -176,6 +202,7 @@ internal object BackgroundCredentialEnvelopeCodec {
         }
         envelope.capability?.let {
             require(it.revision >= 0 && it.expiresAtUnix > 0)
+            require(!it.enabled || it.revision > 0)
         }
         envelope.reservation?.let {
             requireSafeValue(it.mutationId)
@@ -187,7 +214,11 @@ internal object BackgroundCredentialEnvelopeCodec {
         envelope.logoutState?.let {
             requireSafeValue(it.operationId)
             require(it.installGeneration > 0)
-            require(it.installGeneration == envelope.installGeneration)
+            val replacingFinalizedLogout =
+                it.phase == BackgroundLogoutPhase.FINALIZED &&
+                    envelope.installGeneration == Math.addExact(it.installGeneration, 1) &&
+                    envelope.installSecret != null
+            require(it.installGeneration == envelope.installGeneration || replacingFinalizedLogout)
         }
         if (envelope.revision == 0L) require(envelope == BackgroundCredentialEnvelope())
         if (envelope.installSecret != null) require(envelope.installGeneration != null)
@@ -208,13 +239,20 @@ internal object BackgroundCredentialEnvelopeCodec {
         }
         if (envelope.previous != null) require(envelope.active != null)
         if (envelope.logoutState?.phase == BackgroundLogoutPhase.PENDING) {
-            require(envelope.active == null && envelope.pending == null)
-            require(envelope.cleanupCredential != null && envelope.installSecret != null)
+            require(envelope.active == null && envelope.previous == null)
+            require(envelope.installSecret != null)
+            if (envelope.pending == null) require(envelope.reservation == null)
         }
         if (envelope.logoutState?.phase == BackgroundLogoutPhase.FINALIZED) {
             require(envelope.active == null && envelope.previous == null)
-            require(envelope.pending == null && envelope.cleanupCredential == null)
-            require(envelope.installSecret == null && envelope.reservation == null)
+            require(envelope.cleanupCredential == null)
+            val replacingFinalizedLogout = envelope.installGeneration ==
+                Math.addExact(envelope.logoutState.installGeneration, 1) &&
+                envelope.installSecret != null
+            if (!replacingFinalizedLogout) {
+                require(envelope.pending == null)
+                require(envelope.installSecret == null && envelope.reservation == null)
+            }
         }
     }
 
@@ -325,6 +363,10 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             }
             val deviceId = BackgroundCredentialEnvelopeCodec.normalizeDeviceId(provision.deviceId)
             val panelBase = BackgroundCredentialEnvelopeCodec.normalizePanelBase(provision.panelBase)
+            val capability = conservativeBackgroundCapability(
+                current.capability,
+                provision.capability,
+            )
             current.copy(
                 revision = current.revision.incrementRevision(),
                 deviceId = deviceId,
@@ -336,7 +378,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
                 ),
                 previous = null,
                 pending = null,
-                capability = provision.capability,
+                capability = capability,
                 reservation = null,
                 cleanupCredential = null,
                 logoutState = null,
@@ -383,7 +425,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         nowUnix: Long,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = true) { current ->
-            if (current.logoutState != null) {
+            if (current.logoutState?.phase == BackgroundLogoutPhase.PENDING) {
                 throw MutationFailure("background_credential_logout_pending")
             }
             if (current.pending != null || current.reservation != null) {
@@ -395,8 +437,12 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             val panelBase = BackgroundCredentialEnvelopeCodec.normalizePanelBase(
                 provision.panelBase,
             )
-            if (!provision.capability.enabled ||
-                provision.capability.expiresAtUnix <= nowUnix
+            val capability = conservativeBackgroundCapability(
+                current.capability,
+                provision.capability,
+            )
+            if (!capability.enabled ||
+                capability.expiresAtUnix <= nowUnix
             ) {
                 throw MutationFailure("background_credential_capability_unavailable")
             }
@@ -405,6 +451,12 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             BackgroundCredentialEnvelopeCodec.requireSafeValue(mutationId)
             BackgroundCredentialEnvelopeCodec.requireSafeValue(activationOperationId)
             require(expiresAtUnix > nowUnix)
+            current.logoutState?.let { logout ->
+                require(logout.phase == BackgroundLogoutPhase.FINALIZED)
+                if (provision.installGeneration != Math.addExact(logout.installGeneration, 1)) {
+                    throw MutationFailure("background_credential_generation_conflict")
+                }
+            }
             current.copy(
                 revision = current.revision.incrementRevision(),
                 deviceId = deviceId,
@@ -413,7 +465,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
                 installGeneration = provision.installGeneration,
                 active = current.active.takeUnless { replacesDevice },
                 previous = current.previous.takeUnless { replacesDevice },
-                capability = provision.capability,
+                capability = capability,
                 reservation = BackgroundMutationReservation(
                     mutationId,
                     activationOperationId,
@@ -455,6 +507,9 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         expectedRevision: Long,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = true) { current ->
+            if (current.logoutState != null) {
+                throw MutationFailure("background_credential_logout_pending")
+            }
             current.copy(
                 revision = current.revision.incrementRevision(),
                 installSecret = null,
@@ -479,7 +534,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = false) { current ->
             requireMutationReady(current)
-            if (current.logoutState != null) throw MutationFailure(
+            if (current.logoutState?.phase == BackgroundLogoutPhase.PENDING) throw MutationFailure(
                 "background_credential_logout_pending",
             )
             val capability = current.capability
@@ -559,9 +614,13 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             current.capability?.let { existing ->
                 require(capability.revision >= existing.revision)
             }
+            val effectiveCapability = conservativeBackgroundCapability(
+                current.capability,
+                capability,
+            )
             current.copy(
                 revision = current.revision.incrementRevision(),
-                capability = capability,
+                capability = effectiveCapability,
                 reservation = null,
             )
         }
@@ -576,7 +635,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = false) { current ->
             requireMutationReady(current)
-            if (current.logoutState != null) throw MutationFailure(
+            if (current.logoutState?.phase == BackgroundLogoutPhase.PENDING) throw MutationFailure(
                 "background_credential_logout_pending",
             )
             val reservation = current.reservation
@@ -599,9 +658,13 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             current.capability?.let { existing ->
                 require(capability.revision >= existing.revision)
             }
+            val effectiveCapability = conservativeBackgroundCapability(
+                current.capability,
+                capability,
+            )
             current.copy(
                 revision = current.revision.incrementRevision(),
-                capability = capability,
+                capability = effectiveCapability,
             )
         }
     }
@@ -614,7 +677,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             is CredentialStoreResult.Success -> {
                 val current = currentResult.value
                 when {
-                    current.logoutState != null -> CredentialStoreResult.Failure(
+                    current.logoutState?.phase == BackgroundLogoutPhase.PENDING -> CredentialStoreResult.Failure(
                         "background_credential_logout_pending",
                     )
                     current.pending == null -> CredentialStoreResult.Failure(
@@ -632,7 +695,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         activeExpiresAtUnix: Long,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = true) { current ->
-            if (current.logoutState != null) throw MutationFailure(
+            if (current.logoutState?.phase == BackgroundLogoutPhase.PENDING) throw MutationFailure(
                 "background_credential_logout_pending",
             )
             val pending = current.pending
@@ -657,6 +720,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
                 previous = active,
                 pending = null,
                 reservation = null,
+                logoutState = null,
             )
         }
     }
@@ -666,7 +730,7 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         activationOperationId: String,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = true) { current ->
-            if (current.logoutState != null) throw MutationFailure(
+            if (current.logoutState?.phase == BackgroundLogoutPhase.PENDING) throw MutationFailure(
                 "background_credential_logout_pending",
             )
             val pending = current.pending
@@ -688,30 +752,64 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
         installGeneration: Long,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = true) { current ->
-            BackgroundCredentialEnvelopeCodec.requireSafeValue(operationId)
-            require(installGeneration > 0)
-            current.logoutState?.let { existing ->
-                if (existing.operationId == operationId &&
-                    existing.installGeneration == installGeneration
-                ) {
-                    return@mutate current
-                }
-                throw MutationFailure("background_credential_logout_pending")
-            }
-            val active = current.active
-                ?: throw MutationFailure("background_credential_active_absent")
-            current.copy(
-                revision = current.revision.incrementRevision(),
-                active = null,
-                previous = null,
-                pending = null,
-                capability = null,
-                reservation = null,
-                cleanupCredential = active,
-                logoutState = BackgroundLogoutState(
-                    operationId, installGeneration, BackgroundLogoutPhase.PENDING,
-                ),
+            beginLogoutTransition(current, operationId, installGeneration)
+        }
+    }
+
+    fun beginLogoutCurrent(
+        operationId: String,
+    ): CredentialStoreResult<BackgroundLogoutBegin> = synchronized(gate) {
+        val currentResult = readLocked()
+        if (currentResult is CredentialStoreResult.Failure) {
+            return@synchronized CredentialStoreResult.Failure(currentResult.code)
+        }
+        val current = (currentResult as CredentialStoreResult.Success).value
+        if (current.logoutState != null) {
+            return@synchronized CredentialStoreResult.Success(
+                BackgroundLogoutBegin.Owned(current),
             )
+        }
+        return@synchronized try {
+            val nativeCanRevoke = current.active != null || current.pending != null ||
+                current.cleanupCredential != null
+            val next = if (nativeCanRevoke) {
+                beginLogoutTransition(
+                    current,
+                    operationId,
+                    current.installGeneration
+                        ?: throw MutationFailure("background_credential_unavailable"),
+                )
+            } else {
+                current.copy(
+                    revision = current.revision.incrementRevision(),
+                    installSecret = null,
+                    active = null,
+                    previous = null,
+                    pending = null,
+                    capability = null,
+                    reservation = null,
+                    cleanupCredential = null,
+                    logoutState = null,
+                )
+            }
+            when (val persisted = if (next == current) {
+                CredentialStoreResult.Success(current)
+            } else {
+                persist(next)
+            }) {
+                is CredentialStoreResult.Success -> CredentialStoreResult.Success(
+                    if (nativeCanRevoke) {
+                        BackgroundLogoutBegin.Owned(persisted.value)
+                    } else {
+                        BackgroundLogoutBegin.NotOwned(persisted.value)
+                    },
+                )
+                is CredentialStoreResult.Failure -> persisted
+            }
+        } catch (failure: MutationFailure) {
+            CredentialStoreResult.Failure(failure.code)
+        } catch (_: Throwable) {
+            CredentialStoreResult.Failure("background_credential_invalid")
         }
     }
 
@@ -726,6 +824,9 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
                 throw MutationFailure("background_credential_mutation_conflict")
             }
             if (logout.phase == BackgroundLogoutPhase.FINALIZED) return@mutate current
+            if (current.pending != null) {
+                throw MutationFailure("background_credential_activation_pending")
+            }
             current.copy(
                 revision = current.revision.incrementRevision(),
                 installSecret = null,
@@ -738,6 +839,74 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
                 logoutState = logout.copy(phase = BackgroundLogoutPhase.FINALIZED),
             )
         }
+    }
+
+    fun resolveLogoutPendingActivation(
+        expectedRevision: Long,
+        logoutOperationId: String,
+        activationOperationId: String,
+        activeExpiresAtUnix: Long?,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        mutate(expectedRevision, advancesRevision = true) { current ->
+            val logout = current.logoutState
+                ?: throw MutationFailure("background_credential_logout_absent")
+            if (logout.phase != BackgroundLogoutPhase.PENDING ||
+                logout.operationId != logoutOperationId
+            ) {
+                throw MutationFailure("background_credential_mutation_conflict")
+            }
+            val pending = current.pending
+                ?: throw MutationFailure("background_credential_pending_absent")
+            if (pending.activationOperationId != activationOperationId) {
+                throw MutationFailure("background_credential_mutation_conflict")
+            }
+            val selectedCredential = activeExpiresAtUnix?.let { expiresAtUnix ->
+                require(expiresAtUnix > 0)
+                BackgroundCredential(
+                    deviceId = current.deviceId
+                        ?: throw MutationFailure("background_credential_device_mismatch"),
+                    panelBase = current.panelBase
+                        ?: throw MutationFailure("background_credential_device_mismatch"),
+                    token = pending.token,
+                    expiresAtUnix = expiresAtUnix,
+                )
+            } ?: current.cleanupCredential
+            current.copy(
+                revision = current.revision.incrementRevision(),
+                pending = null,
+                reservation = null,
+                cleanupCredential = selectedCredential,
+            )
+        }
+    }
+
+    private fun beginLogoutTransition(
+        current: BackgroundCredentialEnvelope,
+        operationId: String,
+        installGeneration: Long,
+    ): BackgroundCredentialEnvelope {
+        BackgroundCredentialEnvelopeCodec.requireSafeValue(operationId)
+        require(installGeneration > 0)
+        current.logoutState?.let { existing ->
+            if (existing.operationId == operationId &&
+                existing.installGeneration == installGeneration
+            ) {
+                return current
+            }
+            throw MutationFailure("background_credential_logout_pending")
+        }
+        val phase = BackgroundLogoutPhase.PENDING
+        return current.copy(
+            revision = current.revision.incrementRevision(),
+            installSecret = current.installSecret,
+            active = null,
+            previous = null,
+            pending = current.pending,
+            capability = null,
+            reservation = current.reservation.takeIf { current.pending != null },
+            cleanupCredential = current.active ?: current.cleanupCredential,
+            logoutState = BackgroundLogoutState(operationId, installGeneration, phase),
+        )
     }
 
     private fun mutate(

@@ -206,6 +206,7 @@ export interface BindPeerRequest {
 
 export interface StartCommandRequest {
   deviceId: string;
+  bindingRequest?: BindPeerRequest | null;
   layer: Layer;
   ticConnectionMode: TicConnectionMode;
   routeMode: RouteMode;
@@ -297,6 +298,33 @@ export function bindingPreferencesMatch(
     binding.route_mode === routeMode &&
     (ticConnectionMode === "dynamic" || binding.egress_mode === egressMode)
   );
+}
+
+export function bindingPreferenceUpdateRequest(
+  binding: PeerBinding,
+  layer: Layer,
+  ticConnectionMode: TicConnectionMode,
+  routeMode: RouteMode,
+  egressMode: EgressMode,
+): BindPeerRequest | null {
+  if (
+    bindingPreferencesMatch(
+      binding,
+      layer,
+      ticConnectionMode,
+      routeMode,
+      egressMode,
+    )
+  ) {
+    return null;
+  }
+  return {
+    peer_id: binding.peer_id,
+    preferred_layer: layer,
+    tic_connection_mode: ticConnectionMode,
+    route_mode: routeMode,
+    egress_mode: egressMode,
+  };
 }
 
 export function requiresServerProbes(

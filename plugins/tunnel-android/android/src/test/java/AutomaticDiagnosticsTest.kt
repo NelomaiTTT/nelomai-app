@@ -1,6 +1,7 @@
 package ru.nelomai.tunnel
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -11,6 +12,127 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 class AutomaticDiagnosticsTest {
+    @Test
+    fun connectionIntentDiagnosticsReportsAndNotifiesOncePerEpisode() {
+        val episode = AutomaticDiagnosticsConnectionIntentEpisode()
+
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(),
+            episode.observeRetry(299),
+        )
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(
+                queueReport = true,
+                notifyUser = true,
+            ),
+            episode.observeRetry(300),
+        )
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(),
+            episode.observeRetry(300),
+        )
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(),
+            episode.observeTerminal(),
+        )
+
+        episode.reset()
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(queueReport = true),
+            episode.observeTerminal(),
+        )
+
+        episode.reset()
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(
+                queueReport = true,
+                notifyUser = true,
+            ),
+            episode.observeRetry(300),
+        )
+    }
+
+    @Test
+    fun terminalObservationRetriesAnUndurableReportWithoutDuplicatingTheTerminalEvent() {
+        val firstProcess = AutomaticDiagnosticsConnectionIntentEpisode()
+
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(queueReport = true),
+            firstProcess.observeTerminal(),
+        )
+        val restoredProcess = AutomaticDiagnosticsConnectionIntentEpisode(
+            reportQueued = false,
+            notificationSent = false,
+            terminalObserved = true,
+        )
+
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(queueReport = true),
+            restoredProcess.observeTerminal(),
+        )
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(),
+            restoredProcess.observeRetry(300),
+        )
+        val afterDurableQueue = AutomaticDiagnosticsConnectionIntentEpisode(
+            reportQueued = true,
+            notificationSent = false,
+            terminalObserved = true,
+        )
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentActions(),
+            afterDurableQueue.observeTerminal(),
+        )
+    }
+
+    @Test
+    fun connectionIntentPayloadUsesStableReasonClassesWithoutSensitiveInput() {
+        val event = automaticDiagnosticsConnectionIntentEvent(
+            kind = "retry_scheduled",
+            errorCode = "full_error_message private_key=https://private.example",
+            attempt = 7,
+            delaySeconds = 300,
+        )
+        val encoded = event.toString()
+
+        assertEquals("connection.intent.retry_scheduled", event.getString("event"))
+        assertEquals("other", event.getString("reason_class"))
+        assertEquals(7, event.getInt("attempt"))
+        assertEquals(300L, event.getLong("delay_seconds"))
+        listOf(
+            "private_key",
+            "session_token",
+            "wireguard_config",
+            "full_error_message",
+            "https://private.example",
+        ).forEach { forbidden ->
+            assertTrue("leaked $forbidden", !encoded.contains(forbidden))
+        }
+        assertEquals(
+            "network",
+            automaticDiagnosticsConnectionIntentReasonClass("transport_error"),
+        )
+    }
+
+    @Test
+    fun connectionIntentReportLogDropsUnstructuredAndSensitiveFields() {
+        val safe = automaticDiagnosticsSafeConnectionIntentLog(
+            """
+            {"timestamp":"2026-08-30T10:00:00Z","event":"connection.intent.retry_scheduled","reason_class":"network","attempt":6,"delay_seconds":300,"message":"private_key=secret"}
+            {"timestamp":"2026-08-30T10:00:01Z","event":"unrelated.event","message":"session_token=secret"}
+            {"timestamp":"2026-08-30T10:00:02Z","event":"connection.intent.terminal_failure","reason_class":"raw backend failure https://private.example"}
+            """.trimIndent(),
+        )
+
+        assertTrue(safe.contains("connection.intent.retry_scheduled"))
+        assertTrue(safe.contains("connection.intent.terminal_failure"))
+        assertTrue(safe.contains("\"reason_class\":\"network\""))
+        assertTrue(safe.contains("\"reason_class\":\"other\""))
+        listOf("private_key", "session_token", "secret", "https://private.example").forEach {
+            assertTrue("leaked $it", !safe.contains(it))
+        }
+    }
+
     @Test
     fun procStatusMemoryParserReadsCurrentAndPeakRssSafely() {
         val status = """
@@ -40,10 +162,12 @@ class AutomaticDiagnosticsTest {
         val request = StartFailureRequest(
             reportId = "33333333-3333-4333-8333-333333333333",
             deviceId = "11111111-1111-4111-8111-111111111111",
-            errorCode = "configuration_fetch_failed",
+            errorCode = "panel",
             queuedAt = 1_000,
             sent = false,
             memorySamplesJson = memorySamplesJson,
+            trigger = "connection_intent_slow_recovery",
+            diagnosticsEpisodeId = 17L,
         )
 
         val restored = StartFailureRequest.fromJson(request.toJson())
@@ -59,6 +183,117 @@ class AutomaticDiagnosticsTest {
         )
         assertTrue(StartFailureRequest.fromJson(request.copy(sent = true).toJson()).sent)
         assertEquals(memorySamplesJson, restored.memorySamplesJson)
+        assertEquals("connection_intent_slow_recovery", restored.trigger)
+        assertEquals(17L, restored.diagnosticsEpisodeId)
+    }
+
+    @Test
+    fun legacyStartFailureMarkerWithoutEpisodeIdentityRemainsReadable() {
+        val encoded = StartFailureRequest(
+            reportId = "33333333-3333-4333-8333-333333333333",
+            deviceId = "11111111-1111-4111-8111-111111111111",
+            errorCode = "panel",
+            queuedAt = 1_000,
+            sent = false,
+        ).toJson()
+        val legacy = JSONObject(encoded).apply {
+            remove("diagnostics_episode_id")
+        }
+
+        assertNull(StartFailureRequest.fromJson(legacy.toString()).diagnosticsEpisodeId)
+    }
+
+    @Test
+    fun connectionIntentQueuePolicyBindsDurableOwnershipToTheEpisodeNotTheTrigger() {
+        val slowMarker = StartFailureRequest(
+            reportId = "33333333-3333-4333-8333-333333333333",
+            deviceId = "11111111-1111-4111-8111-111111111111",
+            errorCode = "network",
+            queuedAt = 1_000,
+            sent = false,
+            trigger = "connection_intent_slow_recovery",
+            diagnosticsEpisodeId = 17L,
+        )
+
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentReportOutcome.ALREADY_DURABLE_THIS_EPISODE,
+            automaticDiagnosticsConnectionIntentQueuePolicy(
+                existing = slowMarker,
+                diagnosticsEpisodeId = 17L,
+                now = 1_001,
+                cooldownSeconds = 900,
+            ),
+        )
+        assertTrue(
+            AutomaticDiagnosticsConnectionIntentReportOutcome
+                .ALREADY_DURABLE_THIS_EPISODE.ownsEpisodeReport,
+        )
+    }
+
+    @Test
+    fun unrelatedOrLegacyPendingMarkerSuppressesWithoutClaimingEpisodeOwnership() {
+        val unrelated = StartFailureRequest(
+            reportId = "33333333-3333-4333-8333-333333333333",
+            deviceId = "11111111-1111-4111-8111-111111111111",
+            errorCode = "network",
+            queuedAt = 1_000,
+            sent = false,
+            diagnosticsEpisodeId = 16L,
+        )
+        val unrelatedOutcome = automaticDiagnosticsConnectionIntentQueuePolicy(
+            existing = unrelated,
+            diagnosticsEpisodeId = 17L,
+            now = 1_001,
+            cooldownSeconds = 900,
+        )
+        val legacyOutcome = automaticDiagnosticsConnectionIntentQueuePolicy(
+            existing = unrelated.copy(diagnosticsEpisodeId = null),
+            diagnosticsEpisodeId = 17L,
+            now = 1_001,
+            cooldownSeconds = 900,
+        )
+
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentReportOutcome.SUPPRESSED_BY_POLICY,
+            unrelatedOutcome,
+        )
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentReportOutcome.SUPPRESSED_BY_POLICY,
+            legacyOutcome,
+        )
+        assertFalse(unrelatedOutcome.ownsEpisodeReport)
+        assertTrue(unrelatedOutcome.allowsTerminalHandoff)
+    }
+
+    @Test
+    fun cooldownSuppressionFinishesHandoffWhileExpiredOtherEpisodeQueuesFreshReport() {
+        val uploadedOtherEpisode = StartFailureRequest(
+            reportId = "33333333-3333-4333-8333-333333333333",
+            deviceId = "11111111-1111-4111-8111-111111111111",
+            errorCode = "network",
+            queuedAt = 1_000,
+            sent = true,
+            diagnosticsEpisodeId = 16L,
+        )
+
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentReportOutcome.SUPPRESSED_BY_POLICY,
+            automaticDiagnosticsConnectionIntentQueuePolicy(
+                existing = uploadedOtherEpisode,
+                diagnosticsEpisodeId = 17L,
+                now = 1_899,
+                cooldownSeconds = 900,
+            ),
+        )
+        assertEquals(
+            AutomaticDiagnosticsConnectionIntentReportOutcome.QUEUED_THIS_EPISODE,
+            automaticDiagnosticsConnectionIntentQueuePolicy(
+                existing = uploadedOtherEpisode,
+                diagnosticsEpisodeId = 17L,
+                now = 1_900,
+                cooldownSeconds = 900,
+            ),
+        )
     }
 
     @Test

@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use nelomai_contracts::ProbeResult;
 pub use nelomai_contracts::{
     EgressMode as StoredEgressMode, Layer as StoredLayer, RouteMode as StoredRouteMode,
     TicConnectionMode as StoredTicConnectionMode,
@@ -64,7 +65,11 @@ impl fmt::Debug for StoredConnection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+fn default_allow_alternate() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredPendingStart {
     pub operation_id: String,
     pub layer: StoredLayer,
@@ -72,6 +77,34 @@ pub struct StoredPendingStart {
     pub route_mode: StoredRouteMode,
     #[serde(default)]
     pub egress_mode: StoredEgressMode,
+    #[serde(default = "default_allow_alternate")]
+    pub allow_alternate: bool,
+    #[serde(default)]
+    pub probes: Vec<ProbeResult>,
+    #[serde(default)]
+    pub recovery_contract_version: Option<u32>,
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
+    #[serde(default)]
+    pub cancel_operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPendingStalledStop {
+    pub operation_id: String,
+    pub lease_id: String,
+    pub contract_version: u32,
+    pub request_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredPendingCompensationStop {
+    pub operation_id: String,
+    pub lease_id: String,
+    #[serde(default)]
+    pub accept_warm: bool,
+    #[serde(default)]
+    pub failure_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +113,7 @@ pub struct StoredCompatibility {
     pub observed_at_unix: i64,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredAuth {
     pub install_secret: String,
     pub access_token: Option<String>,
@@ -91,6 +124,10 @@ pub struct StoredAuth {
     pub pinned_connection: Option<StoredConnection>,
     #[serde(default)]
     pub pending_start: Option<StoredPendingStart>,
+    #[serde(default)]
+    pub pending_stalled_stop: Option<StoredPendingStalledStop>,
+    #[serde(default)]
+    pub pending_compensation_stop: Option<StoredPendingCompensationStop>,
     #[serde(default)]
     pub compatibility: Option<StoredCompatibility>,
 }
@@ -111,6 +148,8 @@ impl fmt::Debug for StoredAuth {
             .field("saved_connection", &self.saved_connection)
             .field("pinned_connection", &self.pinned_connection)
             .field("pending_start", &self.pending_start)
+            .field("pending_stalled_stop", &self.pending_stalled_stop)
+            .field("pending_compensation_stop", &self.pending_compensation_stop)
             .field("compatibility", &self.compatibility)
             .finish()
     }
@@ -127,6 +166,8 @@ impl StoredAuth {
             saved_connection: None,
             pinned_connection: None,
             pending_start: None,
+            pending_stalled_stop: None,
+            pending_compensation_stop: None,
             compatibility: None,
         }
     }
@@ -450,6 +491,8 @@ mod tests {
         assert!(stored.saved_connection.is_none());
         assert!(stored.pinned_connection.is_none());
         assert!(stored.pending_start.is_none());
+        assert!(stored.pending_stalled_stop.is_none());
+        assert!(stored.pending_compensation_stop.is_none());
         assert!(stored.compatibility.is_none());
     }
 
@@ -480,10 +523,41 @@ mod tests {
             stored.saved_connection.unwrap().egress_mode,
             StoredEgressMode::Ipv4
         );
-        assert_eq!(
-            stored.pending_start.unwrap().egress_mode,
-            StoredEgressMode::Ipv4
-        );
+        let pending = stored.pending_start.unwrap();
+        assert_eq!(pending.egress_mode, StoredEgressMode::Ipv4);
+        assert!(pending.allow_alternate);
+        assert!(pending.probes.is_empty());
+    }
+
+    #[test]
+    fn pending_start_allow_alternate_preserves_explicit_values() {
+        for (allow_alternate, expected) in [(false, false), (true, true)] {
+            let pending: StoredPendingStart = serde_json::from_value(json!({
+                "operation_id": "22222222-2222-4222-8222-222222222222",
+                "layer": "tic",
+                "tic_connection_mode": "dynamic",
+                "route_mode": "via_tak",
+                "allow_alternate": allow_alternate
+            }))
+            .unwrap();
+
+            assert_eq!(pending.allow_alternate, expected);
+        }
+    }
+
+    #[test]
+    fn legacy_compensation_stop_defaults_missing_failure_code_without_changing_warm_policy() {
+        let pending: StoredPendingCompensationStop = serde_json::from_value(json!({
+            "operation_id": "22222222-2222-4222-8222-222222222222",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "accept_warm": true
+        }))
+        .unwrap();
+
+        assert!(pending.accept_warm);
+        let encoded = serde_json::to_value(pending).unwrap();
+        assert!(encoded.as_object().unwrap().contains_key("failure_code"));
+        assert!(encoded["failure_code"].is_null());
     }
 
     #[test]

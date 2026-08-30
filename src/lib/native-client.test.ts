@@ -229,6 +229,32 @@ describe("native client", () => {
     });
   });
 
+  it("hands a changed peer binding to the native connection owner in the start request", async () => {
+    const invoke = vi.fn().mockResolvedValue({ status: "recovering" });
+    const client = createNativeClient(invoke);
+    const bindingRequest = {
+      peer_id: "peer-15",
+      preferred_layer: "tic" as const,
+      tic_connection_mode: "personal" as const,
+      route_mode: "via_tak" as const,
+      egress_mode: "prefer_ipv6" as const,
+    };
+
+    await client.start({
+      deviceId: "11111111-1111-4111-8111-111111111111",
+      bindingRequest,
+      layer: "tic",
+      ticConnectionMode: "personal",
+      routeMode: "via_tak",
+      egressMode: "prefer_ipv6",
+      allowAlternate: true,
+    });
+
+    expect(invoke).toHaveBeenCalledWith("app_start", {
+      request: expect.objectContaining({ bindingRequest }),
+    });
+  });
+
   it("routes Defender status and repair through native commands", async () => {
     const invoke = vi.fn().mockResolvedValue({ supported: true, state: "excluded" });
     const client = createNativeClient(invoke);

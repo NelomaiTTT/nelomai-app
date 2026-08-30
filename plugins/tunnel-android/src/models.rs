@@ -100,7 +100,7 @@ impl fmt::Debug for InstalledApplicationsResponse {
 
 pub const TUNNEL_API_VERSION: u16 = 2;
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TunnelOptions {
     pub split_active: bool,
@@ -231,16 +231,71 @@ pub struct BackgroundCredentialStatusResponse {
     pub credential_revision: i64,
     pub mutation_ready: bool,
     pub mutation_pending: bool,
+    #[serde(default)]
+    pub capability_revision: i64,
     pub capability_enabled: bool,
     pub capability_expires_at_unix: Option<i64>,
     pub device_id: Option<String>,
     pub expires_at_unix: Option<i64>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundLogoutOwnership {
+    Native,
+    NotOwned,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundLogoutOwnershipResponse {
+    pub ownership: BackgroundLogoutOwnership,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundCredentialMutationRequest {
     pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionIntentTemplateRequest {
+    pub device_id: String,
+    pub account_scope: String,
+    pub layer: String,
+    pub tic_connection_mode: String,
+    pub route_mode: String,
+    pub egress_mode: String,
+    pub allow_alternate: bool,
+    #[serde(default)]
+    pub sync_binding_preferences: bool,
+    #[serde(default)]
+    pub options: TunnelOptions,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginConnectionIntentRequest {
+    pub api_version: u16,
+    pub template: ConnectionIntentTemplateRequest,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelConnectionIntentRequest {
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionIntentStatusResponse {
+    pub generation: u64,
+    pub desired_active: bool,
+    pub status: String,
+    pub lease_phase: Option<String>,
+    pub next_retry_at_unix: Option<i64>,
+    pub last_error_code: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -479,6 +534,36 @@ mod tests {
     }
 
     #[test]
+    fn background_credential_status_preserves_the_capability_revision() {
+        let status: BackgroundCredentialStatusResponse =
+            serde_json::from_value(serde_json::json!({
+                "configured": true,
+                "credentialRevision": 7,
+                "mutationReady": true,
+                "mutationPending": false,
+                "capabilityRevision": 17,
+                "capabilityEnabled": true,
+                "capabilityExpiresAtUnix": 1_800_000_000_i64,
+                "deviceId": "11111111-1111-4111-8111-111111111111",
+                "expiresAtUnix": 1_900_000_000_i64
+            }))
+            .unwrap();
+
+        assert_eq!(status.capability_revision, 17);
+    }
+
+    #[test]
+    fn background_logout_ownership_deserializes_both_native_decisions() {
+        let native: BackgroundLogoutOwnershipResponse =
+            serde_json::from_value(serde_json::json!({ "ownership": "native" })).unwrap();
+        let legacy: BackgroundLogoutOwnershipResponse =
+            serde_json::from_value(serde_json::json!({ "ownership": "not_owned" })).unwrap();
+
+        assert_eq!(native.ownership, BackgroundLogoutOwnership::Native);
+        assert_eq!(legacy.ownership, BackgroundLogoutOwnership::NotOwned);
+    }
+
+    #[test]
     fn ui_background_provision_redacts_both_authentication_secrets() {
         let request = BackgroundUiProvisionRequest {
             api_version: TUNNEL_API_VERSION,
@@ -536,6 +621,58 @@ mod tests {
         );
         assert!(response.access_token.is_none());
         assert!(response.refresh_token.is_none());
+    }
+
+    #[test]
+    fn connection_intent_ipc_preserves_normalized_template_and_generation() {
+        let request = BeginConnectionIntentRequest {
+            api_version: TUNNEL_API_VERSION,
+            template: ConnectionIntentTemplateRequest {
+                device_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                account_scope: "11111111-1111-4111-8111-111111111111".to_string(),
+                layer: "stray".to_string(),
+                tic_connection_mode: "dynamic".to_string(),
+                route_mode: "standalone".to_string(),
+                egress_mode: "ipv4".to_string(),
+                allow_alternate: true,
+                sync_binding_preferences: true,
+                options: TunnelOptions {
+                    split_active: true,
+                    policy_hash: Some("policy-7".to_string()),
+                    application_mode: Some("exclude_selected".to_string()),
+                    excluded_packages: vec!["com.example.chat".to_string()],
+                    split_tunnel_routes: vec!["10.0.0.0/8".to_string()],
+                    dns_servers: vec!["1.1.1.1".to_string()],
+                    ..Default::default()
+                },
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["apiVersion"], TUNNEL_API_VERSION);
+        assert_eq!(value["template"]["layer"], "stray");
+        assert_eq!(value["template"]["allowAlternate"], true);
+        assert_eq!(value["template"]["syncBindingPreferences"], true);
+        assert_eq!(value["template"]["options"]["dnsServers"][0], "1.1.1.1");
+        assert_eq!(
+            value["template"]["options"]["excludedPackages"][0],
+            "com.example.chat"
+        );
+
+        let status: ConnectionIntentStatusResponse = serde_json::from_value(serde_json::json!({
+            "generation": 9,
+            "desiredActive": true,
+            "status": "recovering",
+            "leasePhase": "start_pending",
+            "nextRetryAtUnix": 1_800_000_000_i64,
+            "lastErrorCode": "connection_unavailable"
+        }))
+        .unwrap();
+        assert_eq!(status.generation, 9);
+        assert_eq!(status.lease_phase.as_deref(), Some("start_pending"));
+
+        let cancel = serde_json::to_value(CancelConnectionIntentRequest { generation: 9 }).unwrap();
+        assert_eq!(cancel["generation"], 9);
     }
 
     #[test]

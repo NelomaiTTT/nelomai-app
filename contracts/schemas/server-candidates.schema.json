@@ -8,7 +8,7 @@
     "request_id": { "$ref": "common.schema.json#/$defs/id" },
     "candidates": {
       "type": "array",
-      "maxItems": 32,
+      "maxItems": 20,
       "items": {
         "type": "object",
         "required": ["candidate_id", "layer", "region_label", "probe_url", "expires_at"],

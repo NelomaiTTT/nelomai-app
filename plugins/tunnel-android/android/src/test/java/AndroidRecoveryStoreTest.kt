@@ -9,6 +9,284 @@ import org.junit.Test
 
 class AndroidRecoveryStoreTest {
     @Test
+    fun activeCheckpointPersistsArmedHistoryAcrossProcessDeath() {
+        val backend = FakeEncryptedRecordBackend()
+        var store = store(backend)
+        val initial = store.beginStart(0, template(), replay()).success()
+        assertFalse(initial.intent.armedHistory)
+
+        store.recordLease(1, "lease-1").success()
+        store.activateCheckpoint(1).success()
+        store = store(backend)
+
+        assertTrue(store.read().success().intent.armedHistory)
+    }
+
+    @Test
+    fun activeCheckpointAtomicallyRotatesDiagnosticsWithoutBumpingRecoveryGeneration() {
+        val backend = FakeEncryptedRecordBackend()
+        var store = store(backend)
+        val started = store.beginStart(0, template(), replay()).success()
+        store.recordLease(1, "lease-1").success()
+
+        val active = store.activateCheckpoint(1).success()
+        store = store(backend)
+        val reconstructed = store.read().success()
+
+        assertEquals(1L, started.intent.diagnosticsEpisodeId)
+        assertEquals(1L, active.intent.generation)
+        assertEquals(1L, active.leaseTransaction?.generation)
+        assertEquals(2L, active.intent.diagnosticsEpisodeId)
+        assertEquals(active, reconstructed)
+    }
+
+    @Test
+    fun repeatedSuccessfulCheckpointRotationsRemainMonotonicInOneRecoveryGeneration() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginStart(0, template(), replay()).success()
+        store.recordLease(1, "lease-1").success()
+        val first = store.activateCheckpoint(1).success()
+
+        val second = store.activateCheckpoint(1).success()
+
+        assertEquals(1L, second.intent.generation)
+        assertEquals(first.intent.diagnosticsEpisodeId + 1, second.intent.diagnosticsEpisodeId)
+        assertEquals(LeasePhase.ACTIVE_CHECKPOINT, second.leaseTransaction?.phase)
+    }
+
+    @Test
+    fun diagnosticsEpisodeCounterStaysMonotonicWhenRecoveryGenerationMovesIndependently() {
+        assertEquals(13L, nextAndroidDiagnosticsEpisodeId(12, 8))
+        assertEquals(12L, nextAndroidDiagnosticsEpisodeId(7, 12))
+        assertNull(nextAndroidDiagnosticsEpisodeId(Long.MAX_VALUE, Long.MAX_VALUE))
+    }
+
+    @Test
+    fun diagnosticsEpisodeSurvivesCancelAndBootTombstonesAcrossProcessDeath() {
+        val backend = FakeEncryptedRecordBackend()
+        var store = store(backend, bootCount = 7)
+        val started = store.beginStart(0, template(), replay()).success()
+
+        val cancelled = store.cancelCurrentIntent().success()
+        store = store(backend, bootCount = 8)
+        val stale = store.read().success()
+
+        assertEquals(1L, started.intent.diagnosticsEpisodeId)
+        assertEquals(1L, cancelled.intent.diagnosticsEpisodeId)
+        assertEquals(1L, stale.intent.diagnosticsEpisodeId)
+        assertTrue(stale.intent.generation > started.intent.generation)
+    }
+
+    @Test
+    fun missingDiagnosticsEpisodeInV1AndV2DefaultsToPersistedGeneration() {
+        val backend = FakeEncryptedRecordBackend()
+        store(backend).beginStart(0, template(), replay()).success()
+        val currentPayload = org.json.JSONObject(
+            requireNotNull(backend.record).toString(Charsets.UTF_8),
+        )
+        currentPayload.getJSONObject("intent").remove("diagnosticsEpisodeId")
+
+        val restoredV2 = AndroidRecoveryEnvelopeCodec.decode(
+            currentPayload.toString().toByteArray(),
+        )
+        currentPayload.put("formatVersion", 1)
+        val restoredV1 = AndroidRecoveryEnvelopeCodec.decode(
+            currentPayload.toString().toByteArray(),
+        )
+
+        assertEquals(restoredV2.intent.generation, restoredV2.intent.diagnosticsEpisodeId)
+        assertEquals(restoredV1.intent.generation, restoredV1.intent.diagnosticsEpisodeId)
+    }
+
+    @Test
+    fun initialTerminalAfterAcquiredLeaseDisarmsAndClearsEpisodeAfterExactCleanup() {
+        val backend = FakeEncryptedRecordBackend()
+        var store = store(backend)
+        store.beginStart(0, template(), replay()).success()
+        store.recordLease(1, "lease-1").success()
+
+        val cleanup = store.scheduleInitialTerminalAfterCleanup(
+            1,
+            "lease-1",
+            "stop-operation",
+            "service_timeout",
+        ).success()
+        assertFalse(cleanup.intent.desiredActive)
+        assertEquals("initial_terminal_report_pending", cleanup.intent.retry.pendingAction)
+        assertEquals("stop-operation", cleanup.leaseTransaction?.stopOperationId)
+
+        store = store(backend)
+        store.acknowledgeInitialTerminalDiagnostic(1).success()
+        val idle = store.completeInitialTerminalCleanup(1).success()
+        assertFalse(idle.intent.desiredActive)
+        assertNull(idle.intent.template)
+        assertNull(idle.intent.retry.lastErrorCode)
+        assertNull(idle.leaseTransaction)
+    }
+
+    @Test
+    fun armedTerminalAfterCleanupRemainsBlockedTerminal() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+        store.beginStart(0, template(), replay()).success()
+        store.recordLease(1, "lease-1").success()
+        store.activateCheckpoint(1).success()
+
+        val cleanup = store.scheduleTerminalAfterCleanup(
+            1,
+            "lease-1",
+            "stop-operation",
+            "service_timeout",
+        ).success()
+        val terminal = store.completeCleanupAsTerminal(1).success()
+
+        assertTrue(cleanup.intent.armedHistory)
+        assertTrue(terminal.intent.desiredActive)
+        assertTrue(terminal.intent.armedHistory)
+        assertEquals("service_timeout", terminal.intent.retry.lastErrorCode)
+        assertNull(terminal.leaseTransaction)
+    }
+
+    @Test
+    fun retryingAnArmedTerminalPreservesArmedHistoryBeforeTheNextHandshake() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginStart(0, template(), replay()).success()
+        store.recordLease(1, "lease-1").success()
+        val active = store.activateCheckpoint(1).success()
+        store.scheduleTerminalAfterCleanup(
+            1,
+            "lease-1",
+            "stop-operation",
+            "service_timeout",
+        ).success()
+        store.completeCleanupAsTerminal(1).success()
+
+        val retried = store.restartTerminal(
+            1,
+            template(),
+            replay().copy(startOperationId = "retry-operation"),
+            "retry-stop-operation",
+        ).success()
+
+        assertTrue(retried.intent.desiredActive)
+        assertTrue(retried.intent.armedHistory)
+        assertEquals(2L, retried.intent.generation)
+        assertEquals(3L, retried.intent.diagnosticsEpisodeId)
+        assertTrue(retried.intent.diagnosticsEpisodeId > active.intent.diagnosticsEpisodeId)
+        assertEquals(LeasePhase.START_PENDING, retried.leaseTransaction?.phase)
+    }
+
+    @Test
+    fun selectedTunnelOptionsSurviveCodecAndProcessDeathExactly() {
+        val backend = FakeEncryptedRecordBackend()
+        val selected = template().copy(options = AndroidTunnelOptions(
+            splitActive = true,
+            policyHash = "policy-7",
+            applicationMode = "exclude_selected",
+            excludedPackages = listOf("com.example.chat"),
+            splitTunnelRoutes = listOf("10.0.0.0/8"),
+            excludeLocalNetworks = true,
+            dnsServers = listOf("1.1.1.1"),
+        ))
+
+        store(backend).beginStart(0, selected, replay()).success()
+
+        assertEquals(selected.options, store(backend).read().success().intent.template?.options)
+        val plaintext = requireNotNull(backend.record).toString(Charsets.UTF_8).lowercase()
+        listOf("configuration", "privatekey", "token", "credential").forEach {
+            assertFalse("unexpected secret field $it", plaintext.contains(it))
+        }
+    }
+
+    @Test
+    fun legacyV1EnvelopeMigratesWithUnarmedHistoryAndEmptyOptions() {
+        val legacy = AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(7))
+            .toString(Charsets.UTF_8)
+            .replace("\"formatVersion\":2", "\"formatVersion\":1")
+            .replace(",\"armedHistory\":false", "")
+            .toByteArray()
+        val restored = store(FakeEncryptedRecordBackend(legacy)).read().success()
+
+        assertFalse(restored.intent.armedHistory)
+        assertEquals(AndroidTunnelOptions(), restored.intent.template?.options ?: AndroidTunnelOptions())
+        assertEquals(ANDROID_RECOVERY_FORMAT, restored.formatVersion)
+    }
+
+    @Test
+    fun legacyV1ActiveCheckpointMigratesAsPreviouslyArmed() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+        store.beginStart(0, template(), replay()).success()
+        store.recordLease(1, "lease-1").success()
+        store.activateCheckpoint(1).success()
+        val legacy = requireNotNull(backend.record).toString(Charsets.UTF_8)
+            .replace("\"formatVersion\":2", "\"formatVersion\":1")
+            .replace(",\"armedHistory\":true", "")
+            .toByteArray()
+
+        val restored = store(FakeEncryptedRecordBackend(legacy)).read().success()
+
+        assertTrue(restored.intent.armedHistory)
+        assertEquals(LeasePhase.ACTIVE_CHECKPOINT, restored.leaseTransaction?.phase)
+    }
+
+    @Test
+    fun legacyTemplateWithoutBindingSyncFieldDefaultsToFalse() {
+        val backend = FakeEncryptedRecordBackend()
+        store(backend).beginStart(
+            0,
+            template().copy(syncBindingPreferences = true),
+            replay(),
+        ).success()
+        val legacyPayload = org.json.JSONObject(
+            requireNotNull(backend.record).toString(Charsets.UTF_8),
+        )
+        val legacyTemplate = legacyPayload.getJSONObject("intent").getJSONObject("template")
+        legacyTemplate.remove("syncBindingPreferences")
+        assertFalse(legacyTemplate.has("syncBindingPreferences"))
+
+        val restored = AndroidRecoveryEnvelopeCodec.decode(
+            legacyPayload.toString().toByteArray(),
+        )
+
+        assertFalse(requireNotNull(restored.intent.template).syncBindingPreferences)
+    }
+
+    @Test
+    fun tunnelOptionsAreNormalizedAndBoundedBeforePersistence() {
+        val args = TunnelOptionsArgs().apply {
+            splitActive = true
+            policyHash = "policy-1"
+            applicationMode = "exclude_selected"
+            excludedPackages = arrayListOf(" com.example.chat ", "com.example.chat")
+            splitTunnelRoutes = arrayListOf("10.0.0.7/8", "10.0.0.0/8")
+            dnsServers = arrayListOf("1.1.1.1", "1.1.1.1")
+        }
+
+        val normalized = normalizeAndroidTunnelOptions(33, args)
+
+        assertEquals(listOf("com.example.chat"), normalized.excludedPackages)
+        assertEquals(listOf("10.0.0.0/8"), normalized.splitTunnelRoutes)
+        assertEquals(listOf("1.1.1.1"), normalized.dnsServers)
+        val oversized = TunnelOptionsArgs().apply {
+            dnsServers = arrayListOf("1.1.1.1", "8.8.8.8", "9.9.9.9", "4.4.4.4", "2.2.2.2")
+        }
+        assertTrue(runCatching { normalizeAndroidTunnelOptions(33, oversized) }.isFailure)
+    }
+
+    @Test
+    fun retryPersistsSelectedDelayForExactDiagnosticThresholds() {
+        val backend = FakeEncryptedRecordBackend()
+        var store = store(backend)
+        store.beginStart(0, template(), replay()).success()
+
+        store.recordFailure(1, "transport_error", 1_300, scheduledDelaySeconds = 300).success()
+        store = store(backend)
+
+        assertEquals(300L, store.read().success().intent.retry.scheduledDelaySeconds)
+    }
+
+    @Test
     fun beginStartPublishesIntentAndPendingTransactionInOneRecord() {
         val backend = FakeEncryptedRecordBackend()
         val store = store(backend)
@@ -217,6 +495,32 @@ class AndroidRecoveryStoreTest {
         assertEquals(1, enabled.intent.generation)
         assertEquals("connection_intent_generation_conflict", staleWrite.code)
         assertEquals(enabled, restored)
+    }
+
+    @Test
+    fun stoppingAnIdleIntentAdvancesGenerationToTombstoneAQueuedStart() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+
+        val stopped = store.setDesiredActive(0, false).success()
+
+        assertFalse(stopped.intent.desiredActive)
+        assertEquals(1L, stopped.intent.generation)
+        assertEquals(stopped, store(backend).read().success())
+    }
+
+    @Test
+    fun cancelCurrentIntentAtomicallyTombstonesTheLatestGeneration() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+        store.beginStart(0, template(), replay()).success()
+
+        val stopped = store.cancelCurrentIntent().success()
+
+        assertFalse(stopped.intent.desiredActive)
+        assertEquals(2L, stopped.intent.generation)
+        assertEquals(2L, stopped.leaseTransaction?.generation)
+        assertEquals(stopped, store(backend).read().success())
     }
 
     @Test

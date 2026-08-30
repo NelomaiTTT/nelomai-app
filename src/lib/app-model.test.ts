@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  bindingPreferenceUpdateRequest,
   bindingPreferencesMatch,
   bindingRequest,
   connectionEgressMode,
@@ -99,6 +100,33 @@ describe("bindingPreferencesMatch", () => {
         "prefer_ipv6",
       ),
     ).toBe(false);
+  });
+
+  it("hands a changed binding to the connection start owner instead of applying it early", () => {
+    expect(
+      bindingPreferenceUpdateRequest(
+        { ...binding, tic_connection_mode: "personal" },
+        "tic",
+        "personal",
+        "via_tak",
+        "prefer_ipv6",
+      ),
+    ).toEqual({
+      peer_id: "peer-15",
+      preferred_layer: "tic",
+      tic_connection_mode: "personal",
+      route_mode: "via_tak",
+      egress_mode: "prefer_ipv6",
+    });
+    expect(
+      bindingPreferenceUpdateRequest(
+        binding,
+        "tic",
+        "dynamic",
+        "via_tak",
+        "prefer_ipv6",
+      ),
+    ).toBeNull();
   });
 });
 

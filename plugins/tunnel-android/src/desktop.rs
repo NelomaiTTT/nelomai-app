@@ -84,8 +84,42 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(BackgroundCredentialStatusResponse::default())
     }
 
+    pub fn begin_connection_intent(
+        &self,
+        _request: BeginConnectionIntentRequest,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        Ok(ConnectionIntentStatusResponse::default())
+    }
+
+    pub fn toggle_connection_intent(&self) -> crate::Result<ConnectionIntentStatusResponse> {
+        Ok(ConnectionIntentStatusResponse::default())
+    }
+
+    pub fn cancel_connection_intent(
+        &self,
+        _request: CancelConnectionIntentRequest,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        Ok(ConnectionIntentStatusResponse::default())
+    }
+
+    pub fn cancel_current_connection_intent(
+        &self,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        Ok(ConnectionIntentStatusResponse::default())
+    }
+
+    pub fn connection_intent_status(&self) -> crate::Result<ConnectionIntentStatusResponse> {
+        Ok(ConnectionIntentStatusResponse::default())
+    }
+
     pub fn clear_background(&self) -> crate::Result<()> {
         Ok(())
+    }
+
+    pub fn begin_background_logout(&self) -> crate::Result<BackgroundLogoutOwnershipResponse> {
+        Ok(BackgroundLogoutOwnershipResponse {
+            ownership: BackgroundLogoutOwnership::NotOwned,
+        })
     }
 
     pub async fn recover_background_session(

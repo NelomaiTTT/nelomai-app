@@ -68,6 +68,35 @@ impl<R: Runtime> AndroidTunnelController<R> {
     }
 }
 
+pub fn connection_intent_tunnel_options(
+    options: nelomai_client_tunnel::TunnelOptions,
+) -> models::TunnelOptions {
+    let mut plugin_options = models::TunnelOptions {
+        split_active: options.policy_hash.is_some(),
+        policy_hash: options.policy_hash,
+        split_tunnel_routes: options.excluded_ipv4_cidrs,
+        exclude_local_networks: options.exclude_local_networks,
+        dns_servers: options
+            .dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        ..Default::default()
+    };
+    match options.application_mode {
+        Some(SplitTunnelMode::ExcludeSelected) => {
+            plugin_options.application_mode = Some("exclude_selected".to_string());
+            plugin_options.excluded_packages = options.package_ids;
+        }
+        Some(SplitTunnelMode::IncludeSelected) => {
+            plugin_options.application_mode = Some("include_selected".to_string());
+            plugin_options.included_packages = options.package_ids;
+        }
+        None => {}
+    }
+    plugin_options
+}
+
 #[async_trait]
 impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
     async fn start(&self, request: TunnelStartRequest) -> std::result::Result<(), TunnelError> {

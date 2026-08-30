@@ -166,6 +166,30 @@ class BackgroundSessionRecoveryArgs {
 }
 
 @InvokeArg
+class ConnectionIntentTemplateArgs {
+    lateinit var deviceId: String
+    lateinit var accountScope: String
+    lateinit var layer: String
+    lateinit var ticConnectionMode: String
+    lateinit var routeMode: String
+    lateinit var egressMode: String
+    var allowAlternate: Boolean = false
+    var syncBindingPreferences: Boolean = false
+    var options: TunnelOptionsArgs = TunnelOptionsArgs()
+}
+
+@InvokeArg
+class BeginConnectionIntentArgs {
+    var apiVersion: Int = 0
+    var template: ConnectionIntentTemplateArgs = ConnectionIntentTemplateArgs()
+}
+
+@InvokeArg
+class CancelConnectionIntentArgs {
+    var generation: Long = -1
+}
+
+@InvokeArg
 class VersionedTunnelArgs {
     var apiVersion: Int = 0
 }
@@ -209,26 +233,37 @@ internal enum class TransitionDecision {
 internal class TunnelStateGate(
     initialState: SessionState = SessionState.STOPPED,
 ) {
-    private val state = AtomicReference(initialState)
+    private enum class GateState {
+        STOPPED,
+        STARTING,
+        RUNNING,
+        STOPPING,
+        FAILED,
+        REBINDING,
+    }
 
-    fun current(): SessionState = state.get()
+    private val state = AtomicReference(initialState.toGateState())
+
+    fun current(): SessionState = state.get().toSessionState()
 
     fun beginStart(): TransitionDecision {
         while (true) {
             when (val current = state.get()) {
-                SessionState.RUNNING -> {
-                    if (state.compareAndSet(current, SessionState.STARTING)) {
+                GateState.RUNNING -> {
+                    if (state.compareAndSet(current, GateState.STARTING)) {
                         return TransitionDecision.REPLACE
                     }
                 }
-                SessionState.STARTING, SessionState.STOPPING -> return TransitionDecision.BUSY
-                SessionState.STOPPED -> {
-                    if (state.compareAndSet(current, SessionState.STARTING)) {
+                GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> {
+                    return TransitionDecision.BUSY
+                }
+                GateState.STOPPED -> {
+                    if (state.compareAndSet(current, GateState.STARTING)) {
                         return TransitionDecision.PROCEED
                     }
                 }
-                SessionState.FAILED -> {
-                    if (state.compareAndSet(current, SessionState.STARTING)) {
+                GateState.FAILED -> {
+                    if (state.compareAndSet(current, GateState.STARTING)) {
                         return TransitionDecision.REPLACE
                     }
                 }
@@ -239,10 +274,15 @@ internal class TunnelStateGate(
     fun beginStop(): TransitionDecision {
         while (true) {
             when (val current = state.get()) {
-                SessionState.STOPPED -> return TransitionDecision.ALREADY_COMPLETE
-                SessionState.STARTING, SessionState.STOPPING -> return TransitionDecision.BUSY
-                SessionState.RUNNING, SessionState.FAILED -> {
-                    if (state.compareAndSet(current, SessionState.STOPPING)) {
+                GateState.STOPPED -> return TransitionDecision.ALREADY_COMPLETE
+                GateState.STOPPING, GateState.REBINDING -> return TransitionDecision.BUSY
+                GateState.STARTING -> {
+                    if (state.compareAndSet(current, GateState.STOPPING)) {
+                        return TransitionDecision.PROCEED
+                    }
+                }
+                GateState.RUNNING, GateState.FAILED -> {
+                    if (state.compareAndSet(current, GateState.STOPPING)) {
                         return TransitionDecision.PROCEED
                     }
                 }
@@ -253,13 +293,15 @@ internal class TunnelStateGate(
     fun beginRebind(): TransitionDecision {
         while (true) {
             when (val current = state.get()) {
-                SessionState.RUNNING -> {
-                    if (state.compareAndSet(current, SessionState.STARTING)) {
+                GateState.RUNNING -> {
+                    if (state.compareAndSet(current, GateState.REBINDING)) {
                         return TransitionDecision.PROCEED
                     }
                 }
-                SessionState.STARTING, SessionState.STOPPING -> return TransitionDecision.BUSY
-                SessionState.STOPPED, SessionState.FAILED -> {
+                GateState.STARTING, GateState.STOPPING, GateState.REBINDING -> {
+                    return TransitionDecision.BUSY
+                }
+                GateState.STOPPED, GateState.FAILED -> {
                     return TransitionDecision.ALREADY_COMPLETE
                 }
             }
@@ -267,10 +309,26 @@ internal class TunnelStateGate(
     }
 
     fun cancelRebind(): Boolean =
-        state.compareAndSet(SessionState.STARTING, SessionState.RUNNING)
+        state.compareAndSet(GateState.REBINDING, GateState.RUNNING)
 
     fun complete(next: SessionState) {
-        state.set(next)
+        state.set(next.toGateState())
+    }
+
+    private fun SessionState.toGateState(): GateState = when (this) {
+        SessionState.STOPPED -> GateState.STOPPED
+        SessionState.STARTING -> GateState.STARTING
+        SessionState.RUNNING -> GateState.RUNNING
+        SessionState.STOPPING -> GateState.STOPPING
+        SessionState.FAILED -> GateState.FAILED
+    }
+
+    private fun GateState.toSessionState(): SessionState = when (this) {
+        GateState.STOPPED -> SessionState.STOPPED
+        GateState.STARTING, GateState.REBINDING -> SessionState.STARTING
+        GateState.RUNNING -> SessionState.RUNNING
+        GateState.STOPPING -> SessionState.STOPPING
+        GateState.FAILED -> SessionState.FAILED
     }
 }
 
@@ -423,6 +481,16 @@ internal fun shouldPollNetworkTelemetry(
 
 internal fun shouldPersistPeriodicNetworkTelemetry(mode: NetworkTelemetryMode): Boolean =
     mode == NetworkTelemetryMode.PASSIVE
+
+internal fun handOffDataPlaneStall(
+    leaseId: String?,
+    handoff: (String) -> Boolean,
+    fallback: () -> Unit,
+): Boolean {
+    if (leaseId != null && handoff(leaseId)) return true
+    fallback()
+    return false
+}
 
 private data class PendingUdpControlProbe(
     val stage: UdpControlProbeStage,
@@ -1142,6 +1210,7 @@ internal object TunnelRuntime {
                             BackgroundConnectionClient.stop(
                                 credential,
                                 result.connection.leaseId,
+                                UUID.randomUUID().toString(),
                             )
                         },
                         notifyFailure = { onError(code) },
@@ -1223,7 +1292,13 @@ internal object TunnelRuntime {
                     return@stop
                 }
                 backgroundExecutor.execute {
-                    runCatching { BackgroundConnectionClient.stop(credential, leaseId) }
+                    runCatching {
+                        BackgroundConnectionClient.stop(
+                            credential,
+                            leaseId,
+                            UUID.randomUUID().toString(),
+                        )
+                    }
                         .onFailure { error ->
                             TunnelLog.warning(
                                 "background_stop.panel_failed",
@@ -2130,6 +2205,15 @@ internal object TunnelRuntime {
     }
 
     private fun stopAfterUdpRecoveryFailure() {
+        val leaseId = activeSession?.connectionLeaseId
+        handOffDataPlaneStall(
+            leaseId = leaseId,
+            handoff = NelomaiVpnService::reportDataPlaneStall,
+            fallback = ::stopLocallyAfterUdpRecoveryFailure,
+        )
+    }
+
+    private fun stopLocallyAfterUdpRecoveryFailure() {
         val context = applicationContext ?: run {
             suppressBackendStateChanges.set(true)
             try {
@@ -2153,10 +2237,11 @@ internal object TunnelRuntime {
                 QuickTunnelController.updateState(
                     context,
                     state,
-                    desiredActive = false,
+                    desiredActive = null,
                     changed = true,
                 )
                 TunnelPlugin.refreshQuickTile(context)
+                NelomaiVpnService.resumeConnectionIntentRecovery()
             },
             { code ->
                 TunnelLog.warning("tunnel.udp_recovery_stop_failed", code)
@@ -2166,11 +2251,11 @@ internal object TunnelRuntime {
                 QuickTunnelController.updateState(
                     context,
                     SessionState.FAILED,
-                    desiredActive = false,
+                    desiredActive = null,
                     changed = true,
                 )
                 TunnelPlugin.refreshQuickTile(context)
-                NelomaiVpnService.stopForegroundService()
+                NelomaiVpnService.resumeConnectionIntentRecovery()
             },
         )
     }
@@ -2743,14 +2828,14 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         val args = try {
             invoke.parseArgs(BackgroundUiProvisionArgs::class.java)
         } catch (_: Throwable) {
-            invoke.reject("invalid_background_credential")
+            invoke.reject("invalid_background_credential", "invalid_background_credential")
             return
         }
         TunnelServiceClient.provisionBackground(
             activity.applicationContext,
             args,
             { activity.runOnUiThread { invoke.resolve() } },
-            { code -> activity.runOnUiThread { invoke.reject(code) } },
+            { code -> activity.runOnUiThread { invoke.reject(code, code) } },
         )
     }
 
@@ -2763,6 +2848,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
                     credentialRevision,
                     mutationReady,
                     mutationPending,
+                    capabilityRevision,
                     capabilityEnabled,
                     capabilityExpiresAtUnix,
                     deviceId,
@@ -2774,6 +2860,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
                     response.put("credentialRevision", credentialRevision)
                     response.put("mutationReady", mutationReady)
                     response.put("mutationPending", mutationPending)
+                    response.put("capabilityRevision", capabilityRevision)
                     response.put("capabilityEnabled", capabilityEnabled)
                     response.put("capabilityExpiresAtUnix", capabilityExpiresAtUnix)
                     response.put("deviceId", deviceId)
@@ -2786,10 +2873,84 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun beginConnectionIntent(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(BeginConnectionIntentArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_connection_intent")
+            return
+        }
+        TunnelServiceClient.beginConnectionIntent(
+            activity.applicationContext,
+            args,
+            { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun toggleConnectionIntent(invoke: Invoke) {
+        TunnelServiceClient.toggleConnectionIntent(
+            activity.applicationContext,
+            { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun cancelConnectionIntent(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(CancelConnectionIntentArgs::class.java)
+        } catch (_: Throwable) {
+            invoke.reject("invalid_connection_intent")
+            return
+        }
+        TunnelServiceClient.cancelConnectionIntent(
+            activity.applicationContext,
+            args.generation,
+            { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun cancelCurrentConnectionIntent(invoke: Invoke) {
+        TunnelServiceClient.cancelCurrentConnectionIntent(
+            activity.applicationContext,
+            { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun connectionIntentStatus(invoke: Invoke) {
+        TunnelServiceClient.connectionIntentStatus(
+            activity.applicationContext,
+            { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
     fun clearBackground(invoke: Invoke) {
         TunnelServiceClient.clearBackground(
             activity.applicationContext,
             { activity.runOnUiThread { invoke.resolve() } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun beginBackgroundLogout(invoke: Invoke) {
+        TunnelServiceClient.beginBackgroundLogout(
+            activity.applicationContext,
+            { ownership ->
+                activity.runOnUiThread {
+                    invoke.resolve(JSObject().apply {
+                        put("ownership", ownership.wireName)
+                    })
+                }
+            },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
         )
     }
@@ -2982,5 +3143,14 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve(response)
             refreshQuickTile(activity.applicationContext)
         }
+    }
+
+    private fun ConnectionIntentServiceStatus.toJsObject(): JSObject = JSObject().apply {
+        put("generation", generation)
+        put("desiredActive", desiredActive)
+        put("status", status)
+        put("leasePhase", leasePhase)
+        put("nextRetryAtUnix", nextRetryAtUnix)
+        put("lastErrorCode", lastErrorCode)
     }
 }

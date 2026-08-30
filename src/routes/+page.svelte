@@ -4,6 +4,16 @@
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
+  import { clearOwnedConnectionIntentNotice } from "$lib/connection-intent-notice";
+  import {
+    beginConnectionStart,
+    beginConnectionStop,
+    canBeginConnectionAction,
+    finishConnectionStart,
+    finishConnectionStop,
+    initialConnectionActionState,
+    isCurrentConnectionAction,
+  } from "$lib/connection-action";
   import {
     historyStateForOverlay,
     overlayFromHistoryState,
@@ -11,7 +21,7 @@
   } from "$lib/navigation";
 
   import {
-    bindingPreferencesMatch,
+    bindingPreferenceUpdateRequest,
     bindingRequest,
     connectionEgressMode,
     defaultRouteModeForLayer,
@@ -23,6 +33,7 @@
     viewForPhase,
     type AppView,
     type AppPreferences,
+    type BindPeerRequest,
     type DnsProvider,
     type EgressMode,
     type Bootstrap,
@@ -66,6 +77,7 @@
   let ticConnectionMode = $state<TicConnectionMode>("dynamic");
   let routeMode = $state<RouteMode>("standalone");
   let busy = $state(false);
+  let connectionActionState = $state(initialConnectionActionState());
   let probeBusy = $state(false);
   let availableCandidates = $state(0);
   let connection = $state<Connection | null>(null);
@@ -136,6 +148,8 @@
       : null,
   );
   let nativeStateUnlisten: UnlistenFn | null = null;
+  let connectionIntentNotificationUnlisten: UnlistenFn | null = null;
+  let ownedConnectionIntentNotice: string | null = null;
   let splitTunnelBlocksStart = $derived(
     splitTunnelState !== null &&
       emptyIncludeSelection(splitTunnelState, splitTunnelApplications),
@@ -197,6 +211,17 @@
       if (disposed) unlisten();
       else nativeStateUnlisten = unlisten;
     });
+    void listen<{ title: string; body: string }>(
+      "native-connection-intent-notification",
+      (event) => {
+        const notice = `${event.payload.title}. ${event.payload.body}`;
+        error = notice;
+        ownedConnectionIntentNotice = notice;
+      },
+    ).then((unlisten) => {
+      if (disposed) unlisten();
+      else connectionIntentNotificationUnlisten = unlisten;
+    });
     stateTimer = window.setInterval(() => {
       if (document.visibilityState === "visible") void synchronizeRuntimeState();
     }, 1_000);
@@ -242,6 +267,7 @@
       window.removeEventListener("popstate", handleHistoryChange);
       clearUpdateTimer();
       nativeStateUnlisten?.();
+      connectionIntentNotificationUnlisten?.();
     };
   });
 
@@ -346,6 +372,14 @@
       connectionMetrics = current.metrics;
       connectionIntentStatus = current.connectionIntentStatus;
       nextRetryAtUnix = current.nextRetryAtUnix;
+      if (
+        ownedConnectionIntentNotice !== null &&
+        (current.phase === "connected" || current.connectionIntentStatus === "none")
+      ) {
+        const cleared = clearOwnedConnectionIntentNotice(error, ownedConnectionIntentNotice);
+        error = cleared.error;
+        ownedConnectionIntentNotice = cleared.ownedNotice;
+      }
       if (current.phase === phase) {
         connection = current.connection;
         return;
@@ -505,14 +539,19 @@
   }
 
   async function toggleConnection(forceStop = false) {
-    if (busy) return;
     if (!forceStop && connectionAction === "start" && splitTunnelBlocksStart) {
       showOverlay("split_tunnel");
       return;
     }
-    const stopping = forceStop || connectionAction === "stop";
+    const stopping =
+      forceStop || connectionAction === "stop" || connectionActionState.startBusy;
+    if (!canBeginConnectionAction(connectionActionState, busy, stopping)) return;
     const startDeviceId = bootstrap?.device.id;
     if (!stopping && !startDeviceId) return;
+    const action = stopping
+      ? beginConnectionStop(connectionActionState)
+      : beginConnectionStart(connectionActionState);
+    connectionActionState = action.state;
     let shouldReportStartFailure = !stopping;
     busy = true;
     error = null;
@@ -527,18 +566,18 @@
         if (!startDeviceId) return;
         phase = "connecting";
         connectionMetrics = null;
-        await nativeClient.prepareTunnel(startDeviceId);
-        await syncBindingPreferences();
         const effectiveTicConnectionMode =
           selectedLayer === "stray" ? "dynamic" : ticConnectionMode;
         const startResult = await nativeClient.start({
           deviceId: startDeviceId,
+          bindingRequest: pendingBindingPreferenceRequest(),
           layer: selectedLayer,
           ticConnectionMode: effectiveTicConnectionMode,
           routeMode: selectedLayer === "stray" ? "standalone" : routeMode,
           egressMode: selectedEgressMode,
           allowAlternate: true,
         });
+        if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
         connection = startResult.connection;
         connectionIntentStatus = startResult.status === "recovering" ? "recovering" : "none";
         nextRetryAtUnix = startResult.nextRetryAtUnix;
@@ -551,6 +590,7 @@
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
     } catch (reason) {
+      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
       const failureCode = commandCode(reason);
       if (shouldReportStartFailure && startDeviceId) {
         await waitForSettlement(
@@ -586,13 +626,33 @@
         await refreshWindowsDefender();
       }
     } finally {
-      busy = false;
+      connectionActionState = stopping
+        ? finishConnectionStop(connectionActionState)
+        : finishConnectionStart(connectionActionState);
+      busy = connectionActionState.startBusy || connectionActionState.cancelBusy;
     }
   }
 
   async function syncBindingPreferences() {
+    const request = pendingBindingPreferenceRequest();
+    if (!request) return;
+    const response = await nativeClient.bindPeer(request);
+    if (response.binding && bootstrap) {
+      bootstrap = {
+        ...bootstrap,
+        binding: response.binding,
+        defaults: {
+          layer: selectedLayer,
+          tic_connection_mode: selectedLayer === "stray" ? "dynamic" : ticConnectionMode,
+          route_mode: selectedLayer === "stray" ? "standalone" : routeMode,
+        },
+      };
+    }
+  }
+
+  function pendingBindingPreferenceRequest(): BindPeerRequest | null {
     const binding = bootstrap?.binding;
-    if (!binding) return;
+    if (!binding) return null;
     const desiredMode =
       selectedLayer === "stray" ? "dynamic" : ticConnectionMode;
     const desiredRoute =
@@ -603,35 +663,13 @@
       desiredMode,
       appPreferences,
     );
-    if (
-      bindingPreferencesMatch(
-        binding,
-        selectedLayer,
-        desiredMode,
-        desiredRoute,
-        desiredEgressMode,
-      )
-    ) {
-      return;
-    }
-    const response = await nativeClient.bindPeer({
-      peer_id: binding.peer_id,
-      preferred_layer: selectedLayer,
-      tic_connection_mode: desiredMode,
-      route_mode: desiredRoute,
-      egress_mode: desiredEgressMode,
-    });
-    if (response.binding && bootstrap) {
-      bootstrap = {
-        ...bootstrap,
-        binding: response.binding,
-        defaults: {
-          layer: selectedLayer,
-          tic_connection_mode: desiredMode,
-          route_mode: desiredRoute,
-        },
-      };
-    }
+    return bindingPreferenceUpdateRequest(
+      binding,
+      selectedLayer,
+      desiredMode,
+      desiredRoute,
+      desiredEgressMode,
+    );
   }
 
   async function toggleSavedStray() {
@@ -1275,7 +1313,11 @@
             class="connect-button"
             type="button"
             onclick={() => toggleConnection()}
-            disabled={busy ||
+            disabled={!canBeginConnectionAction(
+              connectionActionState,
+              busy,
+              connectionAction === "stop" || connectionActionState.startBusy,
+            ) ||
               (connectionAction === "start" &&
                 (!splitTunnelLoaded || splitTunnelBlocksStart))}
           >
@@ -1302,7 +1344,7 @@
               class="secondary-button blocked-stop-button"
               type="button"
               onclick={() => toggleConnection(true)}
-              disabled={busy}
+              disabled={!canBeginConnectionAction(connectionActionState, busy, true)}
             >
               Стоп
             </button>

@@ -8,6 +8,21 @@ import org.junit.Test
 
 class BackgroundCredentialStoreTest {
     @Test
+    fun enabledCapabilityCannotPersistWithTheDisabledSentinelRevision() {
+        val store = BackgroundCredentialStore(CredentialFakeBackend())
+
+        val result = store.configure(
+            expectedRevision = 0,
+            provision = provision(
+                BackgroundCapabilitySnapshot(0, enabled = true, expiresAtUnix = 500),
+            ),
+        ).failureCredential()
+
+        assertEquals("background_credential_invalid", result.code)
+        assertEquals(0, store.read().successCredential().revision)
+    }
+
+    @Test
     fun configurePublishesOneRevisionedCredentialEnvelope() {
         val backend = CredentialFakeBackend()
         val store = BackgroundCredentialStore(backend)
@@ -103,6 +118,149 @@ class BackgroundCredentialStoreTest {
 
         assertEquals("background_credential_capability_unavailable", disabled.code)
         assertEquals("background_credential_capability_unavailable", expired.code)
+    }
+
+    @Test
+    fun staleEnabledCapabilityCannotReplaceANewerDowngrade() {
+        val store = configuredStore(
+            BackgroundCapabilitySnapshot(10, enabled = false, expiresAtUnix = 500),
+        )
+
+        val result = store.reserveProvision(
+            expectedRevision = 1,
+            provision = provisionReservation(
+                BackgroundCapabilitySnapshot(9, enabled = true, expiresAtUnix = 500),
+            ),
+            mutationId = PREPARE_ID,
+            activationOperationId = ACTIVATE_ID,
+            expiresAtUnix = 150,
+            nowUnix = 100,
+        ).failureCredential()
+
+        assertEquals("background_credential_capability_unavailable", result.code)
+        val persisted = store.read().successCredential()
+        assertEquals(1, persisted.revision)
+        assertEquals(10L, persisted.capability?.revision)
+        assertFalse(persisted.capability?.enabled ?: true)
+        assertNull(persisted.reservation)
+    }
+
+    @Test
+    fun legacyConfigureCannotReplaceANewerCapabilityDowngrade() {
+        val store = configuredStore(
+            BackgroundCapabilitySnapshot(10, enabled = false, expiresAtUnix = 500),
+        )
+
+        val configured = store.configure(
+            expectedRevision = 1,
+            provision = provision(
+                BackgroundCapabilitySnapshot(9, enabled = true, expiresAtUnix = 500),
+            ),
+        ).successCredential()
+
+        assertEquals(2, configured.revision)
+        assertEquals("device-token", configured.active?.token)
+        assertEquals(10L, configured.capability?.revision)
+        assertFalse(configured.capability?.enabled ?: true)
+    }
+
+    @Test
+    fun newerEnabledCapabilityReplacesAnOlderDowngrade() {
+        val store = configuredStore(
+            BackgroundCapabilitySnapshot(10, enabled = false, expiresAtUnix = 500),
+        )
+
+        val configured = store.configure(
+            expectedRevision = 1,
+            provision = provision(
+                BackgroundCapabilitySnapshot(11, enabled = true, expiresAtUnix = 600),
+            ),
+        ).successCredential()
+
+        assertEquals(11L, configured.capability?.revision)
+        assertTrue(configured.capability?.enabled ?: false)
+        assertEquals(600L, configured.capability?.expiresAtUnix)
+    }
+
+    @Test
+    fun equalRevisionDowngradeBlocksAStaleEnabledReservation() {
+        val store = configuredStore(
+            BackgroundCapabilitySnapshot(10, enabled = false, expiresAtUnix = 500),
+        )
+
+        val result = store.reserveProvision(
+            expectedRevision = 1,
+            provision = provisionReservation(
+                BackgroundCapabilitySnapshot(10, enabled = true, expiresAtUnix = 500),
+            ),
+            mutationId = PREPARE_ID,
+            activationOperationId = ACTIVATE_ID,
+            expiresAtUnix = 150,
+            nowUnix = 100,
+        ).failureCredential()
+
+        assertEquals("background_credential_capability_unavailable", result.code)
+        assertFalse(store.read().successCredential().capability?.enabled ?: true)
+    }
+
+    @Test
+    fun equalRevisionDowngradeSurvivesLegacyConfigure() {
+        val store = configuredStore(
+            BackgroundCapabilitySnapshot(10, enabled = false, expiresAtUnix = 500),
+        )
+
+        val configured = store.configure(
+            expectedRevision = 1,
+            provision = provision(
+                BackgroundCapabilitySnapshot(10, enabled = true, expiresAtUnix = 500),
+            ),
+        ).successCredential()
+
+        assertEquals(10L, configured.capability?.revision)
+        assertFalse(configured.capability?.enabled ?: true)
+    }
+
+    @Test
+    fun equalRevisionEnabledSnapshotCannotExtendCapabilityExpiry() {
+        val store = configuredStore(
+            BackgroundCapabilitySnapshot(10, enabled = true, expiresAtUnix = 100),
+        )
+
+        val result = store.reserveProvision(
+            expectedRevision = 1,
+            provision = provisionReservation(
+                BackgroundCapabilitySnapshot(10, enabled = true, expiresAtUnix = 500),
+            ),
+            mutationId = PREPARE_ID,
+            activationOperationId = ACTIVATE_ID,
+            expiresAtUnix = 150,
+            nowUnix = 100,
+        ).failureCredential()
+
+        assertEquals("background_credential_capability_unavailable", result.code)
+        assertEquals(100L, store.read().successCredential().capability?.expiresAtUnix)
+    }
+
+    @Test
+    fun newerEnabledCapabilityExtendsCapabilityExpiry() {
+        val store = configuredStore(
+            BackgroundCapabilitySnapshot(10, enabled = true, expiresAtUnix = 100),
+        )
+
+        val reserved = store.reserveProvision(
+            expectedRevision = 1,
+            provision = provisionReservation(
+                BackgroundCapabilitySnapshot(11, enabled = true, expiresAtUnix = 500),
+            ),
+            mutationId = PREPARE_ID,
+            activationOperationId = ACTIVATE_ID,
+            expiresAtUnix = 150,
+            nowUnix = 100,
+        ).successCredential()
+
+        assertEquals(11L, reserved.capability?.revision)
+        assertEquals(500L, reserved.capability?.expiresAtUnix)
+        assertTrue(reserved.reservation != null)
     }
 
     @Test
@@ -243,13 +401,18 @@ class BackgroundCredentialStoreTest {
     }
 
     @Test
-    fun logoutCancelsMutationAndPreventsLatePromotion() {
+    fun logoutPreservesPendingActivationForExactReplayAndPreventsLatePromotion() {
         val store = storeWithPending()
         val logout = store.beginLogout(
             expectedRevision = 1,
             operationId = "logout-operation",
             installGeneration = 1,
         ).successCredential()
+
+        val prematureFinalize = store.finalizeLogout(
+            logout.revision,
+            "logout-operation",
+        ).failureCredential()
 
         val late = store.promotePending(
             expectedRevision = logout.revision,
@@ -258,8 +421,12 @@ class BackgroundCredentialStoreTest {
         ).failureCredential()
 
         assertNull(logout.active)
-        assertNull(logout.pending)
+        assertEquals("staged-token", logout.pending?.token)
+        assertEquals("activate-operation", logout.pending?.activationOperationId)
+        assertEquals("prepare-operation", logout.reservation?.mutationId)
         assertEquals("device-token", logout.cleanupCredential?.token)
+        assertFalse(hasRecoverableBackgroundCredential(logout))
+        assertEquals("background_credential_activation_pending", prematureFinalize.code)
         assertEquals("background_credential_logout_pending", late.code)
     }
 
@@ -267,9 +434,18 @@ class BackgroundCredentialStoreTest {
     fun finalizedLogoutKeepsOnlyASecretFreeTombstone() {
         val store = storeWithPending()
         val pendingLogout = store.beginLogout(1, "logout-operation", 1).successCredential()
+        val reconciled = store.resolveLogoutPendingActivation(
+            pendingLogout.revision,
+            "logout-operation",
+            "activate-operation",
+            activeExpiresAtUnix = null,
+        ).successCredential()
+        assertEquals("device-token", reconciled.cleanupCredential?.token)
+        assertNull(reconciled.pending)
+        assertNull(reconciled.reservation)
 
         val finalized = store.finalizeLogout(
-            pendingLogout.revision,
+            reconciled.revision,
             "logout-operation",
         ).successCredential()
 
@@ -279,6 +455,110 @@ class BackgroundCredentialStoreTest {
         assertNull(finalized.cleanupCredential)
         assertNull(finalized.installSecret)
         assertEquals(BackgroundLogoutPhase.FINALIZED, finalized.logoutState?.phase)
+    }
+
+    @Test
+    fun clearRejectsPendingLogoutWithoutDestroyingItsCredentialOrTombstone() {
+        val backend = CredentialFakeBackend()
+        val store = BackgroundCredentialStore(backend)
+        store.configure(0, provision()).successCredential()
+        val pending = store.beginLogout(1, "logout-operation", 1).successCredential()
+
+        val result = store.clear(pending.revision).failureCredential()
+        val recreated = BackgroundCredentialStore(backend).read().successCredential()
+
+        assertEquals("background_credential_logout_pending", result.code)
+        assertEquals(BackgroundLogoutPhase.PENDING, recreated.logoutState?.phase)
+        assertEquals("device-token", recreated.cleanupCredential?.token)
+        assertEquals("install-secret", recreated.installSecret)
+    }
+
+    @Test
+    fun currentLogoutWithoutAUsableCredentialExplicitlyReportsNotOwned() {
+        val store = BackgroundCredentialStore(CredentialFakeBackend())
+
+        val result = store.beginLogoutCurrent("logout-operation").successLogoutBegin()
+
+        assertTrue(result is BackgroundLogoutBegin.NotOwned)
+        val cleared = (result as BackgroundLogoutBegin.NotOwned).envelope
+        assertEquals(1L, cleared.revision)
+        assertNull(cleared.logoutState)
+        assertNull(cleared.installSecret)
+    }
+
+    @Test
+    fun reservationWithoutAPreparedTokenIsInvalidatedAndReportsNotOwned() {
+        val store = BackgroundCredentialStore(CredentialFakeBackend())
+        store.reserveProvision(
+            expectedRevision = 0,
+            provision = provisionReservation(),
+            mutationId = PREPARE_ID,
+            activationOperationId = ACTIVATE_ID,
+            expiresAtUnix = 150,
+            nowUnix = 100,
+        ).successCredential()
+
+        val result = store.beginLogoutCurrent("logout-operation").successLogoutBegin()
+
+        assertTrue(result is BackgroundLogoutBegin.NotOwned)
+        val cleared = (result as BackgroundLogoutBegin.NotOwned).envelope
+        assertNull(cleared.reservation)
+        assertNull(cleared.installSecret)
+        assertNull(cleared.logoutState)
+    }
+
+    @Test
+    fun pendingPreparedTokenDurablyAssignsLogoutOwnershipToNative() {
+        val store = BackgroundCredentialStore(CredentialFakeBackend())
+        val reserved = store.reserveProvision(
+            expectedRevision = 0,
+            provision = provisionReservation(),
+            mutationId = PREPARE_ID,
+            activationOperationId = ACTIVATE_ID,
+            expiresAtUnix = 150,
+            nowUnix = 100,
+        ).successCredential()
+        store.savePendingToken(
+            reserved.revision,
+            PREPARE_ID,
+            pending(),
+            110,
+        ).successCredential()
+
+        val result = store.beginLogoutCurrent("logout-operation").successLogoutBegin()
+
+        assertTrue(result is BackgroundLogoutBegin.Owned)
+        val owned = (result as BackgroundLogoutBegin.Owned).envelope
+        assertEquals(BackgroundLogoutPhase.PENDING, owned.logoutState?.phase)
+        assertEquals("staged-token", owned.pending?.token)
+    }
+
+    @Test
+    fun cleanupCredentialWithoutAnActiveTokenStillAssignsLogoutOwnershipToNative() {
+        val backend = CredentialFakeBackend()
+        backend.record = BackgroundCredentialEnvelopeCodec.encode(
+            BackgroundCredentialEnvelope(
+                revision = 7,
+                deviceId = DEVICE_ID,
+                panelBase = "https://nelomai.test",
+                installSecret = "install-secret",
+                installGeneration = 1,
+                cleanupCredential = BackgroundCredential(
+                    deviceId = DEVICE_ID,
+                    panelBase = "https://nelomai.test",
+                    token = "cleanup-token",
+                    expiresAtUnix = 10_000,
+                ),
+            ),
+        )
+        val store = BackgroundCredentialStore(backend)
+
+        val result = store.beginLogoutCurrent("logout-operation").successLogoutBegin()
+
+        assertTrue(result is BackgroundLogoutBegin.Owned)
+        val owned = (result as BackgroundLogoutBegin.Owned).envelope
+        assertEquals(BackgroundLogoutPhase.PENDING, owned.logoutState?.phase)
+        assertEquals("cleanup-token", owned.cleanupCredential?.token)
     }
 
     @Test
@@ -410,6 +690,12 @@ private class CredentialFakeBackend(
 
 private fun CredentialStoreResult<BackgroundCredentialEnvelope>.successCredential():
     BackgroundCredentialEnvelope {
+    assertTrue(this is CredentialStoreResult.Success)
+    return (this as CredentialStoreResult.Success).value
+}
+
+private fun CredentialStoreResult<BackgroundLogoutBegin>.successLogoutBegin():
+    BackgroundLogoutBegin {
     assertTrue(this is CredentialStoreResult.Success)
     return (this as CredentialStoreResult.Success).value
 }

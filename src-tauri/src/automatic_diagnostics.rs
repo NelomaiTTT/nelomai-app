@@ -245,6 +245,38 @@ impl DesktopAutomaticDiagnostics {
         self.begin_upload_candidate(now, true)
     }
 
+    pub(crate) fn queue_connection_intent_report(
+        &self,
+        report: &DiagnosticUploadRequest,
+        generated_at: i64,
+    ) -> io::Result<()> {
+        let report_id = report
+            .report_id
+            .as_deref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing report id"))?;
+        let report_id = Uuid::parse_str(report_id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let state = self.lock_state()?;
+        let device_id = state
+            .current_device_id
+            .as_deref()
+            .ok_or_else(|| io::Error::other("automatic diagnostics device is unavailable"))?;
+        validate_scope(device_id)?;
+        let name = format!(
+            "{:020}.{}.{}{}",
+            generated_at.max(0),
+            device_id,
+            report_id,
+            REPORT_SUFFIX,
+        );
+        drop(state);
+        let destination = self.pending_directory().join(name);
+        if !destination.is_file() {
+            write_json_atomically(&destination, report, MAX_REPORT_BYTES)?;
+        }
+        Ok(())
+    }
+
     fn begin_upload_candidate(
         &self,
         now: i64,

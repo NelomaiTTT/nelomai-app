@@ -76,7 +76,213 @@ private const val KEY_PENDING_SEAL = "pending_seal"
 private const val KEY_RETRY_ATTEMPT = "retry_attempt"
 private const val KEY_NEXT_UPLOAD_AT = "next_upload_at"
 private const val KEY_LAST_ATTEMPTED_REPORT = "last_attempted_report"
+// Keep the existing preference key name for on-device compatibility.
+private const val KEY_CONNECTION_INTENT_EPISODE_ID = "connection_intent_generation"
+private const val KEY_CONNECTION_INTENT_REPORT_QUEUED = "connection_intent_report_queued"
+private const val KEY_CONNECTION_INTENT_NOTIFICATION_SENT = "connection_intent_notification_sent"
+private const val KEY_CONNECTION_INTENT_TERMINAL_OBSERVED = "connection_intent_terminal_observed"
+private const val KEY_CONNECTION_INTENT_EPISODE_REVISION = "connection_intent_episode_revision"
 private const val UNSCOPED_REPORT = "unscoped"
+private const val CONNECTION_START_FAILURE_TRIGGER = "connection_start_failed"
+private const val CONNECTION_INTENT_SLOW_TRIGGER = "connection_intent_slow_recovery"
+private const val CONNECTION_INTENT_TERMINAL_TRIGGER = "connection_intent_terminal_failure"
+
+private fun Long.saturatingIncrement(): Long = if (this == Long.MAX_VALUE) this else this + 1
+
+internal data class AutomaticDiagnosticsConnectionIntentActions(
+    val queueReport: Boolean = false,
+    val notifyUser: Boolean = false,
+)
+
+internal enum class AutomaticDiagnosticsConnectionIntentReportOutcome {
+    QUEUED_THIS_EPISODE,
+    ALREADY_DURABLE_THIS_EPISODE,
+    SUPPRESSED_BY_POLICY,
+    STORAGE_FAILED,
+    ;
+
+    val ownsEpisodeReport: Boolean
+        get() = this in setOf(QUEUED_THIS_EPISODE, ALREADY_DURABLE_THIS_EPISODE)
+
+    val allowsTerminalHandoff: Boolean
+        get() = this != STORAGE_FAILED
+}
+
+private data class PendingConnectionIntentDiagnostics(
+    val actions: AutomaticDiagnosticsConnectionIntentActions,
+    val episodeRevision: Long,
+)
+
+internal class AutomaticDiagnosticsConnectionIntentEpisode(
+    reportQueued: Boolean = false,
+    notificationSent: Boolean = false,
+    terminalObserved: Boolean = false,
+) {
+    var reportQueued = reportQueued
+        private set
+    var notificationSent = notificationSent
+        private set
+    var terminalObserved = terminalObserved
+        private set
+
+    fun observeRetry(delaySeconds: Long): AutomaticDiagnosticsConnectionIntentActions {
+        if (terminalObserved) return AutomaticDiagnosticsConnectionIntentActions()
+        if (delaySeconds < 300) return AutomaticDiagnosticsConnectionIntentActions()
+        return AutomaticDiagnosticsConnectionIntentActions(
+            queueReport = !reportQueued,
+            notifyUser = !notificationSent,
+        ).also {
+            reportQueued = true
+            notificationSent = true
+        }
+    }
+
+    fun observeTerminal(): AutomaticDiagnosticsConnectionIntentActions {
+        if (terminalObserved) {
+            return AutomaticDiagnosticsConnectionIntentActions(queueReport = !reportQueued)
+        }
+        terminalObserved = true
+        return AutomaticDiagnosticsConnectionIntentActions(queueReport = !reportQueued).also {
+            reportQueued = true
+        }
+    }
+
+    fun reset() {
+        reportQueued = false
+        notificationSent = false
+        terminalObserved = false
+    }
+}
+
+internal fun automaticDiagnosticsConnectionIntentReasonClass(errorCode: String): String =
+    when (errorCode) {
+        "network",
+        "panel",
+        "local_service",
+        "tunnel",
+        "profile",
+        "authorization",
+        "compatibility",
+        "local_state",
+        "invariant",
+        "other",
+        -> errorCode
+        "transport_error",
+        "android_service_dispatch_unavailable",
+        "endpoint_route_lost",
+        "endpoint_route_unavailable",
+        "physical_network_monitor_unavailable",
+        "physical_egress_unavailable",
+        "local_networks_unavailable",
+        -> "network"
+        "connection_unavailable",
+        "candidate_unavailable",
+        "configuration_fetch_failed",
+        "connection_no_longer_active",
+        "connection_already_active",
+        "connection_release_failed",
+        "probe_results_required",
+        "saved_connection_unavailable",
+        "connection_stall_verification_unavailable",
+        "connection_stall_recycle_rate_limited",
+        -> "panel"
+        "service_timeout",
+        "tunnel_service_timeout",
+        "service_stopping",
+        "service_unavailable",
+        "udp_rebind_failed",
+        "udp_rebind_timeout",
+        -> "local_service"
+        "tunnel_handshake_timeout", "tunnel_data_plane_stalled" -> "tunnel"
+        "amneziawg_profile_mismatch",
+        "awg3_profile_apply_failed",
+        "awg3_profile_transform_mismatch",
+        -> "profile"
+        "signed_out",
+        "access_expired",
+        "background_credential_unavailable",
+        "invalid_background_token",
+        "missing_background_token",
+        -> "authorization"
+        "update_required",
+        "service_outdated",
+        "unsupported_protocol",
+        "missing_service_version",
+        "recovery_contract_unavailable",
+        -> "compatibility"
+        "storage_unavailable", "clock_unavailable", "quick_state_persist_failed" -> "local_state"
+        "operation_id_conflict",
+        "request_fingerprint_mismatch",
+        "invalid_background_response",
+        "connection_intent_invalid",
+        -> "invariant"
+        else -> "other"
+    }
+
+internal fun automaticDiagnosticsConnectionIntentEvent(
+    kind: String,
+    errorCode: String? = null,
+    attempt: Int? = null,
+    delaySeconds: Long? = null,
+): JSONObject {
+    val safeKind = kind.takeIf {
+        it in setOf(
+            "started",
+            "retry_scheduled",
+            "network_wakeup",
+            "lease_replacement_started",
+            "recovered",
+            "cancelled",
+            "terminal_failure",
+            "slow_recovery_notified",
+        )
+    } ?: "terminal_failure"
+    return JSONObject().apply {
+        put("event", "connection.intent.$safeKind")
+        errorCode?.let {
+            put("reason_class", automaticDiagnosticsConnectionIntentReasonClass(it))
+        }
+        attempt?.takeIf { it >= 0 }?.let { put("attempt", it) }
+        delaySeconds?.takeIf { it >= 0 }?.let { put("delay_seconds", it) }
+    }
+}
+
+internal fun automaticDiagnosticsSafeConnectionIntentLog(value: String): String {
+    val allowedEvents = setOf(
+        "connection.intent.started",
+        "connection.intent.retry_scheduled",
+        "connection.intent.network_wakeup",
+        "connection.intent.lease_replacement_started",
+        "connection.intent.recovered",
+        "connection.intent.cancelled",
+        "connection.intent.terminal_failure",
+        "connection.intent.slow_recovery_notified",
+    )
+    val lines = value.lineSequence().mapNotNull { line ->
+        val source = runCatching { JSONObject(line) }.getOrNull() ?: return@mapNotNull null
+        val event = source.optString("event").takeIf(allowedEvents::contains)
+            ?: return@mapNotNull null
+        JSONObject().apply {
+            source.optString("timestamp").takeIf(String::isNotBlank)?.let {
+                put("timestamp", it.take(40))
+            }
+            put("event", event)
+            if (source.has("reason_class")) {
+                put(
+                    "reason_class",
+                    automaticDiagnosticsConnectionIntentReasonClass(
+                        source.optString("reason_class"),
+                    ),
+                )
+            }
+            source.optInt("attempt", -1).takeIf { it >= 0 }?.let { put("attempt", it) }
+            source.optLong("delay_seconds", -1).takeIf { it >= 0 }?.let {
+                put("delay_seconds", it)
+            }
+        }.toString()
+    }.toList()
+    return if (lines.isEmpty()) "" else lines.joinToString("\n", postfix = "\n")
+}
 
 private data class PendingSeal(
     val reportId: String,
@@ -319,6 +525,320 @@ internal object AutomaticDiagnostics {
         }
     }
 
+    fun onConnectionIntentStarted(context: Context, episodeId: Long) {
+        val applicationContext = context.applicationContext
+        synchronized(gate) {
+            val preferences = preferences(applicationContext)
+            check(
+                preferences.edit()
+                    .putLong(KEY_CONNECTION_INTENT_EPISODE_ID, episodeId)
+                    .putLong(
+                        KEY_CONNECTION_INTENT_EPISODE_REVISION,
+                        preferences.getLong(KEY_CONNECTION_INTENT_EPISODE_REVISION, 0)
+                            .saturatingIncrement(),
+                    )
+                    .putBoolean(KEY_CONNECTION_INTENT_REPORT_QUEUED, false)
+                    .putBoolean(KEY_CONNECTION_INTENT_NOTIFICATION_SENT, false)
+                    .putBoolean(KEY_CONNECTION_INTENT_TERMINAL_OBSERVED, false)
+                    .commit(),
+            ) { "automatic_diagnostics_connection_intent_write_failed" }
+            logConnectionIntentEvent(automaticDiagnosticsConnectionIntentEvent("started"))
+        }
+    }
+
+    fun onConnectionIntentRetryScheduled(
+        context: Context,
+        episodeId: Long,
+        errorCode: String,
+        attempt: Int,
+        nextRetryAtUnix: Long,
+        scheduledDelaySeconds: Long?,
+    ): Boolean {
+        val applicationContext = context.applicationContext
+        val pending = synchronized(gate) {
+            val preferences = preferences(applicationContext)
+            ensureConnectionIntentEpisode(preferences, episodeId)
+            val now = nowUnix()
+            val delaySeconds = scheduledDelaySeconds
+                ?: (nextRetryAtUnix - now).coerceAtLeast(0)
+            logConnectionIntentEvent(
+                automaticDiagnosticsConnectionIntentEvent(
+                    kind = "retry_scheduled",
+                    errorCode = errorCode,
+                    attempt = attempt,
+                    delaySeconds = delaySeconds,
+                ),
+            )
+            val episode = AutomaticDiagnosticsConnectionIntentEpisode(
+                reportQueued = preferences.getBoolean(
+                    KEY_CONNECTION_INTENT_REPORT_QUEUED,
+                    false,
+                ),
+                notificationSent = preferences.getBoolean(
+                    KEY_CONNECTION_INTENT_NOTIFICATION_SENT,
+                    false,
+                ),
+                terminalObserved = preferences.getBoolean(
+                    KEY_CONNECTION_INTENT_TERMINAL_OBSERVED,
+                    false,
+                ),
+            )
+            val observed = episode.observeRetry(delaySeconds)
+            val durableReportQueued = if (observed.queueReport) false else episode.reportQueued
+            check(
+                preferences.edit()
+                    .putBoolean(KEY_CONNECTION_INTENT_REPORT_QUEUED, durableReportQueued)
+                    .putBoolean(
+                        KEY_CONNECTION_INTENT_NOTIFICATION_SENT,
+                        episode.notificationSent,
+                    )
+                    .commit(),
+            ) { "automatic_diagnostics_connection_intent_write_failed" }
+            if (observed.notifyUser) {
+                logConnectionIntentEvent(
+                    automaticDiagnosticsConnectionIntentEvent(
+                        kind = "slow_recovery_notified",
+                        errorCode = errorCode,
+                    ),
+                )
+            }
+            PendingConnectionIntentDiagnostics(
+                actions = observed,
+                episodeRevision = preferences.getLong(
+                    KEY_CONNECTION_INTENT_EPISODE_REVISION,
+                    0,
+                ),
+            )
+        }
+        if (pending.actions.queueReport) {
+            queueConnectionIntentReport(
+                applicationContext,
+                errorCode,
+                CONNECTION_INTENT_SLOW_TRIGGER,
+                episodeId,
+                pending.episodeRevision,
+            )
+        }
+        return pending.actions.notifyUser
+    }
+
+    fun onConnectionIntentTerminalFailure(
+        context: Context,
+        episodeId: Long,
+        errorCode: String,
+        onOutcome: (AutomaticDiagnosticsConnectionIntentReportOutcome) -> Unit = {},
+    ) {
+        val applicationContext = context.applicationContext
+        val pending = synchronized(gate) {
+            val preferences = preferences(applicationContext)
+            ensureConnectionIntentEpisode(preferences, episodeId)
+            val terminalObserved = preferences.getBoolean(
+                KEY_CONNECTION_INTENT_TERMINAL_OBSERVED,
+                false,
+            )
+            if (!terminalObserved) {
+                logConnectionIntentEvent(
+                    automaticDiagnosticsConnectionIntentEvent(
+                        kind = "terminal_failure",
+                        errorCode = errorCode,
+                    ),
+                )
+            }
+            val episode = AutomaticDiagnosticsConnectionIntentEpisode(
+                reportQueued = preferences.getBoolean(
+                    KEY_CONNECTION_INTENT_REPORT_QUEUED,
+                    false,
+                ),
+                notificationSent = preferences.getBoolean(
+                    KEY_CONNECTION_INTENT_NOTIFICATION_SENT,
+                    false,
+                ),
+                terminalObserved = terminalObserved,
+            )
+            val observed = episode.observeTerminal()
+            val durableReportQueued = if (observed.queueReport) false else episode.reportQueued
+            check(
+                preferences.edit()
+                    .putBoolean(KEY_CONNECTION_INTENT_REPORT_QUEUED, durableReportQueued)
+                    .putBoolean(
+                        KEY_CONNECTION_INTENT_TERMINAL_OBSERVED,
+                        episode.terminalObserved,
+                    )
+                    .commit(),
+            ) { "automatic_diagnostics_connection_intent_write_failed" }
+            PendingConnectionIntentDiagnostics(
+                actions = observed,
+                episodeRevision = preferences.getLong(
+                    KEY_CONNECTION_INTENT_EPISODE_REVISION,
+                    0,
+                ),
+            )
+        }
+        if (pending.actions.queueReport) {
+            queueConnectionIntentReport(
+                applicationContext,
+                errorCode,
+                CONNECTION_INTENT_TERMINAL_TRIGGER,
+                episodeId,
+                pending.episodeRevision,
+                onOutcome,
+            )
+        } else {
+            onOutcome(
+                AutomaticDiagnosticsConnectionIntentReportOutcome
+                    .ALREADY_DURABLE_THIS_EPISODE,
+            )
+        }
+    }
+
+    fun onConnectionIntentRecovered(context: Context, episodeId: Long) {
+        synchronized(gate) {
+            val preferences = preferences(context.applicationContext)
+            ensureConnectionIntentEpisode(preferences, episodeId)
+            check(
+                preferences.edit()
+                    .putLong(
+                        KEY_CONNECTION_INTENT_EPISODE_REVISION,
+                        preferences.getLong(KEY_CONNECTION_INTENT_EPISODE_REVISION, 0)
+                            .saturatingIncrement(),
+                    )
+                    .putBoolean(KEY_CONNECTION_INTENT_REPORT_QUEUED, false)
+                    .putBoolean(KEY_CONNECTION_INTENT_NOTIFICATION_SENT, false)
+                    .putBoolean(KEY_CONNECTION_INTENT_TERMINAL_OBSERVED, false)
+                    .commit(),
+            ) { "automatic_diagnostics_connection_intent_write_failed" }
+            logConnectionIntentEvent(automaticDiagnosticsConnectionIntentEvent("recovered"))
+        }
+    }
+
+    fun onConnectionIntentCancelled(context: Context, episodeId: Long) {
+        synchronized(gate) {
+            val preferences = preferences(context.applicationContext)
+            ensureConnectionIntentEpisode(preferences, episodeId)
+            logConnectionIntentEvent(automaticDiagnosticsConnectionIntentEvent("cancelled"))
+        }
+    }
+
+    fun onConnectionIntentNetworkWakeup() {
+        synchronized(gate) {
+            logConnectionIntentEvent(
+                automaticDiagnosticsConnectionIntentEvent("network_wakeup"),
+            )
+        }
+    }
+
+    fun onConnectionIntentLeaseReplacementStarted() {
+        synchronized(gate) {
+            logConnectionIntentEvent(
+                automaticDiagnosticsConnectionIntentEvent("lease_replacement_started"),
+            )
+        }
+    }
+
+    private fun ensureConnectionIntentEpisode(
+        preferences: android.content.SharedPreferences,
+        episodeId: Long,
+    ) {
+        if (preferences.getLong(KEY_CONNECTION_INTENT_EPISODE_ID, Long.MIN_VALUE) == episodeId) {
+            return
+        }
+        check(
+            preferences.edit()
+                .putLong(KEY_CONNECTION_INTENT_EPISODE_ID, episodeId)
+                .putLong(
+                    KEY_CONNECTION_INTENT_EPISODE_REVISION,
+                    preferences.getLong(KEY_CONNECTION_INTENT_EPISODE_REVISION, 0)
+                        .saturatingIncrement(),
+                )
+                .putBoolean(KEY_CONNECTION_INTENT_REPORT_QUEUED, false)
+                .putBoolean(KEY_CONNECTION_INTENT_NOTIFICATION_SENT, false)
+                .putBoolean(KEY_CONNECTION_INTENT_TERMINAL_OBSERVED, false)
+                .commit(),
+        ) { "automatic_diagnostics_connection_intent_write_failed" }
+    }
+
+    private fun queueConnectionIntentReport(
+        context: Context,
+        errorCode: String,
+        trigger: String,
+        episodeId: Long,
+        episodeRevision: Long,
+        onOutcome: (AutomaticDiagnosticsConnectionIntentReportOutcome) -> Unit = {},
+    ) {
+        val deviceId = BackgroundCredentialStore.load(context)?.deviceId
+        if (deviceId == null) {
+            TunnelLog.warning(
+                "diagnostics.start_failure_report_queue_skipped",
+                "background_credential_unavailable",
+            )
+            onOutcome(
+                AutomaticDiagnosticsConnectionIntentReportOutcome.SUPPRESSED_BY_POLICY,
+            )
+            return
+        }
+        startFailureExecutor.execute {
+            var outcome = runCatching {
+                synchronized(gate) {
+                    requireNotNull(queueConnectionStartFailure(
+                        context = context,
+                        deviceId = deviceId,
+                        errorCode = errorCode,
+                        capturedMemorySamples = null,
+                        trigger = trigger,
+                        diagnosticsEpisodeId = episodeId,
+                    ))
+                }
+            }.getOrElse {
+                TunnelLog.warning(
+                    "diagnostics.start_failure_report_queue_failed",
+                    error = it,
+                )
+                AutomaticDiagnosticsConnectionIntentReportOutcome.STORAGE_FAILED
+            }
+            if (outcome.ownsEpisodeReport && !runCatching {
+                synchronized(gate) {
+                    val preferences = preferences(context)
+                    if (preferences.getLong(
+                            KEY_CONNECTION_INTENT_EPISODE_ID,
+                            Long.MIN_VALUE,
+                        ) == episodeId && preferences.getLong(
+                            KEY_CONNECTION_INTENT_EPISODE_REVISION,
+                            0,
+                        ) == episodeRevision
+                    ) {
+                        check(
+                            preferences.edit()
+                                .putBoolean(KEY_CONNECTION_INTENT_REPORT_QUEUED, true)
+                                .commit(),
+                        ) { "automatic_diagnostics_connection_intent_write_failed" }
+                    }
+                }
+            }.onFailure {
+                TunnelLog.warning(
+                    "diagnostics.start_failure_report_queue_failed",
+                    error = it,
+                )
+            }.isSuccess) {
+                outcome = AutomaticDiagnosticsConnectionIntentReportOutcome.STORAGE_FAILED
+            }
+            onOutcome(outcome)
+        }
+    }
+
+    private fun logConnectionIntentEvent(payload: JSONObject) {
+        val event = payload.getString("event")
+        val details = buildMap<String, Any?> {
+            payload.optString("reason_class").takeIf(String::isNotEmpty)?.let {
+                put("reason_class", it)
+            }
+            if (payload.has("attempt")) put("attempt", payload.getInt("attempt"))
+            if (payload.has("delay_seconds")) {
+                put("delay_seconds", payload.getLong("delay_seconds"))
+            }
+        }
+        TunnelLog.info(event, details)
+    }
+
     fun credentialUpdated(context: Context) {
         synchronized(gate) {
             preferences(context).edit()
@@ -551,63 +1071,99 @@ internal object AutomaticDiagnostics {
         deviceId: String,
         errorCode: String,
         capturedMemorySamples: List<JSONObject>?,
-    ) {
+        trigger: String = CONNECTION_START_FAILURE_TRIGGER,
+        diagnosticsEpisodeId: Long? = null,
+    ): AutomaticDiagnosticsConnectionIntentReportOutcome? {
         ensureDirectories(context)
-        TunnelLog.warning("diagnostics.connection_start_failed", errorCode.take(80))
+        val reasonClass = automaticDiagnosticsConnectionIntentReasonClass(errorCode)
+        TunnelLog.warning("diagnostics.connection_start_failed", reasonClass)
         val now = nowUnix()
         var queuedRequest: StartFailureRequest? = null
         var pendingExists = false
+        var connectionIntentOutcome: AutomaticDiagnosticsConnectionIntentReportOutcome? = null
         withStartFailureLock(context) {
             val requestFile = startFailureRequestFile(context, deviceId)
             val existing = readStartFailureRequestOrQuarantine(context, requestFile, deviceId)
             pendingExists = existing?.sent == false
-            if (automaticDiagnosticsShouldQueueStartFailure(
+            val shouldQueue = diagnosticsEpisodeId?.let { episodeId ->
+                automaticDiagnosticsConnectionIntentQueuePolicy(
+                    existing = existing,
+                    diagnosticsEpisodeId = episodeId,
+                    now = now,
+                    cooldownSeconds = START_FAILURE_COOLDOWN_SECONDS,
+                ).also { connectionIntentOutcome = it } ==
+                    AutomaticDiagnosticsConnectionIntentReportOutcome.QUEUED_THIS_EPISODE
+            } ?: automaticDiagnosticsShouldQueueStartFailure(
                     pendingExists = pendingExists,
                     lastQueuedAt = existing?.queuedAt ?: 0,
                     now = now,
                     cooldownSeconds = START_FAILURE_COOLDOWN_SECONDS,
                 )
-            ) {
+            if (shouldQueue) {
                 queuedRequest = StartFailureRequest(
                     reportId = UUID.randomUUID().toString(),
                     deviceId = deviceId,
-                    errorCode = errorCode.take(80),
+                    errorCode = reasonClass,
                     queuedAt = now,
                     sent = false,
+                    trigger = trigger,
                     memorySamplesJson = automaticDiagnosticsEncodeMemorySamples(
                         capturedMemorySamples.orEmpty(),
                     ),
+                    diagnosticsEpisodeId = diagnosticsEpisodeId,
                 ).also {
                     writeStartFailureRequest(requestFile, it)
-                    // Persist the OS job immediately after the durable marker. Report
-                    // materialization below may be interrupted by process termination.
-                    scheduleSystemUpload(context, delaySeconds = 0)
                 }
             }
         }
-        if (queuedRequest == null && pendingExists) {
-            // Repair an earlier marker whose scheduling window was interrupted.
-            scheduleSystemUpload(context, delaySeconds = 0)
+        if (queuedRequest != null || pendingExists) {
+            // Repair or establish the OS job after the request marker is durable.
+            runCatching { scheduleSystemUpload(context, delaySeconds = 0) }
+                .onFailure {
+                    TunnelLog.warning(
+                        "diagnostics.start_failure_report_schedule_failed",
+                        error = it,
+                    )
+                }
         }
         if (queuedRequest == null) {
             TunnelLog.info(
                 "diagnostics.start_failure_report_deduplicated",
-                mapOf("code" to errorCode, "pending" to pendingExists),
+                mapOf("reason_class" to reasonClass, "pending" to pendingExists),
             )
         } else {
             TunnelLog.info(
                 "diagnostics.start_failure_report_queued",
-                mapOf("report_id" to queuedRequest?.reportId, "code" to errorCode),
+                mapOf("report_id" to queuedRequest?.reportId, "reason_class" to reasonClass),
             )
         }
-        try {
+        if (diagnosticsEpisodeId == null) {
+            try {
+                materializeStartFailureRequest(context, deviceId)
+            } finally {
+                scheduleSystemUpload(context, delaySeconds = 0)
+            }
+            return null
+        }
+        runCatching {
             materializeStartFailureRequest(
                 context,
                 deviceId,
             )
-        } finally {
-            scheduleSystemUpload(context, delaySeconds = 0)
+        }.onFailure {
+            TunnelLog.warning(
+                "diagnostics.start_failure_report_queue_failed",
+                error = it,
+            )
         }
+        runCatching { scheduleSystemUpload(context, delaySeconds = 0) }
+            .onFailure {
+                TunnelLog.warning(
+                    "diagnostics.start_failure_report_schedule_failed",
+                    error = it,
+                )
+            }
+        return connectionIntentOutcome
     }
 
     private fun materializeStartFailureRequest(
@@ -643,6 +1199,7 @@ internal object AutomaticDiagnostics {
                     request.queuedAt,
                     request.errorCode,
                     request.memorySamplesJson?.let(::automaticDiagnosticsDecodeMemorySamples),
+                    request.trigger,
                 ),
             )
         }
@@ -654,8 +1211,29 @@ internal object AutomaticDiagnostics {
         endedAt: Long,
         errorCode: String,
         capturedMemorySamples: List<JSONObject>?,
+        trigger: String,
     ): JSONObject {
         val startedAt = (endedAt - START_FAILURE_WINDOW_SECONDS).coerceAtLeast(0)
+        if (trigger != CONNECTION_START_FAILURE_TRIGGER) {
+            val safeLog = automaticDiagnosticsSafeConnectionIntentLog(
+                intervalLog(
+                    context,
+                    "android-tunnel",
+                    MAX_HELPER_LOG_BYTES,
+                    startedAt,
+                    endedAt,
+                ),
+            )
+            return JSONObject().apply {
+                put("report_id", reportId)
+                put("trigger", trigger)
+                put("generated_at_unix", endedAt)
+                put("app_version", appVersion(context))
+                put("platform_version", Build.VERSION.RELEASE.takeIf(String::isNotBlank))
+                put("architecture", Build.SUPPORTED_ABIS.firstOrNull()?.take(32) ?: "unknown")
+                put("application_log", safeLog)
+            }
+        }
         val processes = androidProcessMemory(context)
         logMemorySnapshot(context.packageName, processes, "connection_start_failed")
         val finalMemorySample = automaticDiagnosticsMemorySample(
@@ -665,7 +1243,7 @@ internal object AutomaticDiagnostics {
         )
         return JSONObject().apply {
             put("report_id", reportId)
-            put("trigger", "connection_start_failed")
+            put("trigger", CONNECTION_START_FAILURE_TRIGGER)
             put("generated_at_unix", endedAt)
             put("app_version", appVersion(context))
             put("platform_version", Build.VERSION.RELEASE.takeIf(String::isNotBlank))
@@ -2301,6 +2879,30 @@ internal fun automaticDiagnosticsShouldQueueStartFailure(
     !pendingExists &&
         (lastQueuedAt <= 0 || now < lastQueuedAt || now - lastQueuedAt >= cooldownSeconds)
 
+internal fun automaticDiagnosticsConnectionIntentQueuePolicy(
+    existing: StartFailureRequest?,
+    diagnosticsEpisodeId: Long,
+    now: Long,
+    cooldownSeconds: Long,
+): AutomaticDiagnosticsConnectionIntentReportOutcome {
+    require(diagnosticsEpisodeId >= 0)
+    if (existing?.diagnosticsEpisodeId == diagnosticsEpisodeId) {
+        return AutomaticDiagnosticsConnectionIntentReportOutcome
+            .ALREADY_DURABLE_THIS_EPISODE
+    }
+    return if (automaticDiagnosticsShouldQueueStartFailure(
+            pendingExists = existing?.sent == false,
+            lastQueuedAt = existing?.queuedAt ?: 0,
+            now = now,
+            cooldownSeconds = cooldownSeconds,
+        )
+    ) {
+        AutomaticDiagnosticsConnectionIntentReportOutcome.QUEUED_THIS_EPISODE
+    } else {
+        AutomaticDiagnosticsConnectionIntentReportOutcome.SUPPRESSED_BY_POLICY
+    }
+}
+
 internal fun automaticDiagnosticsNextPendingReport(
     names: List<String>,
     lastAttempted: String?,
@@ -2329,6 +2931,8 @@ internal data class StartFailureRequest(
     val queuedAt: Long,
     val sent: Boolean,
     val memorySamplesJson: String? = null,
+    val trigger: String = CONNECTION_START_FAILURE_TRIGGER,
+    val diagnosticsEpisodeId: Long? = null,
 ) {
     val reportName: String
         get() = automaticDiagnosticsPendingReportName(queuedAt, deviceId, reportId)
@@ -2340,6 +2944,8 @@ internal data class StartFailureRequest(
         put("error_code", errorCode)
         put("queued_at", queuedAt)
         put("sent", sent)
+        put("trigger", trigger)
+        diagnosticsEpisodeId?.let { put("diagnostics_episode_id", it) }
         memorySamplesJson?.let { put("memory_samples", JSONArray(it)) }
     }.toString()
 
@@ -2354,9 +2960,26 @@ internal data class StartFailureRequest(
             return StartFailureRequest(
                 reportId = reportId,
                 deviceId = deviceId,
-                errorCode = payload.getString("error_code").take(80),
+                errorCode = automaticDiagnosticsConnectionIntentReasonClass(
+                    payload.getString("error_code"),
+                ),
                 queuedAt = payload.getLong("queued_at").coerceAtLeast(0),
                 sent = payload.getBoolean("sent"),
+                trigger = payload.optString("trigger", CONNECTION_START_FAILURE_TRIGGER)
+                    .takeIf {
+                        it in setOf(
+                            CONNECTION_START_FAILURE_TRIGGER,
+                            CONNECTION_INTENT_SLOW_TRIGGER,
+                            CONNECTION_INTENT_TERMINAL_TRIGGER,
+                        )
+                    } ?: CONNECTION_START_FAILURE_TRIGGER,
+                diagnosticsEpisodeId = if (payload.has("diagnostics_episode_id") &&
+                    !payload.isNull("diagnostics_episode_id")
+                ) {
+                    payload.getLong("diagnostics_episode_id").also { check(it >= 0) }
+                } else {
+                    null
+                },
                 memorySamplesJson = payload.optJSONArray("memory_samples")?.let { samples ->
                     automaticDiagnosticsEncodeMemorySamples(
                         (0 until samples.length()).map { index ->

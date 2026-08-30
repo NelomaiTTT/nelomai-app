@@ -7,6 +7,33 @@ import org.junit.Test
 
 class NetworkTelemetryTest {
     @Test
+    fun exhaustedRecoveryHandsTheDurableLeaseToTheCoordinatorWithoutLocalAbandonment() {
+        val events = mutableListOf<String>()
+
+        val handedOff = handOffDataPlaneStall(
+            leaseId = "lease-awg3",
+            handoff = {
+                events += "handoff:$it"
+                true
+            },
+            fallback = { events += "fallback" },
+        )
+
+        assertTrue(handedOff)
+        assertEquals(listOf("handoff:lease-awg3"), events)
+    }
+
+    @Test
+    fun exhaustedRecoveryFallsBackLocallyOnlyWhenDurableHandoffCannotBeAccepted() {
+        var fallbackCalls = 0
+
+        assertFalse(handOffDataPlaneStall(null, { true }) { fallbackCalls += 1 })
+        assertFalse(handOffDataPlaneStall("lease-awg3", { false }) { fallbackCalls += 1 })
+
+        assertEquals(2, fallbackCalls)
+    }
+
+    @Test
     fun wireGuardCollectsPassiveTelemetryWithoutEnablingUdpRecovery() {
         assertEquals(
             NetworkTelemetryMode.PASSIVE,

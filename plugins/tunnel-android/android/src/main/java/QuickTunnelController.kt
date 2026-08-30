@@ -254,9 +254,9 @@ object QuickTunnelController {
         val legacyDesiredActive = preferences.getBoolean(DESIRED_ACTIVE, false)
         if (!sealRecoveryProjectionMigration(preferences)) return false
         if (legacyDesiredActive) {
-            val result = QuickDesiredActiveProjection.update(
+            val result = migrateLegacyQuickDesiredActive(
                 AndroidRecoveryStores.open(context),
-                desiredActive = true,
+                legacyDesiredActive,
             )
             if (result is RecoveryStoreResult.Failure) {
                 TunnelLog.warning("quick_state.recovery_migration_failed", result.code)
@@ -281,6 +281,15 @@ object QuickTunnelController {
         }
         return saved
     }
+}
+
+internal fun migrateLegacyQuickDesiredActive(
+    store: AndroidRecoveryStore,
+    legacyDesiredActive: Boolean,
+): RecoveryStoreResult<AndroidConnectionIntent> = if (legacyDesiredActive) {
+    QuickDesiredActiveProjection.update(store, desiredActive = false)
+} else {
+    QuickDesiredActiveProjection.read(store)
 }
 
 internal class QuickStateChangeGate(initialRevision: Long = 0L) {

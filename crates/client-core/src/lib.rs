@@ -1,8 +1,9 @@
 use async_trait::async_trait;
-use nelomai_client_api::{ClientApi, ClientApiError, TokenResponse};
+use nelomai_client_api::{BackgroundTokenResponse, ClientApi, ClientApiError, TokenResponse};
 use nelomai_client_storage::{
     MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredCompatibility, StoredConnection,
-    StoredConnectionKind, StoredPendingStart,
+    StoredConnectionKind, StoredPendingCompensationStop, StoredPendingStalledStop,
+    StoredPendingStart,
 };
 use nelomai_client_tunnel::{
     QuickConnection, QuickReconnect, TunnelConfiguration, TunnelController, TunnelError,
@@ -10,17 +11,19 @@ use nelomai_client_tunnel::{
 };
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
-    ConnectionStartRequest, ConnectionStartResponse, EgressMode, Layer, LeaseStatus, ProbeResult,
-    RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
+    ConnectionStartRequest, ConnectionStartResponse, EgressMode, Layer, LeaseStatus, OperationKind,
+    OperationReconcileRequest, OperationReconcileResponse, OperationState, ProbeResult, RouteMode,
+    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
     TicConnectionMode,
 };
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 mod connection_intent;
@@ -119,6 +122,9 @@ pub enum StalledDataPlaneRecovery {
     RebindUdp,
     RestartLocalTunnel,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartCancellationEpoch(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StalledDataPlaneRecoveryOutcome {
@@ -564,7 +570,10 @@ impl From<ClientApiError> for CoreApiError {
 fn preserves_structured_recovery_error(code: &str) -> bool {
     matches!(
         code,
-        "configuration_fetch_failed" | "connection_stall_verification_unavailable"
+        "configuration_fetch_failed"
+            | "connection_stall_verification_unavailable"
+            | "operation_in_progress"
+            | "device_operation_busy"
     )
 }
 
@@ -596,6 +605,19 @@ pub trait CoreApi: Send + Sync {
         access_token: &str,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError>;
+    async fn background_token(
+        &self,
+        _access_token: &str,
+    ) -> Result<BackgroundTokenResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn reconcile_background_operation(
+        &self,
+        _background_token: &str,
+        _request: &OperationReconcileRequest,
+    ) -> Result<OperationReconcileResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
     async fn split_tunnel_revision(
         &self,
         _access_token: &str,
@@ -693,6 +715,25 @@ impl CoreApi for ClientApi {
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         ClientApi::unpin_stray(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_token(
+        &self,
+        access_token: &str,
+    ) -> Result<BackgroundTokenResponse, CoreApiError> {
+        ClientApi::background_token(self, access_token)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn reconcile_background_operation(
+        &self,
+        background_token: &str,
+        request: &OperationReconcileRequest,
+    ) -> Result<OperationReconcileResponse, CoreApiError> {
+        ClientApi::reconcile_background_operation(self, background_token, request)
             .await
             .map_err(Into::into)
     }
@@ -796,6 +837,8 @@ pub enum CoreError {
     UpdateRequired,
     #[error("сохранённое подключение недоступно")]
     SavedConnectionUnavailable,
+    #[error("запуск подключения отменён")]
+    StartCancelled,
     #[error("защищённое хранилище недоступно")]
     Storage,
     #[error(transparent)]
@@ -835,6 +878,10 @@ pub struct ClientCore<A, S, T, L> {
     logger: Arc<L>,
     state: Mutex<CoreState>,
     intent_recovery_gate: Mutex<()>,
+    start_cancel_epoch: AtomicU64,
+    start_in_progress: AtomicBool,
+    pending_start_active: AtomicBool,
+    start_retry_wake: Notify,
     active_recovery_episode: Mutex<Option<ActiveRecoveryEpisode>>,
     refresh_gate: Mutex<()>,
     connection_gate: Mutex<()>,
@@ -873,6 +920,11 @@ where
         tunnel: Arc<T>,
         logger: Arc<L>,
     ) -> Self {
+        let pending_start_active = store
+            .load()
+            .ok()
+            .flatten()
+            .is_some_and(|stored| stored.pending_start.is_some());
         Self {
             api,
             store,
@@ -880,6 +932,10 @@ where
             logger,
             state: Mutex::new(CoreState::default()),
             intent_recovery_gate: Mutex::new(()),
+            start_cancel_epoch: AtomicU64::new(0),
+            start_in_progress: AtomicBool::new(false),
+            pending_start_active: AtomicBool::new(pending_start_active),
+            start_retry_wake: Notify::new(),
             active_recovery_episode: Mutex::new(None),
             refresh_gate: Mutex::new(()),
             connection_gate: Mutex::new(()),
@@ -1114,6 +1170,8 @@ where
                 saved_connection: None,
                 pinned_connection: None,
                 pending_start: None,
+                pending_stalled_stop: None,
+                pending_compensation_stop: None,
                 compatibility: None,
             })
             .map_err(|_| CoreError::Storage)?;
@@ -1407,9 +1465,29 @@ where
         options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
+        let cancel_epoch = self.begin_start_attempt();
+        let result = self
+            .start_with_cancellation_epoch(options, now_unix, cancel_epoch)
+            .await;
+        self.finish_start_attempt();
+        result
+    }
+
+    pub async fn start_with_cancellation_epoch(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<Connection, CoreError> {
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
-        self.start_internal(options, now_unix, true, ConnectionStartContract::Legacy)
-            .await
+        self.start_internal(
+            options,
+            now_unix,
+            true,
+            ConnectionStartContract::Legacy,
+            cancel_epoch,
+        )
+        .await
     }
 
     #[cfg(not(target_os = "android"))]
@@ -1418,12 +1496,28 @@ where
         options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
+        let cancel_epoch = self.begin_start_attempt();
+        let result = self
+            .connection_intent_attempt_with_cancellation_epoch(options, now_unix, cancel_epoch)
+            .await;
+        self.finish_start_attempt();
+        result
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn connection_intent_attempt_with_cancellation_epoch(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<Connection, CoreError> {
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
         self.start_internal(
             options,
             now_unix,
             false,
             ConnectionStartContract::RecoveryV1,
+            cancel_epoch,
         )
         .await
     }
@@ -1433,16 +1527,23 @@ where
         options: ConnectOptions,
         now_unix: i64,
         allow_internal_retry: bool,
-        contract: ConnectionStartContract,
+        requested_contract: ConnectionStartContract,
+        cancel_epoch: StartCancellationEpoch,
     ) -> Result<Connection, CoreError> {
         let options = options.normalized_for_layer();
         let total_started = Instant::now();
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        if let Some(pending) = self.load_auth()?.pending_compensation_stop {
+            self.set_phase(Phase::Stopping).await;
+            self.resume_pending_compensation_stop(pending).await?;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+        }
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
+        let mut stored = self.load_auth()?;
         if let Some(connection) = self.connected_connection().await {
             return Ok(connection);
         }
-        let mut stored = self.load_auth()?;
         if stored
             .compatibility
             .as_ref()
@@ -1451,9 +1552,31 @@ where
             self.set_phase(Phase::UpdateRequired).await;
             return Err(CoreError::UpdateRequired);
         }
+        if let Some(pending) = stored.pending_start.as_ref() {
+            if pending.cancel_operation_id.is_some() {
+                self.set_phase(Phase::Stopping).await;
+                return Err(unresolved_start_operation_error());
+            }
+            if !pending_start_matches_options(pending, &options) {
+                self.set_phase(Phase::ServerUnavailable).await;
+                return Err(unresolved_start_operation_error());
+            }
+        }
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         self.release_stale_panel_connection_before_start(&stored)
             .await?;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         stored = self.load_auth()?;
+        if let Some(pending) = stored.pending_start.as_ref() {
+            if pending.cancel_operation_id.is_some() {
+                self.set_phase(Phase::Stopping).await;
+                return Err(unresolved_start_operation_error());
+            }
+            if !pending_start_matches_options(pending, &options) {
+                self.set_phase(Phase::ServerUnavailable).await;
+                return Err(unresolved_start_operation_error());
+            }
+        }
         let split_policy = self.cached_policy_for_start()?;
         let preflight_tunnel_options = match &split_policy {
             Some(policy) => Some(
@@ -1468,10 +1591,44 @@ where
             ),
             None => None,
         };
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
-        let mut operation_id = pending_operation_id(&stored, &options)
-            .or_else(|| reusable_operation_id(&stored, &options, now_unix))
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let (contract, operation_id, recovery_contract_version, request_fingerprint) =
+            match stored.pending_start.as_ref() {
+                Some(pending) => {
+                    let (contract, version, fingerprint) = pending_start_contract(pending)?;
+                    (contract, pending.operation_id.clone(), version, fingerprint)
+                }
+                None => {
+                    let require_measured_selection = requested_contract
+                        == ConnectionStartContract::RecoveryV1
+                        && (options.layer != Layer::Tic
+                            || options.tic_connection_mode == TicConnectionMode::Dynamic);
+                    let fingerprint = (requested_contract == ConnectionStartContract::RecoveryV1)
+                        .then(|| {
+                            connection_intent::request_fingerprint_v1(
+                                &options,
+                                require_measured_selection,
+                            )
+                        });
+                    (
+                        requested_contract,
+                        reusable_operation_id(&stored, &options, now_unix)
+                            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                        fingerprint.as_ref().map(|_| 1),
+                        fingerprint,
+                    )
+                }
+            };
+        let replay_probes = stored
+            .pending_start
+            .as_ref()
+            .map(|pending| pending.probes.clone())
+            .unwrap_or_else(|| options.probes.clone());
+        let require_measured_selection = contract == ConnectionStartContract::RecoveryV1
+            && (options.layer != Layer::Tic
+                || options.tic_connection_mode == TicConnectionMode::Dynamic);
+        let mut operation_id = operation_id;
         self.logger.record(CoreLogEvent {
             kind: "connection.egress_selected",
             operation_id: Some(operation_id.clone()),
@@ -1484,45 +1641,54 @@ where
                 .to_string(),
             ),
         });
-        let mut pending_stored = self.load_auth()?;
-        pending_stored.pending_start = Some(StoredPendingStart {
-            operation_id: operation_id.clone(),
-            layer: options.layer,
-            tic_connection_mode: options.tic_connection_mode,
-            route_mode: options.route_mode,
-            egress_mode: options.egress_mode,
-        });
-        self.store
-            .save(&pending_stored)
-            .map_err(|_| CoreError::Storage)?;
+        let pending_start_created_for_dispatch = stored.pending_start.is_none();
+        if pending_start_created_for_dispatch {
+            let mut pending_stored = self.load_auth()?;
+            pending_stored.pending_start = Some(StoredPendingStart {
+                operation_id: operation_id.clone(),
+                layer: options.layer,
+                tic_connection_mode: options.tic_connection_mode,
+                route_mode: options.route_mode,
+                egress_mode: options.egress_mode,
+                allow_alternate: options.allow_alternate,
+                probes: options.probes.clone(),
+                recovery_contract_version,
+                request_fingerprint: request_fingerprint.clone(),
+                cancel_operation_id: None,
+            });
+            self.store
+                .save(&pending_stored)
+                .map_err(|_| CoreError::Storage)?;
+        }
+        self.pending_start_active.store(true, Ordering::SeqCst);
         self.set_phase(Phase::Connecting).await;
-        let require_measured_selection = contract == ConnectionStartContract::RecoveryV1
-            && (options.layer != Layer::Tic
-                || options.tic_connection_mode == TicConnectionMode::Dynamic);
-        let request_fingerprint = (contract == ConnectionStartContract::RecoveryV1).then(|| {
-            connection_intent::request_fingerprint_v1(&options, require_measured_selection)
-        });
         let mut request = ConnectionStartRequest {
             operation_id: operation_id.clone(),
             layer: options.layer,
             tic_connection_mode: options.tic_connection_mode,
             route_mode: options.route_mode,
             egress_mode: options.egress_mode,
-            probes: options.probes,
+            probes: replay_probes,
             allow_alternate: options.allow_alternate,
             require_measured_selection,
-            recovery_contract_version: request_fingerprint.as_ref().map(|_| 1),
+            recovery_contract_version,
             request_fingerprint,
         };
         let panel_started = Instant::now();
         let start_result = self
-            .retry_start(&access_token, &mut request, allow_internal_retry)
+            .retry_start(
+                &access_token,
+                &mut request,
+                allow_internal_retry,
+                cancel_epoch,
+                pending_start_created_for_dispatch,
+            )
             .await;
         operation_id.clone_from(&request.operation_id);
         let response = match start_result {
             Ok(response) => response,
             Err(error) => {
-                if !matches!(&error, CoreError::Api(CoreApiError::Retryable)) {
+                if !start_error_preserves_operation(&error) {
                     let _ = self.clear_pending_start(&operation_id);
                 }
                 self.logger.record_timed(
@@ -1538,6 +1704,18 @@ where
                 return Err(error);
             }
         };
+        if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+            return Err(self
+                .compensate_cancelled_start(
+                    &access_token,
+                    &response.connection,
+                    &response.request_id,
+                    &operation_id,
+                    FailedStartStage::Preparation,
+                    false,
+                )
+                .await);
+        }
         if response.connection.layer != options.layer
             || response.connection.tic_connection_mode != options.tic_connection_mode
             || response.connection.route_mode != options.route_mode
@@ -1678,7 +1856,7 @@ where
         let configuration = TunnelConfiguration::new(response.configuration);
         let transport = configuration.transport();
         let local_start_started = Instant::now();
-        if let Err(start_error) = self
+        let local_start_result = self
             .tunnel
             .start(TunnelStartRequest {
                 configuration,
@@ -1696,8 +1874,20 @@ where
                     allow_alternate: options.allow_alternate,
                 }),
             })
-            .await
-        {
+            .await;
+        if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+            return Err(self
+                .compensate_cancelled_start(
+                    &access_token,
+                    &response.connection,
+                    &response.request_id,
+                    &operation_id,
+                    FailedStartStage::Local,
+                    true,
+                )
+                .await);
+        }
+        if let Err(start_error) = local_start_result {
             let error = CoreError::from(start_error);
             self.logger.record_timed(
                 CoreLogEvent {
@@ -1731,19 +1921,22 @@ where
             elapsed_millis(local_start_started),
         );
         if transport == TunnelTransport::AmneziaWg3 {
-            if let Err(error) = self
+            let handshake_result = self
                 .ensure_awg3_handshake(&operation_id, Some(&response.request_id))
-                .await
-            {
-                let cleanup_error = self.tunnel.stop().await.err().map(CoreError::from);
-                if let Some(cleanup_error) = &cleanup_error {
-                    self.logger.record(CoreLogEvent {
-                        kind: "connection.handshake_cleanup_failed",
-                        operation_id: Some(operation_id.clone()),
-                        request_id: Some(response.request_id.clone()),
-                        code: Some(cleanup_error.to_string()),
-                    });
-                }
+                .await;
+            if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                return Err(self
+                    .compensate_cancelled_start(
+                        &access_token,
+                        &response.connection,
+                        &response.request_id,
+                        &operation_id,
+                        FailedStartStage::Local,
+                        true,
+                    )
+                    .await);
+            }
+            if let Err(error) = handshake_result {
                 let compensation_error = self
                     .compensate_failed_start(
                         &access_token,
@@ -1755,17 +1948,32 @@ where
                     )
                     .await
                     .err();
-                return Err(cleanup_error.or(compensation_error).unwrap_or(error));
+                return Err(compensation_error.unwrap_or(error));
             }
         }
-        let _ = self.clear_pending_start(&operation_id);
         let applied_physical_network_fingerprint = self
             .initialize_physical_network_detector(&tunnel_options)
             .await;
-        *self.state.lock().await = CoreState {
+        let mut state = self.state.lock().await;
+        if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+            drop(state);
+            return Err(self
+                .compensate_cancelled_start(
+                    &access_token,
+                    &response.connection,
+                    &response.request_id,
+                    &operation_id,
+                    FailedStartStage::Local,
+                    true,
+                )
+                .await);
+        }
+        let _ = self.clear_pending_start(&operation_id);
+        *state = CoreState {
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
         };
+        drop(state);
         self.clear_offline_connection_quarantine(&response.connection.lease_id);
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
             .await;
@@ -1837,9 +2045,584 @@ where
             .await
     }
 
+    pub fn begin_start_attempt(&self) -> StartCancellationEpoch {
+        self.start_in_progress.store(true, Ordering::SeqCst);
+        StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst))
+    }
+
+    pub fn finish_start_attempt(&self) {
+        self.start_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    pub fn signal_start_cancellation(&self) -> bool {
+        let cancelled = self.start_in_progress.load(Ordering::SeqCst)
+            || self.pending_start_active.load(Ordering::SeqCst);
+        self.start_cancel_epoch.fetch_add(1, Ordering::SeqCst);
+        self.start_retry_wake.notify_waiters();
+        cancelled
+    }
+
+    fn ensure_start_not_cancelled(
+        &self,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<(), CoreError> {
+        if self.start_cancel_epoch.load(Ordering::SeqCst) == cancel_epoch.0 {
+            Ok(())
+        } else {
+            Err(CoreError::StartCancelled)
+        }
+    }
+
     pub async fn stop(&self) -> Result<Connection, CoreError> {
+        self.signal_start_cancellation();
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
-        self.stop_internal(None, true, None).await
+        if let Some(pending) = self
+            .store
+            .load()
+            .ok()
+            .flatten()
+            .and_then(|stored| stored.pending_compensation_stop)
+        {
+            self.resume_pending_compensation_stop(pending).await?;
+            return self
+                .state
+                .lock()
+                .await
+                .connection
+                .clone()
+                .ok_or(CoreError::SavedConnectionUnavailable);
+        }
+        if self.pending_start_active.load(Ordering::SeqCst) {
+            let current = self.state.lock().await.connection.clone();
+            if let Some(current) = current {
+                let accept_warm =
+                    stored_connection_kind(&current) == StoredConnectionKind::DynamicWarm;
+                let pending =
+                    self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None)?;
+                self.resume_pending_compensation_stop(pending).await?;
+                return self
+                    .state
+                    .lock()
+                    .await
+                    .connection
+                    .clone()
+                    .ok_or(CoreError::SavedConnectionUnavailable);
+            }
+        }
+        if self.state.lock().await.connection.is_none() {
+            if let Some(connection) = self.cancel_unknown_pending_start().await? {
+                return Ok(connection);
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        let pending_stalled_stop = {
+            let current_lease_id = self
+                .state
+                .lock()
+                .await
+                .connection
+                .as_ref()
+                .map(|connection| connection.lease_id.clone());
+            self.store
+                .load()
+                .ok()
+                .flatten()
+                .and_then(|stored| stored.pending_stalled_stop)
+                .filter(|pending| current_lease_id.as_deref() == Some(pending.lease_id.as_str()))
+        };
+        #[cfg(not(target_os = "android"))]
+        if let Some(pending) = pending_stalled_stop {
+            let stopped = self
+                .stop_internal(
+                    Some("tunnel_data_plane_stalled"),
+                    true,
+                    Some(&pending.operation_id),
+                    true,
+                )
+                .await?;
+            self.clear_pending_stalled_stop(&pending.operation_id, &pending.lease_id)?;
+            return Ok(stopped);
+        }
+        self.stop_internal(None, true, None, true).await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn reconcile_pending_operation_for_retry(&self) -> Result<(), CoreError> {
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        let stored = self.load_auth()?;
+        if let Some(pending) = stored.pending_compensation_stop.clone() {
+            return self.resume_pending_compensation_stop(pending).await;
+        }
+        if let Some(pending) = stored.pending_stalled_stop.clone() {
+            return self
+                .reconcile_pending_stalled_stop_for_retry(&stored, pending)
+                .await;
+        }
+        let Some(pending) = stored.pending_start.clone() else {
+            return Ok(());
+        };
+        let (contract_version, request_fingerprint) = match (
+            pending.recovery_contract_version,
+            pending.request_fingerprint.clone(),
+        ) {
+            (Some(contract_version), Some(request_fingerprint))
+                if !request_fingerprint.is_empty() =>
+            {
+                (contract_version, request_fingerprint)
+            }
+            (None, None) => return Ok(()),
+            _ => return Err(CoreError::Storage),
+        };
+        let (access_token, reconciliation) = self
+            .reconcile_background_operation(
+                &stored,
+                OperationReconcileRequest {
+                    operation_id: pending.operation_id.clone(),
+                    kind: OperationKind::Start,
+                    contract_version,
+                    request_fingerprint,
+                    cancel_if_absent: false,
+                },
+            )
+            .await?;
+        match reconciliation.state {
+            OperationState::Pending | OperationState::Applying | OperationState::Compensating => {
+                Err(unresolved_start_operation_retry_error(
+                    reconciliation.retry_count,
+                ))
+            }
+            OperationState::NotFound => {
+                if reconciliation.lease_id.is_some() || reconciliation.lease_status.is_some() {
+                    return Err(invalid_operation_reconcile_response());
+                }
+                Ok(())
+            }
+            OperationState::Applied => {
+                let lease_id = reconciliation
+                    .lease_id
+                    .ok_or_else(invalid_operation_reconcile_response)?;
+                let lease_status = reconciliation
+                    .lease_status
+                    .ok_or_else(invalid_operation_reconcile_response)?;
+                if terminal_lease_status(lease_status) {
+                    return self.clear_pending_start(&pending.operation_id);
+                }
+                if reconciliation.cancel_requested {
+                    self.stop_unknown_pending_lease(
+                        &access_token,
+                        &pending.operation_id,
+                        &lease_id,
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            OperationState::Terminal | OperationState::Cancelled => {
+                if !reconcile_confirms_terminal_or_absent(
+                    reconciliation.lease_id.as_deref(),
+                    reconciliation.lease_status,
+                ) {
+                    return Err(invalid_operation_reconcile_response());
+                }
+                self.clear_pending_start(&pending.operation_id)
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn reconcile_pending_stalled_stop_for_retry(
+        &self,
+        stored: &nelomai_client_storage::StoredAuth,
+        pending: StoredPendingStalledStop,
+    ) -> Result<(), CoreError> {
+        if pending.contract_version != 1
+            || pending.request_fingerprint
+                != connection_intent::stalled_stop_request_fingerprint_v1(&pending.lease_id)
+        {
+            return Err(CoreError::Storage);
+        }
+        let (_, reconciliation) = self
+            .reconcile_background_operation(
+                stored,
+                OperationReconcileRequest {
+                    operation_id: pending.operation_id.clone(),
+                    kind: OperationKind::StalledStop,
+                    contract_version: pending.contract_version,
+                    request_fingerprint: pending.request_fingerprint.clone(),
+                    cancel_if_absent: false,
+                },
+            )
+            .await?;
+        if reconciliation
+            .lease_id
+            .as_deref()
+            .is_some_and(|lease_id| lease_id != pending.lease_id)
+            || (reconciliation.lease_id.is_none() && reconciliation.lease_status.is_some())
+        {
+            return Err(invalid_operation_reconcile_response());
+        }
+        match reconciliation.state {
+            OperationState::Pending | OperationState::Applying | OperationState::Compensating => {
+                Err(unresolved_start_operation_retry_error(
+                    reconciliation.retry_count,
+                ))
+            }
+            OperationState::NotFound => {
+                if reconciliation.lease_id.is_some() || reconciliation.lease_status.is_some() {
+                    return Err(invalid_operation_reconcile_response());
+                }
+                Ok(())
+            }
+            OperationState::Applied | OperationState::Terminal | OperationState::Cancelled => {
+                if let Some(lease_status) = reconciliation
+                    .lease_status
+                    .filter(|status| terminal_lease_status(*status))
+                {
+                    self.apply_reconciled_stalled_stop_terminal(&pending.lease_id, lease_status)
+                        .await?;
+                    self.clear_pending_stalled_stop(&pending.operation_id, &pending.lease_id)?;
+                    return Ok(());
+                }
+                Err(stalled_stop_not_recyclable_error())
+            }
+        }
+    }
+
+    async fn resume_pending_compensation_stop(
+        &self,
+        pending: StoredPendingCompensationStop,
+    ) -> Result<(), CoreError> {
+        let current = self.state.lock().await.connection.clone();
+        let Some(current) = current else {
+            return self
+                .replay_pending_compensation_stop_without_connection(pending)
+                .await;
+        };
+        if current.lease_id != pending.lease_id {
+            return Err(CoreError::Storage);
+        }
+        let stopped = self
+            .stop_internal(
+                pending.failure_code.as_deref(),
+                true,
+                Some(&pending.operation_id),
+                pending.accept_warm,
+            )
+            .await?;
+        if !compensation_stop_confirms_finished(
+            pending.failure_code.as_deref(),
+            pending.accept_warm,
+            stopped.status,
+        ) {
+            return Err(stalled_stop_not_recyclable_error());
+        }
+        if pending.failure_code.as_deref() == Some("tunnel_handshake_timeout") {
+            self.reconcile_pending_handshake_timeout_storage(&stopped)?;
+        }
+        self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)
+    }
+
+    async fn replay_pending_compensation_stop_without_connection(
+        &self,
+        pending: StoredPendingCompensationStop,
+    ) -> Result<(), CoreError> {
+        let _split_guard = self.split_tunnel_gate.lock().await;
+        let _guard = self.connection_gate.lock().await;
+        if self.state.lock().await.connection.is_some() {
+            return Err(CoreError::Storage);
+        }
+        self.set_phase(Phase::Stopping).await;
+        if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
+            self.tunnel.stop().await?;
+        }
+        match self.api.reset_transport() {
+            Ok(()) => self.logger.record(CoreLogEvent {
+                kind: "connection.transport_reset",
+                operation_id: None,
+                request_id: None,
+                code: None,
+            }),
+            Err(error) => self.logger.record(CoreLogEvent {
+                kind: "connection.transport_reset_failed",
+                operation_id: None,
+                request_id: None,
+                code: Some(error.to_string()),
+            }),
+        }
+        self.physical_network_change.lock().await.reset();
+        self.clear_applied_physical_network_fingerprint();
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
+
+        let stored = self.load_auth()?;
+        if stored.pending_compensation_stop.as_ref() != Some(&pending) {
+            return Err(CoreError::Storage);
+        }
+        let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let request = ConnectionOperationRequest {
+            operation_id: pending.operation_id.clone(),
+            lease_id: pending.lease_id.clone(),
+            failure_code: pending.failure_code.clone(),
+        };
+        let response = match self
+            .retry_operation(&access_token, &request, ConnectionOperation::Stop)
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.logger.record(CoreLogEvent {
+                    kind: "connection.stop_failed",
+                    operation_id: Some(request.operation_id),
+                    request_id: None,
+                    code: Some(error.to_string()),
+                });
+                return Err(error);
+            }
+        };
+        if !compensation_stop_confirms_finished(
+            pending.failure_code.as_deref(),
+            pending.accept_warm,
+            response.connection.status,
+        ) {
+            return Err(stalled_stop_not_recyclable_error());
+        }
+        if pending.failure_code.as_deref() == Some("tunnel_handshake_timeout") {
+            self.reconcile_pending_handshake_timeout_storage(&response.connection)?;
+        } else if let Some(pending_start) = stored.pending_start {
+            self.clear_pending_start(&pending_start.operation_id)?;
+        }
+        self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)?;
+        *self.state.lock().await = CoreState {
+            phase: Phase::Ready,
+            connection: Some(response.connection.clone()),
+        };
+        self.logger.record(CoreLogEvent {
+            kind: "connection.stopped",
+            operation_id: Some(request.operation_id),
+            request_id: Some(response.request_id),
+            code: None,
+        });
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn reconcile_background_operation(
+        &self,
+        stored: &nelomai_client_storage::StoredAuth,
+        request: OperationReconcileRequest,
+    ) -> Result<(String, OperationReconcileResponse), CoreError> {
+        let mut access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let background = match self.api.background_token(&access_token).await {
+            Ok(response) => response,
+            Err(CoreApiError::Unauthorized) => {
+                access_token = self.refresh_access_token(&access_token).await?;
+                self.api.background_token(&access_token).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let reconciliation = self
+            .api
+            .reconcile_background_operation(&background.token, &request)
+            .await?;
+        Ok((access_token, reconciliation))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn apply_reconciled_stalled_stop_terminal(
+        &self,
+        lease_id: &str,
+        lease_status: LeaseStatus,
+    ) -> Result<(), CoreError> {
+        let mut state = self.state.lock().await;
+        let connection = state
+            .connection
+            .as_mut()
+            .filter(|connection| connection.lease_id == lease_id)
+            .ok_or_else(invalid_operation_reconcile_response)?;
+        connection.status = lease_status;
+        state.phase = Phase::Stopping;
+        Ok(())
+    }
+
+    async fn cancel_unknown_pending_start(&self) -> Result<Option<Connection>, CoreError> {
+        let stored = self.load_auth()?;
+        let Some(pending) = stored.pending_start.clone() else {
+            return Ok(None);
+        };
+        self.set_phase(Phase::Stopping).await;
+        let (contract_version, request_fingerprint) = match (
+            pending.recovery_contract_version,
+            pending.request_fingerprint.clone(),
+        ) {
+            (None, None) => return self.cancel_unknown_legacy_start(stored, pending).await,
+            (Some(contract_version), Some(request_fingerprint))
+                if !request_fingerprint.is_empty() =>
+            {
+                (contract_version, request_fingerprint)
+            }
+            _ => return Err(CoreError::Storage),
+        };
+        let mut access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let background = match self.api.background_token(&access_token).await {
+            Ok(response) => response,
+            Err(CoreApiError::Unauthorized) => {
+                access_token = self.refresh_access_token(&access_token).await?;
+                self.api.background_token(&access_token).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let reconciliation = self
+            .api
+            .reconcile_background_operation(
+                &background.token,
+                &OperationReconcileRequest {
+                    operation_id: pending.operation_id.clone(),
+                    kind: OperationKind::Start,
+                    contract_version,
+                    request_fingerprint,
+                    cancel_if_absent: true,
+                },
+            )
+            .await?;
+        match reconciliation.state {
+            OperationState::Pending | OperationState::Applying | OperationState::Compensating => {
+                if !reconciliation.cancel_requested {
+                    return Err(invalid_operation_reconcile_response());
+                }
+                Err(unresolved_start_operation_retry_error(
+                    reconciliation.retry_count,
+                ))
+            }
+            OperationState::NotFound => {
+                if !reconciliation.cancel_requested
+                    || reconciliation.lease_id.is_some()
+                    || reconciliation.lease_status.is_some()
+                {
+                    return Err(invalid_operation_reconcile_response());
+                }
+                self.clear_pending_start(&pending.operation_id)?;
+                self.set_phase(Phase::Ready).await;
+                Ok(None)
+            }
+            OperationState::Applied => {
+                let lease_id = reconciliation
+                    .lease_id
+                    .ok_or_else(invalid_operation_reconcile_response)?;
+                let lease_status = reconciliation
+                    .lease_status
+                    .ok_or_else(invalid_operation_reconcile_response)?;
+                if terminal_lease_status(lease_status) {
+                    self.clear_pending_start(&pending.operation_id)?;
+                    self.set_phase(Phase::Ready).await;
+                    return Ok(None);
+                }
+                if !reconciliation.cancel_requested {
+                    return Err(invalid_operation_reconcile_response());
+                }
+                self.stop_unknown_pending_lease(&access_token, &pending.operation_id, &lease_id)
+                    .await
+                    .map(Some)
+            }
+            OperationState::Terminal | OperationState::Cancelled => {
+                if !reconcile_confirms_terminal_or_absent(
+                    reconciliation.lease_id.as_deref(),
+                    reconciliation.lease_status,
+                ) {
+                    return Err(invalid_operation_reconcile_response());
+                }
+                self.clear_pending_start(&pending.operation_id)?;
+                self.set_phase(Phase::Ready).await;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn cancel_unknown_legacy_start(
+        &self,
+        stored: nelomai_client_storage::StoredAuth,
+        pending: StoredPendingStart,
+    ) -> Result<Option<Connection>, CoreError> {
+        let mut access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let request = ConnectionStartRequest {
+            operation_id: pending.operation_id.clone(),
+            layer: pending.layer,
+            tic_connection_mode: pending.tic_connection_mode,
+            route_mode: pending.route_mode,
+            egress_mode: pending.egress_mode,
+            probes: pending.probes.clone(),
+            allow_alternate: pending.allow_alternate,
+            require_measured_selection: false,
+            recovery_contract_version: None,
+            request_fingerprint: None,
+        };
+        let replay = match self.api.start_connection(&access_token, &request).await {
+            Ok(response) => response,
+            Err(CoreApiError::Unauthorized) => {
+                access_token = self.refresh_access_token(&access_token).await?;
+                self.api.start_connection(&access_token, &request).await?
+            }
+            Err(CoreApiError::Rejected { ref code, .. })
+                if code == "connection_no_longer_active" =>
+            {
+                self.clear_pending_start(&pending.operation_id)?;
+                self.set_phase(Phase::Ready).await;
+                return Ok(None);
+            }
+            Err(CoreApiError::Rejected { ref code, .. })
+                if legacy_replay_confirms_operation_absent(code) =>
+            {
+                self.clear_pending_start(&pending.operation_id)?;
+                self.set_phase(Phase::Ready).await;
+                return Ok(None);
+            }
+            Err(error @ CoreApiError::Retryable) | Err(error @ CoreApiError::Rejected { .. }) => {
+                self.set_phase(Phase::Stopping).await;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.stop_unknown_pending_lease(
+            &access_token,
+            &pending.operation_id,
+            &replay.connection.lease_id,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn stop_unknown_pending_lease(
+        &self,
+        access_token: &str,
+        pending_operation_id: &str,
+        lease_id: &str,
+    ) -> Result<Connection, CoreError> {
+        let stop_operation_id = self.pending_cancel_operation_id(pending_operation_id)?;
+        let response = match self
+            .retry_operation(
+                access_token,
+                &ConnectionOperationRequest {
+                    operation_id: stop_operation_id,
+                    lease_id: lease_id.to_string(),
+                    failure_code: None,
+                },
+                ConnectionOperation::Stop,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.set_phase(Phase::Stopping).await;
+                return Err(error);
+            }
+        };
+        self.clear_pending_start(pending_operation_id)?;
+        *self.state.lock().await = CoreState {
+            phase: Phase::Ready,
+            connection: Some(response.connection.clone()),
+        };
+        Ok(response.connection)
     }
 
     async fn stop_internal(
@@ -1847,6 +2630,7 @@ where
         failure_code: Option<&str>,
         clear_recovery_episode: bool,
         operation_id: Option<&str>,
+        accept_warm_as_finished: bool,
     ) -> Result<Connection, CoreError> {
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
@@ -1857,11 +2641,11 @@ where
         if clear_recovery_episode {
             *self.active_recovery_episode.lock().await = None;
         }
-        let panel_connection_finished = matches!(
+        let panel_connection_finished = compensation_stop_confirms_finished(
+            failure_code,
+            accept_warm_as_finished,
             current.status,
-            nelomai_contracts::LeaseStatus::Released | nelomai_contracts::LeaseStatus::Failed
-        ) || (failure_code.is_none()
-            && current.status == nelomai_contracts::LeaseStatus::Warm);
+        );
         self.set_phase(Phase::Stopping).await;
         let tunnel_status = self.tunnel.status().await.unwrap_or(TunnelStatus::Running);
         if tunnel_status != TunnelStatus::Stopped {
@@ -1932,6 +2716,17 @@ where
                 return Err(error);
             }
         };
+        if !compensation_stop_confirms_finished(
+            failure_code,
+            accept_warm_as_finished,
+            response.connection.status,
+        ) {
+            *self.state.lock().await = CoreState {
+                phase: Phase::Stopping,
+                connection: Some(response.connection.clone()),
+            };
+            return Ok(response.connection);
+        }
         if let Some(pending) = &stored.pending_start {
             self.clear_pending_start(&pending.operation_id)?;
         }
@@ -1950,8 +2745,36 @@ where
 
     #[cfg(not(target_os = "android"))]
     pub async fn compensate_stale_connection_intent_result(&self) -> Result<(), CoreError> {
-        match self.stop().await {
-            Ok(_) | Err(CoreError::SavedConnectionUnavailable) => Ok(()),
+        self.signal_start_cancellation();
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        let current = self.state.lock().await.connection.clone();
+        let Some(current) = current else {
+            self.clear_pending_compensation_stop_if_absent()?;
+            return Ok(());
+        };
+        let accept_warm = stored_connection_kind(&current) == StoredConnectionKind::DynamicWarm;
+        let pending =
+            self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None)?;
+        match self
+            .stop_internal(None, true, Some(&pending.operation_id), pending.accept_warm)
+            .await
+        {
+            Ok(stopped)
+                if terminal_lease_status(stopped.status)
+                    || pending.accept_warm && stopped.status == LeaseStatus::Warm =>
+            {
+                self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)?;
+                Ok(())
+            }
+            Ok(_) => Err(CoreError::Api(CoreApiError::Rejected {
+                code: "connection_release_pending".to_string(),
+                message: "Панель ещё не завершила отменённое подключение.".to_string(),
+                retry_after_seconds: None,
+            })),
+            Err(CoreError::SavedConnectionUnavailable) => {
+                self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)?;
+                Ok(())
+            }
             Err(error) => Err(error),
         }
     }
@@ -1962,7 +2785,23 @@ where
         options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
+        let cancel_epoch = self.begin_start_attempt();
+        let result = self
+            .replace_stalled_connection_with_cancellation_epoch(options, now_unix, cancel_epoch)
+            .await;
+        self.finish_start_attempt();
+        result
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn replace_stalled_connection_with_cancellation_epoch(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<Connection, CoreError> {
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         let options = options.normalized_for_layer();
         let current = self
             .state
@@ -1986,20 +2825,27 @@ where
             RecoveryTransport::Other
         };
         self.begin_recovery_episode(&current, options.clone()).await;
-        let stop_operation_id = self
-            .active_recovery_episode
-            .lock()
-            .await
-            .as_ref()
-            .map(|episode| episode.stop_operation_id.clone())
-            .ok_or(CoreError::Storage)?;
         let plan = stall_recovery_plan(&options, current.pinned, recovery_transport);
+        let already_terminal = terminal_lease_status(current.status);
+        let stop_operation_id = match plan {
+            StallRecoveryPlan::ReplaceDynamic { .. } if !already_terminal => {
+                self.pending_stalled_stop_identity(&current.lease_id)?
+                    .operation_id
+            }
+            StallRecoveryPlan::ReplaceDynamic { .. } | StallRecoveryPlan::PreservePeer => self
+                .active_recovery_episode
+                .lock()
+                .await
+                .as_ref()
+                .map(|episode| episode.stop_operation_id.clone())
+                .ok_or(CoreError::Storage)?,
+        };
         let failure_code = match plan {
             StallRecoveryPlan::ReplaceDynamic { failure_code, .. } => Some(failure_code),
             StallRecoveryPlan::PreservePeer => None,
         };
         let stopped = self
-            .stop_internal(failure_code, false, Some(&stop_operation_id))
+            .stop_internal(failure_code, false, Some(&stop_operation_id), true)
             .await?;
         let terminal = match plan {
             StallRecoveryPlan::ReplaceDynamic { .. } => {
@@ -2018,7 +2864,12 @@ where
             }));
         }
         if matches!(plan, StallRecoveryPlan::ReplaceDynamic { .. }) {
+            self.clear_pending_stalled_stop(&stop_operation_id, &current.lease_id)?;
             self.remove_dynamic_recovery_cache(&current.lease_id)?;
+        }
+        if let Err(error) = self.ensure_start_not_cancelled(cancel_epoch) {
+            *self.active_recovery_episode.lock().await = None;
+            return Err(error);
         }
         let mut replacement_options = options;
         if let StallRecoveryPlan::ReplaceDynamic {
@@ -2033,8 +2884,13 @@ where
                 now_unix,
                 false,
                 ConnectionStartContract::RecoveryV1,
+                cancel_epoch,
             )
-            .await?;
+            .await;
+        if matches!(replacement, Err(CoreError::StartCancelled)) {
+            *self.active_recovery_episode.lock().await = None;
+        }
+        let replacement = replacement?;
         *self.active_recovery_episode.lock().await = None;
         Ok(replacement)
     }
@@ -2385,6 +3241,8 @@ where
             stored.pinned_connection = stored.saved_connection.take();
             self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         }
+        self.pending_start_active
+            .store(stored.pending_start.is_some(), Ordering::SeqCst);
         Ok(stored)
     }
 
@@ -2419,8 +3277,16 @@ where
             return Ok(());
         }
         let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let pending_compensation = stored
+            .pending_start
+            .as_ref()
+            .map(|_| self.pending_compensation_stop_identity(&connection.lease_id, true, None))
+            .transpose()?;
         let request = ConnectionOperationRequest {
-            operation_id: Uuid::new_v4().to_string(),
+            operation_id: pending_compensation
+                .as_ref()
+                .map(|pending| pending.operation_id.clone())
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
             lease_id: connection.lease_id,
             failure_code: None,
         };
@@ -2441,6 +3307,9 @@ where
         };
         if let Some(pending) = &stored.pending_start {
             self.clear_pending_start(&pending.operation_id)?;
+        }
+        if let Some(pending) = pending_compensation {
+            self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)?;
         }
         *self.state.lock().await = CoreState {
             phase: Phase::Ready,
@@ -2469,6 +3338,122 @@ where
             .is_some_and(|pending| pending.operation_id == operation_id)
         {
             stored.pending_start = None;
+            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+            self.pending_start_active.store(false, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn pending_cancel_operation_id(&self, operation_id: &str) -> Result<String, CoreError> {
+        let mut stored = self.load_auth()?;
+        let pending = stored
+            .pending_start
+            .as_mut()
+            .filter(|pending| pending.operation_id == operation_id)
+            .ok_or(CoreError::SavedConnectionUnavailable)?;
+        if let Some(cancel_operation_id) = &pending.cancel_operation_id {
+            return Ok(cancel_operation_id.clone());
+        }
+        let cancel_operation_id = Uuid::new_v4().to_string();
+        pending.cancel_operation_id = Some(cancel_operation_id.clone());
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        Ok(cancel_operation_id)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn pending_stalled_stop_identity(
+        &self,
+        lease_id: &str,
+    ) -> Result<StoredPendingStalledStop, CoreError> {
+        let mut stored = self.load_auth()?;
+        if let Some(pending) = stored.pending_stalled_stop.as_ref() {
+            let expected_fingerprint =
+                connection_intent::stalled_stop_request_fingerprint_v1(lease_id);
+            if pending.lease_id != lease_id
+                || pending.contract_version != 1
+                || pending.request_fingerprint != expected_fingerprint
+            {
+                return Err(CoreError::Storage);
+            }
+            return Ok(pending.clone());
+        }
+        let pending = StoredPendingStalledStop {
+            operation_id: Uuid::new_v4().to_string(),
+            lease_id: lease_id.to_string(),
+            contract_version: 1,
+            request_fingerprint: connection_intent::stalled_stop_request_fingerprint_v1(lease_id),
+        };
+        stored.pending_stalled_stop = Some(pending.clone());
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        Ok(pending)
+    }
+
+    fn pending_compensation_stop_identity(
+        &self,
+        lease_id: &str,
+        accept_warm: bool,
+        failure_code: Option<&str>,
+    ) -> Result<StoredPendingCompensationStop, CoreError> {
+        let mut stored = self.load_auth()?;
+        if let Some(pending) = stored.pending_compensation_stop.as_ref() {
+            if pending.lease_id != lease_id
+                || pending.accept_warm != accept_warm
+                || pending.failure_code.as_deref() != failure_code
+            {
+                return Err(CoreError::Storage);
+            }
+            return Ok(pending.clone());
+        }
+        let pending = StoredPendingCompensationStop {
+            operation_id: Uuid::new_v4().to_string(),
+            lease_id: lease_id.to_string(),
+            accept_warm,
+            failure_code: failure_code.map(str::to_string),
+        };
+        stored.pending_compensation_stop = Some(pending.clone());
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        Ok(pending)
+    }
+
+    fn clear_pending_compensation_stop(
+        &self,
+        operation_id: &str,
+        lease_id: &str,
+    ) -> Result<(), CoreError> {
+        let mut stored = self.load_auth()?;
+        if stored
+            .pending_compensation_stop
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.operation_id == operation_id && pending.lease_id == lease_id
+            })
+        {
+            stored.pending_compensation_stop = None;
+            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn clear_pending_compensation_stop_if_absent(&self) -> Result<(), CoreError> {
+        let mut stored = self.load_auth()?;
+        if stored.pending_compensation_stop.take().is_some() {
+            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn clear_pending_stalled_stop(
+        &self,
+        operation_id: &str,
+        lease_id: &str,
+    ) -> Result<(), CoreError> {
+        let mut stored = self.load_auth()?;
+        if stored.pending_stalled_stop.as_ref().is_some_and(|pending| {
+            pending.operation_id == operation_id && pending.lease_id == lease_id
+        }) {
+            stored.pending_stalled_stop = None;
             self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         }
         Ok(())
@@ -2557,6 +3542,18 @@ where
         result
     }
 
+    fn reconcile_pending_handshake_timeout_storage(
+        &self,
+        connection: &Connection,
+    ) -> Result<(), CoreError> {
+        let pending_operation_id = self
+            .load_auth()?
+            .pending_start
+            .map(|pending| pending.operation_id)
+            .unwrap_or_default();
+        self.reconcile_handshake_timeout_storage(&pending_operation_id, connection)
+    }
+
     fn replace_pending_start_operation(
         &self,
         previous_operation_id: &str,
@@ -2573,6 +3570,7 @@ where
             return Err(CoreError::Storage);
         };
         pending.operation_id = replacement_operation_id.to_string();
+        pending.cancel_operation_id = None;
         self.store.save(&stored).map_err(|_| CoreError::Storage)
     }
 
@@ -2788,15 +3786,82 @@ where
         error: &CoreError,
     ) -> Result<(), CoreError> {
         self.physical_network_change.lock().await.reset();
-        let compensation_request = ConnectionOperationRequest {
-            operation_id: Uuid::new_v4().to_string(),
-            lease_id: connection.lease_id.clone(),
-            failure_code: match error {
-                CoreError::Tunnel(code) if code == "tunnel_handshake_timeout" => Some(code.clone()),
-                _ => None,
-            },
+        let failure_code = match error {
+            CoreError::Tunnel(code) if code == "tunnel_handshake_timeout" => Some(code.clone()),
+            _ => None,
         };
         let mut storage_error = None;
+        let accept_warm = stored_connection_kind(connection) == StoredConnectionKind::DynamicWarm;
+        let durable_compensation = match self.pending_compensation_stop_identity(
+            &connection.lease_id,
+            accept_warm,
+            failure_code.as_deref(),
+        ) {
+            Ok(pending) => pending,
+            Err(storage_error) => {
+                let mut phase = phase_for_start_error(&storage_error);
+                if stage.local_start_may_be_incomplete()
+                    && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
+                {
+                    phase = Phase::Stopping;
+                }
+                *self.state.lock().await = CoreState {
+                    phase,
+                    connection: Some(connection.clone()),
+                };
+                self.logger.record(CoreLogEvent {
+                    kind: stage.log_kind(),
+                    operation_id: Some(operation_id.to_string()),
+                    request_id: Some(request_id.to_string()),
+                    code: Some(error.to_string()),
+                });
+                self.logger.record(CoreLogEvent {
+                    kind: "connection.start_compensation_storage_failed",
+                    operation_id: Some(operation_id.to_string()),
+                    request_id: Some(request_id.to_string()),
+                    code: Some(storage_error.to_string()),
+                });
+                return Err(storage_error);
+            }
+        };
+        let compensation_request = ConnectionOperationRequest {
+            operation_id: durable_compensation.operation_id.clone(),
+            lease_id: durable_compensation.lease_id.clone(),
+            failure_code: durable_compensation.failure_code.clone(),
+        };
+        if stage.local_start_may_be_incomplete()
+            && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
+        {
+            if let Err(cleanup_error) = self.tunnel.stop().await.map_err(CoreError::from) {
+                *self.state.lock().await = CoreState {
+                    phase: Phase::Stopping,
+                    connection: Some(connection.clone()),
+                };
+                if matches!(error, CoreError::StartCancelled) {
+                    self.logger.record(CoreLogEvent {
+                        kind: "connection.cancelled_start_cleanup_failed",
+                        operation_id: Some(operation_id.to_string()),
+                        request_id: Some(request_id.to_string()),
+                        code: Some(cleanup_error.to_string()),
+                    });
+                } else if matches!(error, CoreError::Tunnel(code) if code == "tunnel_handshake_timeout")
+                {
+                    self.logger.record(CoreLogEvent {
+                        kind: "connection.handshake_cleanup_failed",
+                        operation_id: Some(operation_id.to_string()),
+                        request_id: Some(request_id.to_string()),
+                        code: Some(cleanup_error.to_string()),
+                    });
+                }
+                self.logger.record(CoreLogEvent {
+                    kind: stage.log_kind(),
+                    operation_id: Some(operation_id.to_string()),
+                    request_id: Some(request_id.to_string()),
+                    code: Some(error.to_string()),
+                });
+                return Err(cleanup_error);
+            }
+        }
         let (connection, mut phase) = match self
             .retry_operation(
                 access_token,
@@ -2806,12 +3871,46 @@ where
             .await
         {
             Ok(compensation) => {
+                let authoritative = compensation_stop_confirms_finished(
+                    durable_compensation.failure_code.as_deref(),
+                    durable_compensation.accept_warm,
+                    compensation.connection.status,
+                );
+                if !authoritative {
+                    let compensation_error = compensation_stop_not_terminal_error();
+                    *self.state.lock().await = CoreState {
+                        phase: Phase::Stopping,
+                        connection: Some(compensation.connection),
+                    };
+                    self.logger.record(CoreLogEvent {
+                        kind: "connection.start_compensation_failed",
+                        operation_id: Some(compensation_request.operation_id.clone()),
+                        request_id: None,
+                        code: Some(compensation_error.to_string()),
+                    });
+                    self.logger.record(CoreLogEvent {
+                        kind: stage.log_kind(),
+                        operation_id: Some(operation_id.to_string()),
+                        request_id: Some(request_id.to_string()),
+                        code: Some(error.to_string()),
+                    });
+                    return Ok(());
+                }
                 if matches!(error, CoreError::Tunnel(code) if code == "tunnel_handshake_timeout") {
                     storage_error = self
                         .reconcile_handshake_timeout_storage(operation_id, connection)
                         .err();
                 } else {
-                    let _ = self.clear_pending_start(operation_id);
+                    storage_error =
+                        storage_error.or_else(|| self.clear_pending_start(operation_id).err());
+                }
+                if storage_error.is_none() {
+                    storage_error = self
+                        .clear_pending_compensation_stop(
+                            &durable_compensation.operation_id,
+                            &durable_compensation.lease_id,
+                        )
+                        .err();
                 }
                 (compensation.connection, phase_for_start_error(error))
             }
@@ -2855,11 +3954,37 @@ where
         Ok(())
     }
 
+    async fn compensate_cancelled_start(
+        &self,
+        access_token: &str,
+        connection: &Connection,
+        request_id: &str,
+        operation_id: &str,
+        stage: FailedStartStage,
+        _local_runtime_may_be_up: bool,
+    ) -> CoreError {
+        let cancellation_error = CoreError::StartCancelled;
+        let compensation_error = self
+            .compensate_failed_start(
+                access_token,
+                connection,
+                request_id,
+                operation_id,
+                stage,
+                &cancellation_error,
+            )
+            .await
+            .err();
+        compensation_error.unwrap_or(cancellation_error)
+    }
+
     async fn retry_start(
         &self,
         access_token: &str,
         request: &mut ConnectionStartRequest,
         allow_internal_retry: bool,
+        cancel_epoch: StartCancellationEpoch,
+        clear_fresh_pending_on_pre_dispatch_cancel: bool,
     ) -> Result<ConnectionStartResponse, CoreError> {
         let delays = if allow_internal_retry {
             self.retry_policy.delays_millis()
@@ -2870,7 +3995,15 @@ where
         let mut access_token = access_token.to_string();
         let mut refreshed = false;
         let mut replaced_finished_operation = false;
+        let mut dispatched = false;
         loop {
+            if self.start_cancel_epoch.load(Ordering::SeqCst) != cancel_epoch.0 {
+                if clear_fresh_pending_on_pre_dispatch_cancel && !dispatched {
+                    self.clear_pending_start(&request.operation_id)?;
+                }
+                return Err(CoreError::StartCancelled);
+            }
+            dispatched = true;
             match self.api.start_connection(&access_token, request).await {
                 Ok(response) => return Ok(response),
                 Err(CoreApiError::Unauthorized) if !refreshed => {
@@ -2880,9 +4013,7 @@ where
                 Err(CoreApiError::Retryable) if retry_index < delays.len() => {
                     let delay = delays[retry_index];
                     retry_index += 1;
-                    if delay > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    }
+                    self.wait_for_start_retry(delay, cancel_epoch).await?;
                 }
                 Err(CoreApiError::Rejected { ref code, .. })
                     if allow_internal_retry
@@ -2905,10 +4036,44 @@ where
                         code: Some("connection_no_longer_active".to_string()),
                     });
                 }
+                Err(error) if allow_internal_retry && retry_index < delays.len() => {
+                    let Some(server_delay) = structured_retry_delay_millis(&error) else {
+                        self.set_phase(phase_for_api_error(&error)).await;
+                        return Err(error.into());
+                    };
+                    let delay = delays[retry_index].max(server_delay);
+                    retry_index += 1;
+                    self.wait_for_start_retry(delay, cancel_epoch).await?;
+                }
                 Err(error) => {
                     self.set_phase(phase_for_api_error(&error)).await;
                     return Err(error.into());
                 }
+            }
+        }
+    }
+
+    async fn wait_for_start_retry(
+        &self,
+        delay_millis: u64,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<(), CoreError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(delay_millis);
+        loop {
+            let notified = self.start_retry_wake.notified();
+            tokio::pin!(notified);
+            if self.start_cancel_epoch.load(Ordering::SeqCst) != cancel_epoch.0 {
+                return Err(CoreError::StartCancelled);
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    return if self.start_cancel_epoch.load(Ordering::SeqCst) == cancel_epoch.0 {
+                        Ok(())
+                    } else {
+                        Err(CoreError::StartCancelled)
+                    };
+                }
+                _ = &mut notified => {}
             }
         }
     }
@@ -2990,20 +4155,109 @@ fn reusable_operation_id(
         .map(|saved| saved.lease_id.clone())
 }
 
-fn pending_operation_id(
-    stored: &nelomai_client_storage::StoredAuth,
-    options: &ConnectOptions,
-) -> Option<String> {
-    stored
-        .pending_start
-        .as_ref()
-        .filter(|pending| {
-            pending.layer == options.layer
-                && pending.tic_connection_mode == options.tic_connection_mode
-                && pending.route_mode == options.route_mode
-                && pending.egress_mode == options.egress_mode
-        })
-        .map(|pending| pending.operation_id.clone())
+fn pending_start_matches_options(pending: &StoredPendingStart, options: &ConnectOptions) -> bool {
+    pending.layer == options.layer
+        && pending.tic_connection_mode == options.tic_connection_mode
+        && pending.route_mode == options.route_mode
+        && pending.egress_mode == options.egress_mode
+        && pending.allow_alternate == options.allow_alternate
+}
+
+fn pending_start_contract(
+    pending: &StoredPendingStart,
+) -> Result<(ConnectionStartContract, Option<u32>, Option<String>), CoreError> {
+    match (
+        pending.recovery_contract_version,
+        pending.request_fingerprint.as_ref(),
+    ) {
+        (None, None) => Ok((ConnectionStartContract::Legacy, None, None)),
+        (Some(1), Some(fingerprint)) if !fingerprint.is_empty() => Ok((
+            ConnectionStartContract::RecoveryV1,
+            Some(1),
+            Some(fingerprint.clone()),
+        )),
+        _ => Err(CoreError::Storage),
+    }
+}
+
+fn unresolved_start_operation_error() -> CoreError {
+    unresolved_start_operation_error_after(1)
+}
+
+fn unresolved_start_operation_retry_error(retry_count: u32) -> CoreError {
+    let retry_index = usize::try_from(retry_count).unwrap_or(usize::MAX);
+    let retry_after_seconds = RetrySchedule::default().delay_seconds(retry_index).max(1);
+    unresolved_start_operation_error_after(retry_after_seconds)
+}
+
+fn unresolved_start_operation_error_after(retry_after_seconds: u64) -> CoreError {
+    CoreError::Api(CoreApiError::Rejected {
+        code: "operation_in_progress".to_string(),
+        message: "Предыдущее подключение ещё не завершено.".to_string(),
+        retry_after_seconds: Some(retry_after_seconds),
+    })
+}
+
+fn invalid_operation_reconcile_response() -> CoreError {
+    CoreError::Api(CoreApiError::Rejected {
+        code: "invalid_client_api_response".to_string(),
+        message: "Панель вернула некорректное состояние операции подключения.".to_string(),
+        retry_after_seconds: None,
+    })
+}
+
+fn stalled_stop_not_recyclable_error() -> CoreError {
+    CoreError::Api(CoreApiError::Rejected {
+        code: "connection_stall_not_recyclable".to_string(),
+        message: "Панель не подтвердила завершение stalled подключения.".to_string(),
+        retry_after_seconds: None,
+    })
+}
+
+fn compensation_stop_not_terminal_error() -> CoreError {
+    CoreError::Api(CoreApiError::Rejected {
+        code: "connection_release_pending".to_string(),
+        message: "Панель ещё не завершила отменённое подключение.".to_string(),
+        retry_after_seconds: None,
+    })
+}
+
+fn terminal_lease_status(status: LeaseStatus) -> bool {
+    matches!(status, LeaseStatus::Released | LeaseStatus::Failed)
+}
+
+fn compensation_stop_confirms_finished(
+    failure_code: Option<&str>,
+    accept_warm: bool,
+    status: LeaseStatus,
+) -> bool {
+    terminal_lease_status(status)
+        || (failure_code.is_none() && accept_warm && status == LeaseStatus::Warm)
+}
+
+fn reconcile_confirms_terminal_or_absent(
+    lease_id: Option<&str>,
+    lease_status: Option<LeaseStatus>,
+) -> bool {
+    match (lease_id, lease_status) {
+        (None, None) => true,
+        (Some(_), Some(status)) => terminal_lease_status(status),
+        _ => false,
+    }
+}
+
+fn legacy_replay_confirms_operation_absent(code: &str) -> bool {
+    matches!(
+        code,
+        "probe_results_required"
+            | "invalid_probe_results"
+            | "duplicate_candidate"
+            | "stale_probe_result"
+            | "invalid_probe_result"
+            | "invalid_candidate"
+            | "candidate_expired"
+            | "candidate_unavailable"
+    )
 }
 
 fn stored_connection_kind(connection: &Connection) -> StoredConnectionKind {
@@ -3037,6 +4291,7 @@ fn phase_for_start_error(error: &CoreError) -> Phase {
             Phase::AccessExpired
         }
         CoreError::UpdateRequired => Phase::UpdateRequired,
+        CoreError::StartCancelled => Phase::Ready,
         CoreError::Api(CoreApiError::Retryable) => Phase::ServerUnavailable,
         CoreError::Api(CoreApiError::Rejected { code, .. }) if transient_start_rejection(code) => {
             Phase::ServerUnavailable
@@ -3047,6 +4302,50 @@ fn phase_for_start_error(error: &CoreError) -> Phase {
         | CoreError::Tunnel(_)
         | CoreError::SplitTunnel(_) => Phase::Ready,
     }
+}
+
+fn start_error_preserves_operation(error: &CoreError) -> bool {
+    match error {
+        CoreError::StartCancelled => true,
+        CoreError::Api(CoreApiError::Retryable) => {
+            classify_recovery("transport_error", RecoveryPolicyContext::default())
+                .preserves_operation()
+        }
+        CoreError::Api(CoreApiError::Rejected {
+            code,
+            retry_after_seconds,
+            ..
+        }) => classify_recovery(
+            code,
+            RecoveryPolicyContext {
+                retry_after_seconds: *retry_after_seconds,
+                ..RecoveryPolicyContext::default()
+            },
+        )
+        .preserves_operation(),
+        _ => false,
+    }
+}
+
+fn structured_retry_delay_millis(error: &CoreApiError) -> Option<u64> {
+    let CoreApiError::Rejected {
+        code,
+        retry_after_seconds,
+        ..
+    } = error
+    else {
+        return None;
+    };
+    let RecoveryDecision::RetryAfter(delay_seconds) = classify_recovery(
+        code,
+        RecoveryPolicyContext {
+            retry_after_seconds: *retry_after_seconds,
+            ..RecoveryPolicyContext::default()
+        },
+    ) else {
+        return None;
+    };
+    Some(delay_seconds.saturating_mul(1_000))
 }
 
 fn transient_start_rejection(code: &str) -> bool {
@@ -3292,6 +4591,26 @@ mod tests {
             CoreApiError::Rejected { ref code, .. }
                 if code == "connection_stall_verification_unavailable"
         ));
+    }
+
+    #[test]
+    fn device_operation_busy_keeps_its_code_and_retry_after() {
+        let error = ClientApiError::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            request_id: "req".to_string(),
+            code: "device_operation_busy".to_string(),
+            message: "Операция устройства ещё завершается.".to_string(),
+            retry_after_seconds: Some(30),
+        };
+
+        assert_eq!(
+            CoreApiError::from(error),
+            CoreApiError::Rejected {
+                code: "device_operation_busy".to_string(),
+                message: "Операция устройства ещё завершается.".to_string(),
+                retry_after_seconds: Some(30),
+            },
+        );
     }
 
     #[test]

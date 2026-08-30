@@ -78,6 +78,44 @@ fn shared_valid_fixtures_match_schemas_and_rust_types() {
 }
 
 #[test]
+fn probe_and_candidate_collections_reject_the_twenty_first_item() {
+    let probe = serde_json::from_str::<Value>(&fixture("valid/probe-results.json")).unwrap()
+        ["probes"][0]
+        .clone();
+    let candidate = serde_json::from_str::<Value>(&fixture("valid/server-candidates.json"))
+        .unwrap()["candidates"][0]
+        .clone();
+
+    let mut probe_results =
+        serde_json::from_str::<Value>(&fixture("valid/probe-results.json")).unwrap();
+    probe_results["probes"] = Value::Array(vec![probe.clone(); 21]);
+    assert!(!schema_is_valid(
+        "probe-results.schema.json",
+        &probe_results
+    ));
+    assert!(serde_json::from_value::<ProbeResults>(probe_results.clone()).is_err());
+    assert!(serde_json::from_value::<ServerSelectionRequest>(probe_results).is_err());
+
+    let mut start = serde_json::from_str::<Value>(&fixture("valid/connection-start.json")).unwrap();
+    start["probes"] = Value::Array(vec![probe; 21]);
+    assert!(!schema_is_valid("connection-start.schema.json", &start));
+    assert!(serde_json::from_value::<ConnectionStartRequest>(start).is_err());
+    let mut outgoing: ConnectionStartRequest =
+        serde_json::from_str(&fixture("valid/connection-start.json")).unwrap();
+    outgoing.probes = vec![outgoing.probes[0].clone(); 21];
+    assert!(serde_json::to_value(outgoing).is_err());
+
+    let mut candidates =
+        serde_json::from_str::<Value>(&fixture("valid/server-candidates.json")).unwrap();
+    candidates["candidates"] = Value::Array(vec![candidate; 21]);
+    assert!(!schema_is_valid(
+        "server-candidates.schema.json",
+        &candidates
+    ));
+    assert!(serde_json::from_value::<ServerCandidatesResponse>(candidates).is_err());
+}
+
+#[test]
 fn legacy_payloads_without_egress_mode_default_to_ipv4() {
     let binding_json =
         fixture("valid/peer-binding.json").replace(",\n    \"egress_mode\": \"prefer_ipv6\"", "");
@@ -186,6 +224,8 @@ fn connection_intent_error_policy_is_complete_and_unambiguous() {
         "connection_unavailable",
         "service_unavailable",
         "connection_stall_recycle_rate_limited",
+        "operation_in_progress",
+        "device_operation_busy",
         "operation_id_conflict",
         "ipv6_pool_unavailable",
     ] {
@@ -219,6 +259,30 @@ fn connection_intent_capability_requires_a_present_enabled_unexpired_snapshot() 
         ..capability
     };
     assert!(!allows_new_connection_intent_operation(Some(&disabled), 0,));
+
+    for revision in [0, -1] {
+        let invalid = ConnectionIntentCapability {
+            revision,
+            expires_at: "2026-08-28T18:05:00Z".to_string(),
+            connection_intent_recovery_v1: true,
+        };
+        assert!(!allows_new_connection_intent_operation(
+            Some(&invalid),
+            1_787_940_299,
+        ));
+    }
+}
+
+#[test]
+fn connection_intent_capability_accepts_a_server_generation_revision() {
+    let capability: ConnectionIntentCapability = serde_json::from_value(serde_json::json!({
+        "revision": 1_787_940_300_000_i64,
+        "expires_at": "2026-08-28T18:05:00Z",
+        "connection_intent_recovery_v1": true
+    }))
+    .unwrap();
+
+    assert_eq!(capability.revision, 1_787_940_300_000_i64);
 }
 
 #[test]

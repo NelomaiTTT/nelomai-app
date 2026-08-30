@@ -36,6 +36,7 @@ struct MockPanelState {
     candidate_requests: AtomicUsize,
     probe_requests: AtomicUsize,
     start_operations: Mutex<Vec<String>>,
+    reconcile_requests: Mutex<Vec<Value>>,
     pinned: AtomicBool,
     split_settings_requests: AtomicUsize,
     split_apply_requests: AtomicUsize,
@@ -451,6 +452,37 @@ async fn connection_intent_background_routes_use_device_auth_but_probes_do_not()
     assert_eq!(reconciled.state, OperationState::Compensating);
     assert!(reconciled.cancel_requested);
 
+    let stalled = api
+        .reconcile_background_operation(
+            "background-token",
+            &OperationReconcileRequest {
+                operation_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                kind: OperationKind::StalledStop,
+                contract_version: 1,
+                request_fingerprint:
+                    "9808141ba59407c91cb5e3b96c4b2051387fe876297dcbacde665c5b656d179f".to_string(),
+                cancel_if_absent: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stalled.state, OperationState::Terminal);
+    assert_eq!(
+        stalled.lease_status,
+        Some(nelomai_contracts::LeaseStatus::Failed)
+    );
+    let reconcile_requests = panel_state.reconcile_requests.lock().unwrap();
+    assert_eq!(reconcile_requests.len(), 2);
+    assert_eq!(reconcile_requests[0]["kind"], "start");
+    assert_eq!(reconcile_requests[0]["cancel_if_absent"], true);
+    assert_eq!(reconcile_requests[1]["kind"], "stalled_stop");
+    assert_eq!(reconcile_requests[1]["contract_version"], 1);
+    assert_eq!(
+        reconcile_requests[1]["request_fingerprint"],
+        "9808141ba59407c91cb5e3b96c4b2051387fe876297dcbacde665c5b656d179f"
+    );
+    assert_eq!(reconcile_requests[1]["cancel_if_absent"], false);
+
     server.abort();
 }
 
@@ -609,21 +641,20 @@ async fn background_server_candidates(
 }
 
 async fn background_operation_reconcile(
+    State(state): State<Arc<MockPanelState>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Json<Value> {
     assert_device_authenticated(&headers);
-    assert_eq!(body["kind"], "start");
-    assert_eq!(body["contract_version"], 1);
-    assert_eq!(body["request_fingerprint"], "a".repeat(64));
-    assert_eq!(body["cancel_if_absent"], true);
+    let stalled_stop = body["kind"] == "stalled_stop";
+    state.reconcile_requests.lock().unwrap().push(body);
     Json(json!({
         "api_version": "1",
         "request_id": "req-background-reconcile",
-        "state": "compensating",
-        "cancel_requested": true,
+        "state": if stalled_stop { "terminal" } else { "compensating" },
+        "cancel_requested": !stalled_stop,
         "lease_id": LEASE_ID,
-        "lease_status": "issued",
+        "lease_status": if stalled_stop { "failed" } else { "issued" },
         "retry_count": 2,
         "next_attempt_at": "2030-01-01T00:00:30Z"
     }))

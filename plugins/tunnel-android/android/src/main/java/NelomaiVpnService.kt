@@ -19,10 +19,13 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.amnezia.awg.backend.GoBackend
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val IDLE_SERVICE_STOP_DELAY_MILLIS = 400L
@@ -77,6 +80,79 @@ internal class IdleStopDebouncer(
     }
 }
 
+internal class AndroidConnectionIntentAttemptDispatcher(
+    private val execute: (() -> Unit) -> Unit,
+    private val persistedDelayMillis: () -> Long,
+    private val scheduleAfter: (Long) -> Unit,
+    private val attempt: () -> Unit,
+) {
+    private val gate = Any()
+    private var queued = false
+    private var rerunRequested = false
+
+    fun request() {
+        val shouldDispatch = synchronized(gate) {
+            if (queued) {
+                rerunRequested = true
+                false
+            } else {
+                queued = true
+                true
+            }
+        }
+        if (!shouldDispatch) return
+        dispatch()
+    }
+
+    private fun dispatch() {
+        try {
+            execute(::runQueuedAttempt)
+        } catch (error: Throwable) {
+            synchronized(gate) {
+                queued = false
+                rerunRequested = false
+            }
+            throw error
+        }
+    }
+
+    private fun runQueuedAttempt() {
+        var deferredToTimer = false
+        try {
+            val delayMillis = persistedDelayMillis()
+            if (delayMillis > 0) {
+                scheduleAfter(delayMillis)
+                deferredToTimer = true
+                return
+            }
+            attempt()
+        } finally {
+            val rerun = synchronized(gate) {
+                if (!deferredToTimer && rerunRequested) {
+                    rerunRequested = false
+                    true
+                } else {
+                    rerunRequested = false
+                    queued = false
+                    false
+                }
+            }
+            if (rerun) dispatch()
+        }
+    }
+}
+
+internal data class LegacyBackgroundStartServiceBoundary(
+    val start: (
+        onSuccess: (SessionState, Long) -> Unit,
+        onError: (String) -> Unit,
+    ) -> Unit,
+    val runtimeState: () -> SessionState,
+    val durableDesiredActive: () -> Boolean,
+    val complete: (SessionState, String?, Boolean?) -> Unit,
+    val status: () -> ConnectionIntentServiceStatus?,
+)
+
 class NelomaiVpnService : GoBackend.VpnService() {
     private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
     private val restoreHandler = Handler(Looper.getMainLooper())
@@ -89,11 +165,16 @@ class NelomaiVpnService : GoBackend.VpnService() {
         cancel = restoreHandler::removeCallbacks,
     )
     private var restoreRetryAttempt = 0
-    private val restoreRetry = Runnable {
-        if (QuickTunnelController.desiredActive(applicationContext)) {
-            performBackgroundStart(restoring = true)
-        }
-    }
+    private val restoreRetry = Runnable { connectionIntentLifecycle.onRetryTimer() }
+    private lateinit var connectionIntentCoordinator: AndroidConnectionIntentCoordinator
+    private lateinit var connectionIntentLifecycle: ConnectionIntentServiceLifecycle
+    private lateinit var connectionIntentAttemptDispatcher: AndroidConnectionIntentAttemptDispatcher
+    private lateinit var logoutCoordinator: AndroidLogoutCoordinator
+    private val connectionIntentDispatch = AndroidConnectionIntentDispatchState()
+    private val connectionIntentRuntimeFence = AndroidRuntimeStartDispatchFence()
+    private val backgroundCredentialProvisionInFlight = AtomicBoolean(false)
+    private val candidateProbeCache = BackgroundCandidateProbeCache()
+    private val logoutRetry = Runnable { scheduleLogoutAttempt() }
 
     override fun getBuilder(): VpnService.Builder =
         object : VpnService.Builder() {
@@ -114,6 +195,57 @@ class NelomaiVpnService : GoBackend.VpnService() {
         super.onCreate()
         TunnelLog.initialize(applicationContext)
         TunnelRuntime.initialize(applicationContext)
+        connectionIntentCoordinator = AndroidConnectionIntentCoordinator(
+            AndroidRecoveryStores.open(applicationContext),
+            diagnostics = AndroidConnectionIntentDiagnosticsObserver {
+                AutomaticDiagnostics.onConnectionIntentLeaseReplacementStarted()
+            },
+        )
+        connectionIntentLifecycle = ConnectionIntentServiceLifecycle(
+            coordinator = connectionIntentCoordinator,
+            hasPendingLogout = ::hasPendingBackgroundLogout,
+            scheduleLogout = ::scheduleLogoutAttempt,
+            schedule = ::scheduleConnectionIntentAttempt,
+        )
+        connectionIntentAttemptDispatcher = AndroidConnectionIntentAttemptDispatcher(
+            execute = credentialExecutor::execute,
+            persistedDelayMillis = {
+                (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)
+                    ?.value
+                    ?.let {
+                        connectionIntentPersistedDelayMillis(
+                            it,
+                            nowUnix = System.currentTimeMillis() / 1_000,
+                        )
+                    } ?: 0L
+            },
+            scheduleAfter = ::scheduleConnectionIntentTimer,
+            attempt = {
+                val step = connectionIntentCoordinator.runOnce(
+                    ServiceConnectionIntentPanel(),
+                    ServiceConnectionIntentRuntime(),
+                    onRecovered = { episodeId ->
+                        runCatching {
+                            AutomaticDiagnostics.onConnectionIntentRecovered(
+                                applicationContext,
+                                episodeId,
+                            )
+                        }.onFailure { failure ->
+                            TunnelLog.warning(
+                                "diagnostics.connection_intent_state_failed",
+                                error = failure,
+                            )
+                        }
+                    },
+                    validateNewIntent = ::validateNewIntentCapability,
+                )
+                restoreHandler.post { completeConnectionIntentStep(step) }
+            },
+        )
+        logoutCoordinator = AndroidLogoutCoordinator(
+            AndroidBackgroundCredentialStores.open(applicationContext),
+            connectionIntentCoordinator,
+        )
         runCatching { AutomaticDiagnostics.initialize(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.initialize_failed", error = it) }
         activeService = this
@@ -129,10 +261,12 @@ class NelomaiVpnService : GoBackend.VpnService() {
         when {
             intent?.action == ACTION_QUICK_TOGGLE -> {
                 cancelRestoreRetry()
-                performBackgroundToggle()
+                performBackgroundToggle(intent.resultReceiver())
             }
             intent?.action == ACTION_ENSURE_RUNNING -> {
-                restoreDesiredTunnel("ensure_running")
+                if (!connectionIntentLifecycle.onEnsureRunning()) {
+                    restoreDesiredTunnel("ensure_running")
+                }
             }
             intent?.action == ACTION_CLIENT_START -> handleClientStart(intent)
             intent?.action == ACTION_CANCEL_CLIENT_START -> handleCancelClientStart(intent)
@@ -140,6 +274,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_CLIENT_STATUS -> handleClientStatus(intent)
             intent?.action == ACTION_CLIENT_METRICS -> handleClientMetrics(intent)
             intent?.action == ACTION_CLIENT_REBIND_UDP -> handleClientRebindUdp(intent)
+            intent?.action == ACTION_BEGIN_CONNECTION_INTENT -> handleBeginConnectionIntent(intent)
+            intent?.action == ACTION_CANCEL_CONNECTION_INTENT -> handleCancelConnectionIntent(intent)
+            intent?.action == ACTION_CANCEL_CURRENT_CONNECTION_INTENT -> {
+                handleCancelCurrentConnectionIntent(intent)
+            }
+            intent?.action == ACTION_CONNECTION_INTENT_STATUS -> handleConnectionIntentStatus(intent)
+            intent?.action == ACTION_BEGIN_BACKGROUND_LOGOUT -> handleBeginBackgroundLogout(intent)
             intent?.action == ACTION_CONFIGURE_BACKGROUND -> handleConfigureBackground(intent)
             intent?.action == ACTION_ROTATE_BACKGROUND -> handleRotateBackground(intent)
             intent?.action == ACTION_PROVISION_BACKGROUND -> handleProvisionBackground(intent)
@@ -152,9 +293,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_UPDATE_QUICK_DNS -> handleUpdateQuickDns(intent)
             intent?.action == ACTION_TAKE_STATE_CHANGE -> handleTakeStateChange(intent)
             intent?.action == ACTION_ACKNOWLEDGE_STATE_CHANGE -> handleAcknowledgeStateChange(intent)
+            intent == null && connectionIntentLifecycle.onStickyRestart() -> Unit
             intent == null && QuickTunnelController.desiredActive(applicationContext) -> {
                 restoreDesiredTunnel("sticky_restart")
             }
+            intent == null && hasPendingBackgroundLogout() -> scheduleLogoutAttempt()
             intent == null -> {
                 TunnelLog.info("service.idle_restart_stopped")
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -199,21 +342,26 @@ class NelomaiVpnService : GoBackend.VpnService() {
             applicationContext,
             args,
             { state, duration ->
+                val durableDesiredActive = QuickTunnelController.desiredActive(applicationContext)
                 QuickTunnelController.updateState(
                     applicationContext,
                     state,
-                    desiredActive = state == SessionState.RUNNING,
+                    desiredActive = legacyStartCallbackDesiredActive(
+                        durableDesiredActive,
+                        state,
+                    ),
                 )
                 receiver.sendOperation(state, duration)
             },
             { code ->
                 val state = TunnelRuntime.state()
+                val durableDesiredActive = QuickTunnelController.desiredActive(applicationContext)
                 QuickTunnelController.updateState(
                     applicationContext,
                     state,
-                    desiredActive = state in setOf(
-                        SessionState.RUNNING,
-                        SessionState.STARTING,
+                    desiredActive = legacyStartCallbackDesiredActive(
+                        durableDesiredActive,
+                        state,
                     ),
                 )
                 receiver.sendError(code)
@@ -323,6 +471,188 @@ class NelomaiVpnService : GoBackend.VpnService() {
         )
     }
 
+    private fun handleBeginConnectionIntent(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        val template = try {
+            if (intent.getIntExtra(EXTRA_API_VERSION, 0) != TUNNEL_API_VERSION) {
+                throw BackgroundConnectionException("unsupported_api_version")
+            }
+            AndroidIntentTemplate(
+                deviceId = canonicalUuid(intent.getStringExtra(EXTRA_DEVICE_ID)),
+                accountScope = canonicalUuid(intent.getStringExtra(EXTRA_ACCOUNT_SCOPE)),
+                layer = requireWireChoice(intent.getStringExtra(EXTRA_LAYER), setOf("tic", "stray")),
+                ticConnectionMode = requireWireChoice(
+                    intent.getStringExtra(EXTRA_TIC_CONNECTION_MODE),
+                    setOf("personal", "dynamic"),
+                ),
+                routeMode = requireWireChoice(
+                    intent.getStringExtra(EXTRA_ROUTE_MODE),
+                    setOf("standalone", "via_tak"),
+                ),
+                egressMode = requireWireChoice(
+                    intent.getStringExtra(EXTRA_EGRESS_MODE),
+                    setOf("ipv4", "prefer_ipv6"),
+                ),
+                allowAlternate = intent.getBooleanExtra(EXTRA_ALLOW_ALTERNATE, false),
+                syncBindingPreferences = intent.getBooleanExtra(
+                    EXTRA_SYNC_BINDING_PREFERENCES,
+                    false,
+                ),
+                options = normalizeAndroidTunnelOptions(
+                    Build.VERSION.SDK_INT,
+                    intent.getBundleExtra(EXTRA_OPTIONS)?.toTunnelOptions()
+                        ?: TunnelOptionsArgs(),
+                ),
+            )
+        } catch (error: BackgroundConnectionException) {
+            receiver.sendError(error.code)
+            stopIfIdle()
+            return
+        } catch (_: Throwable) {
+            receiver.sendError("invalid_connection_intent")
+            stopIfIdle()
+            return
+        }
+        val current = when (val result = connectionIntentCoordinator.status()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> {
+                receiver.sendError(result.code)
+                stopIfIdle()
+                return
+            }
+        }
+        val ticket = connectionIntentDispatch.start(current.intent.generation)
+        dispatchSerializedConnectionIntentMutation(credentialExecutor) {
+            when (val accepted = executeDispatchedConnectionIntent(
+                connectionIntentDispatch,
+                ticket,
+            ) { beginExplicitConnectionIntent(template, ticket) }) {
+                is AndroidCoordinatorResult.Accepted -> {
+                    QuickTunnelController.updateState(
+                        applicationContext,
+                        SessionState.STARTING,
+                        desiredActive = null,
+                    )
+                    receiver?.send(
+                        SERVICE_RESULT_OK,
+                        connectionIntentServiceStatus(accepted.envelope).toBundle(),
+                    )
+                    scheduleConnectionIntentAttempt()
+                }
+                is AndroidCoordinatorResult.Failure -> {
+                    receiver.sendError(accepted.code)
+                    stopIfIdle()
+                }
+            }
+        }
+    }
+
+    private fun handleCancelConnectionIntent(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        val generation = intent.getLongExtra(EXTRA_GENERATION, -1)
+        if (generation < 0) {
+            receiver.sendError("invalid_connection_intent")
+            stopIfIdle()
+            return
+        }
+        handleConnectionIntentCancellation(intent) {
+            connectionIntentCoordinator.cancel(generation)
+        }
+    }
+
+    private fun handleCancelCurrentConnectionIntent(intent: Intent) {
+        handleConnectionIntentCancellation(intent) {
+            connectionIntentCoordinator.cancelCurrent()
+        }
+    }
+
+    private fun handleConnectionIntentCancellation(
+        intent: Intent,
+        cancel: () -> AndroidCoordinatorResult,
+    ) {
+        val receiver = intent.resultReceiver()
+        when (val cancelled = cancelDispatchedConnectionIntent(connectionIntentDispatch) {
+            cancel()
+        }) {
+            is AndroidCoordinatorResult.Accepted -> {
+                connectionIntentRuntimeFence.cancelActive()
+                runCatching {
+                    AutomaticDiagnostics.onConnectionIntentCancelled(
+                        applicationContext,
+                        cancelled.envelope.intent.diagnosticsEpisodeId,
+                    )
+                }.onFailure {
+                    TunnelLog.warning(
+                        "diagnostics.connection_intent_state_failed",
+                        error = it,
+                    )
+                }
+                cancelRestoreRetry()
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.STOPPING,
+                    desiredActive = null,
+                )
+                receiver?.send(
+                    SERVICE_RESULT_OK,
+                    connectionIntentServiceStatus(cancelled.envelope).toBundle(),
+                )
+                scheduleConnectionIntentAttempt()
+            }
+            is AndroidCoordinatorResult.Failure -> receiver.sendError(cancelled.code)
+        }
+    }
+
+    private fun handleConnectionIntentStatus(intent: Intent) {
+        when (val result = connectionIntentCoordinator.status()) {
+            is RecoveryStoreResult.Success -> intent.resultReceiver()?.send(
+                SERVICE_RESULT_OK,
+                connectionIntentServiceStatus(result.value).toBundle(),
+            )
+            is RecoveryStoreResult.Failure -> intent.resultReceiver().sendError(result.code)
+        }
+        stopIfIdle()
+    }
+
+    private fun handleBeginBackgroundLogout(intent: Intent) {
+        when (val result = beginDispatchedLogout(connectionIntentDispatch) {
+            logoutCoordinator.begin()
+        }) {
+            is AndroidLogoutResult.Accepted -> {
+                connectionIntentRuntimeFence.cancelActive()
+                intent.resultReceiver()?.send(
+                    SERVICE_RESULT_OK,
+                    Bundle().apply {
+                        putString(
+                            EXTRA_LOGOUT_OWNERSHIP,
+                            BackgroundLogoutOwnership.NATIVE.wireName,
+                        )
+                    },
+                )
+                scheduleLogoutAttempt()
+            }
+            is AndroidLogoutResult.NotOwned -> {
+                connectionIntentRuntimeFence.cancelActive()
+                intent.resultReceiver()?.send(
+                    SERVICE_RESULT_OK,
+                    Bundle().apply {
+                        putString(
+                            EXTRA_LOGOUT_OWNERSHIP,
+                            BackgroundLogoutOwnership.NOT_OWNED.wireName,
+                        )
+                    },
+                )
+                val durableConnectionWork = result.envelope.leaseTransaction != null ||
+                    result.envelope.intent.retry.pendingAction != null
+                if (durableConnectionWork) scheduleConnectionIntentAttempt() else stopIfIdle()
+            }
+            is AndroidLogoutResult.Failure -> {
+                intent.resultReceiver().sendError(result.code)
+                stopIfIdle()
+            }
+        }
+    }
+
     private fun handleConfigureBackground(intent: Intent) {
         val receiver = intent.resultReceiver()
         try {
@@ -405,6 +735,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     EXTRA_MUTATION_PENDING,
                     envelope.pending != null || envelope.reservation != null,
                 )
+                putLong(EXTRA_CAPABILITY_REVISION, envelope.capability?.revision ?: 0L)
                 putBoolean(EXTRA_CAPABILITY_ENABLED, envelope.capability?.enabled == true)
                 putLong(
                     EXTRA_CAPABILITY_EXPIRES_AT,
@@ -416,7 +747,12 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 }
             },
         )
-        stopIfIdle()
+        if (envelope.logoutState?.phase == BackgroundLogoutPhase.PENDING) {
+            promoteToForeground()
+            connectionIntentLifecycle.onEnsureRunning()
+        } else {
+            stopIfIdle()
+        }
     }
 
     private fun handleRotateBackground(intent: Intent) {
@@ -475,7 +811,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
             stopIfIdle()
             return
         }
+        backgroundCredentialProvisionInFlight.set(true)
         credentialExecutor.execute {
+            var provisioned = false
             try {
                 provisionBackgroundCredential(
                     store = AndroidBackgroundCredentialStores.open(applicationContext),
@@ -485,6 +823,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     prepare = BackgroundConnectionClient::prepareTokenWithBearer,
                     activate = BackgroundConnectionClient::activateToken,
                 )
+                provisioned = true
                 runCatching { AutomaticDiagnostics.credentialUpdated(applicationContext) }
                     .onFailure {
                         TunnelLog.warning("diagnostics.credential_update_failed", error = it)
@@ -495,6 +834,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
             } catch (_: Throwable) {
                 receiver.sendError("background_credential_provision_failed")
             } finally {
+                backgroundCredentialProvisionInFlight.set(false)
+                if (provisioned) connectionIntentCoordinator.credentialProvisioningCompleted()
+                connectionIntentLifecycle.onEnsureRunning()
                 stopIfIdle()
             }
         }
@@ -676,15 +1018,28 @@ class NelomaiVpnService : GoBackend.VpnService() {
         TunnelLog.warning("service.vpn_revoked")
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
-        QuickTunnelController.updateState(
-            applicationContext,
-            SessionState.STOPPED,
-            desiredActive = false,
-            changed = true,
+        val disposition = routeAndroidVpnRevoke(
+            dispatch = connectionIntentDispatch,
+            coordinator = connectionIntentCoordinator,
+            runtimeFence = connectionIntentRuntimeFence,
+            updateStopping = {
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.STOPPING,
+                    desiredActive = null,
+                    changed = true,
+                )
+            },
+            resumePendingWork = connectionIntentLifecycle::onEnsureRunning,
         )
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        (disposition.cancelled as? AndroidCoordinatorResult.Failure)?.let {
+            TunnelLog.warning("service.vpn_revoke_cancel_failed", it.code)
+        }
+        applyAndroidVpnRevokeLifecycle(disposition, ::invokeFrameworkVpnRevoke)
+    }
+
+    private fun invokeFrameworkVpnRevoke() {
         super.onRevoke()
-        stopSelf()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -697,6 +1052,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     override fun onDestroy() {
         idleStopDebouncer.cancel()
         cancelRestoreRetry()
+        restoreHandler.removeCallbacks(logoutRetry)
         credentialExecutor.shutdownNow()
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
@@ -750,29 +1106,185 @@ class NelomaiVpnService : GoBackend.VpnService() {
         restoreHandler.postDelayed(recycle, IDLE_PROCESS_RECYCLE_DELAY_MILLIS)
     }
 
-    private fun performBackgroundToggle() {
-        dispatchBackgroundToggle(
-            desiredActive = QuickTunnelController.desiredActive(applicationContext),
-            start = { performBackgroundStart(restoring = false) },
-            stop = {
-                TunnelRuntime.backgroundStop(
-                    applicationContext,
-                    onSuccess = { state, _ ->
-                        completeBackgroundAction(state, null, false, false)
-                    },
-                    onError = {
-                        completeBackgroundAction(TunnelRuntime.state(), it, false, false)
-                    },
-                )
-            },
-        )
+    private fun performBackgroundToggle(receiver: ResultReceiver? = null) {
+        // Seal any legacy projection first; the actual desired/generation pair below
+        // comes from one encrypted recovery-envelope read.
+        QuickTunnelController.desiredActive(applicationContext)
+        val quickDispatch = when (val result = connectionIntentCoordinator.quickToggle(
+            connectionIntentDispatch,
+        )) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> {
+                receiver.sendError(result.code)
+                stopIfIdle()
+                return
+            }
+        }
+        when (val dispatch = quickDispatch) {
+            is AndroidQuickToggleDispatch.Start ->
+                dispatchSerializedConnectionIntentMutation(credentialExecutor) {
+                    val credential = BackgroundCredentialStore.load(applicationContext)
+                    val quick = QuickTunnelPlanStore.loadTemplate(applicationContext)
+                    val quickTemplate = try {
+                        if (credential == null) {
+                            null
+                        } else {
+                            quick?.let {
+                                quickConnectionIntentTemplate(
+                                    deviceId = credential.deviceId,
+                                    quick = it,
+                                    androidApiLevel = Build.VERSION.SDK_INT,
+                                )
+                            }
+                        }
+                    } catch (_: Throwable) {
+                        null
+                    }
+                    when (val accepted = executeDispatchedQuickStart(
+                        dispatch = connectionIntentDispatch,
+                        start = dispatch,
+                        selectPolicy = {
+                            if (quickTemplate == null) {
+                                AndroidQuickStartPolicy.LEGACY
+                            } else {
+                                selectQuickStartPolicy(
+                                    store = AndroidBackgroundCredentialStores.open(
+                                        applicationContext,
+                                    ),
+                                    template = quickTemplate,
+                                    nowUnix = Instant.now().epochSecond,
+                                    provisionInFlight = backgroundCredentialProvisionInFlight.get(),
+                                    fetch = BackgroundConnectionClient::capabilities,
+                                )
+                            }
+                        },
+                        recoveryStart = {
+                            if (quickTemplate == null) {
+                                AndroidCoordinatorResult.Failure("connection_intent_invalid")
+                            } else {
+                                beginExplicitConnectionIntent(quickTemplate, dispatch.ticket)
+                            }
+                        },
+                        legacyStart = { performLegacyBackgroundStart(receiver) },
+                    )) {
+                        is AndroidQuickStartExecution.RecoveryAccepted -> {
+                            QuickTunnelController.updateState(
+                                applicationContext,
+                                SessionState.STARTING,
+                                desiredActive = null,
+                            )
+                            receiver?.send(
+                                SERVICE_RESULT_OK,
+                                connectionIntentServiceStatus(accepted.envelope).toBundle(),
+                            )
+                            scheduleConnectionIntentAttempt()
+                        }
+                        AndroidQuickStartExecution.LegacyStarted -> Unit
+                        is AndroidQuickStartExecution.Failure -> {
+                            receiver.sendError(accepted.code)
+                            if (accepted.code == "connection_intent_generation_conflict") {
+                                stopIfIdle()
+                            } else {
+                                completeBackgroundAction(
+                                    TunnelRuntime.state(),
+                                    accepted.code,
+                                    false,
+                                    false,
+                                )
+                            }
+                        }
+                    }
+                }
+            AndroidQuickToggleDispatch.Stop -> {
+                when (val cancelled = cancelDispatchedConnectionIntent(connectionIntentDispatch) {
+                    connectionIntentCoordinator.cancelCurrentForQuickToggle()
+                }) {
+                    is AndroidCoordinatorResult.Accepted -> {
+                        connectionIntentRuntimeFence.cancelActive()
+                        QuickTunnelController.updateState(
+                            applicationContext,
+                            SessionState.STOPPING,
+                            desiredActive = null,
+                        )
+                        receiver?.send(
+                            SERVICE_RESULT_OK,
+                            connectionIntentServiceStatus(cancelled.envelope).toBundle(),
+                        )
+                        scheduleConnectionIntentAttempt()
+                    }
+                    is AndroidCoordinatorResult.Failure -> {
+                        receiver.sendError(cancelled.code)
+                        completeBackgroundAction(
+                            TunnelRuntime.state(),
+                            cancelled.code,
+                            false,
+                            false,
+                        )
+                    }
+                }
+            }
+        }
     }
 
-    private fun performBackgroundStart(restoring: Boolean) {
-        TunnelRuntime.backgroundStart(
-            applicationContext,
-            onSuccess = { state, _ -> completeBackgroundAction(state, null, restoring, true) },
-            onError = { completeBackgroundAction(TunnelRuntime.state(), it, restoring, true) },
+    internal fun performLegacyBackgroundStart(
+        receiver: ResultReceiver?,
+        boundary: LegacyBackgroundStartServiceBoundary? = null,
+    ) {
+        val operation = boundary ?: LegacyBackgroundStartServiceBoundary(
+            start = { onSuccess, onError ->
+                TunnelRuntime.backgroundStart(applicationContext, onSuccess, onError)
+            },
+            runtimeState = TunnelRuntime::state,
+            durableDesiredActive = {
+                QuickTunnelController.desiredActive(applicationContext)
+            },
+            complete = { state, errorCode, desiredActive ->
+                completeBackgroundAction(
+                    state,
+                    errorCode,
+                    restoring = false,
+                    starting = true,
+                    desiredActive = desiredActive,
+                )
+            },
+            status = {
+                (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)
+                    ?.value
+                    ?.let(::connectionIntentServiceStatus)
+            },
+        )
+        operation.start(
+            { state, _ ->
+                operation.complete(
+                    state,
+                    null,
+                    legacyStartCallbackDesiredActive(
+                        operation.durableDesiredActive(),
+                        state,
+                    ),
+                )
+                val status = operation.status()
+                if (status == null) {
+                    receiver.sendError("recovery_record_read_failed")
+                } else {
+                    receiver?.send(
+                        SERVICE_RESULT_OK,
+                        status.toBundle(),
+                    )
+                }
+            },
+            { code ->
+                receiver.sendError(code)
+                val state = operation.runtimeState()
+                operation.complete(
+                    state,
+                    code,
+                    legacyStartCallbackDesiredActive(
+                        operation.durableDesiredActive(),
+                        state,
+                    ),
+                )
+            },
         )
     }
 
@@ -786,24 +1298,400 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
         promoteToForeground()
         TunnelLog.info("service.restore_requested", mapOf("source" to source))
-        performBackgroundStart(restoring = true)
+        scheduleConnectionIntentAttempt()
     }
 
-    private fun stopIfIdle() {
-        if (TunnelRuntime.state() != SessionState.RUNNING &&
-            !QuickTunnelController.desiredActive(applicationContext)
-        ) {
-            idleStopDebouncer.schedule {
-                if (TunnelRuntime.state() != SessionState.RUNNING &&
-                    !QuickTunnelController.desiredActive(applicationContext)
-                ) {
-                    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+    private fun scheduleConnectionIntentAttempt(delayMillis: Long = 0L) {
+        restoreHandler.removeCallbacks(restoreRetry)
+        val envelope = (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)?.value
+        if (envelope?.isTerminalConnectionIntent() == true) {
+            return
+        }
+        if (delayMillis > 0) {
+            scheduleConnectionIntentTimer(delayMillis)
+            return
+        }
+        connectionIntentAttemptDispatcher.request()
+    }
+
+    private fun handleDataPlaneStall(leaseId: String): Boolean {
+        return when (val result = connectionIntentCoordinator.dataPlaneStalled(leaseId)) {
+            is AndroidCoordinatorResult.Accepted -> {
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.STOPPING,
+                    desiredActive = null,
+                    changed = true,
+                )
+                scheduleConnectionIntentAttempt()
+                TunnelPlugin.refreshQuickTile(applicationContext)
+                true
+            }
+            is AndroidCoordinatorResult.Failure -> {
+                TunnelLog.warning("tunnel.data_plane_stall_handoff_failed", result.code)
+                false
+            }
+        }
+    }
+
+    private fun scheduleConnectionIntentTimer(delayMillis: Long) {
+        restoreHandler.removeCallbacks(restoreRetry)
+        restoreHandler.postDelayed(restoreRetry, delayMillis.coerceAtLeast(1))
+    }
+
+    private fun scheduleLogoutAttempt(delayMillis: Long = 0L) {
+        restoreHandler.removeCallbacks(logoutRetry)
+        if (delayMillis > 0) {
+            restoreHandler.postDelayed(logoutRetry, delayMillis)
+            return
+        }
+        credentialExecutor.execute {
+            val step = logoutCoordinator.runOnce(
+                ServiceConnectionIntentPanel(),
+                ServiceConnectionIntentRuntime(),
+                activate = BackgroundConnectionClient::activateToken,
+                finalize = BackgroundConnectionClient::finalizeLogout,
+            )
+            restoreHandler.post {
+                if (step == AndroidLogoutStep.RETRY) {
+                    val delay = RESTORE_RETRY_DELAYS_MILLIS[
+                        restoreRetryAttempt.coerceAtMost(
+                            RESTORE_RETRY_DELAYS_MILLIS.lastIndex,
+                        )
+                    ]
+                    restoreRetryAttempt += 1
+                    scheduleLogoutAttempt(delay)
+                } else {
+                    restoreRetryAttempt = 0
+                    stopIfIdle()
                 }
             }
-        } else {
-            idleStopDebouncer.cancel()
         }
+    }
+
+    private fun hasPendingBackgroundLogout(): Boolean = when (
+        val result = AndroidBackgroundCredentialStores.open(applicationContext).read()
+    ) {
+        is CredentialStoreResult.Success ->
+            result.value.logoutState?.phase == BackgroundLogoutPhase.PENDING
+        is CredentialStoreResult.Failure -> false
+    }
+
+    private fun completeConnectionIntentStep(step: AndroidCoordinatorStep) {
+        val envelope = (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)?.value
+        when (step) {
+            AndroidCoordinatorStep.ACTIVE -> {
+                cancelRestoreRetry()
+                refreshConnectionNotification("VPN-подключение активно")
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.RUNNING,
+                    desiredActive = null,
+                    changed = true,
+                )
+            }
+            AndroidCoordinatorStep.IDLE -> {
+                cancelRestoreRetry()
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.STOPPED,
+                    desiredActive = null,
+                    changed = true,
+                )
+                stopIfIdle()
+            }
+            AndroidCoordinatorStep.RETRY -> {
+                val initialTerminalPending =
+                    envelope?.intent?.retry?.terminalDiagnosticPending == true
+                if (initialTerminalPending) {
+                    val initialTerminalEnvelope = requireNotNull(envelope)
+                    val handoffStarted = initialTerminalEnvelope.intent.retry.lastErrorCode?.let {
+                        errorCode ->
+                        runCatching {
+                            AutomaticDiagnostics.onConnectionIntentTerminalFailure(
+                                applicationContext,
+                                initialTerminalEnvelope.intent.diagnosticsEpisodeId,
+                                errorCode,
+                            ) { outcome ->
+                                restoreHandler.post {
+                                    routeInitialTerminalDiagnosticHandoff(
+                                        outcome,
+                                        acknowledge = {
+                                            connectionIntentCoordinator
+                                                .acknowledgeInitialTerminalDiagnostic(
+                                                    initialTerminalEnvelope.intent.generation,
+                                                    initialTerminalEnvelope.intent
+                                                        .diagnosticsEpisodeId,
+                                                )
+                                        },
+                                        continueRecovery = ::scheduleRestoreRetry,
+                                    )
+                                }
+                            }
+                            true
+                        }.onFailure {
+                            TunnelLog.warning(
+                                "diagnostics.connection_intent_state_failed",
+                                error = it,
+                            )
+                        }.getOrDefault(false)
+                    } == true
+                    QuickTunnelController.updateState(
+                        applicationContext,
+                        SessionState.STOPPED,
+                        desiredActive = null,
+                        changed = true,
+                    )
+                    if (!handoffStarted) scheduleRestoreRetry()
+                    return
+                } else envelope?.intent?.retry?.let { retry ->
+                    val errorCode = retry.lastErrorCode
+                    val nextRetryAtUnix = retry.nextRetryAtUnix
+                    if (errorCode != null && nextRetryAtUnix != null) {
+                        val notify = runCatching {
+                            AutomaticDiagnostics.onConnectionIntentRetryScheduled(
+                                applicationContext,
+                                envelope.intent.diagnosticsEpisodeId,
+                                errorCode,
+                                retry.attempt,
+                                nextRetryAtUnix,
+                                retry.scheduledDelaySeconds,
+                            )
+                        }.onFailure {
+                            TunnelLog.warning(
+                                "diagnostics.connection_intent_state_failed",
+                                error = it,
+                            )
+                        }.getOrDefault(false)
+                        if (notify) {
+                            refreshConnectionNotification(
+                                "Сеть недоступна — подключение восстановится автоматически",
+                            )
+                        }
+                    }
+                }
+                scheduleRestoreRetry()
+            }
+            AndroidCoordinatorStep.CLEANUP_REQUIRED,
+            AndroidCoordinatorStep.BUSY,
+            -> scheduleRestoreRetry()
+            AndroidCoordinatorStep.TERMINAL -> {
+                envelope?.intent?.retry?.lastErrorCode?.let { errorCode ->
+                    runCatching {
+                        AutomaticDiagnostics.onConnectionIntentTerminalFailure(
+                            applicationContext,
+                            envelope.intent.diagnosticsEpisodeId,
+                            errorCode,
+                        )
+                    }.onFailure {
+                        TunnelLog.warning(
+                            "diagnostics.connection_intent_state_failed",
+                            error = it,
+                        )
+                    }
+                }
+                cancelRestoreRetry()
+                refreshConnectionNotification(
+                    "Автовосстановление остановлено — откройте Nelomai и нажмите «Повторить»",
+                )
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    TunnelRuntime.state(),
+                    desiredActive = null,
+                    changed = true,
+                )
+            }
+        }
+        TunnelPlugin.refreshQuickTile(applicationContext)
+    }
+
+    private inner class ServiceConnectionIntentPanel : AndroidConnectionIntentPanel {
+        override fun reconcile(
+            transaction: AndroidLeaseTransaction,
+            cancelIfAbsent: Boolean,
+        ): BackgroundReconcileResult {
+            val stalledLeaseId = transaction.leaseId.takeIf {
+                transaction.cleanupFailureCode == "tunnel_data_plane_stalled"
+            }
+            return BackgroundConnectionClient.reconcile(
+                serviceCredential(),
+                stalledLeaseId?.let { requireNotNull(transaction.stopOperationId) }
+                    ?: transaction.startOperationId,
+                if (stalledLeaseId == null) "start" else "stalled_stop",
+                transaction.replay.contractVersion,
+                stalledLeaseId?.let(::androidStalledStopFingerprint)
+                    ?: transaction.replay.requestFingerprint,
+                cancelIfAbsent,
+            )
+        }
+
+        override fun start(
+            template: AndroidIntentTemplate,
+            transaction: AndroidLeaseTransaction,
+        ): BackgroundStartResult {
+            val credential = serviceActiveCredential(template.deviceId)
+            val networkIdentity = runCatching {
+                PhysicalNetworks(applicationContext).snapshotState().fingerprint
+            }.getOrDefault("unavailable")
+            return BackgroundConnectionClient.startExact(
+                credential,
+                template,
+                transaction,
+                candidateProbeCache,
+                networkIdentity,
+            )
+        }
+
+        override fun syncBindingPreferences(template: AndroidIntentTemplate) {
+            BackgroundConnectionClient.syncBindingPreferences(
+                serviceActiveCredential(template.deviceId),
+                template,
+            )
+        }
+
+        override fun stop(leaseId: String, operationId: String, failureCode: String?) {
+            BackgroundConnectionClient.stop(
+                serviceCredential(),
+                leaseId,
+                operationId,
+                failureCode,
+            )
+        }
+    }
+
+    private inner class ServiceConnectionIntentRuntime : AndroidConnectionIntentRuntime {
+        private val boundary = ServiceConnectionIntentRuntimeBoundary(
+            startTransport = { result, operationId, onSuccess, onError ->
+                TunnelRuntime.start(
+                    applicationContext,
+                    StartTunnelArgs().apply {
+                        apiVersion = TUNNEL_API_VERSION
+                        clientOperationId = operationId
+                        startSource = "connection_intent"
+                        configuration = result.configuration
+                        options = result.options
+                        cacheQuickAction = true
+                        quickConnection = result.connection
+                    },
+                    { state, _ -> onSuccess(state == SessionState.RUNNING) },
+                    onError,
+                    keepForegroundServiceOnFailure = true,
+                )
+            },
+            cancelStartTransport = { operationId ->
+                TunnelRuntime.cancelClientStart(applicationContext, operationId)
+            },
+            startFence = connectionIntentRuntimeFence,
+            stopTransport = { onSuccess, onError ->
+                TunnelRuntime.stop(
+                    TUNNEL_API_VERSION,
+                    { state, _ -> onSuccess(state == SessionState.STOPPED) },
+                    onError,
+                    keepForegroundService = true,
+                )
+            },
+            running = { TunnelRuntime.state() == SessionState.RUNNING },
+        )
+
+        override fun start(
+            result: BackgroundStartResult,
+            operationId: String,
+            isCurrent: () -> Boolean,
+        ): Boolean = boundary.start(result, operationId, isCurrent)
+
+        override fun stop(): Boolean = boundary.stop()
+
+        override fun isRunning(): Boolean = boundary.isRunning()
+    }
+
+    private fun serviceCredential(): BackgroundCredential {
+        val envelope = when (val result = AndroidBackgroundCredentialStores.open(
+            applicationContext,
+        ).read()) {
+            is CredentialStoreResult.Success -> result.value
+            is CredentialStoreResult.Failure -> throw BackgroundConnectionException(result.code)
+        }
+        return envelope.active ?: envelope.cleanupCredential
+            ?: throw BackgroundConnectionException("invalid_background_token")
+    }
+
+    private fun serviceActiveCredential(deviceId: String): BackgroundCredential {
+        val envelope = when (val result = AndroidBackgroundCredentialStores.open(
+            applicationContext,
+        ).read()) {
+            is CredentialStoreResult.Success -> result.value
+            is CredentialStoreResult.Failure -> throw BackgroundConnectionException(result.code)
+        }
+        val credential = envelope.active
+            ?: throw BackgroundConnectionException("invalid_background_token")
+        if (credential.deviceId != deviceId) {
+            throw BackgroundConnectionException("background_credential_device_mismatch")
+        }
+        return credential
+    }
+
+    private fun beginExplicitConnectionIntent(
+        template: AndroidIntentTemplate,
+        ticket: AndroidConnectionIntentDispatchTicket,
+    ): AndroidCoordinatorResult = beginObservedConnectionIntent(
+        coordinator = connectionIntentCoordinator,
+        template = template,
+        validateNewIntent = ::validateNewIntentCapability,
+        expectedGeneration = ticket.expectedGeneration,
+        canCommitNewIntent = { connectionIntentDispatch.isCurrent(ticket) },
+        onStarted = { diagnosticsEpisodeId ->
+            runCatching {
+                AutomaticDiagnostics.onConnectionIntentStarted(
+                    applicationContext,
+                    diagnosticsEpisodeId,
+                )
+            }.onFailure {
+                TunnelLog.warning(
+                    "diagnostics.connection_intent_state_failed",
+                    error = it,
+                )
+            }
+        },
+    )
+
+    private fun validateNewIntentCapability(template: AndroidIntentTemplate) {
+        val credentialStore = AndroidBackgroundCredentialStores.open(applicationContext)
+        refreshAndValidateNewIntentCapability(
+            store = credentialStore,
+            template = template,
+            nowUnix = Instant.now().epochSecond,
+            provisionInFlight = backgroundCredentialProvisionInFlight.get(),
+            fetch = BackgroundConnectionClient::capabilities,
+        )
+    }
+
+    private fun canonicalUuid(value: String?): String {
+        val parsed = UUID.fromString(requireNotNull(value)).toString()
+        if (parsed != value) throw BackgroundConnectionException("invalid_connection_intent")
+        return parsed
+    }
+
+    private fun requireWireChoice(value: String?, allowed: Set<String>): String =
+        requireNotNull(value).also {
+            if (it !in allowed) throw BackgroundConnectionException("invalid_connection_intent")
+        }
+
+    private fun stopIfIdle() {
+        applyAndroidVpnServiceIdleLifecycle(
+            debouncer = idleStopDebouncer,
+            shouldStop = {
+                shouldStopVpnService(
+                    TunnelRuntime.state(),
+                    QuickTunnelController.desiredActive(applicationContext),
+                    hasPendingBackgroundLogout(),
+                    connectionIntentLifecycle.hasPendingWork(),
+                )
+            },
+            stop = {
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            },
+        )
     }
 
     private fun completeBackgroundAction(
@@ -811,6 +1699,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         errorCode: String?,
         restoring: Boolean,
         starting: Boolean,
+        desiredActive: Boolean? = state == SessionState.RUNNING,
     ) {
         if (errorCode == "tunnel_operation_in_progress") {
             TunnelLog.info("quick_toggle.duplicate_ignored")
@@ -834,6 +1723,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         errorCode,
                         restoring,
                         deferErrorServiceStop = true,
+                        desiredActive = desiredActive,
                     )
                 },
                 finishDeferredServiceStop = {
@@ -848,7 +1738,12 @@ class NelomaiVpnService : GoBackend.VpnService() {
             )
             return
         }
-        finishBackgroundAction(state, errorCode, restoring)
+        finishBackgroundAction(
+            state,
+            errorCode,
+            restoring,
+            desiredActive = desiredActive,
+        )
     }
 
     private fun finishBackgroundAction(
@@ -856,6 +1751,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         errorCode: String?,
         restoring: Boolean,
         deferErrorServiceStop: Boolean = false,
+        desiredActive: Boolean? = state == SessionState.RUNNING,
     ): Boolean {
         val retryRestore = errorCode != null && restoring && shouldRetryServiceRestore(errorCode)
         if (retryRestore) {
@@ -874,7 +1770,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         QuickTunnelController.updateState(
             applicationContext,
             state,
-            desiredActive = state == SessionState.RUNNING,
+            desiredActive = desiredActive,
             changed = true,
         )
         TunnelPlugin.refreshQuickTile(applicationContext)
@@ -917,11 +1813,20 @@ class NelomaiVpnService : GoBackend.VpnService() {
 
     private fun scheduleRestoreRetry() {
         restoreHandler.removeCallbacks(restoreRetry)
-        val delay = RESTORE_RETRY_DELAYS_MILLIS[
-            restoreRetryAttempt.coerceAtMost(RESTORE_RETRY_DELAYS_MILLIS.lastIndex)
-        ]
+        val envelope = (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)
+            ?.value
+        val delay = if (envelope?.intent?.retry?.nextRetryAtUnix != null) {
+            connectionIntentPersistedDelayMillis(
+                envelope,
+                nowUnix = System.currentTimeMillis() / 1_000,
+            )
+        } else {
+            RESTORE_RETRY_DELAYS_MILLIS[
+                restoreRetryAttempt.coerceAtMost(RESTORE_RETRY_DELAYS_MILLIS.lastIndex)
+            ]
+        }
         restoreRetryAttempt += 1
-        restoreHandler.postDelayed(restoreRetry, delay)
+        restoreHandler.postDelayed(restoreRetry, delay.coerceAtLeast(1))
     }
 
     private fun cancelRestoreRetry() {
@@ -947,6 +1852,16 @@ class NelomaiVpnService : GoBackend.VpnService() {
         internal const val ACTION_CLIENT_STATUS = "ru.nelomai.tunnel.CLIENT_STATUS"
         internal const val ACTION_CLIENT_METRICS = "ru.nelomai.tunnel.CLIENT_METRICS"
         internal const val ACTION_CLIENT_REBIND_UDP = "ru.nelomai.tunnel.CLIENT_REBIND_UDP"
+        internal const val ACTION_BEGIN_CONNECTION_INTENT =
+            "ru.nelomai.tunnel.BEGIN_CONNECTION_INTENT"
+        internal const val ACTION_CANCEL_CONNECTION_INTENT =
+            "ru.nelomai.tunnel.CANCEL_CONNECTION_INTENT"
+        internal const val ACTION_CANCEL_CURRENT_CONNECTION_INTENT =
+            "ru.nelomai.tunnel.CANCEL_CURRENT_CONNECTION_INTENT"
+        internal const val ACTION_CONNECTION_INTENT_STATUS =
+            "ru.nelomai.tunnel.CONNECTION_INTENT_STATUS"
+        internal const val ACTION_BEGIN_BACKGROUND_LOGOUT =
+            "ru.nelomai.tunnel.BEGIN_BACKGROUND_LOGOUT"
         internal const val ACTION_CONFIGURE_BACKGROUND = "ru.nelomai.tunnel.CONFIGURE_BACKGROUND"
         internal const val ACTION_ROTATE_BACKGROUND = "ru.nelomai.tunnel.ROTATE_BACKGROUND"
         internal const val ACTION_PROVISION_BACKGROUND = "ru.nelomai.tunnel.PROVISION_BACKGROUND"
@@ -963,11 +1878,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
             ACTION_QUICK_TOGGLE,
             ACTION_ENSURE_RUNNING,
             ACTION_CLIENT_START,
+            ACTION_BEGIN_CONNECTION_INTENT,
+            ACTION_BEGIN_BACKGROUND_LOGOUT,
         )
         private val RESTORE_RETRY_DELAYS_MILLIS = longArrayOf(
+            2_000L,
             5_000L,
+            15_000L,
             30_000L,
-            120_000L,
+            60_000L,
             300_000L,
         )
         private const val IDLE_PROCESS_RECYCLE_DELAY_MILLIS = 10_000L
@@ -999,8 +1918,24 @@ class NelomaiVpnService : GoBackend.VpnService() {
             }
         }
 
+        fun reportDataPlaneStall(leaseId: String): Boolean =
+            activeService?.handleDataPlaneStall(leaseId) == true
+
+        fun resumeConnectionIntentRecovery() {
+            activeService?.scheduleConnectionIntentAttempt()
+        }
+
         fun setPhysicalNetworks(networks: List<Network>) {
-            activeService?.setUnderlyingNetworks(networks.toTypedArray().takeIf { it.isNotEmpty() })
+            activeService?.run {
+                candidateProbeCache.invalidateNetwork()
+                setUnderlyingNetworks(networks.toTypedArray().takeIf { it.isNotEmpty() })
+                if (QuickTunnelController.desiredActive(applicationContext)) {
+                    runCatching {
+                        AutomaticDiagnostics.onConnectionIntentNetworkWakeup()
+                    }
+                    scheduleConnectionIntentAttempt()
+                }
+            }
         }
 
         private fun quickActionError(code: String): String = when (code) {
@@ -1040,7 +1975,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
         )
     }
 
-    private fun connectionNotification(): android.app.Notification {
+    private fun connectionNotification(
+        content: String = "VPN-подключение активно",
+    ): android.app.Notification {
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         val pendingIntent = launchIntent?.let {
             PendingIntent.getActivity(
@@ -1053,16 +1990,1867 @@ class NelomaiVpnService : GoBackend.VpnService() {
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL)
             .setSmallIcon(R.drawable.ic_vpn_notification)
             .setContentTitle("Nelomai")
-            .setContentText("VPN-подключение активно")
+            .setContentText(content)
             .setOngoing(true)
             .setSilent(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .apply { pendingIntent?.let(::setContentIntent) }
             .build()
     }
+
+    private fun refreshConnectionNotification(content: String) {
+        getSystemService(NotificationManager::class.java).notify(
+            NOTIFICATION_ID,
+            connectionNotification(content),
+        )
+    }
 }
 
 private class CredentialRotationFailure(val code: String) : RuntimeException(code)
+
+internal sealed class AndroidCoordinatorResult {
+    data class Accepted(val envelope: AndroidRecoveryEnvelope) : AndroidCoordinatorResult()
+    data class Failure(val code: String) : AndroidCoordinatorResult()
+}
+
+internal data class AndroidConnectionIntentDispatchTicket(
+    val epoch: Long,
+    val expectedGeneration: Long,
+)
+
+internal sealed class AndroidQuickToggleDispatch {
+    data class Start(
+        val ticket: AndroidConnectionIntentDispatchTicket,
+        val recoveryOwned: Boolean = false,
+    ) :
+        AndroidQuickToggleDispatch()
+
+    object Stop : AndroidQuickToggleDispatch()
+}
+
+internal class AndroidConnectionIntentDispatchState {
+    private val gate = Any()
+    private var epoch = 0L
+    private var pendingStart = false
+
+    fun start(expectedGeneration: Long): AndroidConnectionIntentDispatchTicket =
+        synchronized(gate) {
+            epoch = epoch.checkedIncrementDispatchEpoch()
+            pendingStart = true
+            AndroidConnectionIntentDispatchTicket(epoch, expectedGeneration)
+        }
+
+    fun toggle(
+        expectedGeneration: Long,
+        durableDesiredActive: Boolean,
+        recoveryOwned: Boolean = false,
+    ): AndroidQuickToggleDispatch = synchronized(gate) {
+        toggleLocked(expectedGeneration, durableDesiredActive, recoveryOwned)
+    }
+
+    fun toggleFromSnapshot(
+        snapshot: () -> RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    ): RecoveryStoreResult<AndroidQuickToggleDispatch> = synchronized(gate) {
+        when (val result = snapshot()) {
+            is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(
+                toggleLocked(
+                    expectedGeneration = result.value.intent.generation,
+                    durableDesiredActive = result.value.intent.desiredActive,
+                    recoveryOwned = result.value.leaseTransaction != null,
+                ),
+            )
+            is RecoveryStoreResult.Failure -> result
+        }
+    }
+
+    private fun toggleLocked(
+        expectedGeneration: Long,
+        durableDesiredActive: Boolean,
+        recoveryOwned: Boolean,
+    ): AndroidQuickToggleDispatch {
+        if (pendingStart || durableDesiredActive) {
+            epoch = epoch.checkedIncrementDispatchEpoch()
+            pendingStart = false
+            return AndroidQuickToggleDispatch.Stop
+        } else {
+            epoch = epoch.checkedIncrementDispatchEpoch()
+            pendingStart = true
+            return AndroidQuickToggleDispatch.Start(
+                AndroidConnectionIntentDispatchTicket(epoch, expectedGeneration),
+                recoveryOwned,
+            )
+        }
+    }
+
+    fun invalidate() = synchronized(gate) {
+        epoch = epoch.checkedIncrementDispatchEpoch()
+        pendingStart = false
+    }
+
+    fun isCurrent(ticket: AndroidConnectionIntentDispatchTicket): Boolean =
+        synchronized(gate) { pendingStart && ticket.epoch == epoch }
+
+    fun complete(ticket: AndroidConnectionIntentDispatchTicket): Boolean = synchronized(gate) {
+        if (!pendingStart || ticket.epoch != epoch) {
+            false
+        } else {
+            pendingStart = false
+            true
+        }
+    }
+
+    fun runLegacyIfCurrent(
+        ticket: AndroidConnectionIntentDispatchTicket,
+        start: () -> Unit,
+    ): Boolean = synchronized(gate) {
+        if (!pendingStart || ticket.epoch != epoch) {
+            false
+        } else {
+            try {
+                start()
+            } finally {
+                pendingStart = false
+            }
+            true
+        }
+    }
+
+    private fun Long.checkedIncrementDispatchEpoch(): Long =
+        if (this == Long.MAX_VALUE) 1L else this + 1L
+}
+
+internal fun beginObservedConnectionIntent(
+    coordinator: AndroidConnectionIntentCoordinator,
+    template: AndroidIntentTemplate,
+    validateNewIntent: (AndroidIntentTemplate) -> Unit = {},
+    expectedGeneration: Long? = null,
+    canCommitNewIntent: () -> Boolean = { true },
+    onStarted: (Long) -> Unit,
+): AndroidCoordinatorResult = (if (expectedGeneration == null) {
+    coordinator.begin(template, validateNewIntent)
+} else {
+    coordinator.beginDispatched(
+        template = template,
+        expectedGeneration = expectedGeneration,
+        canCommitNewIntent = canCommitNewIntent,
+        validateNewIntent = validateNewIntent,
+    )
+}).also { result ->
+    if (result is AndroidCoordinatorResult.Accepted) {
+        onStarted(result.envelope.intent.diagnosticsEpisodeId)
+    }
+}
+
+internal fun executeDispatchedConnectionIntent(
+    dispatch: AndroidConnectionIntentDispatchState,
+    ticket: AndroidConnectionIntentDispatchTicket,
+    begin: () -> AndroidCoordinatorResult,
+): AndroidCoordinatorResult {
+    if (!dispatch.isCurrent(ticket)) {
+        return AndroidCoordinatorResult.Failure("connection_intent_generation_conflict")
+    }
+    val result = begin()
+    return if (dispatch.complete(ticket)) {
+        result
+    } else {
+        AndroidCoordinatorResult.Failure("connection_intent_generation_conflict")
+    }
+}
+
+internal enum class AndroidQuickStartPolicy {
+    RECOVERY,
+    LEGACY,
+}
+
+internal sealed class AndroidQuickStartExecution {
+    data class RecoveryAccepted(val envelope: AndroidRecoveryEnvelope) :
+        AndroidQuickStartExecution()
+
+    object LegacyStarted : AndroidQuickStartExecution()
+    data class Failure(val code: String) : AndroidQuickStartExecution()
+}
+
+internal fun executeDispatchedQuickStart(
+    dispatch: AndroidConnectionIntentDispatchState,
+    start: AndroidQuickToggleDispatch.Start,
+    selectPolicy: () -> AndroidQuickStartPolicy,
+    recoveryStart: () -> AndroidCoordinatorResult,
+    legacyStart: () -> Unit,
+): AndroidQuickStartExecution {
+    if (!dispatch.isCurrent(start.ticket)) {
+        return AndroidQuickStartExecution.Failure("connection_intent_generation_conflict")
+    }
+    val policy = if (start.recoveryOwned) {
+        AndroidQuickStartPolicy.RECOVERY
+    } else {
+        try {
+            selectPolicy()
+        } catch (error: BackgroundConnectionException) {
+            return if (dispatch.complete(start.ticket)) {
+                AndroidQuickStartExecution.Failure(error.code)
+            } else {
+                AndroidQuickStartExecution.Failure("connection_intent_generation_conflict")
+            }
+        } catch (_: Throwable) {
+            return if (dispatch.complete(start.ticket)) {
+                AndroidQuickStartExecution.Failure("connection_recovery_failed")
+            } else {
+                AndroidQuickStartExecution.Failure("connection_intent_generation_conflict")
+            }
+        }
+    }
+    return when (policy) {
+        AndroidQuickStartPolicy.RECOVERY -> when (
+            val result = executeDispatchedConnectionIntent(
+                dispatch,
+                start.ticket,
+                recoveryStart,
+            )
+        ) {
+            is AndroidCoordinatorResult.Accepted ->
+                AndroidQuickStartExecution.RecoveryAccepted(result.envelope)
+            is AndroidCoordinatorResult.Failure -> AndroidQuickStartExecution.Failure(result.code)
+        }
+        AndroidQuickStartPolicy.LEGACY -> {
+            var failure: AndroidQuickStartExecution.Failure? = null
+            val dispatched = dispatch.runLegacyIfCurrent(start.ticket) {
+                try {
+                    legacyStart()
+                } catch (error: BackgroundConnectionException) {
+                    failure = AndroidQuickStartExecution.Failure(error.code)
+                } catch (_: Throwable) {
+                    failure = AndroidQuickStartExecution.Failure("legacy_background_start_failed")
+                }
+            }
+            if (!dispatched) {
+                AndroidQuickStartExecution.Failure("connection_intent_generation_conflict")
+            } else {
+                failure ?: AndroidQuickStartExecution.LegacyStarted
+            }
+        }
+    }
+}
+
+internal fun cancelDispatchedConnectionIntent(
+    dispatch: AndroidConnectionIntentDispatchState,
+    cancel: () -> AndroidCoordinatorResult,
+): AndroidCoordinatorResult {
+    dispatch.invalidate()
+    return cancel()
+}
+
+internal data class AndroidVpnRevokeDisposition(
+    val cancelled: AndroidCoordinatorResult,
+    val keepForeground: Boolean,
+)
+
+internal fun routeAndroidVpnRevoke(
+    dispatch: AndroidConnectionIntentDispatchState,
+    coordinator: AndroidConnectionIntentCoordinator,
+    runtimeFence: AndroidRuntimeStartDispatchFence,
+    updateStopping: () -> Unit,
+    resumePendingWork: () -> Boolean,
+): AndroidVpnRevokeDisposition {
+    val cancelled = cancelDispatchedConnectionIntent(dispatch, coordinator::cancelCurrent)
+    runtimeFence.cancelActive()
+    updateStopping()
+    val keepForeground = cancelled is AndroidCoordinatorResult.Accepted &&
+        runCatching(resumePendingWork).getOrDefault(false)
+    return AndroidVpnRevokeDisposition(cancelled, keepForeground)
+}
+
+internal fun applyAndroidVpnRevokeLifecycle(
+    disposition: AndroidVpnRevokeDisposition,
+    invokeFrameworkVpnRevoke: () -> Unit,
+) {
+    // VpnService.onRevoke() calls stopSelf(). A durable cancellation must keep
+    // this service and its executor alive until coordinator cleanup reaches
+    // IDLE; stopIfIdle owns the eventual foreground/service teardown.
+    if (!disposition.keepForeground) invokeFrameworkVpnRevoke()
+}
+
+internal fun applyAndroidVpnServiceIdleLifecycle(
+    debouncer: IdleStopDebouncer,
+    shouldStop: () -> Boolean,
+    stop: () -> Unit,
+) {
+    if (shouldStop()) {
+        debouncer.schedule {
+            if (shouldStop()) stop()
+        }
+    } else {
+        debouncer.cancel()
+    }
+}
+
+internal fun beginDispatchedLogout(
+    dispatch: AndroidConnectionIntentDispatchState,
+    begin: () -> AndroidLogoutResult,
+): AndroidLogoutResult {
+    dispatch.invalidate()
+    return begin()
+}
+
+internal fun refreshAndValidateNewIntentCapability(
+    store: BackgroundCredentialStore,
+    template: AndroidIntentTemplate,
+    nowUnix: Long,
+    provisionInFlight: Boolean = false,
+    fetch: (BackgroundCredential) -> BackgroundCapabilitySnapshot,
+) {
+    if (selectQuickStartPolicy(store, template, nowUnix, provisionInFlight, fetch) ==
+        AndroidQuickStartPolicy.LEGACY
+    ) {
+        throw BackgroundConnectionException("background_credential_capability_unavailable")
+    }
+}
+
+internal fun selectQuickStartPolicy(
+    store: BackgroundCredentialStore,
+    template: AndroidIntentTemplate,
+    nowUnix: Long,
+    provisionInFlight: Boolean = false,
+    fetch: (BackgroundCredential) -> BackgroundCapabilitySnapshot,
+): AndroidQuickStartPolicy {
+    val before = when (val result = store.read()) {
+        is CredentialStoreResult.Success -> result.value
+        is CredentialStoreResult.Failure -> throw BackgroundConnectionException(result.code)
+    }
+    if (before.logoutState != null) {
+        throw BackgroundConnectionException("background_credential_capability_unavailable")
+    }
+    val credential = before.active ?: if (
+        provisionInFlight || before.pending != null || before.reservation != null
+    ) {
+        throw BackgroundConnectionException("background_credential_provision_pending")
+    } else {
+        return AndroidQuickStartPolicy.LEGACY
+    }
+    val refreshed = refreshBackgroundCapability(before.capability, nowUnix) {
+        fetch(credential)
+    }
+    val effective = conservativeBackgroundCapability(before.capability, refreshed)
+    val after = when (val result = store.updateCapability(before.revision, effective)) {
+        is CredentialStoreResult.Success -> result.value
+        is CredentialStoreResult.Failure -> throw BackgroundConnectionException(result.code)
+    }
+    val active = after.active
+        ?: throw BackgroundConnectionException("background_credential_capability_unavailable")
+    val capability = after.capability
+    if (after.logoutState != null || active.deviceId != template.deviceId || capability == null) {
+        throw BackgroundConnectionException("background_credential_capability_unavailable")
+    }
+    return if (capability.enabled && capability.expiresAtUnix > nowUnix) {
+        AndroidQuickStartPolicy.RECOVERY
+    } else {
+        AndroidQuickStartPolicy.LEGACY
+    }
+}
+
+internal enum class AndroidCoordinatorStep {
+    IDLE,
+    ACTIVE,
+    RETRY,
+    CLEANUP_REQUIRED,
+    TERMINAL,
+    BUSY,
+}
+
+internal sealed class AndroidLogoutResult {
+    data class Accepted(val envelope: BackgroundCredentialEnvelope) : AndroidLogoutResult()
+    data class NotOwned(val envelope: AndroidRecoveryEnvelope) : AndroidLogoutResult()
+    data class Failure(val code: String) : AndroidLogoutResult()
+}
+
+internal enum class AndroidLogoutStep {
+    COMPLETE,
+    RETRY,
+}
+
+internal class AndroidLogoutCoordinator(
+    private val credentialStore: BackgroundCredentialStore,
+    private val connectionCoordinator: AndroidConnectionIntentCoordinator,
+    private val operationId: () -> String = { UUID.randomUUID().toString() },
+) {
+    fun begin(): AndroidLogoutResult {
+        val credentialBegin = when (val result = credentialStore.beginLogoutCurrent(
+            operationId(),
+        )) {
+            is CredentialStoreResult.Success -> result.value
+            is CredentialStoreResult.Failure -> return AndroidLogoutResult.Failure(result.code)
+        }
+        val nativeOwned = credentialBegin is BackgroundLogoutBegin.Owned
+        return when (val cancelled = connectionCoordinator.cancelCurrent()) {
+            is AndroidCoordinatorResult.Failure -> if (nativeOwned) {
+                AndroidLogoutResult.Accepted(credentialBegin.envelope)
+            } else {
+                AndroidLogoutResult.Failure(cancelled.code)
+            }
+            is AndroidCoordinatorResult.Accepted -> if (nativeOwned) {
+                AndroidLogoutResult.Accepted(credentialBegin.envelope)
+            } else {
+                AndroidLogoutResult.NotOwned(cancelled.envelope)
+            }
+        }
+    }
+
+    fun runOnce(
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+        activate: (
+            BackgroundCredential,
+            BackgroundPendingToken,
+            String,
+        ) -> BackgroundActivationResult,
+        finalize: (
+            BackgroundCredential,
+            String,
+            Long,
+            String,
+            String,
+        ) -> BackgroundLogoutFinalizeResult,
+    ): AndroidLogoutStep {
+        val beforeCleanup = when (val result = credentialStore.read()) {
+            is CredentialStoreResult.Success -> result.value
+            is CredentialStoreResult.Failure -> return AndroidLogoutStep.RETRY
+        }
+        val logout = beforeCleanup.logoutState ?: return AndroidLogoutStep.COMPLETE
+        if (logout.phase == BackgroundLogoutPhase.FINALIZED) return AndroidLogoutStep.COMPLETE
+        beforeCleanup.pending?.let { pending ->
+            val installSecret = beforeCleanup.installSecret ?: return AndroidLogoutStep.RETRY
+            val credential = try {
+                stagedBackgroundCredential(beforeCleanup, pending)
+            } catch (_: Throwable) {
+                return AndroidLogoutStep.RETRY
+            }
+            val activeExpiresAtUnix = try {
+                val activation = activate(credential, pending, installSecret)
+                if (activation.tokenGeneration != pending.tokenGeneration) {
+                    return AndroidLogoutStep.RETRY
+                }
+                activation.activeExpiresAtUnix
+            } catch (error: BackgroundConnectionException) {
+                if (error.code != "activation_not_applied") {
+                    return AndroidLogoutStep.RETRY
+                }
+                null
+            } catch (_: Throwable) {
+                return AndroidLogoutStep.RETRY
+            }
+            when (credentialStore.resolveLogoutPendingActivation(
+                beforeCleanup.revision,
+                logout.operationId,
+                pending.activationOperationId,
+                activeExpiresAtUnix,
+            )) {
+                is CredentialStoreResult.Success -> Unit
+                is CredentialStoreResult.Failure -> return AndroidLogoutStep.RETRY
+            }
+        }
+        val connectionEnvelope = when (val result = connectionCoordinator.status()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> return AndroidLogoutStep.RETRY
+        }
+        if (connectionEnvelope.intent.desiredActive) {
+            when (connectionCoordinator.cancel(connectionEnvelope.intent.generation)) {
+                is AndroidCoordinatorResult.Failure -> return AndroidLogoutStep.RETRY
+                is AndroidCoordinatorResult.Accepted -> Unit
+            }
+        }
+        when (connectionCoordinator.runOnce(panel, runtime)) {
+            AndroidCoordinatorStep.IDLE -> Unit
+            else -> return AndroidLogoutStep.RETRY
+        }
+        val envelope = when (val result = credentialStore.read()) {
+            is CredentialStoreResult.Success -> result.value
+            is CredentialStoreResult.Failure -> return AndroidLogoutStep.RETRY
+        }
+        val cleanupCredential = envelope.cleanupCredential
+        if (cleanupCredential == null) {
+            return when (credentialStore.finalizeLogout(envelope.revision, logout.operationId)) {
+                is CredentialStoreResult.Success -> AndroidLogoutStep.COMPLETE
+                is CredentialStoreResult.Failure -> AndroidLogoutStep.RETRY
+            }
+        }
+        val deviceId = envelope.deviceId ?: return AndroidLogoutStep.RETRY
+        val installSecret = envelope.installSecret ?: return AndroidLogoutStep.RETRY
+        val accepted = try {
+            finalize(
+                cleanupCredential,
+                deviceId,
+                logout.installGeneration,
+                logout.operationId,
+                installSecret,
+            )
+        } catch (_: Throwable) {
+            return AndroidLogoutStep.RETRY
+        }
+        if (accepted.code != "device_revoked_cleanup_accepted") {
+            return AndroidLogoutStep.RETRY
+        }
+        return when (credentialStore.finalizeLogout(envelope.revision, logout.operationId)) {
+            is CredentialStoreResult.Success -> AndroidLogoutStep.COMPLETE
+            is CredentialStoreResult.Failure -> AndroidLogoutStep.RETRY
+        }
+    }
+}
+
+internal interface AndroidConnectionIntentPanel {
+    fun reconcile(
+        transaction: AndroidLeaseTransaction,
+        cancelIfAbsent: Boolean,
+    ): BackgroundReconcileResult
+
+    fun start(
+        template: AndroidIntentTemplate,
+        transaction: AndroidLeaseTransaction,
+    ): BackgroundStartResult
+
+    fun syncBindingPreferences(template: AndroidIntentTemplate)
+
+    fun stop(leaseId: String, operationId: String, failureCode: String? = null)
+}
+
+internal interface AndroidConnectionIntentRuntime {
+    fun start(
+        result: BackgroundStartResult,
+        operationId: String,
+        isCurrent: () -> Boolean,
+    ): Boolean
+    fun stop(): Boolean
+    fun isRunning(): Boolean
+}
+
+internal class AndroidRuntimeStartDispatchFence {
+    private val gate = Any()
+    private var activeOperationId: String? = null
+    private var activeCancellation: (() -> Unit)? = null
+
+    fun dispatchIfCurrent(
+        operationId: String,
+        isCurrent: () -> Boolean,
+        dispatch: () -> Unit,
+        cancel: () -> Unit,
+    ): Boolean = synchronized(gate) {
+        if (!isCurrent()) return@synchronized false
+        activeOperationId = operationId
+        activeCancellation = cancel
+        dispatch()
+        true
+    }
+
+    fun cancelActive() {
+        val cancellation = synchronized(gate) { activeCancellation }
+        cancellation?.invoke()
+    }
+
+    fun complete(operationId: String) = synchronized(gate) {
+        if (activeOperationId == operationId) {
+            activeOperationId = null
+            activeCancellation = null
+        }
+    }
+}
+
+internal sealed class AndroidRuntimeStartFenceResult {
+    object STARTED : AndroidRuntimeStartFenceResult()
+    data class FAILED(val errorCode: String) : AndroidRuntimeStartFenceResult()
+    object CANCELLED_BEFORE_START : AndroidRuntimeStartFenceResult()
+    object CANCELLED_AFTER_START : AndroidRuntimeStartFenceResult()
+}
+
+internal fun startRuntimeWithConnectionIntentFence(
+    expectedGeneration: Long,
+    operationId: String,
+    current: () -> AndroidRecoveryEnvelope,
+    result: BackgroundStartResult,
+    runtime: AndroidConnectionIntentRuntime,
+): AndroidRuntimeStartFenceResult {
+    var dispatched = false
+    val started = runtime.start(
+        result = result,
+        operationId = operationId,
+        isCurrent = {
+            val before = current()
+            (before.intent.desiredActive && before.intent.generation == expectedGeneration).also {
+                dispatched = it
+            }
+        },
+    )
+    if (!dispatched) {
+        result.configuration.fill(0)
+        return AndroidRuntimeStartFenceResult.CANCELLED_BEFORE_START
+    }
+    if (!started) return AndroidRuntimeStartFenceResult.FAILED("tunnel_backend_error")
+    val after = current()
+    return if (!after.intent.desiredActive || after.intent.generation != expectedGeneration) {
+        AndroidRuntimeStartFenceResult.CANCELLED_AFTER_START
+    } else {
+        AndroidRuntimeStartFenceResult.STARTED
+    }
+}
+
+internal class ServiceConnectionIntentRuntimeBoundary(
+    private val startTransport: (
+        BackgroundStartResult,
+        String,
+        (Boolean) -> Unit,
+        (String) -> Unit,
+    ) -> Unit,
+    private val cancelStartTransport: (String) -> Unit = {},
+    private val startFence: AndroidRuntimeStartDispatchFence = AndroidRuntimeStartDispatchFence(),
+    private val stopTransport: ((Boolean) -> Unit, (String) -> Unit) -> Unit,
+    private val running: () -> Boolean,
+    private val timeoutMillis: Long = 45_000L,
+) : AndroidConnectionIntentRuntime {
+    private data class Completion(
+        val succeeded: Boolean,
+        val errorCode: String? = null,
+    )
+
+    override fun start(
+        result: BackgroundStartResult,
+        operationId: String,
+        isCurrent: () -> Boolean,
+    ): Boolean {
+        val completed = CompletableFuture<Completion>()
+        val dispatched = startFence.dispatchIfCurrent(
+            operationId = operationId,
+            isCurrent = isCurrent,
+            dispatch = {
+                startTransport(
+                    result,
+                    operationId,
+                    { succeeded -> completed.complete(Completion(succeeded)) },
+                    { code -> completed.complete(Completion(false, code)) },
+                )
+            },
+            cancel = { cancelStartTransport(operationId) },
+        )
+        if (!dispatched) return false
+        return try {
+            val completion = await(completed)
+            completion.errorCode?.let { throw BackgroundConnectionException(stableCode(it)) }
+            completion.succeeded
+        } finally {
+            startFence.complete(operationId)
+        }
+    }
+
+    override fun stop(): Boolean {
+        val completed = CompletableFuture<Completion>()
+        stopTransport(
+            { succeeded -> completed.complete(Completion(succeeded)) },
+            { code -> completed.complete(Completion(false, code)) },
+        )
+        return await(completed).succeeded
+    }
+
+    override fun isRunning(): Boolean = running()
+
+    private fun await(completed: CompletableFuture<Completion>): Completion = try {
+        completed.get(timeoutMillis, TimeUnit.MILLISECONDS)
+    } catch (_: Throwable) {
+        Completion(false, "tunnel_service_timeout")
+    }
+
+    private fun stableCode(code: String): String = try {
+        code.also(AndroidRecoveryEnvelopeCodec::validateSafeValue)
+    } catch (_: Throwable) {
+        "tunnel_backend_error"
+    }
+}
+
+internal data class ConnectionIntentServiceStatus(
+    val generation: Long,
+    val desiredActive: Boolean,
+    val status: String,
+    val leasePhase: String?,
+    val nextRetryAtUnix: Long?,
+    val lastErrorCode: String?,
+)
+
+internal class ConnectionIntentServiceLifecycle(
+    private val coordinator: AndroidConnectionIntentCoordinator,
+    private val hasPendingLogout: () -> Boolean = { false },
+    private val scheduleLogout: () -> Unit = {},
+    private val schedule: () -> Unit,
+) {
+    fun onRetryTimer() {
+        if (hasDurableWork()) schedule()
+    }
+
+    fun onStickyRestart(): Boolean = resumeDurableWork()
+
+    fun onEnsureRunning(): Boolean = resumeDurableWork()
+
+    fun hasPendingWork(): Boolean = hasPendingLogout() || hasDurableWork()
+
+    private fun resumeDurableWork(): Boolean {
+        if (hasPendingLogout()) {
+            scheduleLogout()
+            return true
+        }
+        val durable = hasDurableWork()
+        if (durable) schedule()
+        return durable
+    }
+
+    private fun hasDurableWork(): Boolean =
+        (coordinator.status() as? RecoveryStoreResult.Success)
+            ?.value?.let { envelope ->
+                (envelope.leaseTransaction != null ||
+                    envelope.intent.retry.pendingAction == "legacy_runtime_stop") &&
+                    !envelope.isTerminalConnectionIntent()
+            } == true
+}
+
+internal fun shouldStopVpnService(
+    state: SessionState,
+    desiredActive: Boolean,
+    pendingLogout: Boolean,
+    durableConnectionWork: Boolean,
+): Boolean = state != SessionState.RUNNING && !desiredActive && !pendingLogout &&
+    !durableConnectionWork
+
+internal fun legacyStartCallbackDesiredActive(
+    durableDesiredActive: Boolean,
+    state: SessionState,
+): Boolean? = if (!durableDesiredActive) {
+    null
+} else {
+    state in setOf(SessionState.RUNNING, SessionState.STARTING)
+}
+
+private fun AndroidRecoveryEnvelope.isTerminalConnectionIntent(): Boolean =
+    intent.desiredActive && intent.armedHistory && intent.retry.lastErrorCode != null &&
+        intent.retry.nextRetryAtUnix == null &&
+        intent.retry.pendingAction != "terminal_after_cleanup"
+
+internal fun interface AndroidConnectionIntentDiagnosticsObserver {
+    fun leaseReplacementStarted()
+}
+
+internal fun connectionIntentServiceStatus(
+    envelope: AndroidRecoveryEnvelope,
+): ConnectionIntentServiceStatus {
+    val transaction = envelope.leaseTransaction
+    val status = when {
+        transaction?.phase == LeasePhase.CLEANUP_PENDING ||
+            transaction?.phase == LeasePhase.STALE_CLEANUP -> "stopping"
+        envelope.intent.desiredActive && envelope.intent.retry.lastErrorCode != null &&
+            envelope.intent.retry.nextRetryAtUnix == null -> "blocked_terminal"
+        envelope.intent.desiredActive &&
+            (envelope.intent.retry.nextRetryAtUnix != null ||
+                envelope.intent.retry.pendingAction != null) -> "recovering"
+        envelope.intent.desiredActive &&
+            transaction?.phase != LeasePhase.ACTIVE_CHECKPOINT -> "recovering"
+        else -> "none"
+    }
+    return ConnectionIntentServiceStatus(
+        generation = envelope.intent.generation,
+        desiredActive = envelope.intent.desiredActive,
+        status = status,
+        leasePhase = transaction?.phase?.wireName,
+        nextRetryAtUnix = envelope.intent.retry.nextRetryAtUnix,
+        lastErrorCode = envelope.intent.retry.lastErrorCode,
+    )
+}
+
+internal fun connectionIntentPersistedDelayMillis(
+    envelope: AndroidRecoveryEnvelope,
+    nowUnix: Long,
+): Long = envelope.intent.retry.nextRetryAtUnix
+    ?.let { retryAt ->
+        (retryAt - nowUnix)
+            .coerceAtLeast(0)
+            .coerceAtMost(900)
+            .times(1_000)
+    }
+    ?: 0L
+
+internal fun routeInitialTerminalDiagnosticHandoff(
+    outcome: AutomaticDiagnosticsConnectionIntentReportOutcome,
+    acknowledge: () -> Unit,
+    continueRecovery: () -> Unit,
+) {
+    try {
+        if (outcome.allowsTerminalHandoff) acknowledge()
+    } finally {
+        continueRecovery()
+    }
+}
+
+internal fun quickConnectionIntentTemplate(
+    deviceId: String,
+    quick: QuickTunnelTemplate,
+    androidApiLevel: Int,
+): AndroidIntentTemplate {
+    val selected = quick.connection
+    return AndroidIntentTemplate(
+        deviceId = deviceId,
+        accountScope = deviceId,
+        layer = selected.layer,
+        ticConnectionMode = selected.ticConnectionMode,
+        routeMode = selected.routeMode,
+        egressMode = selected.egressMode,
+        allowAlternate = selected.allowAlternate,
+        options = normalizeAndroidTunnelOptions(androidApiLevel, quick.options),
+    )
+}
+
+internal class AndroidConnectionIntentCoordinator(
+    private val store: AndroidRecoveryStore,
+    private val operationId: () -> String = { UUID.randomUUID().toString() },
+    private val errorPolicy: ConnectionIntentErrorPolicy = ConnectionIntentErrorPolicy(),
+    private val nowUnix: () -> Long = { System.currentTimeMillis() / 1_000 },
+    private val diagnostics: AndroidConnectionIntentDiagnosticsObserver =
+        AndroidConnectionIntentDiagnosticsObserver {},
+) {
+    private val operationGate = AtomicBoolean(false)
+
+    fun begin(
+        template: AndroidIntentTemplate,
+        validateNewIntent: (AndroidIntentTemplate) -> Unit = {},
+    ): AndroidCoordinatorResult = beginInternal(
+        template = template,
+        validateNewIntent = validateNewIntent,
+        expectedGeneration = null,
+        canCommitNewIntent = { true },
+    )
+
+    fun beginDispatched(
+        template: AndroidIntentTemplate,
+        expectedGeneration: Long,
+        canCommitNewIntent: () -> Boolean,
+        validateNewIntent: (AndroidIntentTemplate) -> Unit = {},
+    ): AndroidCoordinatorResult = beginInternal(
+        template,
+        validateNewIntent,
+        expectedGeneration,
+        canCommitNewIntent,
+    )
+
+    private fun beginInternal(
+        template: AndroidIntentTemplate,
+        validateNewIntent: (AndroidIntentTemplate) -> Unit,
+        expectedGeneration: Long?,
+        canCommitNewIntent: () -> Boolean,
+    ): AndroidCoordinatorResult {
+        if (!canCommitNewIntent()) {
+            return AndroidCoordinatorResult.Failure("connection_intent_generation_conflict")
+        }
+        val current = when (val result = store.read()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> return AndroidCoordinatorResult.Failure(result.code)
+        }
+        if (expectedGeneration != null && current.intent.generation != expectedGeneration) {
+            return AndroidCoordinatorResult.Failure("connection_intent_generation_conflict")
+        }
+        if (current.intent.desiredActive && current.intent.template == template &&
+            !current.isTerminalConnectionIntent()
+        ) {
+            return AndroidCoordinatorResult.Accepted(current)
+        }
+        if (current.leaseTransaction != null && !current.isTerminalConnectionIntent()) {
+            return AndroidCoordinatorResult.Failure("connection_cleanup_pending")
+        }
+        try {
+            validateNewIntent(template)
+        } catch (error: BackgroundConnectionException) {
+            return AndroidCoordinatorResult.Failure(error.code)
+        } catch (_: Throwable) {
+            return AndroidCoordinatorResult.Failure("connection_recovery_failed")
+        }
+        if (!canCommitNewIntent()) {
+            return AndroidCoordinatorResult.Failure("connection_intent_generation_conflict")
+        }
+        val validatedCurrent = when (val result = store.read()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> return AndroidCoordinatorResult.Failure(result.code)
+        }
+        if (validatedCurrent.intent.generation != current.intent.generation) {
+            return AndroidCoordinatorResult.Failure("connection_intent_generation_conflict")
+        }
+        val measured = requiresMeasuredCandidateSelection(
+            template.layer,
+            template.ticConnectionMode,
+            template.allowAlternate,
+        )
+        val replay = AndroidStartReplay(
+            startOperationId = operationId(),
+            contractVersion = 1,
+            requestFingerprint = androidConnectionIntentFingerprint(template, measured),
+        )
+        if (current.isTerminalConnectionIntent()) {
+            return when (val result = store.restartTerminal(
+                current.intent.generation,
+                template,
+                replay,
+                operationId(),
+            )) {
+                is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+                is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
+            }
+        }
+        return when (val result = store.beginStart(current.intent.generation, template, replay)) {
+            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
+        }
+    }
+
+    fun cancel(): AndroidCoordinatorResult {
+        return cancelCurrent()
+    }
+
+    fun cancelCurrent(): AndroidCoordinatorResult {
+        return when (val result = store.cancelCurrentIntent()) {
+            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
+        }
+    }
+
+    fun cancelCurrentForQuickToggle(): AndroidCoordinatorResult {
+        return when (val result = store.cancelCurrentIntentForQuickToggle()) {
+            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
+        }
+    }
+
+    fun cancel(expectedGeneration: Long): AndroidCoordinatorResult {
+        return when (val result = store.setDesiredActive(expectedGeneration, false)) {
+            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
+        }
+    }
+
+    fun dataPlaneStalled(leaseId: String): AndroidCoordinatorResult {
+        val current = when (val result = store.read()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> return AndroidCoordinatorResult.Failure(result.code)
+        }
+        val template = current.intent.template
+            ?: return AndroidCoordinatorResult.Failure("connection_intent_invalid")
+        val dynamicPoolBacked = requiresMeasuredCandidateSelection(
+            template.layer,
+            template.ticConnectionMode,
+            template.allowAlternate,
+        )
+        val alreadyScheduled = current.leaseTransaction?.let { transaction ->
+            transaction.phase == LeasePhase.CLEANUP_PENDING &&
+                transaction.leaseId == leaseId &&
+                current.intent.retry.pendingAction == "new_operation_after_cleanup" &&
+                current.intent.retry.lastErrorCode == "tunnel_data_plane_stalled"
+        } == true
+        return when (val result = store.scheduleStalledRecovery(
+            expectedGeneration = current.intent.generation,
+            leaseId = leaseId,
+            stopOperationId = current.leaseTransaction?.stopOperationId ?: operationId(),
+            dynamicPoolBacked = dynamicPoolBacked,
+            nowUnix = nowUnix(),
+        )) {
+            is RecoveryStoreResult.Success -> {
+                if (!alreadyScheduled) diagnostics.leaseReplacementStarted()
+                AndroidCoordinatorResult.Accepted(result.value)
+            }
+            is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
+        }
+    }
+
+    fun status(): RecoveryStoreResult<AndroidRecoveryEnvelope> = store.read()
+
+    fun credentialProvisioningCompleted(): AndroidCoordinatorResult {
+        val current = when (val result = store.read()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> return AndroidCoordinatorResult.Failure(result.code)
+        }
+        return when (val result = store.clearCredentialProvisioningBarrier(
+            current.intent.generation,
+        )) {
+            is RecoveryStoreResult.Success -> AndroidCoordinatorResult.Accepted(result.value)
+            is RecoveryStoreResult.Failure -> AndroidCoordinatorResult.Failure(result.code)
+        }
+    }
+
+    fun acknowledgeInitialTerminalDiagnostic(): RecoveryStoreResult<AndroidRecoveryEnvelope> {
+        val current = when (val result = store.read()) {
+            is RecoveryStoreResult.Success -> result.value
+            is RecoveryStoreResult.Failure -> return result
+        }
+        return store.acknowledgeInitialTerminalDiagnostic(
+            current.intent.generation,
+            current.intent.diagnosticsEpisodeId,
+        )
+    }
+
+    fun acknowledgeInitialTerminalDiagnostic(
+        expectedGeneration: Long,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> =
+        store.acknowledgeInitialTerminalDiagnostic(expectedGeneration)
+
+    fun acknowledgeInitialTerminalDiagnostic(
+        expectedGeneration: Long,
+        expectedDiagnosticsEpisodeId: Long,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> =
+        store.acknowledgeInitialTerminalDiagnostic(
+            expectedGeneration,
+            expectedDiagnosticsEpisodeId,
+        )
+
+    fun quickToggle(
+        dispatch: AndroidConnectionIntentDispatchState,
+    ): RecoveryStoreResult<AndroidQuickToggleDispatch> =
+        dispatch.toggleFromSnapshot(store::read)
+
+    fun runOnce(
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+        validateNewIntent: (AndroidIntentTemplate) -> Unit = {},
+    ): AndroidCoordinatorStep = runOnce(
+        panel,
+        runtime,
+        validateNewIntent,
+        onRecovered = {},
+    )
+
+    fun runOnce(
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+        @Suppress("UNUSED_PARAMETER")
+        validateNewIntent: (AndroidIntentTemplate) -> Unit,
+        onRecovered: (Long) -> Unit,
+    ): AndroidCoordinatorStep {
+        if (!operationGate.compareAndSet(false, true)) return AndroidCoordinatorStep.BUSY
+        return try {
+            var envelope = store.read().coordinatorEnvelopeOrNull()
+                ?: return AndroidCoordinatorStep.TERMINAL
+            if (envelope.intent.retry.pendingAction == "legacy_runtime_stop") {
+                return stopLegacyRuntime(envelope, runtime)
+            }
+            if (envelope.isTerminalConnectionIntent()) return AndroidCoordinatorStep.TERMINAL
+            if (envelope.intent.retry.terminalDiagnosticPending) {
+                return AndroidCoordinatorStep.RETRY
+            }
+            var transaction = envelope.leaseTransaction ?: return AndroidCoordinatorStep.IDLE
+            resumePendingAction(
+                envelope,
+                transaction,
+                panel,
+                runtime,
+            )?.let { return it }
+            envelope = store.read().coordinatorEnvelopeOrNull()
+                ?: return AndroidCoordinatorStep.TERMINAL
+            transaction = envelope.leaseTransaction ?: return AndroidCoordinatorStep.IDLE
+            when (transaction.phase) {
+                LeasePhase.START_PENDING -> runPendingStart(
+                    envelope,
+                    transaction,
+                    panel,
+                    runtime,
+                    onRecovered,
+                )
+                LeasePhase.LEASE_ACQUIRED -> {
+                    if (!envelope.intent.desiredActive) {
+                        requireCleanup(envelope, transaction)
+                        cleanup(panel, runtime)
+                    } else {
+                        exactReplayAndStart(
+                            envelope,
+                            transaction,
+                            panel,
+                            runtime,
+                            leaseAlreadyStored = true,
+                            onRecovered = onRecovered,
+                        )
+                    }
+                }
+                LeasePhase.ACTIVE_CHECKPOINT -> {
+                    if (!envelope.intent.desiredActive) {
+                        requireCleanup(envelope, transaction)
+                        cleanup(panel, runtime)
+                    } else if (runtime.isRunning()) {
+                        AndroidCoordinatorStep.ACTIVE
+                    } else {
+                        exactReplayAndStart(
+                            envelope,
+                            transaction,
+                            panel,
+                            runtime,
+                            leaseAlreadyStored = true,
+                            onRecovered = onRecovered,
+                        )
+                    }
+                }
+                LeasePhase.CLEANUP_PENDING, LeasePhase.STALE_CLEANUP -> cleanup(panel, runtime)
+            }
+        } catch (error: BackgroundConnectionException) {
+            recordFailureDecision(error.code, error.retryAfterHeader)
+        } catch (_: Throwable) {
+            recordTerminalFailure("connection_recovery_failed")
+        } finally {
+            operationGate.set(false)
+        }
+    }
+
+    private fun stopLegacyRuntime(
+        envelope: AndroidRecoveryEnvelope,
+        runtime: AndroidConnectionIntentRuntime,
+    ): AndroidCoordinatorStep = try {
+        if (!runtime.stop()) {
+            recordDirectRetry(
+                "legacy_runtime_stop_pending",
+                pendingAction = "legacy_runtime_stop",
+            )
+        } else {
+            when (store.completeLegacyRuntimeStop(envelope.intent.generation)) {
+                is RecoveryStoreResult.Success -> AndroidCoordinatorStep.IDLE
+                is RecoveryStoreResult.Failure -> AndroidCoordinatorStep.RETRY
+            }
+        }
+    } catch (error: BackgroundConnectionException) {
+        recordDirectRetry(error.code, pendingAction = "legacy_runtime_stop")
+    } catch (_: Throwable) {
+        recordDirectRetry(
+            "legacy_runtime_stop_failed",
+            pendingAction = "legacy_runtime_stop",
+        )
+    }
+
+    private fun recordFailureDecision(
+        code: String,
+        retryAfterHeader: String? = null,
+    ): AndroidCoordinatorStep {
+        val envelope = store.read().coordinatorEnvelopeOrNull()
+            ?: return AndroidCoordinatorStep.TERMINAL
+        if (!envelope.intent.desiredActive) {
+            return continueDisarmed(envelope, code)
+        }
+        if (code == "background_credential_provision_pending") {
+            return recordDirectRetry(code)
+        }
+        val retry = envelope.intent.retry
+        val decision = errorPolicy.classify(
+            code,
+            serviceRecoveryUsed = retry.serviceRecoveryUsed,
+            profileRetryUsed = retry.profileRetryUsed,
+            reconcileOnceUsed = retry.reconcileOnceUsed,
+        )
+        val profileCode = code in setOf(
+            "amneziawg_profile_mismatch",
+            "awg3_profile_apply_failed",
+            "awg3_profile_transform_mismatch",
+        )
+        if (decision == ConnectionIntentDecision.TERMINAL) {
+            return recordTerminalFailure(code)
+        }
+        val delay = if (decision == ConnectionIntentDecision.RETRY_AFTER) {
+            errorPolicy.retryAfterSeconds(retryAfterHeader)
+        } else {
+            RETRY_DELAYS_SECONDS[retry.attempt.coerceAtMost(RETRY_DELAYS_SECONDS.lastIndex)]
+        }
+        val retryAt = nowUnix().saturatingAdd(delay)
+        if (decision == ConnectionIntentDecision.RETRY_ONCE && profileCode) {
+            val transaction = envelope.leaseTransaction
+                ?: return AndroidCoordinatorStep.TERMINAL
+            val leaseId = transaction.leaseId ?: run {
+                recordTerminalFailure("connection_cleanup_lease_unavailable")
+                return AndroidCoordinatorStep.TERMINAL
+            }
+            diagnostics.leaseReplacementStarted()
+            return when (store.scheduleProfileRetryAfterCleanup(
+                expectedGeneration = envelope.intent.generation,
+                leaseId = leaseId,
+                stopOperationId = operationId(),
+                errorCode = code,
+                nextRetryAtUnix = retryAt,
+                scheduledDelaySeconds = delay,
+            )) {
+                is RecoveryStoreResult.Success -> AndroidCoordinatorStep.RETRY
+                is RecoveryStoreResult.Failure -> AndroidCoordinatorStep.TERMINAL
+            }
+        }
+        if (decision == ConnectionIntentDecision.RETRY_NEW_OPERATION) {
+            diagnostics.leaseReplacementStarted()
+            val transaction = envelope.leaseTransaction
+                ?: return AndroidCoordinatorStep.TERMINAL
+            if (transaction.phase in setOf(LeasePhase.CLEANUP_PENDING, LeasePhase.STALE_CLEANUP)) {
+                store.recordFailure(
+                    expectedGeneration = envelope.intent.generation,
+                    errorCode = code,
+                    nextRetryAtUnix = retryAt,
+                    scheduledDelaySeconds = delay,
+                    pendingAction = "new_operation_after_cleanup",
+                )
+                return AndroidCoordinatorStep.RETRY
+            }
+            store.replaceStartOperation(
+                envelope.intent.generation,
+                transaction.replay.copy(startOperationId = operationId()),
+                code,
+                retryAt,
+                delay,
+            )
+            return AndroidCoordinatorStep.RETRY
+        }
+        store.recordFailure(
+            expectedGeneration = envelope.intent.generation,
+            errorCode = code,
+            nextRetryAtUnix = retryAt,
+            scheduledDelaySeconds = delay,
+            serviceRecoveryUsed = retry.serviceRecoveryUsed ||
+                (decision == ConnectionIntentDecision.RETRY_ONCE && code == "service_unavailable"),
+            profileRetryUsed = retry.profileRetryUsed ||
+                (decision == ConnectionIntentDecision.RETRY_ONCE && profileCode),
+            reconcileOnceUsed = retry.reconcileOnceUsed ||
+                decision == ConnectionIntentDecision.RECONCILE_ONCE,
+            pendingAction = when (decision) {
+                ConnectionIntentDecision.RECONCILE_THEN_RETRY,
+                ConnectionIntentDecision.RECONCILE_ONCE,
+                -> "reconcile"
+                ConnectionIntentDecision.LOCAL_RESTART -> "local_restart"
+                else -> retry.pendingAction
+            },
+        )
+        return AndroidCoordinatorStep.RETRY
+    }
+
+    private fun resumePendingAction(
+        envelope: AndroidRecoveryEnvelope,
+        transaction: AndroidLeaseTransaction,
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+    ): AndroidCoordinatorStep? {
+        if (!envelope.intent.desiredActive &&
+            envelope.intent.retry.pendingAction !in setOf(
+                "initial_terminal_after_cleanup",
+                "terminal_after_cleanup",
+            )
+        ) {
+            store.clearPendingRetryAction(envelope.intent.generation)
+                .coordinatorEnvelopeOrThrow()
+            return null
+        }
+        return when (envelope.intent.retry.pendingAction) {
+        "validate_capability" -> {
+            // Older versions allocated the operation before capability validation. This marker
+            // therefore belongs to an already-durable operation and must resume service-owned.
+            store.clearPendingRetryAction(envelope.intent.generation)
+                .coordinatorEnvelopeOrThrow()
+            null
+        }
+        "local_restart" -> {
+            if (runtime.isRunning() && !runtime.stop()) {
+                recordDirectRetry("local_restart_pending")
+            } else {
+                store.clearPendingRetryAction(envelope.intent.generation)
+                    .coordinatorEnvelopeOrThrow()
+                null
+            }
+        }
+        "reconcile" -> {
+            val reconciled = panel.reconcile(
+                transaction,
+                cancelIfAbsent = !envelope.intent.desiredActive,
+            )
+            if (transaction.cleanupFailureCode == "tunnel_data_plane_stalled") {
+                return resumeStalledStopReconcile(envelope, transaction, reconciled)
+            }
+            when (reconciled.state) {
+                "pending", "applying", "compensating" ->
+                    recordDirectRetry("operation_reconcile_pending")
+                "terminal", "cancelled" -> closeAuthoritativePendingStartAndRetry(
+                    envelope,
+                    transaction,
+                    "operation_reconcile_${reconciled.state}",
+                )
+                "not_found", "applied" -> {
+                    if (reconciled.state == "applied" && transaction.leaseId != null &&
+                        reconciled.leaseId != null && reconciled.leaseId != transaction.leaseId
+                    ) {
+                        recordTerminalFailure("request_fingerprint_mismatch")
+                    } else {
+                        store.clearPendingRetryAction(envelope.intent.generation)
+                            .coordinatorEnvelopeOrThrow()
+                        null
+                    }
+                }
+                else -> {
+                    recordTerminalFailure("invalid_background_response")
+                }
+            }
+        }
+        "new_operation_after_cleanup" -> null
+        "terminal_after_cleanup" -> null
+        "initial_terminal_after_cleanup" -> null
+        null -> null
+        else -> {
+            recordTerminalFailure("connection_intent_invalid")
+        }
+        }
+    }
+
+    private fun resumeStalledStopReconcile(
+        envelope: AndroidRecoveryEnvelope,
+        transaction: AndroidLeaseTransaction,
+        reconciled: BackgroundReconcileResult,
+    ): AndroidCoordinatorStep {
+        val expectedLeaseId = requireNotNull(transaction.leaseId)
+        if (reconciled.leaseId?.let { it != expectedLeaseId } == true ||
+            (reconciled.leaseId == null && reconciled.leaseStatus != null)
+        ) {
+            return recordTerminalFailure("invalid_background_response")
+        }
+        return when (reconciled.state) {
+            "pending", "applying", "compensating" ->
+                recordDirectRetry("operation_reconcile_pending")
+            "not_found" -> {
+                if (reconciled.leaseId != null || reconciled.leaseStatus != null) {
+                    recordTerminalFailure("invalid_background_response")
+                } else {
+                    recordDirectRetry(
+                        "connection_stalled_stop_replay_pending",
+                        pendingAction = "new_operation_after_cleanup",
+                    )
+                }
+            }
+            "applied", "terminal", "cancelled" -> {
+                if (reconciled.leaseId == expectedLeaseId &&
+                    reconciled.leaseStatus in setOf("released", "failed")
+                ) {
+                    store.completeCleanupAndRestart(
+                        envelope.intent.generation,
+                        transaction.replay.copy(startOperationId = operationId()),
+                    ).coordinatorEnvelopeOrThrow()
+                    recordDirectRetry("connection_restart_pending")
+                } else {
+                    recordBlockedStalledRecovery(envelope)
+                }
+            }
+            else -> recordTerminalFailure("invalid_background_response")
+        }
+    }
+
+    private fun recordBlockedStalledRecovery(
+        envelope: AndroidRecoveryEnvelope,
+    ): AndroidCoordinatorStep = when (store.recordFailure(
+        expectedGeneration = envelope.intent.generation,
+        errorCode = "connection_stall_not_recyclable",
+        nextRetryAtUnix = null,
+        pendingAction = null,
+    )) {
+        is RecoveryStoreResult.Success -> AndroidCoordinatorStep.TERMINAL
+        is RecoveryStoreResult.Failure -> AndroidCoordinatorStep.TERMINAL
+    }
+
+    private fun recordTerminalFailure(code: String): AndroidCoordinatorStep {
+        val envelope = store.read().coordinatorEnvelopeOrNull()
+            ?: return AndroidCoordinatorStep.TERMINAL
+        val transaction = envelope.leaseTransaction
+        val leaseId = transaction?.leaseId
+        if (leaseId != null) {
+            val scheduled = if (envelope.intent.armedHistory) {
+                store.scheduleTerminalAfterCleanup(
+                    expectedGeneration = envelope.intent.generation,
+                    leaseId = leaseId,
+                    stopOperationId = transaction.stopOperationId ?: operationId(),
+                    errorCode = code,
+                )
+            } else {
+                store.scheduleInitialTerminalAfterCleanup(
+                    expectedGeneration = envelope.intent.generation,
+                    leaseId = leaseId,
+                    stopOperationId = transaction.stopOperationId ?: operationId(),
+                    errorCode = code,
+                )
+            }
+            return when (scheduled) {
+                is RecoveryStoreResult.Success -> if (envelope.intent.armedHistory) {
+                    AndroidCoordinatorStep.RETRY
+                } else {
+                    AndroidCoordinatorStep.RETRY
+                }
+                is RecoveryStoreResult.Failure -> AndroidCoordinatorStep.TERMINAL
+            }
+        }
+        if (!envelope.intent.armedHistory) {
+            return when (store.scheduleInitialTerminalReconcile(
+                envelope.intent.generation,
+                code,
+            )) {
+                is RecoveryStoreResult.Success -> AndroidCoordinatorStep.RETRY
+                is RecoveryStoreResult.Failure -> AndroidCoordinatorStep.TERMINAL
+            }
+        }
+        store.recordFailure(envelope.intent.generation, code, null)
+        return AndroidCoordinatorStep.TERMINAL
+    }
+
+    private fun continueDisarmed(
+        envelope: AndroidRecoveryEnvelope,
+        code: String,
+    ): AndroidCoordinatorStep {
+        val transaction = envelope.leaseTransaction ?: return AndroidCoordinatorStep.IDLE
+        transaction.leaseId?.let { leaseId ->
+            when (store.requireCleanup(
+                envelope.intent.generation,
+                leaseId,
+                transaction.stopOperationId ?: operationId(),
+            )) {
+                is RecoveryStoreResult.Success -> Unit
+                is RecoveryStoreResult.Failure -> return AndroidCoordinatorStep.TERMINAL
+            }
+        }
+        return recordDirectRetry(code)
+    }
+
+    private fun recordDirectRetry(
+        code: String,
+        pendingAction: String? = null,
+    ): AndroidCoordinatorStep {
+        val envelope = store.read().coordinatorEnvelopeOrNull()
+            ?: return AndroidCoordinatorStep.TERMINAL
+        val retry = envelope.intent.retry
+        val delay = RETRY_DELAYS_SECONDS[
+            retry.attempt.coerceAtMost(RETRY_DELAYS_SECONDS.lastIndex)
+        ]
+        val result = store.recordFailure(
+            expectedGeneration = envelope.intent.generation,
+            errorCode = code,
+            nextRetryAtUnix = nowUnix().saturatingAdd(delay),
+            scheduledDelaySeconds = delay,
+            pendingAction = pendingAction ?: retry.pendingAction,
+        )
+        return if (result is RecoveryStoreResult.Success) {
+            AndroidCoordinatorStep.RETRY
+        } else {
+            AndroidCoordinatorStep.TERMINAL
+        }
+    }
+
+    private fun recordTerminalCleanupRetry(): AndroidCoordinatorStep {
+        val envelope = store.read().coordinatorEnvelopeOrNull()
+            ?: return AndroidCoordinatorStep.TERMINAL
+        val retry = envelope.intent.retry
+        val delay = RETRY_DELAYS_SECONDS[
+            retry.attempt.coerceAtMost(RETRY_DELAYS_SECONDS.lastIndex)
+        ]
+        val result = store.recordTerminalCleanupRetry(
+            expectedGeneration = envelope.intent.generation,
+            nextRetryAtUnix = nowUnix().saturatingAdd(delay),
+            scheduledDelaySeconds = delay,
+        )
+        return if (result is RecoveryStoreResult.Success) {
+            AndroidCoordinatorStep.RETRY
+        } else {
+            AndroidCoordinatorStep.TERMINAL
+        }
+    }
+
+    private fun Long.saturatingAdd(other: Long): Long =
+        if (this > Long.MAX_VALUE - other) Long.MAX_VALUE else this + other
+
+    private companion object {
+        val RETRY_DELAYS_SECONDS = longArrayOf(2, 5, 15, 30, 60, 300)
+    }
+
+    private fun runPendingStart(
+        envelope: AndroidRecoveryEnvelope,
+        transaction: AndroidLeaseTransaction,
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+        onRecovered: (Long) -> Unit,
+    ): AndroidCoordinatorStep {
+        val cancelIfAbsent = !envelope.intent.desiredActive
+        val reconciled = panel.reconcile(transaction, cancelIfAbsent)
+        val live = store.read().coordinatorEnvelopeOrThrow()
+        if (!cancelIfAbsent && (live.intent.generation != envelope.intent.generation ||
+                !live.intent.desiredActive)
+        ) {
+            return continueAfterReconcileFence(live, reconciled, panel, runtime)
+        }
+        if (cancelIfAbsent) {
+            return when (reconciled.state) {
+                "not_found", "terminal", "cancelled" -> {
+                    store.completeCancelledStart(envelope.intent.generation)
+                        .coordinatorEnvelopeOrNull()
+                    AndroidCoordinatorStep.IDLE
+                }
+                "applied" -> {
+                    val leaseId = reconciled.leaseId
+                        ?: throw BackgroundConnectionException("invalid_background_response")
+                    val current = store.read().coordinatorEnvelopeOrThrow()
+                    store.requireCleanup(current.intent.generation, leaseId, operationId())
+                        .coordinatorEnvelopeOrThrow()
+                    cleanup(panel, runtime)
+                }
+                "pending", "applying", "compensating" ->
+                    recordDirectRetry("operation_reconcile_pending")
+                else -> recordDirectRetry("invalid_background_response")
+            }
+        }
+        return when (reconciled.state) {
+            "not_found", "applied" -> exactReplayAndStart(
+                envelope,
+                transaction,
+                panel,
+                runtime,
+                leaseAlreadyStored = false,
+                syncBeforeStart = reconciled.state == "not_found",
+                onRecovered = onRecovered,
+            )
+            "pending", "applying", "compensating" ->
+                recordDirectRetry("operation_reconcile_pending")
+            "terminal", "cancelled" -> closeAuthoritativePendingStartAndRetry(
+                envelope,
+                transaction,
+                "operation_reconcile_${reconciled.state}",
+            )
+            else -> {
+                recordTerminalFailure("invalid_background_response")
+            }
+        }
+    }
+
+    private fun continueAfterReconcileFence(
+        live: AndroidRecoveryEnvelope,
+        staleResult: BackgroundReconcileResult,
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+    ): AndroidCoordinatorStep {
+        val transaction = live.leaseTransaction ?: return AndroidCoordinatorStep.IDLE
+        if (staleResult.state == "applied") {
+            val leaseId = staleResult.leaseId
+                ?: throw BackgroundConnectionException("invalid_background_response")
+            store.requireCleanup(
+                live.intent.generation,
+                leaseId,
+                transaction.stopOperationId ?: operationId(),
+            ).coordinatorEnvelopeOrThrow()
+            return cleanup(panel, runtime)
+        }
+        val cancelled = panel.reconcile(transaction, cancelIfAbsent = true)
+        return when (cancelled.state) {
+            "not_found", "terminal", "cancelled" -> {
+                if (!live.intent.desiredActive && transaction.phase == LeasePhase.START_PENDING &&
+                    transaction.leaseId == null
+                ) {
+                    store.completeCancelledStart(live.intent.generation)
+                        .coordinatorEnvelopeOrThrow()
+                    AndroidCoordinatorStep.IDLE
+                } else {
+                    recordDirectRetry("operation_reconcile_cancel_pending")
+                }
+            }
+            "applied" -> {
+                val leaseId = cancelled.leaseId
+                    ?: throw BackgroundConnectionException("invalid_background_response")
+                store.requireCleanup(
+                    live.intent.generation,
+                    leaseId,
+                    transaction.stopOperationId ?: operationId(),
+                ).coordinatorEnvelopeOrThrow()
+                cleanup(panel, runtime)
+            }
+            "pending", "applying", "compensating" ->
+                recordDirectRetry("operation_reconcile_pending")
+            else -> recordDirectRetry("invalid_background_response")
+        }
+    }
+
+    private fun closeAuthoritativePendingStartAndRetry(
+        envelope: AndroidRecoveryEnvelope,
+        transaction: AndroidLeaseTransaction,
+        code: String,
+    ): AndroidCoordinatorStep {
+        if (!envelope.intent.desiredActive || transaction.phase != LeasePhase.START_PENDING ||
+            transaction.leaseId != null
+        ) {
+            if (!envelope.intent.desiredActive && transaction.phase == LeasePhase.START_PENDING &&
+                transaction.leaseId == null
+            ) {
+                store.completeCancelledStart(envelope.intent.generation)
+                    .coordinatorEnvelopeOrNull()
+                return AndroidCoordinatorStep.IDLE
+            }
+            return recordTerminalFailure(code)
+        }
+        val retry = envelope.intent.retry
+        val delay = RETRY_DELAYS_SECONDS[
+            retry.attempt.coerceAtMost(RETRY_DELAYS_SECONDS.lastIndex)
+        ]
+        return when (store.closeAuthoritativeStartAndRestart(
+            expectedGeneration = envelope.intent.generation,
+            replay = transaction.replay.copy(startOperationId = operationId()),
+            errorCode = code,
+            nextRetryAtUnix = nowUnix().saturatingAdd(delay),
+            scheduledDelaySeconds = delay,
+        )) {
+            is RecoveryStoreResult.Success -> AndroidCoordinatorStep.RETRY
+            is RecoveryStoreResult.Failure -> AndroidCoordinatorStep.TERMINAL
+        }
+    }
+
+    private fun exactReplayAndStart(
+        envelope: AndroidRecoveryEnvelope,
+        transaction: AndroidLeaseTransaction,
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+        leaseAlreadyStored: Boolean,
+        syncBeforeStart: Boolean = false,
+        onRecovered: (Long) -> Unit,
+    ): AndroidCoordinatorStep {
+        val template = envelope.intent.template
+            ?: throw BackgroundConnectionException("connection_intent_invalid")
+        if (syncBeforeStart && template.syncBindingPreferences) {
+            panel.syncBindingPreferences(template)
+            val ready = store.read().coordinatorEnvelopeOrThrow()
+            if (!ready.intent.desiredActive || ready.intent.generation != transaction.generation) {
+                if (!ready.intent.desiredActive &&
+                    ready.leaseTransaction?.phase == LeasePhase.START_PENDING &&
+                    ready.leaseTransaction.leaseId == null
+                ) {
+                    store.completeCancelledStart(ready.intent.generation)
+                        .coordinatorEnvelopeOrThrow()
+                    return AndroidCoordinatorStep.IDLE
+                }
+                return AndroidCoordinatorStep.RETRY
+            }
+        }
+        val result = panel.start(template, transaction)
+        val leaseId = result.connection.leaseId
+        val live = store.read().coordinatorEnvelopeOrThrow()
+        if (!live.intent.desiredActive || live.intent.generation != transaction.generation) {
+            result.configuration.fill(0)
+            store.requireCleanup(live.intent.generation, leaseId, operationId())
+                .coordinatorEnvelopeOrThrow()
+            return AndroidCoordinatorStep.CLEANUP_REQUIRED
+        }
+        if (!leaseAlreadyStored) {
+            store.recordLease(transaction.generation, leaseId).coordinatorEnvelopeOrThrow()
+        } else if (transaction.leaseId != leaseId) {
+            result.configuration.fill(0)
+            throw BackgroundConnectionException("request_fingerprint_mismatch")
+        }
+        val runtimeStart = try {
+            startRuntimeWithConnectionIntentFence(
+                expectedGeneration = transaction.generation,
+                operationId = transaction.startOperationId,
+                current = { store.read().coordinatorEnvelopeOrThrow() },
+                result = result,
+                runtime = runtime,
+            )
+        } catch (error: BackgroundConnectionException) {
+            if (error.code == "tunnel_handshake_timeout") {
+                val acquired = store.read().coordinatorEnvelopeOrThrow()
+                store.requireCleanup(acquired.intent.generation, leaseId, operationId())
+                    .coordinatorEnvelopeOrThrow()
+            } else if (error.code == "tunnel_start_cancelled") {
+                val acquired = store.read().coordinatorEnvelopeOrThrow()
+                if (!acquired.intent.desiredActive) {
+                    store.requireCleanup(acquired.intent.generation, leaseId, operationId())
+                        .coordinatorEnvelopeOrThrow()
+                    return cleanup(panel, runtime)
+                }
+            }
+            throw error
+        }
+        when (runtimeStart) {
+            AndroidRuntimeStartFenceResult.CANCELLED_BEFORE_START -> {
+                val cancelled = store.read().coordinatorEnvelopeOrThrow()
+                store.requireCleanup(cancelled.intent.generation, leaseId, operationId())
+                    .coordinatorEnvelopeOrThrow()
+                return AndroidCoordinatorStep.CLEANUP_REQUIRED
+            }
+            AndroidRuntimeStartFenceResult.CANCELLED_AFTER_START -> {
+                val acquired = store.read().coordinatorEnvelopeOrThrow()
+                store.requireCleanup(acquired.intent.generation, leaseId, operationId())
+                    .coordinatorEnvelopeOrThrow()
+                return cleanup(panel, runtime)
+            }
+            is AndroidRuntimeStartFenceResult.FAILED -> {
+                throw BackgroundConnectionException(runtimeStart.errorCode)
+            }
+            AndroidRuntimeStartFenceResult.STARTED -> Unit
+        }
+        runCatching { onRecovered(envelope.intent.diagnosticsEpisodeId) }
+        return when (val activated = store.activateCheckpoint(transaction.generation)) {
+            is RecoveryStoreResult.Success -> AndroidCoordinatorStep.ACTIVE
+            is RecoveryStoreResult.Failure -> {
+                val liveAfterStart = store.read().coordinatorEnvelopeOrThrow()
+                if (activated.code != "connection_intent_generation_conflict" ||
+                    liveAfterStart.intent.desiredActive
+                ) {
+                    throw BackgroundConnectionException(activated.code)
+                }
+                store.requireCleanup(liveAfterStart.intent.generation, leaseId, operationId())
+                    .coordinatorEnvelopeOrThrow()
+                cleanup(panel, runtime)
+            }
+        }
+    }
+
+    private fun requireCleanup(
+        envelope: AndroidRecoveryEnvelope,
+        transaction: AndroidLeaseTransaction,
+    ) {
+        val leaseId = transaction.leaseId
+            ?: throw BackgroundConnectionException("connection_cleanup_lease_unavailable")
+        store.requireCleanup(envelope.intent.generation, leaseId, operationId())
+            .coordinatorEnvelopeOrThrow()
+    }
+
+    private fun cleanup(
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+    ): AndroidCoordinatorStep {
+        var envelope = store.read().coordinatorEnvelopeOrThrow()
+        var transaction = envelope.leaseTransaction ?: return AndroidCoordinatorStep.IDLE
+        if (transaction.leaseId == null) {
+            val reconciled = panel.reconcile(transaction, cancelIfAbsent = true)
+            return when (reconciled.state) {
+                "not_found", "terminal", "cancelled" -> {
+                    if (envelope.intent.desiredActive &&
+                        envelope.intent.retry.pendingAction == "new_operation_after_cleanup"
+                    ) {
+                        store.completeCleanupAndRestart(
+                            envelope.intent.generation,
+                            transaction.replay.copy(startOperationId = operationId()),
+                        ).coordinatorEnvelopeOrThrow()
+                        return recordDirectRetry("connection_restart_pending")
+                    } else if (envelope.intent.retry.pendingAction == "terminal_after_cleanup") {
+                        store.completeCleanupAsTerminal(envelope.intent.generation)
+                            .coordinatorEnvelopeOrThrow()
+                        AndroidCoordinatorStep.TERMINAL
+                    } else if (envelope.intent.retry.pendingAction ==
+                        "initial_terminal_after_cleanup"
+                    ) {
+                        store.completeInitialTerminalCleanup(envelope.intent.generation)
+                            .coordinatorEnvelopeOrThrow()
+                        AndroidCoordinatorStep.IDLE
+                    } else if (transaction.phase == LeasePhase.START_PENDING) {
+                        store.completeCancelledStart(envelope.intent.generation)
+                    } else {
+                        store.completeCleanup(envelope.intent.generation)
+                    }.coordinatorEnvelopeOrThrow()
+                    AndroidCoordinatorStep.IDLE
+                }
+                "applied" -> {
+                    val leaseId = reconciled.leaseId
+                        ?: throw BackgroundConnectionException("invalid_background_response")
+                    store.requireCleanup(envelope.intent.generation, leaseId, operationId())
+                        .coordinatorEnvelopeOrThrow()
+                    cleanup(panel, runtime)
+                }
+                else -> recordDirectRetry("connection_cleanup_reconcile_pending")
+            }
+        }
+        if (transaction.stopOperationId == null) {
+            store.requireCleanup(
+                envelope.intent.generation,
+                requireNotNull(transaction.leaseId),
+                operationId(),
+            ).coordinatorEnvelopeOrThrow()
+            envelope = store.read().coordinatorEnvelopeOrThrow()
+            transaction = requireNotNull(envelope.leaseTransaction)
+        }
+        if (!transaction.localStopPending) {
+            store.requireCleanup(
+                envelope.intent.generation,
+                requireNotNull(transaction.leaseId),
+                requireNotNull(transaction.stopOperationId),
+            ).coordinatorEnvelopeOrThrow()
+            envelope = store.read().coordinatorEnvelopeOrThrow()
+            transaction = requireNotNull(envelope.leaseTransaction)
+        }
+        val terminalAfterCleanup =
+            envelope.intent.retry.pendingAction == "terminal_after_cleanup"
+        if (!runtime.stop()) {
+            return if (terminalAfterCleanup) {
+                recordTerminalCleanupRetry()
+            } else {
+                recordDirectRetry("connection_cleanup_local_stop_pending")
+            }
+        }
+        try {
+            panel.stop(
+                requireNotNull(transaction.leaseId),
+                requireNotNull(transaction.stopOperationId),
+                transaction.cleanupFailureCode,
+            )
+        } catch (error: Throwable) {
+            if (terminalAfterCleanup) return recordTerminalCleanupRetry()
+            throw error
+        }
+        return if (envelope.intent.desiredActive &&
+            envelope.intent.retry.pendingAction == "new_operation_after_cleanup"
+        ) {
+            store.completeCleanupAndRestart(
+                envelope.intent.generation,
+                transaction.replay.copy(startOperationId = operationId()),
+            ).coordinatorEnvelopeOrThrow()
+            recordDirectRetry("connection_restart_pending")
+        } else if (envelope.intent.retry.pendingAction == "terminal_after_cleanup") {
+            store.completeCleanupAsTerminal(envelope.intent.generation)
+                .coordinatorEnvelopeOrThrow()
+            AndroidCoordinatorStep.TERMINAL
+        } else if (envelope.intent.retry.pendingAction == "initial_terminal_after_cleanup") {
+            store.completeInitialTerminalCleanup(envelope.intent.generation)
+                .coordinatorEnvelopeOrThrow()
+            AndroidCoordinatorStep.IDLE
+        } else {
+            store.completeCleanup(envelope.intent.generation).coordinatorEnvelopeOrThrow()
+            AndroidCoordinatorStep.IDLE
+        }
+    }
+}
+
+private fun RecoveryStoreResult<AndroidRecoveryEnvelope>.coordinatorEnvelopeOrNull():
+    AndroidRecoveryEnvelope? = when (this) {
+    is RecoveryStoreResult.Success -> value
+    is RecoveryStoreResult.Failure -> null
+}
+
+private fun RecoveryStoreResult<AndroidRecoveryEnvelope>.coordinatorEnvelopeOrThrow():
+    AndroidRecoveryEnvelope = when (this) {
+    is RecoveryStoreResult.Success -> value
+    is RecoveryStoreResult.Failure -> throw BackgroundConnectionException(code)
+}
+
+internal fun androidConnectionIntentFingerprint(
+    template: AndroidIntentTemplate,
+    requireMeasuredSelection: Boolean,
+): String {
+    val canonical = buildString {
+        append("{\"egress_mode\":\"")
+        append(template.egressMode)
+        append("\",\"kind\":\"start\",\"layer\":\"")
+        append(template.layer)
+        append("\",\"require_measured_selection\":")
+        append(requireMeasuredSelection)
+        append(",\"route_mode\":\"")
+        append(template.routeMode)
+        append("\",\"tic_connection_mode\":\"")
+        append(template.ticConnectionMode)
+        append("\"}")
+    }
+    return MessageDigest.getInstance("SHA-256")
+        .digest(canonical.toByteArray(Charsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
+
+internal fun androidStalledStopFingerprint(leaseId: String): String {
+    AndroidRecoveryEnvelopeCodec.validateSafeValue(leaseId)
+    val canonical = buildString {
+        append("{\"failure_code\":\"tunnel_data_plane_stalled\",")
+        append("\"kind\":\"stalled_stop\",")
+        append("\"lease_id\":\"")
+        append(leaseId)
+        append("\"}")
+    }
+    return MessageDigest.getInstance("SHA-256")
+        .digest(canonical.toByteArray(Charsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
 
 private fun CredentialStoreResult<BackgroundCredentialEnvelope>.credentialOrThrow():
     BackgroundCredentialEnvelope = when (this) {
@@ -1075,13 +3863,11 @@ internal fun shouldQueueBackgroundStartFailureDiagnostics(
     errorCode: String?,
 ): Boolean = starting && errorCode != null && errorCode != "tunnel_operation_in_progress"
 
-internal fun dispatchBackgroundToggle(
-    desiredActive: Boolean,
-    start: () -> Unit,
-    stop: () -> Unit,
+internal fun dispatchSerializedConnectionIntentMutation(
+    executor: Executor,
+    mutation: () -> Unit,
 ) {
-    val targetActive = !desiredActive
-    if (targetActive) start() else stop()
+    executor.execute(mutation)
 }
 
 internal fun completeBackgroundFailureWithDiagnostics(

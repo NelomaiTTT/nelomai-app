@@ -29,6 +29,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use tokio::sync::Notify;
 
 #[test]
 fn activation_rule_covers_platform_android_api_layer_and_route() {
@@ -1067,15 +1068,17 @@ async fn settings_save_reports_apply_and_rollback_failures() {
 #[tokio::test]
 async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
     let api = Arc::new(CoordinatorApi::new());
-    let secret_store = Arc::new(TestSecretStore(Mutex::new(Some(StoredAuth {
+    let secret_store = Arc::new(TestSecretStore::new(StoredAuth {
         install_secret: "install".to_string(),
         access_token: Some("access".to_string()),
         refresh_token: Some("refresh".to_string()),
         saved_connection: None,
         pinned_connection: None,
         pending_start: None,
+        pending_stalled_stop: None,
+        pending_compensation_stop: None,
         compatibility: None,
-    }))));
+    }));
     let tunnel = Arc::new(CoordinatorTunnel {
         capabilities: android_35_capabilities(),
         ..CoordinatorTunnel::default()
@@ -1375,6 +1378,386 @@ async fn empty_include_selection_is_rejected_before_requesting_a_connection() {
     );
     assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_during_start_preflight_leaves_no_unknown_operation_to_replay() {
+    let fixture = Arc::new(coordinator_fixture(capabilities(
+        TunnelPlatform::Linux,
+        None,
+        true,
+        false,
+    )));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+    let capability_calls = fixture.tunnel.capability_calls.load(Ordering::SeqCst);
+    fixture
+        .tunnel
+        .block_capabilities
+        .store(true, Ordering::SeqCst);
+    let attempt = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .core
+                .start(
+                    ConnectOptions {
+                        layer: Layer::Tic,
+                        tic_connection_mode: TicConnectionMode::Personal,
+                        route_mode: RouteMode::ViaTak,
+                        egress_mode: EgressMode::Ipv4,
+                        probes: Vec::new(),
+                        allow_alternate: true,
+                    },
+                    1_010,
+                )
+                .await
+        })
+    };
+    while fixture.tunnel.capability_calls.load(Ordering::SeqCst) == capability_calls {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 0);
+    assert!(fixture
+        .secret_store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_start
+        .is_none());
+    assert!(fixture.core.signal_start_cancellation());
+    fixture
+        .tunnel
+        .block_capabilities
+        .store(false, Ordering::SeqCst);
+    fixture.tunnel.capabilities_release.notify_one();
+    assert!(matches!(
+        attempt.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+
+    assert!(matches!(
+        fixture.core.stop().await,
+        Err(CoreError::SavedConnectionUnavailable)
+    ));
+    let stored = fixture.secret_store.load().unwrap().unwrap();
+    assert!(stored.pending_start.is_none());
+    assert!(stored.pending_compensation_stop.is_none());
+    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Stopped
+    );
+
+    fixture
+        .core
+        .start(
+            ConnectOptions {
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                egress_mode: EgressMode::Ipv4,
+                probes: Vec::new(),
+                allow_alternate: true,
+            },
+            1_011,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancellation_while_physical_network_detection_is_in_flight_never_publishes_connected() {
+    let fixture = Arc::new(coordinator_fixture(capabilities(
+        TunnelPlatform::Linux,
+        None,
+        true,
+        false,
+    )));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture.tunnel.set_fingerprints(["network-a"]);
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(true, Ordering::SeqCst);
+    let cancel_epoch = fixture.core.begin_start_attempt();
+    let attempt = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .core
+                .start_with_cancellation_epoch(
+                    ConnectOptions {
+                        layer: Layer::Tic,
+                        tic_connection_mode: TicConnectionMode::Personal,
+                        route_mode: RouteMode::ViaTak,
+                        egress_mode: EgressMode::Ipv4,
+                        probes: Vec::new(),
+                        allow_alternate: true,
+                    },
+                    1_010,
+                    cancel_epoch,
+                )
+                .await
+        })
+    };
+    while fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(fixture.core.signal_start_cancellation());
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(false, Ordering::SeqCst);
+    fixture.tunnel.fingerprint_release.notify_one();
+    let error = attempt.await.unwrap().unwrap_err();
+    fixture.core.finish_start_attempt();
+
+    assert!(matches!(error, CoreError::StartCancelled));
+    assert_ne!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Stopped
+    );
+    assert!(fixture
+        .secret_store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detector_cancellation_journals_compensation_before_local_stop_and_reconstructs_in_order() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let fixture = Arc::new(coordinator_fixture(capabilities(
+        TunnelPlatform::Linux,
+        None,
+        true,
+        false,
+    )));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+    *fixture.api.operation_events.lock().unwrap() = Some(events.clone());
+    fixture.tunnel.set_fingerprints(["network-a"]);
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(true, Ordering::SeqCst);
+    fixture.tunnel.block_stop.store(true, Ordering::SeqCst);
+    *fixture.tunnel.operation_events.lock().unwrap() = Some(events.clone());
+    let cancel_epoch = fixture.core.begin_start_attempt();
+    let attempt = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .core
+                .start_with_cancellation_epoch(
+                    ConnectOptions {
+                        layer: Layer::Tic,
+                        tic_connection_mode: TicConnectionMode::Personal,
+                        route_mode: RouteMode::ViaTak,
+                        egress_mode: EgressMode::Ipv4,
+                        probes: Vec::new(),
+                        allow_alternate: true,
+                    },
+                    1_010,
+                    cancel_epoch,
+                )
+                .await
+        })
+    };
+    while fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    assert!(fixture.core.signal_start_cancellation());
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(false, Ordering::SeqCst);
+    fixture.tunnel.fingerprint_release.notify_one();
+    while fixture.tunnel.stops.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let pending = fixture
+        .secret_store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .expect("compensation identity must be durable before local cleanup");
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(events.lock().unwrap().as_slice(), &["local_stop"]);
+
+    attempt.abort();
+    let _ = attempt.await;
+    fixture.core.finish_start_attempt();
+    fixture.tunnel.block_stop.store(false, Ordering::SeqCst);
+    fixture.tunnel.stop_release.notify_waiters();
+    let reconstructed = ClientCore::with_split_tunnel_store(
+        fixture.api.clone(),
+        fixture.secret_store.clone(),
+        fixture.split_store.clone(),
+        fixture.tunnel.clone(),
+        fixture.logger.clone(),
+    );
+
+    reconstructed
+        .reconcile_pending_operation_for_retry()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["local_stop", "local_stop", "panel_stop"]
+    );
+    assert_eq!(
+        fixture.api.stop_operation_ids.lock().unwrap().as_slice(),
+        &[pending.operation_id]
+    );
+    let stored = fixture.secret_store.load().unwrap().unwrap();
+    assert!(stored.pending_start.is_none());
+    assert!(stored.pending_compensation_stop.is_none());
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Stopped
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detector_cancellation_storage_failure_has_no_cleanup_side_effect_before_retry() {
+    let fixture = Arc::new(coordinator_fixture(capabilities(
+        TunnelPlatform::Linux,
+        None,
+        true,
+        false,
+    )));
+    fixture
+        .api
+        .set_policy(policy(SplitTunnelMode::ExcludeSelected));
+    fixture
+        .core
+        .synchronize_split_tunnel(1_000, false)
+        .await
+        .unwrap();
+    fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+    fixture.tunnel.set_fingerprints(["network-a"]);
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(true, Ordering::SeqCst);
+    let cancel_epoch = fixture.core.begin_start_attempt();
+    let attempt = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move {
+            fixture
+                .core
+                .start_with_cancellation_epoch(
+                    ConnectOptions {
+                        layer: Layer::Tic,
+                        tic_connection_mode: TicConnectionMode::Personal,
+                        route_mode: RouteMode::ViaTak,
+                        egress_mode: EgressMode::Ipv4,
+                        probes: Vec::new(),
+                        allow_alternate: true,
+                    },
+                    1_010,
+                    cancel_epoch,
+                )
+                .await
+        })
+    };
+    while fixture.tunnel.fingerprint_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    fixture
+        .secret_store
+        .reject_compensation_journal_once
+        .store(true, Ordering::SeqCst);
+    assert!(fixture.core.signal_start_cancellation());
+    fixture
+        .tunnel
+        .block_fingerprint
+        .store(false, Ordering::SeqCst);
+    fixture.tunnel.fingerprint_release.notify_one();
+    assert!(matches!(attempt.await.unwrap(), Err(CoreError::Storage)));
+    fixture.core.finish_start_attempt();
+
+    let stored = fixture.secret_store.load().unwrap().unwrap();
+    assert!(stored.pending_start.is_some());
+    assert!(stored.pending_compensation_stop.is_none());
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Running
+    );
+
+    fixture.tunnel.block_stop.store(true, Ordering::SeqCst);
+    let retry = {
+        let fixture = fixture.clone();
+        tokio::spawn(async move { fixture.core.stop().await })
+    };
+    while fixture.tunnel.stops.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+    let pending = fixture
+        .secret_store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .expect("retry must durably transition before local cleanup");
+    assert_eq!(fixture.api.stop_calls.load(Ordering::SeqCst), 0);
+    fixture.tunnel.block_stop.store(false, Ordering::SeqCst);
+    fixture.tunnel.stop_release.notify_one();
+    retry.await.unwrap().unwrap();
+
+    assert_eq!(
+        fixture.api.stop_operation_ids.lock().unwrap().as_slice(),
+        &[pending.operation_id]
+    );
+    let stored = fixture.secret_store.load().unwrap().unwrap();
+    assert!(stored.pending_start.is_none());
+    assert!(stored.pending_compensation_stop.is_none());
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Stopped
+    );
 }
 
 #[tokio::test]
@@ -1808,15 +2191,17 @@ struct CoordinatorFixture {
 
 fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
     let api = Arc::new(CoordinatorApi::new());
-    let secret_store = Arc::new(TestSecretStore(Mutex::new(Some(StoredAuth {
+    let secret_store = Arc::new(TestSecretStore::new(StoredAuth {
         install_secret: "install".to_string(),
         access_token: Some("access".to_string()),
         refresh_token: Some("refresh".to_string()),
         saved_connection: None,
         pinned_connection: None,
         pending_start: None,
+        pending_stalled_stop: None,
+        pending_compensation_stop: None,
         compatibility: None,
-    }))));
+    }));
     let tunnel = Arc::new(CoordinatorTunnel {
         capabilities,
         ..CoordinatorTunnel::default()
@@ -1850,20 +2235,42 @@ fn android_35_capabilities() -> TunnelCapabilities {
     }
 }
 
-struct TestSecretStore(Mutex<Option<StoredAuth>>);
+struct TestSecretStore {
+    stored: Mutex<Option<StoredAuth>>,
+    reject_compensation_journal_once: AtomicBool,
+}
+
+impl TestSecretStore {
+    fn new(auth: StoredAuth) -> Self {
+        Self {
+            stored: Mutex::new(Some(auth)),
+            reject_compensation_journal_once: AtomicBool::new(false),
+        }
+    }
+}
 
 impl SecretStore for TestSecretStore {
     fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
-        Ok(self.0.lock().unwrap().clone())
+        Ok(self.stored.lock().unwrap().clone())
     }
 
     fn save(&self, auth: &StoredAuth) -> Result<(), StorageError> {
-        *self.0.lock().unwrap() = Some(auth.clone());
+        let introduces_compensation = self.stored.lock().unwrap().as_ref().is_some_and(|stored| {
+            stored.pending_compensation_stop.is_none() && auth.pending_compensation_stop.is_some()
+        });
+        if introduces_compensation
+            && self
+                .reject_compensation_journal_once
+                .swap(false, Ordering::SeqCst)
+        {
+            return Err(StorageError::SplitTunnelStateLock);
+        }
+        *self.stored.lock().unwrap() = Some(auth.clone());
         Ok(())
     }
 
     fn delete(&self) -> Result<(), StorageError> {
-        *self.0.lock().unwrap() = None;
+        *self.stored.lock().unwrap() = None;
         Ok(())
     }
 }
@@ -1924,6 +2331,15 @@ struct CoordinatorTunnel {
     options: Mutex<Vec<TunnelOptions>>,
     status: Mutex<TunnelStatus>,
     fingerprints: Mutex<VecDeque<String>>,
+    fingerprint_calls: AtomicUsize,
+    block_fingerprint: AtomicBool,
+    fingerprint_release: Notify,
+    capability_calls: AtomicUsize,
+    block_capabilities: AtomicBool,
+    capabilities_release: Notify,
+    block_stop: AtomicBool,
+    stop_release: Notify,
+    operation_events: Mutex<Option<Arc<Mutex<Vec<&'static str>>>>>,
 }
 
 impl CoordinatorTunnel {
@@ -1956,6 +2372,12 @@ impl TunnelController for CoordinatorTunnel {
 
     async fn stop(&self) -> Result<(), TunnelError> {
         self.stops.fetch_add(1, Ordering::SeqCst);
+        if let Some(events) = self.operation_events.lock().unwrap().clone() {
+            events.lock().unwrap().push("local_stop");
+        }
+        if self.block_stop.load(Ordering::SeqCst) {
+            self.stop_release.notified().await;
+        }
         if self
             .fail_next_stops
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -1977,6 +2399,10 @@ impl TunnelController for CoordinatorTunnel {
     }
 
     async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
+        self.fingerprint_calls.fetch_add(1, Ordering::SeqCst);
+        if self.block_fingerprint.load(Ordering::SeqCst) {
+            self.fingerprint_release.notified().await;
+        }
         let mut fingerprints = self.fingerprints.lock().unwrap();
         let fingerprint = if fingerprints.len() > 1 {
             fingerprints.pop_front()
@@ -1987,6 +2413,10 @@ impl TunnelController for CoordinatorTunnel {
     }
 
     async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
+        self.capability_calls.fetch_add(1, Ordering::SeqCst);
+        if self.block_capabilities.load(Ordering::SeqCst) {
+            self.capabilities_release.notified().await;
+        }
         Ok(self.capabilities)
     }
 }
@@ -1999,6 +2429,10 @@ struct CoordinatorApi {
     revision_calls: AtomicUsize,
     policy_calls: AtomicUsize,
     start_calls: AtomicUsize,
+    stop_calls: AtomicUsize,
+    stop_succeeds: AtomicBool,
+    stop_operation_ids: Mutex<Vec<String>>,
+    operation_events: Mutex<Option<Arc<Mutex<Vec<&'static str>>>>>,
     settings_calls: AtomicUsize,
     apply_failures: AtomicUsize,
     apply_results: Mutex<Vec<SplitTunnelApplyResult>>,
@@ -2020,6 +2454,10 @@ impl CoordinatorApi {
             revision_calls: AtomicUsize::new(0),
             policy_calls: AtomicUsize::new(0),
             start_calls: AtomicUsize::new(0),
+            stop_calls: AtomicUsize::new(0),
+            stop_succeeds: AtomicBool::new(false),
+            stop_operation_ids: Mutex::new(Vec::new()),
+            operation_events: Mutex::new(None),
             settings_calls: AtomicUsize::new(0),
             apply_failures: AtomicUsize::new(0),
             apply_results: Mutex::new(Vec::new()),
@@ -2134,9 +2572,35 @@ impl CoreApi for CoordinatorApi {
     async fn stop_connection(
         &self,
         _access_token: &str,
-        _request: &ConnectionOperationRequest,
+        request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
-        Err(CoreApiError::Retryable)
+        self.stop_calls.fetch_add(1, Ordering::SeqCst);
+        self.stop_operation_ids
+            .lock()
+            .unwrap()
+            .push(request.operation_id.clone());
+        if let Some(events) = self.operation_events.lock().unwrap().clone() {
+            events.lock().unwrap().push("panel_stop");
+        }
+        if !self.stop_succeeds.load(Ordering::SeqCst) {
+            return Err(CoreApiError::Retryable);
+        }
+        Ok(ConnectionOperationResponse {
+            api_version: ApiVersion::V1,
+            request_id: "stop".to_string(),
+            connection: Connection {
+                lease_id: request.lease_id.clone(),
+                pool_id: None,
+                layer: Layer::Tic,
+                tic_connection_mode: TicConnectionMode::Personal,
+                route_mode: RouteMode::ViaTak,
+                egress_mode: EgressMode::Ipv4,
+                probe_url: None,
+                status: LeaseStatus::Released,
+                pinned: false,
+                stopped_at: Some("2026-08-30T10:00:00Z".to_string()),
+            },
+        })
     }
 
     async fn pin_stray(

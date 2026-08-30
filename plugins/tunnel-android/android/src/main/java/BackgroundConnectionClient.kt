@@ -6,6 +6,9 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.Locale
 import java.util.UUID
 import javax.net.ssl.HttpsURLConnection
@@ -15,6 +18,7 @@ import org.json.JSONObject
 internal const val BACKGROUND_CONNECT_TIMEOUT_MILLIS = 10_000
 internal const val BACKGROUND_READ_TIMEOUT_MILLIS = 20_000
 private const val BACKGROUND_MAX_RESPONSE_BYTES = 1024 * 1024
+internal const val BACKGROUND_MAX_CANDIDATES = 20
 
 internal data class BackgroundStartResult(
     val configuration: ByteArray,
@@ -30,7 +34,10 @@ internal data class BackgroundSessionRecoveryResult(
         "BackgroundSessionRecoveryResult(accessToken=<redacted>, refreshToken=<redacted>)"
 }
 
-internal class BackgroundConnectionException(val code: String) : RuntimeException(code)
+internal class BackgroundConnectionException(
+    val code: String,
+    val retryAfterHeader: String? = null,
+) : RuntimeException(code)
 
 internal enum class BackgroundAuthorization(val wireName: String) {
     DEVICE("Device"),
@@ -54,6 +61,167 @@ internal data class BackgroundServerCandidate(
     val probeUrl: String,
     val expiresAtUnix: Long,
 )
+
+internal data class BackgroundProbeResult(
+    val candidateId: String,
+    val latencyMillis: Double?,
+    val failureCode: String?,
+    val measuredAt: String,
+)
+
+internal fun requiresMeasuredCandidateSelection(
+    layer: String,
+    ticConnectionMode: String,
+    allowAlternate: Boolean = true,
+): Boolean = allowAlternate && (layer != "tic" || ticConnectionMode != "personal")
+
+internal class BackgroundCandidateProbeCache(
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val deadlineMillis: Int = BACKGROUND_PROBE_TIMEOUT_MILLIS,
+    private val probe: (BackgroundServerCandidate, Int) -> BackgroundProbeResult =
+        ::probeBackgroundCandidate,
+) {
+    private data class CacheEntry(
+        val layer: String,
+        val egressMode: String,
+        val networkIdentity: String,
+        val candidateIds: List<String>,
+        val validUntilMillis: Long,
+        val results: List<BackgroundProbeResult>,
+    )
+
+    private val gate = Any()
+    private var cached: CacheEntry? = null
+
+    fun measure(
+        layer: String,
+        egressMode: String,
+        networkIdentity: String,
+        candidates: List<BackgroundServerCandidate>,
+    ): List<BackgroundProbeResult> {
+        if (candidates.size > BACKGROUND_MAX_CANDIDATES) {
+            throw BackgroundConnectionException("invalid_background_response")
+        }
+        val now = nowMillis()
+        val ids = candidates.map(BackgroundServerCandidate::candidateId)
+        synchronized(gate) {
+            cached?.takeIf {
+                it.layer == layer && it.egressMode == egressMode &&
+                    it.networkIdentity == networkIdentity && it.candidateIds == ids &&
+                    now < it.validUntilMillis
+            }?.let { return it.results }
+        }
+        if (candidates.isEmpty()) return emptyList()
+        val executor = Executors.newFixedThreadPool(minOf(4, candidates.size)) { task ->
+            Thread(task, "nelomai-background-probe").apply { isDaemon = true }
+        }
+        val measuredAt = Instant.ofEpochMilli(nowMillis()).toString()
+        val results = try {
+            executor.invokeAll(
+                candidates.map { candidate ->
+                    Callable { probe(candidate, deadlineMillis) }
+                },
+                deadlineMillis.toLong(),
+                TimeUnit.MILLISECONDS,
+            ).mapIndexed { index, future ->
+                if (future.isCancelled) {
+                    BackgroundProbeResult(candidates[index].candidateId, null, "timeout", measuredAt)
+                } else {
+                    runCatching { future.get() }.getOrElse {
+                        BackgroundProbeResult(
+                            candidates[index].candidateId,
+                            null,
+                            "network_error",
+                            measuredAt,
+                        )
+                    }
+                }
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+        val earliestCandidateExpiry = candidates.minOf { it.expiresAtUnix }
+            .coerceAtMost(Long.MAX_VALUE / 1_000)
+            .times(1_000)
+        val validUntil = minOf(
+            now.saturatingAdd(BACKGROUND_PROBE_CACHE_MILLIS),
+            earliestCandidateExpiry,
+        )
+        synchronized(gate) {
+            cached = CacheEntry(layer, egressMode, networkIdentity, ids, validUntil, results)
+        }
+        return results
+    }
+
+    fun invalidateNetwork() = synchronized(gate) {
+        cached = null
+    }
+}
+
+private const val BACKGROUND_PROBE_TIMEOUT_MILLIS = 3_000
+private const val BACKGROUND_PROBE_CACHE_MILLIS = 5L * 60 * 1_000
+
+private fun Long.saturatingAdd(other: Long): Long =
+    if (this > Long.MAX_VALUE - other) Long.MAX_VALUE else this + other
+
+private fun probeBackgroundCandidate(
+    candidate: BackgroundServerCandidate,
+    timeoutMillis: Int,
+): BackgroundProbeResult {
+    val measuredAtMillis = System.currentTimeMillis()
+    val startedAt = System.nanoTime()
+    val connection = try {
+        val url = URI(candidate.probeUrl)
+        require(url.scheme.equals("https", ignoreCase = true))
+        url.toURL().openConnection() as HttpsURLConnection
+    } catch (_: Throwable) {
+        return BackgroundProbeResult(
+            candidate.candidateId,
+            null,
+            "invalid_url",
+            Instant.ofEpochMilli(measuredAtMillis).toString(),
+        )
+    }
+    return try {
+        connection.requestMethod = "GET"
+        connection.instanceFollowRedirects = false
+        connection.connectTimeout = timeoutMillis
+        connection.readTimeout = timeoutMillis
+        connection.setRequestProperty("Accept", "application/json")
+        val status = connection.responseCode
+        if (status in 200..299) {
+            BackgroundProbeResult(
+                candidate.candidateId,
+                (System.nanoTime() - startedAt) / 1_000_000.0,
+                null,
+                Instant.ofEpochMilli(measuredAtMillis).toString(),
+            )
+        } else {
+            BackgroundProbeResult(
+                candidate.candidateId,
+                null,
+                "http_error",
+                Instant.ofEpochMilli(measuredAtMillis).toString(),
+            )
+        }
+    } catch (error: java.net.SocketTimeoutException) {
+        BackgroundProbeResult(
+            candidate.candidateId,
+            null,
+            "timeout",
+            Instant.ofEpochMilli(measuredAtMillis).toString(),
+        )
+    } catch (_: Throwable) {
+        BackgroundProbeResult(
+            candidate.candidateId,
+            null,
+            "network_error",
+            Instant.ofEpochMilli(measuredAtMillis).toString(),
+        )
+    } finally {
+        connection.disconnect()
+    }
+}
 
 internal data class BackgroundActivationResult(
     val tokenGeneration: Long,
@@ -103,8 +271,26 @@ internal fun provisionBackgroundCredential(
     if (envelope.revision != request.expectedRevision) {
         throw BackgroundConnectionException("background_credential_revision_conflict")
     }
-    if (envelope.logoutState != null) {
+    if (envelope.logoutState?.phase == BackgroundLogoutPhase.PENDING) {
         throw BackgroundConnectionException("background_credential_logout_pending")
+    }
+    val effectiveCapability = conservativeBackgroundCapability(
+        envelope.capability,
+        request.capability,
+    )
+    if (envelope.reservation == null && envelope.pending == null &&
+        (!effectiveCapability.enabled || effectiveCapability.expiresAtUnix <= nowUnix)
+    ) {
+        if (envelope.deviceId != request.deviceId || envelope.panelBase != request.panelBase ||
+            envelope.installSecret != request.installSecret ||
+            envelope.installGeneration != request.installGeneration
+        ) {
+            throw BackgroundConnectionException("background_credential_mutation_conflict")
+        }
+        return store.updateCapability(
+            envelope.revision,
+            effectiveCapability,
+        ).provisionEnvelopeOrThrow()
     }
     if (envelope.reservation != null || envelope.pending != null) {
         if (envelope.deviceId != request.deviceId || envelope.panelBase != request.panelBase ||
@@ -113,28 +299,25 @@ internal fun provisionBackgroundCredential(
         ) {
             throw BackgroundConnectionException("background_credential_mutation_conflict")
         }
+        val storedCapability = envelope.capability
+        val resumedCapability = conservativeBackgroundCapability(
+            storedCapability,
+            request.capability,
+        )
         if (envelope.pending == null) {
-            val storedCapability = envelope.capability
-            val effectiveCapability = if (
-                storedCapability == null || request.capability.revision >= storedCapability.revision
-            ) {
-                request.capability
-            } else {
-                storedCapability
-            }
-            if (!effectiveCapability.enabled || effectiveCapability.expiresAtUnix <= nowUnix) {
+            if (!resumedCapability.enabled || resumedCapability.expiresAtUnix <= nowUnix) {
                 store.cancelUncommittedReservation(
                     envelope.revision,
-                    effectiveCapability,
+                    resumedCapability,
                 ).provisionEnvelopeOrThrow()
                 throw BackgroundConnectionException("background_credential_capability_unavailable")
             }
-            if (effectiveCapability != storedCapability) {
-                envelope = store.updateCapability(
-                    envelope.revision,
-                    effectiveCapability,
-                ).provisionEnvelopeOrThrow()
-            }
+        }
+        if (resumedCapability != storedCapability) {
+            envelope = store.updateCapability(
+                envelope.revision,
+                resumedCapability,
+            ).provisionEnvelopeOrThrow()
         }
     } else {
         val (prepareOperationId, activationOperationId) = operationIds()
@@ -301,7 +484,7 @@ internal class BackgroundOperationClient(
         val payload = transport.execute(credential, "GET", "background/capabilities")
         return parseResponse {
             BackgroundCapabilitySnapshot(
-                revision = payload.getLong("revision").also { require(it >= 0) },
+                revision = payload.getLong("revision").also { require(it > 0) },
                 enabled = payload.getBoolean("connection_intent_recovery_v1"),
                 expiresAtUnix = parseTimestamp(payload.getString("expires_at")),
             )
@@ -322,6 +505,7 @@ internal class BackgroundOperationClient(
         )
         return parseResponse {
             val candidates = payload.getJSONArray("candidates")
+            require(candidates.length() <= BACKGROUND_MAX_CANDIDATES)
             (0 until candidates.length()).map { index ->
                 val item = candidates.getJSONObject(index)
                 val probeUrl = item.getString("probe_url")
@@ -379,6 +563,27 @@ internal class BackgroundOperationClient(
                 nextAttemptAtUnix = payload.optionalString("next_attempt_at")?.let(::parseTimestamp),
             )
         }
+    }
+
+    fun stop(
+        credential: BackgroundCredential,
+        leaseId: String,
+        operationId: String,
+        failureCode: String? = null,
+    ) {
+        requireUuid(operationId)
+        requireWireValue(leaseId)
+        require(failureCode in setOf(null, "tunnel_data_plane_stalled"))
+        transport.execute(
+            credential,
+            "POST",
+            "background/connections/stop",
+            JSONObject().apply {
+                put("operation_id", operationId)
+                put("lease_id", leaseId)
+                failureCode?.let { put("failure_code", it) }
+            },
+        )
     }
 
     fun prepareToken(
@@ -584,12 +789,11 @@ private class UrlConnectionBackgroundApiTransport : BackgroundApiTransport {
             }.orEmpty()
             val json = runCatching { JSONObject(body) }.getOrNull()
             if (status !in 200..299) {
-                throw BackgroundConnectionException(
-                    backgroundPanelErrorCode(
-                        endpoint.substringBefore('?'),
-                        status,
-                        json?.optString("code")?.takeIf(String::isNotBlank),
-                    ),
+                throw backgroundPanelException(
+                    endpoint = endpoint.substringBefore('?'),
+                    status = status,
+                    panelCode = json?.optString("code")?.takeIf(String::isNotBlank),
+                    retryAfterHeader = connection.getHeaderField("Retry-After"),
                 )
             }
             json ?: throw BackgroundConnectionException("invalid_background_response")
@@ -661,16 +865,67 @@ internal object BackgroundConnectionClient {
         return BackgroundStartResult(configuration, connection, options)
     }
 
-    fun stop(credential: BackgroundCredential, leaseId: String) {
-        execute(
-            credential,
-            "background/connections/stop",
-            JSONObject().apply {
-                put("operation_id", UUID.randomUUID().toString())
-                put("lease_id", leaseId)
-            },
+    fun startExact(
+        credential: BackgroundCredential,
+        template: AndroidIntentTemplate,
+        transaction: AndroidLeaseTransaction,
+        probeCache: BackgroundCandidateProbeCache,
+        networkIdentity: String,
+    ): BackgroundStartResult {
+        val connection = QuickConnectionArgs().apply {
+            leaseId = ""
+            layer = template.layer
+            ticConnectionMode = template.ticConnectionMode
+            routeMode = template.routeMode
+            egressMode = template.egressMode
+            allowAlternate = template.allowAlternate
+        }
+        val quickTemplate = QuickTunnelTemplate(
+            options = template.options.toTunnelOptionsArgs(),
+            connection = connection,
         )
+        val measured = requiresMeasuredCandidateSelection(
+            template.layer,
+            template.ticConnectionMode,
+            template.allowAlternate,
+        )
+        val probes = if (measured) {
+            probeCache.measure(
+                template.layer,
+                template.egressMode,
+                networkIdentity,
+                serverCandidates(credential, template.layer, template.egressMode),
+            )
+        } else {
+            emptyList()
+        }
+        val request = backgroundStartPayload(
+            quickTemplate,
+            transaction.startOperationId,
+            probes,
+            transaction.replay.contractVersion,
+            transaction.replay.requestFingerprint,
+            measured,
+        )
+        val payload = execute(credential, "background/connections/start", request)
+        val selected = payload.getJSONObject("connection").toQuickConnection().also {
+            it.allowAlternate = template.allowAlternate
+        }
+        val options = template.options.toTunnelOptionsArgs()
+        val configuration = payload.getString("configuration").toByteArray(StandardCharsets.UTF_8)
+        if (configuration.isEmpty() || configuration.size > BACKGROUND_MAX_RESPONSE_BYTES) {
+            configuration.fill(0)
+            throw BackgroundConnectionException("invalid_background_configuration")
+        }
+        return BackgroundStartResult(configuration, selected, options)
     }
+
+    fun stop(
+        credential: BackgroundCredential,
+        leaseId: String,
+        operationId: String,
+        failureCode: String? = null,
+    ) = operations.stop(credential, leaseId, operationId, failureCode)
 
     fun uploadDiagnostics(
         credential: BackgroundCredential,
@@ -694,6 +949,18 @@ internal object BackgroundConnectionClient {
 
     fun capabilities(credential: BackgroundCredential): BackgroundCapabilitySnapshot =
         operations.capabilities(credential)
+
+    fun syncBindingPreferences(
+        credential: BackgroundCredential,
+        template: AndroidIntentTemplate,
+    ) {
+        val response = execute(
+            credential,
+            "background/device/sync-binding",
+            backgroundBindingPreferencesPayload(template),
+        )
+        validateBackgroundBindingSyncResponse(response)
+    }
 
     fun serverCandidates(
         credential: BackgroundCredential,
@@ -785,8 +1052,20 @@ internal fun backgroundPanelErrorCode(
         "background_recovery_unsupported"
     endpoint == "background/capabilities" && status == 404 ->
         "recovery_contract_unsupported"
-    else -> panelCode?.takeIf(String::isNotBlank) ?: "background_panel_error"
+    !panelCode.isNullOrBlank() -> panelCode
+    status in 500..599 -> "http_5xx"
+    else -> "background_panel_error"
 }
+
+internal fun backgroundPanelException(
+    endpoint: String,
+    status: Int,
+    panelCode: String?,
+    retryAfterHeader: String?,
+): BackgroundConnectionException = BackgroundConnectionException(
+    backgroundPanelErrorCode(endpoint, status, panelCode),
+    retryAfterHeader,
+)
 
 internal fun refreshBackgroundCapability(
     current: BackgroundCapabilitySnapshot?,
@@ -807,17 +1086,55 @@ internal fun backgroundRecoveryPayload(installSecret: String): JSONObject = JSON
     put("install_secret", installSecret)
 }
 
+internal fun backgroundBindingPreferencesPayload(
+    template: AndroidIntentTemplate,
+): JSONObject = JSONObject().apply {
+    put("preferred_layer", template.layer)
+    put("tic_connection_mode", template.ticConnectionMode)
+    put("route_mode", template.routeMode)
+    put("egress_mode", template.egressMode)
+}
+
+internal fun validateBackgroundBindingSyncResponse(response: JSONObject) {
+    if (!response.optBoolean("ok", false) || response.has("configuration")) {
+        throw BackgroundConnectionException("invalid_background_response")
+    }
+}
+
 internal fun backgroundStartPayload(
     template: QuickTunnelTemplate,
     operationId: String,
-): JSONObject = JSONObject().apply {
-    put("operation_id", operationId)
-    put("layer", template.connection.layer)
-    put("tic_connection_mode", template.connection.ticConnectionMode)
-    put("route_mode", template.connection.routeMode)
-    put("egress_mode", template.connection.egressMode)
-    put("probes", JSONArray())
-    put("allow_alternate", template.connection.allowAlternate)
+    probes: List<BackgroundProbeResult> = emptyList(),
+    contractVersion: Int? = null,
+    requestFingerprint: String? = null,
+    requireMeasuredSelection: Boolean = true,
+): JSONObject {
+    if (probes.size > BACKGROUND_MAX_CANDIDATES) {
+        throw BackgroundConnectionException("invalid_background_response")
+    }
+    return JSONObject().apply {
+        put("operation_id", operationId)
+        put("layer", template.connection.layer)
+        put("tic_connection_mode", template.connection.ticConnectionMode)
+        put("route_mode", template.connection.routeMode)
+        put("egress_mode", template.connection.egressMode)
+        put("probes", JSONArray().apply {
+            probes.forEach { probe ->
+                put(JSONObject().apply {
+                    put("candidate_id", probe.candidateId)
+                    probe.latencyMillis?.let { put("latency_ms", it) }
+                    probe.failureCode?.let { put("failure_code", it) }
+                    put("measured_at", probe.measuredAt)
+                })
+            }
+        })
+        put("allow_alternate", template.connection.allowAlternate)
+        if (contractVersion != null && requestFingerprint != null) {
+            put("require_measured_selection", requireMeasuredSelection)
+            put("recovery_contract_version", contractVersion)
+            put("request_fingerprint", requestFingerprint)
+        }
+    }
 }
 
 private fun JSONObject.toTunnelOptions(

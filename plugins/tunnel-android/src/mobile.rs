@@ -114,9 +114,63 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub fn begin_connection_intent(
+        &self,
+        request: BeginConnectionIntentRequest,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        self.0
+            .run_mobile_plugin("beginConnectionIntent", request)
+            .map_err(Into::into)
+    }
+
+    pub async fn begin_connection_intent_async(
+        &self,
+        request: BeginConnectionIntentRequest,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        self.0
+            .run_mobile_plugin_async("beginConnectionIntent", request)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub fn toggle_connection_intent(&self) -> crate::Result<ConnectionIntentStatusResponse> {
+        self.0
+            .run_mobile_plugin("toggleConnectionIntent", EmptyRequest {})
+            .map_err(Into::into)
+    }
+
+    pub fn cancel_connection_intent(
+        &self,
+        request: CancelConnectionIntentRequest,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        self.0
+            .run_mobile_plugin("cancelConnectionIntent", request)
+            .map_err(Into::into)
+    }
+
+    pub fn cancel_current_connection_intent(
+        &self,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        self.0
+            .run_mobile_plugin("cancelCurrentConnectionIntent", EmptyRequest {})
+            .map_err(Into::into)
+    }
+
+    pub fn connection_intent_status(&self) -> crate::Result<ConnectionIntentStatusResponse> {
+        self.0
+            .run_mobile_plugin("connectionIntentStatus", EmptyRequest {})
+            .map_err(Into::into)
+    }
+
     pub fn clear_background(&self) -> crate::Result<()> {
         self.0
             .run_mobile_plugin::<()>("clearBackground", EmptyRequest {})
+            .map_err(Into::into)
+    }
+
+    pub fn begin_background_logout(&self) -> crate::Result<BackgroundLogoutOwnershipResponse> {
+        self.0
+            .run_mobile_plugin("beginBackgroundLogout", EmptyRequest {})
             .map_err(Into::into)
     }
 

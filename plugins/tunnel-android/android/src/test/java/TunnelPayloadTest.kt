@@ -85,6 +85,17 @@ class TunnelPayloadTest {
     }
 
     @Test
+    fun stopQueuesBehindAnInProgressLegacyStartInsteadOfLeavingItRunning() {
+        val gate = TunnelStateGate()
+
+        assertEquals(TransitionDecision.PROCEED, gate.beginStart())
+        assertEquals(TransitionDecision.PROCEED, gate.beginStop())
+        assertEquals(SessionState.STOPPING, gate.current())
+        assertEquals(TransitionDecision.BUSY, gate.beginStart())
+        assertEquals(TransitionDecision.BUSY, gate.beginStop())
+    }
+
+    @Test
     fun rebindBlocksConcurrentStartStopAndSecondRebind() {
         val gate = TunnelStateGate(SessionState.RUNNING)
 

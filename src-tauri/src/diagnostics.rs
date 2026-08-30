@@ -14,6 +14,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(desktop)]
+use uuid::Uuid;
 
 const CURRENT_LOG: &str = "application.jsonl";
 const PREVIOUS_LOG: &str = "application.previous.jsonl";
@@ -38,6 +40,184 @@ pub(crate) enum TunnelMetricsObservation {
     Unchanged,
     Detected,
     Recovered,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConnectionIntentDiagnosticActions {
+    pub queue_report: bool,
+    pub notify_user: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConnectionIntentDiagnosticsEpisode {
+    report_queued: bool,
+    notification_sent: bool,
+}
+
+impl ConnectionIntentDiagnosticsEpisode {
+    pub(crate) fn observe_retry(
+        &mut self,
+        delay_seconds: u64,
+    ) -> ConnectionIntentDiagnosticActions {
+        if delay_seconds < 300 {
+            return ConnectionIntentDiagnosticActions::default();
+        }
+        let actions = ConnectionIntentDiagnosticActions {
+            queue_report: !self.report_queued,
+            notify_user: !self.notification_sent,
+        };
+        self.report_queued = true;
+        self.notification_sent = true;
+        actions
+    }
+
+    pub(crate) fn observe_terminal(&mut self) -> ConnectionIntentDiagnosticActions {
+        let actions = ConnectionIntentDiagnosticActions {
+            queue_report: !self.report_queued,
+            notify_user: false,
+        };
+        self.report_queued = true;
+        actions
+    }
+
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(crate) fn report_queue_failed(&mut self) {
+        self.report_queued = false;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionIntentReasonClass {
+    Network,
+    Panel,
+    LocalService,
+    Tunnel,
+    Profile,
+    Authorization,
+    Compatibility,
+    LocalState,
+    Invariant,
+    Other,
+}
+
+impl ConnectionIntentReasonClass {
+    pub(crate) fn from_code(code: &str) -> Self {
+        match code {
+            "transport_error"
+            | "android_service_dispatch_unavailable"
+            | "endpoint_route_lost"
+            | "endpoint_route_unavailable"
+            | "physical_network_monitor_unavailable"
+            | "physical_egress_unavailable"
+            | "local_networks_unavailable" => Self::Network,
+            "connection_unavailable"
+            | "candidate_unavailable"
+            | "configuration_fetch_failed"
+            | "connection_no_longer_active"
+            | "connection_already_active"
+            | "connection_release_failed"
+            | "probe_results_required"
+            | "saved_connection_unavailable"
+            | "connection_stall_verification_unavailable"
+            | "connection_stall_recycle_rate_limited" => Self::Panel,
+            "service_timeout"
+            | "tunnel_service_timeout"
+            | "service_stopping"
+            | "service_unavailable"
+            | "udp_rebind_failed"
+            | "udp_rebind_timeout" => Self::LocalService,
+            "tunnel_handshake_timeout" | "tunnel_data_plane_stalled" => Self::Tunnel,
+            "amneziawg_profile_mismatch"
+            | "awg3_profile_apply_failed"
+            | "awg3_profile_transform_mismatch" => Self::Profile,
+            "signed_out"
+            | "access_expired"
+            | "background_credential_unavailable"
+            | "invalid_background_token"
+            | "missing_background_token" => Self::Authorization,
+            "update_required"
+            | "service_outdated"
+            | "unsupported_protocol"
+            | "missing_service_version"
+            | "recovery_contract_unavailable" => Self::Compatibility,
+            "storage_unavailable" | "clock_unavailable" | "quick_state_persist_failed" => {
+                Self::LocalState
+            }
+            "operation_id_conflict"
+            | "request_fingerprint_mismatch"
+            | "invalid_background_response"
+            | "connection_intent_invalid" => Self::Invariant,
+            _ => Self::Other,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Panel => "panel",
+            Self::LocalService => "local_service",
+            Self::Tunnel => "tunnel",
+            Self::Profile => "profile",
+            Self::Authorization => "authorization",
+            Self::Compatibility => "compatibility",
+            Self::LocalState => "local_state",
+            Self::Invariant => "invariant",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionIntentDiagnosticEvent {
+    Started,
+    RetryScheduled {
+        attempt: u32,
+        reason_class: ConnectionIntentReasonClass,
+        delay_seconds: u64,
+    },
+    NetworkWakeup,
+    LeaseReplacementStarted,
+    Recovered,
+    Cancelled,
+    TerminalFailure {
+        reason_class: ConnectionIntentReasonClass,
+    },
+    SlowRecoveryNotified {
+        reason_class: ConnectionIntentReasonClass,
+    },
+}
+
+impl ConnectionIntentDiagnosticEvent {
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Started => "connection.intent.started",
+            Self::RetryScheduled { .. } => "connection.intent.retry_scheduled",
+            Self::NetworkWakeup => "connection.intent.network_wakeup",
+            Self::LeaseReplacementStarted => "connection.intent.lease_replacement_started",
+            Self::Recovered => "connection.intent.recovered",
+            Self::Cancelled => "connection.intent.cancelled",
+            Self::TerminalFailure { .. } => "connection.intent.terminal_failure",
+            Self::SlowRecoveryNotified { .. } => "connection.intent.slow_recovery_notified",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectionIntentReportTrigger {
+    SlowRecovery,
+    TerminalFailure,
+}
+
+impl ConnectionIntentReportTrigger {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SlowRecovery => "connection_intent_slow_recovery",
+            Self::TerminalFailure => "connection_intent_terminal_failure",
+        }
+    }
 }
 #[cfg(any(target_os = "android", test))]
 const MAX_ANDROID_NETWORK_INCIDENT_REPORT_BYTES: usize = 48 * 1024;
@@ -85,6 +265,18 @@ struct TunnelMetricsLogRecord<'a> {
     handshake_age_seconds: Option<u64>,
     probe_succeeded: Option<bool>,
     latency_ms: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct ConnectionIntentLogRecord {
+    timestamp_unix: i64,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delay_seconds: Option<u64>,
 }
 
 impl AppDiagnostics {
@@ -136,6 +328,32 @@ impl AppDiagnostics {
         code: Option<&str>,
     ) {
         self.record_with_duration(kind, operation_id, request_id, code, None);
+    }
+
+    pub(crate) fn record_connection_intent(&self, event: ConnectionIntentDiagnosticEvent) {
+        let (reason_class, attempt, delay_seconds) = match event {
+            ConnectionIntentDiagnosticEvent::RetryScheduled {
+                attempt,
+                reason_class,
+                delay_seconds,
+            } => (
+                Some(reason_class.as_str()),
+                Some(attempt),
+                Some(delay_seconds),
+            ),
+            ConnectionIntentDiagnosticEvent::TerminalFailure { reason_class }
+            | ConnectionIntentDiagnosticEvent::SlowRecoveryNotified { reason_class } => {
+                (Some(reason_class.as_str()), None, None)
+            }
+            _ => (None, None, None),
+        };
+        self.append_serialized(&ConnectionIntentLogRecord {
+            timestamp_unix: now_unix(),
+            kind: event.kind(),
+            reason_class,
+            attempt,
+            delay_seconds,
+        });
     }
 
     pub fn record_timed_named(
@@ -441,6 +659,48 @@ impl AppDiagnostics {
     #[cfg(desktop)]
     pub fn pending_automatic_seal(&self) -> io::Result<Option<PendingSeal>> {
         self.automatic.pending_seal()
+    }
+
+    #[cfg(desktop)]
+    pub(crate) fn queue_connection_intent_report(
+        &self,
+        trigger: ConnectionIntentReportTrigger,
+        generated_at: i64,
+    ) -> io::Result<()> {
+        let _guard = self
+            .write_gate
+            .lock()
+            .map_err(|_| io::Error::other("diagnostics lock poisoned"))?;
+        let previous = read_tail(
+            &self.directory.join(PREVIOUS_LOG),
+            MAX_APPLICATION_REPORT_BYTES / 2,
+        )?;
+        let current = read_tail(
+            &self.directory.join(CURRENT_LOG),
+            MAX_APPLICATION_REPORT_BYTES,
+        )?;
+        let application_log = safe_connection_intent_log(&format!("{previous}{current}"));
+        let report = DiagnosticUploadRequest {
+            report_id: Some(Uuid::new_v4().to_string()),
+            trigger: trigger.as_str().to_string(),
+            tunnel_session_id: None,
+            sequence: None,
+            interval_started_at_unix: None,
+            interval_ended_at_unix: Some(generated_at),
+            tunnel_running: None,
+            connection_lease_id: None,
+            generated_at_unix: generated_at,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform_version: platform_version(),
+            architecture: std::env::consts::ARCH.to_string(),
+            application_log,
+            helper_log: None,
+            network_incidents: None,
+            resource_usage: None,
+        };
+        drop(_guard);
+        self.automatic
+            .queue_connection_intent_report(&report, generated_at)
     }
 
     #[cfg(desktop)]
@@ -836,9 +1096,169 @@ fn now_unix() -> i64 {
         .unwrap_or_default()
 }
 
+#[cfg(desktop)]
+fn safe_connection_intent_log(value: &str) -> String {
+    const SAFE_EVENTS: [&str; 8] = [
+        "connection.intent.started",
+        "connection.intent.retry_scheduled",
+        "connection.intent.network_wakeup",
+        "connection.intent.lease_replacement_started",
+        "connection.intent.recovered",
+        "connection.intent.cancelled",
+        "connection.intent.terminal_failure",
+        "connection.intent.slow_recovery_notified",
+    ];
+    let mut result = String::new();
+    for line in value.lines() {
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(kind) = payload.get("kind").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !SAFE_EVENTS.contains(&kind) {
+            continue;
+        }
+        let mut safe = serde_json::Map::new();
+        if let Some(timestamp) = payload
+            .get("timestamp_unix")
+            .and_then(serde_json::Value::as_i64)
+        {
+            safe.insert("timestamp_unix".to_string(), timestamp.into());
+        }
+        safe.insert("kind".to_string(), kind.into());
+        if let Some(reason_class) = payload
+            .get("reason_class")
+            .and_then(serde_json::Value::as_str)
+        {
+            safe.insert("reason_class".to_string(), reason_class.into());
+        }
+        if let Some(attempt) = payload.get("attempt").and_then(serde_json::Value::as_u64) {
+            safe.insert("attempt".to_string(), attempt.into());
+        }
+        if let Some(delay_seconds) = payload
+            .get("delay_seconds")
+            .and_then(serde_json::Value::as_u64)
+        {
+            safe.insert("delay_seconds".to_string(), delay_seconds.into());
+        }
+        if let Ok(line) = serde_json::to_string(&safe) {
+            result.push_str(&line);
+            result.push('\n');
+        }
+    }
+    tail_string(&result, MAX_APPLICATION_REPORT_BYTES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_intent_diagnostics_reports_and_notifies_once_per_episode() {
+        let mut episode = ConnectionIntentDiagnosticsEpisode::default();
+
+        assert_eq!(
+            episode.observe_retry(299),
+            ConnectionIntentDiagnosticActions::default(),
+        );
+        assert_eq!(
+            episode.observe_retry(300),
+            ConnectionIntentDiagnosticActions {
+                queue_report: true,
+                notify_user: true,
+            },
+        );
+        assert_eq!(
+            episode.observe_retry(300),
+            ConnectionIntentDiagnosticActions::default(),
+        );
+        assert_eq!(
+            episode.observe_terminal(),
+            ConnectionIntentDiagnosticActions::default(),
+        );
+
+        episode.report_queue_failed();
+        assert!(episode.observe_terminal().queue_report);
+
+        episode.reset();
+        assert_eq!(
+            episode.observe_terminal(),
+            ConnectionIntentDiagnosticActions {
+                queue_report: true,
+                notify_user: false,
+            },
+        );
+
+        episode.reset();
+        assert_eq!(
+            episode.observe_retry(300),
+            ConnectionIntentDiagnosticActions {
+                queue_report: true,
+                notify_user: true,
+            },
+        );
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn connection_intent_diagnostics_payload_contains_only_safe_structured_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().to_path_buf(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        diagnostics.set_automatic_device("device-1");
+
+        diagnostics.record_connection_intent(ConnectionIntentDiagnosticEvent::RetryScheduled {
+            attempt: 7,
+            reason_class: ConnectionIntentReasonClass::Network,
+            delay_seconds: 300,
+        });
+        diagnostics
+            .queue_connection_intent_report(ConnectionIntentReportTrigger::SlowRecovery, 1_000)
+            .unwrap();
+
+        let candidate = diagnostics
+            .automatic_upload_candidate(1_000)
+            .unwrap()
+            .unwrap();
+        let encoded = serde_json::to_string(&candidate.report).unwrap();
+        assert_eq!(candidate.report.trigger, "connection_intent_slow_recovery");
+        assert!(candidate.report.application_log.contains("network"));
+        assert!(candidate.report.application_log.contains("\"attempt\":7"));
+        assert!(candidate
+            .report
+            .application_log
+            .contains("\"delay_seconds\":300"));
+        for forbidden in [
+            "private_key",
+            "session_token",
+            "wireguard_config",
+            "full_error_message",
+            "https://private.example",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+        assert!(candidate.report.helper_log.is_none());
+        assert!(candidate.report.network_incidents.is_none());
+    }
+
+    #[test]
+    fn connection_intent_reason_classes_do_not_echo_unknown_codes() {
+        assert_eq!(
+            ConnectionIntentReasonClass::from_code("transport_error"),
+            ConnectionIntentReasonClass::Network,
+        );
+        assert_eq!(
+            ConnectionIntentReasonClass::from_code(
+                "full_error_message private_key=https://private.example",
+            ),
+            ConnectionIntentReasonClass::Other,
+        );
+        assert_eq!(ConnectionIntentReasonClass::Other.as_str(), "other");
+    }
 
     #[test]
     fn rotates_and_builds_bounded_report() {
