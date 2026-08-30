@@ -1,0 +1,17 @@
+{
+  "api_version": "1",
+  "request_id": "req_redundant_role_01",
+  "action": "accepted",
+  "local_active_lease_id": "20000000-0000-4000-8000-000000000003",
+  "session": {
+    "session_id": "20000000-0000-4000-8000-000000000001",
+    "state": "connected",
+    "active_lease_id": "20000000-0000-4000-8000-000000000003",
+    "slot_a_lease_id": "20000000-0000-4000-8000-000000000002",
+    "slot_b_lease_id": "20000000-0000-4000-8000-000000000003",
+    "standby_desired": true,
+    "role_generation": 1,
+    "membership_generation": 0,
+    "reason": null
+  }
+}

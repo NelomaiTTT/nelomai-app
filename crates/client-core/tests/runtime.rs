@@ -713,6 +713,7 @@ fn connection(lease_id: &str) -> Connection {
         lease_id: lease_id.to_string(),
         pool_id: None,
         layer: Layer::Stray,
+        transport_protocol: Default::default(),
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::Standalone,
         egress_mode: EgressMode::Ipv4,
@@ -730,6 +731,7 @@ fn start_response(lease_id: &str) -> ConnectionStartResponse {
         connection: connection(lease_id),
         configuration: "[Interface]\nPrivateKey = tunnel-secret\n".to_string(),
         reused: false,
+        redundancy: None,
     }
 }
 

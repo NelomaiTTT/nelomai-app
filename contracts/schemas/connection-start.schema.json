@@ -25,11 +25,42 @@
     "allow_alternate": { "type": "boolean" },
     "require_measured_selection": { "type": "boolean", "default": false },
     "recovery_contract_version": { "type": "integer", "minimum": 1, "maximum": 32 },
+    "redundancy_contract_version": { "type": "integer", "minimum": 1, "maximum": 32 },
+    "reserve_enabled": { "type": "boolean" },
     "request_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
   },
   "dependentRequired": {
     "recovery_contract_version": ["request_fingerprint"],
-    "request_fingerprint": ["recovery_contract_version"]
+    "request_fingerprint": ["recovery_contract_version"],
+    "redundancy_contract_version": ["reserve_enabled"],
+    "reserve_enabled": ["redundancy_contract_version"]
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["recovery_contract_version"],
+        "properties": { "recovery_contract_version": { "const": 2 } }
+      },
+      "then": {
+        "required": ["redundancy_contract_version", "reserve_enabled"],
+        "properties": { "redundancy_contract_version": { "const": 1 } }
+      }
+    },
+    {
+      "if": {
+        "anyOf": [
+          { "required": ["redundancy_contract_version"] },
+          { "required": ["reserve_enabled"] }
+        ]
+      },
+      "then": {
+        "required": ["recovery_contract_version"],
+        "properties": {
+          "recovery_contract_version": { "const": 2 },
+          "redundancy_contract_version": { "const": 1 }
+        }
+      }
+    }
+  ],
   "additionalProperties": false
 }

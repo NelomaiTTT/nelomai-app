@@ -1,0 +1,13 @@
+{
+  "operation_id": "20000000-0000-4000-8000-000000000000",
+  "layer": "stray",
+  "tic_connection_mode": "dynamic",
+  "route_mode": "standalone",
+  "egress_mode": "ipv4",
+  "probes": [],
+  "allow_alternate": false,
+  "recovery_contract_version": 2,
+  "redundancy_contract_version": 1,
+  "reserve_enabled": true,
+  "request_fingerprint": "b827749f3132065904d3429660bb099ac8260160c24de2dca6cc94116994f5a5"
+}

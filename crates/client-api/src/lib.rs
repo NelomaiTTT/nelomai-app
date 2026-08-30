@@ -5,10 +5,12 @@ use nelomai_contracts::{
     ConnectionOperationResponse, ConnectionStartRequest, ConnectionStartResponse, EgressMode,
     ErrorPayload, Layer, OperationReconcileRequest, OperationReconcileResponse,
     PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode, PushRegistrationRequest,
-    PushRegistrationResponse, ServerCandidatesResponse, ServerSelectionRequest,
-    ServerSelectionResponse, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate,
-    API_PREFIX,
+    PushRegistrationResponse, RedundantCandidateCommitRequest, RedundantRoleRequest,
+    RedundantRoleResponse, RedundantSessionResponse, RedundantStandbyAcquireRequest,
+    RedundantStandbyAcquireResponse, RedundantStandbyReleaseRequest, RedundantStopRequest,
+    ServerCandidatesResponse, ServerSelectionRequest, ServerSelectionResponse,
+    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
+    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate, API_PREFIX,
 };
 use reqwest::{
     header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
@@ -858,6 +860,165 @@ impl ClientApi {
         .await
     }
 
+    pub async fn report_redundant_role(
+        &self,
+        access_token: &str,
+        request: &RedundantRoleRequest,
+    ) -> Result<RedundantRoleResponse, ClientApiError> {
+        self.redundant_operation(access_token, "connections/role", request)
+            .await
+    }
+
+    pub async fn release_redundant_standby(
+        &self,
+        access_token: &str,
+        request: &RedundantStandbyReleaseRequest,
+    ) -> Result<RedundantSessionResponse, ClientApiError> {
+        self.redundant_operation(access_token, "connections/standby/release", request)
+            .await
+    }
+
+    pub async fn acquire_redundant_standby(
+        &self,
+        access_token: &str,
+        request: &RedundantStandbyAcquireRequest,
+    ) -> Result<RedundantStandbyAcquireResponse, ClientApiError> {
+        self.redundant_operation(access_token, "connections/standby/acquire", request)
+            .await
+    }
+
+    pub async fn commit_redundant_candidate(
+        &self,
+        access_token: &str,
+        request: &RedundantCandidateCommitRequest,
+    ) -> Result<RedundantSessionResponse, ClientApiError> {
+        self.redundant_operation(access_token, "connections/standby/commit", request)
+            .await
+    }
+
+    pub async fn stop_redundant_connection(
+        &self,
+        access_token: &str,
+        request: &RedundantStopRequest,
+    ) -> Result<ConnectionOperationResponse, ClientApiError> {
+        self.redundant_operation(access_token, "connections/stop", request)
+            .await
+    }
+
+    async fn redundant_operation<Request, ResponseBody>(
+        &self,
+        access_token: &str,
+        path: &str,
+        request: &Request,
+    ) -> Result<ResponseBody, ClientApiError>
+    where
+        Request: Serialize + ?Sized,
+        ResponseBody: for<'de> Deserialize<'de>,
+    {
+        self.send_json(
+            self.http
+                .post(self.endpoint(path)?)
+                .bearer_auth(access_token)
+                .json(request),
+        )
+        .await
+    }
+
+    pub async fn background_report_redundant_role(
+        &self,
+        background_token: &str,
+        request: &RedundantRoleRequest,
+    ) -> Result<RedundantRoleResponse, ClientApiError> {
+        self.background_redundant_operation(
+            background_token,
+            "background/connections/role",
+            request,
+        )
+        .await
+    }
+
+    pub async fn background_start_connection(
+        &self,
+        background_token: &str,
+        request: &ConnectionStartRequest,
+    ) -> Result<ConnectionStartResponse, ClientApiError> {
+        self.background_redundant_operation(
+            background_token,
+            "background/connections/start",
+            request,
+        )
+        .await
+    }
+
+    pub async fn background_release_redundant_standby(
+        &self,
+        background_token: &str,
+        request: &RedundantStandbyReleaseRequest,
+    ) -> Result<RedundantSessionResponse, ClientApiError> {
+        self.background_redundant_operation(
+            background_token,
+            "background/connections/standby/release",
+            request,
+        )
+        .await
+    }
+
+    pub async fn background_acquire_redundant_standby(
+        &self,
+        background_token: &str,
+        request: &RedundantStandbyAcquireRequest,
+    ) -> Result<RedundantStandbyAcquireResponse, ClientApiError> {
+        self.background_redundant_operation(
+            background_token,
+            "background/connections/standby/acquire",
+            request,
+        )
+        .await
+    }
+
+    pub async fn background_commit_redundant_candidate(
+        &self,
+        background_token: &str,
+        request: &RedundantCandidateCommitRequest,
+    ) -> Result<RedundantSessionResponse, ClientApiError> {
+        self.background_redundant_operation(
+            background_token,
+            "background/connections/standby/commit",
+            request,
+        )
+        .await
+    }
+
+    pub async fn background_stop_redundant_connection(
+        &self,
+        background_token: &str,
+        request: &RedundantStopRequest,
+    ) -> Result<ConnectionOperationResponse, ClientApiError> {
+        self.background_redundant_operation(
+            background_token,
+            "background/connections/stop",
+            request,
+        )
+        .await
+    }
+
+    async fn background_redundant_operation<Request, ResponseBody>(
+        &self,
+        background_token: &str,
+        path: &str,
+        request: &Request,
+    ) -> Result<ResponseBody, ClientApiError>
+    where
+        Request: Serialize + ?Sized,
+        ResponseBody: for<'de> Deserialize<'de>,
+    {
+        self.send_json(
+            self.device_request(self.http.post(self.endpoint(path)?), background_token)
+                .json(request),
+        )
+        .await
+    }
+
     pub async fn stop_connection(
         &self,
         access_token: &str,
@@ -1136,6 +1297,28 @@ mod tests {
     }
 
     #[test]
+    fn background_redundancy_requests_use_device_authorization() {
+        let client = ClientApi::new("https://nelomai.ru").unwrap();
+        let request = client
+            .device_request(
+                client
+                    .http
+                    .post(client.endpoint("background/connections/role").unwrap()),
+                "background-secret",
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Device background-secret")
+        );
+    }
+
+    #[test]
     fn rejects_non_http_urls() {
         assert!(ClientApi::new("not a URL").is_err());
     }
@@ -1157,9 +1340,19 @@ mod tests {
         for path in [
             "server-selection",
             "connections/start",
+            "connections/role",
+            "connections/standby/release",
+            "connections/standby/acquire",
+            "connections/standby/commit",
             "connections/stop",
             "connections/pin-stray",
             "connections/unpin-stray",
+            "background/connections/role",
+            "background/connections/start",
+            "background/connections/standby/release",
+            "background/connections/standby/acquire",
+            "background/connections/standby/commit",
+            "background/connections/stop",
         ] {
             assert_eq!(
                 client.endpoint(path).unwrap().path(),
@@ -1180,6 +1373,8 @@ mod tests {
             allow_alternate: false,
             require_measured_selection: false,
             recovery_contract_version: None,
+            redundancy_contract_version: None,
+            reserve_enabled: None,
             request_fingerprint: None,
         };
         let value = serde_json::to_value(&start).unwrap();
@@ -1188,18 +1383,33 @@ mod tests {
         assert!(value.get("api_version").is_none());
         assert!(value.get("require_measured_selection").is_none());
         assert!(value.get("recovery_contract_version").is_none());
+        assert!(value.get("redundancy_contract_version").is_none());
+        assert!(value.get("reserve_enabled").is_none());
         assert!(value.get("request_fingerprint").is_none());
 
         let recovery_start = ConnectionStartRequest {
             require_measured_selection: true,
             recovery_contract_version: Some(1),
             request_fingerprint: Some("a".repeat(64)),
-            ..start
+            ..start.clone()
         };
         let recovery_value = serde_json::to_value(recovery_start).unwrap();
         assert_eq!(recovery_value["require_measured_selection"], true);
         assert_eq!(recovery_value["recovery_contract_version"], 1);
         assert_eq!(recovery_value["request_fingerprint"], "a".repeat(64));
+
+        let recovery_v2_start = ConnectionStartRequest {
+            recovery_contract_version: Some(2),
+            redundancy_contract_version: Some(1),
+            reserve_enabled: Some(true),
+            request_fingerprint: Some("b".repeat(64)),
+            ..start
+        };
+        let recovery_v2_value = serde_json::to_value(recovery_v2_start).unwrap();
+        assert_eq!(recovery_v2_value["recovery_contract_version"], 2);
+        assert_eq!(recovery_v2_value["redundancy_contract_version"], 1);
+        assert_eq!(recovery_v2_value["reserve_enabled"], true);
+        assert_eq!(recovery_v2_value["request_fingerprint"], "b".repeat(64));
 
         let operation = ConnectionOperationRequest {
             operation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -1236,6 +1446,22 @@ mod tests {
         assert_eq!(
             serde_json::to_value(stalled_operation).unwrap()["failure_code"],
             "tunnel_data_plane_stalled"
+        );
+
+        let redundant_stop = RedundantStopRequest {
+            operation_id: "55555555-5555-4555-8555-555555555555".to_string(),
+            lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            recovery_contract_version: nelomai_contracts::RecoveryContractV2,
+            session_id: "66666666-6666-4666-8666-666666666666".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(redundant_stop).unwrap(),
+            serde_json::json!({
+                "operation_id": "55555555-5555-4555-8555-555555555555",
+                "lease_id": "22222222-2222-4222-8222-222222222222",
+                "recovery_contract_version": 2,
+                "session_id": "66666666-6666-4666-8666-666666666666"
+            })
         );
     }
 

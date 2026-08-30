@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/connection-redundancy.schema.json",
+  "$defs": {
+    "nullableUuid": {
+      "anyOf": [
+        { "$ref": "common.schema.json#/$defs/uuid" },
+        { "type": "null" }
+      ]
+    },
+    "session": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "state",
+        "active_lease_id",
+        "slot_a_lease_id",
+        "slot_b_lease_id",
+        "standby_desired",
+        "role_generation",
+        "membership_generation"
+      ],
+      "properties": {
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "state": {
+          "enum": ["allocating", "connected", "degraded", "stopping", "stopped", "failed"]
+        },
+        "active_lease_id": { "$ref": "#/$defs/nullableUuid" },
+        "slot_a_lease_id": { "$ref": "#/$defs/nullableUuid" },
+        "slot_b_lease_id": { "$ref": "#/$defs/nullableUuid" },
+        "standby_desired": { "type": "boolean" },
+        "role_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "membership_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "reason": {
+          "anyOf": [
+            { "type": "string", "minLength": 1, "maxLength": 120 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "roleRequest": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "active_lease_id",
+        "expected_role_generation",
+        "expected_membership_generation"
+      ],
+      "properties": {
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "active_lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "expected_role_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "expected_membership_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "reason": {
+          "anyOf": [
+            { "type": "string", "minLength": 1, "maxLength": 120 },
+            { "type": "null" }
+          ]
+        },
+        "observed_at": {
+          "anyOf": [
+            { "$ref": "common.schema.json#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "roleResponse": {
+      "type": "object",
+      "required": ["api_version", "request_id", "action", "local_active_lease_id", "session"],
+      "properties": {
+        "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/id" },
+        "action": { "enum": ["accepted", "acknowledged", "rebase"] },
+        "local_active_lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "session": { "$ref": "#/$defs/session" }
+      },
+      "additionalProperties": false
+    },
+    "standbyReleaseRequest": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "inactive_lease_id",
+        "expected_role_generation",
+        "expected_membership_generation"
+      ],
+      "properties": {
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "inactive_lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "expected_role_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "expected_membership_generation": { "$ref": "common.schema.json#/$defs/generation" }
+      },
+      "additionalProperties": false
+    },
+    "standbyAcquireRequest": {
+      "type": "object",
+      "required": [
+        "operation_id",
+        "session_id",
+        "expected_role_generation",
+        "expected_membership_generation",
+        "probes"
+      ],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "expected_role_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "expected_membership_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "replace_lease_id": { "$ref": "#/$defs/nullableUuid" },
+        "probes": {
+          "type": "array",
+          "maxItems": 20,
+          "items": { "$ref": "common.schema.json#/$defs/probe" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "candidateCommitRequest": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "candidate_lease_id",
+        "expected_active_lease_id",
+        "expected_role_generation",
+        "expected_membership_generation"
+      ],
+      "properties": {
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "candidate_lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "expected_active_lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "expected_role_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "expected_membership_generation": { "$ref": "common.schema.json#/$defs/generation" }
+      },
+      "additionalProperties": false
+    },
+    "sessionResponse": {
+      "type": "object",
+      "required": ["api_version", "request_id", "session"],
+      "properties": {
+        "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/id" },
+        "session": { "$ref": "#/$defs/session" }
+      },
+      "additionalProperties": false
+    },
+    "standbyAcquireResponse": {
+      "type": "object",
+      "required": [
+        "api_version",
+        "request_id",
+        "session",
+        "candidate_lease_id",
+        "candidate_slot",
+        "connection",
+        "configuration",
+        "reused"
+      ],
+      "properties": {
+        "api_version": { "$ref": "common.schema.json#/$defs/apiVersion" },
+        "request_id": { "$ref": "common.schema.json#/$defs/id" },
+        "session": { "$ref": "#/$defs/session" },
+        "candidate_lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "candidate_slot": { "enum": ["A", "B"] },
+        "connection": { "$ref": "common.schema.json#/$defs/connection" },
+        "configuration": { "type": "string", "minLength": 1 },
+        "reused": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "stopRequest": {
+      "type": "object",
+      "required": ["operation_id", "lease_id", "recovery_contract_version", "session_id"],
+      "properties": {
+        "operation_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "recovery_contract_version": { "const": 2 },
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/roleRequest" },
+    { "$ref": "#/$defs/roleResponse" },
+    { "$ref": "#/$defs/standbyReleaseRequest" },
+    { "$ref": "#/$defs/standbyAcquireRequest" },
+    { "$ref": "#/$defs/candidateCommitRequest" },
+    { "$ref": "#/$defs/sessionResponse" },
+    { "$ref": "#/$defs/standbyAcquireResponse" },
+    { "$ref": "#/$defs/stopRequest" }
+  ]
+}

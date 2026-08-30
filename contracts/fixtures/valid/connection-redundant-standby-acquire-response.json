@@ -1,0 +1,31 @@
+{
+  "api_version": "1",
+  "request_id": "req_redundant_acquire_01",
+  "session": {
+    "session_id": "20000000-0000-4000-8000-000000000001",
+    "state": "degraded",
+    "active_lease_id": "20000000-0000-4000-8000-000000000003",
+    "slot_a_lease_id": "20000000-0000-4000-8000-000000000002",
+    "slot_b_lease_id": "20000000-0000-4000-8000-000000000003",
+    "standby_desired": true,
+    "role_generation": 1,
+    "membership_generation": 1,
+    "reason": "standby_unavailable"
+  },
+  "candidate_lease_id": "20000000-0000-4000-8000-000000000005",
+  "candidate_slot": "A",
+  "connection": {
+    "lease_id": "20000000-0000-4000-8000-000000000005",
+    "pool_id": "9",
+    "layer": "stray",
+    "transport_protocol": "amneziawg_3",
+    "tic_connection_mode": "dynamic",
+    "route_mode": "standalone",
+    "egress_mode": "ipv4",
+    "status": "issued",
+    "pinned": false,
+    "stopped_at": null
+  },
+  "configuration": "[Interface]\nPrivateKey = candidate-delivered-only-to-core\nAddress = 10.200.0.2/32\n",
+  "reused": false
+}

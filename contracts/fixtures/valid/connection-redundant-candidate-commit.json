@@ -1,0 +1,7 @@
+{
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "candidate_lease_id": "20000000-0000-4000-8000-000000000005",
+  "expected_active_lease_id": "20000000-0000-4000-8000-000000000003",
+  "expected_role_generation": 1,
+  "expected_membership_generation": 1
+}

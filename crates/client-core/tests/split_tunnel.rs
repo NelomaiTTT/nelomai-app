@@ -2122,6 +2122,7 @@ async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy(
         lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
         pool_id: None,
         layer: Layer::Tic,
+        transport_protocol: Default::default(),
         tic_connection_mode: TicConnectionMode::Dynamic,
         route_mode: RouteMode::ViaTak,
         egress_mode: EgressMode::Ipv4,
@@ -2556,6 +2557,7 @@ impl CoreApi for CoordinatorApi {
                 lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
                 pool_id: None,
                 layer: request.layer,
+                transport_protocol: Default::default(),
                 tic_connection_mode: request.tic_connection_mode,
                 route_mode: request.route_mode,
                 egress_mode: EgressMode::Ipv4,
@@ -2566,6 +2568,7 @@ impl CoreApi for CoordinatorApi {
             },
             configuration: "[Interface]\nPrivateKey = secret\n".to_string(),
             reused: false,
+            redundancy: None,
         })
     }
 
@@ -2592,6 +2595,7 @@ impl CoreApi for CoordinatorApi {
                 lease_id: request.lease_id.clone(),
                 pool_id: None,
                 layer: Layer::Tic,
+                transport_protocol: Default::default(),
                 tic_connection_mode: TicConnectionMode::Personal,
                 route_mode: RouteMode::ViaTak,
                 egress_mode: EgressMode::Ipv4,

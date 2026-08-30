@@ -8,7 +8,50 @@
     "request_id": { "$ref": "common.schema.json#/$defs/id" },
     "connection": { "$ref": "common.schema.json#/$defs/connection" },
     "configuration": { "type": "string", "minLength": 1 },
-    "reused": { "type": "boolean" }
+    "reused": { "type": "boolean" },
+    "redundancy": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "state",
+        "role_generation",
+        "membership_generation",
+        "virtual_address_v4",
+        "standby_desired"
+      ],
+      "properties": {
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "state": { "enum": ["warming", "ready", "degraded", "disabled"] },
+        "role_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "membership_generation": { "$ref": "common.schema.json#/$defs/generation" },
+        "virtual_address_v4": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "standby_desired": { "type": "boolean" },
+        "reason": {
+          "anyOf": [
+            { "type": "string", "minLength": 1, "maxLength": 120 },
+            { "type": "null" }
+          ]
+        },
+        "standby": {
+          "anyOf": [
+            {
+              "type": "object",
+              "required": ["health", "connection", "configuration"],
+              "properties": {
+                "health": {
+                  "enum": ["warming", "ready", "suspect", "unhealthy", "recovering"]
+                },
+                "connection": { "$ref": "common.schema.json#/$defs/connection" },
+                "configuration": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": true
+            },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
   },
   "additionalProperties": true
 }

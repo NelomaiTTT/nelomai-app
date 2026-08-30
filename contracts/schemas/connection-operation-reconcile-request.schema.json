@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nelomai.ru/schemas/client/v1/connection-operation-reconcile-request.schema.json",
+  "type": "object",
+  "required": ["operation_id", "kind", "contract_version", "request_fingerprint", "cancel_if_absent"],
+  "properties": {
+    "operation_id": { "$ref": "common.schema.json#/$defs/uuid" },
+    "kind": { "enum": ["start", "redundant_start", "redundant_stop", "stalled_stop"] },
+    "contract_version": { "type": "integer", "minimum": 1, "maximum": 32 },
+    "request_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "cancel_if_absent": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["kind"],
+        "properties": {
+          "kind": { "enum": ["redundant_start", "redundant_stop"] }
+        }
+      },
+      "then": {
+        "properties": { "contract_version": { "const": 2 } }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

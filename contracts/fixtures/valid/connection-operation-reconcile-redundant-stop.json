@@ -1,0 +1,7 @@
+{
+  "operation_id": "20000000-0000-4000-8000-000000000006",
+  "kind": "redundant_stop",
+  "contract_version": 2,
+  "request_fingerprint": "f87a22b86b07f909c81d50c8995a4edcd291445b6eb846dd78e0cef8fe0378c0",
+  "cancel_if_absent": false
+}

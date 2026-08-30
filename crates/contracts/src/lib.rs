@@ -68,6 +68,15 @@ pub enum Layer {
     Stray,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportProtocol {
+    #[default]
+    Wireguard,
+    #[serde(rename = "amneziawg_3")]
+    Amneziawg3,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TicConnectionMode {
@@ -307,6 +316,8 @@ pub struct Connection {
     #[serde(default)]
     pub pool_id: Option<String>,
     pub layer: Layer,
+    #[serde(default, skip_serializing_if = "is_wireguard_transport")]
+    pub transport_protocol: TransportProtocol,
     pub tic_connection_mode: TicConnectionMode,
     pub route_mode: RouteMode,
     #[serde(default)]
@@ -412,7 +423,62 @@ pub struct ConnectionStartRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_contract_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy_contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundancyState {
+    Warming,
+    Ready,
+    Degraded,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundancyMemberHealth {
+    Warming,
+    Ready,
+    Suspect,
+    Unhealthy,
+    Recovering,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundancyMember {
+    pub health: RedundancyMemberHealth,
+    pub connection: Connection,
+    pub configuration: String,
+}
+
+impl fmt::Debug for RedundancyMember {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedundancyMember")
+            .field("health", &self.health)
+            .field("connection", &self.connection)
+            .field("configuration", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundancySession {
+    pub session_id: String,
+    pub state: RedundancyState,
+    pub role_generation: u64,
+    pub membership_generation: u64,
+    pub virtual_address_v4: String,
+    pub standby_desired: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub standby: Option<RedundancyMember>,
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -422,6 +488,8 @@ pub struct ConnectionStartResponse {
     pub connection: Connection,
     pub configuration: String,
     pub reused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<RedundancySession>,
 }
 
 impl fmt::Debug for ConnectionStartResponse {
@@ -433,8 +501,169 @@ impl fmt::Debug for ConnectionStartResponse {
             .field("connection", &self.connection)
             .field("configuration", &"<redacted>")
             .field("reused", &self.reused)
+            .field("redundancy", &self.redundancy)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum RedundancyMemberSlot {
+    #[serde(rename = "A")]
+    A,
+    #[serde(rename = "B")]
+    B,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundantSessionState {
+    Allocating,
+    Connected,
+    Degraded,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantSessionView {
+    pub session_id: String,
+    pub state: RedundantSessionState,
+    pub active_lease_id: Option<String>,
+    pub slot_a_lease_id: Option<String>,
+    pub slot_b_lease_id: Option<String>,
+    pub standby_desired: bool,
+    pub role_generation: u64,
+    pub membership_generation: u64,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantRoleRequest {
+    pub session_id: String,
+    pub active_lease_id: String,
+    pub expected_role_generation: u64,
+    pub expected_membership_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedundantRoleAction {
+    Accepted,
+    Acknowledged,
+    Rebase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantRoleResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub action: RedundantRoleAction,
+    pub local_active_lease_id: String,
+    pub session: RedundantSessionView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantStandbyReleaseRequest {
+    pub session_id: String,
+    pub inactive_lease_id: String,
+    pub expected_role_generation: u64,
+    pub expected_membership_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RedundantStandbyAcquireRequest {
+    pub operation_id: String,
+    pub session_id: String,
+    pub expected_role_generation: u64,
+    pub expected_membership_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_lease_id: Option<String>,
+    #[serde(with = "bounded_connection_items")]
+    pub probes: Vec<ProbeResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantCandidateCommitRequest {
+    pub session_id: String,
+    pub candidate_lease_id: String,
+    pub expected_active_lease_id: String,
+    pub expected_role_generation: u64,
+    pub expected_membership_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantSessionResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub session: RedundantSessionView,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantStandbyAcquireResponse {
+    pub api_version: ApiVersion,
+    pub request_id: String,
+    pub session: RedundantSessionView,
+    pub candidate_lease_id: String,
+    pub candidate_slot: RedundancyMemberSlot,
+    pub connection: Connection,
+    pub configuration: String,
+    pub reused: bool,
+}
+
+impl fmt::Debug for RedundantStandbyAcquireResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedundantStandbyAcquireResponse")
+            .field("api_version", &self.api_version)
+            .field("request_id", &self.request_id)
+            .field("session", &self.session)
+            .field("candidate_lease_id", &self.candidate_lease_id)
+            .field("candidate_slot", &self.candidate_slot)
+            .field("connection", &self.connection)
+            .field("configuration", &"<redacted>")
+            .field("reused", &self.reused)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryContractV2;
+
+impl Serialize for RecoveryContractV2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(2)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryContractV2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match u32::deserialize(deserializer)? {
+            2 => Ok(Self),
+            _ => Err(<D::Error as serde::de::Error>::custom(
+                "redundant stop requires recovery contract version 2",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantStopRequest {
+    pub operation_id: String,
+    pub lease_id: String,
+    pub recovery_contract_version: RecoveryContractV2,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -456,6 +685,8 @@ pub struct ConnectionOperationResponse {
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     Start,
+    RedundantStart,
+    RedundantStop,
     StalledStop,
 }
 
@@ -500,6 +731,10 @@ pub struct OperationReconcileResponse {
 
 const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+const fn is_wireguard_transport(value: &TransportProtocol) -> bool {
+    matches!(value, TransportProtocol::Wireguard)
 }
 
 const fn default_recovery_contract_version() -> u32 {

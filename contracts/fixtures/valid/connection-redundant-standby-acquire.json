@@ -1,0 +1,8 @@
+{
+  "operation_id": "20000000-0000-4000-8000-000000000004",
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "expected_role_generation": 1,
+  "expected_membership_generation": 1,
+  "replace_lease_id": "20000000-0000-4000-8000-000000000002",
+  "probes": []
+}

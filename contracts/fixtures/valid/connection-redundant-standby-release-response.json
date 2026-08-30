@@ -1,0 +1,15 @@
+{
+  "api_version": "1",
+  "request_id": "req_redundant_release_01",
+  "session": {
+    "session_id": "20000000-0000-4000-8000-000000000001",
+    "state": "degraded",
+    "active_lease_id": "20000000-0000-4000-8000-000000000003",
+    "slot_a_lease_id": null,
+    "slot_b_lease_id": "20000000-0000-4000-8000-000000000003",
+    "standby_desired": false,
+    "role_generation": 1,
+    "membership_generation": 1,
+    "reason": "reserve_disabled"
+  }
+}

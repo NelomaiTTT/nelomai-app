@@ -4624,6 +4624,7 @@ mod tests {
             lease_id: lease_id.to_string(),
             pool_id: None,
             layer: Layer::Stray,
+            transport_protocol: Default::default(),
             tic_connection_mode: TicConnectionMode::Dynamic,
             route_mode: RouteMode::Standalone,
             egress_mode: EgressMode::Ipv4,

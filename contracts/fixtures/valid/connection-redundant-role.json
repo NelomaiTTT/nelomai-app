@@ -1,0 +1,8 @@
+{
+  "session_id": "20000000-0000-4000-8000-000000000001",
+  "active_lease_id": "20000000-0000-4000-8000-000000000003",
+  "expected_role_generation": 0,
+  "expected_membership_generation": 0,
+  "reason": "primary_unhealthy",
+  "observed_at": "2026-08-31T00:00:00Z"
+}

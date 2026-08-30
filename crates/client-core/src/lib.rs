@@ -12,10 +12,12 @@ use nelomai_client_tunnel::{
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
     ConnectionStartRequest, ConnectionStartResponse, EgressMode, Layer, LeaseStatus, OperationKind,
-    OperationReconcileRequest, OperationReconcileResponse, OperationState, ProbeResult, RouteMode,
-    SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
-    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
-    TicConnectionMode,
+    OperationReconcileRequest, OperationReconcileResponse, OperationState, ProbeResult,
+    RedundantCandidateCommitRequest, RedundantRoleRequest, RedundantRoleResponse,
+    RedundantSessionResponse, RedundantStandbyAcquireRequest, RedundantStandbyAcquireResponse,
+    RedundantStandbyReleaseRequest, RedundantStopRequest, RouteMode, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision,
+    SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -112,9 +114,10 @@ struct ActiveRecoveryEpisode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConnectionStartContract {
+pub enum ConnectionStartContract {
     Legacy,
     RecoveryV1,
+    RecoveryV2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -595,6 +598,41 @@ pub trait CoreApi: Send + Sync {
         access_token: &str,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError>;
+    async fn report_redundant_role(
+        &self,
+        _access_token: &str,
+        _request: &RedundantRoleRequest,
+    ) -> Result<RedundantRoleResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn release_redundant_standby(
+        &self,
+        _access_token: &str,
+        _request: &RedundantStandbyReleaseRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn acquire_redundant_standby(
+        &self,
+        _access_token: &str,
+        _request: &RedundantStandbyAcquireRequest,
+    ) -> Result<RedundantStandbyAcquireResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn commit_redundant_candidate(
+        &self,
+        _access_token: &str,
+        _request: &RedundantCandidateCommitRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn stop_redundant_connection(
+        &self,
+        _access_token: &str,
+        _request: &RedundantStopRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
     async fn pin_stray(
         &self,
         access_token: &str,
@@ -616,6 +654,48 @@ pub trait CoreApi: Send + Sync {
         _background_token: &str,
         _request: &OperationReconcileRequest,
     ) -> Result<OperationReconcileResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_report_redundant_role(
+        &self,
+        _background_token: &str,
+        _request: &RedundantRoleRequest,
+    ) -> Result<RedundantRoleResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_start_connection(
+        &self,
+        _background_token: &str,
+        _request: &ConnectionStartRequest,
+    ) -> Result<ConnectionStartResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_release_redundant_standby(
+        &self,
+        _background_token: &str,
+        _request: &RedundantStandbyReleaseRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_acquire_redundant_standby(
+        &self,
+        _background_token: &str,
+        _request: &RedundantStandbyAcquireRequest,
+    ) -> Result<RedundantStandbyAcquireResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_commit_redundant_candidate(
+        &self,
+        _background_token: &str,
+        _request: &RedundantCandidateCommitRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
+    }
+    async fn background_stop_redundant_connection(
+        &self,
+        _background_token: &str,
+        _request: &RedundantStopRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn split_tunnel_revision(
@@ -699,6 +779,56 @@ impl CoreApi for ClientApi {
             .map_err(Into::into)
     }
 
+    async fn report_redundant_role(
+        &self,
+        access_token: &str,
+        request: &RedundantRoleRequest,
+    ) -> Result<RedundantRoleResponse, CoreApiError> {
+        ClientApi::report_redundant_role(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn release_redundant_standby(
+        &self,
+        access_token: &str,
+        request: &RedundantStandbyReleaseRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        ClientApi::release_redundant_standby(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn acquire_redundant_standby(
+        &self,
+        access_token: &str,
+        request: &RedundantStandbyAcquireRequest,
+    ) -> Result<RedundantStandbyAcquireResponse, CoreApiError> {
+        ClientApi::acquire_redundant_standby(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn commit_redundant_candidate(
+        &self,
+        access_token: &str,
+        request: &RedundantCandidateCommitRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        ClientApi::commit_redundant_candidate(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn stop_redundant_connection(
+        &self,
+        access_token: &str,
+        request: &RedundantStopRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        ClientApi::stop_redundant_connection(self, access_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
     async fn pin_stray(
         &self,
         access_token: &str,
@@ -734,6 +864,66 @@ impl CoreApi for ClientApi {
         request: &OperationReconcileRequest,
     ) -> Result<OperationReconcileResponse, CoreApiError> {
         ClientApi::reconcile_background_operation(self, background_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_report_redundant_role(
+        &self,
+        background_token: &str,
+        request: &RedundantRoleRequest,
+    ) -> Result<RedundantRoleResponse, CoreApiError> {
+        ClientApi::background_report_redundant_role(self, background_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_start_connection(
+        &self,
+        background_token: &str,
+        request: &ConnectionStartRequest,
+    ) -> Result<ConnectionStartResponse, CoreApiError> {
+        ClientApi::background_start_connection(self, background_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_release_redundant_standby(
+        &self,
+        background_token: &str,
+        request: &RedundantStandbyReleaseRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        ClientApi::background_release_redundant_standby(self, background_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_acquire_redundant_standby(
+        &self,
+        background_token: &str,
+        request: &RedundantStandbyAcquireRequest,
+    ) -> Result<RedundantStandbyAcquireResponse, CoreApiError> {
+        ClientApi::background_acquire_redundant_standby(self, background_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_commit_redundant_candidate(
+        &self,
+        background_token: &str,
+        request: &RedundantCandidateCommitRequest,
+    ) -> Result<RedundantSessionResponse, CoreApiError> {
+        ClientApi::background_commit_redundant_candidate(self, background_token, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn background_stop_redundant_connection(
+        &self,
+        background_token: &str,
+        request: &RedundantStopRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        ClientApi::background_stop_redundant_connection(self, background_token, request)
             .await
             .map_err(Into::into)
     }
@@ -1386,6 +1576,8 @@ where
             allow_alternate: false,
             require_measured_selection: false,
             recovery_contract_version: None,
+            redundancy_contract_version: None,
+            reserve_enabled: None,
             request_fingerprint: None,
         };
         let mut recovered = self.api.start_connection(&access_token, &request).await;
@@ -1672,6 +1864,8 @@ where
             allow_alternate: options.allow_alternate,
             require_measured_selection,
             recovery_contract_version,
+            redundancy_contract_version: None,
+            reserve_enabled: None,
             request_fingerprint,
         };
         let panel_started = Instant::now();
@@ -2555,6 +2749,8 @@ where
             allow_alternate: pending.allow_alternate,
             require_measured_selection: false,
             recovery_contract_version: None,
+            redundancy_contract_version: None,
+            reserve_enabled: None,
             request_fingerprint: None,
         };
         let replay = match self.api.start_connection(&access_token, &request).await {
@@ -3075,6 +3271,10 @@ where
             lease_id: saved.lease_id.clone(),
             pool_id: saved.pool_id.clone(),
             layer: saved.layer,
+            transport_protocol: match transport {
+                TunnelTransport::WireGuard => nelomai_contracts::TransportProtocol::Wireguard,
+                TunnelTransport::AmneziaWg3 => nelomai_contracts::TransportProtocol::Amneziawg3,
+            },
             tic_connection_mode: saved.tic_connection_mode,
             route_mode: saved.route_mode,
             egress_mode: saved.egress_mode,
@@ -3125,6 +3325,14 @@ where
                             lease_id: saved.lease_id.clone(),
                             pool_id: saved.pool_id.clone(),
                             layer: saved.layer,
+                            transport_protocol: match transport {
+                                TunnelTransport::WireGuard => {
+                                    nelomai_contracts::TransportProtocol::Wireguard
+                                }
+                                TunnelTransport::AmneziaWg3 => {
+                                    nelomai_contracts::TransportProtocol::Amneziawg3
+                                }
+                            },
                             tic_connection_mode: saved.tic_connection_mode,
                             route_mode: saved.route_mode,
                             egress_mode: saved.egress_mode,

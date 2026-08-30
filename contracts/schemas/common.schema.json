@@ -9,7 +9,13 @@
       "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
     },
     "timestamp": { "type": "string", "format": "date-time" },
+    "generation": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
     "layer": { "enum": ["tic", "stray"] },
+    "transportProtocol": { "enum": ["wireguard", "amneziawg_3"] },
     "ticConnectionMode": { "enum": ["personal", "dynamic"] },
     "routeMode": { "enum": ["standalone", "via_tak"] },
     "egressMode": { "enum": ["ipv4", "prefer_ipv6"] },
@@ -39,6 +45,7 @@
           ]
         },
         "layer": { "$ref": "#/$defs/layer" },
+        "transport_protocol": { "$ref": "#/$defs/transportProtocol" },
         "tic_connection_mode": { "$ref": "#/$defs/ticConnectionMode" },
         "route_mode": { "$ref": "#/$defs/routeMode" },
         "egress_mode": { "$ref": "#/$defs/egressMode" },

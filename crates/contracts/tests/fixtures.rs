@@ -3,10 +3,14 @@ use std::{fs, path::PathBuf};
 use nelomai_contracts::{
     allows_new_connection_intent_operation, BindPeerRequest, Bootstrap, ConnectionIntentCapability,
     ConnectionIntentCapabilityResponse, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, EgressMode, ErrorPayload, OperationReconcileResponse, OperationState,
-    PeerBindingResponse, PeerOptions, ProbeResults, ServerCandidatesResponse,
+    ConnectionStartResponse, EgressMode, ErrorPayload, OperationReconcileRequest,
+    OperationReconcileResponse, OperationState, PeerBindingResponse, PeerOptions, ProbeResults,
+    RedundantCandidateCommitRequest, RedundantRoleRequest, RedundantRoleResponse,
+    RedundantSessionResponse, RedundantStandbyAcquireRequest, RedundantStandbyAcquireResponse,
+    RedundantStandbyReleaseRequest, RedundantStopRequest, ServerCandidatesResponse,
     ServerSelectionRequest, SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode,
-    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate, UpdateManifest,
+    SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate, TransportProtocol,
+    UpdateManifest,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -65,9 +69,61 @@ fn shared_valid_fixtures_match_schemas_and_rust_types() {
         "valid/connection-start.json",
         "connection-start.schema.json",
     );
+    check::<ConnectionStartRequest>(
+        "valid/connection-start-redundant.json",
+        "connection-start.schema.json",
+    );
     check::<ConnectionStartResponse>(
         "valid/connection-start-response.json",
         "connection-start-response.schema.json",
+    );
+    check::<ConnectionStartResponse>(
+        "valid/connection-start-redundant-response.json",
+        "connection-start-response.schema.json",
+    );
+    check::<RedundantRoleRequest>(
+        "valid/connection-redundant-role.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantRoleResponse>(
+        "valid/connection-redundant-role-response.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantRoleResponse>(
+        "valid/connection-redundant-role-rebase-response.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantStandbyReleaseRequest>(
+        "valid/connection-redundant-standby-release.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantSessionResponse>(
+        "valid/connection-redundant-standby-release-response.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantSessionResponse>(
+        "valid/connection-redundant-candidate-commit-response.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantStandbyAcquireRequest>(
+        "valid/connection-redundant-standby-acquire.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantStandbyAcquireResponse>(
+        "valid/connection-redundant-standby-acquire-response.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantCandidateCommitRequest>(
+        "valid/connection-redundant-candidate-commit.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<RedundantStopRequest>(
+        "valid/connection-redundant-stop.json",
+        "connection-redundancy.schema.json",
+    );
+    check::<OperationReconcileRequest>(
+        "valid/connection-operation-reconcile-redundant-stop.json",
+        "connection-operation-reconcile-request.schema.json",
     );
     check::<ConnectionOperationResponse>(
         "valid/connection-operation.json",
@@ -133,6 +189,16 @@ fn legacy_payloads_without_egress_mode_default_to_ipv4() {
     let response: ConnectionStartResponse = serde_json::from_str(&response_json).unwrap();
     assert_eq!(response.connection.egress_mode, EgressMode::Ipv4);
     assert_eq!(response.connection.pool_id, None);
+    assert_eq!(
+        response.connection.transport_protocol,
+        TransportProtocol::Wireguard
+    );
+    assert!(
+        serde_json::to_value(response).unwrap()["connection"]
+            .get("transport_protocol")
+            .is_none(),
+        "the default transport must not change the legacy response shape"
+    );
 }
 
 #[test]
@@ -189,6 +255,14 @@ fn connection_intent_fixtures_match_schema_and_tolerant_rust_types() {
     assert_eq!(
         serde_json::from_str::<OperationState>(r#""compensating""#).unwrap(),
         OperationState::Compensating,
+    );
+    assert_eq!(
+        serde_json::to_string(&nelomai_contracts::OperationKind::RedundantStart).unwrap(),
+        r#""redundant_start""#,
+    );
+    assert_eq!(
+        serde_json::to_string(&nelomai_contracts::OperationKind::RedundantStop).unwrap(),
+        r#""redundant_stop""#,
     );
     let start: ConnectionStartRequest =
         serde_json::from_str(&fixture("valid/connection-start.json")).unwrap();
@@ -296,6 +370,143 @@ fn wireguard_configuration_is_redacted_from_debug_output() {
     let binding: PeerBindingResponse =
         serde_json::from_str(&fixture("valid/peer-binding.json")).unwrap();
     assert!(!format!("{binding:?}").contains("# client configuration"));
+}
+
+#[test]
+fn recovery_v2_preserves_two_member_identity_and_redacts_configs() {
+    let response: ConnectionStartResponse =
+        serde_json::from_str(&fixture("valid/connection-start-redundant-response.json")).unwrap();
+    let redundancy = response.redundancy.as_ref().unwrap();
+    assert_eq!(
+        redundancy.session_id,
+        "20000000-0000-4000-8000-000000000001"
+    );
+    assert_eq!(
+        redundancy.standby.as_ref().unwrap().connection.lease_id,
+        "20000000-0000-4000-8000-000000000003"
+    );
+    assert_eq!(
+        response.connection.transport_protocol,
+        TransportProtocol::Amneziawg3
+    );
+    let debug = format!("{response:?}");
+    assert!(!debug.contains("primary-delivered-only-to-core"));
+    assert!(!debug.contains("standby-delivered-only-to-core"));
+}
+
+#[test]
+fn redundancy_operations_enforce_cas_and_recovery_v2_shapes() {
+    let rebase: RedundantRoleResponse = serde_json::from_str(&fixture(
+        "valid/connection-redundant-role-rebase-response.json",
+    ))
+    .unwrap();
+    assert_ne!(
+        Some(rebase.local_active_lease_id.as_str()),
+        rebase.session.active_lease_id.as_deref(),
+        "rebase must preserve the local observation separately from canonical state"
+    );
+
+    let mut role =
+        serde_json::from_str::<Value>(&fixture("valid/connection-redundant-role.json")).unwrap();
+    role.as_object_mut()
+        .unwrap()
+        .remove("expected_membership_generation");
+    assert!(!schema_is_valid("connection-redundancy.schema.json", &role));
+
+    let mut acquire =
+        serde_json::from_str::<Value>(&fixture("valid/connection-redundant-standby-acquire.json"))
+            .unwrap();
+    let probe = serde_json::from_str::<Value>(&fixture("valid/probe-results.json")).unwrap()
+        ["probes"][0]
+        .clone();
+    acquire["probes"] = Value::Array(vec![probe; 21]);
+    assert!(!schema_is_valid(
+        "connection-redundancy.schema.json",
+        &acquire
+    ));
+    assert!(serde_json::from_value::<RedundantStandbyAcquireRequest>(acquire).is_err());
+
+    let mut stop =
+        serde_json::from_str::<Value>(&fixture("valid/connection-redundant-stop.json")).unwrap();
+    stop["recovery_contract_version"] = Value::from(1);
+    assert!(!schema_is_valid("connection-redundancy.schema.json", &stop));
+    assert!(serde_json::from_value::<RedundantStopRequest>(stop).is_err());
+
+    let mut reconcile = serde_json::from_str::<Value>(&fixture(
+        "valid/connection-operation-reconcile-redundant-stop.json",
+    ))
+    .unwrap();
+    reconcile["contract_version"] = Value::from(1);
+    assert!(!schema_is_valid(
+        "connection-operation-reconcile-request.schema.json",
+        &reconcile
+    ));
+
+    let mut nullable_role =
+        serde_json::from_str::<Value>(&fixture("valid/connection-redundant-role.json")).unwrap();
+    nullable_role["reason"] = Value::Null;
+    nullable_role["observed_at"] = Value::Null;
+    assert!(schema_is_valid(
+        "connection-redundancy.schema.json",
+        &nullable_role
+    ));
+    serde_json::from_value::<RedundantRoleRequest>(nullable_role).unwrap();
+
+    let mut nullable_acquire =
+        serde_json::from_str::<Value>(&fixture("valid/connection-redundant-standby-acquire.json"))
+            .unwrap();
+    nullable_acquire["replace_lease_id"] = Value::Null;
+    assert!(schema_is_valid(
+        "connection-redundancy.schema.json",
+        &nullable_acquire
+    ));
+    serde_json::from_value::<RedundantStandbyAcquireRequest>(nullable_acquire).unwrap();
+
+    let candidate: RedundantStandbyAcquireResponse = serde_json::from_str(&fixture(
+        "valid/connection-redundant-standby-acquire-response.json",
+    ))
+    .unwrap();
+    assert_eq!(
+        candidate.connection.transport_protocol,
+        TransportProtocol::Amneziawg3
+    );
+    assert!(!format!("{candidate:?}").contains("candidate-delivered-only-to-core"));
+}
+
+#[test]
+fn recovery_v1_serialization_is_unchanged() {
+    let raw = fixture("valid/connection-start.json");
+    let mut expected = serde_json::from_str::<Value>(&raw).unwrap();
+    expected["require_measured_selection"] = Value::Bool(true);
+    expected["recovery_contract_version"] = Value::from(1);
+    expected["request_fingerprint"] = Value::String("b".repeat(64));
+    let raw = serde_json::to_string(&expected).unwrap();
+    let parsed: ConnectionStartRequest = serde_json::from_str(&raw).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+}
+
+#[test]
+fn recovery_v2_schema_requires_the_complete_redundancy_signature() {
+    let value =
+        serde_json::from_str::<Value>(&fixture("valid/connection-start-redundant.json")).unwrap();
+    assert!(schema_is_valid("connection-start.schema.json", &value));
+
+    let mut missing_reserve = value.clone();
+    missing_reserve
+        .as_object_mut()
+        .unwrap()
+        .remove("reserve_enabled");
+    assert!(!schema_is_valid(
+        "connection-start.schema.json",
+        &missing_reserve
+    ));
+
+    let mut wrong_recovery = value;
+    wrong_recovery["recovery_contract_version"] = Value::from(1);
+    assert!(!schema_is_valid(
+        "connection-start.schema.json",
+        &wrong_recovery
+    ));
 }
 
 #[test]

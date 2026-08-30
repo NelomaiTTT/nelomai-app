@@ -46,6 +46,7 @@ impl CoreApi for ProbeApi {
                 lease_id: "lease-1".to_string(),
                 pool_id: None,
                 layer: request.layer,
+                transport_protocol: Default::default(),
                 tic_connection_mode: request.tic_connection_mode,
                 route_mode: request.route_mode,
                 egress_mode: request.egress_mode,
@@ -56,6 +57,7 @@ impl CoreApi for ProbeApi {
             },
             configuration: "PrivateKey = test".to_string(),
             reused: false,
+            redundancy: None,
         })
     }
 
