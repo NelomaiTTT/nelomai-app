@@ -563,6 +563,41 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun redundantRecoveryEnvelopePersistsControlIdentitiesWithoutConfigurationOrPrivateKey() {
+        val backend = FakeEncryptedRecordBackend()
+        val envelope = AndroidRecoveryEnvelope(
+            formatVersion = ANDROID_RECOVERY_FORMAT,
+            intent = AndroidConnectionIntent.empty(7),
+            leaseTransaction = null,
+            redundantTransaction = AndroidRedundantTransaction(
+                desiredActive = true,
+                template = template(),
+                sessionId = "22222222-2222-4222-8222-222222222222",
+                slotALeaseId = "lease-a",
+                slotBLeaseId = "lease-b",
+                localActiveLeaseId = "lease-b",
+                standbyDesired = true,
+                roleGeneration = 4,
+                membershipGeneration = 9,
+                startOperationId = "start-v2",
+                startRequestFingerprint = "fingerprint-v2",
+                candidateLeaseId = "candidate-lease",
+                candidateSlot = RedundantSlot.A,
+            ),
+        )
+
+        backend.write(AndroidRecoveryEnvelopeCodec.encode(envelope))
+        val restored = store(backend).read().success()
+        val plaintext = requireNotNull(backend.record).toString(Charsets.UTF_8).lowercase()
+
+        assertEquals("lease-b", restored.redundantTransaction?.localActiveLeaseId)
+        assertEquals("candidate-lease", restored.redundantTransaction?.candidateLeaseId)
+        listOf("configuration", "privatekey").forEach {
+            assertFalse("unexpected secret field $it", plaintext.contains(it))
+        }
+    }
+
+    @Test
     fun cleanupBlocksANewStartUntilTheTransactionIsConfirmedTerminal() {
         val backend = FakeEncryptedRecordBackend()
         val store = store(backend)

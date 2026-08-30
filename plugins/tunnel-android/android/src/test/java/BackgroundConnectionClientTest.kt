@@ -15,6 +15,73 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class BackgroundConnectionClientTest {
     @Test
+    fun redundantBackgroundPayloadsUseTaskSixSessionContractsWithoutConfiguration() {
+        val transaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = AndroidIntentTemplate(
+                deviceId = DEVICE_ID,
+                accountScope = "account",
+                layer = "stray",
+                ticConnectionMode = "dynamic",
+                routeMode = "standalone",
+                egressMode = "ipv4",
+                allowAlternate = true,
+            ),
+            sessionId = "20000000-0000-4000-8000-000000000001",
+            slotALeaseId = "lease-a",
+            slotBLeaseId = "lease-b",
+            localActiveLeaseId = "lease-b",
+            standbyDesired = true,
+            roleGeneration = 1,
+            membershipGeneration = 2,
+            startOperationId = "start-v2",
+            startRequestFingerprint = "fingerprint-v2",
+            stopOperationId = "stop-v2",
+        )
+
+        val role = backgroundRedundantRolePayload(transaction, "primary_unhealthy")
+        val stop = backgroundRedundantStopPayload(transaction, "lease-b")
+
+        assertEquals("lease-b", role.getString("active_lease_id"))
+        assertEquals(2, stop.getInt("recovery_contract_version"))
+        assertEquals(transaction.sessionId, stop.getString("session_id"))
+        assertFalse(role.has("configuration"))
+        assertFalse(stop.has("configuration"))
+    }
+
+    @Test
+    fun redundantStartUsesTheV2AndReserveContractFields() {
+        val connection = QuickConnectionArgs().apply {
+            layer = "stray"
+            ticConnectionMode = "dynamic"
+            routeMode = "standalone"
+            egressMode = "ipv4"
+            allowAlternate = true
+        }
+        val transaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = AndroidIntentTemplate(
+                DEVICE_ID, "account", "stray", "dynamic", "standalone", "ipv4", true,
+            ),
+            sessionId = "20000000-0000-4000-8000-000000000001",
+            slotALeaseId = null,
+            slotBLeaseId = null,
+            localActiveLeaseId = null,
+            standbyDesired = true,
+            roleGeneration = 0,
+            membershipGeneration = 0,
+            startOperationId = OPERATION_ID,
+            startRequestFingerprint = FINGERPRINT,
+        )
+
+        val payload = backgroundRedundantStartPayload(QuickTunnelTemplate(TunnelOptionsArgs(), connection), transaction)
+
+        assertEquals(2, payload.getInt("recovery_contract_version"))
+        assertEquals(1, payload.getInt("redundancy_contract_version"))
+        assertTrue(payload.getBoolean("reserve_enabled"))
+    }
+
+    @Test
     fun bindingPreflightCarriesOnlyPreferencesAndRejectsConfigurationResponses() {
         val payload = backgroundBindingPreferencesPayload(
             AndroidIntentTemplate(

@@ -165,6 +165,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         cancel = restoreHandler::removeCallbacks,
     )
     private var restoreRetryAttempt = 0
+    private lateinit var recoveryStore: AndroidRecoveryStore
     private val restoreRetry = Runnable { connectionIntentLifecycle.onRetryTimer() }
     private lateinit var connectionIntentCoordinator: AndroidConnectionIntentCoordinator
     private lateinit var connectionIntentLifecycle: ConnectionIntentServiceLifecycle
@@ -195,8 +196,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
         super.onCreate()
         TunnelLog.initialize(applicationContext)
         TunnelRuntime.initialize(applicationContext)
+        recoveryStore = AndroidRecoveryStores.open(applicationContext)
         connectionIntentCoordinator = AndroidConnectionIntentCoordinator(
-            AndroidRecoveryStores.open(applicationContext),
+            recoveryStore,
             diagnostics = AndroidConnectionIntentDiagnosticsObserver {
                 AutomaticDiagnostics.onConnectionIntentLeaseReplacementStarted()
             },
@@ -264,7 +266,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 performBackgroundToggle(intent.resultReceiver())
             }
             intent?.action == ACTION_ENSURE_RUNNING -> {
-                if (!connectionIntentLifecycle.onEnsureRunning()) {
+                if (!connectionIntentLifecycle.onEnsureRunning() && shouldEnterLegacyVpnRecovery(
+                        recoveryStore.read(),
+                    )
+                ) {
                     restoreDesiredTunnel("ensure_running")
                 }
             }

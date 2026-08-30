@@ -810,6 +810,36 @@ private class UrlConnectionBackgroundApiTransport : BackgroundApiTransport {
 private fun JSONObject.optionalString(name: String): String? =
     if (has(name) && !isNull(name)) getString(name) else null
 
+/** Task 6's session view. It contains identifiers only, never member configuration. */
+internal data class BackgroundRedundantSession(
+    val sessionId: String,
+    val state: String,
+    val activeLeaseId: String?,
+    val slotALeaseId: String?,
+    val slotBLeaseId: String?,
+    val standbyDesired: Boolean,
+    val roleGeneration: Long,
+    val membershipGeneration: Long,
+    val reason: String?,
+) {
+    fun containsCurrentLease(leaseId: String?): Boolean = leaseId != null &&
+        leaseId in setOf(slotALeaseId, slotBLeaseId)
+}
+
+internal data class RedundantRoleResponse(
+    val action: String,
+    val localActiveLeaseId: String,
+    val session: BackgroundRedundantSession,
+)
+
+internal data class BackgroundRedundantCandidate(
+    val session: BackgroundRedundantSession,
+    val candidateLeaseId: String,
+    val candidateSlot: RedundantSlot,
+    val connection: QuickConnectionArgs,
+    val configuration: ByteArray,
+)
+
 internal object BackgroundConnectionClient {
     private val transport: BackgroundApiTransport = UrlConnectionBackgroundApiTransport()
     private val operations = BackgroundOperationClient(transport)
@@ -926,6 +956,59 @@ internal object BackgroundConnectionClient {
         operationId: String,
         failureCode: String? = null,
     ) = operations.stop(credential, leaseId, operationId, failureCode)
+
+    fun reportRedundantRole(
+        credential: BackgroundCredential,
+        transaction: AndroidRedundantTransaction,
+        reason: String,
+        observedAt: String? = null,
+    ): RedundantRoleResponse = redundantRoleFromJson(execute(
+        credential,
+        "background/connections/role",
+        backgroundRedundantRolePayload(transaction, reason, observedAt),
+    ))
+
+    fun releaseRedundantStandby(
+        credential: BackgroundCredential,
+        transaction: AndroidRedundantTransaction,
+        inactiveLeaseId: String,
+    ): BackgroundRedundantSession = redundantSessionFromJson(execute(
+        credential,
+        "background/connections/standby/release",
+        backgroundRedundantStandbyReleasePayload(transaction, inactiveLeaseId),
+    ).getJSONObject("session"))
+
+    fun acquireRedundantStandby(
+        credential: BackgroundCredential,
+        transaction: AndroidRedundantTransaction,
+        operationId: String,
+        probes: List<BackgroundProbeResult> = emptyList(),
+        replaceLeaseId: String? = null,
+    ): BackgroundRedundantCandidate = redundantCandidateFromJson(execute(
+        credential,
+        "background/connections/standby/acquire",
+        backgroundRedundantStandbyAcquirePayload(transaction, operationId, probes, replaceLeaseId),
+    ))
+
+    fun commitRedundantCandidate(
+        credential: BackgroundCredential,
+        transaction: AndroidRedundantTransaction,
+        candidateLeaseId: String,
+    ): BackgroundRedundantSession = redundantSessionFromJson(execute(
+        credential,
+        "background/connections/standby/commit",
+        backgroundRedundantCandidateCommitPayload(transaction, candidateLeaseId),
+    ).getJSONObject("session"))
+
+    fun stopRedundant(
+        credential: BackgroundCredential,
+        transaction: AndroidRedundantTransaction,
+        leaseId: String,
+    ): JSONObject = execute(
+        credential,
+        "background/connections/stop",
+        backgroundRedundantStopPayload(transaction, leaseId),
+    )
 
     fun uploadDiagnostics(
         credential: BackgroundCredential,
@@ -1095,6 +1178,109 @@ internal fun backgroundBindingPreferencesPayload(
     put("egress_mode", template.egressMode)
 }
 
+internal fun backgroundRedundantRolePayload(
+    transaction: AndroidRedundantTransaction,
+    reason: String,
+    observedAt: String? = null,
+): JSONObject = JSONObject().apply {
+    put("session_id", transaction.sessionId)
+    put("active_lease_id", requireNotNull(transaction.localActiveLeaseId))
+    put("expected_role_generation", transaction.roleGeneration)
+    put("expected_membership_generation", transaction.membershipGeneration)
+    put("reason", reason)
+    observedAt?.let { put("observed_at", it) }
+}
+
+internal fun backgroundRedundantStandbyReleasePayload(
+    transaction: AndroidRedundantTransaction,
+    inactiveLeaseId: String,
+): JSONObject = JSONObject().apply {
+    put("session_id", transaction.sessionId)
+    put("inactive_lease_id", inactiveLeaseId)
+    put("expected_role_generation", transaction.roleGeneration)
+    put("expected_membership_generation", transaction.membershipGeneration)
+}
+
+internal fun backgroundRedundantStandbyAcquirePayload(
+    transaction: AndroidRedundantTransaction,
+    operationId: String,
+    probes: List<BackgroundProbeResult>,
+    replaceLeaseId: String? = null,
+): JSONObject {
+    require(probes.size <= BACKGROUND_MAX_CANDIDATES)
+    return JSONObject().apply {
+        put("operation_id", operationId)
+        put("session_id", transaction.sessionId)
+        put("expected_role_generation", transaction.roleGeneration)
+        put("expected_membership_generation", transaction.membershipGeneration)
+        replaceLeaseId?.let { put("replace_lease_id", it) }
+        put("probes", probesToJson(probes))
+    }
+}
+
+internal fun backgroundRedundantCandidateCommitPayload(
+    transaction: AndroidRedundantTransaction,
+    candidateLeaseId: String,
+): JSONObject = JSONObject().apply {
+    put("session_id", transaction.sessionId)
+    put("candidate_lease_id", candidateLeaseId)
+    put("expected_active_lease_id", requireNotNull(transaction.localActiveLeaseId))
+    put("expected_role_generation", transaction.roleGeneration)
+    put("expected_membership_generation", transaction.membershipGeneration)
+}
+
+internal fun backgroundRedundantStopPayload(
+    transaction: AndroidRedundantTransaction,
+    leaseId: String,
+): JSONObject = JSONObject().apply {
+    put("operation_id", requireNotNull(transaction.stopOperationId))
+    put("lease_id", leaseId)
+    put("recovery_contract_version", 2)
+    put("session_id", transaction.sessionId)
+}
+
+private fun probesToJson(probes: List<BackgroundProbeResult>) = JSONArray().apply {
+    probes.forEach { probe -> put(JSONObject().apply {
+        put("candidate_id", probe.candidateId)
+        probe.latencyMillis?.let { put("latency_ms", it) }
+        probe.failureCode?.let { put("failure_code", it) }
+        put("measured_at", probe.measuredAt)
+    }) }
+}
+
+internal fun redundantSessionFromJson(payload: JSONObject): BackgroundRedundantSession =
+    BackgroundRedundantSession(
+        sessionId = UUID.fromString(payload.getString("session_id")).toString(),
+        state = payload.getString("state").also {
+            require(it in setOf("allocating", "connected", "degraded", "stopping", "stopped", "failed"))
+        },
+        activeLeaseId = payload.optionalString("active_lease_id"),
+        slotALeaseId = payload.optionalString("slot_a_lease_id"),
+        slotBLeaseId = payload.optionalString("slot_b_lease_id"),
+        standbyDesired = payload.getBoolean("standby_desired"),
+        roleGeneration = payload.getLong("role_generation").also { require(it >= 0) },
+        membershipGeneration = payload.getLong("membership_generation").also { require(it >= 0) },
+        reason = payload.optionalString("reason"),
+    )
+
+internal fun redundantRoleFromJson(payload: JSONObject): RedundantRoleResponse = RedundantRoleResponse(
+    action = payload.getString("action").also { require(it in setOf("accepted", "acknowledged", "rebase")) },
+    localActiveLeaseId = payload.getString("local_active_lease_id"),
+    session = redundantSessionFromJson(payload.getJSONObject("session")),
+)
+
+private fun redundantCandidateFromJson(payload: JSONObject): BackgroundRedundantCandidate {
+    val configuration = payload.getString("configuration").toByteArray(StandardCharsets.UTF_8)
+    require(configuration.isNotEmpty() && configuration.size <= BACKGROUND_MAX_RESPONSE_BYTES)
+    return BackgroundRedundantCandidate(
+        session = redundantSessionFromJson(payload.getJSONObject("session")),
+        candidateLeaseId = payload.getString("candidate_lease_id"),
+        candidateSlot = RedundantSlot.fromWireName(payload.getString("candidate_slot")),
+        connection = payload.getJSONObject("connection").toQuickConnection(),
+        configuration = configuration,
+    )
+}
+
 internal fun validateBackgroundBindingSyncResponse(response: JSONObject) {
     if (!response.optBoolean("ok", false) || response.has("configuration")) {
         throw BackgroundConnectionException("invalid_background_response")
@@ -1108,6 +1294,8 @@ internal fun backgroundStartPayload(
     contractVersion: Int? = null,
     requestFingerprint: String? = null,
     requireMeasuredSelection: Boolean = true,
+    redundancyContractVersion: Int? = null,
+    reserveEnabled: Boolean? = null,
 ): JSONObject {
     if (probes.size > BACKGROUND_MAX_CANDIDATES) {
         throw BackgroundConnectionException("invalid_background_response")
@@ -1134,8 +1322,28 @@ internal fun backgroundStartPayload(
             put("recovery_contract_version", contractVersion)
             put("request_fingerprint", requestFingerprint)
         }
+        if (redundancyContractVersion != null && reserveEnabled != null) {
+            require(contractVersion == 2)
+            require(redundancyContractVersion == 1)
+            put("redundancy_contract_version", redundancyContractVersion)
+            put("reserve_enabled", reserveEnabled)
+        }
     }
 }
+
+internal fun backgroundRedundantStartPayload(
+    template: QuickTunnelTemplate,
+    transaction: AndroidRedundantTransaction,
+    probes: List<BackgroundProbeResult> = emptyList(),
+): JSONObject = backgroundStartPayload(
+    template = template,
+    operationId = transaction.startOperationId,
+    probes = probes,
+    contractVersion = 2,
+    requestFingerprint = transaction.startRequestFingerprint,
+    redundancyContractVersion = 1,
+    reserveEnabled = transaction.standbyDesired,
+)
 
 private fun JSONObject.toTunnelOptions(
     context: Context,
