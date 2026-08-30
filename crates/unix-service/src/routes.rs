@@ -40,6 +40,12 @@ impl fmt::Debug for OwnedRoute {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteScope {
+    Unscoped,
+    InterfaceScoped,
+}
+
 #[derive(Clone, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub(crate) struct OwnedRouteState {
     pub format_version: u16,
@@ -69,14 +75,20 @@ pub(crate) trait RouteBackend {
     fn fingerprint_material(&self, egress: &Self::Egress, local_networks: &[Ipv4Net]) -> String;
     fn owned_route(&self, egress: &Self::Egress, network: Ipv4Net) -> OwnedRoute;
     fn route_exists(&self, route: &OwnedRoute) -> Result<bool, ServiceError>;
-    fn route_presence(&self, routes: &[OwnedRoute]) -> Result<Vec<bool>, ServiceError> {
+    fn route_presence(
+        &self,
+        routes: &[OwnedRoute],
+    ) -> Result<Vec<Option<RouteScope>>, ServiceError> {
         routes
             .iter()
-            .map(|route| self.route_exists(route))
+            .map(|route| {
+                self.route_exists(route)
+                    .map(|exists| exists.then_some(RouteScope::Unscoped))
+            })
             .collect()
     }
     fn add_route(&self, route: &OwnedRoute) -> Result<(), ServiceError>;
-    fn remove_route(&self, route: &OwnedRoute) -> Result<(), ServiceError>;
+    fn remove_route(&self, route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError>;
 }
 
 pub(crate) struct RouteManager<B> {
@@ -120,7 +132,7 @@ impl<B: RouteBackend> RouteManager<B> {
             .backend
             .route_presence(&routes)?
             .into_iter()
-            .any(|exists| exists)
+            .any(|presence| presence.is_some())
         {
             return Err(ServiceError::Backend("route_conflict".to_string()));
         }
@@ -185,9 +197,9 @@ impl<B: RouteBackend> RouteManager<B> {
             }
         };
         let mut retained = Vec::new();
-        for (route, exists) in routes.into_iter().zip(presence) {
-            if exists {
-                if let Err(error) = self.backend.remove_route(&route) {
+        for (route, scope) in routes.into_iter().zip(presence) {
+            if let Some(scope) = scope {
+                if let Err(error) = self.backend.remove_route(&route, scope) {
                     first_error.get_or_insert(error);
                     retained.push(route);
                 }
@@ -361,7 +373,7 @@ mod tests {
                 .any(|destination| destination == &route.destination))
         }
 
-        fn remove_route(&self, route: &OwnedRoute) -> Result<(), ServiceError> {
+        fn remove_route(&self, route: &OwnedRoute, _scope: RouteScope) -> Result<(), ServiceError> {
             self.removed.borrow_mut().push(route.destination.clone());
             self.installed
                 .borrow_mut()

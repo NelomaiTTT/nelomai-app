@@ -1,4 +1,4 @@
-use super::{OwnedRoute, RouteBackend};
+use super::{OwnedRoute, RouteBackend, RouteScope};
 use crate::process::{output_with_timeout, COMMAND_TIMEOUT};
 use crate::ServiceError;
 use ipnet::Ipv4Net;
@@ -183,17 +183,23 @@ impl RouteBackend for SystemRouteBackend {
         route_lookup_matches(&output.stdout, route)
     }
 
-    fn route_presence(&self, routes: &[OwnedRoute]) -> Result<Vec<bool>, ServiceError> {
+    fn route_presence(
+        &self,
+        routes: &[OwnedRoute],
+    ) -> Result<Vec<Option<RouteScope>>, ServiceError> {
         let output = run(NETSTAT, &["-rn", "-f", "inet"])?;
         route_table_presence(&output.stdout, routes)
     }
 
-    fn remove_route(&self, route: &OwnedRoute) -> Result<(), ServiceError> {
-        mutate_route("delete", route)
+    fn remove_route(&self, route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError> {
+        cleanup_route(route, scope)
     }
 }
 
-fn route_table_presence(output: &[u8], routes: &[OwnedRoute]) -> Result<Vec<bool>, ServiceError> {
+fn route_table_presence(
+    output: &[u8],
+    routes: &[OwnedRoute],
+) -> Result<Vec<Option<RouteScope>>, ServiceError> {
     let output = String::from_utf8_lossy(output);
     let table = output
         .lines()
@@ -201,8 +207,13 @@ fn route_table_presence(output: &[u8], routes: &[OwnedRoute]) -> Result<Vec<bool
             let tokens = line.split_whitespace().collect::<Vec<_>>();
             let destination = parse_netstat_destination(tokens.first().copied()?)?;
             let gateway = tokens.get(1)?.parse::<Ipv4Addr>().ok()?;
+            let scope = if tokens.get(2)?.contains('I') {
+                RouteScope::InterfaceScoped
+            } else {
+                RouteScope::Unscoped
+            };
             let interface = tokens.get(3)?.to_string();
-            Some((destination, gateway, interface))
+            Some((destination, gateway, interface, scope))
         })
         .collect::<Vec<_>>();
     routes
@@ -214,13 +225,19 @@ fn route_table_presence(output: &[u8], routes: &[OwnedRoute]) -> Result<Vec<bool
                 .as_deref()
                 .and_then(|value| value.parse::<Ipv4Addr>().ok())
                 .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?;
-            Ok(table
-                .iter()
-                .any(|(actual_destination, actual_gateway, actual_interface)| {
-                    *actual_destination == destination
-                        && *actual_gateway == gateway
-                        && actual_interface == &route.interface_identifier
-                }))
+            let mut presence = None;
+            for (actual_destination, actual_gateway, actual_interface, actual_scope) in &table {
+                if *actual_destination == destination
+                    && *actual_gateway == gateway
+                    && actual_interface == &route.interface_identifier
+                {
+                    if presence.is_some_and(|scope| scope != *actual_scope) {
+                        return Err(ServiceError::Backend("route_conflict".to_string()));
+                    }
+                    presence = Some(*actual_scope);
+                }
+            }
+            Ok(presence)
         })
         .collect()
 }
@@ -309,9 +326,23 @@ fn mutate_route(action: &str, route: &OwnedRoute) -> Result<(), ServiceError> {
         .gateway
         .as_deref()
         .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?;
+    let arguments = route_arguments(action, route, gateway);
+    run_route_mutation(action, &arguments)
+}
+
+fn cleanup_route(route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError> {
+    let gateway = route
+        .gateway
+        .as_deref()
+        .ok_or_else(|| ServiceError::Backend("route_state_invalid".to_string()))?;
+    let arguments = route_cleanup_arguments(route, gateway, scope);
+    run_route_mutation("delete", &arguments)
+}
+
+fn run_route_mutation(action: &str, arguments: &[&str]) -> Result<(), ServiceError> {
     let output = output_with_timeout(
         Command::new(ROUTE)
-            .args(route_arguments(action, route, gateway))
+            .args(arguments)
             .env("LANG", "C")
             .env("LC_ALL", "C"),
         COMMAND_TIMEOUT,
@@ -326,16 +357,27 @@ fn mutate_route(action: &str, route: &OwnedRoute) -> Result<(), ServiceError> {
     }
 }
 
-fn route_arguments<'a>(action: &'a str, route: &'a OwnedRoute, gateway: &'a str) -> [&'a str; 7] {
-    [
-        "-n",
-        action,
-        "-net",
-        "-ifscope",
-        &route.interface_identifier,
-        &route.destination,
-        gateway,
-    ]
+fn route_arguments<'a>(action: &'a str, route: &'a OwnedRoute, gateway: &'a str) -> [&'a str; 5] {
+    ["-n", action, "-net", &route.destination, gateway]
+}
+
+fn route_cleanup_arguments<'a>(
+    route: &'a OwnedRoute,
+    gateway: &'a str,
+    scope: RouteScope,
+) -> Vec<&'a str> {
+    match scope {
+        RouteScope::Unscoped => route_arguments("delete", route, gateway).to_vec(),
+        RouteScope::InterfaceScoped => vec![
+            "-n",
+            "delete",
+            "-net",
+            "-ifscope",
+            &route.interface_identifier,
+            &route.destination,
+            gateway,
+        ],
+    }
 }
 
 fn run(path: &str, arguments: &[&str]) -> Result<Output, ServiceError> {
@@ -571,8 +613,47 @@ Destination        Gateway            Flags               Netif Expire\n\
 
         assert_eq!(
             route_table_presence(output, &routes).unwrap(),
-            vec![true, false]
+            vec![Some(RouteScope::Unscoped), None]
         );
+    }
+
+    #[test]
+    fn route_table_presence_preserves_interface_scope() {
+        let route = OwnedRoute {
+            destination: "203.0.113.0/24".to_string(),
+            interface_identifier: "en0".to_string(),
+            gateway: Some("192.168.3.1".to_string()),
+            metric: None,
+        };
+        let output = b"Routing tables\n\
+Internet:\n\
+Destination        Gateway            Flags               Netif Expire\n\
+203.0.113/24       192.168.3.1        UGScI                 en0\n";
+
+        assert_eq!(
+            route_table_presence(output, &[route]).unwrap(),
+            vec![Some(RouteScope::InterfaceScoped)]
+        );
+    }
+
+    #[test]
+    fn route_table_presence_rejects_ambiguous_scope() {
+        let route = OwnedRoute {
+            destination: "203.0.113.0/24".to_string(),
+            interface_identifier: "en0".to_string(),
+            gateway: Some("192.168.3.1".to_string()),
+            metric: None,
+        };
+        let output = b"Routing tables\n\
+Internet:\n\
+Destination        Gateway            Flags               Netif Expire\n\
+203.0.113/24       192.168.3.1        UGSc                  en0\n\
+203.0.113/24       192.168.3.1        UGScI                 en0\n";
+
+        assert!(matches!(
+            route_table_presence(output, &[route]),
+            Err(ServiceError::Backend(code)) if code == "route_conflict"
+        ));
     }
 
     #[test]
@@ -592,7 +673,7 @@ Destination        Gateway            Flags               Netif Expire\n\
     }
 
     #[test]
-    fn route_mutation_is_scoped_to_the_recorded_interface() {
+    fn route_mutation_is_unscoped_so_regular_traffic_uses_the_direct_route() {
         let route = OwnedRoute {
             destination: "203.0.113.0/24".to_string(),
             interface_identifier: "en7".to_string(),
@@ -601,7 +682,29 @@ Destination        Gateway            Flags               Netif Expire\n\
         };
 
         assert_eq!(
-            route_arguments("delete", &route, "192.168.1.1"),
+            route_arguments("delete", &route, "192.168.1.1").as_slice(),
+            ["-n", "delete", "-net", "203.0.113.0/24", "192.168.1.1",].as_slice()
+        );
+    }
+
+    #[test]
+    fn route_cleanup_selects_the_recorded_route_scope() {
+        let route = OwnedRoute {
+            destination: "203.0.113.0/24".to_string(),
+            interface_identifier: "en7".to_string(),
+            gateway: Some("192.168.1.1".to_string()),
+            metric: None,
+        };
+
+        let unscoped = route_cleanup_arguments(&route, "192.168.1.1", RouteScope::Unscoped);
+        let scoped = route_cleanup_arguments(&route, "192.168.1.1", RouteScope::InterfaceScoped);
+
+        assert_eq!(
+            unscoped.as_slice(),
+            ["-n", "delete", "-net", "203.0.113.0/24", "192.168.1.1",].as_slice()
+        );
+        assert_eq!(
+            scoped.as_slice(),
             [
                 "-n",
                 "delete",
@@ -611,6 +714,7 @@ Destination        Gateway            Flags               Netif Expire\n\
                 "203.0.113.0/24",
                 "192.168.1.1",
             ]
+            .as_slice()
         );
     }
 }

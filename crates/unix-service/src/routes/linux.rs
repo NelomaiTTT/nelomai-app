@@ -1,4 +1,4 @@
-use super::{OwnedRoute, RouteBackend};
+use super::{OwnedRoute, RouteBackend, RouteScope};
 use crate::process::{output_with_timeout, COMMAND_TIMEOUT};
 use crate::ServiceError;
 use defguard_wireguard_rs::peer::Peer;
@@ -638,10 +638,14 @@ impl RouteBackend for SystemRouteBackend {
             .route_presence(std::slice::from_ref(route))?
             .into_iter()
             .next()
-            .unwrap_or(false))
+            .flatten()
+            .is_some())
     }
 
-    fn route_presence(&self, routes: &[OwnedRoute]) -> Result<Vec<bool>, ServiceError> {
+    fn route_presence(
+        &self,
+        routes: &[OwnedRoute],
+    ) -> Result<Vec<Option<RouteScope>>, ServiceError> {
         let output = run(&self.ip, &["-4", "route", "show", "table", "main"])?;
         let output = String::from_utf8_lossy(&output.stdout);
         let table = output
@@ -654,12 +658,16 @@ impl RouteBackend for SystemRouteBackend {
                 validate_owned_route(route)?;
                 Ok(table
                     .iter()
-                    .any(|tokens| route_matches_tokens(tokens, route)))
+                    .any(|tokens| route_matches_tokens(tokens, route))
+                    .then_some(RouteScope::Unscoped))
             })
             .collect()
     }
 
-    fn remove_route(&self, route: &OwnedRoute) -> Result<(), ServiceError> {
+    fn remove_route(&self, route: &OwnedRoute, scope: RouteScope) -> Result<(), ServiceError> {
+        if scope != RouteScope::Unscoped {
+            return Err(ServiceError::Backend("route_state_invalid".to_string()));
+        }
         mutate_route(&self.ip, "del", route)
     }
 }
