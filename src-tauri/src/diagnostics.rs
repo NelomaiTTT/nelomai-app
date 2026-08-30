@@ -179,7 +179,7 @@ pub(crate) enum ConnectionIntentDiagnosticEvent {
         delay_seconds: u64,
     },
     NetworkWakeup,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     LeaseReplacementStarted,
     Recovered,
     Cancelled,
@@ -197,7 +197,7 @@ impl ConnectionIntentDiagnosticEvent {
             Self::Started => "connection.intent.started",
             Self::RetryScheduled { .. } => "connection.intent.retry_scheduled",
             Self::NetworkWakeup => "connection.intent.network_wakeup",
-            #[cfg(any(target_os = "macos", test))]
+            #[cfg(target_os = "macos")]
             Self::LeaseReplacementStarted => "connection.intent.lease_replacement_started",
             Self::Recovered => "connection.intent.recovered",
             Self::Cancelled => "connection.intent.cancelled",

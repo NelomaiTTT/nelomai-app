@@ -9,15 +9,16 @@ use crate::{
     NativeApplication,
 };
 use nelomai_client_application::ApplicationError;
+#[cfg(any(target_os = "macos", test))]
+use nelomai_client_core::StallRecoveryPlan;
 use nelomai_client_core::{
     classify_recovery, ConnectOptions, ConnectionIntentCoordinator, ConnectionIntentStatus,
     CoreApiError, CoreError, CoreState, IntentGeneration, Phase, RecoveryDecision,
     RecoveryPolicyContext, StartDisposition,
 };
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 use nelomai_client_core::{
-    RecoveryTransport, StallRecoveryPlan, StallTrigger, StalledDataPlaneRecovery,
-    StalledDataPlaneRecoveryOutcome,
+    RecoveryTransport, StallTrigger, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
 };
 use nelomai_contracts::{
     allows_new_connection_intent_operation, BindPeerRequest, Connection,
@@ -347,7 +348,7 @@ impl DesktopConnectionIntent {
         woke
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub(crate) async fn handle_stall(&self, lease_id: &str) -> bool {
         let (options, generation) = {
             let state = self.state.lock().await;
@@ -415,7 +416,7 @@ impl DesktopConnectionIntent {
         true
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     async fn recover_current_connection_locally(
         &self,
         generation: IntentGeneration,
@@ -467,7 +468,7 @@ impl DesktopConnectionIntent {
         None
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     async fn accept_local_recovery(
         &self,
         generation: IntentGeneration,
