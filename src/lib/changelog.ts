@@ -30,6 +30,14 @@ export function defineChangelog(
 
 export const CHANGELOG = defineChangelog([
   {
+    version: "0.2.15",
+    items: [
+      "Улучшили автоматическое восстановление подключения.",
+      "Исправили переподключение после выхода macOS из сна.",
+      "Исправили состояние приложения после выключения VPN через плитку Android.",
+    ],
+  },
+  {
     version: "0.2.14",
     items: ["Исправили запуск VPN-подключения на Android."],
   },

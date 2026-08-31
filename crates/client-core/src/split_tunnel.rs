@@ -66,6 +66,7 @@ pub(crate) struct PhysicalNetworkChangeDetector {
 
 impl PhysicalNetworkChangeDetector {
     fn observe(&mut self, fingerprint: String, now_unix: i64) -> PhysicalNetworkObservation {
+        let recovered_from_probe_failure = self.probe_failed;
         self.probe_failed = false;
         let Some(applied) = self.applied.as_deref() else {
             self.applied = Some(fingerprint);
@@ -73,12 +74,6 @@ impl PhysicalNetworkChangeDetector {
             self.retry_after_unix = None;
             return PhysicalNetworkObservation::BaselineRecorded;
         };
-        if applied == fingerprint {
-            self.candidate = None;
-            self.retry_after_unix = None;
-            self.reconnect_failure_reported = false;
-            return PhysicalNetworkObservation::Unchanged;
-        }
         if self.candidate.as_deref() == Some(fingerprint.as_str()) {
             if self
                 .retry_after_unix
@@ -88,6 +83,18 @@ impl PhysicalNetworkChangeDetector {
             }
             self.retry_after_unix = None;
             return PhysicalNetworkObservation::ConfirmedChange(fingerprint);
+        }
+        if applied == fingerprint {
+            if recovered_from_probe_failure {
+                self.candidate = Some(fingerprint.clone());
+                self.retry_after_unix = None;
+                self.reconnect_failure_reported = false;
+                return PhysicalNetworkObservation::ConfirmedChange(fingerprint);
+            }
+            self.candidate = None;
+            self.retry_after_unix = None;
+            self.reconnect_failure_reported = false;
+            return PhysicalNetworkObservation::Unchanged;
         }
         self.candidate = Some(fingerprint);
         self.retry_after_unix = None;
@@ -2419,6 +2426,27 @@ mod physical_network_tests {
         assert!(!detector.mark_probe_failed());
         detector.observe("network-a".to_string(), 1_000);
         assert!(detector.mark_probe_failed());
+    }
+
+    #[test]
+    fn successful_probe_after_failure_reconnects_even_when_network_is_unchanged() {
+        let mut detector = PhysicalNetworkChangeDetector::default();
+        detector.observe("network-a".to_string(), 1_000);
+        assert!(detector.mark_probe_failed());
+
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_030),
+            PhysicalNetworkObservation::ConfirmedChange("network-a".to_string())
+        );
+        detector.defer_retry(1_030);
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_329),
+            PhysicalNetworkObservation::RetryDeferred
+        );
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_330),
+            PhysicalNetworkObservation::ConfirmedChange("network-a".to_string())
+        );
     }
 
     #[test]

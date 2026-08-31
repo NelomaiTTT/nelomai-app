@@ -1256,22 +1256,33 @@ async fn current_connection_intent(
     (snapshot.status, snapshot.next_retry_at_unix)
 }
 
+#[cfg(any(target_os = "android", test))]
+fn project_android_connection_intent_status(
+    status: Option<(&str, Option<i64>)>,
+) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
+    match status {
+        Some(("recovering", next_retry_at_unix)) => (
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+            next_retry_at_unix,
+        ),
+        Some(("blocked_terminal", next_retry_at_unix)) => (
+            nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
+            next_retry_at_unix,
+        ),
+        _ => (nelomai_client_core::ConnectionIntentStatus::None, None),
+    }
+}
+
 #[cfg(target_os = "android")]
 async fn current_connection_intent(
     app: &AppHandle,
 ) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
-    let Ok(status) = app.tunnel_android().connection_intent_status() else {
-        return (
-            nelomai_client_core::ConnectionIntentStatus::Recovering,
-            None,
-        );
-    };
-    let projected = match status.status.as_str() {
-        "recovering" => nelomai_client_core::ConnectionIntentStatus::Recovering,
-        "blocked_terminal" => nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
-        _ => nelomai_client_core::ConnectionIntentStatus::None,
-    };
-    (projected, status.next_retry_at_unix)
+    let status = app.tunnel_android().connection_intent_status().ok();
+    project_android_connection_intent_status(
+        status
+            .as_ref()
+            .map(|status| (status.status.as_str(), status.next_retry_at_unix)),
+    )
 }
 
 #[cfg(desktop)]
@@ -3466,6 +3477,28 @@ mod tests {
         assert_eq!(value["phase"], "error");
         assert_eq!(value["connectionIntentStatus"], "blocked_terminal");
         assert!(value["nextRetryAtUnix"].is_null());
+    }
+
+    #[test]
+    fn unavailable_android_service_does_not_project_a_recovery() {
+        assert_eq!(
+            project_android_connection_intent_status(None),
+            (nelomai_client_core::ConnectionIntentStatus::None, None),
+        );
+        assert_eq!(
+            project_android_connection_intent_status(Some(("recovering", Some(42)))),
+            (
+                nelomai_client_core::ConnectionIntentStatus::Recovering,
+                Some(42),
+            ),
+        );
+        assert_eq!(
+            project_android_connection_intent_status(Some(("blocked_terminal", None))),
+            (
+                nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
+                None,
+            ),
+        );
     }
 
     #[test]
