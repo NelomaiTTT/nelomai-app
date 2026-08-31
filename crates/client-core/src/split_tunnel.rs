@@ -61,13 +61,15 @@ pub(crate) struct PhysicalNetworkChangeDetector {
     candidate: Option<String>,
     retry_after_unix: Option<i64>,
     probe_failed: bool,
+    reconnect_after_probe_failure: bool,
     reconnect_failure_reported: bool,
 }
 
 impl PhysicalNetworkChangeDetector {
     fn observe(&mut self, fingerprint: String, now_unix: i64) -> PhysicalNetworkObservation {
-        let recovered_from_probe_failure = self.probe_failed;
+        let reconnect_after_probe_failure = self.reconnect_after_probe_failure;
         self.probe_failed = false;
+        self.reconnect_after_probe_failure = false;
         let Some(applied) = self.applied.as_deref() else {
             self.applied = Some(fingerprint);
             self.candidate = None;
@@ -85,7 +87,7 @@ impl PhysicalNetworkChangeDetector {
             return PhysicalNetworkObservation::ConfirmedChange(fingerprint);
         }
         if applied == fingerprint {
-            if recovered_from_probe_failure {
+            if reconnect_after_probe_failure {
                 self.candidate = Some(fingerprint.clone());
                 self.retry_after_unix = None;
                 self.reconnect_failure_reported = false;
@@ -114,6 +116,7 @@ impl PhysicalNetworkChangeDetector {
         self.candidate = None;
         self.retry_after_unix = None;
         self.probe_failed = false;
+        self.reconnect_after_probe_failure = false;
         self.reconnect_failure_reported = false;
     }
 
@@ -122,12 +125,14 @@ impl PhysicalNetworkChangeDetector {
         self.candidate = None;
         self.retry_after_unix = None;
         self.probe_failed = false;
+        self.reconnect_after_probe_failure = false;
         self.reconnect_failure_reported = false;
     }
 
-    fn mark_probe_failed(&mut self) -> bool {
+    fn mark_probe_failed(&mut self, reconnect_after_recovery: bool) -> bool {
         let first_failure = !self.probe_failed;
         self.probe_failed = true;
+        self.reconnect_after_probe_failure |= reconnect_after_recovery;
         first_failure
     }
 
@@ -136,8 +141,17 @@ impl PhysicalNetworkChangeDetector {
         self.candidate = None;
         self.retry_after_unix = None;
         self.probe_failed = false;
+        self.reconnect_after_probe_failure = false;
         self.reconnect_failure_reported = false;
     }
+}
+
+fn probe_failure_requires_reconnect(error: &nelomai_client_tunnel::TunnelError) -> bool {
+    matches!(
+        error,
+        nelomai_client_tunnel::TunnelError::Backend(code)
+            if code == "physical_egress_unavailable"
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -756,11 +770,12 @@ where
                 return Ok(PhysicalNetworkPollOutcome::Skipped);
             }
             Err(error) => {
+                let reconnect_after_recovery = probe_failure_requires_reconnect(&error);
                 if self
                     .physical_network_change
                     .lock()
                     .await
-                    .mark_probe_failed()
+                    .mark_probe_failed(reconnect_after_recovery)
                 {
                     self.logger.record(crate::CoreLogEvent {
                         kind: "split_tunnel.network_probe_failed",
@@ -2422,17 +2437,17 @@ mod physical_network_tests {
     fn repeated_probe_failures_are_reported_once_until_a_success() {
         let mut detector = PhysicalNetworkChangeDetector::default();
 
-        assert!(detector.mark_probe_failed());
-        assert!(!detector.mark_probe_failed());
+        assert!(detector.mark_probe_failed(false));
+        assert!(!detector.mark_probe_failed(false));
         detector.observe("network-a".to_string(), 1_000);
-        assert!(detector.mark_probe_failed());
+        assert!(detector.mark_probe_failed(false));
     }
 
     #[test]
     fn successful_probe_after_failure_reconnects_even_when_network_is_unchanged() {
         let mut detector = PhysicalNetworkChangeDetector::default();
         detector.observe("network-a".to_string(), 1_000);
-        assert!(detector.mark_probe_failed());
+        assert!(detector.mark_probe_failed(true));
 
         assert_eq!(
             detector.observe("network-a".to_string(), 1_030),
@@ -2447,6 +2462,33 @@ mod physical_network_tests {
             detector.observe("network-a".to_string(), 1_330),
             PhysicalNetworkObservation::ConfirmedChange("network-a".to_string())
         );
+    }
+
+    #[test]
+    fn transient_probe_failure_keeps_an_unchanged_network_connected() {
+        let mut detector = PhysicalNetworkChangeDetector::default();
+        detector.observe("network-a".to_string(), 1_000);
+        assert!(detector.mark_probe_failed(false));
+
+        assert_eq!(
+            detector.observe("network-a".to_string(), 1_030),
+            PhysicalNetworkObservation::Unchanged
+        );
+    }
+
+    #[test]
+    fn only_physical_egress_loss_requires_reconnect_after_probe_recovery() {
+        assert!(probe_failure_requires_reconnect(
+            &nelomai_client_tunnel::TunnelError::Backend("physical_egress_unavailable".to_string(),)
+        ));
+        assert!(!probe_failure_requires_reconnect(
+            &nelomai_client_tunnel::TunnelError::Backend("tunnel_service_timeout".to_string())
+        ));
+        assert!(!probe_failure_requires_reconnect(
+            &nelomai_client_tunnel::TunnelError::InvalidOptions {
+                code: "invalid_options",
+            }
+        ));
     }
 
     #[test]

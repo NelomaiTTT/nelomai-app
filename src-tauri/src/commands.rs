@@ -1246,6 +1246,7 @@ async fn current_connection_metrics(
 #[cfg(not(target_os = "android"))]
 async fn current_connection_intent(
     app: &AppHandle,
+    _status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
 ) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
     use tauri::Manager;
 
@@ -1259,6 +1260,7 @@ async fn current_connection_intent(
 #[cfg(any(target_os = "android", test))]
 fn project_android_connection_intent_status(
     status: Option<(&str, Option<i64>)>,
+    status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
 ) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
     match status {
         Some(("recovering", next_retry_at_unix)) => (
@@ -1269,19 +1271,33 @@ fn project_android_connection_intent_status(
             nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
             next_retry_at_unix,
         ),
-        _ => (nelomai_client_core::ConnectionIntentStatus::None, None),
+        Some(_) => (nelomai_client_core::ConnectionIntentStatus::None, None),
+        None => (status_unavailable_fallback, None),
+    }
+}
+
+fn android_status_unavailable_fallback(
+    quick_state_changed: bool,
+    phase: Phase,
+) -> nelomai_client_core::ConnectionIntentStatus {
+    if quick_state_changed && phase == Phase::Ready {
+        nelomai_client_core::ConnectionIntentStatus::None
+    } else {
+        nelomai_client_core::ConnectionIntentStatus::Recovering
     }
 }
 
 #[cfg(target_os = "android")]
 async fn current_connection_intent(
     app: &AppHandle,
+    status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
 ) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
     let status = app.tunnel_android().connection_intent_status().ok();
     project_android_connection_intent_status(
         status
             .as_ref()
             .map(|status| (status.status.as_str(), status.next_retry_at_unix)),
+        status_unavailable_fallback,
     )
 }
 
@@ -1417,7 +1433,10 @@ pub async fn app_state(
     let warning = application.split_tunnel_warning().await;
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    let (intent_status, next_retry_at_unix) = current_connection_intent(&app).await;
+    let status_unavailable_fallback =
+        android_status_unavailable_fallback(quick_state_changed, state.phase);
+    let (intent_status, next_retry_at_unix) =
+        current_connection_intent(&app, status_unavailable_fallback).await;
     Ok(AppStateResponse::new(
         state,
         warning,
@@ -1579,7 +1598,9 @@ pub(crate) async fn quick_toggle(
     #[cfg(not(target_os = "android"))]
     {
         let state = application.state().await;
-        let (intent_status, _) = current_connection_intent(app).await;
+        let (intent_status, _) =
+            current_connection_intent(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
+                .await;
         if intent_status != nelomai_client_core::ConnectionIntentStatus::None {
             stop_connection(app, application).await?;
         } else {
@@ -1693,7 +1714,9 @@ pub(crate) async fn quick_toggle(
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>();
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    let (intent_status, next_retry_at_unix) = current_connection_intent(app).await;
+    let (intent_status, next_retry_at_unix) =
+        current_connection_intent(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
+            .await;
     Ok(AppStateResponse::new(
         state,
         warning,
@@ -3480,20 +3503,49 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_android_service_does_not_project_a_recovery() {
+    fn unavailable_android_service_preserves_recovery_without_a_confirmed_quick_stop() {
         assert_eq!(
-            project_android_connection_intent_status(None),
+            project_android_connection_intent_status(
+                None,
+                nelomai_client_core::ConnectionIntentStatus::Recovering,
+            ),
+            (
+                nelomai_client_core::ConnectionIntentStatus::Recovering,
+                None,
+            ),
+        );
+        assert_eq!(
+            android_status_unavailable_fallback(false, Phase::Ready),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+        assert_eq!(
+            android_status_unavailable_fallback(true, Phase::Connected),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+    }
+
+    #[test]
+    fn confirmed_android_quick_stop_clears_an_unavailable_service_status() {
+        let fallback = android_status_unavailable_fallback(true, Phase::Ready);
+        assert_eq!(
+            project_android_connection_intent_status(None, fallback),
             (nelomai_client_core::ConnectionIntentStatus::None, None),
         );
         assert_eq!(
-            project_android_connection_intent_status(Some(("recovering", Some(42)))),
+            project_android_connection_intent_status(
+                Some(("recovering", Some(42))),
+                nelomai_client_core::ConnectionIntentStatus::None,
+            ),
             (
                 nelomai_client_core::ConnectionIntentStatus::Recovering,
                 Some(42),
             ),
         );
         assert_eq!(
-            project_android_connection_intent_status(Some(("blocked_terminal", None))),
+            project_android_connection_intent_status(
+                Some(("blocked_terminal", None)),
+                nelomai_client_core::ConnectionIntentStatus::None,
+            ),
             (
                 nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
                 None,
