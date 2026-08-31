@@ -88,15 +88,6 @@ impl AndroidDesiredActiveProjection {
     }
 }
 
-#[cfg(target_os = "android")]
-fn confirm_android_desired_active(desired_active: bool) {
-    ANDROID_UI_START_STOP_COORDINATOR
-        .confirm_projected_state(&ANDROID_DESIRED_ACTIVE_PROJECTION, desired_active);
-}
-
-#[cfg(not(target_os = "android"))]
-fn confirm_android_desired_active(_desired_active: bool) {}
-
 #[cfg(any(target_os = "android", test))]
 fn android_status_unavailable_fallback() -> nelomai_client_core::ConnectionIntentStatus {
     ANDROID_DESIRED_ACTIVE_PROJECTION.status_unavailable_fallback()
@@ -238,6 +229,20 @@ impl AndroidUiStartStopCoordinator {
         projection_ticket
     }
 
+    fn begin_projected_clear(&self) -> AndroidProjectionTicket {
+        let _side_effect_gate = self
+            .side_effect_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let projection_ticket = self.next_projection_ticket();
+        self.pending_projection.store(
+            Self::PROJECTION_STOPPING,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        projection_ticket
+    }
+
     fn begin_projected_toggle(
         &self,
         projection: &AndroidDesiredActiveProjection,
@@ -303,12 +308,7 @@ impl AndroidUiStartStopCoordinator {
         let pending = self
             .pending_projection
             .load(std::sync::atomic::Ordering::SeqCst);
-        if matches!(
-            (pending, desired_active),
-            (Self::PROJECTION_STOPPING, true)
-                | (Self::PROJECTION_STARTING, false)
-                | (Self::PROJECTION_TOGGLING, _)
-        ) {
+        if !Self::projection_observation_matches_pending(pending, Some(desired_active)) {
             return false;
         }
         projection.observe_confirmed(desired_active);
@@ -336,30 +336,36 @@ impl AndroidUiStartStopCoordinator {
         if !self.projection_observation_is_current(ticket) {
             return false;
         }
+        let pending = self
+            .pending_projection
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if !Self::projection_observation_matches_pending(pending, desired_active) {
+            return false;
+        }
         self.applied_observation_sequence.store(
             ticket.observation_sequence,
             std::sync::atomic::Ordering::SeqCst,
         );
-        self.next_projection_ticket();
-        self.pending_projection
-            .store(Self::PROJECTION_STABLE, std::sync::atomic::Ordering::SeqCst);
         projection.observe_snapshot(true, desired_active);
         true
     }
 
-    fn confirm_projected_state(
+    fn projected_status_fallback(
         &self,
+        ticket: AndroidProjectionObservationTicket,
         projection: &AndroidDesiredActiveProjection,
-        desired_active: bool,
-    ) {
+    ) -> nelomai_client_core::ConnectionIntentStatus {
         let _side_effect_gate = self
             .side_effect_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.next_projection_ticket();
-        self.pending_projection
-            .store(Self::PROJECTION_STABLE, std::sync::atomic::Ordering::SeqCst);
-        projection.observe_confirmed(desired_active);
+        if self.projection_observation_is_current(ticket) {
+            self.applied_observation_sequence.store(
+                ticket.observation_sequence,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        projection.status_unavailable_fallback()
     }
 
     fn projection_is_current(&self, ticket: AndroidProjectionTicket) -> bool {
@@ -381,6 +387,16 @@ impl AndroidUiStartStopCoordinator {
                 >= self
                     .applied_observation_sequence
                     .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn projection_observation_matches_pending(pending: u8, desired_active: Option<bool>) -> bool {
+        match pending {
+            Self::PROJECTION_STABLE => true,
+            Self::PROJECTION_STOPPING => desired_active == Some(false),
+            Self::PROJECTION_STARTING => desired_active == Some(true),
+            Self::PROJECTION_TOGGLING => false,
+            _ => false,
+        }
     }
 
     async fn run_start<F, Fut, T>(
@@ -1611,22 +1627,19 @@ fn project_android_connection_intent_status(
 #[cfg(target_os = "android")]
 async fn current_connection_intent(
     app: &AppHandle,
-    status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
+    _status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
 ) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
     let projection_ticket = ANDROID_UI_START_STOP_COORDINATOR.projection_ticket();
     let status = app.tunnel_android().connection_intent_status().ok();
-    let status_is_current = status.as_ref().is_none_or(|status| {
+    let status_is_current = status.as_ref().is_some_and(|status| {
         ANDROID_UI_START_STOP_COORDINATOR.observe_projected_status(
             projection_ticket,
             &ANDROID_DESIRED_ACTIVE_PROJECTION,
             status.desired_active,
         )
     });
-    let status_unavailable_fallback = if status_is_current {
-        status_unavailable_fallback
-    } else {
-        android_status_unavailable_fallback()
-    };
+    let status_unavailable_fallback = ANDROID_UI_START_STOP_COORDINATOR
+        .projected_status_fallback(projection_ticket, &ANDROID_DESIRED_ACTIVE_PROJECTION);
     project_android_connection_intent_status(
         status
             .as_ref()
@@ -1733,13 +1746,15 @@ pub async fn app_state(
         .take_quick_state_change()
         .unwrap_or_default();
     #[cfg(target_os = "android")]
-    ANDROID_UI_START_STOP_COORDINATOR.observe_projected_snapshot(
+    let quick_projection_applied = ANDROID_UI_START_STOP_COORDINATOR.observe_projected_snapshot(
         quick_projection_ticket,
         &ANDROID_DESIRED_ACTIVE_PROJECTION,
         quick_state_change.changed,
         quick_state_change.desired_active,
     );
-    let quick_state_changed = quick_state_change.changed;
+    #[cfg(not(target_os = "android"))]
+    let quick_projection_applied = true;
+    let quick_state_changed = quick_state_change.changed && quick_projection_applied;
     let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
         match application.bootstrap(now_unix()).await {
             Ok(response) => {
@@ -2112,9 +2127,21 @@ pub async fn app_login(
     diagnostics.set_automatic_device(&response.device.id);
     #[cfg(not(target_os = "android"))]
     let _ = app.tunnel_android().clear_background();
-    if app.tunnel_android().clear_quick_plan().is_ok() {
-        confirm_android_desired_active(false);
+    #[cfg(target_os = "android")]
+    let quick_clear_ticket = ANDROID_UI_START_STOP_COORDINATOR.begin_projected_clear();
+    let quick_plan_result = app.tunnel_android().clear_quick_plan();
+    #[cfg(target_os = "android")]
+    if quick_plan_result.is_ok() {
+        ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
+            quick_clear_ticket,
+            &ANDROID_DESIRED_ACTIVE_PROJECTION,
+            false,
+        );
+    } else {
+        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
     }
+    #[cfg(not(target_os = "android"))]
+    let _ = quick_plan_result;
     provision_android_background_resilient(
         app.clone(),
         application.inner().clone(),
@@ -2499,9 +2526,21 @@ pub async fn app_unbind_peer(
         .unbind_peer()
         .await
         .map_err(CommandError::from)?;
-    if app.tunnel_android().clear_quick_plan().is_ok() {
-        confirm_android_desired_active(false);
+    #[cfg(target_os = "android")]
+    let quick_clear_ticket = ANDROID_UI_START_STOP_COORDINATOR.begin_projected_clear();
+    let quick_plan_result = app.tunnel_android().clear_quick_plan();
+    #[cfg(target_os = "android")]
+    if quick_plan_result.is_ok() {
+        ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
+            quick_clear_ticket,
+            &ANDROID_DESIRED_ACTIVE_PROJECTION,
+            false,
+        );
+    } else {
+        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
     }
+    #[cfg(not(target_os = "android"))]
+    let _ = quick_plan_result;
     Ok(response.into())
 }
 
@@ -3491,24 +3530,35 @@ pub async fn app_logout(
     prepare_desktop_logout(&app, &application, &diagnostics).await;
     #[cfg(not(target_os = "android"))]
     let logout_result = push_registration_scheduler.logout(&app, &application).await;
+    #[cfg(target_os = "android")]
+    let quick_clear_ticket = ANDROID_UI_START_STOP_COORDINATOR.begin_projected_clear();
     let quick_plan_result = app.tunnel_android().clear_quick_plan();
     #[cfg(not(target_os = "android"))]
     let background_result = app.tunnel_android().clear_background();
 
     if let Err(error) = logout_result {
+        #[cfg(target_os = "android")]
+        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
         return Err(CommandError::from(error));
     }
     #[cfg(desktop)]
     diagnostics.clear_automatic_device();
     #[cfg(not(desktop))]
     let _ = &diagnostics;
-    quick_plan_result.map_err(|_| {
-        CommandError::new(
+    if quick_plan_result.is_err() {
+        #[cfg(target_os = "android")]
+        ANDROID_UI_START_STOP_COORDINATOR.finish_projected_action(quick_clear_ticket);
+        return Err(CommandError::new(
             "quick_state_persist_failed",
             "Не удалось очистить данные быстрого подключения",
-        )
-    })?;
-    confirm_android_desired_active(false);
+        ));
+    }
+    #[cfg(target_os = "android")]
+    ANDROID_UI_START_STOP_COORDINATOR.commit_projected_action(
+        quick_clear_ticket,
+        &ANDROID_DESIRED_ACTIVE_PROJECTION,
+        false,
+    );
     #[cfg(not(target_os = "android"))]
     background_result.map_err(|_| {
         CommandError::new(
@@ -4886,6 +4936,94 @@ mod tests {
     }
 
     #[test]
+    fn android_quick_snapshot_cannot_override_a_pending_start() {
+        let coordinator = AndroidUiStartStopCoordinator::new();
+        let projection = AndroidDesiredActiveProjection::new();
+        projection.observe_confirmed(false);
+        let start_ticket = coordinator.start_ticket();
+        let projected_start = match coordinator.begin_projected_start(start_ticket, &projection) {
+            Ok(projected_start) => projected_start,
+            Err(error) => panic!("unexpected projected start failure: {}", error.code()),
+        };
+        let quick_snapshot_ticket = coordinator.projection_ticket();
+
+        assert!(!coordinator.observe_projected_snapshot(
+            quick_snapshot_ticket,
+            &projection,
+            true,
+            Some(false),
+        ));
+        assert!(coordinator.commit_projected_action(projected_start, &projection, true));
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+    }
+
+    #[test]
+    fn newer_android_quick_snapshot_supersedes_an_older_completed_snapshot() {
+        let coordinator = AndroidUiStartStopCoordinator::new();
+        let projection = AndroidDesiredActiveProjection::new();
+        projection.observe_confirmed(true);
+        let older_snapshot_ticket = coordinator.projection_ticket();
+        let newer_snapshot_ticket = coordinator.projection_ticket();
+
+        assert!(coordinator.observe_projected_snapshot(
+            older_snapshot_ticket,
+            &projection,
+            true,
+            Some(true),
+        ));
+        assert!(coordinator.observe_projected_snapshot(
+            newer_snapshot_ticket,
+            &projection,
+            true,
+            Some(false),
+        ));
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::None,
+        );
+    }
+
+    #[test]
+    fn android_status_failure_uses_projection_after_a_concurrent_start() {
+        let coordinator = AndroidUiStartStopCoordinator::new();
+        let projection = AndroidDesiredActiveProjection::new();
+        projection.observe_confirmed(false);
+        let stale_status_ticket = coordinator.projection_ticket();
+        let start_ticket = coordinator.start_ticket();
+        if let Err(error) = coordinator.begin_projected_start(start_ticket, &projection) {
+            panic!("unexpected projected start failure: {}", error.code());
+        }
+
+        assert_eq!(
+            coordinator.projected_status_fallback(stale_status_ticket, &projection),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+    }
+
+    #[test]
+    fn late_android_clear_cannot_override_a_new_start() {
+        let coordinator = AndroidUiStartStopCoordinator::new();
+        let projection = AndroidDesiredActiveProjection::new();
+        projection.observe_confirmed(true);
+        let clear_ticket = coordinator.begin_projected_clear();
+        let start_ticket = coordinator.start_ticket();
+        let projected_start = match coordinator.begin_projected_start(start_ticket, &projection) {
+            Ok(projected_start) => projected_start,
+            Err(error) => panic!("unexpected projected start failure: {}", error.code()),
+        };
+
+        assert!(coordinator.commit_projected_action(projected_start, &projection, true));
+        assert!(!coordinator.commit_projected_action(clear_ticket, &projection, false));
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+    }
+
+    #[test]
     fn android_toggle_and_clear_fence_contradictory_status_polls() {
         let coordinator = AndroidUiStartStopCoordinator::new();
         let projection = AndroidDesiredActiveProjection::new();
@@ -4899,7 +5037,8 @@ mod tests {
         assert!(coordinator.observe_projected_status(recovered_status_ticket, &projection, true,));
 
         let stale_status_ticket = coordinator.projection_ticket();
-        coordinator.confirm_projected_state(&projection, false);
+        let clear_ticket = coordinator.begin_projected_clear();
+        assert!(coordinator.commit_projected_action(clear_ticket, &projection, false));
         assert!(!coordinator.observe_projected_status(stale_status_ticket, &projection, true,));
         assert_eq!(
             projection.status_unavailable_fallback(),
