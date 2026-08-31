@@ -139,6 +139,35 @@ impl AndroidUiStartStopCoordinator {
         AndroidUiStartTicket(self.epoch.load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    fn begin_projected_start(
+        &self,
+        ticket: AndroidUiStartTicket,
+        projection: &AndroidDesiredActiveProjection,
+    ) -> Result<(), CommandError> {
+        let _side_effect_gate = self
+            .side_effect_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_current(ticket)?;
+        projection.observe_snapshot(true, None);
+        Ok(())
+    }
+
+    fn commit_projected_start(
+        &self,
+        ticket: AndroidUiStartTicket,
+        projection: &AndroidDesiredActiveProjection,
+        desired_active: bool,
+    ) -> Result<(), CommandError> {
+        let _side_effect_gate = self
+            .side_effect_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_current(ticket)?;
+        projection.observe_confirmed(desired_active);
+        Ok(())
+    }
+
     async fn run_start<F, Fut, T>(
         &self,
         ticket: AndroidUiStartTicket,
@@ -2484,6 +2513,11 @@ pub async fn app_start(
                                 "Не удалось проверить состояние службы подключения",
                             )
                         })?;
+                    ANDROID_UI_START_STOP_COORDINATOR.commit_projected_start(
+                        android_start_ticket,
+                        &ANDROID_DESIRED_ACTIVE_PROJECTION,
+                        current_intent.desired_active,
+                    )?;
                     let legacy_start_attempt = current_intent
                         .lease_phase
                         .is_none()
@@ -2564,7 +2598,11 @@ pub async fn app_start(
                             })
                         },
                         move |request| async move {
-                            ANDROID_UI_START_STOP_COORDINATOR
+                            ANDROID_UI_START_STOP_COORDINATOR.begin_projected_start(
+                                android_start_ticket,
+                                &ANDROID_DESIRED_ACTIVE_PROJECTION,
+                            )?;
+                            let acknowledged = ANDROID_UI_START_STOP_COORDINATOR
                                 .run_start_side_effect(android_start_ticket, async move {
                                     begin_app
                                         .tunnel_android()
@@ -2577,7 +2615,13 @@ pub async fn app_start(
                                             )
                                         })
                                 })
-                                .await
+                                .await?;
+                            ANDROID_UI_START_STOP_COORDINATOR.commit_projected_start(
+                                android_start_ticket,
+                                &ANDROID_DESIRED_ACTIVE_PROJECTION,
+                                acknowledged.desired_active,
+                            )?;
+                            Ok(acknowledged)
                         },
                         move || async move {
                             let legacy_start_epoch = legacy_start_epoch.ok_or_else(|| {
@@ -2617,8 +2661,6 @@ pub async fn app_start(
     .await;
     match start_result {
         Ok(response) => {
-            #[cfg(target_os = "android")]
-            remember_android_desired_active(response.status == "recovering");
             #[cfg(desktop)]
             if let Some(connection) = &response.connection {
                 begin_desktop_tunnel_diagnostics(&app, &connection.lease_id);
@@ -4407,6 +4449,63 @@ mod tests {
             .await;
             assert!(response.is_err(), "phase={phase:?} status={status}");
         }
+    }
+
+    #[test]
+    fn android_service_start_invalidates_a_stopped_projection_before_acknowledgement() {
+        let coordinator = AndroidUiStartStopCoordinator::new();
+        let projection = AndroidDesiredActiveProjection::new();
+        projection.observe_confirmed(false);
+        let ticket = coordinator.start_ticket();
+
+        if let Err(error) = coordinator.begin_projected_start(ticket, &projection) {
+            panic!("unexpected projected start failure: {}", error.code());
+        }
+
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+        if let Err(error) = coordinator.commit_projected_start(ticket, &projection, true) {
+            panic!(
+                "unexpected projected start commit failure: {}",
+                error.code()
+            );
+        }
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+    }
+
+    #[tokio::test]
+    async fn late_android_start_acknowledgement_cannot_override_a_completed_stop() {
+        let coordinator = AndroidUiStartStopCoordinator::new();
+        let projection = AndroidDesiredActiveProjection::new();
+        projection.observe_confirmed(false);
+        let ticket = coordinator.start_ticket();
+        if let Err(error) = coordinator.begin_projected_start(ticket, &projection) {
+            panic!("unexpected projected start failure: {}", error.code());
+        }
+
+        let stop_result = coordinator
+            .run_stop(|| async {
+                projection.observe_confirmed(false);
+                Ok(())
+            })
+            .await;
+        if let Err(error) = stop_result {
+            panic!("unexpected stop failure: {}", error.code());
+        }
+
+        let error = coordinator
+            .commit_projected_start(ticket, &projection, true)
+            .expect_err("a cancelled start must not publish its late acknowledgement");
+        assert_eq!(error.code(), "connection_intent_cancelled");
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::None,
+        );
     }
 
     #[tokio::test]
