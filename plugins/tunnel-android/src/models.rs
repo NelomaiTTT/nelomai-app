@@ -428,6 +428,7 @@ pub struct TunnelOperationResponse {
 pub struct QuickStateChangeResponse {
     pub changed: bool,
     pub revision: u64,
+    pub desired_active: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -673,6 +674,25 @@ mod tests {
 
         let cancel = serde_json::to_value(CancelConnectionIntentRequest { generation: 9 }).unwrap();
         assert_eq!(cancel["generation"], 9);
+    }
+
+    #[test]
+    fn quick_state_change_preserves_the_desired_active_projection() {
+        let stopped: QuickStateChangeResponse = serde_json::from_value(serde_json::json!({
+            "changed": true,
+            "revision": 11,
+            "desiredActive": false
+        }))
+        .unwrap();
+        let unavailable: QuickStateChangeResponse = serde_json::from_value(serde_json::json!({
+            "changed": false,
+            "revision": 0,
+            "desiredActive": null
+        }))
+        .unwrap();
+
+        assert_eq!(stopped.desired_active, Some(false));
+        assert_eq!(unavailable.desired_active, None);
     }
 
     #[test]

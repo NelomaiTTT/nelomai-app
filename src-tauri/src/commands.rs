@@ -35,6 +35,84 @@ static ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX: AtomicI64 = AtomicI64::new(0);
 #[cfg(target_os = "android")]
 static ANDROID_UI_START_STOP_COORDINATOR: AndroidUiStartStopCoordinator =
     AndroidUiStartStopCoordinator::new();
+#[cfg(any(target_os = "android", test))]
+static ANDROID_DESIRED_ACTIVE_PROJECTION: AndroidDesiredActiveProjection =
+    AndroidDesiredActiveProjection::new();
+
+#[cfg(any(target_os = "android", test))]
+struct AndroidDesiredActiveProjection {
+    value: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl AndroidDesiredActiveProjection {
+    const UNKNOWN: u8 = 0;
+    const STOPPED: u8 = 1;
+    const ACTIVE: u8 = 2;
+
+    const fn new() -> Self {
+        Self {
+            value: std::sync::atomic::AtomicU8::new(Self::UNKNOWN),
+        }
+    }
+
+    fn observe_confirmed(&self, desired_active: bool) {
+        self.value.store(
+            if desired_active {
+                Self::ACTIVE
+            } else {
+                Self::STOPPED
+            },
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    fn observe_snapshot(&self, changed: bool, desired_active: Option<bool>) {
+        if !changed {
+            return;
+        }
+        if let Some(desired_active) = desired_active {
+            self.observe_confirmed(desired_active);
+        } else {
+            self.value
+                .store(Self::UNKNOWN, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn status_unavailable_fallback(&self) -> nelomai_client_core::ConnectionIntentStatus {
+        if self.value.load(std::sync::atomic::Ordering::SeqCst) == Self::STOPPED {
+            nelomai_client_core::ConnectionIntentStatus::None
+        } else {
+            nelomai_client_core::ConnectionIntentStatus::Recovering
+        }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn remember_android_desired_active(desired_active: bool) {
+    ANDROID_DESIRED_ACTIVE_PROJECTION.observe_confirmed(desired_active);
+}
+
+#[cfg(not(any(target_os = "android", test)))]
+fn remember_android_desired_active(_desired_active: bool) {}
+
+#[cfg(any(target_os = "android", test))]
+fn observe_android_desired_active_snapshot(changed: bool, desired_active: Option<bool>) {
+    ANDROID_DESIRED_ACTIVE_PROJECTION.observe_snapshot(changed, desired_active);
+}
+
+#[cfg(not(any(target_os = "android", test)))]
+fn observe_android_desired_active_snapshot(_changed: bool, _desired_active: Option<bool>) {}
+
+#[cfg(any(target_os = "android", test))]
+fn android_status_unavailable_fallback() -> nelomai_client_core::ConnectionIntentStatus {
+    ANDROID_DESIRED_ACTIVE_PROJECTION.status_unavailable_fallback()
+}
+
+#[cfg(not(any(target_os = "android", test)))]
+fn android_status_unavailable_fallback() -> nelomai_client_core::ConnectionIntentStatus {
+    nelomai_client_core::ConnectionIntentStatus::Recovering
+}
 
 #[cfg(any(target_os = "android", test))]
 #[derive(Clone, Copy)]
@@ -754,7 +832,7 @@ async fn stop_connection(
 ) -> Result<Option<Connection>, CommandError> {
     #[cfg(target_os = "android")]
     {
-        ANDROID_UI_START_STOP_COORDINATOR
+        let cancelled = ANDROID_UI_START_STOP_COORDINATOR
             .run_stop(|| async {
                 route_android_connection_stop_with_legacy(
                     || {
@@ -792,6 +870,7 @@ async fn stop_connection(
                 .await
             })
             .await?;
+        remember_android_desired_active(cancelled.desired_active);
         return Ok(None);
     }
     #[cfg(not(target_os = "android"))]
@@ -1276,23 +1355,15 @@ fn project_android_connection_intent_status(
     }
 }
 
-fn android_status_unavailable_fallback(
-    quick_state_changed: bool,
-    phase: Phase,
-) -> nelomai_client_core::ConnectionIntentStatus {
-    if quick_state_changed && phase == Phase::Ready {
-        nelomai_client_core::ConnectionIntentStatus::None
-    } else {
-        nelomai_client_core::ConnectionIntentStatus::Recovering
-    }
-}
-
 #[cfg(target_os = "android")]
 async fn current_connection_intent(
     app: &AppHandle,
     status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
 ) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
     let status = app.tunnel_android().connection_intent_status().ok();
+    if let Some(status) = &status {
+        remember_android_desired_active(status.desired_active);
+    }
     project_android_connection_intent_status(
         status
             .as_ref()
@@ -1395,6 +1466,10 @@ pub async fn app_state(
         .tunnel_android()
         .take_quick_state_change()
         .unwrap_or_default();
+    observe_android_desired_active_snapshot(
+        quick_state_change.changed,
+        quick_state_change.desired_active,
+    );
     let quick_state_changed = quick_state_change.changed;
     let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
         match application.bootstrap(now_unix()).await {
@@ -1433,8 +1508,7 @@ pub async fn app_state(
     let warning = application.split_tunnel_warning().await;
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    let status_unavailable_fallback =
-        android_status_unavailable_fallback(quick_state_changed, state.phase);
+    let status_unavailable_fallback = android_status_unavailable_fallback();
     let (intent_status, next_retry_at_unix) =
         current_connection_intent(&app, status_unavailable_fallback).await;
     Ok(AppStateResponse::new(
@@ -1567,7 +1641,7 @@ pub(crate) async fn quick_toggle(
     #[cfg(target_os = "android")]
     {
         let _ = skip_probe_refresh;
-        route_android_quick_toggle(
+        let status = route_android_quick_toggle(
             || async {
                 app.tunnel_android()
                     .toggle_connection_intent()
@@ -1594,6 +1668,7 @@ pub(crate) async fn quick_toggle(
             },
         )
         .await?;
+        remember_android_desired_active(status.desired_active);
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -1755,7 +1830,9 @@ pub async fn app_login(
     diagnostics.set_automatic_device(&response.device.id);
     #[cfg(not(target_os = "android"))]
     let _ = app.tunnel_android().clear_background();
-    let _ = app.tunnel_android().clear_quick_plan();
+    if app.tunnel_android().clear_quick_plan().is_ok() {
+        remember_android_desired_active(false);
+    }
     provision_android_background_resilient(
         app.clone(),
         application.inner().clone(),
@@ -2140,7 +2217,9 @@ pub async fn app_unbind_peer(
         .unbind_peer()
         .await
         .map_err(CommandError::from)?;
-    let _ = app.tunnel_android().clear_quick_plan();
+    if app.tunnel_android().clear_quick_plan().is_ok() {
+        remember_android_desired_active(false);
+    }
     Ok(response.into())
 }
 
@@ -2538,6 +2617,8 @@ pub async fn app_start(
     .await;
     match start_result {
         Ok(response) => {
+            #[cfg(target_os = "android")]
+            remember_android_desired_active(response.status == "recovering");
             #[cfg(desktop)]
             if let Some(connection) = &response.connection {
                 begin_desktop_tunnel_diagnostics(&app, &connection.lease_id);
@@ -3120,6 +3201,7 @@ pub async fn app_logout(
             "Не удалось очистить данные быстрого подключения",
         )
     })?;
+    remember_android_desired_active(false);
     #[cfg(not(target_os = "android"))]
     background_result.map_err(|_| {
         CommandError::new(
@@ -3504,29 +3586,59 @@ mod tests {
 
     #[test]
     fn unavailable_android_service_preserves_recovery_without_a_confirmed_quick_stop() {
+        let projection = AndroidDesiredActiveProjection::new();
+        let fallback = projection.status_unavailable_fallback();
         assert_eq!(
-            project_android_connection_intent_status(
-                None,
-                nelomai_client_core::ConnectionIntentStatus::Recovering,
-            ),
+            project_android_connection_intent_status(None, fallback),
             (
                 nelomai_client_core::ConnectionIntentStatus::Recovering,
                 None,
             ),
         );
+    }
+
+    #[test]
+    fn confirmed_android_stop_remains_idle_across_status_failures() {
+        let projection = AndroidDesiredActiveProjection::new();
         assert_eq!(
-            android_status_unavailable_fallback(false, Phase::Ready),
+            projection.status_unavailable_fallback(),
             nelomai_client_core::ConnectionIntentStatus::Recovering,
         );
+
+        projection.observe_snapshot(true, Some(false));
         assert_eq!(
-            android_status_unavailable_fallback(true, Phase::Connected),
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::None,
+        );
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::None,
+        );
+
+        projection.observe_snapshot(false, None);
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::None,
+        );
+
+        projection.observe_snapshot(true, None);
+        assert_eq!(
+            projection.status_unavailable_fallback(),
+            nelomai_client_core::ConnectionIntentStatus::Recovering,
+        );
+
+        projection.observe_confirmed(true);
+        assert_eq!(
+            projection.status_unavailable_fallback(),
             nelomai_client_core::ConnectionIntentStatus::Recovering,
         );
     }
 
     #[test]
     fn confirmed_android_quick_stop_clears_an_unavailable_service_status() {
-        let fallback = android_status_unavailable_fallback(true, Phase::Ready);
+        let projection = AndroidDesiredActiveProjection::new();
+        projection.observe_confirmed(false);
+        let fallback = projection.status_unavailable_fallback();
         assert_eq!(
             project_android_connection_intent_status(None, fallback),
             (nelomai_client_core::ConnectionIntentStatus::None, None),

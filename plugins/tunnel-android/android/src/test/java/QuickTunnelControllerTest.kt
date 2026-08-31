@@ -53,6 +53,18 @@ class QuickTunnelControllerTest {
     }
 
     @Test
+    fun desiredActiveSnapshotDistinguishesAStoppedIntentFromUnavailableStorage() {
+        val backend = QuickFakeEncryptedRecordBackend()
+        val store = AndroidRecoveryStore(backend, BootIdentityProvider { 9 })
+
+        val stopped = quickDesiredActiveSnapshot(store)
+        assertTrue(stopped is RecoveryStoreResult.Success)
+        assertFalse((stopped as RecoveryStoreResult.Success).value)
+        backend.failReads = true
+        assertTrue(quickDesiredActiveSnapshot(store) is RecoveryStoreResult.Failure)
+    }
+
+    @Test
     fun broadcastGateAvoidsPollingTheVpnServiceForPersistedChanges() {
         val gate = QuickStateChangeGate()
 
@@ -147,10 +159,14 @@ class QuickTunnelControllerTest {
 
 private class QuickFakeEncryptedRecordBackend(
     var failWrites: Boolean = false,
+    var failReads: Boolean = false,
 ) : EncryptedRecordBackend {
     private var record: ByteArray? = null
 
-    override fun read(): ByteArray? = record?.copyOf()
+    override fun read(): ByteArray? {
+        if (failReads) throw EncryptedRecordCorruptException()
+        return record?.copyOf()
+    }
 
     override fun write(plaintext: ByteArray): Boolean {
         if (failWrites) return false

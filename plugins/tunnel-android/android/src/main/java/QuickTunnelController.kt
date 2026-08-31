@@ -33,6 +33,13 @@ internal object QuickDesiredActiveProjection {
     }
 }
 
+internal fun quickDesiredActiveSnapshot(
+    store: AndroidRecoveryStore,
+): RecoveryStoreResult<Boolean> = when (val result = QuickDesiredActiveProjection.read(store)) {
+    is RecoveryStoreResult.Success -> RecoveryStoreResult.Success(result.value.desiredActive)
+    is RecoveryStoreResult.Failure -> result
+}
+
 object QuickTunnelController {
     internal const val ACTION_STATE_CHANGED = "ru.nelomai.tunnel.STATE_CHANGED"
     internal const val EXTRA_STATE_CHANGE_REVISION = "state_change_revision"
@@ -139,15 +146,16 @@ object QuickTunnelController {
         return saved || desiredActive != null
     }
 
-    internal fun desiredActive(context: Context): Boolean {
-        if (!migrateLegacyDesiredActive(context)) return false
-        return when (
-            val result = QuickDesiredActiveProjection.read(AndroidRecoveryStores.open(context))
-        ) {
-            is RecoveryStoreResult.Success -> result.value.desiredActive
+    internal fun desiredActive(context: Context): Boolean =
+        desiredActiveSnapshot(context) ?: false
+
+    internal fun desiredActiveSnapshot(context: Context): Boolean? {
+        if (!migrateLegacyDesiredActive(context)) return null
+        return when (val result = quickDesiredActiveSnapshot(AndroidRecoveryStores.open(context))) {
+            is RecoveryStoreResult.Success -> result.value
             is RecoveryStoreResult.Failure -> {
                 TunnelLog.warning("quick_state.recovery_read_failed", result.code)
-                false
+                null
             }
         }
     }

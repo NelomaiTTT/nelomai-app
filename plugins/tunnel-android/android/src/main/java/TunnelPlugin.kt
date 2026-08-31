@@ -2989,9 +2989,18 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun takeQuickStateChange(invoke: Invoke) {
+        val changed = quickStateChangeGate.current()
         val response = JSObject()
-        response.put("changed", quickStateChangeGate.current())
+        response.put("changed", changed)
         response.put("revision", quickStateChangeGate.snapshot())
+        response.put(
+            "desiredActive",
+            if (changed) {
+                QuickTunnelController.desiredActiveSnapshot(activity.applicationContext)
+            } else {
+                null
+            },
+        )
         invoke.resolve(response)
     }
 
