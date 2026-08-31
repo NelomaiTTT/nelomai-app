@@ -27,7 +27,7 @@ internal interface RedundantConnectionPanel {
         transaction: AndroidRedundantTransaction,
         candidateLeaseId: String,
     ): BackgroundRedundantSession = throw UnsupportedOperationException()
-    fun stop(transaction: AndroidRedundantTransaction)
+    fun stop(transaction: AndroidRedundantTransaction): Boolean
 }
 
 internal data class RedundantRecoveryResponse(
@@ -38,7 +38,45 @@ internal data class RedundantRecoveryResponse(
 /** A v2 envelope is reserved for this coordinator and must never create a recovery-v1 backend. */
 internal fun shouldEnterLegacyVpnRecovery(
     recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
-): Boolean = (recovery as? RecoveryStoreResult.Success)?.value?.redundantTransaction == null
+): Boolean = when (recovery) {
+    is RecoveryStoreResult.Success -> recovery.value.redundantTransaction == null
+    is RecoveryStoreResult.Failure -> false
+}
+
+/** Deferred until Task 8/9 provide native and authenticated-panel adapters. */
+internal interface RedundantVpnProcessOwner {
+    fun recover(): Boolean
+    fun revoke(): Boolean
+}
+
+/** Never fall through to a legacy backend when a v2 envelope is present or unreadable. */
+internal fun routeVpnProcessRecovery(
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    owner: RedundantVpnProcessOwner?,
+    legacyRecovery: () -> Unit,
+): Boolean = when (recovery) {
+    is RecoveryStoreResult.Failure -> false
+    is RecoveryStoreResult.Success -> if (recovery.value.redundantTransaction != null) {
+        owner?.recover() ?: false
+    } else {
+        legacyRecovery()
+        true
+    }
+}
+
+internal fun routeVpnProcessRevoke(
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    owner: RedundantVpnProcessOwner?,
+    legacyRevoke: () -> Unit,
+): Boolean = when (recovery) {
+    is RecoveryStoreResult.Failure -> false
+    is RecoveryStoreResult.Success -> if (recovery.value.redundantTransaction != null) {
+        owner?.revoke() ?: false
+    } else {
+        legacyRevoke()
+        true
+    }
+}
 
 /**
  * Sole recovery-v2 owner in the VPN process. It deliberately has no legacy runtime dependency:
@@ -50,7 +88,7 @@ internal class RedundantConnectionCoordinator(
     private val native: RedundantConnectionNative,
     private val operationId: () -> String = { UUID.randomUUID().toString() },
     private val onAllSlotsStalled: () -> Unit = {},
-) {
+) : RedundantVpnProcessOwner {
     private val gate = Any()
     private var recoveryStarted = false
 
@@ -61,36 +99,43 @@ internal class RedundantConnectionCoordinator(
         transaction: AndroidRedundantTransaction,
         configurations: Map<String, ByteArray>,
     ): Boolean = synchronized(gate) {
-        if (store.beginRedundant(transaction) !is RecoveryStoreResult.Success) return@synchronized false
         val active = transaction.localActiveLeaseId ?: return@synchronized false
-        for (leaseId in listOf(active) + listOfNotNull(
+        val activeConfiguration = configurations[active] ?: return@synchronized false
+        if (store.beginRedundant(transaction) !is RecoveryStoreResult.Success) return@synchronized false
+        if (!native.start(active, activeConfiguration) || !native.activate(active)) return@synchronized false
+        for (leaseId in listOfNotNull(
             transaction.slotALeaseId,
             transaction.slotBLeaseId,
         ).filter { it != active }.distinct()) {
             val configuration = configurations[leaseId] ?: continue
-            if (!native.start(leaseId, configuration)) return@synchronized false
+            // A standby is never allowed to turn a usable active member into a failed start.
+            native.start(leaseId, configuration)
         }
         recoveryStarted = true
         true
     }
 
     /** Replays the v2 session before callers attempt any recovery-v1 flow. */
-    fun recover(): Boolean = synchronized(gate) {
+    override fun recover(): Boolean = synchronized(gate) {
         val transaction = status() ?: return@synchronized false
-        if (!transaction.desiredActive || transaction.retry.stopQueued) return@synchronized false
+        if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
+            return@synchronized false
+        }
         if (recoveryStarted) return@synchronized true
         val response = panel.recover(transaction)
         val refreshed = transaction.withCanonical(response.session)
         val active = transaction.localActiveLeaseId.takeIf(response.session::containsCurrentLease)
             ?: response.session.activeLeaseId
             ?: return@synchronized false
-        val ordered = listOf(active) + listOfNotNull(
+        val activeConfiguration = response.configurations[active] ?: return@synchronized false
+        if (!native.start(active, activeConfiguration) || !native.activate(active)) return@synchronized false
+        val standby = listOfNotNull(
             response.session.slotALeaseId,
             response.session.slotBLeaseId,
         ).filter { it != active }.distinct()
-        for (leaseId in ordered) {
+        for (leaseId in standby) {
             val configuration = response.configurations[leaseId] ?: continue
-            if (!native.start(leaseId, configuration)) return@synchronized false
+            native.start(leaseId, configuration)
         }
         // The local active identity wins over a stale canonical role until its observation is sent.
         val persisted = persist(refreshed.copy(localActiveLeaseId = active))
@@ -104,9 +149,16 @@ internal class RedundantConnectionCoordinator(
         val surviving = listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
             .firstOrNull { it != leaseId && native.isUsable(it) }
         if (surviving != null) {
-            if (!native.activate(surviving)) return@synchronized false
-            val updated = transaction.copy(localActiveLeaseId = surviving)
+            val updated = transaction.copy(
+                localActiveLeaseId = surviving,
+                retry = transaction.retry.copy(
+                    roleObservationPending = true,
+                    pendingRoleLeaseId = surviving,
+                    pendingRoleReason = reason,
+                ),
+            )
             if (!persist(updated)) return@synchronized false
+            if (!native.activate(surviving)) return@synchronized false
             reportLocalRoleLocked(reason)
             return@synchronized true
         }
@@ -126,8 +178,40 @@ internal class RedundantConnectionCoordinator(
     private fun reportLocalRoleLocked(reason: String): Boolean {
         val transaction = status() ?: return false
         if (!transaction.desiredActive || transaction.localActiveLeaseId == null) return false
-        val response = panel.reportRole(transaction, reason)
-        return persist(transaction.withCanonical(response.session))
+        val pending = if (transaction.retry.roleObservationPending) transaction else transaction.copy(
+            retry = transaction.retry.copy(
+                roleObservationPending = true,
+                pendingRoleLeaseId = transaction.localActiveLeaseId,
+                pendingRoleReason = reason,
+            ),
+        )
+        if (!persist(pending)) return false
+        return flushRoleObservationLocked()
+    }
+
+    private fun flushRoleObservationLocked(): Boolean {
+        var transaction = status() ?: return false
+        if (!transaction.retry.roleObservationPending) return true
+        repeat(2) {
+            val reason = requireNotNull(transaction.retry.pendingRoleReason)
+            val response = try {
+                panel.reportRole(transaction, reason)
+            } catch (_: Throwable) {
+                return false
+            }
+            val canonical = transaction.withCanonical(response.session)
+            if (response.action == "rebase") {
+                if (!persist(canonical)) return false
+                transaction = status() ?: return false
+            } else {
+                return persist(canonical.copy(retry = canonical.retry.copy(
+                    roleObservationPending = false,
+                    pendingRoleLeaseId = null,
+                    pendingRoleReason = null,
+                )))
+            }
+        }
+        return false
     }
 
     fun releaseStandby(): Boolean = synchronized(gate) {
@@ -145,19 +229,43 @@ internal class RedundantConnectionCoordinator(
     fun acquireAndCommitStandby(operationId: String): Boolean = synchronized(gate) {
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || !transaction.standbyDesired) return@synchronized false
-        val candidate = panel.acquireStandby(transaction, operationId)
-        val staged = transaction.copy(
+        val replayOperationId = transaction.retry.acquireOperationId ?: operationId
+        val staged = if (transaction.retry.acquirePending) transaction else transaction.copy(
+            retry = transaction.retry.copy(
+                acquirePending = true,
+                acquireOperationId = replayOperationId,
+                acquireFingerprint = "acquire:${transaction.sessionId}:$replayOperationId:${transaction.localActiveLeaseId}",
+                acquireReplaceLeaseId = transaction.candidateLeaseId,
+            ),
+        )
+        if (!persist(staged)) return@synchronized false
+        val candidate = try {
+            panel.acquireStandby(staged, requireNotNull(staged.retry.acquireOperationId))
+        } catch (_: Throwable) {
+            return@synchronized false
+        }
+        val candidateStaged = staged.copy(
             candidateLeaseId = candidate.candidateLeaseId,
             candidateSlot = candidate.candidateSlot,
         )
-        if (!persist(staged)) return@synchronized false
+        if (!persist(candidateStaged)) return@synchronized false
         if (!native.start(candidate.candidateLeaseId, candidate.configuration)) return@synchronized false
-        val session = panel.commitCandidate(staged, candidate.candidateLeaseId)
-        persist(staged.withCanonical(session))
+        val session = try {
+            panel.commitCandidate(candidateStaged, candidate.candidateLeaseId)
+        } catch (_: Throwable) {
+            return@synchronized false
+        }
+        val committed = candidateStaged.withCanonical(session).copy(retry = candidateStaged.retry.copy(
+            acquirePending = false,
+            acquireOperationId = null,
+            acquireFingerprint = null,
+            acquireReplaceLeaseId = null,
+        ))
+        persist(committed)
     }
 
     /** onRevoke calls this synchronously; desired-active is durable before the idempotent stop is queued. */
-    fun revoke(): Boolean = synchronized(gate) {
+    override fun revoke(): Boolean = synchronized(gate) {
         val transaction = status() ?: return@synchronized false
         val stopped = if (transaction.desiredActive || transaction.stopOperationId == null) {
             transaction.copy(desiredActive = false, stopOperationId = transaction.stopOperationId ?: operationId())
@@ -165,12 +273,14 @@ internal class RedundantConnectionCoordinator(
             transaction
         }
         if (!persist(stopped)) return@synchronized false
-        if (stopped.retry.stopQueued) return@synchronized true
-        val queued = stopped.copy(retry = stopped.retry.copy(stopQueued = true))
-        if (!persist(queued)) return@synchronized false
-        native.stop()
-        panel.stop(queued)
-        true
+        val pending = stopped.copy(retry = stopped.retry.copy(stopState = RedundantStopState.PENDING))
+        if (!persist(pending)) return@synchronized false
+        val localStopped = try { native.stop() } catch (_: Throwable) { false }
+        val panelStopped = if (localStopped) try { panel.stop(pending) } catch (_: Throwable) { false } else false
+        if (!localStopped || !panelStopped) return@synchronized false
+        val acknowledged = pending.copy(retry = pending.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+        if (!persist(acknowledged)) return@synchronized false
+        store.completeRedundantStop(requireNotNull(acknowledged.stopOperationId)) is RecoveryStoreResult.Success
     }
 
     private fun persist(transaction: AndroidRedundantTransaction): Boolean =

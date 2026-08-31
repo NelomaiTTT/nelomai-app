@@ -598,6 +598,56 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun legacyBeginStartIsRejectedWhileAV2TransactionOwnsTheEnvelope() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+        store.beginRedundant(AndroidRedundantTransaction(
+            desiredActive = true,
+            template = template(),
+            sessionId = "22222222-2222-4222-8222-222222222222",
+            slotALeaseId = "lease-a",
+            slotBLeaseId = "lease-b",
+            localActiveLeaseId = "lease-a",
+            standbyDesired = true,
+            roleGeneration = 0,
+            membershipGeneration = 0,
+            startOperationId = "v2-start",
+            startRequestFingerprint = "v2-fingerprint",
+        )).success()
+
+        assertEquals("connection_recovery_v2_owned", store.beginStart(0, template(), replay()).failure().code)
+        assertEquals(
+            "connection_recovery_v2_owned",
+            store.restartTerminal(0, template(), replay(), "legacy-stop").failure().code,
+        )
+    }
+
+    @Test
+    fun deferredV2RevokeDurablyDisarmsAndRetainsTheSameStopOperationForAnOwnerReplay() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginRedundant(AndroidRedundantTransaction(
+            desiredActive = true,
+            template = template(),
+            sessionId = "22222222-2222-4222-8222-222222222222",
+            slotALeaseId = "lease-a",
+            slotBLeaseId = "lease-b",
+            localActiveLeaseId = "lease-a",
+            standbyDesired = true,
+            roleGeneration = 0,
+            membershipGeneration = 0,
+            startOperationId = "v2-start",
+            startRequestFingerprint = "v2-fingerprint",
+        )).success()
+
+        store.deferRedundantStop("v2-stop").success()
+        val replay = requireNotNull(store.read().success().redundantTransaction)
+
+        assertFalse(replay.desiredActive)
+        assertEquals("v2-stop", replay.stopOperationId)
+        assertEquals(RedundantStopState.PENDING, replay.retry.stopState)
+    }
+
+    @Test
     fun cleanupBlocksANewStartUntilTheTransactionIsConfirmedTerminal() {
         val backend = FakeEncryptedRecordBackend()
         val store = store(backend)

@@ -166,6 +166,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     )
     private var restoreRetryAttempt = 0
     private lateinit var recoveryStore: AndroidRecoveryStore
+    private var redundantVpnOwner: RedundantVpnProcessOwner? = null
     private val restoreRetry = Runnable { connectionIntentLifecycle.onRetryTimer() }
     private lateinit var connectionIntentCoordinator: AndroidConnectionIntentCoordinator
     private lateinit var connectionIntentLifecycle: ConnectionIntentServiceLifecycle
@@ -265,11 +266,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 cancelRestoreRetry()
                 performBackgroundToggle(intent.resultReceiver())
             }
-            intent?.action == ACTION_ENSURE_RUNNING -> {
-                if (!connectionIntentLifecycle.onEnsureRunning() && shouldEnterLegacyVpnRecovery(
-                        recoveryStore.read(),
-                    )
-                ) {
+            intent?.action == ACTION_ENSURE_RUNNING -> routeVpnProcessRecovery(
+                recoveryStore.read(),
+                redundantVpnOwner,
+            ) {
+                if (!connectionIntentLifecycle.onEnsureRunning()) {
                     restoreDesiredTunnel("ensure_running")
                 }
             }
@@ -1023,24 +1024,48 @@ class NelomaiVpnService : GoBackend.VpnService() {
         TunnelLog.warning("service.vpn_revoked")
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
-        val disposition = routeAndroidVpnRevoke(
-            dispatch = connectionIntentDispatch,
-            coordinator = connectionIntentCoordinator,
-            runtimeFence = connectionIntentRuntimeFence,
-            updateStopping = {
-                QuickTunnelController.updateState(
-                    applicationContext,
-                    SessionState.STOPPING,
-                    desiredActive = null,
-                    changed = true,
-                )
-            },
-            resumePendingWork = connectionIntentLifecycle::onEnsureRunning,
-        )
-        (disposition.cancelled as? AndroidCoordinatorResult.Failure)?.let {
-            TunnelLog.warning("service.vpn_revoke_cancel_failed", it.code)
+        val recovery = recoveryStore.read()
+        val v2Owned = !shouldEnterLegacyVpnRecovery(recovery)
+        val routed = routeVpnProcessRevoke(recovery, redundantVpnOwner) {
+            val disposition = routeAndroidVpnRevoke(
+                dispatch = connectionIntentDispatch,
+                coordinator = connectionIntentCoordinator,
+                runtimeFence = connectionIntentRuntimeFence,
+                updateStopping = {
+                    QuickTunnelController.updateState(
+                        applicationContext,
+                        SessionState.STOPPING,
+                        desiredActive = null,
+                        changed = true,
+                    )
+                },
+                resumePendingWork = connectionIntentLifecycle::onEnsureRunning,
+            )
+            (disposition.cancelled as? AndroidCoordinatorResult.Failure)?.let {
+                TunnelLog.warning("service.vpn_revoke_cancel_failed", it.code)
+            }
+            applyAndroidVpnRevokeLifecycle(disposition, ::invokeFrameworkVpnRevoke)
         }
-        applyAndroidVpnRevokeLifecycle(disposition, ::invokeFrameworkVpnRevoke)
+        if (!routed) {
+            if (recovery is RecoveryStoreResult.Success && recovery.value.redundantTransaction != null) {
+                recoveryStore.deferRedundantStop(UUID.randomUUID().toString())
+            }
+            TunnelLog.warning("service.vpn_revoke_v2_owner_unavailable")
+            invokeFrameworkVpnRevoke()
+        } else if (v2Owned) {
+            QuickTunnelController.updateState(
+                applicationContext,
+                SessionState.STOPPING,
+                desiredActive = null,
+                changed = true,
+            )
+            invokeFrameworkVpnRevoke()
+        }
+    }
+
+    /** Installed only by the future native/panel adapter in this dedicated :vpn process. */
+    internal fun installRedundantVpnOwner(owner: RedundantVpnProcessOwner?) {
+        redundantVpnOwner = owner
     }
 
     private fun invokeFrameworkVpnRevoke() {
@@ -2848,6 +2873,9 @@ internal class AndroidConnectionIntentCoordinator(
         val current = when (val result = store.read()) {
             is RecoveryStoreResult.Success -> result.value
             is RecoveryStoreResult.Failure -> return AndroidCoordinatorResult.Failure(result.code)
+        }
+        if (current.redundantTransaction != null) {
+            return AndroidCoordinatorResult.Failure("connection_recovery_v2_owned")
         }
         if (expectedGeneration != null && current.intent.generation != expectedGeneration) {
             return AndroidCoordinatorResult.Failure("connection_intent_generation_conflict")

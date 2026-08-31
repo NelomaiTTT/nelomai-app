@@ -158,12 +158,32 @@ internal enum class RedundantSlot(val wireName: String) {
     }
 }
 
+internal enum class RedundantStopState(val wireName: String) {
+    NONE("none"),
+    PENDING("pending"),
+    ACKNOWLEDGED("acknowledged"),
+    ;
+
+    companion object {
+        fun fromWireName(value: String): RedundantStopState = values().firstOrNull {
+            it.wireName == value
+        } ?: throw IllegalArgumentException("invalid_redundant_stop_state")
+    }
+}
+
 internal data class AndroidRedundantRetryState(
     val attempt: Int = 0,
     val nextRetryAtUnix: Long? = null,
     val lastErrorCode: String? = null,
     val sessionStalledRecorded: Boolean = false,
-    val stopQueued: Boolean = false,
+    val stopState: RedundantStopState = RedundantStopState.NONE,
+    val roleObservationPending: Boolean = false,
+    val pendingRoleLeaseId: String? = null,
+    val pendingRoleReason: String? = null,
+    val acquirePending: Boolean = false,
+    val acquireOperationId: String? = null,
+    val acquireFingerprint: String? = null,
+    val acquireReplaceLeaseId: String? = null,
 )
 
 /** Safe recovery-v2 control state. Configurations and private keys remain ephemeral. */
@@ -405,7 +425,14 @@ internal object AndroidRecoveryEnvelopeCodec {
             transaction.retry.nextRetryAtUnix?.let { put("nextRetryAtUnix", it) }
             transaction.retry.lastErrorCode?.let { put("lastErrorCode", it) }
             put("sessionStalledRecorded", transaction.retry.sessionStalledRecorded)
-            put("stopQueued", transaction.retry.stopQueued)
+            put("stopState", transaction.retry.stopState.wireName)
+            put("roleObservationPending", transaction.retry.roleObservationPending)
+            transaction.retry.pendingRoleLeaseId?.let { put("pendingRoleLeaseId", it) }
+            transaction.retry.pendingRoleReason?.let { put("pendingRoleReason", it) }
+            put("acquirePending", transaction.retry.acquirePending)
+            transaction.retry.acquireOperationId?.let { put("acquireOperationId", it) }
+            transaction.retry.acquireFingerprint?.let { put("acquireFingerprint", it) }
+            transaction.retry.acquireReplaceLeaseId?.let { put("acquireReplaceLeaseId", it) }
         })
     }
 
@@ -431,7 +458,16 @@ internal object AndroidRecoveryEnvelopeCodec {
                 nextRetryAtUnix = retry.optionalLong("nextRetryAtUnix"),
                 lastErrorCode = retry.optionalString("lastErrorCode"),
                 sessionStalledRecorded = retry.optBoolean("sessionStalledRecorded", false),
-                stopQueued = retry.optBoolean("stopQueued", false),
+                stopState = retry.optionalString("stopState")?.let(RedundantStopState::fromWireName)
+                    ?: if (retry.optBoolean("stopQueued", false)) RedundantStopState.PENDING
+                    else RedundantStopState.NONE,
+                roleObservationPending = retry.optBoolean("roleObservationPending", false),
+                pendingRoleLeaseId = retry.optionalString("pendingRoleLeaseId"),
+                pendingRoleReason = retry.optionalString("pendingRoleReason"),
+                acquirePending = retry.optBoolean("acquirePending", false),
+                acquireOperationId = retry.optionalString("acquireOperationId"),
+                acquireFingerprint = retry.optionalString("acquireFingerprint"),
+                acquireReplaceLeaseId = retry.optionalString("acquireReplaceLeaseId"),
             ),
         )
     }
@@ -544,10 +580,20 @@ internal object AndroidRecoveryEnvelopeCodec {
             require(transaction.localActiveLeaseId == null ||
                 transaction.containsCurrentLease(transaction.localActiveLeaseId))
             require((transaction.candidateLeaseId == null) == (transaction.candidateSlot == null))
-            if (transaction.retry.stopQueued) {
+            if (transaction.retry.stopState != RedundantStopState.NONE) {
                 require(!transaction.desiredActive)
                 require(!transaction.stopOperationId.isNullOrBlank())
             }
+            require(transaction.retry.roleObservationPending ==
+                (transaction.retry.pendingRoleLeaseId != null && transaction.retry.pendingRoleReason != null))
+            if (transaction.retry.roleObservationPending) {
+                require(transaction.containsCurrentLease(transaction.retry.pendingRoleLeaseId))
+            }
+            require(transaction.retry.acquirePending ==
+                (transaction.retry.acquireOperationId != null && transaction.retry.acquireFingerprint != null))
+            transaction.retry.acquireOperationId?.let(::validateSafeValue)
+            transaction.retry.acquireFingerprint?.let(::validateSafeValue)
+            transaction.retry.acquireReplaceLeaseId?.let(::validateSafeValue)
         }
         if (envelope.intent.retry.pendingAction == "terminal_after_cleanup") {
             val transaction = requireNotNull(envelope.leaseTransaction)
@@ -669,6 +715,34 @@ internal class AndroidRecoveryStore(
         }
     }
 
+    fun completeRedundantStop(
+        stopOperationId: String,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        val currentResult = readLocked()
+        if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
+        val current = (currentResult as RecoveryStoreResult.Success).value
+        val transaction = current.redundantTransaction
+            ?: return@synchronized RecoveryStoreResult.Success(current)
+        if (transaction.desiredActive || transaction.stopOperationId != stopOperationId ||
+            transaction.retry.stopState != RedundantStopState.ACKNOWLEDGED
+        ) {
+            return@synchronized RecoveryStoreResult.Failure("redundant_stop_not_acknowledged")
+        }
+        persist(clearDisarmedEpisode(current).copy(redundantTransaction = null))
+    }
+
+    fun deferRedundantStop(
+        stopOperationId: String,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = updateRedundant { transaction ->
+        transaction.copy(
+            desiredActive = false,
+            stopOperationId = transaction.stopOperationId ?: stopOperationId.also(
+                AndroidRecoveryEnvelopeCodec::validateSafeValue,
+            ),
+            retry = transaction.retry.copy(stopState = RedundantStopState.PENDING),
+        )
+    }
+
     fun beginStart(
         expectedGeneration: Long,
         template: AndroidIntentTemplate,
@@ -677,6 +751,9 @@ internal class AndroidRecoveryStore(
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
+        if (current.redundantTransaction != null) {
+            return@synchronized RecoveryStoreResult.Failure("connection_recovery_v2_owned")
+        }
         if (current.intent.generation != expectedGeneration) return@synchronized generationConflict()
         if (current.leaseTransaction != null) {
             return@synchronized RecoveryStoreResult.Failure("connection_cleanup_pending")
@@ -827,6 +904,9 @@ internal class AndroidRecoveryStore(
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
+        if (current.redundantTransaction != null) {
+            return@synchronized RecoveryStoreResult.Failure("connection_recovery_v2_owned")
+        }
         if (current.intent.generation != expectedGeneration) return@synchronized generationConflict()
         if (!current.intent.desiredActive || current.intent.retry.lastErrorCode == null ||
             current.intent.retry.nextRetryAtUnix != null
