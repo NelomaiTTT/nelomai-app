@@ -261,6 +261,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
         if (intent == null || intent.action in FOREGROUND_ACTIONS) {
             promoteToForeground()
         }
+        if (intent == null) {
+            val stickyRecovery = recoveryStore.read()
+            if (!shouldEnterLegacyVpnRecovery(stickyRecovery)) {
+                // A v2 envelope (or an unreadable store) owns this restart.  Do not let
+                // quick/legacy recovery reinterpret it as an idle service.
+                routeVpnStickyRestart(stickyRecovery, redundantVpnOwner) {}
+                return START_STICKY
+            }
+        }
         when {
             intent?.action == ACTION_QUICK_TOGGLE -> {
                 cancelRestoreRetry()

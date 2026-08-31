@@ -40,6 +40,22 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun stickyRestartUsesV2OwnerResumeBeforeLegacyAndStaysRestartableWhenUnavailable() {
+        var legacyCalls = 0
+        val owner = FakeVpnOwner(recoverResult = true)
+
+        assertTrue(routeVpnStickyRestart(
+            RecoveryStoreResult.Success(v2Envelope()), owner, { legacyCalls += 1 },
+        ))
+        assertEquals(1, owner.resumeCalls)
+        assertEquals(0, legacyCalls)
+        assertFalse(routeVpnStickyRestart(
+            RecoveryStoreResult.Success(v2Envelope()), null, { legacyCalls += 1 },
+        ))
+        assertEquals(0, legacyCalls)
+    }
+
+    @Test
     fun processDeathRecoveryStartsTheLocallyActiveMemberBeforeCanonicalActive() {
         val store = store(transaction(localActiveLeaseId = "lease-a"))
         val native = FakeNative()
@@ -114,7 +130,7 @@ class RedundantConnectionCoordinatorTest {
         assertEquals(RedundantStopState.PENDING, pending.retry.stopState)
 
         val replayed = RedundantConnectionCoordinator(store, panel, native)
-        assertTrue(replayed.revoke())
+        assertTrue(replayed.resume())
         assertEquals(2, panel.stopCalls)
         assertEquals(2, native.stopCalls)
         assertEquals(null, replayed.status())
@@ -158,6 +174,31 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun recoveryDrainsPendingRoleObservationAfterProcessRecreation() {
+        val pending = transaction(localActiveLeaseId = "lease-b").copy(
+            retry = AndroidRedundantRetryState(
+                roleObservationPending = true,
+                pendingRoleLeaseId = "lease-b",
+                pendingRoleReason = "primary_unhealthy",
+            ),
+        )
+        val store = store(pending)
+        val panel = FakePanel(role = RedundantRoleResponse(
+            action = "rebase",
+            localActiveLeaseId = "lease-b",
+            session = session(activeLeaseId = "lease-a", roleGeneration = 7, membershipGeneration = 3),
+        ))
+
+        assertTrue(RedundantConnectionCoordinator(store, panel, FakeNative()).recover())
+        val recovered = requireNotNull(RedundantConnectionCoordinator(store, panel, FakeNative()).status())
+        assertEquals("lease-b", recovered.localActiveLeaseId)
+        assertEquals(7, recovered.roleGeneration)
+        assertEquals(3, recovered.membershipGeneration)
+        assertFalse(recovered.retry.roleObservationPending)
+        assertEquals(2, panel.roleCalls)
+    }
+
+    @Test
     fun acquireIdentityIsDurableBeforeRequestAndReplayedWithTheSameOperation() {
         val store = store(transaction())
         val panel = FakePanel(acquireFailures = ArrayDeque(listOf(true, false)))
@@ -170,6 +211,20 @@ class RedundantConnectionCoordinatorTest {
 
         assertTrue(RedundantConnectionCoordinator(store, panel, FakeNative()).acquireAndCommitStandby("different"))
         assertEquals(listOf("acquire-1", "acquire-1"), panel.acquireOperationIds)
+    }
+
+    @Test
+    fun recoveryDrainsPendingAcquireWithItsOriginalOperationAndInactiveReplaceLease() {
+        val store = store(transaction())
+        val panel = FakePanel(acquireFailures = ArrayDeque(listOf(true, false)))
+        val first = RedundantConnectionCoordinator(store, panel, FakeNative())
+
+        assertFalse(first.acquireAndCommitStandby("acquire-1", replaceLeaseId = "lease-b"))
+        assertEquals("lease-b", requireNotNull(first.status()).retry.acquireReplaceLeaseId)
+
+        assertTrue(RedundantConnectionCoordinator(store, panel, FakeNative()).recover())
+        assertEquals(listOf("acquire-1", "acquire-1"), panel.acquireOperationIds)
+        assertEquals(listOf("lease-b", "lease-b"), panel.acquireReplaceLeaseIds)
     }
 
     @Test
@@ -290,6 +345,7 @@ private class FakePanel(
     var stopCalls = 0
     var roleCalls = 0
     val acquireOperationIds = mutableListOf<String>()
+    val acquireReplaceLeaseIds = mutableListOf<String>()
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
         RedundantRecoveryResponse(
             session = BackgroundRedundantSession(
@@ -320,8 +376,10 @@ private class FakePanel(
     override fun acquireStandby(
         transaction: AndroidRedundantTransaction,
         operationId: String,
+        replaceLeaseId: String,
     ): BackgroundRedundantCandidate {
         acquireOperationIds += operationId
+        acquireReplaceLeaseIds += replaceLeaseId
         if (acquireFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
         return BackgroundRedundantCandidate(
             session(), "candidate", RedundantSlot.B, QuickConnectionArgs(), "candidate-config".toByteArray(),
@@ -350,8 +408,13 @@ private class FakePanel(
 
 private class FakeVpnOwner(private val recoverResult: Boolean) : RedundantVpnProcessOwner {
     var recoverCalls = 0
+    var resumeCalls = 0
     override fun recover(): Boolean {
         recoverCalls += 1
+        return recoverResult
+    }
+    override fun resume(): Boolean {
+        resumeCalls += 1
         return recoverResult
     }
     override fun revoke(): Boolean = true

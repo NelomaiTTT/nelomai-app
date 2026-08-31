@@ -182,7 +182,6 @@ internal data class AndroidRedundantRetryState(
     val pendingRoleReason: String? = null,
     val acquirePending: Boolean = false,
     val acquireOperationId: String? = null,
-    val acquireFingerprint: String? = null,
     val acquireReplaceLeaseId: String? = null,
 )
 
@@ -431,7 +430,6 @@ internal object AndroidRecoveryEnvelopeCodec {
             transaction.retry.pendingRoleReason?.let { put("pendingRoleReason", it) }
             put("acquirePending", transaction.retry.acquirePending)
             transaction.retry.acquireOperationId?.let { put("acquireOperationId", it) }
-            transaction.retry.acquireFingerprint?.let { put("acquireFingerprint", it) }
             transaction.retry.acquireReplaceLeaseId?.let { put("acquireReplaceLeaseId", it) }
         })
     }
@@ -466,7 +464,6 @@ internal object AndroidRecoveryEnvelopeCodec {
                 pendingRoleReason = retry.optionalString("pendingRoleReason"),
                 acquirePending = retry.optBoolean("acquirePending", false),
                 acquireOperationId = retry.optionalString("acquireOperationId"),
-                acquireFingerprint = retry.optionalString("acquireFingerprint"),
                 acquireReplaceLeaseId = retry.optionalString("acquireReplaceLeaseId"),
             ),
         )
@@ -590,10 +587,13 @@ internal object AndroidRecoveryEnvelopeCodec {
                 require(transaction.containsCurrentLease(transaction.retry.pendingRoleLeaseId))
             }
             require(transaction.retry.acquirePending ==
-                (transaction.retry.acquireOperationId != null && transaction.retry.acquireFingerprint != null))
+                (transaction.retry.acquireOperationId != null && transaction.retry.acquireReplaceLeaseId != null))
             transaction.retry.acquireOperationId?.let(::validateSafeValue)
-            transaction.retry.acquireFingerprint?.let(::validateSafeValue)
             transaction.retry.acquireReplaceLeaseId?.let(::validateSafeValue)
+            transaction.retry.acquireReplaceLeaseId?.let { replaceLeaseId ->
+                require(transaction.containsCurrentLease(replaceLeaseId))
+                require(replaceLeaseId != transaction.localActiveLeaseId)
+            }
         }
         if (envelope.intent.retry.pendingAction == "terminal_after_cleanup") {
             val transaction = requireNotNull(envelope.leaseTransaction)

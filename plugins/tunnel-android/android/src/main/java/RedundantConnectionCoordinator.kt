@@ -22,6 +22,7 @@ internal interface RedundantConnectionPanel {
     fun acquireStandby(
         transaction: AndroidRedundantTransaction,
         operationId: String,
+        replaceLeaseId: String,
     ): BackgroundRedundantCandidate = throw UnsupportedOperationException()
     fun commitCandidate(
         transaction: AndroidRedundantTransaction,
@@ -46,6 +47,7 @@ internal fun shouldEnterLegacyVpnRecovery(
 /** Deferred until Task 8/9 provide native and authenticated-panel adapters. */
 internal interface RedundantVpnProcessOwner {
     fun recover(): Boolean
+    fun resume(): Boolean
     fun revoke(): Boolean
 }
 
@@ -74,6 +76,21 @@ internal fun routeVpnProcessRevoke(
         owner?.revoke() ?: false
     } else {
         legacyRevoke()
+        true
+    }
+}
+
+/** Used by the actual null-intent sticky restart before any legacy or quick restore path. */
+internal fun routeVpnStickyRestart(
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    owner: RedundantVpnProcessOwner?,
+    legacyRestart: () -> Unit,
+): Boolean = when (recovery) {
+    is RecoveryStoreResult.Failure -> false
+    is RecoveryStoreResult.Success -> if (recovery.value.redundantTransaction != null) {
+        owner?.resume() ?: false
+    } else {
+        legacyRestart()
         true
     }
 }
@@ -140,7 +157,26 @@ internal class RedundantConnectionCoordinator(
         // The local active identity wins over a stale canonical role until its observation is sent.
         val persisted = persist(refreshed.copy(localActiveLeaseId = active))
         if (persisted) recoveryStarted = true
-        persisted
+        persisted && drainPendingWorkLocked()
+    }
+
+    override fun resume(): Boolean = synchronized(gate) {
+        val transaction = status() ?: return@synchronized false
+        if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
+            return@synchronized revoke()
+        }
+        val restored = if (recoveryStarted) true else recover()
+        restored && drainPendingWorkLocked()
+    }
+
+    private fun drainPendingWorkLocked(): Boolean {
+        val transaction = status() ?: return false
+        if (transaction.retry.roleObservationPending && !flushRoleObservationLocked()) return false
+        val pendingAcquire = status()?.retry ?: return false
+        if (pendingAcquire.acquirePending) {
+            return acquireAndCommitStandby(requireNotNull(pendingAcquire.acquireOperationId))
+        }
+        return true
     }
 
     fun slotFailed(leaseId: String, reason: String): Boolean = synchronized(gate) {
@@ -226,21 +262,34 @@ internal class RedundantConnectionCoordinator(
         persist(fenced.withCanonical(session).copy(standbyDesired = false))
     }
 
-    fun acquireAndCommitStandby(operationId: String): Boolean = synchronized(gate) {
+    fun acquireAndCommitStandby(
+        operationId: String,
+        replaceLeaseId: String? = null,
+    ): Boolean = synchronized(gate) {
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || !transaction.standbyDesired) return@synchronized false
         val replayOperationId = transaction.retry.acquireOperationId ?: operationId
+        val replacement = transaction.retry.acquireReplaceLeaseId ?: replaceLeaseId ?: listOfNotNull(
+            transaction.slotALeaseId,
+            transaction.slotBLeaseId,
+        ).firstOrNull { it != transaction.localActiveLeaseId } ?: return@synchronized false
+        if (!transaction.containsCurrentLease(replacement) || replacement == transaction.localActiveLeaseId) {
+            return@synchronized false
+        }
         val staged = if (transaction.retry.acquirePending) transaction else transaction.copy(
             retry = transaction.retry.copy(
                 acquirePending = true,
                 acquireOperationId = replayOperationId,
-                acquireFingerprint = "acquire:${transaction.sessionId}:$replayOperationId:${transaction.localActiveLeaseId}",
-                acquireReplaceLeaseId = transaction.candidateLeaseId,
+                acquireReplaceLeaseId = replacement,
             ),
         )
         if (!persist(staged)) return@synchronized false
         val candidate = try {
-            panel.acquireStandby(staged, requireNotNull(staged.retry.acquireOperationId))
+            panel.acquireStandby(
+                staged,
+                requireNotNull(staged.retry.acquireOperationId),
+                requireNotNull(staged.retry.acquireReplaceLeaseId),
+            )
         } catch (_: Throwable) {
             return@synchronized false
         }
@@ -258,7 +307,6 @@ internal class RedundantConnectionCoordinator(
         val committed = candidateStaged.withCanonical(session).copy(retry = candidateStaged.retry.copy(
             acquirePending = false,
             acquireOperationId = null,
-            acquireFingerprint = null,
             acquireReplaceLeaseId = null,
         ))
         persist(committed)
