@@ -708,10 +708,10 @@ index 8557c5ab..3480c49a 100644
  target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DAWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
 diff --git a/tunnel/tools/libwg-go/redundant_tun.go b/tunnel/tools/libwg-go/redundant_tun.go
 new file mode 100644
-index 00000000..13a20146
+index 00000000..54532c1b
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun.go
-@@ -0,0 +1,783 @@
+@@ -0,0 +1,792 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -741,6 +741,7 @@ index 00000000..13a20146
 +	ErrRedundantSlotClosed   = errors.New("redundant tunnel slot is closed")
 +	ErrInvalidRedundantSlot  = errors.New("invalid redundant tunnel slot")
 +	ErrPacketQueueFull       = errors.New("redundant tunnel packet queue is full")
++	ErrPacketTooLarge        = errors.New("redundant tunnel packet exceeds maximum size")
 +	ErrInvalidProbe          = errors.New("invalid redundant tunnel probe")
 +	ErrProbeAlreadyPending   = errors.New("redundant tunnel probe is already pending")
 +	ErrProbeLimitReached     = errors.New("redundant tunnel probe limit reached")
@@ -1394,12 +1395,20 @@ index 00000000..13a20146
 +		if offset > len(buffer) {
 +			return index, errors.New("invalid channel TUN write buffer")
 +		}
-+		packet := append([]byte(nil), buffer[offset:]...)
++		packetSize := len(buffer) - offset
++		if packetSize > redundantTunnelMaxPacketSize {
++			return index, ErrPacketTooLarge
++		}
 +		c.stateMu.Lock()
 +		if c.closedFlag.Load() {
 +			c.stateMu.Unlock()
 +			return index, os.ErrClosed
 +		}
++		if len(c.inbound) == cap(c.inbound) {
++			c.stateMu.Unlock()
++			return index, ErrPacketQueueFull
++		}
++		packet := append([]byte(nil), buffer[offset:]...)
 +		select {
 +		case c.inbound <- packet:
 +			c.stateMu.Unlock()
@@ -1497,10 +1506,10 @@ index 00000000..13a20146
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_test.go b/tunnel/tools/libwg-go/redundant_tun_test.go
 new file mode 100644
-index 00000000..2c8adfa8
+index 00000000..82239138
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_test.go
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,882 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -2344,5 +2353,42 @@ index 00000000..2c8adfa8
 +			t.Fatal("probe was not registered before enqueue")
 +		}
 +		time.Sleep(time.Millisecond)
++	}
++}
++
++func TestChannelTUNWriteRejectsOversizedPacket(t *testing.T) {
++	device := newChannelTUN(nil, 0, 1420, "bounded-write", 1, 1)
++	written, err := device.Write(
++		[][]byte{make([]byte, redundantTunnelMaxPacketSize+1)},
++		0,
++	)
++	if err == nil || written != 0 {
++		t.Fatalf("oversized write returned packets=%d error=%v", written, err)
++	}
++	select {
++	case packet := <-device.inbound:
++		t.Fatalf("oversized packet entered the inbound queue: %d bytes", len(packet))
++	default:
++	}
++}
++
++func TestChannelTUNFullQueueRejectsWriteWithoutAllocation(t *testing.T) {
++	device := newChannelTUN(nil, 0, 1420, "bounded-write", 1, 1)
++	if written, err := device.Write([][]byte{{1}}, 0); err != nil || written != 1 {
++		t.Fatalf("failed to fill inbound queue: packets=%d error=%v", written, err)
++	}
++	packet := [][]byte{{2}}
++	var (
++		written int
++		err     error
++	)
++	allocations := testing.AllocsPerRun(100, func() {
++		written, err = device.Write(packet, 0)
++	})
++	if !errors.Is(err, ErrPacketQueueFull) || written != 0 {
++		t.Fatalf("full queue write returned packets=%d error=%v", written, err)
++	}
++	if allocations != 0 {
++		t.Fatalf("full queue rejection allocated %.2f objects per write, want 0", allocations)
 +	}
 +}
