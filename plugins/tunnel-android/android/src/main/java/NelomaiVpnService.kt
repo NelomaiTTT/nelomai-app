@@ -81,7 +81,7 @@ internal class IdleStopDebouncer(
 }
 
 internal class AndroidConnectionIntentAttemptDispatcher(
-    private val execute: (() -> Unit) -> Unit,
+    private val execute: (Runnable) -> Unit,
     private val persistedDelayMillis: () -> Long,
     private val scheduleAfter: (Long) -> Unit,
     private val attempt: () -> Unit,
@@ -106,7 +106,7 @@ internal class AndroidConnectionIntentAttemptDispatcher(
 
     private fun dispatch() {
         try {
-            execute(::runQueuedAttempt)
+            execute(Runnable(::runQueuedAttempt))
         } catch (error: Throwable) {
             synchronized(gate) {
                 queued = false

@@ -2269,7 +2269,7 @@ class NelomaiVpnServiceTest {
         var persistedDelayMillis = 0L
         var attempts = 0
         val dispatcher = AndroidConnectionIntentAttemptDispatcher(
-            execute = { queued += Runnable(it) },
+            execute = { queued += it },
             persistedDelayMillis = { persistedDelayMillis },
             scheduleAfter = scheduled::add,
             attempt = { attempts += 1 },
@@ -2295,6 +2295,22 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun productionExecutorBoundaryDispatchesAttemptWithoutClassCast() {
+        val executor = Executor(Runnable::run)
+        var attempts = 0
+        val dispatcher = AndroidConnectionIntentAttemptDispatcher(
+            execute = executor::execute,
+            persistedDelayMillis = { 0L },
+            scheduleAfter = { error("unexpected retry timer") },
+            attempt = { attempts += 1 },
+        )
+
+        dispatcher.request()
+
+        assertEquals(1, attempts)
+    }
+
+    @Test
     fun requestDuringRunningAttemptQueuesOneDueTimeCheckedFollowUp() {
         val queued = ArrayDeque<Runnable>()
         val scheduled = mutableListOf<Long>()
@@ -2302,7 +2318,7 @@ class NelomaiVpnServiceTest {
         var attempts = 0
         lateinit var dispatcher: AndroidConnectionIntentAttemptDispatcher
         dispatcher = AndroidConnectionIntentAttemptDispatcher(
-            execute = { queued += Runnable(it) },
+            execute = { queued += it },
             persistedDelayMillis = { persistedDelayMillis },
             scheduleAfter = scheduled::add,
             attempt = {
