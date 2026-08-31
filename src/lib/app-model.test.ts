@@ -10,6 +10,7 @@ import {
   primaryAction,
   recoveryCopy,
   requiresServerProbes,
+  visibleConnectionIntentStatus,
   viewForPhase,
   viewForAppState,
   type Bootstrap,
@@ -196,6 +197,7 @@ describe("connection intent recovery", () => {
       }),
     ).toBe("stop");
     expect(recoveryCopy("recovering")).not.toContain("Старт ещё раз");
+    expect(recoveryCopy("recovering")).not.toContain("недоступна");
   });
 
   it("keeps Stop available for a legacy connection still being established", () => {
@@ -205,6 +207,13 @@ describe("connection intent recovery", () => {
         connectionIntentStatus: "none",
       }),
     ).toBe("stop");
+  });
+
+  it("does not present a confirmed connected tunnel as recovering", () => {
+    expect(visibleConnectionIntentStatus("connected", "recovering")).toBe("none");
+    expect(visibleConnectionIntentStatus("connecting", "recovering")).toBe(
+      "recovering",
+    );
   });
 
   it("offers an explicit retry or stop after terminal recovery", () => {

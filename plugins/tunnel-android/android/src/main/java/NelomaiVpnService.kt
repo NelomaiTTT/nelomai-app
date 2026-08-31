@@ -1504,7 +1504,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         }.getOrDefault(false)
                         if (notify) {
                             refreshConnectionNotification(
-                                "Сеть недоступна — подключение восстановится автоматически",
+                                connectionIntentRetryNotificationContent(),
                             )
                         }
                     }
@@ -2795,6 +2795,9 @@ internal fun connectionIntentServiceStatus(
         lastErrorCode = envelope.intent.retry.lastErrorCode,
     )
 }
+
+internal fun connectionIntentRetryNotificationContent(): String =
+    "Проверяем стабильность подключения; при необходимости повторим попытку автоматически"
 
 internal fun connectionIntentPersistedDelayMillis(
     envelope: AndroidRecoveryEnvelope,

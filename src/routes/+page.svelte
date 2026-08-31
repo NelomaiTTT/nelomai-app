@@ -6,7 +6,10 @@
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import { CHANGELOG } from "$lib/changelog";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
-  import { clearOwnedConnectionIntentNotice } from "$lib/connection-intent-notice";
+  import {
+    clearOwnedConnectionIntentNotice,
+    connectionIntentNoticeForPhase,
+  } from "$lib/connection-intent-notice";
   import {
     beginConnectionStart,
     beginConnectionStop,
@@ -30,6 +33,7 @@
     hasSecondaryStop,
     primaryAction,
     recoveryCopy,
+    visibleConnectionIntentStatus,
     requiresServerProbes,
     viewForAppState,
     viewForPhase,
@@ -84,6 +88,9 @@
   let availableCandidates = $state(0);
   let connection = $state<Connection | null>(null);
   let connectionIntentStatus = $state<ConnectionIntentStatus>("none");
+  let visibleConnectionIntent = $derived(
+    visibleConnectionIntentStatus(phase, connectionIntentStatus),
+  );
   let nextRetryAtUnix = $state<number | null>(null);
   let connectionAction = $derived(
     primaryAction({ phase, connectionIntentStatus }),
@@ -91,7 +98,7 @@
   let connectionHasSecondaryStop = $derived(
     hasSecondaryStop({ connectionIntentStatus }),
   );
-  let connectionRecoveryCopy = $derived(recoveryCopy(connectionIntentStatus));
+  let connectionRecoveryCopy = $derived(recoveryCopy(visibleConnectionIntent));
   let connectionMetrics = $state<ConnectionMetrics | null>(null);
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
@@ -217,7 +224,12 @@
     void listen<{ title: string; body: string }>(
       "native-connection-intent-notification",
       (event) => {
-        const notice = `${event.payload.title}. ${event.payload.body}`;
+        const notice = connectionIntentNoticeForPhase(
+          phase,
+          event.payload.title,
+          event.payload.body,
+        );
+        if (notice === null) return;
         error = notice;
         ownedConnectionIntentNotice = notice;
       },
@@ -593,6 +605,13 @@
         antivirusStartFailure = false;
         shouldReportStartFailure = false;
         phase = startResult.status === "connected" ? "connected" : "connecting";
+        const clearedNotice = clearOwnedConnectionIntentNotice(
+          error,
+          ownedConnectionIntentNotice,
+          phase,
+        );
+        error = clearedNotice.error;
+        ownedConnectionIntentNotice = clearedNotice.ownedNotice;
       }
       view = "connection";
       const current = await nativeClient.state();
@@ -1313,9 +1332,9 @@
           <div>
             <p class="eyebrow">Подключение</p>
             <h1>
-              {connectionIntentStatus === "recovering"
+              {visibleConnectionIntent === "recovering"
                 ? "Восстанавливаем подключение"
-                : connectionIntentStatus === "blocked_terminal"
+                : visibleConnectionIntent === "blocked_terminal"
                   ? "Нужно ваше действие"
                 : phase === "connected"
                 ? "Интернет защищён"
@@ -1370,9 +1389,9 @@
           {/if}
 
           {#if connectionRecoveryCopy}
-            <p class:warning-message={connectionIntentStatus === "blocked_terminal"}>
+            <p class:warning-message={visibleConnectionIntent === "blocked_terminal"}>
               {connectionRecoveryCopy}
-              {#if connectionIntentStatus === "recovering" && nextRetryAtUnix !== null}
+              {#if visibleConnectionIntent === "recovering" && nextRetryAtUnix !== null}
                 Следующая попытка запланирована автоматически.
               {/if}
             </p>

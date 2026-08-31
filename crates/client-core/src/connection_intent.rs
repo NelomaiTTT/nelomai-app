@@ -126,6 +126,7 @@ pub fn classify_recovery(code: &str, context: RecoveryPolicyContext) -> Recovery
         | "candidate_unavailable"
         | "configuration_fetch_failed"
         | "binding_sync_failed"
+        | "connection_release_pending"
         | "connection_release_failed"
         | "connection_stop_failed"
         | "probe_results_required"

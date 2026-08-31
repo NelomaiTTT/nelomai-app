@@ -9,6 +9,7 @@
     { "code": "binding_sync_failed", "decision": "retry_same_operation" },
     { "code": "connection_no_longer_active", "decision": "retry_new_operation" },
     { "code": "connection_already_active", "decision": "reconcile_then_retry" },
+    { "code": "connection_release_pending", "decision": "retry_same_operation" },
     { "code": "connection_release_failed", "decision": "retry_same_operation" },
     { "code": "connection_stop_failed", "decision": "retry_same_operation" },
     { "code": "probe_results_required", "decision": "retry_same_operation" },

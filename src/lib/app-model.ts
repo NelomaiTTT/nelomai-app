@@ -171,12 +171,19 @@ export function hasSecondaryStop(state: {
 export function recoveryCopy(status: ConnectionIntentStatus): string {
   switch (status) {
     case "recovering":
-      return "Сеть пока недоступна. Следующая попытка будет выполнена автоматически.";
+      return "Приложение проверяет стабильность подключения и при необходимости повторит попытку автоматически.";
     case "blocked_terminal":
       return "Автоматическое восстановление остановлено. Нажмите «Повторить» или «Стоп».";
     default:
       return "";
   }
+}
+
+export function visibleConnectionIntentStatus(
+  phase: Phase,
+  status: ConnectionIntentStatus,
+): ConnectionIntentStatus {
+  return phase === "connected" && status === "recovering" ? "none" : status;
 }
 
 export interface ConnectionMetrics {

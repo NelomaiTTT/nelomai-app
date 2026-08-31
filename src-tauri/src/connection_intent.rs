@@ -131,8 +131,8 @@ trait SlowRecoveryNotifier: Send + Sync {
 
 fn show_slow_recovery_notification(notifier: &dyn SlowRecoveryNotifier) -> Result<(), String> {
     notifier.show(
-        "Восстанавливаем подключение",
-        "Сеть пока недоступна. Следующая попытка будет выполнена автоматически.",
+        "Проверяем подключение",
+        "Приложение проверяет стабильность подключения и при необходимости повторит попытку автоматически.",
     )
 }
 
@@ -1049,8 +1049,8 @@ impl DesktopConnectionIntent {
     }
 
     fn emit_slow_recovery_notification(&self) {
-        const TITLE: &str = "Восстанавливаем подключение";
-        const BODY: &str = "Сеть пока недоступна. Следующая попытка будет выполнена автоматически.";
+        const TITLE: &str = "Проверяем подключение";
+        const BODY: &str = "Приложение проверяет стабильность подключения и при необходимости повторит попытку автоматически.";
         if show_slow_recovery_notification(self.notifier.as_ref()).is_err() {
             self.diagnostics.record_named(
                 "diagnostics.connection_intent_notification_failed",
@@ -1346,8 +1346,9 @@ mod tests {
 
     impl SlowRecoveryNotifier for CountingNotifier {
         fn show(&self, title: &str, body: &str) -> Result<(), String> {
-            assert_eq!(title, "Восстанавливаем подключение");
+            assert_eq!(title, "Проверяем подключение");
             assert!(body.contains("автоматически"));
+            assert!(!body.contains("недоступна"));
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }

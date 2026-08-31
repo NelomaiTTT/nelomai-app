@@ -20,6 +20,7 @@ use nelomai_contracts::{
     SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -39,9 +40,11 @@ pub use connection_intent::{
 #[cfg(not(target_os = "android"))]
 pub use connection_intent::{ConnectionIntentCoordinator, ConnectionIntentError, StartDisposition};
 
-const INITIAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+// AWG retries its handshake after 5 s plus up to 334 ms jitter. Each gate must
+// leave room for one protocol-level retransmission before changing strategy.
+const INITIAL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(7);
 const UDP_REBIND_TIMEOUT: Duration = Duration::from_millis(3_500);
-const POST_REBIND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const POST_REBIND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(7);
 const HANDSHAKE_STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PINNED_HANDSHAKE_RETRY_COOLDOWN_SECONDS: i64 = 30;
@@ -2116,7 +2119,11 @@ where
         );
         if transport == TunnelTransport::AmneziaWg3 {
             let handshake_result = self
-                .ensure_awg3_handshake(&operation_id, Some(&response.request_id))
+                .ensure_awg3_handshake(
+                    &operation_id,
+                    Some(&response.request_id),
+                    Some(cancel_epoch),
+                )
                 .await;
             if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
                 return Err(self
@@ -2289,8 +2296,7 @@ where
         if self.pending_start_active.load(Ordering::SeqCst) {
             let current = self.state.lock().await.connection.clone();
             if let Some(current) = current {
-                let accept_warm =
-                    stored_connection_kind(&current) == StoredConnectionKind::DynamicWarm;
+                let accept_warm = stored_connection_accepts_warm(&current);
                 let pending =
                     self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None)?;
                 self.resume_pending_compensation_stop(pending).await?;
@@ -2487,13 +2493,17 @@ where
         pending: StoredPendingCompensationStop,
     ) -> Result<(), CoreError> {
         let current = self.state.lock().await.connection.clone();
-        let Some(current) = current else {
+        if current
+            .as_ref()
+            .is_some_and(|current| current.lease_id != pending.lease_id)
+        {
+            return Err(CoreError::Storage);
+        }
+        let pending = self.migrate_legacy_pending_compensation_stop(pending, current.as_ref())?;
+        if current.is_none() {
             return self
                 .replay_pending_compensation_stop_without_connection(pending)
                 .await;
-        };
-        if current.lease_id != pending.lease_id {
-            return Err(CoreError::Storage);
         }
         let stopped = self
             .stop_internal(
@@ -2503,13 +2513,11 @@ where
                 pending.accept_warm,
             )
             .await?;
-        if !compensation_stop_confirms_finished(
+        require_compensation_stop_finished(
             pending.failure_code.as_deref(),
             pending.accept_warm,
             stopped.status,
-        ) {
-            return Err(stalled_stop_not_recyclable_error());
-        }
+        )?;
         if pending.failure_code.as_deref() == Some("tunnel_handshake_timeout") {
             self.reconcile_pending_handshake_timeout_storage(&stopped)?;
         }
@@ -2575,13 +2583,11 @@ where
                 return Err(error);
             }
         };
-        if !compensation_stop_confirms_finished(
+        require_compensation_stop_finished(
             pending.failure_code.as_deref(),
             pending.accept_warm,
             response.connection.status,
-        ) {
-            return Err(stalled_stop_not_recyclable_error());
-        }
+        )?;
         if pending.failure_code.as_deref() == Some("tunnel_handshake_timeout") {
             self.reconcile_pending_handshake_timeout_storage(&response.connection)?;
         } else if let Some(pending_start) = stored.pending_start {
@@ -2948,7 +2954,7 @@ where
             self.clear_pending_compensation_stop_if_absent()?;
             return Ok(());
         };
-        let accept_warm = stored_connection_kind(&current) == StoredConnectionKind::DynamicWarm;
+        let accept_warm = stored_connection_accepts_warm(&current);
         let pending =
             self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None)?;
         match self
@@ -3316,7 +3322,10 @@ where
             return Err(error.into());
         }
         if transport == TunnelTransport::AmneziaWg3 {
-            if let Err(error) = self.ensure_awg3_handshake(&saved.lease_id, None).await {
+            if let Err(error) = self
+                .ensure_awg3_handshake(&saved.lease_id, None, None)
+                .await
+            {
                 if let Err(stop_error) = self.tunnel.stop().await {
                     let stop_error = CoreError::from(stop_error);
                     *self.state.lock().await = CoreState {
@@ -3485,10 +3494,13 @@ where
             return Ok(());
         }
         let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let accept_warm = stored_connection_accepts_warm(&connection);
         let pending_compensation = stored
             .pending_start
             .as_ref()
-            .map(|_| self.pending_compensation_stop_identity(&connection.lease_id, true, None))
+            .map(|_| {
+                self.pending_compensation_stop_identity(&connection.lease_id, accept_warm, None)
+            })
             .transpose()?;
         let request = ConnectionOperationRequest {
             operation_id: pending_compensation
@@ -3513,6 +3525,7 @@ where
                 return Err(error);
             }
         };
+        require_compensation_stop_finished(None, accept_warm, response.connection.status)?;
         if let Some(pending) = &stored.pending_start {
             self.clear_pending_start(&pending.operation_id)?;
         }
@@ -3620,6 +3633,49 @@ where
         };
         stored.pending_compensation_stop = Some(pending.clone());
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        Ok(pending)
+    }
+
+    fn migrate_legacy_pending_compensation_stop(
+        &self,
+        mut pending: StoredPendingCompensationStop,
+        current: Option<&Connection>,
+    ) -> Result<StoredPendingCompensationStop, CoreError> {
+        if pending.accept_warm
+            || !matches!(
+                pending.failure_code.as_deref(),
+                None | Some("tunnel_handshake_timeout")
+            )
+        {
+            return Ok(pending);
+        }
+        let mut stored = self.load_auth()?;
+        let accepts_warm = current
+            .map(stored_connection_accepts_warm)
+            .unwrap_or_else(|| {
+                stored
+                    .saved_connection
+                    .as_ref()
+                    .into_iter()
+                    .chain(stored.pinned_connection.as_ref())
+                    .find(|connection| connection.lease_id == pending.lease_id)
+                    .is_some_and(|connection| connection.kind != StoredConnectionKind::Fixed)
+            });
+        if !accepts_warm {
+            return Ok(pending);
+        }
+        let stored_pending = stored
+            .pending_compensation_stop
+            .as_mut()
+            .filter(|stored_pending| {
+                stored_pending.operation_id == pending.operation_id
+                    && stored_pending.lease_id == pending.lease_id
+                    && stored_pending.failure_code == pending.failure_code
+            })
+            .ok_or(CoreError::Storage)?;
+        stored_pending.accept_warm = true;
+        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+        pending.accept_warm = true;
         Ok(pending)
     }
 
@@ -3786,6 +3842,7 @@ where
         &self,
         operation_id: &str,
         request_id: Option<&str>,
+        cancel_epoch: Option<StartCancellationEpoch>,
     ) -> Result<(), CoreError> {
         let handshake_started = Instant::now();
         let event = |kind, code| CoreLogEvent {
@@ -3795,14 +3852,21 @@ where
             code,
         };
         let mut initial_metrics_error = None;
-        let handshake_outcome = match self.wait_for_handshake(INITIAL_HANDSHAKE_TIMEOUT).await {
+        let handshake_outcome = match self
+            .wait_for_handshake(INITIAL_HANDSHAKE_TIMEOUT, cancel_epoch)
+            .await
+        {
             Ok(outcome) => outcome,
+            Err(CoreError::StartCancelled) => return Err(CoreError::StartCancelled),
             Err(metrics_error) => {
                 self.logger.record(event(
                     "connection.handshake_metrics_failed",
                     Some(metrics_error.to_string()),
                 ));
-                if !self.tunnel_is_running_after_metrics_failure().await {
+                if !self
+                    .tunnel_is_running_after_metrics_failure(cancel_epoch)
+                    .await?
+                {
                     return Err(metrics_error);
                 }
                 initial_metrics_error = Some(metrics_error);
@@ -3837,8 +3901,13 @@ where
         }
 
         let mut rebind_error = None;
-        let rebound = match tokio::time::timeout(UDP_REBIND_TIMEOUT, self.tunnel.rebind_udp()).await
-        {
+        let rebind_result = self
+            .await_with_start_cancellation(
+                cancel_epoch,
+                tokio::time::timeout(UDP_REBIND_TIMEOUT, self.tunnel.rebind_udp()),
+            )
+            .await?;
+        let rebound = match rebind_result {
             Ok(Ok(rebound)) => rebound,
             Ok(Err(error)) => {
                 let error = CoreError::from(error);
@@ -3864,7 +3933,10 @@ where
         }
         let rebound_started = Instant::now();
         let recovered = if rebound {
-            match self.wait_for_handshake(POST_REBIND_HANDSHAKE_TIMEOUT).await {
+            match self
+                .wait_for_handshake(POST_REBIND_HANDSHAKE_TIMEOUT, cancel_epoch)
+                .await
+            {
                 Ok(HandshakeWaitOutcome::Established) => true,
                 Ok(HandshakeWaitOutcome::TimedOut) => false,
                 Ok(HandshakeWaitOutcome::MetricsUnsupported) => {
@@ -3874,6 +3946,7 @@ where
                     ));
                     return Ok(());
                 }
+                Err(CoreError::StartCancelled) => return Err(CoreError::StartCancelled),
                 Err(metrics_error) => {
                     self.logger.record(event(
                         "connection.handshake_metrics_failed",
@@ -3920,16 +3993,24 @@ where
         Err(CoreError::Tunnel("tunnel_handshake_timeout".to_string()))
     }
 
-    async fn tunnel_is_running_after_metrics_failure(&self) -> bool {
-        matches!(
-            tokio::time::timeout(HANDSHAKE_STATUS_TIMEOUT, self.tunnel.status()).await,
+    async fn tunnel_is_running_after_metrics_failure(
+        &self,
+        cancel_epoch: Option<StartCancellationEpoch>,
+    ) -> Result<bool, CoreError> {
+        Ok(matches!(
+            self.await_with_start_cancellation(
+                cancel_epoch,
+                tokio::time::timeout(HANDSHAKE_STATUS_TIMEOUT, self.tunnel.status()),
+            )
+            .await?,
             Ok(Ok(TunnelStatus::Running))
-        )
+        ))
     }
 
     async fn wait_for_handshake(
         &self,
         timeout: Duration,
+        cancel_epoch: Option<StartCancellationEpoch>,
     ) -> Result<HandshakeWaitOutcome, CoreError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut last_metrics_error = None;
@@ -3937,7 +4018,12 @@ where
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            let metrics = match tokio::time::timeout_at(deadline, self.tunnel.metrics(false)).await
+            let metrics = match self
+                .await_with_start_cancellation(
+                    cancel_epoch,
+                    tokio::time::timeout_at(deadline, self.tunnel.metrics(false)),
+                )
+                .await?
             {
                 Ok(metrics) => metrics,
                 Err(_) => {
@@ -3971,16 +4057,48 @@ where
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(
-                HANDSHAKE_POLL_INTERVAL
-                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            self.await_with_start_cancellation(
+                cancel_epoch,
+                tokio::time::sleep(
+                    HANDSHAKE_POLL_INTERVAL
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                ),
             )
-            .await;
+            .await?;
         }
         if let Some(error) = last_metrics_error {
             Err(error)
         } else {
             Ok(HandshakeWaitOutcome::TimedOut)
+        }
+    }
+
+    async fn await_with_start_cancellation<Output, F>(
+        &self,
+        cancel_epoch: Option<StartCancellationEpoch>,
+        future: F,
+    ) -> Result<Output, CoreError>
+    where
+        F: Future<Output = Output>,
+    {
+        let Some(cancel_epoch) = cancel_epoch else {
+            return Ok(future.await);
+        };
+        tokio::pin!(future);
+        loop {
+            let notified = self.start_retry_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            tokio::select! {
+                output = &mut future => {
+                    self.ensure_start_not_cancelled(cancel_epoch)?;
+                    return Ok(output);
+                }
+                _ = &mut notified => {
+                    self.ensure_start_not_cancelled(cancel_epoch)?;
+                }
+            }
         }
     }
 
@@ -3999,7 +4117,7 @@ where
             _ => None,
         };
         let mut storage_error = None;
-        let accept_warm = stored_connection_kind(connection) == StoredConnectionKind::DynamicWarm;
+        let accept_warm = stored_connection_accepts_warm(connection);
         let durable_compensation = match self.pending_compensation_stop_identity(
             &connection.lease_id,
             accept_warm,
@@ -4102,7 +4220,7 @@ where
                         request_id: Some(request_id.to_string()),
                         code: Some(error.to_string()),
                     });
-                    return Ok(());
+                    return Err(compensation_error);
                 }
                 if matches!(error, CoreError::Tunnel(code) if code == "tunnel_handshake_timeout") {
                     storage_error = self
@@ -4440,7 +4558,21 @@ fn compensation_stop_confirms_finished(
     status: LeaseStatus,
 ) -> bool {
     terminal_lease_status(status)
-        || (failure_code.is_none() && accept_warm && status == LeaseStatus::Warm)
+        || (matches!(failure_code, None | Some("tunnel_handshake_timeout"))
+            && accept_warm
+            && status == LeaseStatus::Warm)
+}
+
+fn require_compensation_stop_finished(
+    failure_code: Option<&str>,
+    accept_warm: bool,
+    status: LeaseStatus,
+) -> Result<(), CoreError> {
+    if compensation_stop_confirms_finished(failure_code, accept_warm, status) {
+        Ok(())
+    } else {
+        Err(compensation_stop_not_terminal_error())
+    }
 }
 
 fn reconcile_confirms_terminal_or_absent(
@@ -4478,6 +4610,10 @@ fn stored_connection_kind(connection: &Connection) -> StoredConnectionKind {
     } else {
         StoredConnectionKind::DynamicWarm
     }
+}
+
+fn stored_connection_accepts_warm(connection: &Connection) -> bool {
+    stored_connection_kind(connection) != StoredConnectionKind::Fixed
 }
 
 fn phase_for_api_error(error: &CoreApiError) -> Phase {
@@ -4564,6 +4700,22 @@ fn transient_start_rejection(code: &str) -> bool {
 mod tests {
     use super::*;
     use nelomai_client_tunnel::TunnelStatus;
+
+    #[test]
+    fn pending_compensation_uses_a_generic_release_error() {
+        let error = require_compensation_stop_finished(
+            Some("tunnel_handshake_timeout"),
+            false,
+            LeaseStatus::Warm,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoreError::Api(CoreApiError::Rejected { ref code, .. })
+                if code == "connection_release_pending"
+        ));
+    }
 
     #[test]
     fn reducer_covers_the_primary_connection_lifecycle() {

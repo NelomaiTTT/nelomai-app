@@ -1028,7 +1028,7 @@ where
             return Err(error.into());
         }
         if transport == nelomai_client_tunnel::TunnelTransport::AmneziaWg3 {
-            if let Err(error) = self.ensure_awg3_handshake(lease_id, None).await {
+            if let Err(error) = self.ensure_awg3_handshake(lease_id, None, None).await {
                 let cleanup_error = self.tunnel.stop().await.err().map(CoreError::from);
                 *self.state.lock().await = crate::CoreState {
                     phase: Phase::Stopping,

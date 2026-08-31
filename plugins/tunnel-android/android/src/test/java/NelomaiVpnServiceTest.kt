@@ -16,6 +16,14 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun retryNotificationDoesNotClaimThatTheWorkingNetworkIsUnavailable() {
+        val content = connectionIntentRetryNotificationContent()
+
+        assertFalse(content.contains("недоступна", ignoreCase = true))
+        assertTrue(content.contains("автоматически"))
+    }
+
+    @Test
     fun queuedStartInvalidatedBeforeExecutionDoesNotRefreshOrPersist() {
         val store = recoveryStore(ServiceRecoveryBackend())
         val coordinator = coordinator(store)
