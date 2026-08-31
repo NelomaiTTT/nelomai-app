@@ -30,6 +30,10 @@ export function defineChangelog(
 
 export const CHANGELOG = defineChangelog([
   {
+    version: "0.2.14",
+    items: ["Исправили запуск VPN-подключения на Android."],
+  },
+  {
     version: "0.2.13",
     items: [
       "Убрали активные ошибки при начале подключения.",

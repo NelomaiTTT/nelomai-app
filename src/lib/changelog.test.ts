@@ -3,8 +3,15 @@ import { describe, expect, it } from "vitest";
 import { CHANGELOG, defineChangelog } from "./changelog";
 
 describe("application changelog", () => {
-  it("starts with the user-facing 0.2.13 entry", () => {
+  it("starts with the user-facing 0.2.14 entry", () => {
     expect(CHANGELOG[0]).toEqual({
+      version: "0.2.14",
+      items: ["Исправили запуск VPN-подключения на Android."],
+    });
+  });
+
+  it("keeps the user-facing 0.2.13 entry", () => {
+    expect(CHANGELOG[1]).toEqual({
       version: "0.2.13",
       items: [
         "Убрали активные ошибки при начале подключения.",
