@@ -135,6 +135,12 @@ diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-an
 index 3af343d1..e9f34d73 100644
 --- a/tunnel/tools/libwg-go/api-android.go
 +++ b/tunnel/tools/libwg-go/api-android.go
+@@ -1,3 +1,5 @@
++//go:build android
++
+ /* SPDX-License-Identifier: Apache-2.0
+  *
+  * Copyright © 2017-2022 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
 @@ -10,6 +10,8 @@ package main
  import "C"
  
@@ -619,6 +625,12 @@ diff --git a/tunnel/tools/libwg-go/jni.c b/tunnel/tools/libwg-go/jni.c
 index 237043e5..e18bf9c7 100644
 --- a/tunnel/tools/libwg-go/jni.c
 +++ b/tunnel/tools/libwg-go/jni.c
+@@ -1,3 +1,5 @@
++//go:build android
++
+ /* SPDX-License-Identifier: Apache-2.0
+  *
+  * Copyright © 2017-2021 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
 @@ -13,6 +13,13 @@ extern void awgTurnOff(int handle);
  extern int awgGetSocketV4(int handle);
  extern int awgGetSocketV6(int handle);
@@ -694,3 +706,1466 @@ index 8557c5ab..3480c49a 100644
 +
  add_executable(libwg-quick.so amneziawg-tools/src/wg-quick/android.c ndk-compat/compat.c)
  target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DAWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
+diff --git a/tunnel/tools/libwg-go/redundant_tun.go b/tunnel/tools/libwg-go/redundant_tun.go
+new file mode 100644
+index 00000000..37039697
+--- /dev/null
++++ b/tunnel/tools/libwg-go/redundant_tun.go
+@@ -0,0 +1,779 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++package main
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"os"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
++)
++
++const (
++	redundantTunnelSlotCount       = 2
++	redundantTunnelQueueDepth      = 128
++	redundantTunnelMaxPacketSize   = 65_535
++	redundantTunnelMaxPendingProbe = 64
++	redundantTunnelProbeRetention  = time.Minute
++)
++
++var (
++	ErrRedundantTunnelClosed = errors.New("redundant tunnel is closed")
++	ErrRedundantSlotClosed   = errors.New("redundant tunnel slot is closed")
++	ErrInvalidRedundantSlot  = errors.New("invalid redundant tunnel slot")
++	ErrPacketQueueFull       = errors.New("redundant tunnel packet queue is full")
++	ErrInvalidProbe          = errors.New("invalid redundant tunnel probe")
++	ErrProbeAlreadyPending   = errors.New("redundant tunnel probe is already pending")
++	ErrProbeLimitReached     = errors.New("redundant tunnel probe limit reached")
++)
++
++// ProbeToken is the bounded tuple used to recognize one DNS dataplane reply.
++// The packet itself and its DNS payload are never retained after dispatch.
++type ProbeToken struct {
++	Port  uint16
++	DNSID uint16
++}
++
++type probeState struct {
++	slot      uint32
++	identity  probeIdentity
++	status    probeStatus
++	expiresAt time.Time
++}
++
++type probeStatus uint8
++
++const (
++	probePending probeStatus = iota
++	probeSucceeded
++	probeReported
++	probeCancelled
++)
++
++type probeIdentity struct {
++	ipVersion   uint8
++	sourceIP    [16]byte
++	destination [16]byte
++	question    string
++}
++
++type parsedDNSPacket struct {
++	sourcePort      uint16
++	destinationPort uint16
++	dnsID           uint16
++	response        bool
++	identity        probeIdentity
++}
++
++// RedundantTunnelCounters is a compact, non-secret dispatcher snapshot.
++type RedundantTunnelCounters struct {
++	OutboundPackets       uint64
++	OutboundDropped       uint64
++	InboundPackets        uint64
++	InactiveInboundDrops  uint64
++	ProbePacketsInjected  uint64
++	ProbeRepliesConsumed  uint64
++	ProbeInjectionDropped uint64
++	ActiveSwitches        uint64
++	SlotCloses            uint64
++}
++
++type redundantTunnelCounters struct {
++	outboundPackets       atomic.Uint64
++	outboundDropped       atomic.Uint64
++	inboundPackets        atomic.Uint64
++	inactiveInboundDrops  atomic.Uint64
++	probePacketsInjected  atomic.Uint64
++	probeRepliesConsumed  atomic.Uint64
++	probeInjectionDropped atomic.Uint64
++	activeSwitches        atomic.Uint64
++	slotCloses            atomic.Uint64
++}
++
++// RedundantTunnel owns the sole real TUN reader/writer and exposes two
++// independent channel-backed devices to cryptographic backend slots.
++type RedundantTunnel struct {
++	real   tun.Device
++	slots  [redundantTunnelSlotCount]*channelTUN
++	active atomic.Uint32
++	closed atomic.Bool
++	done   chan struct{}
++
++	routeMu   sync.RWMutex
++	probes    map[ProbeToken]probeState
++	probeMu   sync.Mutex
++	probeOpMu sync.Mutex
++
++	closeOnce sync.Once
++	closeMu   sync.Mutex
++	closeErr  error
++	wait      sync.WaitGroup
++	counters  redundantTunnelCounters
++}
++
++type channelTUN struct {
++	owner        *RedundantTunnel
++	index        uint32
++	mtu          int
++	name         string
++	batchSize    int
++	outbound     chan channelPacket
++	inbound      chan []byte
++	events       chan tun.Event
++	done         chan struct{}
++	dispatchDone chan struct{}
++	stateMu      sync.Mutex
++	closedFlag   atomic.Bool
++}
++
++type channelPacket struct {
++	payload    []byte
++	probe      bool
++	probeToken ProbeToken
++}
++
++// NewRedundantTunnel starts one dispatcher with slot A active by default.
++func NewRedundantTunnel(real tun.Device) (*RedundantTunnel, error) {
++	if real == nil {
++		return nil, errors.New("real TUN is required")
++	}
++	mtu, err := real.MTU()
++	if err != nil {
++		return nil, fmt.Errorf("read real TUN MTU: %w", err)
++	}
++	if mtu <= 0 || mtu > redundantTunnelMaxPacketSize {
++		return nil, fmt.Errorf("invalid real TUN MTU: %d", mtu)
++	}
++	batchSize := real.BatchSize()
++	if batchSize < 1 {
++		batchSize = 1
++	}
++	r := &RedundantTunnel{
++		real:   real,
++		done:   make(chan struct{}),
++		probes: make(map[ProbeToken]probeState),
++	}
++	for index := range r.slots {
++		r.slots[index] = newChannelTUN(
++			r,
++			uint32(index),
++			mtu,
++			fmt.Sprintf("redundant-slot-%d", index),
++			batchSize,
++			redundantTunnelQueueDepth,
++		)
++	}
++	r.wait.Add(1 + len(r.slots))
++	go r.dispatchOutbound()
++	for index := range r.slots {
++		go r.dispatchInbound(uint32(index), r.slots[index])
++	}
++	return r, nil
++}
++
++func newChannelTUN(
++	owner *RedundantTunnel,
++	index uint32,
++	mtu int,
++	name string,
++	batchSize, queueDepth int,
++) *channelTUN {
++	device := &channelTUN{
++		owner:        owner,
++		index:        index,
++		mtu:          mtu,
++		name:         name,
++		batchSize:    batchSize,
++		outbound:     make(chan channelPacket, queueDepth),
++		inbound:      make(chan []byte, queueDepth),
++		events:       make(chan tun.Event, 1),
++		done:         make(chan struct{}),
++		dispatchDone: make(chan struct{}),
++	}
++	device.events <- tun.EventUp
++	return device
++}
++
++func (r *RedundantTunnel) Slot(slot uint32) (tun.Device, error) {
++	if slot >= uint32(len(r.slots)) {
++		return nil, ErrInvalidRedundantSlot
++	}
++	return r.slots[slot], nil
++}
++
++func (r *RedundantTunnel) SwitchActive(slot uint32) error {
++	if slot >= uint32(len(r.slots)) {
++		return ErrInvalidRedundantSlot
++	}
++	if r.closed.Load() {
++		return ErrRedundantTunnelClosed
++	}
++	r.routeMu.Lock()
++	defer r.routeMu.Unlock()
++	if r.closed.Load() {
++		return ErrRedundantTunnelClosed
++	}
++	if r.slots[slot].closed() {
++		return ErrRedundantSlotClosed
++	}
++	previous := r.active.Swap(slot)
++	if previous != slot {
++		r.counters.outboundDropped.Add(r.slots[previous].dropQueuedUserPackets())
++		r.counters.activeSwitches.Add(1)
++	}
++	return nil
++}
++
++func (r *RedundantTunnel) InjectProbe(slot uint32, packet []byte, token ProbeToken) error {
++	r.probeOpMu.Lock()
++	defer r.probeOpMu.Unlock()
++	if slot >= uint32(len(r.slots)) {
++		return ErrInvalidRedundantSlot
++	}
++	if r.closed.Load() {
++		return ErrRedundantTunnelClosed
++	}
++	if r.slots[slot].closed() {
++		return ErrRedundantSlotClosed
++	}
++	if len(packet) == 0 || len(packet) > r.slots[slot].mtu {
++		return ErrInvalidProbe
++	}
++	identity, validProbe := probeQueryIdentity(packet, token)
++	if !validProbe {
++		return ErrInvalidProbe
++	}
++	now := time.Now()
++	r.probeMu.Lock()
++	r.pruneExpiredProbesLocked(now)
++	if _, exists := r.probes[token]; exists {
++		r.probeMu.Unlock()
++		return ErrProbeAlreadyPending
++	}
++	if len(r.probes) >= redundantTunnelMaxPendingProbe {
++		r.probeMu.Unlock()
++		return ErrProbeLimitReached
++	}
++	r.probes[token] = probeState{
++		slot:      slot,
++		identity:  identity,
++		status:    probePending,
++		expiresAt: now.Add(redundantTunnelProbeRetention),
++	}
++	r.probeMu.Unlock()
++
++	r.routeMu.RLock()
++	enqueued := !r.closed.Load() && !r.slots[slot].closed() &&
++		r.slots[slot].enqueueOutbound(packet, true, token)
++	r.routeMu.RUnlock()
++	if !enqueued {
++		r.probeMu.Lock()
++		delete(r.probes, token)
++		r.probeMu.Unlock()
++		r.counters.probeInjectionDropped.Add(1)
++		return ErrPacketQueueFull
++	}
++	r.counters.probePacketsInjected.Add(1)
++	return nil
++}
++
++// ProbeSucceeded returns and consumes one successful probe result. Pending
++// probes remain bounded until they succeed or the caller cancels them.
++func (r *RedundantTunnel) ProbeSucceeded(token ProbeToken) bool {
++	r.probeMu.Lock()
++	defer r.probeMu.Unlock()
++	now := time.Now()
++	r.pruneExpiredProbesLocked(now)
++	state, ok := r.probes[token]
++	if !ok || state.status != probeSucceeded {
++		return false
++	}
++	state.status = probeReported
++	state.expiresAt = now.Add(redundantTunnelProbeRetention)
++	r.probes[token] = state
++	return true
++}
++
++func (r *RedundantTunnel) CancelProbe(token ProbeToken) {
++	r.probeOpMu.Lock()
++	defer r.probeOpMu.Unlock()
++	r.probeMu.Lock()
++	now := time.Now()
++	r.pruneExpiredProbesLocked(now)
++	state, exists := r.probes[token]
++	if exists {
++		state.status = probeCancelled
++		state.expiresAt = now.Add(redundantTunnelProbeRetention)
++		r.probes[token] = state
++	}
++	r.probeMu.Unlock()
++	if exists {
++		r.slots[state.slot].dropQueuedProbe(token)
++	}
++}
++
++func (r *RedundantTunnel) CloseSlot(slot uint32) error {
++	if slot >= uint32(len(r.slots)) {
++		return ErrInvalidRedundantSlot
++	}
++	r.routeMu.Lock()
++	closedNow := r.slots[slot].closeTransition()
++	r.routeMu.Unlock()
++	if closedNow {
++		r.counters.slotCloses.Add(1)
++	}
++	<-r.slots[slot].dispatchDone
++	r.probeMu.Lock()
++	for token, state := range r.probes {
++		if state.slot == slot {
++			delete(r.probes, token)
++		}
++	}
++	r.probeMu.Unlock()
++	return nil
++}
++
++func (r *RedundantTunnel) pruneExpiredProbesLocked(now time.Time) {
++	for token, state := range r.probes {
++		if !now.Before(state.expiresAt) {
++			delete(r.probes, token)
++		}
++	}
++}
++
++func (r *RedundantTunnel) Closed() bool {
++	return r.closed.Load()
++}
++
++func (r *RedundantTunnel) Counters() RedundantTunnelCounters {
++	return RedundantTunnelCounters{
++		OutboundPackets:       r.counters.outboundPackets.Load(),
++		OutboundDropped:       r.counters.outboundDropped.Load(),
++		InboundPackets:        r.counters.inboundPackets.Load(),
++		InactiveInboundDrops:  r.counters.inactiveInboundDrops.Load(),
++		ProbePacketsInjected:  r.counters.probePacketsInjected.Load(),
++		ProbeRepliesConsumed:  r.counters.probeRepliesConsumed.Load(),
++		ProbeInjectionDropped: r.counters.probeInjectionDropped.Load(),
++		ActiveSwitches:        r.counters.activeSwitches.Load(),
++		SlotCloses:            r.counters.slotCloses.Load(),
++	}
++}
++
++func (r *RedundantTunnel) Close() error {
++	r.closeWithError(nil)
++	r.wait.Wait()
++	r.closeMu.Lock()
++	defer r.closeMu.Unlock()
++	return r.closeErr
++}
++
++func (r *RedundantTunnel) closeWithError(cause error) {
++	r.closeOnce.Do(func() {
++		r.closed.Store(true)
++		close(r.done)
++		for _, slot := range r.slots {
++			slot.closeTransition()
++		}
++		if err := r.real.Close(); cause == nil {
++			cause = err
++		}
++		r.probeMu.Lock()
++		clear(r.probes)
++		r.probeMu.Unlock()
++		r.closeMu.Lock()
++		r.closeErr = cause
++		r.closeMu.Unlock()
++	})
++}
++
++func (r *RedundantTunnel) dispatchOutbound() {
++	defer r.wait.Done()
++	batchSize := r.real.BatchSize()
++	if batchSize < 1 {
++		batchSize = 1
++	}
++	bufs := make([][]byte, batchSize)
++	sizes := make([]int, batchSize)
++	for index := range bufs {
++		bufs[index] = make([]byte, redundantTunnelMaxPacketSize)
++	}
++	for {
++		count, err := r.real.Read(bufs, sizes, 0)
++		if err != nil {
++			if r.closed.Load() || errors.Is(err, os.ErrClosed) {
++				return
++			}
++			r.closeWithError(fmt.Errorf("read real TUN: %w", err))
++			return
++		}
++		if count < 0 || count > len(bufs) || count > len(sizes) {
++			r.closeWithError(fmt.Errorf("real TUN returned invalid packet count: %d", count))
++			return
++		}
++		for index := 0; index < count; index++ {
++			if sizes[index] <= 0 || sizes[index] > len(bufs[index]) {
++				r.counters.outboundDropped.Add(1)
++				continue
++			}
++			r.routeMu.RLock()
++			active := r.active.Load()
++			slot := r.slots[active]
++			enqueued := !slot.closed() && slot.enqueueOutbound(
++				bufs[index][:sizes[index]],
++				false,
++				ProbeToken{},
++			)
++			r.routeMu.RUnlock()
++			if enqueued {
++				r.counters.outboundPackets.Add(1)
++			} else {
++				r.counters.outboundDropped.Add(1)
++			}
++		}
++	}
++}
++
++func (r *RedundantTunnel) dispatchInbound(slotIndex uint32, slot *channelTUN) {
++	defer r.wait.Done()
++	defer close(slot.dispatchDone)
++	for {
++		select {
++		case <-r.done:
++			return
++		case <-slot.done:
++			return
++		case packet := <-slot.inbound:
++			r.routeMu.RLock()
++			if r.closed.Load() || slot.closed() {
++				r.routeMu.RUnlock()
++				r.counters.inactiveInboundDrops.Add(1)
++				return
++			}
++			if r.consumeProbeReply(slotIndex, packet) {
++				r.routeMu.RUnlock()
++				continue
++			}
++			if r.active.Load() != slotIndex {
++				r.routeMu.RUnlock()
++				r.counters.inactiveInboundDrops.Add(1)
++				continue
++			}
++			_, err := r.real.Write([][]byte{packet}, 0)
++			r.routeMu.RUnlock()
++			if err != nil {
++				if r.closed.Load() || errors.Is(err, os.ErrClosed) {
++					return
++				}
++				r.closeWithError(fmt.Errorf("write real TUN: %w", err))
++				return
++			}
++			r.counters.inboundPackets.Add(1)
++		}
++	}
++}
++
++func (r *RedundantTunnel) consumeProbeReply(slot uint32, packet []byte) bool {
++	parsed, ok := parseDNSPacket(packet)
++	if !ok || !parsed.response || parsed.sourcePort != 53 || parsed.destinationPort == 0 {
++		return false
++	}
++	token := ProbeToken{Port: parsed.destinationPort, DNSID: parsed.dnsID}
++	now := time.Now()
++	r.probeMu.Lock()
++	r.pruneExpiredProbesLocked(now)
++	state, exists := r.probes[token]
++	if !exists || state.slot != slot || !state.identity.matchesReply(parsed.identity) {
++		r.probeMu.Unlock()
++		return false
++	}
++	if state.status == probePending {
++		state.status = probeSucceeded
++		state.expiresAt = now.Add(redundantTunnelProbeRetention)
++		r.probes[token] = state
++	}
++	r.probeMu.Unlock()
++	r.counters.probeRepliesConsumed.Add(1)
++	return true
++}
++
++func probeQueryIdentity(packet []byte, token ProbeToken) (probeIdentity, bool) {
++	parsed, ok := parseDNSPacket(packet)
++	if !ok {
++		return probeIdentity{}, false
++	}
++	valid := !parsed.response && token.Port != 0 && parsed.sourcePort == token.Port &&
++		parsed.destinationPort == 53 && parsed.dnsID == token.DNSID
++	if !valid {
++		return probeIdentity{}, false
++	}
++	return parsed.identity, true
++}
++
++func (identity probeIdentity) matchesReply(reply probeIdentity) bool {
++	return identity.ipVersion == reply.ipVersion &&
++		identity.sourceIP == reply.destination &&
++		identity.destination == reply.sourceIP &&
++		identity.question == reply.question
++}
++
++func parseDNSPacket(packet []byte) (parsedDNSPacket, bool) {
++	if len(packet) < 1 {
++		return parsedDNSPacket{}, false
++	}
++	var (
++		udpOffset     int
++		networkLength int
++		identity      probeIdentity
++	)
++	switch packet[0] >> 4 {
++	case 4:
++		if len(packet) < 20 {
++			return parsedDNSPacket{}, false
++		}
++		headerLength := int(packet[0]&0x0f) * 4
++		networkLength = int(binary.BigEndian.Uint16(packet[2:4]))
++		fragment := binary.BigEndian.Uint16(packet[6:8])
++		if headerLength < 20 || networkLength != len(packet) ||
++			networkLength < headerLength+20 || packet[9] != 17 || fragment&0x3fff != 0 {
++			return parsedDNSPacket{}, false
++		}
++		udpOffset = headerLength
++		identity.ipVersion = 4
++		copy(identity.sourceIP[:4], packet[12:16])
++		copy(identity.destination[:4], packet[16:20])
++	case 6:
++		if len(packet) < 60 || packet[6] != 17 {
++			return parsedDNSPacket{}, false
++		}
++		networkLength = 40 + int(binary.BigEndian.Uint16(packet[4:6]))
++		if networkLength != len(packet) {
++			return parsedDNSPacket{}, false
++		}
++		udpOffset = 40
++		identity.ipVersion = 6
++		copy(identity.sourceIP[:], packet[8:24])
++		copy(identity.destination[:], packet[24:40])
++	default:
++		return parsedDNSPacket{}, false
++	}
++	udpLength := int(binary.BigEndian.Uint16(packet[udpOffset+4 : udpOffset+6]))
++	if udpLength < 20 || udpOffset+udpLength != networkLength {
++		return parsedDNSPacket{}, false
++	}
++	dnsPayload := packet[udpOffset+8 : udpOffset+udpLength]
++	question, response, ok := parseDNSQuestion(dnsPayload)
++	if !ok {
++		return parsedDNSPacket{}, false
++	}
++	identity.question = question
++	return parsedDNSPacket{
++		sourcePort:      binary.BigEndian.Uint16(packet[udpOffset : udpOffset+2]),
++		destinationPort: binary.BigEndian.Uint16(packet[udpOffset+2 : udpOffset+4]),
++		dnsID:           binary.BigEndian.Uint16(dnsPayload[:2]),
++		response:        response,
++		identity:        identity,
++	}, true
++}
++
++func parseDNSQuestion(payload []byte) (string, bool, bool) {
++	if len(payload) < 12 {
++		return "", false, false
++	}
++	flags := binary.BigEndian.Uint16(payload[2:4])
++	if flags&0x7800 != 0 || binary.BigEndian.Uint16(payload[4:6]) != 1 {
++		return "", false, false
++	}
++	position := 12
++	normalized := make([]byte, 0, 64)
++	for {
++		if position >= len(payload) {
++			return "", false, false
++		}
++		labelLength := int(payload[position])
++		position++
++		if labelLength&0xc0 != 0 || labelLength > 63 || position+labelLength > len(payload) {
++			return "", false, false
++		}
++		normalized = append(normalized, byte(labelLength))
++		if labelLength == 0 {
++			break
++		}
++		for _, value := range payload[position : position+labelLength] {
++			if value >= 'A' && value <= 'Z' {
++				value += 'a' - 'A'
++			}
++			normalized = append(normalized, value)
++		}
++		position += labelLength
++	}
++	if position+4 > len(payload) {
++		return "", false, false
++	}
++	normalized = append(normalized, payload[position:position+4]...)
++	return string(normalized), flags&0x8000 != 0, true
++}
++
++func (c *channelTUN) File() *os.File { return nil }
++
++func (c *channelTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	if len(bufs) == 0 || len(sizes) < len(bufs) || offset < 0 {
++		return 0, errors.New("invalid channel TUN read buffers")
++	}
++	select {
++	case <-c.done:
++		return 0, os.ErrClosed
++	default:
++	}
++	var first channelPacket
++	select {
++	case <-c.done:
++		return 0, os.ErrClosed
++	case first = <-c.outbound:
++	}
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	if c.closedFlag.Load() {
++		return 0, os.ErrClosed
++	}
++	packets := 0
++	for packets < len(bufs) {
++		packet := first.payload
++		if packets > 0 {
++			var queued channelPacket
++			select {
++			case queued = <-c.outbound:
++			default:
++				return packets, nil
++			}
++			packet = queued.payload
++		}
++		if offset+len(packet) > len(bufs[packets]) {
++			if packets == 0 {
++				return 0, errors.New("channel TUN read buffer is too small")
++			}
++			return packets, nil
++		}
++		copy(bufs[packets][offset:], packet)
++		sizes[packets] = len(packet)
++		packets++
++	}
++	return packets, nil
++}
++
++func (c *channelTUN) Write(bufs [][]byte, offset int) (int, error) {
++	if offset < 0 {
++		return 0, errors.New("invalid channel TUN write offset")
++	}
++	if c.closed() {
++		return 0, os.ErrClosed
++	}
++	for index, buffer := range bufs {
++		if offset > len(buffer) {
++			return index, errors.New("invalid channel TUN write buffer")
++		}
++		packet := append([]byte(nil), buffer[offset:]...)
++		c.stateMu.Lock()
++		if c.closedFlag.Load() {
++			c.stateMu.Unlock()
++			return index, os.ErrClosed
++		}
++		select {
++		case c.inbound <- packet:
++			c.stateMu.Unlock()
++		default:
++			c.stateMu.Unlock()
++			return index, ErrPacketQueueFull
++		}
++	}
++	return len(bufs), nil
++}
++
++func (c *channelTUN) MTU() (int, error)        { return c.mtu, nil }
++func (c *channelTUN) Name() (string, error)    { return c.name, nil }
++func (c *channelTUN) Events() <-chan tun.Event { return c.events }
++func (c *channelTUN) BatchSize() int           { return c.batchSize }
++
++func (c *channelTUN) Close() error {
++	return c.owner.CloseSlot(c.index)
++}
++
++func (c *channelTUN) closeTransition() bool {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	if c.closedFlag.Load() {
++		return false
++	}
++	c.closedFlag.Store(true)
++	close(c.done)
++	close(c.events)
++	return true
++}
++
++func (c *channelTUN) enqueueOutbound(packet []byte, probe bool, token ProbeToken) bool {
++	queued := channelPacket{
++		payload:    append([]byte(nil), packet...),
++		probe:      probe,
++		probeToken: token,
++	}
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	if c.closedFlag.Load() {
++		return false
++	}
++	select {
++	case c.outbound <- queued:
++		return true
++	default:
++		return false
++	}
++}
++
++func (c *channelTUN) dropQueuedUserPackets() uint64 {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	preserved := make([]channelPacket, 0, len(c.outbound))
++	dropped := uint64(0)
++	for {
++		select {
++		case packet := <-c.outbound:
++			if packet.probe {
++				preserved = append(preserved, packet)
++			} else {
++				dropped++
++			}
++		default:
++			for _, packet := range preserved {
++				c.outbound <- packet
++			}
++			return dropped
++		}
++	}
++}
++
++func (c *channelTUN) dropQueuedProbe(token ProbeToken) {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	preserved := make([]channelPacket, 0, len(c.outbound))
++	for {
++		select {
++		case packet := <-c.outbound:
++			if !packet.probe || packet.probeToken != token {
++				preserved = append(preserved, packet)
++			}
++		default:
++			for _, packet := range preserved {
++				c.outbound <- packet
++			}
++			return
++		}
++	}
++}
++
++func (c *channelTUN) closed() bool {
++	return c.closedFlag.Load()
++}
+diff --git a/tunnel/tools/libwg-go/redundant_tun_test.go b/tunnel/tools/libwg-go/redundant_tun_test.go
+new file mode 100644
+index 00000000..e991aedb
+--- /dev/null
++++ b/tunnel/tools/libwg-go/redundant_tun_test.go
+@@ -0,0 +1,672 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++package main
++
++import (
++	"encoding/binary"
++	"errors"
++	"os"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
++)
++
++const redundantTUNTestTimeout = 250 * time.Millisecond
++
++type fakeRealTUN struct {
++	outbound chan []byte
++	inbound  chan []byte
++	events   chan tun.Event
++	closed   chan struct{}
++	once     sync.Once
++}
++
++func newFakeRealTUN() *fakeRealTUN {
++	device := &fakeRealTUN{
++		outbound: make(chan []byte, 8),
++		inbound:  make(chan []byte, 8),
++		events:   make(chan tun.Event, 1),
++		closed:   make(chan struct{}),
++	}
++	device.events <- tun.EventUp
++	return device
++}
++
++func (f *fakeRealTUN) File() *os.File { return nil }
++
++func (f *fakeRealTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	select {
++	case <-f.closed:
++		return 0, os.ErrClosed
++	case packet := <-f.outbound:
++		if len(bufs) == 0 || len(sizes) == 0 || offset < 0 || offset+len(packet) > len(bufs[0]) {
++			return 0, errors.New("fake TUN read buffer is too small")
++		}
++		copy(bufs[0][offset:], packet)
++		sizes[0] = len(packet)
++		return 1, nil
++	}
++}
++
++func (f *fakeRealTUN) Write(bufs [][]byte, offset int) (int, error) {
++	for index, buffer := range bufs {
++		if offset < 0 || offset > len(buffer) {
++			return index, errors.New("invalid fake TUN write offset")
++		}
++		packet := append([]byte(nil), buffer[offset:]...)
++		select {
++		case <-f.closed:
++			return index, os.ErrClosed
++		case f.inbound <- packet:
++		}
++	}
++	return len(bufs), nil
++}
++
++func (f *fakeRealTUN) MTU() (int, error)        { return 1420, nil }
++func (f *fakeRealTUN) Name() (string, error)    { return "fake-real-tun", nil }
++func (f *fakeRealTUN) Events() <-chan tun.Event { return f.events }
++func (f *fakeRealTUN) BatchSize() int           { return 1 }
++
++func (f *fakeRealTUN) Close() error {
++	f.once.Do(func() {
++		close(f.closed)
++		close(f.events)
++	})
++	return nil
++}
++
++func (f *fakeRealTUN) injectOutbound(t *testing.T, packet []byte) {
++	t.Helper()
++	select {
++	case f.outbound <- append([]byte(nil), packet...):
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("timed out injecting outbound packet into fake real TUN")
++	}
++}
++
++func readDevicePacket(t *testing.T, device tun.Device) []byte {
++	t.Helper()
++	result := make(chan struct {
++		packet []byte
++		err    error
++	}, 1)
++	go func() {
++		buffer := make([]byte, 2048)
++		sizes := make([]int, 1)
++		count, err := device.Read([][]byte{buffer}, sizes, 0)
++		if err != nil {
++			result <- struct {
++				packet []byte
++				err    error
++			}{err: err}
++			return
++		}
++		if count != 1 {
++			result <- struct {
++				packet []byte
++				err    error
++			}{err: errors.New("device returned an unexpected packet count")}
++			return
++		}
++		result <- struct {
++			packet []byte
++			err    error
++		}{packet: append([]byte(nil), buffer[:sizes[0]]...)}
++	}()
++	select {
++	case got := <-result:
++		if got.err != nil {
++			t.Fatalf("failed to read device packet: %v", got.err)
++		}
++		return got.packet
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("timed out reading device packet")
++		return nil
++	}
++}
++
++func writeDevicePacket(t *testing.T, device tun.Device, packet []byte) {
++	t.Helper()
++	written, err := device.Write([][]byte{append([]byte(nil), packet...)}, 0)
++	if err != nil {
++		t.Fatalf("failed to write device packet: %v", err)
++	}
++	if written != 1 {
++		t.Fatalf("device wrote %d packets, want 1", written)
++	}
++}
++
++func requireNoDevicePacketBeforeClose(
++	t *testing.T,
++	device tun.Device,
++	closeDevice func() error,
++) {
++	t.Helper()
++	result := make(chan error, 1)
++	go func() {
++		buffer := make([]byte, 2048)
++		_, err := device.Read([][]byte{buffer}, make([]int, 1), 0)
++		result <- err
++	}()
++	select {
++	case err := <-result:
++		t.Fatalf("inactive device returned before close: %v", err)
++	case <-time.After(50 * time.Millisecond):
++	}
++	if err := closeDevice(); err != nil {
++		t.Fatalf("failed to close inactive device: %v", err)
++	}
++	select {
++	case err := <-result:
++		if !errors.Is(err, os.ErrClosed) {
++			t.Fatalf("inactive device returned wrong close error: %v", err)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("inactive device read did not unblock after close")
++	}
++}
++
++func requireNoFakeRealTUNPacket(t *testing.T, real *fakeRealTUN) {
++	t.Helper()
++	select {
++	case packet := <-real.inbound:
++		t.Fatalf("unexpected packet reached real TUN: %v", packet)
++	case <-time.After(50 * time.Millisecond):
++	}
++}
++
++func waitForOutboundAccounting(t *testing.T, tunnel *RedundantTunnel, want uint64) {
++	t.Helper()
++	deadline := time.Now().Add(redundantTUNTestTimeout)
++	for time.Now().Before(deadline) {
++		counters := tunnel.Counters()
++		if counters.OutboundPackets+counters.OutboundDropped >= want {
++			return
++		}
++		time.Sleep(time.Millisecond)
++	}
++	t.Fatalf("dispatcher did not account for %d outbound packets", want)
++}
++
++func fakeDNSPacket(sourcePort, destinationPort, dnsID uint16, response bool) []byte {
++	querySource := [4]byte{10, 0, 0, 2}
++	resolver := [4]byte{1, 1, 1, 1}
++	if response {
++		return fakeDNSPacketForQuestion(
++			sourcePort,
++			destinationPort,
++			dnsID,
++			true,
++			resolver,
++			querySource,
++			"health.nelomai.invalid",
++		)
++	}
++	return fakeDNSPacketForQuestion(
++		sourcePort,
++		destinationPort,
++		dnsID,
++		false,
++		querySource,
++		resolver,
++		"health.nelomai.invalid",
++	)
++}
++
++func fakeDNSPacketForQuestion(
++	sourcePort, destinationPort, dnsID uint16,
++	response bool,
++	sourceIP, destinationIP [4]byte,
++	labels ...string,
++) []byte {
++	const ipv4HeaderLength = 20
++	const udpHeaderLength = 8
++	dnsQuestion := make([]byte, 0, 64)
++	for _, labelSet := range labels {
++		for len(labelSet) > 0 {
++			labelLength := 0
++			for labelLength < len(labelSet) && labelSet[labelLength] != '.' {
++				labelLength++
++			}
++			dnsQuestion = append(dnsQuestion, byte(labelLength))
++			dnsQuestion = append(dnsQuestion, labelSet[:labelLength]...)
++			if labelLength == len(labelSet) {
++				labelSet = ""
++			} else {
++				labelSet = labelSet[labelLength+1:]
++			}
++		}
++	}
++	dnsQuestion = append(dnsQuestion, 0, 0, 1, 0, 1)
++	dnsLength := 12 + len(dnsQuestion)
++	packet := make([]byte, ipv4HeaderLength+udpHeaderLength+dnsLength)
++	packet[0] = 0x45
++	packet[9] = 17
++	copy(packet[12:16], sourceIP[:])
++	copy(packet[16:20], destinationIP[:])
++	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
++	binary.BigEndian.PutUint16(packet[ipv4HeaderLength:ipv4HeaderLength+2], sourcePort)
++	binary.BigEndian.PutUint16(packet[ipv4HeaderLength+2:ipv4HeaderLength+4], destinationPort)
++	binary.BigEndian.PutUint16(packet[ipv4HeaderLength+4:ipv4HeaderLength+6], uint16(udpHeaderLength+dnsLength))
++	dnsOffset := ipv4HeaderLength + udpHeaderLength
++	binary.BigEndian.PutUint16(packet[dnsOffset:], dnsID)
++	if response {
++		packet[dnsOffset+2] = 0x80
++	}
++	binary.BigEndian.PutUint16(packet[dnsOffset+4:dnsOffset+6], 1)
++	copy(packet[dnsOffset+12:], dnsQuestion)
++	return packet
++}
++
++func malformedShortDNSPacket(sourcePort, destinationPort, dnsID uint16) []byte {
++	const ipv4HeaderLength = 20
++	const udpHeaderLength = 8
++	packet := make([]byte, ipv4HeaderLength+udpHeaderLength+4)
++	packet[0] = 0x45
++	packet[9] = 17
++	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
++	binary.BigEndian.PutUint16(packet[ipv4HeaderLength:ipv4HeaderLength+2], sourcePort)
++	binary.BigEndian.PutUint16(packet[ipv4HeaderLength+2:ipv4HeaderLength+4], destinationPort)
++	binary.BigEndian.PutUint16(packet[ipv4HeaderLength+4:ipv4HeaderLength+6], udpHeaderLength+4)
++	binary.BigEndian.PutUint16(packet[ipv4HeaderLength+udpHeaderLength:], dnsID)
++	return packet
++}
++
++func newFakeRedundantTunnel(t *testing.T) (*fakeRealTUN, tun.Device, tun.Device, *RedundantTunnel) {
++	t.Helper()
++	real := newFakeRealTUN()
++	tunnel, err := NewRedundantTunnel(real)
++	if err != nil {
++		t.Fatalf("failed to create redundant tunnel: %v", err)
++	}
++	t.Cleanup(func() {
++		if err := tunnel.Close(); err != nil {
++			t.Errorf("failed to close redundant tunnel: %v", err)
++		}
++	})
++	slotA, err := tunnel.Slot(0)
++	if err != nil {
++		t.Fatalf("failed to get slot A: %v", err)
++	}
++	slotB, err := tunnel.Slot(1)
++	if err != nil {
++		t.Fatalf("failed to get slot B: %v", err)
++	}
++	return real, slotA, slotB, tunnel
++}
++
++func TestOutboundPacketsReachOnlyActiveSlot(t *testing.T) {
++	real, slotA, slotB, tunnel := newFakeRedundantTunnel(t)
++	packet := []byte{1, 2, 3}
++
++	real.injectOutbound(t, packet)
++	if got := readDevicePacket(t, slotA); string(got) != string(packet) {
++		t.Fatalf("active slot received %v, want %v", got, packet)
++	}
++
++	requireNoDevicePacketBeforeClose(t, slotB, func() error {
++		return tunnel.CloseSlot(1)
++	})
++}
++
++func TestInactiveInboundPacketsAreDropped(t *testing.T) {
++	real, _, slotB, _ := newFakeRedundantTunnel(t)
++
++	writeDevicePacket(t, slotB, []byte{4, 5, 6})
++	requireNoFakeRealTUNPacket(t, real)
++}
++
++func TestProbeReplyIsConsumedBeforeRealTun(t *testing.T) {
++	real, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 7}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	reply := fakeDNSPacket(53, token.Port, token.DNSID, true)
++
++	if err := tunnel.InjectProbe(1, query, token); err != nil {
++		t.Fatalf("failed to inject probe: %v", err)
++	}
++	if got := readDevicePacket(t, slotB); string(got) != string(query) {
++		t.Fatalf("standby slot received probe %v, want %v", got, query)
++	}
++	writeDevicePacket(t, slotB, reply)
++	requireNoFakeRealTUNPacket(t, real)
++	if !tunnel.ProbeSucceeded(token) {
++		t.Fatal("matching probe reply was not recorded")
++	}
++	writeDevicePacket(t, slotB, reply)
++	requireNoFakeRealTUNPacket(t, real)
++	if tunnel.ProbeSucceeded(token) {
++		t.Fatal("duplicate probe reply was reported twice")
++	}
++}
++
++func TestProbeReplyRequiresDNSResponseFromPort53(t *testing.T) {
++	real, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 8}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	wrongSourceReply := fakeDNSPacket(54, token.Port, token.DNSID, true)
++
++	if err := tunnel.InjectProbe(1, query, token); err != nil {
++		t.Fatalf("failed to inject probe: %v", err)
++	}
++	_ = readDevicePacket(t, slotB)
++	writeDevicePacket(t, slotB, wrongSourceReply)
++	requireNoFakeRealTUNPacket(t, real)
++	if tunnel.ProbeSucceeded(token) {
++		t.Fatal("UDP packet from a non-DNS source satisfied the probe")
++	}
++}
++
++func TestStoppingOneSlotKeepsDispatcherAlive(t *testing.T) {
++	real, slotA, _, tunnel := newFakeRedundantTunnel(t)
++
++	if err := tunnel.CloseSlot(1); err != nil {
++		t.Fatalf("failed to close standby slot: %v", err)
++	}
++	if tunnel.Closed() {
++		t.Fatal("closing one slot closed the dispatcher")
++	}
++	packet := []byte{9, 8, 7}
++	real.injectOutbound(t, packet)
++	if got := readDevicePacket(t, slotA); string(got) != string(packet) {
++		t.Fatalf("active slot received %v after standby close, want %v", got, packet)
++	}
++}
++
++func TestClosedSlotRejectsEveryInboundWrite(t *testing.T) {
++	_, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	if err := tunnel.CloseSlot(1); err != nil {
++		t.Fatalf("failed to close standby slot: %v", err)
++	}
++
++	for attempt := 0; attempt < redundantTunnelQueueDepth; attempt++ {
++		written, err := slotB.Write([][]byte{{byte(attempt)}}, 0)
++		if !errors.Is(err, os.ErrClosed) || written != 0 {
++			t.Fatalf(
++				"closed slot accepted write %d: packets=%d error=%v",
++				attempt,
++				written,
++				err,
++			)
++		}
++	}
++}
++
++func TestSwitchDropsQueuedUserPacketFromFormerActiveSlot(t *testing.T) {
++	real, slotA, slotB, tunnel := newFakeRedundantTunnel(t)
++	stalePacket := []byte{1, 1, 1}
++	real.injectOutbound(t, stalePacket)
++	waitForOutboundAccounting(t, tunnel, 1)
++
++	if err := tunnel.SwitchActive(1); err != nil {
++		t.Fatalf("failed to switch active slot: %v", err)
++	}
++	requireNoDevicePacketBeforeClose(t, slotA, func() error {
++		return tunnel.CloseSlot(0)
++	})
++
++	freshPacket := []byte{2, 2, 2}
++	real.injectOutbound(t, freshPacket)
++	if got := readDevicePacket(t, slotB); string(got) != string(freshPacket) {
++		t.Fatalf("new active slot received %v, want %v", got, freshPacket)
++	}
++}
++
++func TestCloseSlotWaitsForInboundDispatcherRouteBarrier(t *testing.T) {
++	_, slotA, _, tunnel := newFakeRedundantTunnel(t)
++	tunnel.routeMu.Lock()
++	writeDevicePacket(t, slotA, []byte{7, 7, 7})
++
++	closed := make(chan error, 1)
++	go func() {
++		closed <- tunnel.CloseSlot(0)
++	}()
++	select {
++	case err := <-closed:
++		tunnel.routeMu.Unlock()
++		t.Fatalf("slot close returned before inbound dispatcher quiesced: %v", err)
++	case <-time.After(20 * time.Millisecond):
++	}
++	tunnel.routeMu.Unlock()
++	select {
++	case err := <-closed:
++		if err != nil {
++			t.Fatalf("failed to close active slot: %v", err)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("slot close did not finish after dispatcher was released")
++	}
++}
++
++func TestCancelledProbeReplyIsStillConsumed(t *testing.T) {
++	real, slotA, _, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 9}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	reply := fakeDNSPacket(53, token.Port, token.DNSID, true)
++
++	if err := tunnel.InjectProbe(0, query, token); err != nil {
++		t.Fatalf("failed to inject probe: %v", err)
++	}
++	_ = readDevicePacket(t, slotA)
++	tunnel.CancelProbe(token)
++	writeDevicePacket(t, slotA, reply)
++	requireNoFakeRealTUNPacket(t, real)
++	if tunnel.ProbeSucceeded(token) {
++		t.Fatal("cancelled probe was reported as successful")
++	}
++}
++
++func TestProbeRejectsIncompleteDNSHeader(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 10}
++	err := tunnel.InjectProbe(1, malformedShortDNSPacket(token.Port, 53, token.DNSID), token)
++	if !errors.Is(err, ErrInvalidProbe) {
++		t.Fatalf("incomplete DNS header returned %v, want %v", err, ErrInvalidProbe)
++	}
++}
++
++func TestProbeReplyMustMatchQuestionAndIPEndpoints(t *testing.T) {
++	real, slotA, _, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 11}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	wrongQuestion := fakeDNSPacketForQuestion(
++		53,
++		token.Port,
++		token.DNSID,
++		true,
++		[4]byte{1, 1, 1, 1},
++		[4]byte{10, 0, 0, 2},
++		"unrelated.nelomai.invalid",
++	)
++
++	if err := tunnel.InjectProbe(0, query, token); err != nil {
++		t.Fatalf("failed to inject probe: %v", err)
++	}
++	_ = readDevicePacket(t, slotA)
++	writeDevicePacket(t, slotA, wrongQuestion)
++	select {
++	case got := <-real.inbound:
++		if string(got) != string(wrongQuestion) {
++			t.Fatalf("real TUN received %v, want %v", got, wrongQuestion)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("unrelated DNS packet was incorrectly consumed")
++	}
++	if tunnel.ProbeSucceeded(token) {
++		t.Fatal("unrelated DNS question satisfied the probe")
++	}
++	wrongEndpoint := fakeDNSPacketForQuestion(
++		53,
++		token.Port,
++		token.DNSID,
++		true,
++		[4]byte{9, 9, 9, 9},
++		[4]byte{10, 0, 0, 2},
++		"health.nelomai.invalid",
++	)
++	writeDevicePacket(t, slotA, wrongEndpoint)
++	select {
++	case got := <-real.inbound:
++		if string(got) != string(wrongEndpoint) {
++			t.Fatalf("real TUN received %v, want %v", got, wrongEndpoint)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("DNS packet from an unrelated endpoint was incorrectly consumed")
++	}
++	if tunnel.ProbeSucceeded(token) {
++		t.Fatal("unrelated DNS endpoint satisfied the probe")
++	}
++}
++
++func TestProbePacketCannotExceedTunnelMTU(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 12}
++	packet := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	packet = append(packet, make([]byte, 1421-len(packet))...)
++
++	err := tunnel.InjectProbe(1, packet, token)
++	if !errors.Is(err, ErrInvalidProbe) {
++		t.Fatalf("oversized probe returned %v, want %v", err, ErrInvalidProbe)
++	}
++}
++
++func TestConcurrentDuplicateSlotCloseCountedOnce(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	start := make(chan struct{})
++	var wait sync.WaitGroup
++	for range 64 {
++		wait.Add(1)
++		go func() {
++			defer wait.Done()
++			<-start
++			if err := tunnel.CloseSlot(1); err != nil {
++				t.Errorf("failed to close standby slot: %v", err)
++			}
++		}()
++	}
++	close(start)
++	wait.Wait()
++	if got := tunnel.Counters().SlotCloses; got != 1 {
++		t.Fatalf("slot close counter is %d, want 1", got)
++	}
++}
++
++func TestSwitchActiveRejectsClosedSlot(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	if err := tunnel.CloseSlot(1); err != nil {
++		t.Fatalf("failed to close standby slot: %v", err)
++	}
++	if err := tunnel.SwitchActive(1); !errors.Is(err, ErrRedundantSlotClosed) {
++		t.Fatalf("switch to closed slot returned %v, want %v", err, ErrRedundantSlotClosed)
++	}
++}
++
++func TestCancelRemovesQueuedProbe(t *testing.T) {
++	_, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 13}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	if err := tunnel.InjectProbe(1, query, token); err != nil {
++		t.Fatalf("failed to inject probe: %v", err)
++	}
++	tunnel.CancelProbe(token)
++	requireNoDevicePacketBeforeClose(t, slotB, func() error {
++		return tunnel.CloseSlot(1)
++	})
++}
++
++func TestPendingProbeCountIsBounded(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	for index := 0; index < redundantTunnelMaxPendingProbe; index++ {
++		token := ProbeToken{Port: uint16(10_000 + index), DNSID: uint16(index + 1)}
++		query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++		if err := tunnel.InjectProbe(1, query, token); err != nil {
++			t.Fatalf("probe %d was rejected before the limit: %v", index, err)
++		}
++	}
++	overflowToken := ProbeToken{Port: 20_000, DNSID: 20_000}
++	overflowQuery := fakeDNSPacket(overflowToken.Port, 53, overflowToken.DNSID, false)
++	if err := tunnel.InjectProbe(1, overflowQuery, overflowToken); !errors.Is(err, ErrProbeLimitReached) {
++		t.Fatalf("probe above the limit returned %v, want %v", err, ErrProbeLimitReached)
++	}
++}
++
++func TestDirectSlotCloseUsesDispatcherRouteBarrier(t *testing.T) {
++	_, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	tunnel.routeMu.Lock()
++	closed := make(chan error, 1)
++	go func() {
++		closed <- slotB.Close()
++	}()
++	select {
++	case err := <-closed:
++		tunnel.routeMu.Unlock()
++		t.Fatalf("direct slot close bypassed route barrier: %v", err)
++	case <-time.After(20 * time.Millisecond):
++	}
++	tunnel.routeMu.Unlock()
++	select {
++	case err := <-closed:
++		if err != nil {
++			t.Fatalf("direct slot close failed: %v", err)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("direct slot close did not finish after route barrier was released")
++	}
++	if err := tunnel.SwitchActive(1); !errors.Is(err, ErrRedundantSlotClosed) {
++		t.Fatalf("switch after direct close returned %v, want %v", err, ErrRedundantSlotClosed)
++	}
++	if got := tunnel.Counters().SlotCloses; got != 1 {
++		t.Fatalf("direct slot close counter is %d, want 1", got)
++	}
++}
++
++func TestCancelWaitsForConcurrentProbeInjection(t *testing.T) {
++	_, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 14}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	tunnel.routeMu.Lock()
++	injected := make(chan error, 1)
++	go func() {
++		injected <- tunnel.InjectProbe(1, query, token)
++	}()
++	deadline := time.Now().Add(redundantTUNTestTimeout)
++	for {
++		tunnel.probeMu.Lock()
++		_, registered := tunnel.probes[token]
++		tunnel.probeMu.Unlock()
++		if registered {
++			break
++		}
++		if time.Now().After(deadline) {
++			tunnel.routeMu.Unlock()
++			t.Fatal("probe was not registered before enqueue")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	cancelled := make(chan struct{})
++	go func() {
++		tunnel.CancelProbe(token)
++		close(cancelled)
++	}()
++	select {
++	case <-cancelled:
++		tunnel.routeMu.Unlock()
++		t.Fatal("probe cancellation returned before concurrent injection completed")
++	case <-time.After(20 * time.Millisecond):
++	}
++	tunnel.routeMu.Unlock()
++	if err := <-injected; err != nil {
++		t.Fatalf("concurrent probe injection failed: %v", err)
++	}
++	select {
++	case <-cancelled:
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("probe cancellation did not finish after injection")
++	}
++	requireNoDevicePacketBeforeClose(t, slotB, func() error {
++		return tunnel.CloseSlot(1)
++	})
++}
