@@ -27,7 +27,8 @@ class RedundantConnectionCoordinatorTest {
         assertTrue(routeVpnProcessRecovery(
             RecoveryStoreResult.Success(v2Envelope()), owner, { legacyCalls += 1 },
         ))
-        assertEquals(1, owner.recoverCalls)
+        assertEquals(1, owner.resumeCalls)
+        assertEquals(0, owner.recoverCalls)
         assertEquals(0, legacyCalls)
         assertFalse(routeVpnProcessRecovery(
             RecoveryStoreResult.Success(v2Envelope()), null, { legacyCalls += 1 },
@@ -228,6 +229,57 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun degradedSessionAcquiresIntoEmptySlotAndReplaysNullReplacement() {
+        val store = store(transaction().copy(slotBLeaseId = null))
+        val panel = FakePanel(acquireFailures = ArrayDeque(listOf(true, false)))
+        val first = RedundantConnectionCoordinator(store, panel, FakeNative())
+
+        assertFalse(first.acquireAndCommitStandby("acquire-empty"))
+        val pending = requireNotNull(first.status()).retry
+        assertTrue(pending.acquirePending)
+        assertEquals("acquire-empty", pending.acquireOperationId)
+        assertEquals(null, pending.acquireReplaceLeaseId)
+
+        assertTrue(RedundantConnectionCoordinator(store, panel, FakeNative()).acquireAndCommitStandby("different"))
+        assertEquals(listOf("acquire-empty", "acquire-empty"), panel.acquireOperationIds)
+        assertEquals(listOf(null, null), panel.acquireReplaceLeaseIds)
+    }
+
+    @Test
+    fun recoveryFinalizesCandidateAlreadyCommittedRemotelyWithoutAnotherAcquire() {
+        val pending = transaction().copy(
+            candidateLeaseId = "candidate",
+            candidateSlot = RedundantSlot.B,
+            retry = AndroidRedundantRetryState(
+                acquirePending = true,
+                acquireOperationId = "acquire-1",
+                acquireReplaceLeaseId = "lease-b",
+            ),
+        )
+        val store = store(pending)
+        val panel = FakePanel(
+            recoveredSession = session(
+                activeLeaseId = "lease-a",
+                roleGeneration = 3,
+                membershipGeneration = 3,
+                slotBLeaseId = "candidate",
+            ),
+            acquireFailures = ArrayDeque(listOf(true)),
+            commitFailures = ArrayDeque(listOf(true)),
+        )
+
+        assertTrue(RedundantConnectionCoordinator(store, panel, FakeNative()).recover())
+        val recovered = requireNotNull(RedundantConnectionCoordinator(store, panel, FakeNative()).status())
+        assertFalse(recovered.retry.acquirePending)
+        assertEquals(null, recovered.retry.acquireOperationId)
+        assertEquals(null, recovered.retry.acquireReplaceLeaseId)
+        assertEquals(null, recovered.candidateLeaseId)
+        assertEquals(null, recovered.candidateSlot)
+        assertTrue(panel.acquireOperationIds.isEmpty())
+        assertEquals(0, panel.commitCalls)
+    }
+
+    @Test
     fun duplicateStopAndRecoveryCallbacksAreIdempotent() {
         val panel = FakePanel()
         val native = FakeNative()
@@ -286,12 +338,13 @@ class RedundantConnectionCoordinatorTest {
         activeLeaseId: String,
         roleGeneration: Long,
         membershipGeneration: Long,
+        slotBLeaseId: String = "lease-b",
     ) = BackgroundRedundantSession(
         sessionId = "22222222-2222-4222-8222-222222222222",
         state = "connected",
         activeLeaseId = activeLeaseId,
         slotALeaseId = "lease-a",
-        slotBLeaseId = "lease-b",
+        slotBLeaseId = slotBLeaseId,
         standbyDesired = true,
         roleGeneration = roleGeneration,
         membershipGeneration = membershipGeneration,
@@ -338,17 +391,20 @@ private class FakeNative(
 private class FakePanel(
     private val role: RedundantRoleResponse? = null,
     private val configurations: Map<String, ByteArray>? = null,
+    private val recoveredSession: BackgroundRedundantSession? = null,
     private val stopResults: ArrayDeque<Boolean> = ArrayDeque(),
     private val roleFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val acquireFailures: ArrayDeque<Boolean> = ArrayDeque(),
+    private val commitFailures: ArrayDeque<Boolean> = ArrayDeque(),
 ) : RedundantConnectionPanel {
     var stopCalls = 0
     var roleCalls = 0
+    var commitCalls = 0
     val acquireOperationIds = mutableListOf<String>()
-    val acquireReplaceLeaseIds = mutableListOf<String>()
+    val acquireReplaceLeaseIds = mutableListOf<String?>()
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
         RedundantRecoveryResponse(
-            session = BackgroundRedundantSession(
+            session = recoveredSession ?: BackgroundRedundantSession(
                 sessionId = transaction.sessionId,
                 state = "connected",
                 activeLeaseId = "lease-b",
@@ -376,7 +432,7 @@ private class FakePanel(
     override fun acquireStandby(
         transaction: AndroidRedundantTransaction,
         operationId: String,
-        replaceLeaseId: String,
+        replaceLeaseId: String?,
     ): BackgroundRedundantCandidate {
         acquireOperationIds += operationId
         acquireReplaceLeaseIds += replaceLeaseId
@@ -388,7 +444,11 @@ private class FakePanel(
     override fun commitCandidate(
         transaction: AndroidRedundantTransaction,
         candidateLeaseId: String,
-    ): BackgroundRedundantSession = session()
+    ): BackgroundRedundantSession {
+        commitCalls += 1
+        if (commitFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
+        return session()
+    }
     override fun stop(transaction: AndroidRedundantTransaction): Boolean {
         stopCalls += 1
         return stopResults.removeFirstOrNull() ?: true

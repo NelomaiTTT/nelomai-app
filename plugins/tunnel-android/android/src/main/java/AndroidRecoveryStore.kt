@@ -430,7 +430,11 @@ internal object AndroidRecoveryEnvelopeCodec {
             transaction.retry.pendingRoleReason?.let { put("pendingRoleReason", it) }
             put("acquirePending", transaction.retry.acquirePending)
             transaction.retry.acquireOperationId?.let { put("acquireOperationId", it) }
-            transaction.retry.acquireReplaceLeaseId?.let { put("acquireReplaceLeaseId", it) }
+            if (transaction.retry.acquirePending) {
+                put("acquireReplaceLeaseId", transaction.retry.acquireReplaceLeaseId ?: JSONObject.NULL)
+            } else {
+                transaction.retry.acquireReplaceLeaseId?.let { put("acquireReplaceLeaseId", it) }
+            }
         })
     }
 
@@ -586,8 +590,8 @@ internal object AndroidRecoveryEnvelopeCodec {
             if (transaction.retry.roleObservationPending) {
                 require(transaction.containsCurrentLease(transaction.retry.pendingRoleLeaseId))
             }
-            require(transaction.retry.acquirePending ==
-                (transaction.retry.acquireOperationId != null && transaction.retry.acquireReplaceLeaseId != null))
+            require(transaction.retry.acquirePending == (transaction.retry.acquireOperationId != null))
+            require(transaction.retry.acquirePending || transaction.retry.acquireReplaceLeaseId == null)
             transaction.retry.acquireOperationId?.let(::validateSafeValue)
             transaction.retry.acquireReplaceLeaseId?.let(::validateSafeValue)
             transaction.retry.acquireReplaceLeaseId?.let { replaceLeaseId ->

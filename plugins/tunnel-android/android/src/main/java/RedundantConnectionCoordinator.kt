@@ -22,7 +22,7 @@ internal interface RedundantConnectionPanel {
     fun acquireStandby(
         transaction: AndroidRedundantTransaction,
         operationId: String,
-        replaceLeaseId: String,
+        replaceLeaseId: String?,
     ): BackgroundRedundantCandidate = throw UnsupportedOperationException()
     fun commitCandidate(
         transaction: AndroidRedundantTransaction,
@@ -59,7 +59,7 @@ internal fun routeVpnProcessRecovery(
 ): Boolean = when (recovery) {
     is RecoveryStoreResult.Failure -> false
     is RecoveryStoreResult.Success -> if (recovery.value.redundantTransaction != null) {
-        owner?.recover() ?: false
+        owner?.resume() ?: false
     } else {
         legacyRecovery()
         true
@@ -140,7 +140,7 @@ internal class RedundantConnectionCoordinator(
         }
         if (recoveryStarted) return@synchronized true
         val response = panel.recover(transaction)
-        val refreshed = transaction.withCanonical(response.session)
+        val refreshed = transaction.withRecoveredCanonical(response.session)
         val active = transaction.localActiveLeaseId.takeIf(response.session::containsCurrentLease)
             ?: response.session.activeLeaseId
             ?: return@synchronized false
@@ -269,11 +269,20 @@ internal class RedundantConnectionCoordinator(
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || !transaction.standbyDesired) return@synchronized false
         val replayOperationId = transaction.retry.acquireOperationId ?: operationId
-        val replacement = transaction.retry.acquireReplaceLeaseId ?: replaceLeaseId ?: listOfNotNull(
-            transaction.slotALeaseId,
-            transaction.slotBLeaseId,
-        ).firstOrNull { it != transaction.localActiveLeaseId } ?: return@synchronized false
-        if (!transaction.containsCurrentLease(replacement) || replacement == transaction.localActiveLeaseId) {
+        val replacement = if (transaction.retry.acquirePending) {
+            transaction.retry.acquireReplaceLeaseId
+        } else {
+            replaceLeaseId ?: listOfNotNull(
+                transaction.slotALeaseId,
+                transaction.slotBLeaseId,
+            ).firstOrNull { it != transaction.localActiveLeaseId }
+        }
+        if (replacement != null && (
+                !transaction.containsCurrentLease(replacement) || replacement == transaction.localActiveLeaseId
+            )) {
+            return@synchronized false
+        }
+        if (replacement == null && transaction.slotALeaseId != null && transaction.slotBLeaseId != null) {
             return@synchronized false
         }
         val staged = if (transaction.retry.acquirePending) transaction else transaction.copy(
@@ -288,7 +297,7 @@ internal class RedundantConnectionCoordinator(
             panel.acquireStandby(
                 staged,
                 requireNotNull(staged.retry.acquireOperationId),
-                requireNotNull(staged.retry.acquireReplaceLeaseId),
+                staged.retry.acquireReplaceLeaseId,
             )
         } catch (_: Throwable) {
             return@synchronized false
@@ -347,3 +356,28 @@ private fun AndroidRedundantTransaction.withCanonical(
     candidateSlot = candidateSlot.takeIf { candidateLeaseId != null &&
         candidateLeaseId != session.slotALeaseId && candidateLeaseId != session.slotBLeaseId },
 )
+
+/** Reconcile a remote commit response before persisting its canonical member set. */
+private fun AndroidRedundantTransaction.withRecoveredCanonical(
+    session: BackgroundRedundantSession,
+): AndroidRedundantTransaction {
+    val candidate = candidateLeaseId
+    val replacement = retry.acquireReplaceLeaseId
+    val remoteCommitApplied = retry.acquirePending && candidate != null &&
+        session.containsCurrentLease(candidate) &&
+        (replacement == null || !session.containsCurrentLease(replacement))
+    val canonical = withCanonical(session)
+    return if (remoteCommitApplied) {
+        canonical.copy(
+            candidateLeaseId = null,
+            candidateSlot = null,
+            retry = canonical.retry.copy(
+                acquirePending = false,
+                acquireOperationId = null,
+                acquireReplaceLeaseId = null,
+            ),
+        )
+    } else {
+        canonical
+    }
+}
