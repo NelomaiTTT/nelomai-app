@@ -708,10 +708,10 @@ index 8557c5ab..3480c49a 100644
  target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DAWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
 diff --git a/tunnel/tools/libwg-go/redundant_tun.go b/tunnel/tools/libwg-go/redundant_tun.go
 new file mode 100644
-index 00000000..37039697
+index 00000000..13a20146
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun.go
-@@ -0,0 +1,779 @@
+@@ -0,0 +1,783 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -1035,13 +1035,13 @@ index 00000000..37039697
 +	if slot >= uint32(len(r.slots)) {
 +		return ErrInvalidRedundantSlot
 +	}
++	r.probeOpMu.Lock()
 +	r.routeMu.Lock()
 +	closedNow := r.slots[slot].closeTransition()
 +	r.routeMu.Unlock()
 +	if closedNow {
 +		r.counters.slotCloses.Add(1)
 +	}
-+	<-r.slots[slot].dispatchDone
 +	r.probeMu.Lock()
 +	for token, state := range r.probes {
 +		if state.slot == slot {
@@ -1049,6 +1049,8 @@ index 00000000..37039697
 +		}
 +	}
 +	r.probeMu.Unlock()
++	r.probeOpMu.Unlock()
++	<-r.slots[slot].dispatchDone
 +	return nil
 +}
 +
@@ -1087,6 +1089,8 @@ index 00000000..37039697
 +}
 +
 +func (r *RedundantTunnel) closeWithError(cause error) {
++	r.probeOpMu.Lock()
++	defer r.probeOpMu.Unlock()
 +	r.closeOnce.Do(func() {
 +		r.closed.Store(true)
 +		close(r.done)
@@ -1493,10 +1497,10 @@ index 00000000..37039697
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_test.go b/tunnel/tools/libwg-go/redundant_tun_test.go
 new file mode 100644
-index 00000000..e991aedb
+index 00000000..2c8adfa8
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_test.go
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,845 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -1522,6 +1526,13 @@ index 00000000..e991aedb
 +	once     sync.Once
 +}
 +
++type controlledWriteErrorTUN struct {
++	*fakeRealTUN
++	writeStarted chan struct{}
++	releaseWrite chan struct{}
++	startOnce    sync.Once
++}
++
 +func newFakeRealTUN() *fakeRealTUN {
 +	device := &fakeRealTUN{
 +		outbound: make(chan []byte, 8),
@@ -1531,6 +1542,26 @@ index 00000000..e991aedb
 +	}
 +	device.events <- tun.EventUp
 +	return device
++}
++
++func newControlledWriteErrorTUN() *controlledWriteErrorTUN {
++	return &controlledWriteErrorTUN{
++		fakeRealTUN:  newFakeRealTUN(),
++		writeStarted: make(chan struct{}),
++		releaseWrite: make(chan struct{}),
++	}
++}
++
++func (f *controlledWriteErrorTUN) Write(_ [][]byte, _ int) (int, error) {
++	f.startOnce.Do(func() {
++		close(f.writeStarted)
++	})
++	select {
++	case <-f.releaseWrite:
++		return 0, errors.New("controlled real TUN write failure")
++	case <-f.closed:
++		return 0, os.ErrClosed
++	}
 +}
 +
 +func (f *fakeRealTUN) File() *os.File { return nil }
@@ -2168,4 +2199,150 @@ index 00000000..e991aedb
 +	requireNoDevicePacketBeforeClose(t, slotB, func() error {
 +		return tunnel.CloseSlot(1)
 +	})
++}
++
++func TestCloseSlotWaitsForConcurrentProbeInjection(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 15}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	tunnel.routeMu.Lock()
++	injected := make(chan error, 1)
++	go func() {
++		injected <- tunnel.InjectProbe(1, query, token)
++	}()
++	waitForProbeRegistration(t, tunnel, token, func() {
++		tunnel.routeMu.Unlock()
++	})
++	closed := make(chan error, 1)
++	go func() {
++		closed <- tunnel.CloseSlot(1)
++	}()
++
++	select {
++	case err := <-closed:
++		tunnel.routeMu.Unlock()
++		t.Fatalf("slot close finished while a probe operation was in flight: %v", err)
++	case <-time.After(20 * time.Millisecond):
++	}
++	tunnel.routeMu.Unlock()
++	if err := <-injected; err != nil {
++		t.Fatalf("probe injection failed before slot close: %v", err)
++	}
++	select {
++	case err := <-closed:
++		if err != nil {
++			t.Fatalf("slot close failed after the probe operation completed: %v", err)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("slot close did not finish after the probe operation completed")
++	}
++	if err := tunnel.InjectProbe(1, query, ProbeToken{Port: token.Port, DNSID: 16}); !errors.Is(err, ErrRedundantSlotClosed) {
++		t.Fatalf("post-close injection returned %v, want %v", err, ErrRedundantSlotClosed)
++	}
++}
++
++func TestGlobalCloseWaitsForConcurrentProbeInjection(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 17}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	tunnel.routeMu.Lock()
++	injected := make(chan error, 1)
++	go func() {
++		injected <- tunnel.InjectProbe(1, query, token)
++	}()
++	waitForProbeRegistration(t, tunnel, token, func() {
++		tunnel.routeMu.Unlock()
++	})
++	closed := make(chan error, 1)
++	go func() {
++		closed <- tunnel.Close()
++	}()
++
++	select {
++	case err := <-closed:
++		tunnel.routeMu.Unlock()
++		t.Fatalf("global close finished while a probe operation was in flight: %v", err)
++	case <-time.After(20 * time.Millisecond):
++	}
++	tunnel.routeMu.Unlock()
++	if err := <-injected; err != nil {
++		t.Fatalf("probe injection failed before global close: %v", err)
++	}
++	select {
++	case err := <-closed:
++		if err != nil {
++			t.Fatalf("global close failed after the probe operation completed: %v", err)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("global close did not finish after the probe operation completed")
++	}
++	if err := tunnel.InjectProbe(1, query, ProbeToken{Port: token.Port, DNSID: 18}); !errors.Is(err, ErrRedundantTunnelClosed) {
++		t.Fatalf("post-close injection returned %v, want %v", err, ErrRedundantTunnelClosed)
++	}
++}
++
++func TestCloseSlotDoesNotDeadlockWithInboundWriteFailure(t *testing.T) {
++	real := newControlledWriteErrorTUN()
++	tunnel, err := NewRedundantTunnel(real)
++	if err != nil {
++		t.Fatalf("failed to create redundant tunnel: %v", err)
++	}
++	slotA, err := tunnel.Slot(0)
++	if err != nil {
++		t.Fatalf("failed to get active slot: %v", err)
++	}
++	writeDevicePacket(t, slotA, []byte{1, 2, 3})
++	select {
++	case <-real.writeStarted:
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("inbound dispatcher did not enter real TUN write")
++	}
++
++	closed := make(chan error, 1)
++	go func() {
++		closed <- tunnel.CloseSlot(0)
++	}()
++	deadline := time.Now().Add(redundantTUNTestTimeout)
++	for tunnel.probeOpMu.TryLock() {
++		tunnel.probeOpMu.Unlock()
++		if time.Now().After(deadline) {
++			t.Fatal("slot close did not acquire the probe-operation fence")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	close(real.releaseWrite)
++	select {
++	case err := <-closed:
++		if err != nil {
++			t.Fatalf("slot close failed after inbound write error: %v", err)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("slot close deadlocked with inbound write error")
++	}
++	if !tunnel.Closed() {
++		t.Fatal("inbound write error did not close the redundant tunnel")
++	}
++}
++
++func waitForProbeRegistration(
++	t *testing.T,
++	tunnel *RedundantTunnel,
++	token ProbeToken,
++	onTimeout func(),
++) {
++	t.Helper()
++	deadline := time.Now().Add(redundantTUNTestTimeout)
++	for {
++		tunnel.probeMu.Lock()
++		_, registered := tunnel.probes[token]
++		tunnel.probeMu.Unlock()
++		if registered {
++			return
++		}
++		if time.Now().After(deadline) {
++			onTimeout()
++			t.Fatal("probe was not registered before enqueue")
++		}
++		time.Sleep(time.Millisecond)
++	}
 +}
