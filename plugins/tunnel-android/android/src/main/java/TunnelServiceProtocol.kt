@@ -719,6 +719,7 @@ private fun Bundle.toRedundantMember(): RedundantMemberArgs = RedundantMemberArg
 private fun RedundantStartArgs.copyForServiceTransport(): RedundantStartArgs =
     RedundantStartArgs().also { copy ->
         copy.sessionId = sessionId
+        copy.state = state
         copy.operationId = operationId
         copy.requestFingerprint = requestFingerprint
         copy.reserveEnabled = reserveEnabled
@@ -739,6 +740,7 @@ private fun RedundantStartArgs.copyForServiceTransport(): RedundantStartArgs =
 
 internal fun RedundantStartArgs.toBundle(): Bundle = Bundle().apply {
     putString("session_id", sessionId)
+    putString("state", state)
     putString("operation_id", operationId)
     putString("request_fingerprint", requestFingerprint)
     putBoolean("reserve_enabled", reserveEnabled)
@@ -759,6 +761,7 @@ internal fun RedundantStartArgs.toBundle(): Bundle = Bundle().apply {
 
 internal fun Bundle.toRedundantStart(): RedundantStartArgs = RedundantStartArgs().also {
     it.sessionId = requireNotNull(getString("session_id"))
+    it.state = requireNotNull(getString("state"))
     it.operationId = requireNotNull(getString("operation_id"))
     it.requestFingerprint = requireNotNull(getString("request_fingerprint"))
     it.reserveEnabled = getBoolean("reserve_enabled")

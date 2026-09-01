@@ -143,6 +143,7 @@ class RedundantStandbyArgs {
 @InvokeArg
 class RedundantStartArgs {
     lateinit var sessionId: String
+    lateinit var state: String
     lateinit var operationId: String
     lateinit var requestFingerprint: String
     var reserveEnabled: Boolean = false

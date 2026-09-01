@@ -1,7 +1,9 @@
 use nelomai_client_tunnel::{
     RedundantTunnelMemberStart, RedundantTunnelStandbyStart, RedundantTunnelStart,
 };
-use nelomai_contracts::{HealthProbeKind, RedundancyMemberSlot, RedundantHealthProbe};
+use nelomai_contracts::{
+    HealthProbeKind, RedundancyMemberSlot, RedundancyState, RedundantHealthProbe,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroizing;
@@ -197,6 +199,7 @@ impl Serialize for RedundantStandbyRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RedundantStartRequest {
     pub session_id: String,
+    pub state: RedundancyState,
     pub operation_id: String,
     pub request_fingerprint: String,
     pub reserve_enabled: bool,
@@ -249,6 +252,7 @@ impl From<RedundantTunnelStart> for RedundantStartRequest {
     fn from(start: RedundantTunnelStart) -> Self {
         Self {
             session_id: start.session_id,
+            state: start.state,
             operation_id: start.operation_id,
             request_fingerprint: start.request_fingerprint,
             reserve_enabled: start.reserve_enabled,
@@ -619,6 +623,7 @@ mod tests {
         let mut request = StartTunnelRequest::new(b"primary-never-log-this");
         request.redundancy = Some(RedundantStartRequest {
             session_id: "session-1".to_string(),
+            state: RedundancyState::Ready,
             operation_id: "operation-1".to_string(),
             request_fingerprint: "f".repeat(64),
             reserve_enabled: true,
@@ -657,6 +662,7 @@ mod tests {
         let debug = format!("{request:?}");
 
         assert_eq!(value["redundancy"]["primary"]["slot"], "A");
+        assert_eq!(value["redundancy"]["state"], "ready");
         assert_eq!(value["redundancy"]["reserveEnabled"], true);
         assert_eq!(value["redundancy"]["standby"]["member"]["slot"], "B");
         assert_eq!(value["redundancy"]["standby"]["configuration"][0], b's');

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use nelomai_contracts::{
-    EgressMode, Layer, RedundancyMemberSlot, RedundantHealthProbe, RouteMode, SplitTunnelMode,
-    TicConnectionMode,
+    EgressMode, Layer, RedundancyMemberSlot, RedundancyState, RedundantHealthProbe, RouteMode,
+    SplitTunnelMode, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -188,6 +188,7 @@ impl fmt::Debug for RedundantTunnelStandbyStart {
 #[derive(Debug)]
 pub struct RedundantTunnelStart {
     pub session_id: String,
+    pub state: RedundancyState,
     pub operation_id: String,
     pub request_fingerprint: String,
     pub reserve_enabled: bool,
@@ -589,6 +590,7 @@ mod tests {
             quick_connection: None,
             redundancy: Some(RedundantTunnelStart {
                 session_id: "session-1".to_string(),
+                state: RedundancyState::Ready,
                 operation_id: "operation-1".to_string(),
                 request_fingerprint: "f".repeat(64),
                 reserve_enabled: true,

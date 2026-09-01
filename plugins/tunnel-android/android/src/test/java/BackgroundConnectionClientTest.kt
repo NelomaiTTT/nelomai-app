@@ -76,6 +76,42 @@ class BackgroundConnectionClientTest {
         recovered.configurations.values.forEach { it.fill(0) }
     }
 
+    @Test
+    fun degradedSingleMemberRecoveryRejectsMissingPrimaryHealthProbe() {
+        val primaryLease = "10000000-0000-4000-8000-000000000001"
+        val transaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = AndroidIntentTemplate(
+                DEVICE_ID, DEVICE_ID, "stray", "dynamic", "standalone", "ipv4", true,
+            ),
+            sessionId = "20000000-0000-4000-8000-000000000001",
+            slotALeaseId = primaryLease,
+            slotBLeaseId = null,
+            localActiveLeaseId = primaryLease,
+            standbyDesired = false,
+            roleGeneration = 1,
+            membershipGeneration = 1,
+            startOperationId = OPERATION_ID,
+            startRequestFingerprint = "a".repeat(64),
+        )
+        val payload = JSONObject().apply {
+            put("connection", JSONObject().put("lease_id", primaryLease))
+            put("configuration", "primary-config")
+            put("redundancy", JSONObject().apply {
+                put("session_id", transaction.sessionId)
+                put("state", "degraded")
+                put("role_generation", 1)
+                put("membership_generation", 1)
+                put("virtual_address_v4", "10.200.0.2/32")
+                put("standby_desired", false)
+                put("reason", "standby_released")
+                put("standby", JSONObject.NULL)
+            })
+        }
+
+        assertRejected { redundantRecoveryTransportFromJson(payload, transaction) }
+    }
+
     private fun assertRejected(block: () -> Unit) {
         try {
             block()

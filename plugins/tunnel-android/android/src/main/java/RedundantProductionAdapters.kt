@@ -35,7 +35,14 @@ internal fun validatedRedundantHealthProbe(
 internal fun redundantHealthProbesFromStart(
     redundancy: RedundantStartArgs,
 ): Map<String, BackgroundRedundantHealthProbe> {
-    require(!redundancy.standbyDesired || redundancy.primary.healthProbe != null)
+    require(redundancy.state in setOf("disabled", "degraded", "warming", "ready"))
+    if (redundancy.state == "disabled") {
+        require(!redundancy.standbyDesired)
+        require(redundancy.standby == null)
+        require(redundancy.primary.healthProbe == null)
+    } else {
+        require(redundancy.primary.healthProbe != null)
+    }
     require(redundancy.standbyDesired || redundancy.standby == null)
     return linkedMapOf<String, BackgroundRedundantHealthProbe>().apply {
         redundancy.primary.healthProbe?.let {

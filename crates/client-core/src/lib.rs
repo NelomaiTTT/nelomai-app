@@ -4882,7 +4882,7 @@ fn redundant_tunnel_start(
         }));
     }
     if redundancy.state == RedundancyState::Disabled
-        && (redundancy.standby_desired || redundancy.standby.is_some())
+        && (redundancy.standby_desired || redundancy.standby.is_some() || primary_probe.is_some())
     {
         return Err(CoreError::Api(CoreApiError::Rejected {
             code: "invalid_client_api_response".to_string(),
@@ -4903,6 +4903,7 @@ fn redundant_tunnel_start(
         });
     Ok(Some(RedundantTunnelStart {
         session_id: redundancy.session_id.clone(),
+        state: redundancy.state,
         operation_id: operation_id.to_string(),
         request_fingerprint: request_fingerprint.to_string(),
         reserve_enabled,
@@ -4939,6 +4940,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(start.session_id, "20000000-0000-4000-8000-000000000001");
+        assert_eq!(start.state, RedundancyState::Warming);
         assert!(start.reserve_enabled);
         assert_eq!(
             start.primary.slot,
@@ -4962,6 +4964,27 @@ mod tests {
             .expose()
             .contains("standby-delivered-only-to-core"));
         assert!(!format!("{start:?}").contains("standby-delivered-only-to-core"));
+    }
+
+    #[test]
+    fn disabled_redundant_response_rejects_a_primary_health_probe() {
+        let mut response: ConnectionStartResponse = serde_json::from_str(include_str!(
+            "../../../contracts/fixtures/valid/connection-start-redundant-response.json"
+        ))
+        .unwrap();
+        let redundancy = response.redundancy.as_mut().unwrap();
+        redundancy.state = RedundancyState::Disabled;
+        redundancy.standby_desired = false;
+        redundancy.standby = None;
+
+        let result =
+            redundant_tunnel_start(&response, "operation-1", Some(&"f".repeat(64)), Some(false));
+
+        assert!(matches!(
+            result,
+            Err(CoreError::Api(CoreApiError::Rejected { ref code, .. }))
+                if code == "invalid_client_api_response"
+        ));
     }
 
     #[test]

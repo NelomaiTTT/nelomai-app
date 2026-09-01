@@ -1331,12 +1331,21 @@ internal fun redundantRecoveryTransportFromJson(
             primaryConfiguration.size <= BACKGROUND_MAX_RESPONSE_BYTES)
         val primaryLeaseId = payload.getJSONObject("connection").getString("lease_id")
         val redundancy = payload.getJSONObject("redundancy")
+        val redundancyState = redundancy.getString("state").also {
+            require(it in setOf("disabled", "degraded", "warming", "ready"))
+        }
         require(redundancy.getString("session_id") == transaction.sessionId)
         val standbyDesired = redundancy.getBoolean("standby_desired")
         val standby = redundancy.optJSONObject("standby")
         val primaryProbe = payload.optJSONObject("health_probe")
             ?.let(::redundantHealthProbeFromJson)
-        require(!standbyDesired || primaryProbe != null)
+        if (redundancyState == "disabled") {
+            require(!standbyDesired)
+            require(standby == null)
+            require(primaryProbe == null)
+        } else {
+            require(primaryProbe != null)
+        }
         require(standbyDesired || standby == null)
         val standbyLeaseId = standby?.getJSONObject("connection")?.getString("lease_id")
         standbyConfiguration = standby?.getString("configuration")
@@ -1363,7 +1372,7 @@ internal fun redundantRecoveryTransportFromJson(
         }
         val session = BackgroundRedundantSession(
             sessionId = transaction.sessionId,
-            state = redundancy.getString("state"),
+            state = redundancyState,
             activeLeaseId = primaryLeaseId,
             slotALeaseId = recoveredSlot(RedundantSlot.A),
             slotBLeaseId = recoveredSlot(RedundantSlot.B),

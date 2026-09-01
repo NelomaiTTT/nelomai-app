@@ -23,6 +23,7 @@ class RedundantStartArgsTest {
                 redundant.sessionId = "20000000-0000-4000-8000-000000000001"
                 redundant.operationId = "30000000-0000-4000-8000-000000000001"
                 redundant.requestFingerprint = "a".repeat(64)
+                redundant.state = "disabled"
                 redundant.virtualAddressV4 = "10.0.0.2/32"
                 redundant.standbyDesired = false
                 redundant.activeLeaseId = primaryLease
@@ -45,6 +46,21 @@ class RedundantStartArgsTest {
         assertFalse(transaction.standbyDesired)
         assertEquals(null, transaction.slotBLeaseId)
         assertTrue(redundantHealthProbesFromStart(requireNotNull(args.redundancy)).isEmpty())
+    }
+
+    @Test
+    fun `degraded single-member start rejects a missing primary health probe`() {
+        val redundancy = RedundantStartArgs().also {
+            it.state = "degraded"
+            it.standbyDesired = false
+            it.primary = RedundantMemberArgs().also { member ->
+                member.slot = "A"
+                member.leaseId = "10000000-0000-4000-8000-000000000001"
+                member.healthProbe = null
+            }
+        }
+
+        assertRejected { redundantHealthProbesFromStart(redundancy) }
     }
 
     @Test
@@ -96,6 +112,7 @@ class RedundantStartArgsTest {
                 redundant.sessionId = "20000000-0000-4000-8000-000000000001"
                 redundant.operationId = "30000000-0000-4000-8000-000000000001"
                 redundant.requestFingerprint = "a".repeat(64)
+                redundant.state = "ready"
                 redundant.reserveEnabled = false
                 redundant.virtualAddressV4 = "10.200.0.2/32"
                 redundant.standbyDesired = true
