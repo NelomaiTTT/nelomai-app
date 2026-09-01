@@ -272,6 +272,64 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun cancelledStartWithUnreadableStoreStopsLocallyAndCannotLaterBecomeReady() {
+        val backend = CoordinatorRecordBackend()
+        backend.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1)))
+        val native = FakeNative()
+        val panel = FakePanel()
+        val gate = RedundantStartOperationGate()
+        val outcomes = mutableListOf<String>()
+        val coordinator = RedundantConnectionCoordinator(
+            AndroidRecoveryStore(backend, CoordinatorBootIdentity()),
+            panel,
+            native,
+            nowMs = { 20_000L },
+        )
+        assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
+        assertTrue(coordinator.start(
+            transaction().copy(startOperationId = "operation-a"),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            shouldCancel = { gate.isCancelled("operation-a") },
+            onPrimaryStarted = {
+                gate.complete("operation-a") { outcomes += "running" }
+                gate.finish("operation-a")
+            },
+            onPrimaryCancelled = {
+                gate.completeCancelled("operation-a")
+            },
+        ))
+
+        assertEquals("operation-a", gate.cancelPendingAndComplete())
+        backend.failReads = true
+        assertTrue(coordinator.closeLocal())
+        backend.failReads = false
+
+        coordinator.onHealthObservations(listOf(
+            healthSlot(
+                index = 0,
+                active = true,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = 0,
+            ),
+        ))
+        assertEquals(listOf("stopped"), outcomes)
+        assertTrue(gate.isCancelled("operation-a"))
+        assertFalse(coordinator.isRunning())
+
+        assertTrue(coordinator.fenceRevoke())
+        assertTrue(coordinator.revoke())
+        gate.finish("operation-a")
+
+        assertEquals(2, native.stopCalls)
+        assertEquals(1, panel.stopCalls)
+        assertEquals(null, coordinator.status())
+        assertFalse(gate.isCancelled("operation-a"))
+    }
+
+    @Test
     fun wallClockJumpCannotExpirePrimaryReadiness() {
         var wallMs = 1_000L
         var elapsedMs = 5_000L

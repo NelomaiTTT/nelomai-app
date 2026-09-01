@@ -9,6 +9,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -47,12 +48,11 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
-    fun redundantStartCancellationSurvivesWorkerSetupUntilStoppedIsDelivered() {
+    fun redundantStartCancellationSurvivesSetupUntilReadinessAcknowledgesIt() {
         val outcomes = mutableListOf<String>()
         val gate = RedundantStartOperationGate()
 
         assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
-        gate.workerFinished("operation-a")
         assertFalse(gate.begin("operation-b") { outcomes += "wrong" })
         assertFalse(gate.cancel("operation-b"))
         assertTrue(gate.cancel("operation-a"))
@@ -60,6 +60,11 @@ class NelomaiVpnServiceTest {
         assertTrue(gate.completeCancelled("operation-a"))
 
         assertEquals(listOf("stopped"), outcomes)
+        assertTrue(gate.isCancelled("operation-a"))
+        assertFalse(gate.begin("operation-b") { outcomes += "wrong" })
+
+        gate.finish("operation-a")
+
         assertFalse(gate.isCancelled("operation-a"))
         assertTrue(gate.begin("operation-b") { outcomes += "stopped-b" })
     }
@@ -75,7 +80,7 @@ class NelomaiVpnServiceTest {
         assertTrue(gate.isCancelled("operation-a"))
         assertFalse(gate.begin("operation-b") { outcomes += "wrong" })
 
-        gate.workerFinished("operation-a")
+        gate.finish("operation-a")
 
         assertEquals(listOf("stopped"), outcomes)
         assertFalse(gate.isCancelled("operation-a"))
@@ -94,7 +99,7 @@ class NelomaiVpnServiceTest {
         assertTrue(gate.isCancelled("operation-a"))
         assertFalse(gate.complete("operation-a") { outcomes += "running" })
 
-        gate.workerFinished("operation-a")
+        gate.finish("operation-a")
 
         assertFalse(gate.isCancelled("operation-a"))
         assertTrue(gate.begin("operation-b") { outcomes += "stopped-b" })
@@ -109,7 +114,6 @@ class NelomaiVpnServiceTest {
             val release = CountDownLatch(1)
             val operationId = "operation-$index"
             assertTrue(gate.begin(operationId) { outcomes += "stopped" })
-            gate.workerFinished(operationId)
             val runningThread = Thread {
                 ready.countDown()
                 release.await()
@@ -129,7 +133,102 @@ class NelomaiVpnServiceTest {
 
             assertEquals(1, outcomes.size)
             assertTrue(outcomes.single() in setOf("running", "stopped"))
+            gate.finish(operationId)
         }
+    }
+
+    @Test
+    fun revokeLifecycleDrainsCleanupAcrossDestroyAndFinalizesFrameworkExactlyOnce() {
+        val lifecycle = RedundantRevokeLifecycleGate()
+        val queued = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(queued::addLast))
+        val events = mutableListOf<String>()
+
+        assertTrue(lifecycle.begin())
+        dispatchRedundantRevoke(
+            dispatcher,
+            fence = {
+                events += "fence"
+                true
+            },
+            revoke = {
+                events += "revoke"
+                true
+            },
+            onComplete = {
+                lifecycle.cleanupFinished()
+                lifecycle.completeFramework { events += "framework" }
+            },
+        )
+
+        assertTrue(lifecycle.hasPendingCleanup())
+        assertTrue(lifecycle.needsFrameworkCompletion())
+        lifecycle.completeFramework { events += "framework" }
+        assertEquals(listOf("framework"), events)
+
+        queued.removeFirst().run()
+
+        assertFalse(lifecycle.hasPendingCleanup())
+        assertFalse(lifecycle.needsFrameworkCompletion())
+        assertEquals(listOf("framework", "fence", "revoke"), events)
+    }
+
+    @Test
+    fun revokeLifecycleFinalizesDuringDestroyAfterCleanupButBeforeMainCallback() {
+        val lifecycle = RedundantRevokeLifecycleGate()
+        val worker = ArrayDeque<Runnable>()
+        val main = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(worker::addLast))
+        var frameworkCalls = 0
+
+        assertTrue(lifecycle.begin())
+        dispatchRedundantRevoke(
+            dispatcher,
+            fence = { true },
+            revoke = { true },
+            onComplete = {
+                lifecycle.cleanupFinished()
+                main += Runnable {
+                    lifecycle.completeFramework { frameworkCalls += 1 }
+                }
+            },
+        )
+        worker.removeFirst().run()
+
+        assertFalse(lifecycle.hasPendingCleanup())
+        assertTrue(lifecycle.needsFrameworkCompletion())
+        assertFalse(lifecycle.begin())
+        lifecycle.completeFramework { frameworkCalls += 1 }
+        main.removeFirst().run()
+
+        assertFalse(lifecycle.needsFrameworkCompletion())
+        assertEquals(1, frameworkCalls)
+    }
+
+    @Test
+    fun rejectedRevokeDispatchStillCompletesFrameworkFallback() {
+        val lifecycle = RedundantRevokeLifecycleGate()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor {
+            throw RejectedExecutionException("destroyed")
+        })
+        var result: RedundantRevokeResult? = null
+        var frameworkCalls = 0
+
+        assertTrue(lifecycle.begin())
+        dispatchRedundantRevoke(
+            dispatcher,
+            fence = { error("must not run") },
+            revoke = { error("must not run") },
+            onComplete = {
+                result = it
+                lifecycle.cleanupFinished()
+                lifecycle.completeFramework { frameworkCalls += 1 }
+            },
+        )
+
+        assertEquals(RedundantRevokeResult(fenced = false, stopped = false), result)
+        assertFalse(lifecycle.hasPendingCleanup())
+        assertEquals(1, frameworkCalls)
     }
 
     @Test
