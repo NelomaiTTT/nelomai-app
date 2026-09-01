@@ -2999,6 +2999,15 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun releaseRedundantStandby(invoke: Invoke) {
+        TunnelServiceClient.releaseRedundantStandby(
+            activity.applicationContext,
+            { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
     fun clearBackground(invoke: Invoke) {
         TunnelServiceClient.clearBackground(
             activity.applicationContext,
@@ -3226,5 +3235,6 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         put("leasePhase", leasePhase)
         put("nextRetryAtUnix", nextRetryAtUnix)
         put("lastErrorCode", lastErrorCode)
+        put("reserveState", reserveState)
     }
 }

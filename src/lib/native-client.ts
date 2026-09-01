@@ -137,6 +137,8 @@ export function createNativeClient(
       egressMode: EgressMode,
     ) =>
       invoke("app_set_tic_egress_mode", { connectionMode, egressMode }) as Promise<AppPreferences>,
+    setUseReserveConnection: (enabled: boolean) =>
+      invoke("app_set_use_reserve_connection", { enabled }) as Promise<AppPreferences>,
     login: (request: LoginRequest) =>
       invoke("app_login", { request }) as Promise<Bootstrap>,
     bootstrap: () => invoke("app_bootstrap") as Promise<Bootstrap>,

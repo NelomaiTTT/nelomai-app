@@ -27,6 +27,7 @@ export type RouteMode = "standalone" | "via_tak";
 export type EgressMode = "ipv4" | "prefer_ipv6";
 export type Platform = "android" | "windows" | "macos" | "linux";
 export type ConnectionIntentStatus = "none" | "recovering" | "blocked_terminal";
+export type ReserveState = "warming" | "ready" | "unavailable" | "failover";
 export type PrimaryConnectionAction = "start" | "stop" | "retry";
 
 export interface Access {
@@ -151,6 +152,7 @@ export interface AppState {
   nextRetryAtUnix: number | null;
   warning: string | null;
   metrics: ConnectionMetrics | null;
+  reserveState: ReserveState | null;
 }
 
 export function primaryAction(state: {
@@ -199,6 +201,32 @@ export interface AppPreferences {
   dnsProvider: DnsProvider;
   personalTicEgressMode: EgressMode;
   dynamicTicEgressMode: EgressMode;
+  useReserveConnection: boolean;
+}
+
+export function defaultAppPreferences(platform: Platform): AppPreferences {
+  return {
+    closeToTraySupported: false,
+    closeToTray: true,
+    dnsProvider: "auto",
+    personalTicEgressMode: "ipv4",
+    dynamicTicEgressMode: "ipv4",
+    useReserveConnection: platform === "android",
+  };
+}
+
+export function connectionView(state: {
+  reserveState: ReserveState | null;
+}): { statusText: string; requiresUserAction: boolean } {
+  const statusText = state.reserveState === null
+    ? "Подключено"
+    : {
+        warming: "Резерв запускается",
+        ready: "Резерв готов",
+        unavailable: "Резерв временно недоступен",
+        failover: "Подключено через резервный сервер",
+      }[state.reserveState];
+  return { statusText, requiresUserAction: false };
 }
 
 export type DnsProvider = "auto" | "google" | "yandex" | "quad9";

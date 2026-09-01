@@ -78,6 +78,49 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun reserveStatusMovesCalmlyFromWarmingToReadyAndFailover() {
+        val states = mutableListOf<RedundantReserveState?>()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            FakePanel(),
+            FakeNative(),
+            nowMs = { 20_000L },
+            onReserveStateChanged = states::add,
+        )
+
+        assertTrue(coordinator.recover())
+        assertEquals(RedundantReserveState.WARMING, coordinator.reserveState())
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = 0L,
+            ),
+        )))
+        assertEquals(RedundantReserveState.READY, coordinator.reserveState())
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        )))
+        assertEquals(RedundantReserveState.FAILOVER, coordinator.reserveState())
+        assertEquals(
+            listOf(
+                RedundantReserveState.WARMING,
+                RedundantReserveState.READY,
+                RedundantReserveState.FAILOVER,
+            ),
+            states,
+        )
+        assertEquals(
+            "Подключено через резервный сервер",
+            redundantNotificationContent(coordinator.reserveState()),
+        )
+    }
+
+    @Test
     fun recoveryRequiresAndActivatesTheLocalActiveConfigurationWhileStandbyIsBestEffort() {
         val native = FakeNative(startFailures = setOf("lease-b"))
         val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
@@ -372,6 +415,74 @@ class RedundantConnectionCoordinatorTest {
         nowMs += 60_000
         assertTrue(coordinator.tick())
         assertTrue(panel.acquireOperationIds.isEmpty())
+        assertEquals(listOf("lease-a"), panel.releasedLeaseIds)
+    }
+
+    @Test
+    fun disablingADegradedSingleMemberSessionNeedsNoSyntheticMemberRelease() {
+        val panel = FakePanel()
+        val single = transaction().copy(slotBLeaseId = null)
+        val coordinator = RedundantConnectionCoordinator(store(single), panel, FakeNative())
+
+        assertTrue(coordinator.releaseStandby())
+        assertFalse(requireNotNull(coordinator.status()).standbyDesired)
+        assertTrue(panel.releasedLeaseIds.isEmpty())
+        assertEquals(null, coordinator.reserveState())
+    }
+
+    @Test
+    fun failedStandbyReleaseIsRetriedByTickWithoutReenablingStandby() {
+        val panel = FakePanel(releaseFailures = ArrayDeque(listOf(true, false)))
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), panel, FakeNative())
+
+        assertFalse(coordinator.releaseStandby())
+        assertFalse(requireNotNull(coordinator.status()).standbyDesired)
+        assertTrue(coordinator.tick())
+
+        val released = requireNotNull(coordinator.status())
+        assertFalse(released.standbyDesired)
+        assertEquals(null, released.slotBLeaseId)
+        assertEquals(listOf("lease-b", "lease-b"), panel.releaseAttempts)
+        assertTrue(panel.acquireOperationIds.isEmpty())
+    }
+
+    @Test
+    fun standbyReleaseConflictRebasesGenerationsBeforeRetryingExactInactiveMember() {
+        val panel = FakePanel(
+            recoveredSession = session(
+                activeLeaseId = "lease-a",
+                roleGeneration = 7,
+                membershipGeneration = 4,
+            ),
+            releaseFailureCodes = ArrayDeque(listOf("session_membership_conflict")),
+        )
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), panel, FakeNative())
+
+        assertFalse(coordinator.releaseStandby())
+        val rebased = requireNotNull(coordinator.status())
+        assertFalse(rebased.standbyDesired)
+        assertEquals(7L, rebased.roleGeneration)
+        assertEquals(4L, rebased.membershipGeneration)
+
+        assertTrue(coordinator.tick())
+        assertEquals(listOf("lease-b", "lease-b"), panel.releaseAttempts)
+        assertEquals(null, coordinator.status()?.slotBLeaseId)
+    }
+
+    @Test
+    fun recoveryWithDisabledStandbyStartsOnlyActiveAndDrainsCanonicalInactive() {
+        val disabled = transaction().copy(standbyDesired = false)
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(disabled), panel, native)
+
+        assertTrue(coordinator.recover())
+
+        assertEquals(listOf("lease-a"), native.started)
+        assertEquals(listOf("lease-a"), native.activated)
+        assertEquals(listOf("lease-b"), panel.releaseAttempts)
+        assertFalse(requireNotNull(coordinator.status()).standbyDesired)
+        assertEquals(null, coordinator.status()?.slotBLeaseId)
     }
 
     @Test
@@ -820,6 +931,8 @@ private class FakePanel(
     private val roleFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val acquireFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val commitFailures: ArrayDeque<Boolean> = ArrayDeque(),
+    private val releaseFailures: ArrayDeque<Boolean> = ArrayDeque(),
+    private val releaseFailureCodes: ArrayDeque<String> = ArrayDeque(),
 ) : RedundantConnectionPanel {
     var stopCalls = 0
     var roleCalls = 0
@@ -828,6 +941,8 @@ private class FakePanel(
     val acquireReplaceLeaseIds = mutableListOf<String?>()
     val commitTransactions = mutableListOf<AndroidRedundantTransaction>()
     val candidateConfigurations = mutableListOf<ByteArray>()
+    val releasedLeaseIds = mutableListOf<String>()
+    val releaseAttempts = mutableListOf<String>()
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
         RedundantRecoveryResponse(
             session = recoveredSession ?: BackgroundRedundantSession(
@@ -858,7 +973,13 @@ private class FakePanel(
     override fun releaseStandby(
         transaction: AndroidRedundantTransaction,
         inactiveLeaseId: String,
-    ): BackgroundRedundantSession = BackgroundRedundantSession(
+    ): BackgroundRedundantSession {
+        releaseAttempts += inactiveLeaseId
+        releaseFailureCodes.removeFirstOrNull()?.let { throw BackgroundConnectionException(it) }
+        if (releaseFailures.removeFirstOrNull() == true) {
+            throw BackgroundConnectionException("offline")
+        }
+        return BackgroundRedundantSession(
         sessionId = transaction.sessionId,
         state = "connected",
         activeLeaseId = transaction.localActiveLeaseId,
@@ -868,7 +989,8 @@ private class FakePanel(
         roleGeneration = transaction.roleGeneration,
         membershipGeneration = transaction.membershipGeneration + 1,
         reason = null,
-    )
+        ).also { releasedLeaseIds += inactiveLeaseId }
+    }
     override fun acquireStandby(
         transaction: AndroidRedundantTransaction,
         operationId: String,

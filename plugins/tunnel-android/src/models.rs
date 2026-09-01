@@ -439,6 +439,7 @@ pub struct ConnectionIntentStatusResponse {
     pub lease_phase: Option<String>,
     pub next_retry_at_unix: Option<i64>,
     pub last_error_code: Option<String>,
+    pub reserve_state: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

@@ -13,6 +13,57 @@ import kotlin.concurrent.thread
 
 class AutomaticDiagnosticsTest {
     @Test
+    fun `redundant recovery and replacement counters use explicit events`() {
+        val accumulator = RedundantDiagnosticsAccumulator()
+
+        accumulator.observeState("warming")
+        accumulator.observeState("ready")
+        accumulator.observeState("unavailable")
+        val transitionsOnly = accumulator.observeState("ready")
+        assertEquals(4L, transitionsOnly.stateTransitionCount)
+        assertEquals(0L, transitionsOnly.recoveryCount)
+        assertEquals(0L, transitionsOnly.replacementCount)
+
+        accumulator.observeEvent(RedundantDiagnosticEvent.FAILOVER)
+        accumulator.observeEvent(RedundantDiagnosticEvent.RECOVERY)
+        val explicit = accumulator.observeEvent(RedundantDiagnosticEvent.REPLACEMENT)
+        assertEquals(1L, explicit.failoverCount)
+        assertEquals(1L, explicit.recoveryCount)
+        assertEquals(1L, explicit.replacementCount)
+    }
+
+    @Test
+    fun `redundant diagnostics contain bounded counters but never configs keys or probe payload`() {
+        val report = automaticDiagnosticsRedundantSnapshot(
+            state = "ready",
+            nativeMetrics = """{
+                "dispatcher":{"outbound_packets":7,"dropped_inactive_packets":2},
+                "slots":[
+                    {"slot":0,"admitted":true,"latest_handshake_at_unix_ms":1234,
+                     "configuration":"PrivateKey = secret",
+                     "health-query-payload":"secret-probe",
+                     "telemetry":{"tun_read_packets":4,"tun_read_bytes":512,
+                       "udp_send_packets":4,"udp_receive_packets":3,
+                       "go_heap_alloc_bytes":1048576,"go_goroutines":8,
+                       "last_udp_send_error":"secret endpoint"}}
+                ]
+            }""",
+            transitionCount = 3,
+            failoverCount = 1,
+            recoveryCount = 2,
+            replacementCount = 1,
+        ).toString()
+
+        assertTrue(report.contains("backend_device_count"))
+        assertTrue(report.contains("tun_read_packets"))
+        assertTrue(report.contains("go_heap_alloc_bytes"))
+        assertTrue(report.contains("go_goroutines"))
+        assertFalse(report.contains("PrivateKey"))
+        assertFalse(report.contains("health-query-payload"))
+        assertFalse(report.contains("secret"))
+        assertFalse(report.contains("last_udp_send_error"))
+    }
+    @Test
     fun connectionIntentDiagnosticsReportsAndNotifiesOncePerEpisode() {
         val episode = AutomaticDiagnosticsConnectionIntentEpisode()
 

@@ -58,6 +58,7 @@ internal const val EXTRA_CONNECTION_INTENT_STATUS = "connection_intent_status"
 internal const val EXTRA_LEASE_PHASE = "lease_phase"
 internal const val EXTRA_NEXT_RETRY_AT_UNIX = "next_retry_at_unix"
 internal const val EXTRA_LAST_ERROR_CODE = "last_error_code"
+internal const val EXTRA_RESERVE_STATE = "reserve_state"
 internal const val EXTRA_LOGOUT_OWNERSHIP = "logout_ownership"
 internal const val EXTRA_ACCOUNT_SCOPE = "account_scope"
 internal const val EXTRA_LAYER = "layer"
@@ -205,6 +206,19 @@ internal object TunnelServiceClient {
             .setAction(NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS),
         { onSuccess(it.toConnectionIntentServiceStatus()) },
         onError,
+    )
+
+    fun releaseRedundantStandby(
+        context: Context,
+        onSuccess: (ConnectionIntentServiceStatus) -> Unit,
+        onError: (String) -> Unit,
+    ) = requestBundle(
+        context,
+        Intent(context, NelomaiVpnService::class.java)
+            .setAction(NelomaiVpnService.ACTION_RELEASE_REDUNDANT_STANDBY),
+        { onSuccess(it.toConnectionIntentServiceStatus()) },
+        onError,
+        foreground = true,
     )
 
     fun start(
@@ -620,6 +634,7 @@ internal fun ConnectionIntentServiceStatus.toBundle(): Bundle = Bundle().apply {
     leasePhase?.let { putString(EXTRA_LEASE_PHASE, it) }
     nextRetryAtUnix?.let { putLong(EXTRA_NEXT_RETRY_AT_UNIX, it) }
     lastErrorCode?.let { putString(EXTRA_LAST_ERROR_CODE, it) }
+    reserveState?.let { putString(EXTRA_RESERVE_STATE, it) }
 }
 
 internal fun Bundle.toConnectionIntentServiceStatus() = ConnectionIntentServiceStatus(
@@ -631,6 +646,7 @@ internal fun Bundle.toConnectionIntentServiceStatus() = ConnectionIntentServiceS
         containsKey(EXTRA_NEXT_RETRY_AT_UNIX)
     },
     lastErrorCode = getString(EXTRA_LAST_ERROR_CODE),
+    reserveState = getString(EXTRA_RESERVE_STATE),
 )
 
 internal fun TunnelOptionsArgs.toBundle(): Bundle = Bundle().apply {

@@ -284,6 +284,152 @@ internal fun automaticDiagnosticsSafeConnectionIntentLog(value: String): String 
     return if (lines.isEmpty()) "" else lines.joinToString("\n", postfix = "\n")
 }
 
+internal fun automaticDiagnosticsRedundantSnapshot(
+    state: String?,
+    nativeMetrics: String?,
+    transitionCount: Long,
+    failoverCount: Long,
+    recoveryCount: Long,
+    replacementCount: Long,
+): JSONObject {
+    val source = nativeMetrics?.let { runCatching { JSONObject(it) }.getOrNull() }
+    val slots = source?.optJSONArray("slots")
+    val safeSlots = JSONArray()
+    if (slots != null) {
+        for (index in 0 until minOf(slots.length(), 2)) {
+            val slot = slots.optJSONObject(index) ?: continue
+            safeSlots.put(JSONObject().apply {
+                put("slot", slot.optInt("slot", index).coerceIn(0, 1))
+                put("admitted", slot.optBoolean("admitted", false))
+                put(
+                    "latest_handshake_at_unix_ms",
+                    slot.optLong("latest_handshake_at_unix_ms", 0L).coerceAtLeast(0L),
+                )
+                val telemetry = slot.optJSONObject("telemetry")
+                put("telemetry", JSONObject().apply {
+                    REDUNDANT_TELEMETRY_COUNTERS.forEach { key ->
+                        telemetry?.takeIf { it.has(key) }?.let {
+                            put(key, it.optLong(key, 0L).coerceAtLeast(0L))
+                        }
+                    }
+                })
+            })
+        }
+    }
+    val dispatcher = source?.optJSONObject("dispatcher")
+    return JSONObject().apply {
+        put("state", state.takeIf { it in REDUNDANT_DIAGNOSTIC_STATES } ?: "disabled")
+        put("state_transition_count", transitionCount.coerceAtLeast(0L))
+        put("failover_count", failoverCount.coerceAtLeast(0L))
+        put("recovery_count", recoveryCount.coerceAtLeast(0L))
+        put("replacement_count", replacementCount.coerceAtLeast(0L))
+        put("backend_device_count", safeSlots.length())
+        put("dispatcher", JSONObject().apply {
+            REDUNDANT_DISPATCHER_COUNTERS.forEach { (sourceKey, outputKey) ->
+                dispatcher?.takeIf { it.has(sourceKey) }?.let {
+                    put(outputKey, it.optLong(sourceKey, 0L).coerceAtLeast(0L))
+                }
+            }
+        })
+        put("slots", safeSlots)
+    }
+}
+
+private val REDUNDANT_DIAGNOSTIC_STATES = setOf(
+    "warming",
+    "ready",
+    "unavailable",
+    "failover",
+)
+private val REDUNDANT_DISPATCHER_COUNTERS = listOf(
+    "OutboundPackets" to "outbound_packets",
+    "OutboundDropped" to "outbound_dropped",
+    "InboundPackets" to "inbound_packets",
+    "InactiveInboundDrops" to "inactive_inbound_drops",
+    "ProbePacketsInjected" to "probe_packets_injected",
+    "ProbeRepliesConsumed" to "probe_replies_consumed",
+    "ProbeInjectionDropped" to "probe_injection_dropped",
+    "ActiveSwitches" to "active_switches",
+    "SlotCloses" to "slot_closes",
+    "outbound_packets" to "outbound_packets",
+    "dropped_inactive_packets" to "inactive_inbound_drops",
+)
+private val REDUNDANT_TELEMETRY_COUNTERS = setOf(
+    "tun_read_packets",
+    "tun_read_bytes",
+    "tun_read_errors",
+    "tun_write_packets",
+    "tun_write_bytes",
+    "tun_write_errors",
+    "udp_send_calls",
+    "udp_send_packets",
+    "udp_send_bytes",
+    "udp_send_errors",
+    "udp_receive_calls",
+    "udp_receive_packets",
+    "udp_receive_bytes",
+    "udp_receive_errors",
+    "last_tun_read_at_unix_ms",
+    "last_tun_write_at_unix_ms",
+    "last_udp_send_at_unix_ms",
+    "last_udp_receive_at_unix_ms",
+    "last_udp_send_errno",
+    "last_udp_receive_errno",
+    "go_heap_alloc_bytes",
+    "go_heap_sys_bytes",
+    "go_heap_idle_bytes",
+    "go_heap_inuse_bytes",
+    "go_heap_released_bytes",
+    "go_stack_inuse_bytes",
+    "go_gc_cycles",
+    "go_memory_limit_bytes",
+    "go_device_starts",
+    "go_device_start_failures",
+    "go_device_closes",
+    "go_devices_starting",
+    "go_active_devices",
+    "go_goroutines",
+)
+
+internal data class RedundantDiagnosticCounts(
+    val stateTransitionCount: Long = 0,
+    val failoverCount: Long = 0,
+    val recoveryCount: Long = 0,
+    val replacementCount: Long = 0,
+)
+
+internal class RedundantDiagnosticsAccumulator {
+    var state: String? = null
+        private set
+    var counts = RedundantDiagnosticCounts()
+        private set
+
+    fun observeState(next: String?): RedundantDiagnosticCounts {
+        if (next != state) {
+            state = next
+            counts = counts.copy(
+                stateTransitionCount = counts.stateTransitionCount.saturatingAdd(1),
+            )
+        }
+        return counts
+    }
+
+    fun observeEvent(event: RedundantDiagnosticEvent): RedundantDiagnosticCounts {
+        counts = when (event) {
+            RedundantDiagnosticEvent.FAILOVER -> counts.copy(
+                failoverCount = counts.failoverCount.saturatingAdd(1),
+            )
+            RedundantDiagnosticEvent.RECOVERY -> counts.copy(
+                recoveryCount = counts.recoveryCount.saturatingAdd(1),
+            )
+            RedundantDiagnosticEvent.REPLACEMENT -> counts.copy(
+                replacementCount = counts.replacementCount.saturatingAdd(1),
+            )
+        }
+        return counts
+    }
+}
+
 private data class PendingSeal(
     val reportId: String,
     val trigger: String,
@@ -311,6 +457,9 @@ private data class PendingSeal(
 internal object AutomaticDiagnostics {
     private val gate = Any()
     private val memoryTimelineGate = Any()
+    private val redundantGate = Any()
+    @Volatile private var redundantSnapshot: String? = null
+    private val redundantAccumulator = RedundantDiagnosticsAccumulator()
     private val uploadQueued = AtomicBoolean(false)
     private val systemJobRunning = AtomicBoolean(false)
     private val immediateUploadPending = AtomicBoolean(false)
@@ -318,6 +467,38 @@ internal object AutomaticDiagnostics {
     private val executor = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "nelomai-automatic-diagnostics").apply { isDaemon = true }
     }
+
+    fun onRedundantStateChanged(state: String?, nativeMetrics: String?) {
+        synchronized(redundantGate) {
+            val counts = redundantAccumulator.observeState(state)
+            updateRedundantSnapshotLocked(state, nativeMetrics, counts)
+        }
+    }
+
+    fun onRedundantEvent(event: RedundantDiagnosticEvent, nativeMetrics: String?) {
+        synchronized(redundantGate) {
+            val counts = redundantAccumulator.observeEvent(event)
+            updateRedundantSnapshotLocked(redundantAccumulator.state, nativeMetrics, counts)
+        }
+    }
+
+    private fun updateRedundantSnapshotLocked(
+        state: String?,
+        nativeMetrics: String?,
+        counts: RedundantDiagnosticCounts,
+    ) {
+        redundantSnapshot = automaticDiagnosticsRedundantSnapshot(
+            state,
+            nativeMetrics,
+            counts.stateTransitionCount,
+            counts.failoverCount,
+            counts.recoveryCount,
+            counts.replacementCount,
+        ).toString()
+    }
+
+    private fun redundantSnapshotForReport(): JSONObject? =
+        redundantSnapshot?.let { runCatching { JSONObject(it) }.getOrNull() }
     private val memoryDetailExecutor = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "nelomai-memory-diagnostics").apply { isDaemon = true }
     }
@@ -1063,6 +1244,7 @@ internal object AutomaticDiagnostics {
                     put("memory_samples", memorySamples)
                 },
             )
+            redundantSnapshotForReport()?.let { put("redundant_runtime", it) }
         }
     }
 
@@ -1271,6 +1453,7 @@ internal object AutomaticDiagnostics {
                     )
                 },
             )
+            redundantSnapshotForReport()?.let { put("redundant_runtime", it) }
         }
     }
 

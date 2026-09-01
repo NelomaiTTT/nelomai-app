@@ -1572,6 +1572,7 @@ pub struct AppStateResponse {
     next_retry_at_unix: Option<i64>,
     warning: Option<String>,
     metrics: Option<ConnectionMetricsResponse>,
+    reserve_state: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1662,6 +1663,18 @@ where
 }
 
 #[cfg(any(target_os = "android", test))]
+fn should_use_android_recovery_v2(
+    lease_phase: Option<&str>,
+    capability: Option<&ConnectionIntentCapability>,
+    now_unix: i64,
+    reserve_enabled: bool,
+) -> bool {
+    lease_phase.is_none()
+        && reserve_enabled
+        && nelomai_contracts::allows_new_connection_intent_operation(capability, now_unix)
+}
+
+#[cfg(any(target_os = "android", test))]
 async fn route_android_logout<B, L, LFut, R, RFut>(
     begin_native_logout: B,
     local_sign_out: L,
@@ -1730,6 +1743,7 @@ pub struct AppPreferencesResponse {
     dns_provider: DnsProvider,
     personal_tic_egress_mode: EgressMode,
     dynamic_tic_egress_mode: EgressMode,
+    use_reserve_connection: bool,
 }
 
 impl AppStateResponse {
@@ -1739,6 +1753,7 @@ impl AppStateResponse {
         metrics: Option<ConnectionMetricsResponse>,
         connection_intent_status: nelomai_client_core::ConnectionIntentStatus,
         next_retry_at_unix: Option<i64>,
+        reserve_state: Option<String>,
     ) -> Self {
         let phase = if connection_intent_status
             == nelomai_client_core::ConnectionIntentStatus::Recovering
@@ -1757,6 +1772,7 @@ impl AppStateResponse {
             next_retry_at_unix,
             warning,
             metrics,
+            reserve_state,
         }
     }
 }
@@ -1782,32 +1798,46 @@ async fn current_connection_metrics(
 async fn current_connection_intent(
     app: &AppHandle,
     _status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
-) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
+) -> (
+    nelomai_client_core::ConnectionIntentStatus,
+    Option<i64>,
+    Option<String>,
+) {
     use tauri::Manager;
 
     let snapshot = app
         .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
         .snapshot()
         .await;
-    (snapshot.status, snapshot.next_retry_at_unix)
+    (snapshot.status, snapshot.next_retry_at_unix, None)
 }
 
 #[cfg(any(target_os = "android", test))]
 fn project_android_connection_intent_status(
-    status: Option<(&str, Option<i64>)>,
+    status: Option<(&str, Option<i64>, Option<String>)>,
     status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
-) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
+) -> (
+    nelomai_client_core::ConnectionIntentStatus,
+    Option<i64>,
+    Option<String>,
+) {
     match status {
-        Some(("recovering", next_retry_at_unix)) => (
+        Some(("recovering", next_retry_at_unix, reserve_state)) => (
             nelomai_client_core::ConnectionIntentStatus::Recovering,
             next_retry_at_unix,
+            reserve_state,
         ),
-        Some(("blocked_terminal", next_retry_at_unix)) => (
+        Some(("blocked_terminal", next_retry_at_unix, reserve_state)) => (
             nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
             next_retry_at_unix,
+            reserve_state,
         ),
-        Some(_) => (nelomai_client_core::ConnectionIntentStatus::None, None),
-        None => (status_unavailable_fallback, None),
+        Some((_, _, reserve_state)) => (
+            nelomai_client_core::ConnectionIntentStatus::None,
+            None,
+            reserve_state,
+        ),
+        None => (status_unavailable_fallback, None, None),
     }
 }
 
@@ -1815,7 +1845,11 @@ fn project_android_connection_intent_status(
 async fn current_connection_intent(
     app: &AppHandle,
     _status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
-) -> (nelomai_client_core::ConnectionIntentStatus, Option<i64>) {
+) -> (
+    nelomai_client_core::ConnectionIntentStatus,
+    Option<i64>,
+    Option<String>,
+) {
     let projection_ticket = ANDROID_UI_START_STOP_COORDINATOR.projection_ticket();
     let status = app.tunnel_android().connection_intent_status().ok();
     let (status_is_current, status_unavailable_fallback) = ANDROID_UI_START_STOP_COORDINATOR
@@ -1825,10 +1859,13 @@ async fn current_connection_intent(
             status.as_ref().map(|status| status.desired_active),
         );
     project_android_connection_intent_status(
-        status
-            .as_ref()
-            .filter(|_| status_is_current)
-            .map(|status| (status.status.as_str(), status.next_retry_at_unix)),
+        status.as_ref().filter(|_| status_is_current).map(|status| {
+            (
+                status.status.as_str(),
+                status.next_retry_at_unix,
+                status.reserve_state.clone(),
+            )
+        }),
         status_unavailable_fallback,
     )
 }
@@ -1977,7 +2014,7 @@ pub async fn app_state(
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
     let status_unavailable_fallback = android_status_unavailable_fallback();
-    let (intent_status, next_retry_at_unix) =
+    let (intent_status, next_retry_at_unix, reserve_state) =
         current_connection_intent(&app, status_unavailable_fallback).await;
     Ok(AppStateResponse::new(
         state,
@@ -1985,6 +2022,7 @@ pub async fn app_state(
         current_metrics,
         intent_status,
         next_retry_at_unix,
+        reserve_state,
     ))
 }
 
@@ -2026,6 +2064,7 @@ pub fn app_preferences(preferences: State<'_, Arc<AppPreferenceStore>>) -> AppPr
         dns_provider: current.dns_provider,
         personal_tic_egress_mode: current.personal_tic_egress_mode,
         dynamic_tic_egress_mode: current.dynamic_tic_egress_mode,
+        use_reserve_connection: current.use_reserve_connection,
     }
 }
 
@@ -2046,6 +2085,7 @@ pub fn app_set_close_to_tray(
         dns_provider: saved.dns_provider,
         personal_tic_egress_mode: saved.personal_tic_egress_mode,
         dynamic_tic_egress_mode: saved.dynamic_tic_egress_mode,
+        use_reserve_connection: saved.use_reserve_connection,
     })
 }
 
@@ -2075,6 +2115,7 @@ pub fn app_set_dns_provider(
         dns_provider: saved.dns_provider,
         personal_tic_egress_mode: saved.personal_tic_egress_mode,
         dynamic_tic_egress_mode: saved.dynamic_tic_egress_mode,
+        use_reserve_connection: saved.use_reserve_connection,
     })
 }
 
@@ -2098,6 +2139,45 @@ pub fn app_set_tic_egress_mode(
         dns_provider: saved.dns_provider,
         personal_tic_egress_mode: saved.personal_tic_egress_mode,
         dynamic_tic_egress_mode: saved.dynamic_tic_egress_mode,
+        use_reserve_connection: saved.use_reserve_connection,
+    })
+}
+
+#[tauri::command]
+pub async fn app_set_use_reserve_connection(
+    app: AppHandle,
+    preferences: State<'_, Arc<AppPreferenceStore>>,
+    enabled: bool,
+) -> Result<AppPreferencesResponse, CommandError> {
+    let saved = preferences
+        .set_use_reserve_connection(enabled)
+        .map_err(|_| {
+            CommandError::new(
+                "preferences_unavailable",
+                "Не удалось сохранить настройки приложения",
+            )
+        })?;
+    #[cfg(target_os = "android")]
+    if !enabled {
+        app.tunnel_android()
+            .release_redundant_standby()
+            .await
+            .map_err(|_| {
+                CommandError::new(
+                    "redundant_standby_release_failed",
+                    "Настройка сохранена, но резерв пока не удалось освободить",
+                )
+            })?;
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = app;
+    Ok(AppPreferencesResponse {
+        close_to_tray_supported: cfg!(desktop),
+        close_to_tray: saved.close_to_tray,
+        dns_provider: saved.dns_provider,
+        personal_tic_egress_mode: saved.personal_tic_egress_mode,
+        dynamic_tic_egress_mode: saved.dynamic_tic_egress_mode,
+        use_reserve_connection: saved.use_reserve_connection,
     })
 }
 
@@ -2154,7 +2234,7 @@ pub(crate) async fn quick_toggle(
     #[cfg(not(target_os = "android"))]
     {
         let state = application.state().await;
-        let (intent_status, _) =
+        let (intent_status, _, _) =
             current_connection_intent(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
                 .await;
         if intent_status != nelomai_client_core::ConnectionIntentStatus::None {
@@ -2270,7 +2350,7 @@ pub(crate) async fn quick_toggle(
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>();
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    let (intent_status, next_retry_at_unix) =
+    let (intent_status, next_retry_at_unix, reserve_state) =
         current_connection_intent(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
             .await;
     Ok(AppStateResponse::new(
@@ -2279,6 +2359,7 @@ pub(crate) async fn quick_toggle(
         current_metrics,
         intent_status,
         next_retry_at_unix,
+        reserve_state,
     ))
 }
 
@@ -2941,11 +3022,16 @@ pub async fn app_start(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     diagnostics: State<'_, Arc<AppDiagnostics>>,
+    preferences: State<'_, Arc<AppPreferenceStore>>,
     request: StartCommandRequest,
 ) -> Result<StartCommandResponse, CommandError> {
     let device_id = request.device_id;
     let failure_device_id = device_id.clone();
     let binding_request = request.binding_request;
+    #[cfg(target_os = "android")]
+    let reserve_enabled = preferences.get().use_reserve_connection;
+    #[cfg(not(target_os = "android"))]
+    let _ = preferences;
     #[cfg(target_os = "android")]
     let android_start_ticket = ANDROID_UI_START_STOP_COORDINATOR.start_ticket();
     #[cfg(not(target_os = "android"))]
@@ -3000,12 +3086,6 @@ pub async fn app_start(
                         current_intent.desired_active,
                     );
                     ANDROID_UI_START_STOP_COORDINATOR.ensure_current(android_start_ticket)?;
-                    let legacy_start_attempt = current_intent
-                        .lease_phase
-                        .is_none()
-                        .then(|| AndroidLegacyStartAttempt::new(rust_application.clone()));
-                    let legacy_start_epoch =
-                        legacy_start_attempt.as_ref().map(|attempt| attempt.epoch);
                     let current_bootstrap = if current_intent.lease_phase.is_some() {
                         None
                     } else {
@@ -3021,6 +3101,38 @@ pub async fn app_start(
                         }
                         Some(bootstrap)
                     };
+                    let recovery_capability = current_bootstrap
+                        .as_ref()
+                        .and_then(|bootstrap| bootstrap.capabilities.as_ref());
+                    let use_recovery_v2 = should_use_android_recovery_v2(
+                        current_intent.lease_phase.as_deref(),
+                        recovery_capability,
+                        now,
+                        reserve_enabled,
+                    );
+                    if use_recovery_v2 {
+                        return ANDROID_UI_START_STOP_COORDINATOR
+                            .run_start_side_effect(android_start_ticket, async move {
+                                if let Some(binding_request) = binding_request {
+                                    rust_application
+                                        .bind_peer(binding_request)
+                                        .await
+                                        .map_err(CommandError::from)?;
+                                }
+                                rust_application
+                                    .start_recovery_v2(options, now, true)
+                                    .await
+                                    .map(StartCommandResponse::connected)
+                                    .map_err(CommandError::from)
+                            })
+                            .await;
+                    }
+                    let legacy_start_attempt = current_intent
+                        .lease_phase
+                        .is_none()
+                        .then(|| AndroidLegacyStartAttempt::new(rust_application.clone()));
+                    let legacy_start_epoch =
+                        legacy_start_attempt.as_ref().map(|attempt| attempt.epoch);
                     let begin_app = service_app.clone();
                     let recovery_application = rust_application.clone();
                     let recovery_device_id = device_id.clone();
@@ -3030,9 +3142,6 @@ pub async fn app_start(
                     let recovery_egress_mode = request.egress_mode;
                     let recovery_allow_alternate = request.allow_alternate;
                     let recovery_sync_binding_preferences = binding_request.is_some();
-                    let recovery_capability = current_bootstrap
-                        .as_ref()
-                        .and_then(|bootstrap| bootstrap.capabilities.as_ref());
                     let response = route_android_app_start_with_capability(
                         &current_intent,
                         recovery_capability,
@@ -4099,11 +4208,13 @@ mod tests {
             None,
             nelomai_client_core::ConnectionIntentStatus::Recovering,
             Some(1_700_000_123),
+            Some("warming".to_string()),
         );
         let value = serde_json::to_value(recovering).unwrap();
         assert_eq!(value["phase"], "connecting");
         assert_eq!(value["connectionIntentStatus"], "recovering");
         assert_eq!(value["nextRetryAtUnix"], 1_700_000_123_i64);
+        assert_eq!(value["reserveState"], "warming");
 
         let blocked = AppStateResponse::new(
             CoreState {
@@ -4113,6 +4224,7 @@ mod tests {
             None,
             None,
             nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
+            None,
             None,
         );
         let value = serde_json::to_value(blocked).unwrap();
@@ -4129,6 +4241,7 @@ mod tests {
             project_android_connection_intent_status(None, fallback),
             (
                 nelomai_client_core::ConnectionIntentStatus::Recovering,
+                None,
                 None,
             ),
         );
@@ -4178,25 +4291,31 @@ mod tests {
         let fallback = projection.status_unavailable_fallback();
         assert_eq!(
             project_android_connection_intent_status(None, fallback),
-            (nelomai_client_core::ConnectionIntentStatus::None, None),
+            (
+                nelomai_client_core::ConnectionIntentStatus::None,
+                None,
+                None
+            ),
         );
         assert_eq!(
             project_android_connection_intent_status(
-                Some(("recovering", Some(42))),
+                Some(("recovering", Some(42), Some("ready".to_string()))),
                 nelomai_client_core::ConnectionIntentStatus::None,
             ),
             (
                 nelomai_client_core::ConnectionIntentStatus::Recovering,
                 Some(42),
+                Some("ready".to_string()),
             ),
         );
         assert_eq!(
             project_android_connection_intent_status(
-                Some(("blocked_terminal", None)),
+                Some(("blocked_terminal", None, None)),
                 nelomai_client_core::ConnectionIntentStatus::None,
             ),
             (
                 nelomai_client_core::ConnectionIntentStatus::BlockedTerminal,
+                None,
                 None,
             ),
         );
@@ -4688,6 +4807,7 @@ mod tests {
                         lease_phase: Some("start_pending".to_string()),
                         next_retry_at_unix: None,
                         last_error_code: None,
+                        reserve_state: None,
                     },
                 )
             },
@@ -4767,6 +4887,36 @@ mod tests {
             assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
             assert_eq!(recovery_request_calls.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn android_reserve_preference_selects_v2_only_for_a_new_supported_session() {
+        let capability = ConnectionIntentCapability {
+            revision: 1,
+            expires_at: "2030-01-01T00:00:00Z".to_string(),
+            connection_intent_recovery_v1: true,
+        };
+        let now = 1_700_000_000;
+
+        assert!(should_use_android_recovery_v2(
+            None,
+            Some(&capability),
+            now,
+            true,
+        ));
+        assert!(!should_use_android_recovery_v2(
+            None,
+            Some(&capability),
+            now,
+            false,
+        ));
+        assert!(!should_use_android_recovery_v2(
+            Some("start_pending"),
+            Some(&capability),
+            now,
+            true,
+        ));
+        assert!(!should_use_android_recovery_v2(None, None, now, true));
     }
 
     #[tokio::test]
@@ -4905,6 +5055,7 @@ mod tests {
                             lease_phase: Some(phase.to_string()),
                             next_retry_at_unix: None,
                             last_error_code: None,
+                            reserve_state: None,
                         },
                     )
                 },
@@ -4936,6 +5087,7 @@ mod tests {
                             lease_phase: phase.map(str::to_string),
                             next_retry_at_unix: None,
                             last_error_code: None,
+                            reserve_state: None,
                         },
                     )
                 },
@@ -5199,11 +5351,12 @@ mod tests {
         assert!(!status_is_current);
         assert_eq!(
             project_android_connection_intent_status(
-                status_is_current.then_some(("none", None)),
+                status_is_current.then_some(("none", None, None)),
                 fallback,
             ),
             (
                 nelomai_client_core::ConnectionIntentStatus::Recovering,
+                None,
                 None,
             ),
         );
@@ -5377,6 +5530,7 @@ mod tests {
                                             lease_phase: Some("start_pending".to_string()),
                                             next_retry_at_unix: None,
                                             last_error_code: None,
+                                            reserve_state: None,
                                         },
                                     )
                                 },
@@ -5415,6 +5569,7 @@ mod tests {
                                             lease_phase: Some("start_pending".to_string()),
                                             next_retry_at_unix: None,
                                             last_error_code: None,
+                                            reserve_state: None,
                                         },
                                     )
                                 },
@@ -5451,6 +5606,7 @@ mod tests {
                                 lease_phase: Some("start_pending".to_string()),
                                 next_retry_at_unix: None,
                                 last_error_code: None,
+                                reserve_state: None,
                             },
                         )
                     })
@@ -5750,6 +5906,7 @@ mod tests {
             lease_phase: Some("start_pending".to_string()),
             next_retry_at_unix: None,
             last_error_code: None,
+            reserve_state: None,
         }
     }
 
@@ -5789,6 +5946,7 @@ mod tests {
                         lease_phase: Some("start_pending".to_string()),
                         next_retry_at_unix: None,
                         last_error_code: None,
+                        reserve_state: None,
                     },
                 )
             },
@@ -5834,6 +5992,7 @@ mod tests {
                         lease_phase: Some("cleanup_pending".to_string()),
                         next_retry_at_unix: None,
                         last_error_code: None,
+                        reserve_state: None,
                     },
                 )
             },
@@ -5909,6 +6068,7 @@ mod tests {
                                 lease_phase: Some("cleanup_pending".to_string()),
                                 next_retry_at_unix: None,
                                 last_error_code: None,
+                                reserve_state: None,
                             },
                         )
                     },
@@ -5955,6 +6115,7 @@ mod tests {
                         lease_phase: None,
                         next_retry_at_unix: None,
                         last_error_code: None,
+                        reserve_state: None,
                     },
                 )
             },

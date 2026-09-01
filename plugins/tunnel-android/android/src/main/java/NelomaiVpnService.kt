@@ -437,6 +437,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 handleCancelCurrentConnectionIntent(intent)
             }
             intent?.action == ACTION_CONNECTION_INTENT_STATUS -> handleConnectionIntentStatus(intent)
+            intent?.action == ACTION_RELEASE_REDUNDANT_STANDBY -> handleReleaseRedundantStandby(intent)
             intent?.action == ACTION_BEGIN_BACKGROUND_LOGOUT -> handleBeginBackgroundLogout(intent)
             intent?.action == ACTION_CONFIGURE_BACKGROUND -> handleConfigureBackground(intent)
             intent?.action == ACTION_ROTATE_BACKGROUND -> handleRotateBackground(intent)
@@ -725,6 +726,18 @@ class NelomaiVpnService : GoBackend.VpnService() {
             ServiceRedundantConnectionPanel(::serviceActiveCredential),
             native,
             onAllSlotsStalled = { TunnelLog.warning("redundant.session_stalled") },
+            onReserveStateChanged = { state ->
+                AutomaticDiagnostics.onRedundantStateChanged(
+                    state?.wireName,
+                    native.diagnosticMetrics(),
+                )
+                restoreHandler.post {
+                    refreshConnectionNotification(redundantNotificationContent(state))
+                }
+            },
+            onDiagnosticEvent = { event ->
+                AutomaticDiagnostics.onRedundantEvent(event, native.diagnosticMetrics())
+            },
         )
         installRedundantVpnOwner(coordinator)
         redundantPhysicalNetworks?.stop()
@@ -1191,11 +1204,51 @@ class NelomaiVpnService : GoBackend.VpnService() {
         when (val result = connectionIntentCoordinator.status()) {
             is RecoveryStoreResult.Success -> intent.resultReceiver()?.send(
                 SERVICE_RESULT_OK,
-                connectionIntentServiceStatus(result.value).toBundle(),
+                connectionIntentServiceStatus(
+                    result.value,
+                    redundantVpnOwner?.reserveState()?.wireName
+                        ?: result.value.redundantTransaction?.standbyDesired
+                            ?.takeIf { it }
+                            ?.let { RedundantReserveState.WARMING.wireName },
+                ).toBundle(),
             )
             is RecoveryStoreResult.Failure -> intent.resultReceiver().sendError(result.code)
         }
         stopIfIdle()
+    }
+
+    private fun handleReleaseRedundantStandby(intent: Intent) {
+        val receiver = intent.resultReceiver()
+        val recovery = recoveryStore.read()
+        val envelope = (recovery as? RecoveryStoreResult.Success)?.value
+        val transaction = envelope?.redundantTransaction
+        if (transaction == null) {
+            if (envelope == null) receiver.sendError("redundant_recovery_unavailable")
+            else receiver?.send(
+                SERVICE_RESULT_OK,
+                connectionIntentServiceStatus(envelope).toBundle(),
+            )
+            stopIfIdle()
+            return
+        }
+        redundantWork.execute {
+            val owner = redundantVpnOwner ?: ensureRedundantCoordinator(transaction)
+            val released = runCatching(owner::releaseStandby).getOrDefault(false)
+            val current = (recoveryStore.read() as? RecoveryStoreResult.Success)?.value
+            restoreHandler.post {
+                if (!released || current == null) {
+                    receiver.sendError("redundant_standby_release_failed")
+                } else {
+                    receiver?.send(
+                        SERVICE_RESULT_OK,
+                        connectionIntentServiceStatus(
+                            current,
+                            owner.reserveState()?.wireName,
+                        ).toBundle(),
+                    )
+                }
+            }
+        }
     }
 
     private fun handleBeginBackgroundLogout(intent: Intent) {
@@ -2497,6 +2550,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
             "ru.nelomai.tunnel.CANCEL_CURRENT_CONNECTION_INTENT"
         internal const val ACTION_CONNECTION_INTENT_STATUS =
             "ru.nelomai.tunnel.CONNECTION_INTENT_STATUS"
+        internal const val ACTION_RELEASE_REDUNDANT_STANDBY =
+            "ru.nelomai.tunnel.RELEASE_REDUNDANT_STANDBY"
         internal const val ACTION_BEGIN_BACKGROUND_LOGOUT =
             "ru.nelomai.tunnel.BEGIN_BACKGROUND_LOGOUT"
         internal const val ACTION_CONFIGURE_BACKGROUND = "ru.nelomai.tunnel.CONFIGURE_BACKGROUND"
@@ -3323,6 +3378,7 @@ internal data class ConnectionIntentServiceStatus(
     val leasePhase: String?,
     val nextRetryAtUnix: Long?,
     val lastErrorCode: String?,
+    val reserveState: String? = null,
 )
 
 internal class ConnectionIntentServiceLifecycle(
@@ -3388,6 +3444,7 @@ internal fun interface AndroidConnectionIntentDiagnosticsObserver {
 
 internal fun connectionIntentServiceStatus(
     envelope: AndroidRecoveryEnvelope,
+    reserveState: String? = null,
 ): ConnectionIntentServiceStatus {
     val transaction = envelope.leaseTransaction
     val status = when {
@@ -3409,7 +3466,16 @@ internal fun connectionIntentServiceStatus(
         leasePhase = transaction?.phase?.wireName,
         nextRetryAtUnix = envelope.intent.retry.nextRetryAtUnix,
         lastErrorCode = envelope.intent.retry.lastErrorCode,
+        reserveState = reserveState,
     )
+}
+
+internal fun redundantNotificationContent(state: RedundantReserveState?): String = when (state) {
+    RedundantReserveState.WARMING -> "Резерв запускается"
+    RedundantReserveState.READY -> "Резерв готов"
+    RedundantReserveState.UNAVAILABLE -> "Резерв временно недоступен"
+    RedundantReserveState.FAILOVER -> "Подключено через резервный сервер"
+    null -> "VPN-подключение активно"
 }
 
 internal fun connectionIntentRetryNotificationContent(): String =

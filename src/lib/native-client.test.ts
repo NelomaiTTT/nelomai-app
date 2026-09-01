@@ -292,6 +292,7 @@ describe("native client", () => {
     await client.setCloseToTray(false);
     await client.setDnsProvider("quad9");
     await client.setTicEgressMode("personal", "prefer_ipv6");
+    await client.setUseReserveConnection(false);
 
     expect(invoke).toHaveBeenNthCalledWith(1, "app_preferences");
     expect(invoke).toHaveBeenNthCalledWith(2, "app_set_close_to_tray", {
@@ -303,6 +304,9 @@ describe("native client", () => {
     expect(invoke).toHaveBeenNthCalledWith(4, "app_set_tic_egress_mode", {
       connectionMode: "personal",
       egressMode: "prefer_ipv6",
+    });
+    expect(invoke).toHaveBeenNthCalledWith(5, "app_set_use_reserve_connection", {
+      enabled: false,
     });
   });
 

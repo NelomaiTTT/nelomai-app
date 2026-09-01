@@ -29,6 +29,7 @@
     bindingPreferenceUpdateRequest,
     bindingRequest,
     connectionEgressMode,
+    connectionView,
     defaultRouteModeForLayer,
     hasSecondaryStop,
     primaryAction,
@@ -50,6 +51,7 @@
     type PeerOption,
     type Phase,
     type RouteMode,
+    type ReserveState,
     type TicConnectionMode,
     type UpdateStatus,
   } from "$lib/app-model";
@@ -100,6 +102,8 @@
   );
   let connectionRecoveryCopy = $derived(recoveryCopy(visibleConnectionIntent));
   let connectionMetrics = $state<ConnectionMetrics | null>(null);
+  let reserveState = $state<ReserveState | null>(null);
+  let connectionPresentation = $derived(connectionView({ reserveState }));
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
   let diagnosticsBusy = $state(false);
@@ -375,6 +379,19 @@
     }
   }
 
+  async function setUseReserveConnection(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const previous = appPreferences?.useReserveConnection ?? true;
+    try {
+      appPreferences = await nativeClient.setUseReserveConnection(input.checked);
+      void synchronizeRuntimeState();
+    } catch (reason) {
+      appPreferences = await nativeClient.preferences().catch(() => appPreferences);
+      input.checked = appPreferences?.useReserveConnection ?? previous;
+      error = commandMessage(reason, "preferences");
+    }
+  }
+
   async function synchronizeRuntimeState() {
     if (
       busy ||
@@ -391,6 +408,7 @@
       if (!current) return;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
+      reserveState = current.reserveState;
       connectionIntentStatus = current.connectionIntentStatus;
       nextRetryAtUnix = current.nextRetryAtUnix;
       if (
@@ -439,6 +457,7 @@
     } catch (reason) {
       const code = commandCode(reason);
       if (code === "signed_out") {
+        reserveState = null;
         phase = "signed_out";
         view = "sign_in";
       } else if (code === "access_expired") {
@@ -491,6 +510,7 @@
     connectionIntentStatus = state.connectionIntentStatus;
     nextRetryAtUnix = state.nextRetryAtUnix;
     connectionMetrics = state.metrics;
+    reserveState = state.reserveState;
     runtimeWarning = state.warning;
     view = viewForAppState(state);
     await loadSplitTunnel(false);
@@ -580,6 +600,7 @@
       if (stopping) {
         connection = await nativeClient.stop();
         connectionMetrics = null;
+        reserveState = null;
         connectionIntentStatus = "none";
         nextRetryAtUnix = null;
         phase = "ready";
@@ -617,6 +638,7 @@
       const current = await nativeClient.state();
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
+      reserveState = current.reserveState;
     } catch (reason) {
       if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
       const failureCode = commandCode(reason);
@@ -635,6 +657,7 @@
       connectionIntentStatus = current?.connectionIntentStatus ?? connectionIntentStatus;
       nextRetryAtUnix = current?.nextRetryAtUnix ?? nextRetryAtUnix;
       connectionMetrics = current?.metrics ?? connectionMetrics;
+      reserveState = current?.reserveState ?? reserveState;
       runtimeWarning = current?.warning ?? runtimeWarning;
       error =
         failureCode === "connection_intent_cancelled"
@@ -732,6 +755,7 @@
     try {
       await nativeClient.unbindPeer();
       connection = null;
+      reserveState = null;
       pinnedStray = null;
       bootstrap = bootstrap
         ? { ...bootstrap, binding: null, connection: null, pinned_stray: null }
@@ -1098,7 +1122,7 @@
     <div class="header-actions">
       <span class="status" data-phase={phase}>
         <span aria-hidden="true"></span>
-        {phaseLabels[phase]}
+        {phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
       </span>
       {#if bootstrap}
         <button class="quiet-button" type="button" onclick={openChangelog}>
@@ -1397,6 +1421,12 @@
             </p>
           {/if}
 
+          {#if phase === "connected" && reserveState !== null}
+            <p class="reserve-status" aria-live="polite">
+              {connectionPresentation.statusText}
+            </p>
+          {/if}
+
           {#if phase === "connected"}
             <dl class="connection-metrics" aria-label="Показатели подключения">
               <div>
@@ -1547,6 +1577,19 @@
             </strong>
           </div>
           {#if appPreferences}
+            {#if bootstrap?.device.platform === "android"}
+              <label class="update-preference">
+                <span>
+                  <strong>Использовать резервное подключение</strong>
+                  <small>Выключение освободит резерв; включение применится после переподключения</small>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={appPreferences.useReserveConnection}
+                  onchange={setUseReserveConnection}
+                />
+              </label>
+            {/if}
             <label class="select-field">
               <span>DNS</span>
               <select
@@ -2046,6 +2089,13 @@
     background: #2a2112;
     font-size: 13px;
     line-height: 1.45;
+  }
+
+  .reserve-status {
+    margin: 0;
+    color: #aebfc0;
+    font-size: 13px;
+    text-align: center;
   }
 
   .center-state {

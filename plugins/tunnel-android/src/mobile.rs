@@ -162,6 +162,13 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub async fn release_redundant_standby(&self) -> crate::Result<ConnectionIntentStatusResponse> {
+        self.0
+            .run_mobile_plugin_async("releaseRedundantStandby", EmptyRequest {})
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn clear_background(&self) -> crate::Result<()> {
         self.0
             .run_mobile_plugin::<()>("clearBackground", EmptyRequest {})

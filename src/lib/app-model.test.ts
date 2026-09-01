@@ -5,6 +5,8 @@ import {
   bindingPreferencesMatch,
   bindingRequest,
   connectionEgressMode,
+  connectionView,
+  defaultAppPreferences,
   defaultRouteModeForLayer,
   hasSecondaryStop,
   primaryAction,
@@ -231,5 +233,24 @@ describe("connection intent recovery", () => {
       }),
     ).toBe("connection");
     expect(hasSecondaryStop({ connectionIntentStatus: "blocked_terminal" })).toBe(true);
+  });
+});
+
+describe("Android reserve presentation", () => {
+  it("defaults reserve preference to enabled only on Android", () => {
+    expect(defaultAppPreferences("android").useReserveConnection).toBe(true);
+    expect(defaultAppPreferences("macos").useReserveConnection).toBe(false);
+  });
+
+  it.each([
+    ["warming", "Резерв запускается"],
+    ["ready", "Резерв готов"],
+    ["unavailable", "Резерв временно недоступен"],
+    ["failover", "Подключено через резервный сервер"],
+  ] as const)("maps %s to calm status text", (reserveState, statusText) => {
+    expect(connectionView({ reserveState })).toEqual({
+      statusText,
+      requiresUserAction: false,
+    });
   });
 });

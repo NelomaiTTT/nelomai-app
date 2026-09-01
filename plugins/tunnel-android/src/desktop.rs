@@ -112,6 +112,10 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(ConnectionIntentStatusResponse::default())
     }
 
+    pub async fn release_redundant_standby(&self) -> crate::Result<ConnectionIntentStatusResponse> {
+        Ok(ConnectionIntentStatusResponse::default())
+    }
+
     pub fn clear_background(&self) -> crate::Result<()> {
         Ok(())
     }

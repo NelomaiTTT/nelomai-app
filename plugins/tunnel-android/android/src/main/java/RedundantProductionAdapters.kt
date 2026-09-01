@@ -264,6 +264,11 @@ internal class ServiceRedundantConnectionNative(
         )
     }
 
+    override fun diagnosticMetrics(): String? = synchronized(gate) {
+        val nativeSession = session ?: return@synchronized null
+        runCatching { backend.metrics(nativeSession) }.getOrNull()
+    }
+
     override fun healthObservations(): List<SlotObservation> = synchronized(gate) {
         val nativeSession = session ?: return@synchronized emptyList()
         val now = nowMs()

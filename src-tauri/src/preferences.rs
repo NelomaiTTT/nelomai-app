@@ -43,6 +43,7 @@ pub struct AppPreferences {
     pub dns_provider: DnsProvider,
     pub personal_tic_egress_mode: EgressMode,
     pub dynamic_tic_egress_mode: EgressMode,
+    pub use_reserve_connection: bool,
 }
 
 impl Default for AppPreferences {
@@ -52,6 +53,7 @@ impl Default for AppPreferences {
             dns_provider: DnsProvider::Auto,
             personal_tic_egress_mode: EgressMode::Ipv4,
             dynamic_tic_egress_mode: EgressMode::Ipv4,
+            use_reserve_connection: cfg!(target_os = "android"),
         }
     }
 }
@@ -145,6 +147,20 @@ impl AppPreferenceStore {
         *current = preferences;
         Ok(preferences)
     }
+
+    pub fn set_use_reserve_connection(&self, enabled: bool) -> io::Result<AppPreferences> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| io::Error::other("preference lock poisoned"))?;
+        let preferences = AppPreferences {
+            use_reserve_connection: enabled,
+            ..*current
+        };
+        save(&self.path, preferences)?;
+        *current = preferences;
+        Ok(preferences)
+    }
 }
 
 fn load(path: &Path) -> io::Result<AppPreferences> {
@@ -191,12 +207,18 @@ mod tests {
         let store = AppPreferenceStore::new(&path);
         assert!(store.get().close_to_tray);
         assert_eq!(store.get().dns_provider, DnsProvider::Auto);
+        assert_eq!(
+            store.get().use_reserve_connection,
+            cfg!(target_os = "android")
+        );
 
         store.set_close_to_tray(false).unwrap();
         store.set_dns_provider(DnsProvider::Quad9).unwrap();
+        store.set_use_reserve_connection(true).unwrap();
         let restored = AppPreferenceStore::new(&path).get();
         assert!(!restored.close_to_tray);
         assert_eq!(restored.dns_provider, DnsProvider::Quad9);
+        assert!(restored.use_reserve_connection);
 
         store.set_close_to_tray(true).unwrap();
         assert_eq!(store.get().dns_provider, DnsProvider::Quad9);
@@ -227,6 +249,7 @@ mod tests {
             restored.dynamic_tic_egress_mode,
             nelomai_contracts::EgressMode::Ipv4
         );
+        assert_eq!(restored.use_reserve_connection, cfg!(target_os = "android"));
         let _ = fs::remove_dir_all(directory);
     }
 

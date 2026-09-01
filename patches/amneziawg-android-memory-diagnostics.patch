@@ -10,12 +10,13 @@ index 2278d4d262c4cda579a0a230909f8c2b3f9923cf..38fc77db64fda2810692d77dd9c37766
  func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
 +	memory := readGoMemoryStats()
  	return tunnelTelemetrySnapshot{
-@@ -173,2 +175,9 @@ func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
+@@ -173,2 +175,10 @@ func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
  		LastSendErrno: int(t.lastSendErrno.Load()), LastRecvErrno: int(t.lastRecvErrno.Load()),
 +		GoHeapAlloc: memory.HeapAlloc, GoHeapSys: memory.HeapSys,
 +		GoHeapIdle: memory.HeapIdle, GoHeapInuse: memory.HeapInuse,
 +		GoHeapReleased: memory.HeapReleased, GoStackInuse: memory.StackInuse,
-+		GoGCCycles: memory.NumGC, GoMemoryLimit: goBackendMemoryLimitBytes,
++		GoGCCycles: memory.NumGC, GoGoroutines: runtime.NumGoroutine(),
++		GoMemoryLimit:  goBackendMemoryLimitBytes,
 +		GoDeviceStarts: goDeviceStarts.Load(), GoStartFailures: goDeviceStartFailures.Load(),
 +		GoDeviceCloses: goDeviceCloses.Load(), GoStarting: goDevicesStarting.Load(),
 +		GoActiveDevices: activeTunnelCount(),
@@ -152,7 +153,7 @@ diff --git a/tunnel/tools/libwg-go/telemetry_snapshot.go b/tunnel/tools/libwg-go
 index bb25c104dd47299373a2923c5cee04034e845fa4..407832729a0bb8b7825f7cfea50c55ff19086610 100644
 --- a/tunnel/tools/libwg-go/telemetry_snapshot.go
 +++ b/tunnel/tools/libwg-go/telemetry_snapshot.go
-@@ -29,2 +29,15 @@ type tunnelTelemetrySnapshot struct {
+@@ -29,2 +29,16 @@ type tunnelTelemetrySnapshot struct {
  	Endpoint        string `json:"endpoint,omitempty"`
 +	GoHeapAlloc     uint64 `json:"go_heap_alloc_bytes"`
 +	GoHeapSys       uint64 `json:"go_heap_sys_bytes"`
@@ -161,6 +162,7 @@ index bb25c104dd47299373a2923c5cee04034e845fa4..407832729a0bb8b7825f7cfea50c55ff
 +	GoHeapReleased  uint64 `json:"go_heap_released_bytes"`
 +	GoStackInuse    uint64 `json:"go_stack_inuse_bytes"`
 +	GoGCCycles      uint32 `json:"go_gc_cycles"`
++	GoGoroutines    int    `json:"go_goroutines"`
 +	GoMemoryLimit   int64  `json:"go_memory_limit_bytes"`
 +	GoDeviceStarts  uint64 `json:"go_device_starts"`
 +	GoStartFailures uint64 `json:"go_device_start_failures"`
@@ -168,3 +170,22 @@ index bb25c104dd47299373a2923c5cee04034e845fa4..407832729a0bb8b7825f7cfea50c55ff
 +	GoStarting      int64  `json:"go_devices_starting"`
 +	GoActiveDevices int    `json:"go_active_devices"`
  }
+diff --git a/tunnel/tools/libwg-go/redundant_metrics_test.go b/tunnel/tools/libwg-go/redundant_metrics_test.go
+--- a/tunnel/tools/libwg-go/redundant_metrics_test.go
++++ b/tunnel/tools/libwg-go/redundant_metrics_test.go
+@@ -38,3 +38,15 @@ func TestRedundantMetricsExcludeEndpointAndArbitraryErrorText(t *testing.T) {
+ 		t.Fatalf("redundant metrics lost bounded errno diagnostics: %s", encoded)
+ 	}
+ }
++
++func TestRedundantMetricsIncludeBoundedGoRuntimeCounters(t *testing.T) {
++	encoded, err := json.Marshal(redactRedundantTelemetry(tunnelTelemetrySnapshot{
++		GoGoroutines: 8,
++	}))
++	if err != nil {
++		t.Fatalf("encode redundant telemetry: %v", err)
++	}
++	if !strings.Contains(string(encoded), `"go_goroutines":8`) {
++		t.Fatalf("redundant metrics lost Go goroutine count: %s", encoded)
++	}
++}
