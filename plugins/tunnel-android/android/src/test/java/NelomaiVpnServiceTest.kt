@@ -47,33 +47,71 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
-    fun redundantStartCancellationIsExactAndSurvivesUntilWorkerCompletion() {
-        val fence = RedundantStartCancellationFence()
+    fun redundantStartCancellationSurvivesWorkerSetupUntilStoppedIsDelivered() {
+        val outcomes = mutableListOf<String>()
+        val gate = RedundantStartOperationGate()
 
-        assertTrue(fence.begin("operation-a"))
-        assertFalse(fence.begin("operation-b"))
-        assertFalse(fence.cancel("operation-b"))
-        assertTrue(fence.cancel("operation-a"))
-        assertTrue(fence.isCancelled("operation-a"))
+        assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
+        gate.workerFinished("operation-a")
+        assertFalse(gate.begin("operation-b") { outcomes += "wrong" })
+        assertFalse(gate.cancel("operation-b"))
+        assertTrue(gate.cancel("operation-a"))
+        assertTrue(gate.isCancelled("operation-a"))
+        assertTrue(gate.completeCancelled("operation-a"))
 
-        fence.complete("operation-a")
-
-        assertFalse(fence.isCancelled("operation-a"))
-        assertTrue(fence.begin("operation-b"))
+        assertEquals(listOf("stopped"), outcomes)
+        assertFalse(gate.isCancelled("operation-a"))
+        assertTrue(gate.begin("operation-b") { outcomes += "stopped-b" })
     }
 
     @Test
-    fun redundantStartCompletionPublishesOnlyItsFirstTerminalOutcome() {
-        val successFirst = RedundantStartCompletionGate()
-        val failureFirst = RedundantStartCompletionGate()
+    fun redundantStartCancellationRemainsVisibleUntilWorkerObservesIt() {
         val outcomes = mutableListOf<String>()
+        val gate = RedundantStartOperationGate()
 
-        assertTrue(successFirst.complete { outcomes += "running" })
-        assertFalse(successFirst.complete { outcomes += "failed" })
-        assertTrue(failureFirst.complete { outcomes += "failed" })
-        assertFalse(failureFirst.complete { outcomes += "running" })
+        assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
+        assertTrue(gate.cancel("operation-a"))
+        assertTrue(gate.completeCancelled("operation-a"))
+        assertTrue(gate.isCancelled("operation-a"))
+        assertFalse(gate.begin("operation-b") { outcomes += "wrong" })
 
-        assertEquals(listOf("running", "failed"), outcomes)
+        gate.workerFinished("operation-a")
+
+        assertEquals(listOf("stopped"), outcomes)
+        assertFalse(gate.isCancelled("operation-a"))
+        assertTrue(gate.begin("operation-b") { outcomes += "stopped-b" })
+    }
+
+    @Test
+    fun redundantStartReadyAndStopRacePublishesExactlyOneTerminalOutcome() {
+        repeat(100) { index ->
+            val outcomes = CopyOnWriteArrayList<String>()
+            val gate = RedundantStartOperationGate()
+            val ready = CountDownLatch(2)
+            val release = CountDownLatch(1)
+            val operationId = "operation-$index"
+            assertTrue(gate.begin(operationId) { outcomes += "stopped" })
+            gate.workerFinished(operationId)
+            val runningThread = Thread {
+                ready.countDown()
+                release.await()
+                gate.complete(operationId) { outcomes += "running" }
+            }
+            val stoppedThread = Thread {
+                ready.countDown()
+                release.await()
+                gate.completeCancelled(operationId)
+            }
+            runningThread.start()
+            stoppedThread.start()
+            assertTrue(ready.await(1, TimeUnit.SECONDS))
+            release.countDown()
+            runningThread.join()
+            stoppedThread.join()
+
+            assertEquals(1, outcomes.size)
+            assertTrue(outcomes.single() in setOf("running", "stopped"))
+        }
     }
 
     @Test

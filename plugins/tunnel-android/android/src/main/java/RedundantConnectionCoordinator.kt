@@ -79,6 +79,7 @@ private data class PendingPrimaryReadiness(
     val drainPendingWork: Boolean,
     val onReady: () -> Unit,
     val onFailed: () -> Unit,
+    val onCancelled: () -> Unit,
 )
 
 /** A v2 envelope is reserved for this coordinator and must never create a recovery-v1 backend. */
@@ -208,6 +209,7 @@ internal class RedundantConnectionCoordinator(
         shouldCancel: () -> Boolean = { false },
         onPrimaryStarted: () -> Unit = {},
         onPrimaryFailed: () -> Unit = {},
+        onPrimaryCancelled: () -> Unit = {},
     ): Boolean = synchronized(gate) {
         val active = transaction.localActiveLeaseId ?: return@synchronized false
         val activeConfiguration = configurations[active] ?: return@synchronized false
@@ -239,6 +241,7 @@ internal class RedundantConnectionCoordinator(
             drainPendingWork = false,
             onReady = onPrimaryStarted,
             onFailed = onPrimaryFailed,
+            onCancelled = onPrimaryCancelled,
         )
     }
 
@@ -289,6 +292,7 @@ internal class RedundantConnectionCoordinator(
                 drainPendingWork = true,
                 onReady = {},
                 onFailed = {},
+                onCancelled = {},
             )
         } finally {
             response.configurations.values.forEach { it.fill(0) }
@@ -333,6 +337,7 @@ internal class RedundantConnectionCoordinator(
         drainPendingWork: Boolean,
         onReady: () -> Unit,
         onFailed: () -> Unit,
+        onCancelled: () -> Unit,
     ): Boolean {
         if (healthProbe == null) {
             return completePrimaryReadinessLocked(
@@ -354,6 +359,7 @@ internal class RedundantConnectionCoordinator(
             drainPendingWork = drainPendingWork,
             onReady = onReady,
             onFailed = onFailed,
+            onCancelled = onCancelled,
         )
         publishReserveStateLocked(transaction, emptyList())
         return true
@@ -368,7 +374,7 @@ internal class RedundantConnectionCoordinator(
             transaction.retry.stopState != RedundantStopState.NONE ||
             transaction.localActiveLeaseId != pending.activeLeaseId
         ) {
-            return failPrimaryReadinessLocked(pending)
+            return cancelPrimaryReadinessLocked(pending)
         }
         val observation = observations.singleOrNull { it.index == pending.activeIndex }
         if (observation?.hardFailure == true ||
@@ -412,6 +418,17 @@ internal class RedundantConnectionCoordinator(
         runCatching(native::stop)
         publishReserveStateLocked(null, emptyList())
         if (pending.freshStart) pending.onFailed()
+        return false
+    }
+
+    private fun cancelPrimaryReadinessLocked(pending: PendingPrimaryReadiness): Boolean {
+        if (pendingPrimaryReadiness !== pending) return false
+        pendingPrimaryReadiness = null
+        recoveryStarted = false
+        primaryReadinessFailed = false
+        runCatching(native::stop)
+        publishReserveStateLocked(null, emptyList())
+        if (pending.freshStart) pending.onCancelled()
         return false
     }
 
@@ -825,17 +842,19 @@ internal class RedundantConnectionCoordinator(
     }
 
     /** Safe main-thread barrier: no native or panel operation is performed here. */
-    override fun fenceRevoke(): Boolean {
+    override fun fenceRevoke(): Boolean = synchronized(gate) {
         val transaction = status() ?: return false
         val fenced = store.deferRedundantStop(transaction.stopOperationId ?: operationId()) is
             RecoveryStoreResult.Success
         if (fenced) {
+            val pending = pendingPrimaryReadiness
             candidateWarmupLeaseId = null
             pendingPrimaryReadiness = null
             recoveryStarted = false
             primaryReadinessFailed = false
             failoverActive = false
             publishReserveStateLocked(null, emptyList())
+            if (pending?.freshStart == true) pending.onCancelled()
         }
         return fenced
     }
@@ -857,12 +876,14 @@ internal class RedundantConnectionCoordinator(
         store.completeRedundantStop(requireNotNull(acknowledged.stopOperationId)) is RecoveryStoreResult.Success
     }
 
-    override fun closeLocal(): Boolean {
+    override fun closeLocal(): Boolean = synchronized(gate) {
+        val pending = pendingPrimaryReadiness
         candidateWarmupLeaseId = null
         pendingPrimaryReadiness = null
         recoveryStarted = false
         primaryReadinessFailed = false
-        return runCatching(native::stop).getOrDefault(false)
+        if (pending?.freshStart == true) pending.onCancelled()
+        runCatching(native::stop).getOrDefault(false)
     }
 
     private fun persist(transaction: AndroidRedundantTransaction): Boolean {

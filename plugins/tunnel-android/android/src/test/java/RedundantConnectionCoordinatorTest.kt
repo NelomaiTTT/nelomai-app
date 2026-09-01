@@ -118,9 +118,10 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun revokeFencesPendingPrimaryCallbacksBeforeCleanup() {
+    fun revokeCancelsPendingPrimaryReadinessExactlyOnceBeforeCleanup() {
         var successes = 0
         var failures = 0
+        var cancellations = 0
         val panel = FakePanel()
         val native = FakeNative()
         val coordinator = RedundantConnectionCoordinator(emptyStore(), panel, native)
@@ -131,6 +132,7 @@ class RedundantConnectionCoordinatorTest {
             mapOf("lease-a" to probe()),
             onPrimaryStarted = { successes += 1 },
             onPrimaryFailed = { failures += 1 },
+            onPrimaryCancelled = { cancellations += 1 },
         ))
         assertTrue(coordinator.fenceRevoke())
         assertTrue(coordinator.revoke())
@@ -138,8 +140,60 @@ class RedundantConnectionCoordinatorTest {
 
         assertEquals(0, successes)
         assertEquals(0, failures)
+        assertEquals(1, cancellations)
         assertEquals(1, panel.stopCalls)
         assertFalse(coordinator.isRunning())
+    }
+
+    @Test
+    fun primaryReadyAndRevokeRacePublishesExactlyOneTerminalCallback() {
+        repeat(100) {
+            val outcomes = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val coordinator = RedundantConnectionCoordinator(
+                emptyStore(),
+                FakePanel(),
+                FakeNative(),
+                nowMs = { 20_000L },
+            )
+            assertTrue(coordinator.start(
+                transaction(),
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                mapOf("lease-a" to probe()),
+                onPrimaryStarted = { outcomes += "ready" },
+                onPrimaryFailed = { outcomes += "failed" },
+                onPrimaryCancelled = { outcomes += "stopped" },
+            ))
+            val ready = java.util.concurrent.CountDownLatch(2)
+            val release = java.util.concurrent.CountDownLatch(1)
+            val readinessThread = Thread {
+                ready.countDown()
+                release.await()
+                coordinator.onHealthObservations(listOf(
+                    healthSlot(
+                        index = 0,
+                        active = true,
+                        health = BackendHealth.READY,
+                        handshakeFresh = true,
+                        consecutiveProbeSuccesses = 3,
+                        stableSinceMs = 0,
+                    ),
+                ))
+            }
+            val revokeThread = Thread {
+                ready.countDown()
+                release.await()
+                coordinator.fenceRevoke()
+            }
+            readinessThread.start()
+            revokeThread.start()
+            assertTrue(ready.await(1, java.util.concurrent.TimeUnit.SECONDS))
+            release.countDown()
+            readinessThread.join()
+            revokeThread.join()
+
+            assertEquals(1, outcomes.size)
+            assertTrue(outcomes.single() in setOf("ready", "stopped"))
+        }
     }
 
     @Test
