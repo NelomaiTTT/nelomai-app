@@ -32,9 +32,10 @@ internal data class FailoverDecision(
 internal class RedundantHealthMonitor(
     private val softFailureConfirmationMs: Long = DEFAULT_SOFT_FAILURE_CONFIRMATION_MS,
     private val rebindStabilizationMs: Long = DEFAULT_REBIND_STABILIZATION_MS,
+    initialNetworkValidated: Boolean = true,
 ) {
     private val softFailureSinceMs = mutableMapOf<Int, Long>()
-    private var networkValidated = true
+    private var networkValidated = initialNetworkValidated
     private var suppressFailoverUntilMs = Long.MIN_VALUE
     private var sessionStalledEmitted = false
 

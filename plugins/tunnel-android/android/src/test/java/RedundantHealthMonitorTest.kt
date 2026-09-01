@@ -8,6 +8,25 @@ import org.junit.Test
 
 class RedundantHealthMonitorTest {
     @Test
+    fun initiallyUnvalidatedNetworkCannotReportPrimaryReady() {
+        val monitor = RedundantHealthMonitor(
+            rebindStabilizationMs = 0,
+            initialNetworkValidated = false,
+        )
+        val ready = slot(
+            index = 0,
+            active = true,
+            health = BackendHealth.READY,
+            handshakeFresh = true,
+            successfulProbes = 3,
+        )
+
+        assertFalse(monitor.ready(nowMs = 1_000, observation = ready))
+        monitor.onUnderlyingNetworkChanged(nowMs = 1_000, validated = true)
+        assertTrue(monitor.ready(nowMs = 1_000, observation = ready))
+    }
+
+    @Test
     fun hardFailureSwitchesReadyStandbyImmediately() {
         val monitor = RedundantHealthMonitor()
 

@@ -63,6 +63,20 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun redundantStartCompletionPublishesOnlyItsFirstTerminalOutcome() {
+        val successFirst = RedundantStartCompletionGate()
+        val failureFirst = RedundantStartCompletionGate()
+        val outcomes = mutableListOf<String>()
+
+        assertTrue(successFirst.complete { outcomes += "running" })
+        assertFalse(successFirst.complete { outcomes += "failed" })
+        assertTrue(failureFirst.complete { outcomes += "failed" })
+        assertFalse(failureFirst.complete { outcomes += "running" })
+
+        assertEquals(listOf("running", "failed"), outcomes)
+    }
+
+    @Test
     fun redundantWorkDispatcherSerializesAndCoalescesTicksAndNetworkSnapshots() {
         val queued = ArrayDeque<Runnable>()
         val dispatcher = RedundantVpnWorkDispatcher(Executor(queued::addLast))

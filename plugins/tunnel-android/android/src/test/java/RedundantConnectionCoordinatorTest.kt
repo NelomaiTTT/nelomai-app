@@ -28,7 +28,6 @@ class RedundantConnectionCoordinatorTest {
             emptyStore(),
             FakePanel(),
             native,
-            primaryReadinessSleep = {},
         )
 
         val started = coordinator.start(
@@ -49,8 +48,183 @@ class RedundantConnectionCoordinatorTest {
         )
 
         assertTrue(started)
+        assertFalse(coordinator.isRunning())
+        assertEquals(0, reports)
+        assertEquals(listOf("lease-a", "lease-b"), native.started)
+        assertTrue(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+        assertEquals(0, reports)
+        assertTrue(coordinator.tick())
+        assertTrue(coordinator.isRunning())
         assertEquals(1, reports)
         assertTrue(native.healthSnapshots.isEmpty())
+    }
+
+    @Test
+    fun pendingPrimaryReadinessDoesNotBlockNetworkRebinding() {
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), FakePanel(), native)
+
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+        ))
+        assertFalse(coordinator.isRunning())
+
+        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
+        assertEquals(listOf("lease-a", "lease-b"), native.rebound)
+    }
+
+    @Test
+    fun initiallyUnvalidatedStartRebindsBeforeLaterReadiness() {
+        val native = FakeNative().apply {
+            healthSnapshots += listOf(
+                healthSlot(
+                    index = 0,
+                    active = true,
+                    health = BackendHealth.READY,
+                    handshakeFresh = true,
+                    consecutiveProbeSuccesses = 3,
+                    stableSinceMs = 0,
+                ),
+            )
+            healthSnapshots += healthSnapshots.first()
+        }
+        val coordinator = RedundantConnectionCoordinator(
+            emptyStore(),
+            FakePanel(),
+            native,
+            nowMs = { 20_000L },
+            monotonicMs = { 1_000L },
+            healthMonitor = RedundantHealthMonitor(
+                rebindStabilizationMs = 0,
+                initialNetworkValidated = false,
+            ),
+        )
+
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+        ))
+        assertTrue(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+
+        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = true))
+        assertEquals(listOf("lease-a", "lease-b"), native.rebound)
+        assertTrue(coordinator.tick())
+        assertTrue(coordinator.isRunning())
+    }
+
+    @Test
+    fun revokeFencesPendingPrimaryCallbacksBeforeCleanup() {
+        var successes = 0
+        var failures = 0
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), panel, native)
+
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryStarted = { successes += 1 },
+            onPrimaryFailed = { failures += 1 },
+        ))
+        assertTrue(coordinator.fenceRevoke())
+        assertTrue(coordinator.revoke())
+        assertFalse(coordinator.tick())
+
+        assertEquals(0, successes)
+        assertEquals(0, failures)
+        assertEquals(1, panel.stopCalls)
+        assertFalse(coordinator.isRunning())
+    }
+
+    @Test
+    fun primaryReadinessTimeoutFailsExactlyOnce() {
+        var elapsedMs = 0L
+        var failures = 0
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            emptyStore(),
+            FakePanel(),
+            native,
+            monotonicMs = { elapsedMs },
+        )
+
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryFailed = { failures += 1 },
+        ))
+        elapsedMs = 30_000L
+
+        assertFalse(coordinator.tick())
+        assertFalse(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+        assertEquals(1, failures)
+        assertEquals(1, native.stopCalls)
+    }
+
+    @Test
+    fun wallClockJumpCannotExpirePrimaryReadiness() {
+        var wallMs = 1_000L
+        var elapsedMs = 5_000L
+        val coordinator = RedundantConnectionCoordinator(
+            emptyStore(),
+            FakePanel(),
+            FakeNative(),
+            nowMs = { wallMs },
+            monotonicMs = { elapsedMs },
+        )
+
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+        ))
+        wallMs = Long.MAX_VALUE
+        assertTrue(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+
+        elapsedMs = 35_000L
+        assertFalse(coordinator.tick())
+    }
+
+    @Test
+    fun resumeKeepsOnePendingRecoveryUntilReadinessArrives() {
+        val native = FakeNative().apply {
+            healthSnapshots += listOf(
+                healthSlot(
+                    index = 0,
+                    active = true,
+                    health = BackendHealth.READY,
+                    handshakeFresh = true,
+                    consecutiveProbeSuccesses = 3,
+                    stableSinceMs = 0,
+                ),
+            )
+        }
+        val panel = FakePanel(
+            recoveryHealthProbes = mapOf("lease-a" to probe()),
+        )
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            native,
+            monotonicMs = { 20_000L },
+        )
+
+        assertTrue(coordinator.recover())
+        assertFalse(coordinator.isRunning())
+        assertTrue(coordinator.resume())
+        assertEquals(listOf("lease-a", "lease-b"), native.started)
+        assertTrue(coordinator.tick())
+        assertTrue(coordinator.isRunning())
+        assertEquals(listOf("lease-a", "lease-b"), native.started)
     }
 
     @Test
@@ -931,6 +1105,13 @@ class RedundantConnectionCoordinatorTest {
         consecutiveProbeSuccesses = consecutiveProbeSuccesses,
         stableSinceMs = stableSinceMs,
     )
+
+    private fun probe() = BackgroundRedundantHealthProbe(
+        "dns_a",
+        "8.8.8.8",
+        "nelomai.ru",
+        4_000,
+    )
 }
 
 private class CoordinatorRecordBackend : EncryptedRecordBackend {
@@ -996,6 +1177,7 @@ private class FakePanel(
     private val commitFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val releaseFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val releaseFailureCodes: ArrayDeque<String> = ArrayDeque(),
+    private val recoveryHealthProbes: Map<String, BackgroundRedundantHealthProbe> = emptyMap(),
 ) : RedundantConnectionPanel {
     var stopCalls = 0
     var roleCalls = 0
@@ -1023,6 +1205,7 @@ private class FakePanel(
                 "lease-a" to "PrivateKey = only-in-memory-a".toByteArray(),
                 "lease-b" to "PrivateKey = only-in-memory-b".toByteArray(),
             ),
+            healthProbes = recoveryHealthProbes,
         )
     override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
         roleCalls += 1
