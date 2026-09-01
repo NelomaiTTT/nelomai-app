@@ -313,10 +313,10 @@ internal class ServiceRedundantConnectionNative(
         }.orEmpty()
         slots.values.sortedBy { it.slot.index }.map { runtime ->
             val nativeMetrics = metricsBySlot[runtime.slot.index]
-            advanceProbeLocked(nativeSession, runtime, now)
             val telemetry = nativeMetrics?.optJSONObject("telemetry")
             val txPackets = telemetry?.optLong("udp_send_packets") ?: runtime.previousTxPackets
             val rxPackets = telemetry?.optLong("udp_receive_packets") ?: runtime.previousRxPackets
+            advanceProbeLocked(nativeSession, runtime, now, txPackets, rxPackets)
             val probeBaselineTx = runtime.probeBaselineTxPackets
             val probeBaselineRx = runtime.probeBaselineRxPackets
             val noReceiveProgress = runtime.probeFailed && probeBaselineTx != null &&
@@ -354,6 +354,8 @@ internal class ServiceRedundantConnectionNative(
         nativeSession: NativeSession,
         runtime: SlotRuntime,
         now: Long,
+        currentTxPackets: Long,
+        currentRxPackets: Long,
     ) {
         if (!networkValidated) return
         val token = runtime.probeToken
@@ -376,8 +378,8 @@ internal class ServiceRedundantConnectionNative(
         }
         if (runtime.lastProbeAtMs != Long.MIN_VALUE && now - runtime.lastProbeAtMs < interval) return
         val probe = runtime.probe ?: return
-        runtime.probeBaselineTxPackets = runtime.previousTxPackets
-        runtime.probeBaselineRxPackets = runtime.previousRxPackets
+        runtime.probeBaselineTxPackets = currentTxPackets
+        runtime.probeBaselineRxPackets = currentRxPackets
         val opaque = backend.startProbe(
             nativeSession,
             runtime.slot.index,

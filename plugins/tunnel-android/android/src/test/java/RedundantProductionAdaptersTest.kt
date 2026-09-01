@@ -174,6 +174,37 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun preLaunchTrafficIsOutsideTheProbeFailureWindow() {
+        var nowMs = 1_000_000L
+        val backend = RecordingSessionBackend { nowMs }.also {
+            it.countProbeSend = false
+        }
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+            nowMs = { nowMs },
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        assertTrue(native.activate("lease-a"))
+
+        native.healthObservations()
+        backend.probeStatuses[requireNotNull(backend.latestProbeToken)] =
+            NativeProbeStatus.SUCCEEDED
+        nowMs += 1
+        native.healthObservations()
+        nowMs += 5_000
+        backend.setUdpPackets(sent = 5, received = 0)
+        native.healthObservations()
+        nowMs += 4_000
+        val timedOut = native.healthObservations().single()
+
+        assertTrue(timedOut.probeFailed)
+        assertFalse(timedOut.independentFailureSignal)
+    }
+
+    @Test
     fun productionNativePublishesBoundedSessionMetricsAcrossSlotSwitches() {
         val backend = RecordingSessionBackend()
         val native = ServiceRedundantConnectionNative(
@@ -246,6 +277,7 @@ private class RecordingSessionBackend(
     val probeStatuses = mutableMapOf<Long, NativeProbeStatus>()
     val rebindFailures = mutableSetOf<Int>()
     var latestProbeToken: Long? = null
+    var countProbeSend = true
     private val admitted = mutableSetOf<Int>()
     private var nextToken = 1L
 
@@ -288,7 +320,7 @@ private class RecordingSessionBackend(
         slot: Int,
         template: NativeDnsProbeTemplate,
     ): Long = nextToken++.also {
-        udpSendPackets += 1
+        if (countProbeSend) udpSendPackets += 1
         latestProbeToken = it
         probeStatuses[it] = NativeProbeStatus.PENDING
     }
@@ -309,6 +341,11 @@ private class RecordingSessionBackend(
 
     override fun close(session: NativeSession) {
         admitted.clear()
+    }
+
+    fun setUdpPackets(sent: Long, received: Long) {
+        udpSendPackets = sent
+        udpReceivePackets = received
     }
 
     private var udpSendPackets = 0L
