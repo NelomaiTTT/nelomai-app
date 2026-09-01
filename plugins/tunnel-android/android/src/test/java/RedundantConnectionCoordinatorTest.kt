@@ -224,6 +224,54 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun primaryReadinessDeadlineSurvivesThrowingHealthSnapshots() {
+        var elapsedMs = 0L
+        var failures = 0
+        val coordinator = RedundantConnectionCoordinator(
+            emptyStore(),
+            FakePanel(),
+            FakeNative(healthSnapshotFailures = 2),
+            monotonicMs = { elapsedMs },
+        )
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryFailed = { failures += 1 },
+        ))
+
+        assertTrue(coordinator.tick())
+        assertEquals(0, failures)
+
+        elapsedMs = 30_000L
+        assertFalse(coordinator.tick())
+        assertEquals(1, failures)
+    }
+
+    @Test
+    fun unreadableStoreFailsPendingPrimaryReadinessExactlyOnce() {
+        var failures = 0
+        val backend = CoordinatorRecordBackend()
+        backend.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1)))
+        val coordinator = RedundantConnectionCoordinator(
+            AndroidRecoveryStore(backend, CoordinatorBootIdentity()),
+            FakePanel(),
+            FakeNative(),
+        )
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryFailed = { failures += 1 },
+        ))
+        backend.failReads = true
+
+        assertFalse(coordinator.tick())
+        assertFalse(coordinator.tick())
+        assertEquals(1, failures)
+    }
+
+    @Test
     fun wallClockJumpCannotExpirePrimaryReadiness() {
         var wallMs = 1_000L
         var elapsedMs = 5_000L
@@ -1170,7 +1218,11 @@ class RedundantConnectionCoordinatorTest {
 
 private class CoordinatorRecordBackend : EncryptedRecordBackend {
     var record: ByteArray? = null
-    override fun read(): ByteArray? = record?.copyOf()
+    var failReads = false
+    override fun read(): ByteArray? {
+        if (failReads) throw IllegalStateException("read_failed")
+        return record?.copyOf()
+    }
     override fun write(plaintext: ByteArray): Boolean {
         record = plaintext.copyOf()
         return true
@@ -1186,6 +1238,7 @@ private class FakeNative(
     private val startFailures: Set<String> = emptySet(),
     private val stopResults: ArrayDeque<Boolean> = ArrayDeque(),
     val healthSnapshots: ArrayDeque<List<SlotObservation>> = ArrayDeque(),
+    private var healthSnapshotFailures: Int = 0,
 ) : RedundantConnectionNative {
     val started = mutableListOf<String>()
     val activated = mutableListOf<String>()
@@ -1216,8 +1269,13 @@ private class FakeNative(
     override fun rebind(leaseId: String): Boolean = (leaseId in usable).also {
         if (it) rebound += leaseId
     }
-    override fun healthObservations(): List<SlotObservation> =
-        healthSnapshots.removeFirstOrNull() ?: emptyList()
+    override fun healthObservations(): List<SlotObservation> {
+        if (healthSnapshotFailures > 0) {
+            healthSnapshotFailures -= 1
+            throw IllegalStateException("health_snapshot_failed")
+        }
+        return healthSnapshots.removeFirstOrNull() ?: emptyList()
+    }
 }
 
 private class FakePanel(

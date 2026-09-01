@@ -369,8 +369,9 @@ internal class RedundantConnectionCoordinator(
         observations: List<SlotObservation>,
     ): Boolean {
         val pending = pendingPrimaryReadiness ?: return false
-        val transaction = status()
-        if (pending.shouldCancel() || transaction?.desiredActive != true ||
+        if (pending.shouldCancel()) return cancelPrimaryReadinessLocked(pending)
+        val transaction = status() ?: return failPrimaryReadinessLocked(pending)
+        if (!transaction.desiredActive ||
             transaction.retry.stopState != RedundantStopState.NONE ||
             transaction.localActiveLeaseId != pending.activeLeaseId
         ) {
@@ -504,17 +505,17 @@ internal class RedundantConnectionCoordinator(
     }
 
     override fun tick(): Boolean = synchronized(gate) {
-        val transaction = status() ?: return@synchronized false
-        if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
-            return@synchronized false
-        }
         if (pendingPrimaryReadiness != null) {
             val observations = try {
                 native.healthObservations()
             } catch (_: Throwable) {
-                return@synchronized false
+                emptyList()
             }
             return@synchronized advancePrimaryReadinessLocked(observations)
+        }
+        val transaction = status() ?: return@synchronized false
+        if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
+            return@synchronized false
         }
         if (primaryReadinessFailed) return@synchronized false
         if (!transaction.standbyDesired) {
@@ -841,7 +842,7 @@ internal class RedundantConnectionCoordinator(
         return true
     }
 
-    /** Safe main-thread barrier: no native or panel operation is performed here. */
+    /** Serialized durable stop barrier; production callers dispatch it on redundant work. */
     override fun fenceRevoke(): Boolean = synchronized(gate) {
         val transaction = status() ?: return false
         val fenced = store.deferRedundantStop(transaction.stopOperationId ?: operationId()) is

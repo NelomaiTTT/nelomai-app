@@ -83,6 +83,24 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun redundantStopAtomicallyCancelsAndCompletesPendingStart() {
+        val outcomes = mutableListOf<String>()
+        val gate = RedundantStartOperationGate()
+
+        assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
+
+        assertEquals("operation-a", gate.cancelPendingAndComplete())
+        assertEquals(listOf("stopped"), outcomes)
+        assertTrue(gate.isCancelled("operation-a"))
+        assertFalse(gate.complete("operation-a") { outcomes += "running" })
+
+        gate.workerFinished("operation-a")
+
+        assertFalse(gate.isCancelled("operation-a"))
+        assertTrue(gate.begin("operation-b") { outcomes += "stopped-b" })
+    }
+
+    @Test
     fun redundantStartReadyAndStopRacePublishesExactlyOneTerminalOutcome() {
         repeat(100) { index ->
             val outcomes = CopyOnWriteArrayList<String>()
@@ -139,6 +157,59 @@ class NelomaiVpnServiceTest {
         assertEquals(listOf(true), networks)
         assertTrue(dispatcher.tick { ticks += 1 })
     }
+
+    @Test
+    fun redundantRevokeFencingAndCleanupRunOnlyOnDispatchedWorker() {
+        val queued = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(queued::addLast))
+        val events = mutableListOf<String>()
+        var result: RedundantRevokeResult? = null
+
+        dispatchRedundantRevoke(
+            dispatcher,
+            fence = {
+                events += "fence"
+                true
+            },
+            revoke = {
+                events += "revoke"
+                true
+            },
+            onComplete = { result = it },
+        )
+
+        assertTrue(events.isEmpty())
+        assertNull(result)
+        assertEquals(1, queued.size)
+
+        queued.removeFirst().run()
+
+        assertEquals(listOf("fence", "revoke"), events)
+        assertEquals(RedundantRevokeResult(fenced = true, stopped = true), result)
+    }
+
+    @Test
+    fun redundantRevokeNeverCleansUpWithoutDurableFence() {
+        val queued = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(queued::addLast))
+        var revokeCalls = 0
+        var result: RedundantRevokeResult? = null
+
+        dispatchRedundantRevoke(
+            dispatcher,
+            fence = { false },
+            revoke = {
+                revokeCalls += 1
+                true
+            },
+            onComplete = { result = it },
+        )
+        queued.removeFirst().run()
+
+        assertEquals(0, revokeCalls)
+        assertEquals(RedundantRevokeResult(fenced = false, stopped = false), result)
+    }
+
     @Test
     fun oneLogicalRedundantSessionEstablishesAndroidTunExactlyOnce() {
         var establishCalls = 0
