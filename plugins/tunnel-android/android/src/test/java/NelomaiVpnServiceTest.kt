@@ -30,7 +30,7 @@ class NelomaiVpnServiceTest {
             standbyConfiguration = "standby-secret".toByteArray(),
         )
 
-        assertEquals(NativeSession(7), session)
+        assertEquals(7L, session?.handle)
         assertEquals(1, establishCalls)
         assertEquals(listOf(41), backend.startedTunFds)
         assertEquals(listOf(1), backend.startedSlots)

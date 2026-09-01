@@ -1,10 +1,8 @@
 diff --git a/device/device.go b/device/device.go
-index 26c8ede..0329c87 100644
+index 26c8ede561e2185b5d9b14f9c70b640d10d3b049..0329c87dffd8337ae0feceb78d7e504d6c78ed6e 100644
 --- a/device/device.go
 +++ b/device/device.go
-@@ -126,6 +126,11 @@ type Device struct {
- 		keepaliveTimeoutSec AtomicUintRange
- 		maxHandshakeAttemps AtomicUintRange
+@@ -128,2 +128,7 @@ type Device struct {
  	}
 +
 +	controlProbe struct {
@@ -12,11 +10,7 @@ index 26c8ede..0329c87 100644
 +		completedGeneration atomic.Uint64
 +	}
  }
- 
- // deviceState represents the state of a Device.
-@@ -585,3 +590,76 @@ func (device *Device) BindClose() error {
- 	device.net.Unlock()
- 	return err
+@@ -587 +592,74 @@ func (device *Device) BindClose() error {
  }
 +
 +// SendKeepalivesToAllRunningPeers queues one keepalive for every running peer
@@ -92,12 +86,10 @@ index 26c8ede..0329c87 100644
 +	return peers
 +}
 diff --git a/device/device_test.go b/device/device_test.go
-index 1e13f9d..1a42459 100644
+index 1e13f9dc4296cbcdaa5b9743ddcd3c51c305d3b0..1a4245953c61dff0a62143e40227bda8871b8d5e 100644
 --- a/device/device_test.go
 +++ b/device/device_test.go
-@@ -329,6 +329,103 @@ func TestUpDown(t *testing.T) {
- 	}
- }
+@@ -331,2 +331,99 @@ func TestUpDown(t *testing.T) {
  
 +func TestSendKeepalivesWithoutPersistentInterval(t *testing.T) {
 +	pair := genTestPair(t, false)
@@ -197,15 +189,11 @@ index 1e13f9d..1a42459 100644
 +}
 +
  // TestConcurrencySafety does other things concurrently with tunnel use.
- // It is intended to be used with the race detector to catch data races.
- func TestConcurrencySafety(t *testing.T) {
 diff --git a/device/peer.go b/device/peer.go
-index e9ef5ee..9eda890 100644
+index e9ef5ee5665e4c78ba8ee9098e359e9a24dd2614..9eda890a755dae5874bc0aec8d5e59ff4076dfc9 100644
 --- a/device/peer.go
 +++ b/device/peer.go
-@@ -25,6 +25,12 @@ type Peer struct {
- 	rxBytes           atomic.Uint64  // bytes received from peer
- 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+@@ -27,2 +27,8 @@ type Peer struct {
  
 +	controlProbe struct {
 +		generation      atomic.Uint64
@@ -214,11 +202,7 @@ index e9ef5ee..9eda890 100644
 +	}
 +
  	endpoint struct {
- 		sync.Mutex
- 		val            conn.Endpoint
-@@ -59,6 +65,32 @@ type Peer struct {
- 	persistentKeepaliveInterval AtomicUintRange
- }
+@@ -61,2 +67,28 @@ type Peer struct {
  
 +func (peer *Peer) cancelHandshakeProbe(generation uint64) {
 +	if peer.controlProbe.generation.CompareAndSwap(generation, 0) {
@@ -247,27 +231,19 @@ index e9ef5ee..9eda890 100644
 +}
 +
  func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
- 	if device.isClosed() {
- 		return nil, errors.New("device closed")
 diff --git a/device/receive.go b/device/receive.go
-index fc2e2da..d6bc92c 100644
+index fc2e2da303d2c264423ba4a47990f28dbf03169f..d6bc92cce65e08b73d7ef144211b5da3af87ad3d 100644
 --- a/device/receive.go
 +++ b/device/receive.go
-@@ -466,6 +466,7 @@ func (device *Device) RoutineHandshake(id int) {
- 			}
- 
+@@ -468,2 +468,3 @@ func (device *Device) RoutineHandshake(id int) {
  			peer.timersSessionDerived()
 +			peer.completeHandshakeProbe(msg.Receiver)
  			peer.timersHandshakeComplete()
- 			peer.SendKeepalive()
- 		}
 diff --git a/device/send.go b/device/send.go
-index 5c22d97..c6748d9 100644
+index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..c6748d95e3b960c72efa39360963797192458324 100644
 --- a/device/send.go
 +++ b/device/send.go
-@@ -104,6 +104,21 @@ func (peer *Peer) SendKeepalive() {
- }
- 
+@@ -106,2 +106,17 @@ func (peer *Peer) SendKeepalive() {
  func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 +	probeGeneration := uint64(0)
 +	if isRetry {
@@ -285,87 +261,146 @@ index 5c22d97..c6748d9 100644
 +
 +func (peer *Peer) sendHandshakeInitiation(isRetry bool, probeGeneration uint64) error {
  	if !isRetry {
- 		peer.timers.handshakeAttempts.Store(0)
- 		peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttemps())
-@@ -133,6 +148,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
- 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
- 		return err
+@@ -135,2 +150,5 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
  	}
 +	if probeGeneration != 0 && peer.controlProbe.generation.Load() == probeGeneration {
 +		peer.controlProbe.expectedIndex.Store(msg.Sender)
 +	}
  
- 	var sendBuffer [][]byte
- 
+diff --git a/device/uapi.go b/device/uapi.go
+index f28994ccb7faff2b50062e3bc63641856c199215..453ecbbfa12ce9d0f25542aa5811c940b00b8269 100644
+--- a/device/uapi.go
++++ b/device/uapi.go
+@@ -250,4 +250,3 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 				ipc.IpcErrorProtocol,
+-				"failed to parse line %q",
+-				line,
++				"failed to parse configuration line",
+ 			)
+diff --git a/device/uapi_privacy_test.go b/device/uapi_privacy_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b87df2e4bdc84ef0ee825c5186aaa7e547e674a
+--- /dev/null
++++ b/device/uapi_privacy_test.go
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: MIT */
++
++package device
++
++import (
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn/bindtest"
++	"github.com/amnezia-vpn/amneziawg-go/v3/tun/tuntest"
++)
++
++func TestMalformedUAPIConfigDoesNotLogSourceLine(t *testing.T) {
++	const secretLine = "private_key super-secret-material"
++	var logs struct {
++		sync.Mutex
++		strings.Builder
++	}
++	logger := &Logger{
++		Verbosef: DiscardLogf,
++		Errorf: func(format string, args ...any) {
++			logs.Lock()
++			defer logs.Unlock()
++			_, _ = fmt.Fprintf(&logs.Builder, format, args...)
++		},
++	}
++	binds := bindtest.NewChannelBinds()
++	channelTUN := tuntest.NewChannelTUN()
++	device := NewDevice(channelTUN.TUN(), binds[0], logger)
++	t.Cleanup(device.Close)
++
++	if err := device.IpcSet(secretLine + "\n"); err == nil {
++		t.Fatal("malformed UAPI configuration was accepted")
++	}
++	logs.Lock()
++	logged := logs.String()
++	logs.Unlock()
++	if strings.Contains(logged, secretLine) || strings.Contains(logged, "super-secret-material") {
++		t.Fatalf("malformed UAPI source line leaked into logs: %q", logged)
++	}
++}
 diff --git a/tun/tun.go b/tun/tun.go
-index 336d642..568048e 100644
+index 336d642251f91a80e30eeb0c74d8afa15393b884..568048ecedeac856a959f5e8aa8d10d3c18cbd9c 100644
 --- a/tun/tun.go
 +++ b/tun/tun.go
-@@ -20,34 +20,35 @@
+@@ -20,3 +20,4 @@ const (
  type Device interface {
 -	// File returns the file descriptor of the device.
--	File() *os.File
--
--	// Read one or more packets from the Device (without any additional headers).
--	// On a successful read it returns the number of packets read, and sets
--	// packet lengths within the sizes slice. len(sizes) must be >= len(bufs).
--	// A nonzero offset can be used to instruct the Device on where to begin
--	// reading into each element of the bufs slice.
--	Read(bufs [][]byte, sizes []int, offset int) (n int, err error)
--
--	// Write one or more packets to the device (without any additional headers).
--	// On a successful write it returns the number of packets written. A nonzero
--	// offset can be used to instruct the Device on where to begin writing from
--	// each packet contained within the bufs slice.
--	Write(bufs [][]byte, offset int) (int, error)
--
--	// MTU returns the MTU of the Device.
--	MTU() (int, error)
--
--	// Name returns the current name of the Device.
--	Name() (string, error)
--
--	// Events returns a channel of type Event, which is fed Device events.
--	Events() <-chan Event
--
--	// Close stops the Device and closes the Event channel.
--	Close() error
--
--	// BatchSize returns the preferred/max number of packets that can be read or
--	// written in a single read/write call. BatchSize must not change over the
--	// lifetime of a Device.
--	BatchSize() int
 +	// File returns the backing file descriptor of the device. In-memory virtual
 +	// devices may return nil.
-+	File() *os.File
+ 	File() *os.File
+diff --git a/tun/tun_linux.go b/tun/tun_linux.go
+index b1254fdba30380ba9d076a8d373d367d74179e1c..20a72481191bee5a866e273215ea85b0a5e3420c 100644
+--- a/tun/tun_linux.go
++++ b/tun/tun_linux.go
+@@ -635,3 +635,3 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+ // CreateUnmonitoredTUNFromFD creates a Device from the provided file
+-// descriptor.
++// descriptor. Ownership of fd is always consumed, including on error.
+ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+@@ -639,2 +639,3 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	if err != nil {
++		_ = unix.Close(fd)
+ 		return nil, "", err
+@@ -642,2 +643,6 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	file := os.NewFile(uintptr(fd), "/dev/tun")
++	if file == nil {
++		_ = unix.Close(fd)
++		return nil, "", errors.New("failed to own TUN file descriptor")
++	}
+ 	tun := &NativeTun{
+@@ -652,2 +657,3 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	if err != nil {
++		_ = file.Close()
+ 		return nil, "", err
+@@ -656,2 +662,3 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	if err != nil {
++		_ = file.Close()
+ 		return nil, "", err
+diff --git a/tun/tun_linux_ownership_test.go b/tun/tun_linux_ownership_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..437b56c230895d1e46dee3ea68610c7d576d02ac
+--- /dev/null
++++ b/tun/tun_linux_ownership_test.go
+@@ -0,0 +1,34 @@
++//go:build linux
 +
-+	// Read one or more packets from the Device (without any additional headers).
-+	// On a successful read it returns the number of packets read, and sets
-+	// packet lengths within the sizes slice. len(sizes) must be >= len(bufs).
-+	// A nonzero offset can be used to instruct the Device on where to begin
-+	// reading into each element of the bufs slice.
-+	Read(bufs [][]byte, sizes []int, offset int) (n int, err error)
++package tun
 +
-+	// Write one or more packets to the device (without any additional headers).
-+	// On a successful write it returns the number of packets written. A nonzero
-+	// offset can be used to instruct the Device on where to begin writing from
-+	// each packet contained within the bufs slice.
-+	Write(bufs [][]byte, offset int) (int, error)
++import (
++	"errors"
++	"runtime/debug"
++	"testing"
 +
-+	// MTU returns the MTU of the Device.
-+	MTU() (int, error)
++	"golang.org/x/sys/unix"
++)
 +
-+	// Name returns the current name of the Device.
-+	Name() (string, error)
++func TestCreateUnmonitoredTUNFromFDConsumesDescriptorOnFailure(t *testing.T) {
++	previousGCPercent := debug.SetGCPercent(-1)
++	defer debug.SetGCPercent(previousGCPercent)
 +
-+	// Events returns a channel of type Event, which is fed Device events.
-+	Events() <-chan Event
++	pipe := make([]int, 2)
++	if err := unix.Pipe(pipe); err != nil {
++		t.Fatal(err)
++	}
++	defer unix.Close(pipe[1])
 +
-+	// Close stops the Device and closes the Event channel.
-+	Close() error
-+
-+	// BatchSize returns the preferred/max number of packets that can be read or
-+	// written in a single read/write call. BatchSize must not change over the
-+	// lifetime of a Device.
-+	BatchSize() int
- }
++	device, _, err := CreateUnmonitoredTUNFromFD(pipe[0])
++	if err == nil {
++		device.Close()
++		t.Fatal("expected a non-TUN descriptor to be rejected")
++	}
++	if _, err := unix.FcntlInt(uintptr(pipe[0]), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
++		if err == nil {
++			unix.Close(pipe[0])
++		}
++		t.Fatalf("descriptor remains owned by the caller after failure: %v", err)
++	}
++}

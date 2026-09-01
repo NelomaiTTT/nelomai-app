@@ -6,6 +6,11 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
 
 class RedundantNativeBackendTest {
     @Test
@@ -52,7 +57,7 @@ class RedundantNativeBackendTest {
         val session = backend.start(41, configuration)
 
         assertEquals(null, session)
-        assertEquals(listOf(7), native.closedSessions)
+        assertEquals(listOf(7L), native.closedSessions)
         assertArrayEquals(ByteArray(configuration.size), configuration)
     }
 
@@ -73,7 +78,7 @@ class RedundantNativeBackendTest {
     @Test
     fun reusedNativeHandleBelongsToTheNewSessionAfterClose() {
         val native = FakeRedundantNativeApi().apply {
-            createHandles = ArrayDeque(listOf(7, 7))
+            createHandles = ArrayDeque(listOf(7L, 7L))
         }
         val backend = RedundantNativeBackend(native) { true }
         val first = requireNotNull(backend.start(41, "first-secret".toByteArray()))
@@ -99,7 +104,7 @@ class RedundantNativeBackendTest {
     }
 
     @Test
-    fun ambiguousPrepareFailureAbortsPendingNativeState() {
+    fun prepareExceptionCannotAbortAnUnidentifiedNativeGeneration() {
         val native = FakeRedundantNativeApi()
         val backend = RedundantNativeBackend(native) { true }
         val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
@@ -107,59 +112,177 @@ class RedundantNativeBackendTest {
 
         assertFalse(backend.rebind(session, 0))
 
-        assertEquals(1, native.abortedPreparations)
+        assertEquals(0, native.abortedPreparations)
+    }
+
+    @Test
+    fun concurrentRebindsAreSerializedAcrossProtectionAndAdmission() {
+        val native = FakeRedundantNativeApi()
+        val firstProtectEntered = CountDownLatch(1)
+        val releaseFirstProtect = CountDownLatch(1)
+        val protectedRebindSockets = AtomicInteger(0)
+        val backend = RedundantNativeBackend(native) { fd ->
+            if (fd >= 200 && protectedRebindSockets.incrementAndGet() == 1) {
+                firstProtectEntered.countDown()
+                releaseFirstProtect.await(1, TimeUnit.SECONDS)
+            }
+            true
+        }
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+        native.nextPreparedSockets = intArrayOf(201, 202)
+        val firstResult = AtomicBoolean(false)
+        val secondResult = AtomicBoolean(false)
+        val secondFinished = CountDownLatch(1)
+
+        val first = thread(start = true) { firstResult.set(backend.rebind(session, 0)) }
+        assertTrue(firstProtectEntered.await(1, TimeUnit.SECONDS))
+        val second = thread(start = true) {
+            secondResult.set(backend.rebind(session, 0))
+            secondFinished.countDown()
+        }
+
+        assertFalse(secondFinished.await(50, TimeUnit.MILLISECONDS))
+        releaseFirstProtect.countDown()
+        first.join(1_000)
+        second.join(1_000)
+
+        assertTrue(firstResult.get())
+        assertTrue(secondResult.get())
+    }
+
+    @Test
+    fun closeWaitsForAnInFlightSessionOperation() {
+        val native = FakeRedundantNativeApi()
+        val backend = RedundantNativeBackend(native) { true }
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+        native.blockSwitch = true
+        val closeFinished = CountDownLatch(1)
+
+        val switching = thread(start = true) { backend.switchActive(session, 0) }
+        assertTrue(native.switchEntered.await(1, TimeUnit.SECONDS))
+        val closing = thread(start = true) {
+            backend.close(session)
+            closeFinished.countDown()
+        }
+
+        assertFalse(closeFinished.await(50, TimeUnit.MILLISECONDS))
+        native.releaseSwitch.countDown()
+        switching.join(1_000)
+        closing.join(1_000)
+
+        assertEquals(listOf(7L), native.closedSessions)
+    }
+
+    @Test
+    fun nativeSessionHandleIsNotNarrowedToInt() {
+        val largeHandle = Int.MAX_VALUE.toLong() + 41L
+        val native = FakeRedundantNativeApi().apply {
+            createHandles = ArrayDeque(listOf(largeHandle))
+        }
+        val backend = RedundantNativeBackend(native) { true }
+
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+        backend.close(session)
+
+        assertEquals(largeHandle, session.handle)
+        assertEquals(listOf(largeHandle), native.closedSessions)
+    }
+
+    @Test
+    fun createExceptionClosesTunFdThatNeverReachedNativeOwnership() {
+        val native = FakeRedundantNativeApi().apply {
+            createFailure = UnsatisfiedLinkError("missing redundant JNI ABI")
+        }
+        val closedTunFds = mutableListOf<Int>()
+        val backend = RedundantNativeBackend(
+            native = native,
+            protectSocket = { true },
+            closeTunFd = { fd -> closedTunFds.add(fd) },
+        )
+        val configuration = "primary-secret".toByteArray()
+
+        val session = backend.start(41, configuration)
+
+        assertEquals(null, session)
+        assertEquals(listOf(41), closedTunFds)
+        assertArrayEquals(ByteArray(configuration.size), configuration)
     }
 }
 
 private class FakeRedundantNativeApi : RedundantNativeApi {
-    var createHandles = ArrayDeque(listOf(7))
+    var createHandles = ArrayDeque(listOf(7L))
     var nextPreparedSockets = intArrayOf(101, 102)
     var sentPackets = 0
     var admissions = 0
     var abortedPreparations = 0
     var prepareFailure: Throwable? = null
+    var createFailure: Throwable? = null
+    var blockSwitch = false
+    val switchEntered = CountDownLatch(1)
+    val releaseSwitch = CountDownLatch(1)
     val stoppedSlots = mutableListOf<Int>()
-    val closedSessions = mutableListOf<Int>()
-    private val prepared = mutableMapOf<Int, List<Int>>()
+    val closedSessions = mutableListOf<Long>()
+    private var nextPreparationToken = 1L
+    private val prepared = mutableMapOf<Int, LongArray>()
     private val active = mutableMapOf<Int, List<Int>>()
 
-    override fun create(tunFd: Int): Int = createHandles.removeFirst()
-
-    override fun prepareSlot(handle: Int, slot: Int, configuration: ByteArray): IntArray =
-        nextPreparedSockets.copyOf().also { prepared[slot] = it.toList() }
-
-    override fun prepareRebind(handle: Int, slot: Int): IntArray {
-        prepareFailure?.let { throw it }
-        return nextPreparedSockets.copyOf().also { prepared[slot] = it.toList() }
+    override fun create(tunFd: Int): Long {
+        createFailure?.let { throw it }
+        return createHandles.removeFirst()
     }
 
-    override fun admitSlot(handle: Int, slot: Int): Boolean {
+    override fun prepareSlot(handle: Long, slot: Int, configuration: ByteArray): LongArray =
+        preparation(slot)
+
+    override fun prepareRebind(handle: Long, slot: Int): LongArray {
+        prepareFailure?.let { throw it }
+        return preparation(slot)
+    }
+
+    override fun admitSlot(handle: Long, slot: Int, preparationToken: Long): Boolean {
+        val pending = prepared[slot]
+        if (pending?.firstOrNull() != preparationToken) return false
         admissions += 1
-        active[slot] = prepared.remove(slot).orEmpty()
+        active[slot] = requireNotNull(prepared.remove(slot)).drop(1).map(Long::toInt)
         sentPackets += 1
         return true
     }
 
-    override fun abortPreparation(handle: Int, slot: Int) {
+    override fun abortPreparation(handle: Long, slot: Int, preparationToken: Long) {
         abortedPreparations += 1
-        prepared.remove(slot)
+        if (prepared[slot]?.firstOrNull() == preparationToken) prepared.remove(slot)
     }
 
-    override fun switchActive(handle: Int, slot: Int): Boolean = true
+    override fun switchActive(handle: Long, slot: Int): Boolean {
+        if (blockSwitch) {
+            switchEntered.countDown()
+            releaseSwitch.await(1, TimeUnit.SECONDS)
+        }
+        return true
+    }
 
-    override fun stopSlot(handle: Int, slot: Int): Boolean {
+    override fun stopSlot(handle: Long, slot: Int): Boolean {
         stoppedSlots += slot
         active.remove(slot)
         return true
     }
 
-    override fun metrics(handle: Int): String? = "{}"
+    override fun metrics(handle: Long): String? = "{}"
 
-    override fun close(handle: Int) {
+    override fun close(handle: Long) {
         closedSessions += handle
         active.clear()
         prepared.clear()
     }
 
     fun activeSocketSet(slot: Int): List<Int> = active[slot].orEmpty()
+
+    private fun preparation(slot: Int): LongArray {
+        val result = longArrayOf(
+            nextPreparationToken++,
+            *nextPreparedSockets.map(Int::toLong).toLongArray(),
+        )
+        prepared[slot] = result
+        return result
+    }
 }

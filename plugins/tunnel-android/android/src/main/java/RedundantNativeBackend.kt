@@ -1,9 +1,12 @@
 package ru.nelomai.tunnel
 
 import android.content.Context
+import android.os.ParcelFileDescriptor
 import org.amnezia.awg.util.SharedLibraryLoader
 
-internal data class NativeSession(val handle: Int)
+internal class NativeSession(val handle: Long) {
+    val operationGate = Any()
+}
 
 internal interface RedundantSessionBackend {
     fun start(tunFd: Int, primaryConfiguration: ByteArray): NativeSession?
@@ -13,15 +16,16 @@ internal interface RedundantSessionBackend {
 
 /** Raw Task 9 JNI boundary. Socket descriptors are pending until [admitSlot]. */
 internal interface RedundantNativeApi {
-    fun create(tunFd: Int): Int
-    fun prepareSlot(handle: Int, slot: Int, configuration: ByteArray): IntArray
-    fun prepareRebind(handle: Int, slot: Int): IntArray
-    fun admitSlot(handle: Int, slot: Int): Boolean
-    fun abortPreparation(handle: Int, slot: Int)
-    fun switchActive(handle: Int, slot: Int): Boolean
-    fun stopSlot(handle: Int, slot: Int): Boolean
-    fun metrics(handle: Int): String?
-    fun close(handle: Int)
+    fun create(tunFd: Int): Long
+    /** Encodes the opaque preparation token first, followed by one or two socket FDs. */
+    fun prepareSlot(handle: Long, slot: Int, configuration: ByteArray): LongArray
+    fun prepareRebind(handle: Long, slot: Int): LongArray
+    fun admitSlot(handle: Long, slot: Int, preparationToken: Long): Boolean
+    fun abortPreparation(handle: Long, slot: Int, preparationToken: Long)
+    fun switchActive(handle: Long, slot: Int): Boolean
+    fun stopSlot(handle: Long, slot: Int): Boolean
+    fun metrics(handle: Long): String?
+    fun close(handle: Long)
 }
 
 internal class JniRedundantNativeApi(context: Context) : RedundantNativeApi {
@@ -29,33 +33,37 @@ internal class JniRedundantNativeApi(context: Context) : RedundantNativeApi {
         SharedLibraryLoader.loadSharedLibrary(context.applicationContext, "wg-go")
     }
 
-    override fun create(tunFd: Int): Int = nativeCreate(tunFd)
-    override fun prepareSlot(handle: Int, slot: Int, configuration: ByteArray): IntArray =
-        nativePrepareSlot(handle, slot, configuration)
-    override fun prepareRebind(handle: Int, slot: Int): IntArray =
-        nativePrepareRebind(handle, slot)
-    override fun admitSlot(handle: Int, slot: Int): Boolean = nativeAdmitSlot(handle, slot)
-    override fun abortPreparation(handle: Int, slot: Int) =
-        nativeAbortPreparation(handle, slot)
-    override fun switchActive(handle: Int, slot: Int): Boolean =
-        nativeSwitchActive(handle, slot)
-    override fun stopSlot(handle: Int, slot: Int): Boolean = nativeStopSlot(handle, slot)
-    override fun metrics(handle: Int): String? = nativeMetrics(handle)
-    override fun close(handle: Int) = nativeClose(handle)
-
-    private external fun nativeCreate(tunFd: Int): Int
-    private external fun nativePrepareSlot(
-        handle: Int,
+    override fun create(tunFd: Int): Long = nativeCreate(tunFd)
+    override fun prepareSlot(
+        handle: Long,
         slot: Int,
         configuration: ByteArray,
-    ): IntArray
-    private external fun nativePrepareRebind(handle: Int, slot: Int): IntArray
-    private external fun nativeAdmitSlot(handle: Int, slot: Int): Boolean
-    private external fun nativeAbortPreparation(handle: Int, slot: Int)
-    private external fun nativeSwitchActive(handle: Int, slot: Int): Boolean
-    private external fun nativeStopSlot(handle: Int, slot: Int): Boolean
-    private external fun nativeMetrics(handle: Int): String?
-    private external fun nativeClose(handle: Int)
+    ): LongArray = nativePrepareSlot(handle, slot, configuration)
+    override fun prepareRebind(handle: Long, slot: Int): LongArray =
+        nativePrepareRebind(handle, slot)
+    override fun admitSlot(handle: Long, slot: Int, preparationToken: Long): Boolean =
+        nativeAdmitSlot(handle, slot, preparationToken)
+    override fun abortPreparation(handle: Long, slot: Int, preparationToken: Long) =
+        nativeAbortPreparation(handle, slot, preparationToken)
+    override fun switchActive(handle: Long, slot: Int): Boolean =
+        nativeSwitchActive(handle, slot)
+    override fun stopSlot(handle: Long, slot: Int): Boolean = nativeStopSlot(handle, slot)
+    override fun metrics(handle: Long): String? = nativeMetrics(handle)
+    override fun close(handle: Long) = nativeClose(handle)
+
+    private external fun nativeCreate(tunFd: Int): Long
+    private external fun nativePrepareSlot(
+        handle: Long,
+        slot: Int,
+        configuration: ByteArray,
+    ): LongArray
+    private external fun nativePrepareRebind(handle: Long, slot: Int): LongArray
+    private external fun nativeAdmitSlot(handle: Long, slot: Int, preparationToken: Long): Boolean
+    private external fun nativeAbortPreparation(handle: Long, slot: Int, preparationToken: Long)
+    private external fun nativeSwitchActive(handle: Long, slot: Int): Boolean
+    private external fun nativeStopSlot(handle: Long, slot: Int): Boolean
+    private external fun nativeMetrics(handle: Long): String?
+    private external fun nativeClose(handle: Long)
 }
 
 /**
@@ -64,19 +72,21 @@ internal class JniRedundantNativeApi(context: Context) : RedundantNativeApi {
  */
 internal class RedundantNativeBackend(
     private val native: RedundantNativeApi,
+    private val closeTunFd: (Int) -> Unit = { fd -> ParcelFileDescriptor.adoptFd(fd).close() },
     private val protectSocket: (Int) -> Boolean,
 ) : RedundantSessionBackend {
     private val gate = Any()
-    private val activeSessions = mutableMapOf<Int, NativeSession>()
+    private val activeSessions = mutableMapOf<Long, NativeSession>()
 
     override fun start(tunFd: Int, primaryConfiguration: ByteArray): NativeSession? {
         val handle = try {
             native.create(tunFd)
         } catch (_: Throwable) {
+            runCatching { closeTunFd(tunFd) }
             primaryConfiguration.fill(0)
             return null
         }
-        if (handle < 0) {
+        if (handle <= 0L) {
             primaryConfiguration.fill(0)
             return null
         }
@@ -93,74 +103,85 @@ internal class RedundantNativeBackend(
         slot: Int,
         configuration: ByteArray,
     ): Boolean = try {
-        prepareAndAdmit(session, slot) {
-            native.prepareSlot(session.handle, slot, configuration)
+        synchronized(session.operationGate) {
+            prepareAndAdmit(session, slot) {
+                native.prepareSlot(session.handle, slot, configuration)
+            }
         }
     } finally {
         configuration.fill(0)
     }
 
-    fun rebind(session: NativeSession, slot: Int): Boolean =
+    fun rebind(session: NativeSession, slot: Int): Boolean = synchronized(session.operationGate) {
         prepareAndAdmit(session, slot) { native.prepareRebind(session.handle, slot) }
+    }
 
-    fun switchActive(session: NativeSession, slot: Int): Boolean =
+    fun switchActive(session: NativeSession, slot: Int): Boolean = synchronized(session.operationGate) {
         valid(session, slot) && runCatching {
             native.switchActive(session.handle, slot)
         }.getOrDefault(false)
+    }
 
-    fun stopSlot(session: NativeSession, slot: Int): Boolean =
+    fun stopSlot(session: NativeSession, slot: Int): Boolean = synchronized(session.operationGate) {
         valid(session, slot) && runCatching {
             native.stopSlot(session.handle, slot)
         }.getOrDefault(false)
+    }
 
-    fun metrics(session: NativeSession): String? = if (valid(session)) {
-        runCatching { native.metrics(session.handle) }.getOrNull()
-    } else {
-        null
+    fun metrics(session: NativeSession): String? = synchronized(session.operationGate) {
+        if (valid(session)) {
+            runCatching { native.metrics(session.handle) }.getOrNull()
+        } else {
+            null
+        }
     }
 
     override fun close(session: NativeSession) {
         val shouldClose = synchronized(gate) { activeSessions.remove(session.handle, session) }
-        if (shouldClose) runCatching { native.close(session.handle) }
+        if (shouldClose) synchronized(session.operationGate) {
+            runCatching { native.close(session.handle) }
+        }
     }
 
     private fun prepareAndAdmit(
         session: NativeSession,
         slot: Int,
-        prepare: () -> IntArray,
+        prepare: () -> LongArray,
     ): Boolean {
         if (!valid(session, slot)) return false
-        val descriptors = try {
+        val encoded = try {
             prepare()
         } catch (_: Throwable) {
-            abort(session, slot)
             return false
         }
-        if (descriptors.isEmpty() || descriptors.any { it < 0 } ||
-            descriptors.toSet().size != descriptors.size
-        ) {
-            abort(session, slot)
+        val preparationToken = encoded.firstOrNull() ?: return false
+        if (preparationToken <= 0L) return false
+        if (encoded.size !in 2..3) {
+            abort(session, slot, preparationToken)
             return false
         }
-        val protected = descriptors.all { fd ->
-            runCatching { protectSocket(fd) }.getOrDefault(false)
-        }
-        if (!protected) {
-            abort(session, slot)
-            return false
+        for (index in 1 until encoded.size) {
+            val descriptor = encoded[index]
+            if (descriptor !in 0L..Int.MAX_VALUE.toLong() ||
+                (index == 2 && descriptor == encoded[1]) ||
+                !runCatching { protectSocket(descriptor.toInt()) }.getOrDefault(false)
+            ) {
+                abort(session, slot, preparationToken)
+                return false
+            }
         }
         val admitted = runCatching {
-            native.admitSlot(session.handle, slot)
+            native.admitSlot(session.handle, slot, preparationToken)
         }.getOrDefault(false)
-        if (!admitted) abort(session, slot)
+        if (!admitted) abort(session, slot, preparationToken)
         return admitted
     }
 
-    private fun abort(session: NativeSession, slot: Int) {
-        runCatching { native.abortPreparation(session.handle, slot) }
+    private fun abort(session: NativeSession, slot: Int, preparationToken: Long) {
+        runCatching { native.abortPreparation(session.handle, slot, preparationToken) }
     }
 
     private fun valid(session: NativeSession, slot: Int? = null): Boolean =
-        session.handle >= 0 && (slot == null || slot in 0..1) &&
+        session.handle > 0L && (slot == null || slot in 0..1) &&
             synchronized(gate) { activeSessions[session.handle] === session }
 }
