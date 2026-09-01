@@ -6,16 +6,45 @@ import java.util.UUID
 
 internal fun RedundantHealthProbeArgs?.toBackgroundProbe(): BackgroundRedundantHealthProbe {
     val value = requireNotNull(this) { "missing_redundant_health_probe" }
-    require(value.kind == "dns_a")
-    require(value.timeoutMs in 250L..10_000L)
-    require(canonicalRedundantIpv4(value.targetIpv4))
-    require(canonicalRedundantDnsName(value.queryName))
-    return BackgroundRedundantHealthProbe(
+    return validatedRedundantHealthProbe(
         kind = value.kind,
         targetIpv4 = value.targetIpv4,
         queryName = value.queryName,
         timeoutMs = value.timeoutMs,
     )
+}
+
+internal fun validatedRedundantHealthProbe(
+    kind: String,
+    targetIpv4: String,
+    queryName: String,
+    timeoutMs: Long,
+): BackgroundRedundantHealthProbe {
+    require(kind == "dns_a")
+    require(timeoutMs in 1_000L..8_000L)
+    require(canonicalRedundantIpv4(targetIpv4))
+    require(canonicalRedundantDnsName(queryName))
+    return BackgroundRedundantHealthProbe(
+        kind = kind,
+        targetIpv4 = targetIpv4,
+        queryName = queryName,
+        timeoutMs = timeoutMs,
+    )
+}
+
+internal fun redundantHealthProbesFromStart(
+    redundancy: RedundantStartArgs,
+): Map<String, BackgroundRedundantHealthProbe> {
+    require(!redundancy.standbyDesired || redundancy.primary.healthProbe != null)
+    require(redundancy.standbyDesired || redundancy.standby == null)
+    return linkedMapOf<String, BackgroundRedundantHealthProbe>().apply {
+        redundancy.primary.healthProbe?.let {
+            put(redundancy.primary.leaseId, it.toBackgroundProbe())
+        }
+        redundancy.standby?.let {
+            put(it.member.leaseId, it.member.healthProbe.toBackgroundProbe())
+        }
+    }
 }
 
 internal fun redundantTransactionFromStart(
@@ -52,8 +81,7 @@ internal fun redundantTransactionFromStart(
     require(redundancy.requestFingerprint.matches(Regex("^[0-9a-f]{64}$")))
     require(redundancy.virtualAddressV4.endsWith("/32") &&
         canonicalRedundantIpv4(redundancy.virtualAddressV4.removeSuffix("/32")))
-    redundancy.primary.healthProbe.toBackgroundProbe()
-    redundancy.standby?.let { it.member.healthProbe.toBackgroundProbe() }
+    redundantHealthProbesFromStart(redundancy)
     return AndroidRedundantTransaction(
         desiredActive = true,
         template = AndroidIntentTemplate(
@@ -126,6 +154,8 @@ internal class ServiceRedundantConnectionNative(
         var hardFailure: Boolean = false,
         var previousTxPackets: Long = 0,
         var previousRxPackets: Long = 0,
+        var probeBaselineTxPackets: Long? = null,
+        var probeBaselineRxPackets: Long? = null,
     )
 
     private val gate = Any()
@@ -234,6 +264,8 @@ internal class ServiceRedundantConnectionNative(
                 runtime.hardFailure = false
                 runtime.probeToken = null
                 runtime.probeDeadlineMs = null
+                runtime.probeBaselineTxPackets = null
+                runtime.probeBaselineRxPackets = null
             }
             if (!rebound && networkValidated) runtime.hardFailure = true
         }
@@ -285,8 +317,11 @@ internal class ServiceRedundantConnectionNative(
             val telemetry = nativeMetrics?.optJSONObject("telemetry")
             val txPackets = telemetry?.optLong("udp_send_packets") ?: runtime.previousTxPackets
             val rxPackets = telemetry?.optLong("udp_receive_packets") ?: runtime.previousRxPackets
-            val noReceiveProgress = runtime.probeFailed &&
-                txPackets > runtime.previousTxPackets && rxPackets <= runtime.previousRxPackets
+            val probeBaselineTx = runtime.probeBaselineTxPackets
+            val probeBaselineRx = runtime.probeBaselineRxPackets
+            val noReceiveProgress = runtime.probeFailed && probeBaselineTx != null &&
+                probeBaselineRx != null && txPackets > probeBaselineTx &&
+                rxPackets <= probeBaselineRx
             runtime.previousTxPackets = txPackets
             runtime.previousRxPackets = rxPackets
             val latestHandshake = nativeMetrics?.optLong("latest_handshake_at_unix_ms") ?: 0L
@@ -341,6 +376,8 @@ internal class ServiceRedundantConnectionNative(
         }
         if (runtime.lastProbeAtMs != Long.MIN_VALUE && now - runtime.lastProbeAtMs < interval) return
         val probe = runtime.probe ?: return
+        runtime.probeBaselineTxPackets = runtime.previousTxPackets
+        runtime.probeBaselineRxPackets = runtime.previousRxPackets
         val opaque = backend.startProbe(
             nativeSession,
             runtime.slot.index,
@@ -375,6 +412,8 @@ internal class ServiceRedundantConnectionNative(
         runtime.probeToken?.let { backend.cancelProbe(nativeSession, it) }
         runtime.probeToken = null
         runtime.probeDeadlineMs = null
+        runtime.probeBaselineTxPackets = null
+        runtime.probeBaselineRxPackets = null
     }
 
     private fun saturatingAdd(value: Long, increment: Long): Long =
@@ -426,7 +465,7 @@ internal class ServiceRedundantConnectionPanel(
 
     override fun releaseStandby(
         transaction: AndroidRedundantTransaction,
-        inactiveLeaseId: String,
+        inactiveLeaseId: String?,
     ): BackgroundRedundantSession = BackgroundConnectionClient.releaseRedundantStandby(
         credential(transaction.template.deviceId),
         transaction,

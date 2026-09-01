@@ -48,7 +48,7 @@ internal interface RedundantConnectionPanel {
     fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse
     fun releaseStandby(
         transaction: AndroidRedundantTransaction,
-        inactiveLeaseId: String,
+        inactiveLeaseId: String?,
     ): BackgroundRedundantSession = throw UnsupportedOperationException()
     fun acquireStandby(
         transaction: AndroidRedundantTransaction,
@@ -162,6 +162,7 @@ internal class RedundantConnectionCoordinator(
     private val native: RedundantConnectionNative,
     private val operationId: () -> String = { UUID.randomUUID().toString() },
     private val nowMs: () -> Long = System::currentTimeMillis,
+    private val primaryReadinessSleep: (Long) -> Unit = Thread::sleep,
     private val healthMonitor: RedundantHealthMonitor = RedundantHealthMonitor(),
     private val onReserveStateChanged: (RedundantReserveState?) -> Unit = {},
     private val onDiagnosticEvent: (RedundantDiagnosticEvent) -> Unit = {},
@@ -209,6 +210,19 @@ internal class RedundantConnectionCoordinator(
             native.stop()
             return@synchronized false
         }
+        if (healthProbes[active] != null &&
+            !awaitPrimaryReadiness(activeSlot, shouldCancel)
+        ) {
+            native.stop()
+            return@synchronized false
+        }
+        val readyCurrent = status()
+        if (shouldCancel() || readyCurrent?.desiredActive != true ||
+            readyCurrent.retry.stopState != RedundantStopState.NONE
+        ) {
+            native.stop()
+            return@synchronized false
+        }
         recoveryStarted = true
         publishReserveStateLocked(transaction, emptyList())
         onPrimaryStarted()
@@ -223,6 +237,33 @@ internal class RedundantConnectionCoordinator(
             }
         }
         true
+    }
+
+    private fun awaitPrimaryReadiness(
+        activeSlot: RedundantSlot,
+        shouldCancel: () -> Boolean,
+    ): Boolean {
+        val activeIndex = if (activeSlot == RedundantSlot.A) 0 else 1
+        val startedAt = nowMs().coerceAtLeast(0L)
+        val deadline = if (startedAt > Long.MAX_VALUE - PRIMARY_READINESS_TIMEOUT_MILLIS) {
+            Long.MAX_VALUE
+        } else {
+            startedAt + PRIMARY_READINESS_TIMEOUT_MILLIS
+        }
+        while (!shouldCancel()) {
+            val current = nowMs().coerceAtLeast(0L)
+            val observation = native.healthObservations()
+                .singleOrNull { it.index == activeIndex }
+            if (observation != null) {
+                if (observation.hardFailure || observation.health == BackendHealth.UNHEALTHY) {
+                    return false
+                }
+                if (healthMonitor.ready(current, observation)) return true
+            }
+            if (current >= deadline) return false
+            primaryReadinessSleep(minOf(PRIMARY_READINESS_POLL_MILLIS, deadline - current))
+        }
+        return false
     }
 
     /** Replays the v2 session before callers attempt any recovery-v1 flow. */
@@ -367,7 +408,6 @@ internal class RedundantConnectionCoordinator(
     override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean = synchronized(gate) {
         healthMonitor.onUnderlyingNetworkChanged(nowMs(), validated)
         native.setNetworkValidated(validated)
-        if (!validated) return@synchronized true
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
@@ -466,11 +506,7 @@ internal class RedundantConnectionCoordinator(
             transaction = transaction.copy(candidateLeaseId = null, candidateSlot = null)
             if (!persist(transaction)) return false
         }
-        if (inactive == null) {
-            publishReserveStateLocked(null, emptyList())
-            return true
-        }
-        if (recoveryStarted && !native.stopSlot(inactive)) return false
+        if (inactive != null && recoveryStarted && !native.stopSlot(inactive)) return false
         val session = try {
             panel.releaseStandby(transaction, inactive)
         } catch (error: Throwable) {
@@ -780,6 +816,8 @@ internal class RedundantConnectionCoordinator(
 
     private companion object {
         const val HEALTH_FAILOVER_REASON = "primary_unhealthy"
+        const val PRIMARY_READINESS_POLL_MILLIS = 250L
+        const val PRIMARY_READINESS_TIMEOUT_MILLIS = 30_000L
         const val REPLACEMENT_DELAY_SECONDS = 60L
         private val REDUNDANT_RELEASE_REBASE_CODES = setOf(
             "role_generation_conflict",

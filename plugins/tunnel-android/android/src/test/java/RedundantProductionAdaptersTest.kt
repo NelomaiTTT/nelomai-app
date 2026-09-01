@@ -150,6 +150,30 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
+    fun timedOutProbeKeepsItsLaunchBaselineAsIndependentFailureSignal() {
+        var nowMs = 1_000_000L
+        val backend = RecordingSessionBackend { nowMs }
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+            nowMs = { nowMs },
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        assertTrue(native.activate("lease-a"))
+
+        native.healthObservations()
+        nowMs += 1_000
+        native.healthObservations()
+        nowMs += 3_000
+        val timedOut = native.healthObservations().single()
+
+        assertTrue(timedOut.probeFailed)
+        assertTrue(timedOut.independentFailureSignal)
+    }
+
+    @Test
     fun productionNativePublishesBoundedSessionMetricsAcrossSlotSwitches() {
         val backend = RecordingSessionBackend()
         val native = ServiceRedundantConnectionNative(
@@ -264,6 +288,7 @@ private class RecordingSessionBackend(
         slot: Int,
         template: NativeDnsProbeTemplate,
     ): Long = nextToken++.also {
+        udpSendPackets += 1
         latestProbeToken = it
         probeStatuses[it] = NativeProbeStatus.PENDING
     }
@@ -279,10 +304,13 @@ private class RecordingSessionBackend(
             prefix = "{\"slots\":[",
             postfix = "]}",
         ) { slot ->
-            """{"slot":$slot,"admitted":true,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"udp_send_packets":1,"udp_receive_packets":1}}"""
+            """{"slot":$slot,"admitted":true,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"udp_send_packets":$udpSendPackets,"udp_receive_packets":$udpReceivePackets}}"""
         }
 
     override fun close(session: NativeSession) {
         admitted.clear()
     }
+
+    private var udpSendPackets = 0L
+    private var udpReceivePackets = 0L
 }

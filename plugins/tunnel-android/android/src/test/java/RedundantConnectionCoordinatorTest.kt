@@ -7,6 +7,53 @@ import org.junit.Test
 
 class RedundantConnectionCoordinatorTest {
     @Test
+    fun primaryIsReportedOnlyAfterItsDataplaneBecomesReady() {
+        val native = FakeNative().apply {
+            healthSnapshots += listOf(
+                healthSlot(index = 0, active = true, health = BackendHealth.WARMING),
+            )
+            healthSnapshots += listOf(
+                healthSlot(
+                    index = 0,
+                    active = true,
+                    health = BackendHealth.READY,
+                    handshakeFresh = true,
+                    consecutiveProbeSuccesses = 3,
+                    stableSinceMs = 0,
+                ),
+            )
+        }
+        var reports = 0
+        val coordinator = RedundantConnectionCoordinator(
+            emptyStore(),
+            FakePanel(),
+            native,
+            primaryReadinessSleep = {},
+        )
+
+        val started = coordinator.start(
+            transaction(),
+            mapOf(
+                "lease-a" to byteArrayOf(1),
+                "lease-b" to byteArrayOf(2),
+            ),
+            mapOf(
+                "lease-a" to BackgroundRedundantHealthProbe(
+                    "dns_a",
+                    "8.8.8.8",
+                    "nelomai.ru",
+                    4_000,
+                ),
+            ),
+            onPrimaryStarted = { reports += 1 },
+        )
+
+        assertTrue(started)
+        assertEquals(1, reports)
+        assertTrue(native.healthSnapshots.isEmpty())
+    }
+
+    @Test
     fun v2RecoveryEnvelopeNeverEntersLegacyVpnRecovery() {
         val envelope = AndroidRecoveryEnvelope(
             formatVersion = ANDROID_RECOVERY_FORMAT,
@@ -318,6 +365,16 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun availableUnvalidatedNetworkRebindsBothMembersWhileHealthStaysSuspended() {
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
+
+        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
+
+        assertEquals(listOf("lease-a", "lease-b"), native.rebound)
+    }
+
+    @Test
     fun replacementDeadlineSurvivesCoordinatorRecreation() {
         var nowMs = 2_000_000L
         val store = store(transaction())
@@ -426,7 +483,7 @@ class RedundantConnectionCoordinatorTest {
 
         assertTrue(coordinator.releaseStandby())
         assertFalse(requireNotNull(coordinator.status()).standbyDesired)
-        assertTrue(panel.releasedLeaseIds.isEmpty())
+        assertEquals(1, panel.releaseAttempts.size)
         assertEquals(null, coordinator.reserveState())
     }
 
@@ -804,6 +861,12 @@ class RedundantConnectionCoordinatorTest {
         return AndroidRecoveryStore(backend, CoordinatorBootIdentity())
     }
 
+    private fun emptyStore(): AndroidRecoveryStore {
+        val backend = CoordinatorRecordBackend()
+        backend.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1)))
+        return AndroidRecoveryStore(backend, CoordinatorBootIdentity())
+    }
+
     private fun v2Envelope() = AndroidRecoveryEnvelope(
         formatVersion = ANDROID_RECOVERY_FORMAT,
         intent = AndroidConnectionIntent.empty(1),
@@ -942,7 +1005,7 @@ private class FakePanel(
     val commitTransactions = mutableListOf<AndroidRedundantTransaction>()
     val candidateConfigurations = mutableListOf<ByteArray>()
     val releasedLeaseIds = mutableListOf<String>()
-    val releaseAttempts = mutableListOf<String>()
+    val releaseAttempts = mutableListOf<String?>()
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
         RedundantRecoveryResponse(
             session = recoveredSession ?: BackgroundRedundantSession(
@@ -972,7 +1035,7 @@ private class FakePanel(
     }
     override fun releaseStandby(
         transaction: AndroidRedundantTransaction,
-        inactiveLeaseId: String,
+        inactiveLeaseId: String?,
     ): BackgroundRedundantSession {
         releaseAttempts += inactiveLeaseId
         releaseFailureCodes.removeFirstOrNull()?.let { throw BackgroundConnectionException(it) }
@@ -989,7 +1052,7 @@ private class FakePanel(
         roleGeneration = transaction.roleGeneration,
         membershipGeneration = transaction.membershipGeneration + 1,
         reason = null,
-        ).also { releasedLeaseIds += inactiveLeaseId }
+        ).also { inactiveLeaseId?.let(releasedLeaseIds::add) }
     }
     override fun acquireStandby(
         transaction: AndroidRedundantTransaction,

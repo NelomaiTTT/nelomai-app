@@ -1013,7 +1013,7 @@ internal object BackgroundConnectionClient {
     fun releaseRedundantStandby(
         credential: BackgroundCredential,
         transaction: AndroidRedundantTransaction,
-        inactiveLeaseId: String,
+        inactiveLeaseId: String?,
     ): BackgroundRedundantSession = redundantSessionFromJson(execute(
         credential,
         "background/connections/standby/release",
@@ -1235,10 +1235,10 @@ internal fun backgroundRedundantRolePayload(
 
 internal fun backgroundRedundantStandbyReleasePayload(
     transaction: AndroidRedundantTransaction,
-    inactiveLeaseId: String,
+    inactiveLeaseId: String?,
 ): JSONObject = JSONObject().apply {
     put("session_id", transaction.sessionId)
-    put("inactive_lease_id", inactiveLeaseId)
+    inactiveLeaseId?.let { put("inactive_lease_id", it) }
     put("expected_role_generation", transaction.roleGeneration)
     put("expected_membership_generation", transaction.membershipGeneration)
 }
@@ -1312,11 +1312,11 @@ internal fun redundantRoleFromJson(payload: JSONObject): RedundantRoleResponse =
 )
 
 internal fun redundantHealthProbeFromJson(payload: JSONObject): BackgroundRedundantHealthProbe =
-    BackgroundRedundantHealthProbe(
-        kind = payload.getString("kind").also { require(it == "dns_a") },
+    validatedRedundantHealthProbe(
+        kind = payload.getString("kind"),
         targetIpv4 = payload.getString("target_ipv4"),
         queryName = payload.getString("query_name"),
-        timeoutMs = payload.getLong("timeout_ms").also { require(it in 250L..10_000L) },
+        timeoutMs = payload.getLong("timeout_ms"),
     )
 
 internal fun redundantRecoveryTransportFromJson(
@@ -1330,10 +1330,14 @@ internal fun redundantRecoveryTransportFromJson(
         require(primaryConfiguration.isNotEmpty() &&
             primaryConfiguration.size <= BACKGROUND_MAX_RESPONSE_BYTES)
         val primaryLeaseId = payload.getJSONObject("connection").getString("lease_id")
-        val primaryProbe = redundantHealthProbeFromJson(payload.getJSONObject("health_probe"))
         val redundancy = payload.getJSONObject("redundancy")
         require(redundancy.getString("session_id") == transaction.sessionId)
+        val standbyDesired = redundancy.getBoolean("standby_desired")
         val standby = redundancy.optJSONObject("standby")
+        val primaryProbe = payload.optJSONObject("health_probe")
+            ?.let(::redundantHealthProbeFromJson)
+        require(!standbyDesired || primaryProbe != null)
+        require(standbyDesired || standby == null)
         val standbyLeaseId = standby?.getJSONObject("connection")?.getString("lease_id")
         standbyConfiguration = standby?.getString("configuration")
             ?.toByteArray(StandardCharsets.UTF_8)
@@ -1363,14 +1367,15 @@ internal fun redundantRecoveryTransportFromJson(
             activeLeaseId = primaryLeaseId,
             slotALeaseId = recoveredSlot(RedundantSlot.A),
             slotBLeaseId = recoveredSlot(RedundantSlot.B),
-            standbyDesired = redundancy.getBoolean("standby_desired"),
+            standbyDesired = standbyDesired,
             roleGeneration = redundancy.getLong("role_generation"),
             membershipGeneration = redundancy.getLong("membership_generation"),
             reason = redundancy.optionalString("reason"),
         )
         require(session.containsCurrentLease(primaryLeaseId))
         val configurations = linkedMapOf(primaryLeaseId to primaryConfiguration)
-        val healthProbes = linkedMapOf(primaryLeaseId to primaryProbe)
+        val healthProbes = linkedMapOf<String, BackgroundRedundantHealthProbe>()
+        primaryProbe?.let { healthProbes[primaryLeaseId] = it }
         if (standby != null && standbyLeaseId != null && standbyConfiguration != null) {
             configurations[standbyLeaseId] = standbyConfiguration
             healthProbes[standbyLeaseId] = redundantHealthProbeFromJson(

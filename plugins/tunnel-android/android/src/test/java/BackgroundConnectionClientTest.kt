@@ -15,6 +15,77 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class BackgroundConnectionClientTest {
     @Test
+    fun redundantRecoveryHealthProbesEnforceTheSharedWireContract() {
+        fun probe() = JSONObject().apply {
+            put("kind", "dns_a")
+            put("target_ipv4", "8.8.8.8")
+            put("query_name", "nelomai.ru")
+            put("timeout_ms", 4_000)
+        }
+
+        listOf(999L, 8_001L).forEach { timeoutMs ->
+            assertRejected {
+                redundantHealthProbeFromJson(probe().put("timeout_ms", timeoutMs))
+            }
+        }
+        assertRejected {
+            redundantHealthProbeFromJson(probe().put("target_ipv4", "08.8.8.8"))
+        }
+        assertRejected {
+            redundantHealthProbeFromJson(probe().put("query_name", "Nelomai.ru"))
+        }
+    }
+
+    @Test
+    fun disabledSingleMemberRecoveryAcceptsNoHealthProbe() {
+        val primaryLease = "10000000-0000-4000-8000-000000000001"
+        val transaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = AndroidIntentTemplate(
+                DEVICE_ID, DEVICE_ID, "stray", "dynamic", "standalone", "ipv4", true,
+            ),
+            sessionId = "20000000-0000-4000-8000-000000000001",
+            slotALeaseId = primaryLease,
+            slotBLeaseId = null,
+            localActiveLeaseId = primaryLease,
+            standbyDesired = false,
+            roleGeneration = 1,
+            membershipGeneration = 1,
+            startOperationId = OPERATION_ID,
+            startRequestFingerprint = "a".repeat(64),
+        )
+        val payload = JSONObject().apply {
+            put("connection", JSONObject().put("lease_id", primaryLease))
+            put("configuration", "primary-config")
+            put("redundancy", JSONObject().apply {
+                put("session_id", transaction.sessionId)
+                put("state", "disabled")
+                put("role_generation", 1)
+                put("membership_generation", 1)
+                put("virtual_address_v4", "10.0.0.2/32")
+                put("standby_desired", false)
+                put("reason", "capability_disabled")
+                put("standby", JSONObject.NULL)
+            })
+        }
+
+        val recovered = redundantRecoveryTransportFromJson(payload, transaction)
+
+        assertEquals(setOf(primaryLease), recovered.configurations.keys)
+        assertTrue(recovered.healthProbes.isEmpty())
+        recovered.configurations.values.forEach { it.fill(0) }
+    }
+
+    private fun assertRejected(block: () -> Unit) {
+        try {
+            block()
+            throw AssertionError("expected invalid redundant health probe")
+        } catch (_: IllegalArgumentException) {
+            // Expected.
+        }
+    }
+
+    @Test
     fun redundantRecoveryReplayMapsCommittedCandidateBackToItsFixedSlot() {
         val oldA = "10000000-0000-4000-8000-000000000001"
         val activeB = "10000000-0000-4000-8000-000000000002"
@@ -111,10 +182,14 @@ class BackgroundConnectionClientTest {
 
         val role = backgroundRedundantRolePayload(transaction, "primary_unhealthy")
         val stop = backgroundRedundantStopPayload(transaction, "lease-b")
+        val degradedRelease = backgroundRedundantStandbyReleasePayload(transaction, null)
+        val regularRelease = backgroundRedundantStandbyReleasePayload(transaction, "lease-a")
 
         assertEquals("lease-b", role.getString("active_lease_id"))
         assertEquals(2, stop.getInt("recovery_contract_version"))
         assertEquals(transaction.sessionId, stop.getString("session_id"))
+        assertFalse(degradedRelease.has("inactive_lease_id"))
+        assertEquals("lease-a", regularRelease.getString("inactive_lease_id"))
         assertFalse(role.has("configuration"))
         assertFalse(stop.has("configuration"))
     }

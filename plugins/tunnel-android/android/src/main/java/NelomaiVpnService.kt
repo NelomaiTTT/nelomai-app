@@ -575,12 +575,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             coordinatorOwner = coordinator
             val configurations = linkedMapOf(redundancy.primary.leaseId to args.configuration)
             redundancy.standby?.let { configurations[it.member.leaseId] = it.configuration }
-            val probes = linkedMapOf(
-                redundancy.primary.leaseId to redundancy.primary.healthProbe.toBackgroundProbe(),
-            )
-            redundancy.standby?.let {
-                probes[it.member.leaseId] = it.member.healthProbe.toBackgroundProbe()
-            }
+            val probes = redundantHealthProbesFromStart(redundancy)
             val started = coordinator.start(
                 transaction,
                 configurations,
