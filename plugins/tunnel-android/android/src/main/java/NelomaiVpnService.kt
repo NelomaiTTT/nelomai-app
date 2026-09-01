@@ -1499,6 +1499,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 BackgroundConnectionClient.capabilities(credential)
             }
             envelope = store.updateCapability(envelope.revision, capability).credentialOrThrow()
+            synchronizeRedundantCapability(requireNotNull(envelope.capability))
             if (!capability.enabled || capability.expiresAtUnix <= nowUnix) return
             if (credential.expiresAtUnix > nowUnix + BACKGROUND_REFRESH_WINDOW_SECONDS) return
         }
@@ -1532,6 +1533,21 @@ class NelomaiVpnService : GoBackend.VpnService() {
             activationOperationId = pending.activationOperationId,
             activeExpiresAtUnix = activation.activeExpiresAtUnix,
         ).credentialOrThrow()
+    }
+
+    private fun synchronizeRedundantCapability(capability: BackgroundCapabilitySnapshot) {
+        val transaction = (recoveryStore.read() as? RecoveryStoreResult.Success)
+            ?.value?.redundantTransaction
+        if (!redundantCapabilityRequiresStandbyRelease(capability, transaction)) return
+        redundantWork.execute {
+            val released = runCatching {
+                (redundantVpnOwner ?: ensureRedundantCoordinator(requireNotNull(transaction)))
+                    .releaseStandby()
+            }.onFailure {
+                TunnelLog.warning("redundant.capability_release_failed", error = it)
+            }.getOrDefault(false)
+            if (!released) TunnelLog.warning("redundant.capability_release_pending")
+        }
     }
 
     private fun handleRecoverBackgroundSession(intent: Intent) {
@@ -3014,6 +3030,11 @@ internal fun refreshAndValidateNewIntentCapability(
         throw BackgroundConnectionException("background_credential_capability_unavailable")
     }
 }
+
+internal fun redundantCapabilityRequiresStandbyRelease(
+    capability: BackgroundCapabilitySnapshot,
+    transaction: AndroidRedundantTransaction?,
+): Boolean = !capability.reserveEnabled && transaction?.standbyDesired == true
 
 internal fun selectQuickStartPolicy(
     store: BackgroundCredentialStore,

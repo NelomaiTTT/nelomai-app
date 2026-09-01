@@ -1663,6 +1663,11 @@ where
 }
 
 #[cfg(any(target_os = "android", test))]
+fn android_recovery_v2_connection_eligible(tic_connection_mode: TicConnectionMode) -> bool {
+    tic_connection_mode == TicConnectionMode::Dynamic
+}
+
+#[cfg(any(target_os = "android", test))]
 fn should_use_android_recovery_v2(
     lease_phase: Option<&str>,
     capability: Option<&ConnectionIntentCapability>,
@@ -3104,7 +3109,9 @@ pub async fn app_start(
                     let recovery_capability = current_bootstrap
                         .as_ref()
                         .and_then(|bootstrap| bootstrap.capabilities.as_ref());
-                    let use_recovery_v2 = should_use_android_recovery_v2(
+                    let use_recovery_v2 = android_recovery_v2_connection_eligible(
+                        request.tic_connection_mode,
+                    ) && should_use_android_recovery_v2(
                         current_intent.lease_phase.as_deref(),
                         recovery_capability,
                         now,
@@ -4917,6 +4924,12 @@ mod tests {
             true,
         ));
         assert!(!should_use_android_recovery_v2(None, None, now, true));
+        assert!(android_recovery_v2_connection_eligible(
+            TicConnectionMode::Dynamic,
+        ));
+        assert!(!android_recovery_v2_connection_eligible(
+            TicConnectionMode::Personal,
+        ));
     }
 
     #[tokio::test]

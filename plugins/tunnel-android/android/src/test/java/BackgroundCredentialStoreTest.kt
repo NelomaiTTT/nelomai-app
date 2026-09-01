@@ -183,6 +183,37 @@ class BackgroundCredentialStoreTest {
     }
 
     @Test
+    fun reserveCapabilityPersistsAndEqualRevisionCannotReenableIt() {
+        val backend = CredentialFakeBackend()
+        val store = BackgroundCredentialStore(backend)
+        store.configure(
+            0,
+            provision(
+                BackgroundCapabilitySnapshot(
+                    revision = 10,
+                    enabled = true,
+                    expiresAtUnix = 500,
+                    reserveEnabled = true,
+                ),
+            ),
+        ).successCredential()
+
+        val restored = BackgroundCredentialStore(backend).read().successCredential()
+        assertTrue(restored.capability?.reserveEnabled ?: false)
+
+        val downgraded = store.updateCapability(
+            restored.revision,
+            requireNotNull(restored.capability).copy(reserveEnabled = false),
+        ).successCredential()
+        val staleEnable = store.updateCapability(
+            downgraded.revision,
+            requireNotNull(downgraded.capability).copy(reserveEnabled = true),
+        ).successCredential()
+
+        assertFalse(staleEnable.capability?.reserveEnabled ?: true)
+    }
+
+    @Test
     fun equalRevisionDowngradeBlocksAStaleEnabledReservation() {
         val store = configuredStore(
             BackgroundCapabilitySnapshot(10, enabled = false, expiresAtUnix = 500),

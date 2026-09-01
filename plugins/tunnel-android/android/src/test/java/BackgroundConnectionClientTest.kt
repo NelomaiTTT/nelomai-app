@@ -924,6 +924,7 @@ class BackgroundConnectionClientTest {
                 put("revision", 7)
                 put("expires_at", "2026-08-29T12:00:00Z")
                 put("connection_intent_recovery_v1", true)
+                put("android_hot_standby_v1", true)
             },
             JSONObject().apply {
                 put("candidates", JSONArray().put(JSONObject().apply {
@@ -941,6 +942,7 @@ class BackgroundConnectionClientTest {
         val candidates = client.serverCandidates(credential(), "tic", "prefer_ipv6")
 
         assertTrue(capability.enabled)
+        assertTrue(capability.reserveEnabled)
         assertEquals(7, capability.revision)
         assertEquals("candidate-1", candidates.single().candidateId)
         assertEquals(listOf("GET", "GET"), transport.methods)

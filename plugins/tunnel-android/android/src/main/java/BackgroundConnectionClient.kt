@@ -487,6 +487,7 @@ internal class BackgroundOperationClient(
                 revision = payload.getLong("revision").also { require(it > 0) },
                 enabled = payload.getBoolean("connection_intent_recovery_v1"),
                 expiresAtUnix = parseTimestamp(payload.getString("expires_at")),
+                reserveEnabled = payload.optBoolean("android_hot_standby_v1", false),
             )
         }
     }

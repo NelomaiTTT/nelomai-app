@@ -29,6 +29,7 @@ internal data class BackgroundCapabilitySnapshot(
     val revision: Long,
     val enabled: Boolean,
     val expiresAtUnix: Long,
+    val reserveEnabled: Boolean = false,
 )
 
 internal fun conservativeBackgroundCapability(
@@ -41,6 +42,7 @@ internal fun conservativeBackgroundCapability(
         revision = current.revision,
         enabled = current.enabled && proposed.enabled,
         expiresAtUnix = minOf(current.expiresAtUnix, proposed.expiresAtUnix),
+        reserveEnabled = current.reserveEnabled && proposed.reserveEnabled,
     )
 }
 
@@ -308,10 +310,12 @@ internal object BackgroundCredentialEnvelopeCodec {
 
     private fun capabilityToJson(value: BackgroundCapabilitySnapshot) = JSONObject().apply {
         put("revision", value.revision); put("enabled", value.enabled); put("expiresAtUnix", value.expiresAtUnix)
+        put("reserveEnabled", value.reserveEnabled)
     }
 
     private fun capabilityFromJson(payload: JSONObject) = BackgroundCapabilitySnapshot(
         payload.getLong("revision"), payload.getBoolean("enabled"), payload.getLong("expiresAtUnix"),
+        payload.optBoolean("reserveEnabled", false),
     )
 
     private fun reservationToJson(value: BackgroundMutationReservation) = JSONObject().apply {

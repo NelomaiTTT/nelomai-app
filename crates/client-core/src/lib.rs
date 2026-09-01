@@ -1008,6 +1008,15 @@ enum FailedStartStage {
     Local,
 }
 
+#[derive(Clone, Copy)]
+struct FailedStartContext<'a> {
+    access_token: &'a str,
+    connection: &'a Connection,
+    request_id: &'a str,
+    operation_id: &'a str,
+    redundant_session_id: Option<&'a str>,
+}
+
 impl FailedStartStage {
     fn log_kind(self) -> &'static str {
         match self {
@@ -1970,17 +1979,16 @@ where
             .redundancy
             .as_ref()
             .map(|redundancy| redundancy.session_id.as_str());
+        let failed_start = FailedStartContext {
+            access_token: &access_token,
+            connection: &response.connection,
+            request_id: &response.request_id,
+            operation_id: &operation_id,
+            redundant_session_id,
+        };
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             return Err(self
-                .compensate_cancelled_start(
-                    &access_token,
-                    &response.connection,
-                    &response.request_id,
-                    &operation_id,
-                    redundant_session_id,
-                    FailedStartStage::Preparation,
-                    false,
-                )
+                .compensate_cancelled_start(failed_start, FailedStartStage::Preparation)
                 .await);
         }
         if response.connection.layer != options.layer
@@ -1994,15 +2002,7 @@ where
                 retry_after_seconds: None,
             });
             let compensation_error = self
-                .compensate_failed_start(
-                    &access_token,
-                    &response.connection,
-                    &response.request_id,
-                    &operation_id,
-                    redundant_session_id,
-                    FailedStartStage::Preparation,
-                    &error,
-                )
+                .compensate_failed_start(failed_start, FailedStartStage::Preparation, &error)
                 .await
                 .err();
             return Err(compensation_error.unwrap_or(error));
@@ -2053,11 +2053,7 @@ where
                 Err(error) => {
                     let compensation_error = self
                         .compensate_failed_start(
-                            &access_token,
-                            &response.connection,
-                            &response.request_id,
-                            &operation_id,
-                            redundant_session_id,
+                            failed_start,
                             FailedStartStage::Preparation,
                             &error,
                         )
@@ -2089,15 +2085,7 @@ where
             Ok(start) => start,
             Err(error) => {
                 let compensation_error = self
-                    .compensate_failed_start(
-                        &access_token,
-                        &response.connection,
-                        &response.request_id,
-                        &operation_id,
-                        redundant_session_id,
-                        FailedStartStage::Preparation,
-                        &error,
-                    )
+                    .compensate_failed_start(failed_start, FailedStartStage::Preparation, &error)
                     .await
                     .err();
                 return Err(compensation_error.unwrap_or(error));
@@ -2138,15 +2126,7 @@ where
         if self.store.save(&current_stored).is_err() {
             let error = CoreError::Storage;
             let compensation_error = self
-                .compensate_failed_start(
-                    &access_token,
-                    &response.connection,
-                    &response.request_id,
-                    &operation_id,
-                    redundant_session_id,
-                    FailedStartStage::Storage,
-                    &error,
-                )
+                .compensate_failed_start(failed_start, FailedStartStage::Storage, &error)
                 .await
                 .err();
             return Err(compensation_error.unwrap_or(error));
@@ -2177,15 +2157,7 @@ where
             .await;
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             return Err(self
-                .compensate_cancelled_start(
-                    &access_token,
-                    &response.connection,
-                    &response.request_id,
-                    &operation_id,
-                    redundant_session_id,
-                    FailedStartStage::Local,
-                    true,
-                )
+                .compensate_cancelled_start(failed_start, FailedStartStage::Local)
                 .await);
         }
         if let Err(start_error) = local_start_result {
@@ -2200,15 +2172,7 @@ where
                 elapsed_millis(local_start_started),
             );
             let compensation_error = self
-                .compensate_failed_start(
-                    &access_token,
-                    &response.connection,
-                    &response.request_id,
-                    &operation_id,
-                    redundant_session_id,
-                    FailedStartStage::Local,
-                    &error,
-                )
+                .compensate_failed_start(failed_start, FailedStartStage::Local, &error)
                 .await
                 .err();
             return Err(compensation_error.unwrap_or(error));
@@ -2232,28 +2196,12 @@ where
                 .await;
             if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
                 return Err(self
-                    .compensate_cancelled_start(
-                        &access_token,
-                        &response.connection,
-                        &response.request_id,
-                        &operation_id,
-                        redundant_session_id,
-                        FailedStartStage::Local,
-                        true,
-                    )
+                    .compensate_cancelled_start(failed_start, FailedStartStage::Local)
                     .await);
             }
             if let Err(error) = handshake_result {
                 let compensation_error = self
-                    .compensate_failed_start(
-                        &access_token,
-                        &response.connection,
-                        &response.request_id,
-                        &operation_id,
-                        redundant_session_id,
-                        FailedStartStage::Local,
-                        &error,
-                    )
+                    .compensate_failed_start(failed_start, FailedStartStage::Local, &error)
                     .await
                     .err();
                 return Err(compensation_error.unwrap_or(error));
@@ -2266,15 +2214,7 @@ where
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             drop(state);
             return Err(self
-                .compensate_cancelled_start(
-                    &access_token,
-                    &response.connection,
-                    &response.request_id,
-                    &operation_id,
-                    redundant_session_id,
-                    FailedStartStage::Local,
-                    true,
-                )
+                .compensate_cancelled_start(failed_start, FailedStartStage::Local)
                 .await);
         }
         let _ = self.clear_pending_start(&operation_id);
@@ -4245,14 +4185,17 @@ where
 
     async fn compensate_failed_start(
         &self,
-        access_token: &str,
-        connection: &Connection,
-        request_id: &str,
-        operation_id: &str,
-        redundant_session_id: Option<&str>,
+        context: FailedStartContext<'_>,
         stage: FailedStartStage,
         error: &CoreError,
     ) -> Result<(), CoreError> {
+        let FailedStartContext {
+            access_token,
+            connection,
+            request_id,
+            operation_id,
+            redundant_session_id,
+        } = context;
         self.physical_network_change.lock().await.reset();
         let failure_code = match error {
             CoreError::Tunnel(code) if code == "tunnel_handshake_timeout" => Some(code.clone()),
@@ -4416,25 +4359,12 @@ where
 
     async fn compensate_cancelled_start(
         &self,
-        access_token: &str,
-        connection: &Connection,
-        request_id: &str,
-        operation_id: &str,
-        redundant_session_id: Option<&str>,
+        context: FailedStartContext<'_>,
         stage: FailedStartStage,
-        _local_runtime_may_be_up: bool,
     ) -> CoreError {
         let cancellation_error = CoreError::StartCancelled;
         let compensation_error = self
-            .compensate_failed_start(
-                access_token,
-                connection,
-                request_id,
-                operation_id,
-                redundant_session_id,
-                stage,
-                &cancellation_error,
-            )
+            .compensate_failed_start(context, stage, &cancellation_error)
             .await
             .err();
         compensation_error.unwrap_or(cancellation_error)
@@ -4692,18 +4622,17 @@ fn pending_start_matches_options(pending: &StoredPendingStart, options: &Connect
         && pending.allow_alternate == options.allow_alternate
 }
 
+type PendingStartContractParts = (
+    ConnectionStartContract,
+    Option<u32>,
+    Option<u32>,
+    Option<bool>,
+    Option<String>,
+);
+
 fn pending_start_contract(
     pending: &StoredPendingStart,
-) -> Result<
-    (
-        ConnectionStartContract,
-        Option<u32>,
-        Option<u32>,
-        Option<bool>,
-        Option<String>,
-    ),
-    CoreError,
-> {
+) -> Result<PendingStartContractParts, CoreError> {
     match (
         pending.recovery_contract_version,
         pending.redundancy_contract_version,

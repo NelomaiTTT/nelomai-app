@@ -16,6 +16,37 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun disabledReserveCapabilityOnlyReleasesDesiredStandby() {
+        val disabled = BackgroundCapabilitySnapshot(
+            revision = 2,
+            enabled = true,
+            expiresAtUnix = 2_000,
+            reserveEnabled = false,
+        )
+        val enabled = disabled.copy(reserveEnabled = true)
+
+        assertTrue(
+            redundantCapabilityRequiresStandbyRelease(
+                disabled,
+                serviceV2Envelope().redundantTransaction,
+            ),
+        )
+        assertFalse(
+            redundantCapabilityRequiresStandbyRelease(
+                enabled,
+                serviceV2Envelope().redundantTransaction,
+            ),
+        )
+        assertFalse(redundantCapabilityRequiresStandbyRelease(disabled, null))
+        assertFalse(
+            redundantCapabilityRequiresStandbyRelease(
+                disabled,
+                serviceV2Envelope().redundantTransaction?.copy(standbyDesired = false),
+            ),
+        )
+    }
+
+    @Test
     fun redundantStartCancellationIsExactAndSurvivesUntilWorkerCompletion() {
         val fence = RedundantStartCancellationFence()
 
