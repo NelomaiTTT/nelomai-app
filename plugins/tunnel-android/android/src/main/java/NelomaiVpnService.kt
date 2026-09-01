@@ -153,6 +153,33 @@ internal data class LegacyBackgroundStartServiceBoundary(
     val status: () -> ConnectionIntentServiceStatus?,
 )
 
+/**
+ * Establishes the one Android TUN before attaching either cryptographic slot.
+ * A standby admission failure leaves the already admitted primary session alive.
+ */
+internal fun startRedundantVpnSession(
+    establishTun: () -> Int?,
+    backend: RedundantSessionBackend,
+    primaryConfiguration: ByteArray,
+    standbyConfiguration: ByteArray?,
+): NativeSession? {
+    val tunFd = runCatching(establishTun).getOrNull()
+    if (tunFd == null || tunFd < 0) {
+        primaryConfiguration.fill(0)
+        standbyConfiguration?.fill(0)
+        return null
+    }
+    val session = backend.start(tunFd, primaryConfiguration)
+    if (session == null) {
+        standbyConfiguration?.fill(0)
+        return null
+    }
+    if (standbyConfiguration != null) {
+        backend.startSlot(session, 1, standbyConfiguration)
+    }
+    return session
+}
+
 class NelomaiVpnService : GoBackend.VpnService() {
     private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
     private val restoreHandler = Handler(Looper.getMainLooper())

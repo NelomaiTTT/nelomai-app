@@ -1,17 +1,14 @@
 diff --git a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
-index 3f168208..a8e936b3 100644
+index 3f1682085725bd58ff6129cead962820ce7a5eb0..a8e936b3aad0de745a1659619156f31eab5d3438 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
-@@ -6,10 +6,25 @@ public class GoBackend {
-     @Nullable
-     public static native String awgGetConfig(int handle);
+@@ -8,2 +8,5 @@ public class GoBackend {
  
 +    @Nullable
 +    public static native String awgGetNetworkTelemetry(int handle);
 +
      public static native int awgGetSocketV4(int handle);
- 
-     public static native int awgGetSocketV6(int handle);
+@@ -12,2 +15,14 @@ public class GoBackend {
  
 +    public static native int awgCloseUdp(int handle);
 +
@@ -26,15 +23,11 @@ index 3f168208..a8e936b3 100644
 +    public static native long awgHandshakeProbeTimeoutMillis(int handle);
 +
      public static native void awgTurnOff(int handle);
- 
-     public static native int awgTurnOn(String ifName, int tunFd, String settings);
 diff --git a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
-index 2bb8026a..de358507 100644
+index 2bb8026ab3d4207eb465f7428de309a1671ed2ec..de3585073138193920d6bf1b6916c264c8d6de31 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
-@@ -171,6 +171,69 @@ public final class GoBackend implements Backend {
-         return stats;
-     }
+@@ -173,2 +173,65 @@ public final class GoBackend implements Backend {
  
 +    /** Return transport telemetry collected below the WireGuard device counters. */
 +    @Nullable
@@ -100,15 +93,19 @@ index 2bb8026a..de358507 100644
 +    }
 +
  
-     /**
-      * Get the last handshake time for a given {@link Tunnel}.
+diff --git a/tunnel/tools/CMakeLists.txt b/tunnel/tools/CMakeLists.txt
+index 8557c5ab88919028443e4a4180741d4fac5aee41..3480c49ada179a75902fd60962f39cae725d413b 100644
+--- a/tunnel/tools/CMakeLists.txt
++++ b/tunnel/tools/CMakeLists.txt
+@@ -11,2 +11,3 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size
+ add_compile_options(-Wall -Werror)
++set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO} -Wl,--strip-all")
+ 
 diff --git a/tunnel/tools/libwg-go/Makefile b/tunnel/tools/libwg-go/Makefile
-index 9b9c081f..9045ea05 100644
+index 9b9c081f236a1e0c2a5f16becad6b2357e60da52..3b34848c35029976c9e4c129a5ae9638889f5901 100644
 --- a/tunnel/tools/libwg-go/Makefile
 +++ b/tunnel/tools/libwg-go/Makefile
-@@ -29,6 +29,14 @@ GO_HASH_linux-amd64 := 68097bd680839cbc9d464a0edce4f7c333975e27a90246890e9f1078c
- 
- default: $(DESTDIR)/libwg-go.so
+@@ -31,2 +31,10 @@ default: $(DESTDIR)/libwg-go.so
  
 +WORKSPACE_ROOT := ../../../../..
 +AMNEZIAWG_GO_ROOT := ../../../../amneziawg-go
@@ -119,57 +116,391 @@ index 9b9c081f..9045ea05 100644
 +GO_BUILD_FILES := Makefile $(GO_WORKSPACE_FILES)
 +
  $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL):
- 	mkdir -p "$(dir $@)"
- 	flock "$@.lock" -c ' \
-@@ -46,7 +54,7 @@ $(BUILDDIR)/go-$(GO_VERSION)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_T
- 	touch "$@"'
- 
+@@ -48,4 +56,4 @@ $(BUILDDIR)/go-$(GO_VERSION)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_T
  $(DESTDIR)/libwg-go.so: export PATH := $(BUILDDIR)/go-$(GO_VERSION)/bin/:$(PATH)
 -$(DESTDIR)/libwg-go.so: $(BUILDDIR)/go-$(GO_VERSION)/.prepared go.mod
-+$(DESTDIR)/libwg-go.so: $(BUILDDIR)/go-$(GO_VERSION)/.prepared $(GO_BUILD_FILES) $(LIBWG_GO_SOURCES) $(AMNEZIAWG_GO_SOURCES)
 -	go build -tags linux -ldflags="-X github.com/amnezia-vpn/amneziawg-go/ipc.socketDirectory=/data/data/$(ANDROID_PACKAGE_NAME)/cache/amneziawg -buildid=" -v -trimpath -buildvcs=false -o "$@" -buildmode c-shared
++$(DESTDIR)/libwg-go.so: $(BUILDDIR)/go-$(GO_VERSION)/.prepared $(GO_BUILD_FILES) $(LIBWG_GO_SOURCES) $(AMNEZIAWG_GO_SOURCES)
 +	go build -tags linux -ldflags="-s -w -X github.com/amnezia-vpn/amneziawg-go/ipc.socketDirectory=/data/data/$(ANDROID_PACKAGE_NAME)/cache/amneziawg -buildid=" -v -trimpath -buildvcs=false -o "$@" -buildmode c-shared
  
- .DELETE_ON_ERROR:
+diff --git a/tunnel/tools/libwg-go/admission_bind.go b/tunnel/tools/libwg-go/admission_bind.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d11fd5be834664694648569f2c3eff89ef971df8
+--- /dev/null
++++ b/tunnel/tools/libwg-go/admission_bind.go
+@@ -0,0 +1,320 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++
++package main
++
++import (
++	"errors"
++	"fmt"
++	"net"
++	"sync"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
++)
++
++var (
++	errAdmissionBindClosed     = errors.New("admission bind is closed")
++	errAdmissionBindNotPending = errors.New("admission bind has no prepared socket set")
++	errAdmissionBindBusy       = errors.New("admission bind already has a prepared socket set")
++)
++
++type admissionBindGeneration struct {
++	bind       conn.Bind
++	receive    []conn.ReceiveFunc
++	generation uint64
++	actualPort uint16
++}
++
++// admissionBind keeps newly opened sockets unable to send or deliver packets
++// until Android has synchronously protected every descriptor.
++type admissionBind struct {
++	mu      sync.Mutex
++	changed *sync.Cond
++	factory func() conn.Bind
++	parser  conn.Bind
++
++	active      *admissionBindGeneration
++	pending     *admissionBindGeneration
++	next        uint64
++	receiveSize int
++	mark        uint32
++	closed      bool
++
++	endpointGenerations sync.Map
++}
++
++func newAdmissionBind(factory func() conn.Bind) *admissionBind {
++	bind := &admissionBind{
++		factory: factory,
++		parser:  conn.NewStdNetBind(),
++	}
++	bind.changed = sync.NewCond(&bind.mu)
++	return bind
++}
++
++func (a *admissionBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed {
++		return nil, 0, errAdmissionBindClosed
++	}
++	if a.active != nil || a.pending != nil || a.receiveSize != 0 {
++		return nil, 0, conn.ErrBindAlreadyOpen
++	}
++	generation, actualPort, err := a.prepareLocked(port)
++	if err != nil {
++		return nil, 0, err
++	}
++	a.receiveSize = len(generation.receive)
++	stable := make([]conn.ReceiveFunc, a.receiveSize)
++	for index := range stable {
++		index := index
++		stable[index] = func(
++			packets [][]byte,
++			sizes []int,
++			endpoints []conn.Endpoint,
++		) (int, error) {
++			return a.receive(index, packets, sizes, endpoints)
++		}
++	}
++	return stable, actualPort, nil
++}
++
++func (a *admissionBind) PrepareRebind(port uint16) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed {
++		return errAdmissionBindClosed
++	}
++	if a.active == nil {
++		return fmt.Errorf("active admission bind is required")
++	}
++	if a.pending != nil {
++		return errAdmissionBindBusy
++	}
++	generation, _, err := a.prepareLocked(port)
++	if err != nil {
++		return err
++	}
++	if len(generation.receive) != a.receiveSize {
++		a.pending = nil
++		_ = generation.bind.Close()
++		return fmt.Errorf(
++			"rebound receive function count changed from %d to %d",
++			a.receiveSize,
++			len(generation.receive),
++		)
++	}
++	return nil
++}
++
++func (a *admissionBind) prepareLocked(port uint16) (*admissionBindGeneration, uint16, error) {
++	if a.factory == nil {
++		return nil, 0, errors.New("admission bind factory is required")
++	}
++	prepared := a.factory()
++	if prepared == nil {
++		return nil, 0, errors.New("admission bind factory returned nil")
++	}
++	receive, actualPort, err := prepared.Open(port)
++	if err != nil {
++		_ = prepared.Close()
++		return nil, 0, err
++	}
++	if len(receive) == 0 {
++		_ = prepared.Close()
++		return nil, 0, errors.New("admission bind opened no receive functions")
++	}
++	if a.mark != 0 {
++		if err := prepared.SetMark(a.mark); err != nil {
++			_ = prepared.Close()
++			return nil, 0, err
++		}
++	}
++	a.next++
++	generation := &admissionBindGeneration{
++		bind:       prepared,
++		receive:    receive,
++		generation: a.next,
++		actualPort: actualPort,
++	}
++	a.pending = generation
++	return generation, actualPort, nil
++}
++
++func (a *admissionBind) PreparedSocketFDs() []int {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed || a.pending == nil {
++		return nil
++	}
++	peek, ok := a.pending.bind.(conn.PeekLookAtSocketFd)
++	if !ok {
++		return nil
++	}
++	result := make([]int, 0, 2)
++	if fd, err := peek.PeekLookAtSocketFd4(); err == nil && fd >= 0 {
++		result = append(result, fd)
++	}
++	if fd, err := peek.PeekLookAtSocketFd6(); err == nil && fd >= 0 {
++		result = append(result, fd)
++	}
++	return result
++}
++
++func (a *admissionBind) ActivePort() (uint16, bool) {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed || a.active == nil {
++		return 0, false
++	}
++	return a.active.actualPort, true
++}
++
++func (a *admissionBind) AdmitPrepared() error {
++	a.mu.Lock()
++	if a.closed {
++		a.mu.Unlock()
++		return errAdmissionBindClosed
++	}
++	if a.pending == nil {
++		a.mu.Unlock()
++		return errAdmissionBindNotPending
++	}
++	previous := a.active
++	a.active = a.pending
++	a.pending = nil
++	a.changed.Broadcast()
++	a.mu.Unlock()
++	if previous != nil {
++		// The protected pending generation is already canonical. A best-effort
++		// close failure from the retired sockets must not make callers abort it.
++		_ = previous.bind.Close()
++	}
++	return nil
++}
++
++func (a *admissionBind) AbortPrepared() {
++	a.mu.Lock()
++	pending := a.pending
++	a.pending = nil
++	a.mu.Unlock()
++	if pending != nil {
++		_ = pending.bind.Close()
++	}
++}
++
++func (a *admissionBind) receive(
++	index int,
++	packets [][]byte,
++	sizes []int,
++	endpoints []conn.Endpoint,
++) (int, error) {
++	for {
++		a.mu.Lock()
++		for a.active == nil && !a.closed {
++			a.changed.Wait()
++		}
++		if a.closed {
++			a.mu.Unlock()
++			return 0, net.ErrClosed
++		}
++		generation := a.active
++		if index >= len(generation.receive) {
++			a.mu.Unlock()
++			return 0, errors.New("admission bind receive function unavailable")
++		}
++		receive := generation.receive[index]
++		a.mu.Unlock()
++
++		n, err := receive(packets, sizes, endpoints)
++		if !errors.Is(err, net.ErrClosed) {
++			return n, err
++		}
++		a.mu.Lock()
++		closed := a.closed
++		replaced := a.active != generation
++		a.mu.Unlock()
++		if closed {
++			return 0, net.ErrClosed
++		}
++		if replaced {
++			continue
++		}
++		return n, err
++	}
++}
++
++func (a *admissionBind) Close() error {
++	a.mu.Lock()
++	if a.closed {
++		a.mu.Unlock()
++		return nil
++	}
++	a.closed = true
++	active := a.active
++	pending := a.pending
++	a.active = nil
++	a.pending = nil
++	a.changed.Broadcast()
++	a.mu.Unlock()
++
++	var result error
++	if pending != nil {
++		result = pending.bind.Close()
++	}
++	if active != nil {
++		if err := active.bind.Close(); result == nil {
++			result = err
++		}
++	}
++	return result
++}
++
++func (a *admissionBind) SetMark(mark uint32) error {
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if a.closed {
++		return errAdmissionBindClosed
++	}
++	if a.active != nil {
++		if err := a.active.bind.SetMark(mark); err != nil {
++			return err
++		}
++	}
++	if a.pending != nil {
++		if err := a.pending.bind.SetMark(mark); err != nil {
++			return err
++		}
++	}
++	a.mark = mark
++	return nil
++}
++
++func (a *admissionBind) Send(buffers [][]byte, endpoint conn.Endpoint) error {
++	a.mu.Lock()
++	if a.closed {
++		a.mu.Unlock()
++		return net.ErrClosed
++	}
++	generation := a.active
++	a.mu.Unlock()
++	if generation == nil {
++		// Peers may queue an initial handshake while Kotlin is protecting the
++		// descriptors. Dropping it is safe; admission sends a fresh keepalive.
++		return nil
++	}
++	if endpoint != nil {
++		previous, _ := a.endpointGenerations.Load(endpoint)
++		if previous != generation.generation {
++			endpoint.ClearSrc()
++			a.endpointGenerations.Store(endpoint, generation.generation)
++		}
++	}
++	return generation.bind.Send(buffers, endpoint)
++}
++
++func (a *admissionBind) ParseEndpoint(value string) (conn.Endpoint, error) {
++	return a.parser.ParseEndpoint(value)
++}
++
++func (a *admissionBind) BatchSize() int { return a.parser.BatchSize() }
 diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
-index 3af343d1..e9f34d73 100644
+index 3af343d17d35120cd29f7610281f0d26b77087c8..40ad272ff1d21d4863aa9cc678ae60ac55a0adb5 100644
 --- a/tunnel/tools/libwg-go/api-android.go
 +++ b/tunnel/tools/libwg-go/api-android.go
-@@ -1,3 +1,5 @@
+@@ -1 +1,3 @@
 +//go:build android
 +
  /* SPDX-License-Identifier: Apache-2.0
-  *
-  * Copyright © 2017-2022 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
-@@ -10,6 +10,8 @@ package main
- import "C"
- 
+@@ -12,2 +14,4 @@ import "C"
  import (
 +	"encoding/json"
 +	"errors"
  	"fmt"
- 	"math"
- 	"net"
-@@ -18,6 +20,10 @@ import (
- 	"runtime"
- 	"runtime/debug"
+@@ -20,2 +24,6 @@ import (
  	"strings"
 +	"sync"
 +	"sync/atomic"
 +	"syscall"
 +	"time"
  	"unsafe"
- 
- 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
-@@ -46,11 +52,285 @@ func (l AndroidLogger) Printf(format string, args ...interface{}) {
- }
- 
+@@ -48,4 +56,295 @@ func (l AndroidLogger) Printf(format string, args ...interface{}) {
  type TunnelHandle struct {
 -	device *device.Device
 -	uapi   net.Listener
 +	device    *device.Device
 +	uapi      net.Listener
 +	telemetry *tunnelTelemetry
++}
++
++type redundantNativeSlot struct {
++	device    *device.Device
++	bind      *admissionBind
++	telemetry *tunnelTelemetry
++	admitted  bool
++}
++
++type redundantNativeSession struct {
++	mu     sync.Mutex
++	tunnel *RedundantTunnel
++	slots  [redundantTunnelSlotCount]*redundantNativeSlot
++	closed bool
++}
++
++type redundantNativeSlotMetrics struct {
++	Slot      int                     `json:"slot"`
++	Admitted  bool                    `json:"admitted"`
++	Telemetry tunnelTelemetrySnapshot `json:"telemetry"`
++}
++
++type redundantNativeMetrics struct {
++	Dispatcher RedundantTunnelCounters      `json:"dispatcher"`
++	Slots      []redundantNativeSlotMetrics `json:"slots"`
 +}
 +
 +type tunnelTelemetry struct {
@@ -436,9 +767,11 @@ index 3af343d1..e9f34d73 100644
 +	}
 +	return peek.PeekLookAtSocketFd6()
  }
- 
+@@ -53,2 +352,12 @@ type TunnelHandle struct {
  var tunnelHandles map[int32]TunnelHandle
 +var tunnelHandlesMutex sync.RWMutex
++var redundantNativeHandles map[int32]*redundantNativeSession
++var redundantNativeHandlesMutex sync.RWMutex
 +
 +func lookupTunnelHandle(tunnelHandle int32) (TunnelHandle, bool) {
 +	tunnelHandlesMutex.RLock()
@@ -447,20 +780,329 @@ index 3af343d1..e9f34d73 100644
 +	return handle, ok
 +}
  
- func init() {
+@@ -56,2 +365,3 @@ func init() {
  	tunnelHandles = make(map[int32]TunnelHandle)
-@@ -80,7 +360,7 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
- 		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
- 	}
++	redundantNativeHandles = make(map[int32]*redundantNativeSession)
+ 	signals := make(chan os.Signal)
+@@ -74,2 +384,312 @@ func init() {
+ 
++func lookupRedundantNativeSession(handle int32) (*redundantNativeSession, bool) {
++	redundantNativeHandlesMutex.RLock()
++	defer redundantNativeHandlesMutex.RUnlock()
++	session, ok := redundantNativeHandles[handle]
++	return session, ok
++}
++
++func redundantNativeLogger(handle int32, slot uint32) *device.Logger {
++	tag := cstring(fmt.Sprintf("AmneziaWG/redundant-%d-%d", handle, slot))
++	return &device.Logger{
++		Verbosef: AndroidLogger{level: C.ANDROID_LOG_DEBUG, tag: tag}.Printf,
++		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
++	}
++}
++
++func allocateRedundantNativeHandle(session *redundantNativeSession) int32 {
++	redundantNativeHandlesMutex.Lock()
++	defer redundantNativeHandlesMutex.Unlock()
++	for candidate := int32(0); candidate < math.MaxInt32; candidate++ {
++		if _, exists := redundantNativeHandles[candidate]; !exists {
++			redundantNativeHandles[candidate] = session
++			return candidate
++		}
++	}
++	return -1
++}
++
++//export awgRedundantCreate
++func awgRedundantCreate(tunFd int32) int32 {
++	nativeTun, _, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
++	if err != nil {
++		_ = unix.Close(int(tunFd))
++		return -1
++	}
++	dispatcher, err := NewRedundantTunnel(nativeTun)
++	if err != nil {
++		_ = nativeTun.Close()
++		return -1
++	}
++	session := &redundantNativeSession{tunnel: dispatcher}
++	handle := allocateRedundantNativeHandle(session)
++	if handle < 0 {
++		_ = dispatcher.Close()
++	}
++	return handle
++}
++
++//export awgRedundantPrepareSlot
++func awgRedundantPrepareSlot(handle int32, slot int32, settings string) int32 {
++	if slot < 0 || slot >= redundantTunnelSlotCount || len(settings) == 0 {
++		return -1
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	beginGoDeviceStart()
++	succeeded := false
++	defer func() { finishGoDeviceStart(succeeded) }()
++
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	if session.closed || session.slots[slot] != nil {
++		return -1
++	}
++	virtualTun, err := session.tunnel.AttachSlot(uint32(slot))
++	if err != nil {
++		return -1
++	}
++	telemetry := new(tunnelTelemetry)
++	bind := newAdmissionBind(func() conn.Bind {
++		return &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
++	})
++	backend := device.NewDevice(
++		virtualTun,
++		bind,
++		redundantNativeLogger(handle, uint32(slot)),
++	)
++	goDeviceStarts.Add(1)
++	if err := backend.IpcSet(settings); err != nil {
++		closeGoDevice(backend)
++		_ = session.tunnel.ResetSlot(uint32(slot))
++		return -1
++	}
++	backend.DisableSomeRoamingForBrokenMobileSemantics()
++	if err := backend.Up(); err != nil {
++		closeGoDevice(backend)
++		_ = session.tunnel.ResetSlot(uint32(slot))
++		return -1
++	}
++	if len(bind.PreparedSocketFDs()) == 0 {
++		closeGoDevice(backend)
++		_ = session.tunnel.ResetSlot(uint32(slot))
++		return -1
++	}
++	session.slots[slot] = &redundantNativeSlot{
++		device: backend, bind: bind, telemetry: telemetry,
++	}
++	succeeded = true
++	return 0
++}
++
++//export awgRedundantPrepareRebind
++func awgRedundantPrepareRebind(handle int32, slot int32) int32 {
++	if slot < 0 || slot >= redundantTunnelSlotCount {
++		return -1
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	runtime := session.slots[slot]
++	if session.closed || runtime == nil || !runtime.admitted {
++		return -1
++	}
++	if err := runtime.bind.PrepareRebind(0); err != nil {
++		return -1
++	}
++	if len(runtime.bind.PreparedSocketFDs()) == 0 {
++		runtime.bind.AbortPrepared()
++		return -1
++	}
++	return 0
++}
++
++//export awgRedundantPreparedSocketV4
++func awgRedundantPreparedSocketV4(handle int32, slot int32) int32 {
++	return awgRedundantPreparedSocket(handle, slot, 0)
++}
++
++//export awgRedundantPreparedSocketV6
++func awgRedundantPreparedSocketV6(handle int32, slot int32) int32 {
++	return awgRedundantPreparedSocket(handle, slot, 1)
++}
++
++func awgRedundantPreparedSocket(handle int32, slot int32, index int) int32 {
++	if slot < 0 || slot >= redundantTunnelSlotCount {
++		return -1
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	runtime := session.slots[slot]
++	if session.closed || runtime == nil {
++		return -1
++	}
++	descriptors := runtime.bind.PreparedSocketFDs()
++	if index >= len(descriptors) {
++		return -1
++	}
++	return int32(descriptors[index])
++}
++
++//export awgRedundantAdmitSlot
++func awgRedundantAdmitSlot(handle int32, slot int32) int32 {
++	if slot < 0 || slot >= redundantTunnelSlotCount {
++		return -1
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	session.mu.Lock()
++	runtime := session.slots[slot]
++	if session.closed || runtime == nil {
++		session.mu.Unlock()
++		return -1
++	}
++	if err := runtime.bind.AdmitPrepared(); err != nil {
++		session.mu.Unlock()
++		return -1
++	}
++	runtime.admitted = true
++	runtime.device.SendKeepalivesToAllRunningPeers()
++	session.mu.Unlock()
++	return 0
++}
++
++//export awgRedundantAbortPreparation
++func awgRedundantAbortPreparation(handle int32, slot int32) {
++	if slot < 0 || slot >= redundantTunnelSlotCount {
++		return
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	runtime := session.slots[slot]
++	if !session.closed && runtime != nil {
++		if runtime.admitted {
++			runtime.bind.AbortPrepared()
++			if port, active := runtime.bind.ActivePort(); active {
++				runtime.telemetry.localPort.Store(uint32(port))
++			}
++		} else {
++			closeGoDevice(runtime.device)
++			_ = session.tunnel.ResetSlot(uint32(slot))
++			session.slots[slot] = nil
++		}
++	}
++}
++
++//export awgRedundantSwitchActive
++func awgRedundantSwitchActive(handle int32, slot int32) int32 {
++	if slot < 0 || slot >= redundantTunnelSlotCount {
++		return -1
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	ready := !session.closed && session.slots[slot] != nil && session.slots[slot].admitted
++	if !ready || session.tunnel.SwitchActive(uint32(slot)) != nil {
++		return -1
++	}
++	return 0
++}
++
++//export awgRedundantStopSlot
++func awgRedundantStopSlot(handle int32, slot int32) int32 {
++	if slot < 0 || slot >= redundantTunnelSlotCount {
++		return -1
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	if session.closed {
++		return -1
++	}
++	runtime := session.slots[slot]
++	if runtime == nil {
++		return 0
++	}
++	closeGoDevice(runtime.device)
++	resetErr := session.tunnel.ResetSlot(uint32(slot))
++	session.slots[slot] = nil
++	if resetErr != nil {
++		return -1
++	}
++	return 0
++}
++
++//export awgRedundantMetrics
++func awgRedundantMetrics(handle int32) *C.char {
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return nil
++	}
++	session.mu.Lock()
++	if session.closed {
++		session.mu.Unlock()
++		return nil
++	}
++	metrics := redundantNativeMetrics{Dispatcher: session.tunnel.Counters()}
++	for slot, runtime := range session.slots {
++		if runtime != nil {
++			metrics.Slots = append(metrics.Slots, redundantNativeSlotMetrics{
++				Slot: slot, Admitted: runtime.admitted, Telemetry: runtime.telemetry.snapshot(),
++			})
++		}
++	}
++	session.mu.Unlock()
++	encoded, err := json.Marshal(metrics)
++	if err != nil {
++		return nil
++	}
++	return C.CString(string(encoded))
++}
++
++//export awgRedundantClose
++func awgRedundantClose(handle int32) {
++	redundantNativeHandlesMutex.Lock()
++	session, ok := redundantNativeHandles[handle]
++	if ok {
++		delete(redundantNativeHandles, handle)
++	}
++	redundantNativeHandlesMutex.Unlock()
++	if !ok {
++		return
++	}
++	session.mu.Lock()
++	if session.closed {
++		session.mu.Unlock()
++		return
++	}
++	session.closed = true
++	slots := session.slots
++	session.slots = [redundantTunnelSlotCount]*redundantNativeSlot{}
++	session.mu.Unlock()
++	for _, runtime := range slots {
++		if runtime != nil {
++			closeGoDevice(runtime.device)
++		}
++	}
++	_ = session.tunnel.Close()
++	releaseUnusedGoMemory()
++}
++
+ //export awgTurnOn
+@@ -82,3 +702,3 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  
 -	tun, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
 +	nativeTun, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
  	if err != nil {
- 		unix.Close(int(tunFd))
- 		logger.Errorf("CreateUnmonitoredTUNFromFD: %v", err)
-@@ -88,7 +368,10 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
- 	}
- 
+@@ -90,3 +710,6 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  	logger.Verbosef("Attaching to interface %v", name)
 -	device := device.NewDevice(tun, conn.NewStdNetBind(), logger)
 +	telemetry := new(tunnelTelemetry)
@@ -468,69 +1110,43 @@ index 3af343d1..e9f34d73 100644
 +	diagnosticBind := &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
 +	device := device.NewDevice(diagnosticTun, diagnosticBind, logger)
  
- 	err = device.IpcSet(settings)
- 	if err != nil {
-@@ -131,6 +414,8 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
- 	logger.Verbosef("Device started")
- 
+@@ -133,2 +756,4 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  	var i int32
 +	tunnelHandlesMutex.Lock()
 +	defer tunnelHandlesMutex.Unlock()
  	for i = 0; i < math.MaxInt32; i++ {
- 		if _, exists := tunnelHandles[i]; !exists {
- 			break
-@@ -142,17 +427,20 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
- 		device.Close()
- 		return -1
+@@ -144,3 +769,3 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  	}
 -	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi}
 +	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi, telemetry: telemetry}
  	return i
- }
- 
- //export awgTurnOff
+@@ -150,4 +775,6 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  func awgTurnOff(tunnelHandle int32) {
 +	tunnelHandlesMutex.Lock()
  	handle, ok := tunnelHandles[tunnelHandle]
  	if !ok {
 +		tunnelHandlesMutex.Unlock()
  		return
- 	}
+@@ -155,2 +782,3 @@ func awgTurnOff(tunnelHandle int32) {
  	delete(tunnelHandles, tunnelHandle)
 +	tunnelHandlesMutex.Unlock()
  	if handle.uapi != nil {
- 		handle.uapi.Close()
- 	}
-@@ -161,7 +449,7 @@ func awgTurnOff(tunnelHandle int32) {
- 
- //export awgGetSocketV4
+@@ -163,3 +791,3 @@ func awgTurnOff(tunnelHandle int32) {
  func awgGetSocketV4(tunnelHandle int32) int32 {
 -	handle, ok := tunnelHandles[tunnelHandle]
 +	handle, ok := lookupTunnelHandle(tunnelHandle)
  	if !ok {
- 		return -1
- 	}
-@@ -178,7 +466,7 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
- 
- //export awgGetSocketV6
+@@ -180,3 +808,3 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
  func awgGetSocketV6(tunnelHandle int32) int32 {
 -	handle, ok := tunnelHandles[tunnelHandle]
 +	handle, ok := lookupTunnelHandle(tunnelHandle)
  	if !ok {
- 		return -1
- 	}
-@@ -195,7 +483,7 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
- 
- //export awgGetConfig
+@@ -197,3 +825,3 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
  func awgGetConfig(tunnelHandle int32) *C.char {
 -	handle, ok := tunnelHandles[tunnelHandle]
 +	handle, ok := lookupTunnelHandle(tunnelHandle)
  	if !ok {
- 		return nil
- 	}
-@@ -206,6 +494,92 @@ func awgGetConfig(tunnelHandle int32) *C.char {
- 	return C.CString(settings)
- }
+@@ -208,2 +836,88 @@ func awgGetConfig(tunnelHandle int32) *C.char {
  
 +//export awgGetNetworkTelemetry
 +func awgGetNetworkTelemetry(tunnelHandle int32) *C.char {
@@ -619,21 +1235,15 @@ index 3af343d1..e9f34d73 100644
 +}
 +
  //export awgVersion
- func awgVersion() *C.char {
- 	info, ok := debug.ReadBuildInfo()
 diff --git a/tunnel/tools/libwg-go/jni.c b/tunnel/tools/libwg-go/jni.c
-index 237043e5..e18bf9c7 100644
+index 237043e561625a6d8bbdec7f215bb323cf1b75cd..71a091eed71d7928fac5ff02d3702210532edfd7 100644
 --- a/tunnel/tools/libwg-go/jni.c
 +++ b/tunnel/tools/libwg-go/jni.c
-@@ -1,3 +1,5 @@
+@@ -1 +1,3 @@
 +//go:build android
 +
  /* SPDX-License-Identifier: Apache-2.0
-  *
-  * Copyright © 2017-2021 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
-@@ -13,6 +13,13 @@ extern void awgTurnOff(int handle);
- extern int awgGetSocketV4(int handle);
- extern int awgGetSocketV6(int handle);
+@@ -15,3 +17,37 @@ extern int awgGetSocketV6(int handle);
  extern char *awgGetConfig(int handle);
 +extern char *awgGetNetworkTelemetry(int handle);
 +extern int awgCloseUdp(int handle);
@@ -643,11 +1253,35 @@ index 237043e5..e18bf9c7 100644
 +extern int awgHandshakeProbeStatus(int handle, long long generation);
 +extern long long awgHandshakeProbeTimeoutMillis(int handle);
  extern char *awgVersion();
++extern int awgRedundantCreate(int tun_fd);
++extern int awgRedundantPrepareSlot(int handle, int slot, struct go_string settings);
++extern int awgRedundantPrepareRebind(int handle, int slot);
++extern int awgRedundantPreparedSocketV4(int handle, int slot);
++extern int awgRedundantPreparedSocketV6(int handle, int slot);
++extern int awgRedundantAdmitSlot(int handle, int slot);
++extern void awgRedundantAbortPreparation(int handle, int slot);
++extern int awgRedundantSwitchActive(int handle, int slot);
++extern int awgRedundantStopSlot(int handle, int slot);
++extern char *awgRedundantMetrics(int handle);
++extern void awgRedundantClose(int handle);
++
++static jintArray redundant_prepared_fds(JNIEnv *env, int handle, int slot)
++{
++	jint values[2];
++	jsize count = 0;
++	int fd4 = awgRedundantPreparedSocketV4(handle, slot);
++	int fd6 = awgRedundantPreparedSocketV6(handle, slot);
++	if (fd4 >= 0)
++		values[count++] = fd4;
++	if (fd6 >= 0 && fd6 != fd4)
++		values[count++] = fd6;
++	jintArray result = (*env)->NewIntArray(env, count);
++	if (result != NULL && count > 0)
++		(*env)->SetIntArrayRegion(env, result, 0, count, values);
++	return result;
++}
  
- JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgTurnOn(JNIEnv *env, jclass c, jstring ifname, jint tun_fd, jstring settings)
-@@ -59,6 +66,47 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetConfig(JNIEnv *en
- 	return ret;
- }
+@@ -61,2 +97,43 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetConfig(JNIEnv *en
  
 +JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetNetworkTelemetry(JNIEnv *env, jclass c, jint handle)
 +{
@@ -691,27 +1325,91 @@ index 237043e5..e18bf9c7 100644
 +}
 +
  JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env, jclass c)
- {
- 	jstring ret;
-diff --git a/tunnel/tools/CMakeLists.txt b/tunnel/tools/CMakeLists.txt
-index 8557c5ab..3480c49a 100644
---- a/tunnel/tools/CMakeLists.txt
-+++ b/tunnel/tools/CMakeLists.txt
-@@ -9,6 +9,7 @@ add_link_options(LINKER:--build-id=none)
- add_link_options(-Wl,-z,max-page-size=16384)
- set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
- add_compile_options(-Wall -Werror)
-+set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO} -Wl,--strip-all")
--
+@@ -71 +148,78 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env,
+ }
 +
- add_executable(libwg-quick.so amneziawg-tools/src/wg-quick/android.c ndk-compat/compat.c)
- target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DAWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
++JNIEXPORT jint JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeCreate(
++	JNIEnv *env, jobject self, jint tun_fd)
++{
++	return awgRedundantCreate(tun_fd);
++}
++
++JNIEXPORT jintArray JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativePrepareSlot(
++	JNIEnv *env, jobject self, jint handle, jint slot, jbyteArray configuration)
++{
++	if (configuration == NULL)
++		return (*env)->NewIntArray(env, 0);
++	jsize length = (*env)->GetArrayLength(env, configuration);
++	if (length <= 0)
++		return (*env)->NewIntArray(env, 0);
++	jbyte *bytes = (*env)->GetByteArrayElements(env, configuration, NULL);
++	if (bytes == NULL)
++		return (*env)->NewIntArray(env, 0);
++	int prepared = awgRedundantPrepareSlot(
++		handle,
++		slot,
++		(struct go_string){.str = (const char *)bytes, .n = length}
++	);
++	(*env)->ReleaseByteArrayElements(env, configuration, bytes, JNI_ABORT);
++	if (prepared != 0)
++		return (*env)->NewIntArray(env, 0);
++	return redundant_prepared_fds(env, handle, slot);
++}
++
++JNIEXPORT jintArray JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativePrepareRebind(
++	JNIEnv *env, jobject self, jint handle, jint slot)
++{
++	if (awgRedundantPrepareRebind(handle, slot) != 0)
++		return (*env)->NewIntArray(env, 0);
++	return redundant_prepared_fds(env, handle, slot);
++}
++
++JNIEXPORT jboolean JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeAdmitSlot(
++	JNIEnv *env, jobject self, jint handle, jint slot)
++{
++	return awgRedundantAdmitSlot(handle, slot) == 0 ? JNI_TRUE : JNI_FALSE;
++}
++
++JNIEXPORT void JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeAbortPreparation(
++	JNIEnv *env, jobject self, jint handle, jint slot)
++{
++	awgRedundantAbortPreparation(handle, slot);
++}
++
++JNIEXPORT jboolean JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeSwitchActive(
++	JNIEnv *env, jobject self, jint handle, jint slot)
++{
++	return awgRedundantSwitchActive(handle, slot) == 0 ? JNI_TRUE : JNI_FALSE;
++}
++
++JNIEXPORT jboolean JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeStopSlot(
++	JNIEnv *env, jobject self, jint handle, jint slot)
++{
++	return awgRedundantStopSlot(handle, slot) == 0 ? JNI_TRUE : JNI_FALSE;
++}
++
++JNIEXPORT jstring JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeMetrics(
++	JNIEnv *env, jobject self, jint handle)
++{
++	char *metrics = awgRedundantMetrics(handle);
++	if (metrics == NULL)
++		return NULL;
++	jstring result = (*env)->NewStringUTF(env, metrics);
++	free(metrics);
++	return result;
++}
++
++JNIEXPORT void JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeClose(
++	JNIEnv *env, jobject self, jint handle)
++{
++	awgRedundantClose(handle);
++}
 diff --git a/tunnel/tools/libwg-go/redundant_tun.go b/tunnel/tools/libwg-go/redundant_tun.go
 new file mode 100644
-index 00000000..54532c1b
+index 0000000000000000000000000000000000000000..e568bafe14c19ff14719a9c3991177151f9338b1
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun.go
-@@ -0,0 +1,792 @@
+@@ -0,0 +1,964 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -838,18 +1536,36 @@ index 00000000..54532c1b
 +	name         string
 +	batchSize    int
 +	outbound     chan channelPacket
-+	inbound      chan []byte
++	inbound      chan channelInboundPacket
 +	events       chan tun.Event
 +	done         chan struct{}
 +	dispatchDone chan struct{}
 +	stateMu      sync.Mutex
 +	closedFlag   atomic.Bool
++	generation   atomic.Uint64
++}
++
++// slotAttachmentTUN gives one cryptographic backend an independently
++// cancellable view of a reusable dispatcher slot. Closing an attachment
++// satisfies tun.Device.Close without permanently closing the logical slot.
++type slotAttachmentTUN struct {
++	slot       *channelTUN
++	done       chan struct{}
++	events     chan tun.Event
++	closed     atomic.Bool
++	generation uint64
++	stateMu    sync.Mutex
 +}
 +
 +type channelPacket struct {
 +	payload    []byte
 +	probe      bool
 +	probeToken ProbeToken
++}
++
++type channelInboundPacket struct {
++	payload    []byte
++	generation uint64
 +}
 +
 +// NewRedundantTunnel starts one dispatcher with slot A active by default.
@@ -905,7 +1621,7 @@ index 00000000..54532c1b
 +		name:         name,
 +		batchSize:    batchSize,
 +		outbound:     make(chan channelPacket, queueDepth),
-+		inbound:      make(chan []byte, queueDepth),
++		inbound:      make(chan channelInboundPacket, queueDepth),
 +		events:       make(chan tun.Event, 1),
 +		done:         make(chan struct{}),
 +		dispatchDone: make(chan struct{}),
@@ -919,6 +1635,30 @@ index 00000000..54532c1b
 +		return nil, ErrInvalidRedundantSlot
 +	}
 +	return r.slots[slot], nil
++}
++
++func (r *RedundantTunnel) AttachSlot(slot uint32) (tun.Device, error) {
++	device, err := r.Slot(slot)
++	if err != nil {
++		return nil, err
++	}
++	channel := device.(*channelTUN)
++	r.routeMu.Lock()
++	defer r.routeMu.Unlock()
++	if r.closed.Load() {
++		return nil, ErrRedundantTunnelClosed
++	}
++	if channel.closed() {
++		return nil, ErrRedundantSlotClosed
++	}
++	attachment := &slotAttachmentTUN{
++		slot:       channel,
++		done:       make(chan struct{}),
++		events:     make(chan tun.Event, 1),
++		generation: channel.generation.Add(1),
++	}
++	attachment.events <- tun.EventUp
++	return attachment, nil
 +}
 +
 +func (r *RedundantTunnel) SwitchActive(slot uint32) error {
@@ -1055,6 +1795,37 @@ index 00000000..54532c1b
 +	return nil
 +}
 +
++// ResetSlot clears the ephemeral queues and probes left by a stopped backend
++// while keeping its channel TUN reusable for a replacement device.
++func (r *RedundantTunnel) ResetSlot(slot uint32) error {
++	if slot >= uint32(len(r.slots)) {
++		return ErrInvalidRedundantSlot
++	}
++	r.probeOpMu.Lock()
++	defer r.probeOpMu.Unlock()
++	if r.closed.Load() {
++		return ErrRedundantTunnelClosed
++	}
++	r.routeMu.Lock()
++	if r.slots[slot].closed() {
++		r.routeMu.Unlock()
++		return ErrRedundantSlotClosed
++	}
++	droppedUser, droppedProbes, droppedInbound := r.slots[slot].dropAllQueuedPackets()
++	r.routeMu.Unlock()
++	r.probeMu.Lock()
++	for token, state := range r.probes {
++		if state.slot == slot {
++			delete(r.probes, token)
++		}
++	}
++	r.probeMu.Unlock()
++	r.counters.outboundDropped.Add(droppedUser)
++	r.counters.probeInjectionDropped.Add(droppedProbes)
++	r.counters.inactiveInboundDrops.Add(droppedInbound)
++	return nil
++}
++
 +func (r *RedundantTunnel) pruneExpiredProbesLocked(now time.Time) {
 +	for token, state := range r.probes {
 +		if !now.Before(state.expiresAt) {
@@ -1173,7 +1944,12 @@ index 00000000..54532c1b
 +				r.counters.inactiveInboundDrops.Add(1)
 +				return
 +			}
-+			if r.consumeProbeReply(slotIndex, packet) {
++			if packet.generation != slot.generation.Load() {
++				r.routeMu.RUnlock()
++				r.counters.inactiveInboundDrops.Add(1)
++				continue
++			}
++			if r.consumeProbeReply(slotIndex, packet.payload) {
 +				r.routeMu.RUnlock()
 +				continue
 +			}
@@ -1182,7 +1958,7 @@ index 00000000..54532c1b
 +				r.counters.inactiveInboundDrops.Add(1)
 +				continue
 +			}
-+			_, err := r.real.Write([][]byte{packet}, 0)
++			_, err := r.real.Write([][]byte{packet.payload}, 0)
 +			r.routeMu.RUnlock()
 +			if err != nil {
 +				if r.closed.Load() || errors.Is(err, os.ErrClosed) {
@@ -1340,11 +2116,22 @@ index 00000000..54532c1b
 +func (c *channelTUN) File() *os.File { return nil }
 +
 +func (c *channelTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	return c.readWithCancel(bufs, sizes, offset, nil)
++}
++
++func (c *channelTUN) readWithCancel(
++	bufs [][]byte,
++	sizes []int,
++	offset int,
++	cancel <-chan struct{},
++) (int, error) {
 +	if len(bufs) == 0 || len(sizes) < len(bufs) || offset < 0 {
 +		return 0, errors.New("invalid channel TUN read buffers")
 +	}
 +	select {
 +	case <-c.done:
++		return 0, os.ErrClosed
++	case <-cancel:
 +		return 0, os.ErrClosed
 +	default:
 +	}
@@ -1352,11 +2139,13 @@ index 00000000..54532c1b
 +	select {
 +	case <-c.done:
 +		return 0, os.ErrClosed
++	case <-cancel:
++		return 0, os.ErrClosed
 +	case first = <-c.outbound:
 +	}
 +	c.stateMu.Lock()
 +	defer c.stateMu.Unlock()
-+	if c.closedFlag.Load() {
++	if c.closedFlag.Load() || channelClosed(cancel) {
 +		return 0, os.ErrClosed
 +	}
 +	packets := 0
@@ -1384,7 +2173,24 @@ index 00000000..54532c1b
 +	return packets, nil
 +}
 +
++func channelClosed(channel <-chan struct{}) bool {
++	select {
++	case <-channel:
++		return true
++	default:
++		return false
++	}
++}
++
 +func (c *channelTUN) Write(bufs [][]byte, offset int) (int, error) {
++	return c.writeWithGeneration(bufs, offset, c.generation.Load())
++}
++
++func (c *channelTUN) writeWithGeneration(
++	bufs [][]byte,
++	offset int,
++	generation uint64,
++) (int, error) {
 +	if offset < 0 {
 +		return 0, errors.New("invalid channel TUN write offset")
 +	}
@@ -1400,7 +2206,7 @@ index 00000000..54532c1b
 +			return index, ErrPacketTooLarge
 +		}
 +		c.stateMu.Lock()
-+		if c.closedFlag.Load() {
++		if c.closedFlag.Load() || generation != c.generation.Load() {
 +			c.stateMu.Unlock()
 +			return index, os.ErrClosed
 +		}
@@ -1408,7 +2214,10 @@ index 00000000..54532c1b
 +			c.stateMu.Unlock()
 +			return index, ErrPacketQueueFull
 +		}
-+		packet := append([]byte(nil), buffer[offset:]...)
++		packet := channelInboundPacket{
++			payload:    append([]byte(nil), buffer[offset:]...),
++			generation: generation,
++		}
 +		select {
 +		case c.inbound <- packet:
 +			c.stateMu.Unlock()
@@ -1482,6 +2291,31 @@ index 00000000..54532c1b
 +	}
 +}
 +
++func (c *channelTUN) dropAllQueuedPackets() (uint64, uint64, uint64) {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	var userPackets, probes, inbound uint64
++	for {
++		select {
++		case packet := <-c.outbound:
++			if packet.probe {
++				probes++
++			} else {
++				userPackets++
++			}
++		default:
++			for {
++				select {
++				case <-c.inbound:
++					inbound++
++				default:
++					return userPackets, probes, inbound
++				}
++			}
++		}
++	}
++}
++
 +func (c *channelTUN) dropQueuedProbe(token ProbeToken) {
 +	c.stateMu.Lock()
 +	defer c.stateMu.Unlock()
@@ -1504,12 +2338,48 @@ index 00000000..54532c1b
 +func (c *channelTUN) closed() bool {
 +	return c.closedFlag.Load()
 +}
++
++func (a *slotAttachmentTUN) File() *os.File { return nil }
++
++func (a *slotAttachmentTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	return a.slot.readWithCancel(bufs, sizes, offset, a.done)
++}
++
++func (a *slotAttachmentTUN) Write(bufs [][]byte, offset int) (int, error) {
++	a.stateMu.Lock()
++	defer a.stateMu.Unlock()
++	if a.closed.Load() {
++		return 0, os.ErrClosed
++	}
++	return a.slot.writeWithGeneration(bufs, offset, a.generation)
++}
++
++func (a *slotAttachmentTUN) MTU() (int, error)     { return a.slot.MTU() }
++func (a *slotAttachmentTUN) Name() (string, error) { return a.slot.Name() }
++func (a *slotAttachmentTUN) Events() <-chan tun.Event {
++	return a.events
++}
++func (a *slotAttachmentTUN) BatchSize() int { return a.slot.BatchSize() }
++
++func (a *slotAttachmentTUN) Close() error {
++	a.stateMu.Lock()
++	defer a.stateMu.Unlock()
++	if a.closed.Swap(true) {
++		return nil
++	}
++	close(a.done)
++	close(a.events)
++	a.slot.generation.CompareAndSwap(a.generation, a.generation+1)
++	a.slot.owner.routeMu.Lock()
++	a.slot.owner.routeMu.Unlock()
++	return nil
++}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_test.go b/tunnel/tools/libwg-go/redundant_tun_test.go
 new file mode 100644
-index 00000000..82239138
+index 0000000000000000000000000000000000000000..2def653400d8fc013783d8fd13fce4a3b7b2a796
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_test.go
-@@ -0,0 +1,882 @@
+@@ -0,0 +1,1178 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -1522,6 +2392,7 @@ index 00000000..82239138
 +	"testing"
 +	"time"
 +
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 +	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 +)
 +
@@ -1912,6 +2783,175 @@ index 00000000..82239138
 +	real.injectOutbound(t, packet)
 +	if got := readDevicePacket(t, slotA); string(got) != string(packet) {
 +		t.Fatalf("active slot received %v after standby close, want %v", got, packet)
++	}
++}
++
++func TestResetSlotDropsQueuedTrafficAndPendingProbesWithoutClosingSlot(t *testing.T) {
++	_, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	token := ProbeToken{Port: 5353, DNSID: 19}
++	query := fakeDNSPacket(token.Port, 53, token.DNSID, false)
++	if err := tunnel.InjectProbe(1, query, token); err != nil {
++		t.Fatalf("inject pending probe: %v", err)
++	}
++	channel := slotB.(*channelTUN)
++	if !channel.enqueueOutbound([]byte{1, 2, 3}, false, ProbeToken{}) {
++		t.Fatal("queue user packet before reset")
++	}
++
++	if err := tunnel.ResetSlot(1); err != nil {
++		t.Fatalf("reset slot: %v", err)
++	}
++
++	select {
++	case packet := <-channel.outbound:
++		t.Fatalf("slot reset retained queued packet: %v", packet.payload)
++	default:
++	}
++	tunnel.probeMu.Lock()
++	pending := len(tunnel.probes)
++	tunnel.probeMu.Unlock()
++	if pending != 0 {
++		t.Fatalf("slot reset retained %d pending probes", pending)
++	}
++	if channel.closed() {
++		t.Fatal("slot reset permanently closed the reusable channel TUN")
++	}
++}
++
++func TestSlotAttachmentCloseUnblocksReadAndClosesEvents(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	attachment, err := tunnel.AttachSlot(1)
++	if err != nil {
++		t.Fatalf("attach standby slot: %v", err)
++	}
++	events := attachment.Events()
++	select {
++	case event := <-events:
++		if event != tun.EventUp {
++			t.Fatalf("initial attachment event is %v, want %v", event, tun.EventUp)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("attachment did not report its initial up event")
++	}
++
++	readDone := make(chan error, 1)
++	go func() {
++		buffer := make([]byte, 2048)
++		sizes := make([]int, 1)
++		_, readErr := attachment.Read([][]byte{buffer}, sizes, 0)
++		readDone <- readErr
++	}()
++	if err := attachment.Close(); err != nil {
++		t.Fatalf("close slot attachment: %v", err)
++	}
++	select {
++	case readErr := <-readDone:
++		if !errors.Is(readErr, os.ErrClosed) {
++			t.Fatalf("attachment read returned %v, want %v", readErr, os.ErrClosed)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("attachment close did not unblock its reader")
++	}
++	select {
++	case _, open := <-events:
++		if open {
++			t.Fatal("attachment event channel remained open after close")
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("attachment close did not close its event channel")
++	}
++	if tunnel.slots[1].closed() {
++		t.Fatal("attachment close permanently closed the reusable slot")
++	}
++}
++
++func TestStoppedSlotAcceptsReplacementAttachment(t *testing.T) {
++	real, _, _, tunnel := newFakeRedundantTunnel(t)
++	first, err := tunnel.AttachSlot(1)
++	if err != nil {
++		t.Fatalf("attach first standby backend: %v", err)
++	}
++	if err := first.Close(); err != nil {
++		t.Fatalf("stop first standby backend: %v", err)
++	}
++	if err := tunnel.ResetSlot(1); err != nil {
++		t.Fatalf("reset stopped standby slot: %v", err)
++	}
++	replacement, err := tunnel.AttachSlot(1)
++	if err != nil {
++		t.Fatalf("attach replacement standby backend: %v", err)
++	}
++	defer replacement.Close()
++	if err := tunnel.SwitchActive(1); err != nil {
++		t.Fatalf("switch to replacement standby backend: %v", err)
++	}
++
++	packet := []byte{4, 3, 2, 1}
++	real.injectOutbound(t, packet)
++	if got := readDevicePacket(t, replacement); string(got) != string(packet) {
++		t.Fatalf("replacement received %v, want %v", got, packet)
++	}
++}
++
++func TestReplacementAttachmentCannotDeliverStoppedBackendInboundPackets(t *testing.T) {
++	real, _, _, tunnel := newFakeRedundantTunnel(t)
++	old, err := tunnel.AttachSlot(1)
++	if err != nil {
++		t.Fatalf("attach old standby backend: %v", err)
++	}
++	if err := tunnel.SwitchActive(1); err != nil {
++		t.Fatalf("switch to old standby backend: %v", err)
++	}
++
++	tunnel.routeMu.Lock()
++	if written, err := old.Write([][]byte{{1}, {2}}, 0); err != nil || written != 2 {
++		tunnel.routeMu.Unlock()
++		t.Fatalf("queue old backend packets: packets=%d error=%v", written, err)
++	}
++	deadline := time.Now().Add(redundantTUNTestTimeout)
++	for len(tunnel.slots[1].inbound) != 1 {
++		if time.Now().After(deadline) {
++			tunnel.routeMu.Unlock()
++			t.Fatal("dispatcher did not dequeue the first old backend packet")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	stopped := make(chan error, 1)
++	go func() {
++		if closeErr := old.Close(); closeErr != nil {
++			stopped <- closeErr
++			return
++		}
++		stopped <- tunnel.ResetSlot(1)
++	}()
++	time.Sleep(20 * time.Millisecond)
++	tunnel.routeMu.Unlock()
++	select {
++	case stopErr := <-stopped:
++		if stopErr != nil {
++			t.Fatalf("stop old standby backend: %v", stopErr)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("old standby backend did not stop within the bound")
++	}
++
++	replacement, err := tunnel.AttachSlot(1)
++	if err != nil {
++		t.Fatalf("attach replacement standby backend: %v", err)
++	}
++	defer replacement.Close()
++	requireNoFakeRealTUNPacket(t, real)
++	fresh := []byte{3}
++	if written, err := replacement.Write([][]byte{fresh}, 0); err != nil || written != 1 {
++		t.Fatalf("write replacement packet: packets=%d error=%v", written, err)
++	}
++	select {
++	case got := <-real.inbound:
++		if string(got) != string(fresh) {
++			t.Fatalf("real TUN received %v, want replacement packet %v", got, fresh)
++		}
++	case <-time.After(redundantTUNTestTimeout):
++		t.Fatal("replacement packet did not reach real TUN")
 +	}
 +}
 +
@@ -2367,7 +3407,7 @@ index 00000000..82239138
 +	}
 +	select {
 +	case packet := <-device.inbound:
-+		t.Fatalf("oversized packet entered the inbound queue: %d bytes", len(packet))
++		t.Fatalf("oversized packet entered the inbound queue: %d bytes", len(packet.payload))
 +	default:
 +	}
 +}
@@ -2390,5 +3430,131 @@ index 00000000..82239138
 +	}
 +	if allocations != 0 {
 +		t.Fatalf("full queue rejection allocated %.2f objects per write, want 0", allocations)
++	}
++}
++
++type fakeAdmissionBind struct {
++	fds        [2]int
++	sendCalls  int
++	closeCalls int
++	closeErr   error
++}
++
++func (f *fakeAdmissionBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
++	return []conn.ReceiveFunc{
++		func(_ [][]byte, _ []int, _ []conn.Endpoint) (int, error) {
++			return 0, os.ErrClosed
++		},
++	}, port + 1, nil
++}
++
++func (f *fakeAdmissionBind) Close() error {
++	f.closeCalls++
++	return f.closeErr
++}
++
++func (f *fakeAdmissionBind) SetMark(uint32) error { return nil }
++
++func (f *fakeAdmissionBind) Send(_ [][]byte, _ conn.Endpoint) error {
++	f.sendCalls++
++	return nil
++}
++
++func (f *fakeAdmissionBind) ParseEndpoint(string) (conn.Endpoint, error) { return nil, nil }
++func (f *fakeAdmissionBind) BatchSize() int                              { return 1 }
++func (f *fakeAdmissionBind) PeekLookAtSocketFd4() (int, error)           { return f.fds[0], nil }
++func (f *fakeAdmissionBind) PeekLookAtSocketFd6() (int, error)           { return f.fds[1], nil }
++
++func TestAdmissionBindCannotSendBeforeAdmission(t *testing.T) {
++	network := &fakeAdmissionBind{fds: [2]int{101, 102}}
++	bind := newAdmissionBind(func() conn.Bind { return network })
++	if _, _, err := bind.Open(0); err != nil {
++		t.Fatalf("prepare initial bind: %v", err)
++	}
++	if err := bind.Send([][]byte{{1}}, nil); err != nil {
++		t.Fatalf("blocked send returned error: %v", err)
++	}
++	if network.sendCalls != 0 {
++		t.Fatalf("pending bind sent %d packets before admission", network.sendCalls)
++	}
++	if got := bind.PreparedSocketFDs(); len(got) != 2 || got[0] != 101 || got[1] != 102 {
++		t.Fatalf("prepared socket descriptors = %v, want [101 102]", got)
++	}
++	if err := bind.AdmitPrepared(); err != nil {
++		t.Fatalf("admit initial bind: %v", err)
++	}
++	if err := bind.Send([][]byte{{1}}, nil); err != nil {
++		t.Fatalf("admitted send: %v", err)
++	}
++	if network.sendCalls != 1 {
++		t.Fatalf("admitted bind sent %d packets, want 1", network.sendCalls)
++	}
++}
++
++func TestAdmissionBindFailedRebindPreservesActiveSocketSet(t *testing.T) {
++	initial := &fakeAdmissionBind{fds: [2]int{101, 102}}
++	rebound := &fakeAdmissionBind{fds: [2]int{201, 202}}
++	binds := []conn.Bind{initial, rebound}
++	bind := newAdmissionBind(func() conn.Bind {
++		result := binds[0]
++		binds = binds[1:]
++		return result
++	})
++	if _, _, err := bind.Open(0); err != nil {
++		t.Fatalf("prepare initial bind: %v", err)
++	}
++	if err := bind.AdmitPrepared(); err != nil {
++		t.Fatalf("admit initial bind: %v", err)
++	}
++	if err := bind.PrepareRebind(70); err != nil {
++		t.Fatalf("prepare rebound bind: %v", err)
++	}
++	if got := bind.PreparedSocketFDs(); len(got) != 2 || got[0] != 201 || got[1] != 202 {
++		t.Fatalf("rebound socket descriptors = %v, want [201 202]", got)
++	}
++	bind.AbortPrepared()
++	if port, ok := bind.ActivePort(); !ok || port != 1 {
++		t.Fatalf("active port after aborted rebind = %d, %v; want 1, true", port, ok)
++	}
++	if err := bind.Send([][]byte{{1}}, nil); err != nil {
++		t.Fatalf("send through preserved bind: %v", err)
++	}
++	if initial.sendCalls != 1 || initial.closeCalls != 0 {
++		t.Fatalf("active bind changed after abort: sends=%d closes=%d", initial.sendCalls, initial.closeCalls)
++	}
++	if rebound.sendCalls != 0 || rebound.closeCalls != 1 {
++		t.Fatalf("pending bind was not discarded: sends=%d closes=%d", rebound.sendCalls, rebound.closeCalls)
++	}
++}
++
++func TestAdmissionBindSuccessfulRebindStaysAdmittedWhenOldCloseReportsError(t *testing.T) {
++	initial := &fakeAdmissionBind{
++		fds:      [2]int{101, 102},
++		closeErr: errors.New("old socket close failure"),
++	}
++	rebound := &fakeAdmissionBind{fds: [2]int{201, 202}}
++	binds := []conn.Bind{initial, rebound}
++	bind := newAdmissionBind(func() conn.Bind {
++		result := binds[0]
++		binds = binds[1:]
++		return result
++	})
++	if _, _, err := bind.Open(0); err != nil {
++		t.Fatalf("prepare initial bind: %v", err)
++	}
++	if err := bind.AdmitPrepared(); err != nil {
++		t.Fatalf("admit initial bind: %v", err)
++	}
++	if err := bind.PrepareRebind(0); err != nil {
++		t.Fatalf("prepare rebound bind: %v", err)
++	}
++	if err := bind.AdmitPrepared(); err != nil {
++		t.Fatalf("admit protected rebound bind: %v", err)
++	}
++	if err := bind.Send([][]byte{{1}}, nil); err != nil {
++		t.Fatalf("send through rebound bind: %v", err)
++	}
++	if rebound.sendCalls != 1 {
++		t.Fatalf("rebound bind sent %d packets, want 1", rebound.sendCalls)
 +	}
 +}

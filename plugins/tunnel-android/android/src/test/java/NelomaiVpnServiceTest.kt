@@ -16,6 +16,27 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun oneLogicalRedundantSessionEstablishesAndroidTunExactlyOnce() {
+        var establishCalls = 0
+        val backend = FakeRedundantSessionBackend()
+
+        val session = startRedundantVpnSession(
+            establishTun = {
+                establishCalls += 1
+                41
+            },
+            backend = backend,
+            primaryConfiguration = "primary-secret".toByteArray(),
+            standbyConfiguration = "standby-secret".toByteArray(),
+        )
+
+        assertEquals(NativeSession(7), session)
+        assertEquals(1, establishCalls)
+        assertEquals(listOf(41), backend.startedTunFds)
+        assertEquals(listOf(1), backend.startedSlots)
+    }
+
+    @Test
     fun retryNotificationDoesNotClaimThatTheWorkingNetworkIsUnavailable() {
         val content = connectionIntentRetryNotificationContent()
 
@@ -4298,6 +4319,29 @@ class NelomaiVpnServiceTest {
         0,
         null,
     )
+}
+
+private class FakeRedundantSessionBackend : RedundantSessionBackend {
+    val startedTunFds = mutableListOf<Int>()
+    val startedSlots = mutableListOf<Int>()
+
+    override fun start(tunFd: Int, primaryConfiguration: ByteArray): NativeSession? {
+        startedTunFds += tunFd
+        primaryConfiguration.fill(0)
+        return NativeSession(7)
+    }
+
+    override fun startSlot(
+        session: NativeSession,
+        slot: Int,
+        configuration: ByteArray,
+    ): Boolean {
+        startedSlots += slot
+        configuration.fill(0)
+        return true
+    }
+
+    override fun close(session: NativeSession) = Unit
 }
 
 private fun CredentialStoreResult<BackgroundCredentialEnvelope>.credentialSuccess():
