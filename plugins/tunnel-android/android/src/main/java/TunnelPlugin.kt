@@ -116,6 +116,44 @@ class StartTunnelArgs {
     var cacheQuickAction: Boolean = false
     var quickActionValidUntilUnix: Long? = null
     var quickConnection: QuickConnectionArgs? = null
+    var redundancy: RedundantStartArgs? = null
+}
+
+@InvokeArg
+class RedundantHealthProbeArgs {
+    lateinit var kind: String
+    lateinit var targetIpv4: String
+    lateinit var queryName: String
+    var timeoutMs: Long = 0
+}
+
+@InvokeArg
+class RedundantMemberArgs {
+    lateinit var slot: String
+    lateinit var leaseId: String
+    var healthProbe: RedundantHealthProbeArgs? = null
+}
+
+@InvokeArg
+class RedundantStandbyArgs {
+    var member: RedundantMemberArgs = RedundantMemberArgs()
+    lateinit var configuration: ByteArray
+}
+
+@InvokeArg
+class RedundantStartArgs {
+    lateinit var sessionId: String
+    lateinit var operationId: String
+    lateinit var requestFingerprint: String
+    var reserveEnabled: Boolean = false
+    lateinit var virtualAddressV4: String
+    var standbyDesired: Boolean = false
+    lateinit var activeLeaseId: String
+    lateinit var localActiveLeaseId: String
+    var roleGeneration: Long = 0
+    var membershipGeneration: Long = 0
+    var primary: RedundantMemberArgs = RedundantMemberArgs()
+    var standby: RedundantStandbyArgs? = null
 }
 
 @InvokeArg
@@ -709,18 +747,16 @@ internal object TunnelRuntime {
             validateVersion(args.apiVersion)
             NelomaiVpnService.ensureStarted(applicationContext)
         } catch (error: Throwable) {
-            if (args.configurationInitialized) {
-                args.configuration.fill(0)
-            }
-            quickPlan?.configuration?.fill(0)
+            args.clearSensitiveConfigurations()
+            quickPlan?.clearSensitiveConfigurations()
             onError(errorCode(error))
             return
         }
         val replaceExisting = when (stateGate.beginStart()) {
             TransitionDecision.REPLACE -> true
             TransitionDecision.BUSY -> {
-                args.configuration.fill(0)
-                quickPlan?.configuration?.fill(0)
+                args.clearSensitiveConfigurations()
+                quickPlan?.clearSensitiveConfigurations()
                 onError("tunnel_operation_in_progress")
                 return
             }
@@ -832,7 +868,10 @@ internal object TunnelRuntime {
                 } else {
                     emptyList()
                 }
-                NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
+                NelomaiVpnService.setPhysicalNetworks(
+                    physicalState.networks,
+                    physicalState.validated,
+                )
                 AndroidSplitTunnel.replaceVpnRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(
                         options.excludedRoutes,
@@ -950,7 +989,10 @@ internal object TunnelRuntime {
                     throw TunnelOperationException("tunnel_start_cancelled")
                 }
                 if (state == Tunnel.State.UP) {
-                    NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
+                    NelomaiVpnService.setPhysicalNetworks(
+                        physicalState.networks,
+                        physicalState.validated,
+                    )
                 }
                 logStage("start.backend_state_up", backendStartedAt)
                 val resolved = if (state == Tunnel.State.UP) {
@@ -1027,10 +1069,10 @@ internal object TunnelRuntime {
                             TunnelLog.warning("quick_plan.clear_failed")
                         }
                     } finally {
-                        quickPlan.configuration.fill(0)
+                        quickPlan.clearSensitiveConfigurations()
                     }
                 } else {
-                    quickPlan?.configuration?.fill(0)
+                    quickPlan?.clearSensitiveConfigurations()
                     if (!keepForegroundServiceOnFailure) {
                         runTunnelFailureCleanup(
                             optionalDiagnostics = {
@@ -1057,10 +1099,8 @@ internal object TunnelRuntime {
                 logStage("start.completed", startedAt, "state=${resolved.wireName}")
                 onSuccess(resolved, elapsedMillis(startedAt))
             } catch (error: Throwable) {
-                if (args.configurationInitialized) {
-                    args.configuration.fill(0)
-                }
-                quickPlan?.configuration?.fill(0)
+                args.clearSensitiveConfigurations()
+                quickPlan?.clearSensitiveConfigurations()
                 AndroidSplitTunnel.clear()
                 stateGate.complete(SessionState.FAILED)
                 if (!keepForegroundServiceOnFailure) {
@@ -1093,6 +1133,8 @@ internal object TunnelRuntime {
                 )
                 onError(code)
             } finally {
+                args.clearSensitiveConfigurations()
+                quickPlan?.clearSensitiveConfigurations()
                 completeOperationWatchdog(watchdog)
             }
         }
@@ -1765,7 +1807,7 @@ internal object TunnelRuntime {
             if (!physicalState.available) {
                 session.networkWasUnavailable = true
                 session.observedNetworkFingerprint = physicalState.fingerprint
-                NelomaiVpnService.setPhysicalNetworks(emptyList())
+                NelomaiVpnService.setPhysicalNetworks(emptyList(), validated = false)
                 TunnelLog.info("tunnel.network_unavailable")
                 logDataPlaneSnapshot(session, "physical_network_unavailable")
                 return@execute
@@ -1781,7 +1823,10 @@ internal object TunnelRuntime {
             if (fingerprint == session.observedNetworkFingerprint && !session.networkWasUnavailable) {
                 return@execute
             }
-            NelomaiVpnService.setPhysicalNetworks(physicalState.networks)
+            NelomaiVpnService.setPhysicalNetworks(
+                physicalState.networks,
+                physicalState.validated,
+            )
             val recoveredAfterLoss = session.networkWasUnavailable
             session.observedNetworkFingerprint = fingerprint
             session.networkWasUnavailable = false
@@ -2574,8 +2619,30 @@ internal val StartTunnelArgs.configurationInitialized: Boolean
         false
     }
 
+private val RedundantStandbyArgs.configurationInitialized: Boolean
+    get() = try {
+        configuration
+        true
+    } catch (_: UninitializedPropertyAccessException) {
+        false
+    }
+
+internal fun StartTunnelArgs.clearSensitiveConfigurations() {
+    if (configurationInitialized) {
+        configuration.fill(0)
+    }
+    redundancy?.standby?.let { standby ->
+        if (standby.configurationInitialized) {
+            standby.configuration.fill(0)
+        }
+    }
+}
+
+internal fun StartTunnelArgs.canCacheQuickPlan(): Boolean =
+    cacheQuickAction && configurationInitialized && redundancy == null
+
 private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
-    if (!cacheQuickAction || !configurationInitialized) return null
+    if (!canCacheQuickPlan()) return null
     return StartTunnelArgs().also { copy ->
         copy.apiVersion = apiVersion
         copy.startSource = startSource
@@ -3035,9 +3102,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         }
 
         if (VpnService.prepare(activity.applicationContext) != null) {
-            if (args.configurationInitialized) {
-                args.configuration.fill(0)
-            }
+            args.clearSensitiveConfigurations()
             invoke.reject("vpn_permission_required")
             return
         }

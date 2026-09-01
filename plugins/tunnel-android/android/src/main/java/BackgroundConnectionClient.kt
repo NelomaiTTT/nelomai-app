@@ -832,12 +832,27 @@ internal data class RedundantRoleResponse(
     val session: BackgroundRedundantSession,
 )
 
+internal data class BackgroundRedundantRecoveryTransport(
+    val session: BackgroundRedundantSession,
+    val configurations: Map<String, ByteArray>,
+    val healthProbes: Map<String, BackgroundRedundantHealthProbe>,
+    val virtualAddressV4: String,
+)
+
 internal data class BackgroundRedundantCandidate(
     val session: BackgroundRedundantSession,
     val candidateLeaseId: String,
     val candidateSlot: RedundantSlot,
     val connection: QuickConnectionArgs,
     val configuration: ByteArray,
+    val healthProbe: BackgroundRedundantHealthProbe,
+)
+
+internal data class BackgroundRedundantHealthProbe(
+    val kind: String,
+    val targetIpv4: String,
+    val queryName: String,
+    val timeoutMs: Long,
 )
 
 internal object BackgroundConnectionClient {
@@ -967,6 +982,32 @@ internal object BackgroundConnectionClient {
         "background/connections/role",
         backgroundRedundantRolePayload(transaction, reason, observedAt),
     ))
+
+    fun recoverRedundant(
+        credential: BackgroundCredential,
+        transaction: AndroidRedundantTransaction,
+    ): BackgroundRedundantRecoveryTransport {
+        val connection = QuickConnectionArgs().apply {
+            leaseId = ""
+            layer = transaction.template.layer
+            ticConnectionMode = transaction.template.ticConnectionMode
+            routeMode = transaction.template.routeMode
+            egressMode = transaction.template.egressMode
+            allowAlternate = transaction.template.allowAlternate
+        }
+        val payload = execute(
+            credential,
+            "background/connections/start",
+            backgroundRedundantStartPayload(
+                QuickTunnelTemplate(
+                    options = transaction.template.options.toTunnelOptionsArgs(),
+                    connection = connection,
+                ),
+                transaction,
+            ),
+        )
+        return redundantRecoveryTransportFromJson(payload, transaction)
+    }
 
     fun releaseRedundantStandby(
         credential: BackgroundCredential,
@@ -1269,16 +1310,101 @@ internal fun redundantRoleFromJson(payload: JSONObject): RedundantRoleResponse =
     session = redundantSessionFromJson(payload.getJSONObject("session")),
 )
 
-private fun redundantCandidateFromJson(payload: JSONObject): BackgroundRedundantCandidate {
-    val configuration = payload.getString("configuration").toByteArray(StandardCharsets.UTF_8)
-    require(configuration.isNotEmpty() && configuration.size <= BACKGROUND_MAX_RESPONSE_BYTES)
-    return BackgroundRedundantCandidate(
-        session = redundantSessionFromJson(payload.getJSONObject("session")),
-        candidateLeaseId = payload.getString("candidate_lease_id"),
-        candidateSlot = RedundantSlot.fromWireName(payload.getString("candidate_slot")),
-        connection = payload.getJSONObject("connection").toQuickConnection(),
-        configuration = configuration,
+internal fun redundantHealthProbeFromJson(payload: JSONObject): BackgroundRedundantHealthProbe =
+    BackgroundRedundantHealthProbe(
+        kind = payload.getString("kind").also { require(it == "dns_a") },
+        targetIpv4 = payload.getString("target_ipv4"),
+        queryName = payload.getString("query_name"),
+        timeoutMs = payload.getLong("timeout_ms").also { require(it in 250L..10_000L) },
     )
+
+internal fun redundantRecoveryTransportFromJson(
+    payload: JSONObject,
+    transaction: AndroidRedundantTransaction,
+): BackgroundRedundantRecoveryTransport {
+    val primaryConfiguration = payload.getString("configuration")
+        .toByteArray(StandardCharsets.UTF_8)
+    var standbyConfiguration: ByteArray? = null
+    try {
+        require(primaryConfiguration.isNotEmpty() &&
+            primaryConfiguration.size <= BACKGROUND_MAX_RESPONSE_BYTES)
+        val primaryLeaseId = payload.getJSONObject("connection").getString("lease_id")
+        val primaryProbe = redundantHealthProbeFromJson(payload.getJSONObject("health_probe"))
+        val redundancy = payload.getJSONObject("redundancy")
+        require(redundancy.getString("session_id") == transaction.sessionId)
+        val standby = redundancy.optJSONObject("standby")
+        val standbyLeaseId = standby?.getJSONObject("connection")?.getString("lease_id")
+        standbyConfiguration = standby?.getString("configuration")
+            ?.toByteArray(StandardCharsets.UTF_8)
+        if (standbyConfiguration != null) {
+            require(standbyConfiguration.isNotEmpty() &&
+                standbyConfiguration.size <= BACKGROUND_MAX_RESPONSE_BYTES)
+        }
+        val returnedLeases = listOfNotNull(primaryLeaseId, standbyLeaseId).toSet()
+        val allowedLeases = listOfNotNull(
+            transaction.slotALeaseId,
+            transaction.slotBLeaseId,
+            transaction.candidateLeaseId,
+        ).toSet()
+        require(returnedLeases.isNotEmpty() && returnedLeases.all { it in allowedLeases })
+        fun recoveredSlot(slot: RedundantSlot): String? {
+            val current = when (slot) {
+                RedundantSlot.A -> transaction.slotALeaseId
+                RedundantSlot.B -> transaction.slotBLeaseId
+            }
+            val candidate = transaction.candidateLeaseId.takeIf { transaction.candidateSlot == slot }
+            return candidate?.takeIf { it in returnedLeases }
+                ?: current?.takeIf { it in returnedLeases }
+        }
+        val session = BackgroundRedundantSession(
+            sessionId = transaction.sessionId,
+            state = redundancy.getString("state"),
+            activeLeaseId = primaryLeaseId,
+            slotALeaseId = recoveredSlot(RedundantSlot.A),
+            slotBLeaseId = recoveredSlot(RedundantSlot.B),
+            standbyDesired = redundancy.getBoolean("standby_desired"),
+            roleGeneration = redundancy.getLong("role_generation"),
+            membershipGeneration = redundancy.getLong("membership_generation"),
+            reason = redundancy.optionalString("reason"),
+        )
+        require(session.containsCurrentLease(primaryLeaseId))
+        val configurations = linkedMapOf(primaryLeaseId to primaryConfiguration)
+        val healthProbes = linkedMapOf(primaryLeaseId to primaryProbe)
+        if (standby != null && standbyLeaseId != null && standbyConfiguration != null) {
+            configurations[standbyLeaseId] = standbyConfiguration
+            healthProbes[standbyLeaseId] = redundantHealthProbeFromJson(
+                standby.getJSONObject("health_probe"),
+            )
+        }
+        return BackgroundRedundantRecoveryTransport(
+            session,
+            configurations,
+            healthProbes,
+            redundancy.getString("virtual_address_v4"),
+        )
+    } catch (error: Throwable) {
+        primaryConfiguration.fill(0)
+        standbyConfiguration?.fill(0)
+        throw error
+    }
+}
+
+internal fun redundantCandidateFromJson(payload: JSONObject): BackgroundRedundantCandidate {
+    val configuration = payload.getString("configuration").toByteArray(StandardCharsets.UTF_8)
+    try {
+        require(configuration.isNotEmpty() && configuration.size <= BACKGROUND_MAX_RESPONSE_BYTES)
+        return BackgroundRedundantCandidate(
+            session = redundantSessionFromJson(payload.getJSONObject("session")),
+            candidateLeaseId = payload.getString("candidate_lease_id"),
+            candidateSlot = RedundantSlot.fromWireName(payload.getString("candidate_slot")),
+            connection = payload.getJSONObject("connection").toQuickConnection(),
+            configuration = configuration,
+            healthProbe = redundantHealthProbeFromJson(payload.getJSONObject("health_probe")),
+        )
+    } catch (error: Throwable) {
+        configuration.fill(0)
+        throw error
+    }
 }
 
 internal fun validateBackgroundBindingSyncResponse(response: JSONObject) {
@@ -1342,7 +1468,7 @@ internal fun backgroundRedundantStartPayload(
     contractVersion = 2,
     requestFingerprint = transaction.startRequestFingerprint,
     redundancyContractVersion = 1,
-    reserveEnabled = transaction.standbyDesired,
+    reserveEnabled = transaction.startReserveEnabled,
 )
 
 private fun JSONObject.toTunnelOptions(

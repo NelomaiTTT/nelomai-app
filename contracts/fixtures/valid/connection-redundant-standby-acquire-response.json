@@ -27,5 +27,11 @@
     "stopped_at": null
   },
   "configuration": "[Interface]\nPrivateKey = candidate-delivered-only-to-core\nAddress = 10.200.0.2/32\n",
+  "health_probe": {
+    "kind": "dns_a",
+    "target_ipv4": "8.8.8.8",
+    "query_name": "nelomai.ru",
+    "timeout_ms": 4000
+  },
   "reused": false
 }

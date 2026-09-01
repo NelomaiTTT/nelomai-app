@@ -2,7 +2,9 @@ diff --git a/device/device.go b/device/device.go
 index 26c8ede561e2185b5d9b14f9c70b640d10d3b049..0329c87dffd8337ae0feceb78d7e504d6c78ed6e 100644
 --- a/device/device.go
 +++ b/device/device.go
-@@ -128,2 +128,7 @@ type Device struct {
+@@ -126,6 +126,11 @@ type Device struct {
+ 		keepaliveTimeoutSec AtomicUintRange
+ 		maxHandshakeAttemps AtomicUintRange
  	}
 +
 +	controlProbe struct {
@@ -10,7 +12,11 @@ index 26c8ede561e2185b5d9b14f9c70b640d10d3b049..0329c87dffd8337ae0feceb78d7e504d
 +		completedGeneration atomic.Uint64
 +	}
  }
-@@ -587 +592,74 @@ func (device *Device) BindClose() error {
+ 
+ // deviceState represents the state of a Device.
+@@ -585,3 +590,76 @@ func (device *Device) BindClose() error {
+ 	device.net.Unlock()
+ 	return err
  }
 +
 +// SendKeepalivesToAllRunningPeers queues one keepalive for every running peer
@@ -89,7 +95,9 @@ diff --git a/device/device_test.go b/device/device_test.go
 index 1e13f9dc4296cbcdaa5b9743ddcd3c51c305d3b0..1a4245953c61dff0a62143e40227bda8871b8d5e 100644
 --- a/device/device_test.go
 +++ b/device/device_test.go
-@@ -331,2 +331,99 @@ func TestUpDown(t *testing.T) {
+@@ -329,6 +329,103 @@ func TestUpDown(t *testing.T) {
+ 	}
+ }
  
 +func TestSendKeepalivesWithoutPersistentInterval(t *testing.T) {
 +	pair := genTestPair(t, false)
@@ -189,11 +197,76 @@ index 1e13f9dc4296cbcdaa5b9743ddcd3c51c305d3b0..1a4245953c61dff0a62143e40227bda8
 +}
 +
  // TestConcurrencySafety does other things concurrently with tunnel use.
+ // It is intended to be used with the race detector to catch data races.
+ func TestConcurrencySafety(t *testing.T) {
+diff --git a/device/handshake_snapshot.go b/device/handshake_snapshot.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..95d861e24ea9a4cb6079b3bf939e1bfca7a51cb6
+--- /dev/null
++++ b/device/handshake_snapshot.go
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: MIT */
++
++package device
++
++// LatestHandshakeUnixMillis returns only the newest authenticated peer handshake time.
++// It deliberately avoids the UAPI serialization path, which also contains key material.
++func (device *Device) LatestHandshakeUnixMillis() int64 {
++	device.peers.RLock()
++	defer device.peers.RUnlock()
++	var latest int64
++	for _, peer := range device.peers.keyMap {
++		if current := peer.lastHandshakeNano.Load(); current > latest {
++			latest = current
++		}
++	}
++	return latest / 1_000_000
++}
+diff --git a/device/handshake_snapshot_test.go b/device/handshake_snapshot_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7db9eeac3a8d1dbbc3dae9bd3da26ff33b3a1fb5
+--- /dev/null
++++ b/device/handshake_snapshot_test.go
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: MIT */
++
++package device
++
++import "testing"
++
++func TestLatestHandshakeUnixMillisIsZeroWithoutPeers(t *testing.T) {
++	device := new(Device)
++	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
++	if got := device.LatestHandshakeUnixMillis(); got != 0 {
++		t.Fatalf("latest handshake = %d, want 0", got)
++	}
++}
++
++func TestLatestHandshakeUnixMillisReturnsNewestPeerWithoutUAPI(t *testing.T) {
++	device := new(Device)
++	first := new(Peer)
++	second := new(Peer)
++	first.lastHandshakeNano.Store(1_700_000_000_123_000_000)
++	second.lastHandshakeNano.Store(1_700_000_001_456_789_000)
++	var firstKey, secondKey NoisePublicKey
++	firstKey[0] = 1
++	secondKey[0] = 2
++	device.peers.keyMap = map[NoisePublicKey]*Peer{
++		firstKey:  first,
++		secondKey: second,
++	}
++
++	if got := device.LatestHandshakeUnixMillis(); got != 1_700_000_001_456 {
++		t.Fatalf("latest handshake = %d, want 1700000001456", got)
++	}
++}
 diff --git a/device/peer.go b/device/peer.go
 index e9ef5ee5665e4c78ba8ee9098e359e9a24dd2614..9eda890a755dae5874bc0aec8d5e59ff4076dfc9 100644
 --- a/device/peer.go
 +++ b/device/peer.go
-@@ -27,2 +27,8 @@ type Peer struct {
+@@ -25,6 +25,12 @@ type Peer struct {
+ 	rxBytes           atomic.Uint64  // bytes received from peer
+ 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
  
 +	controlProbe struct {
 +		generation      atomic.Uint64
@@ -202,7 +275,11 @@ index e9ef5ee5665e4c78ba8ee9098e359e9a24dd2614..9eda890a755dae5874bc0aec8d5e59ff
 +	}
 +
  	endpoint struct {
-@@ -61,2 +67,28 @@ type Peer struct {
+ 		sync.Mutex
+ 		val            conn.Endpoint
+@@ -59,6 +65,32 @@ type Peer struct {
+ 	persistentKeepaliveInterval AtomicUintRange
+ }
  
 +func (peer *Peer) cancelHandshakeProbe(generation uint64) {
 +	if peer.controlProbe.generation.CompareAndSwap(generation, 0) {
@@ -231,19 +308,27 @@ index e9ef5ee5665e4c78ba8ee9098e359e9a24dd2614..9eda890a755dae5874bc0aec8d5e59ff
 +}
 +
  func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+ 	if device.isClosed() {
+ 		return nil, errors.New("device closed")
 diff --git a/device/receive.go b/device/receive.go
 index fc2e2da303d2c264423ba4a47990f28dbf03169f..d6bc92cce65e08b73d7ef144211b5da3af87ad3d 100644
 --- a/device/receive.go
 +++ b/device/receive.go
-@@ -468,2 +468,3 @@ func (device *Device) RoutineHandshake(id int) {
+@@ -466,6 +466,7 @@ func (device *Device) RoutineHandshake(id int) {
+ 			}
+ 
  			peer.timersSessionDerived()
 +			peer.completeHandshakeProbe(msg.Receiver)
  			peer.timersHandshakeComplete()
+ 			peer.SendKeepalive()
+ 		}
 diff --git a/device/send.go b/device/send.go
 index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..c6748d95e3b960c72efa39360963797192458324 100644
 --- a/device/send.go
 +++ b/device/send.go
-@@ -106,2 +106,17 @@ func (peer *Peer) SendKeepalive() {
+@@ -104,6 +104,21 @@ func (peer *Peer) SendKeepalive() {
+ }
+ 
  func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 +	probeGeneration := uint64(0)
 +	if isRetry {
@@ -261,22 +346,32 @@ index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..c6748d95e3b960c72efa393609637971
 +
 +func (peer *Peer) sendHandshakeInitiation(isRetry bool, probeGeneration uint64) error {
  	if !isRetry {
-@@ -135,2 +150,5 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+ 		peer.timers.handshakeAttempts.Store(0)
+ 		peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttemps())
+@@ -133,6 +148,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+ 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+ 		return err
  	}
 +	if probeGeneration != 0 && peer.controlProbe.generation.Load() == probeGeneration {
 +		peer.controlProbe.expectedIndex.Store(msg.Sender)
 +	}
  
+ 	var sendBuffer [][]byte
+ 
 diff --git a/device/uapi.go b/device/uapi.go
 index f28994ccb7faff2b50062e3bc63641856c199215..453ecbbfa12ce9d0f25542aa5811c940b00b8269 100644
 --- a/device/uapi.go
 +++ b/device/uapi.go
-@@ -250,4 +250,3 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+@@ -248,8 +248,7 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 		if !ok {
+ 			return ipcErrorf(
  				ipc.IpcErrorProtocol,
 -				"failed to parse line %q",
 -				line,
 +				"failed to parse configuration line",
  			)
+ 		}
+ 
 diff --git a/device/uapi_privacy_test.go b/device/uapi_privacy_test.go
 new file mode 100644
 index 0000000000000000000000000000000000000000..3b87df2e4bdc84ef0ee825c5186aaa7e547e674a
@@ -330,40 +425,53 @@ diff --git a/tun/tun.go b/tun/tun.go
 index 336d642251f91a80e30eeb0c74d8afa15393b884..568048ecedeac856a959f5e8aa8d10d3c18cbd9c 100644
 --- a/tun/tun.go
 +++ b/tun/tun.go
-@@ -20,3 +20,4 @@ const (
+@@ -18,7 +18,8 @@ const (
+ )
+ 
  type Device interface {
 -	// File returns the file descriptor of the device.
 +	// File returns the backing file descriptor of the device. In-memory virtual
 +	// devices may return nil.
  	File() *os.File
+ 
+ 	// Read one or more packets from the Device (without any additional headers).
 diff --git a/tun/tun_linux.go b/tun/tun_linux.go
 index b1254fdba30380ba9d076a8d373d367d74179e1c..20a72481191bee5a866e273215ea85b0a5e3420c 100644
 --- a/tun/tun_linux.go
 +++ b/tun/tun_linux.go
-@@ -635,3 +635,3 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+@@ -633,13 +633,18 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+ }
+ 
  // CreateUnmonitoredTUNFromFD creates a Device from the provided file
 -// descriptor.
 +// descriptor. Ownership of fd is always consumed, including on error.
  func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
-@@ -639,2 +639,3 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	err := unix.SetNonblock(fd, true)
  	if err != nil {
 +		_ = unix.Close(fd)
  		return nil, "", err
-@@ -642,2 +643,6 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	}
  	file := os.NewFile(uintptr(fd), "/dev/tun")
 +	if file == nil {
 +		_ = unix.Close(fd)
 +		return nil, "", errors.New("failed to own TUN file descriptor")
 +	}
  	tun := &NativeTun{
-@@ -652,2 +657,3 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 		tunFile:     file,
+ 		events:      make(chan Event, 5),
+@@ -650,10 +655,12 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	}
+ 	name, err := tun.Name()
  	if err != nil {
 +		_ = file.Close()
  		return nil, "", err
-@@ -656,2 +662,3 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+ 	}
+ 	err = tun.initFromFlags(name)
  	if err != nil {
 +		_ = file.Close()
  		return nil, "", err
+ 	}
+ 	return tun, name, err
 diff --git a/tun/tun_linux_ownership_test.go b/tun/tun_linux_ownership_test.go
 new file mode 100644
 index 0000000000000000000000000000000000000000..437b56c230895d1e46dee3ea68610c7d576d02ac

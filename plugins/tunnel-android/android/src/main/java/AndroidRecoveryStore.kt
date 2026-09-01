@@ -198,6 +198,7 @@ internal data class AndroidRedundantTransaction(
     val membershipGeneration: Long,
     val startOperationId: String,
     val startRequestFingerprint: String,
+    val startReserveEnabled: Boolean = true,
     val stopOperationId: String? = null,
     val candidateLeaseId: String? = null,
     val candidateSlot: RedundantSlot? = null,
@@ -416,6 +417,7 @@ internal object AndroidRecoveryEnvelopeCodec {
         put("membershipGeneration", transaction.membershipGeneration)
         put("startOperationId", transaction.startOperationId)
         put("startRequestFingerprint", transaction.startRequestFingerprint)
+        put("startReserveEnabled", transaction.startReserveEnabled)
         transaction.stopOperationId?.let { put("stopOperationId", it) }
         transaction.candidateLeaseId?.let { put("candidateLeaseId", it) }
         transaction.candidateSlot?.let { put("candidateSlot", it.wireName) }
@@ -452,6 +454,7 @@ internal object AndroidRecoveryEnvelopeCodec {
             membershipGeneration = payload.getLong("membershipGeneration"),
             startOperationId = payload.getString("startOperationId"),
             startRequestFingerprint = payload.getString("startRequestFingerprint"),
+            startReserveEnabled = payload.optBoolean("startReserveEnabled", true),
             stopOperationId = payload.optionalString("stopOperationId"),
             candidateLeaseId = payload.optionalString("candidateLeaseId"),
             candidateSlot = payload.optionalString("candidateSlot")?.let(RedundantSlot::fromWireName),

@@ -2,13 +2,16 @@ diff --git a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java b/tunnel/src/ma
 index 3f1682085725bd58ff6129cead962820ce7a5eb0..a8e936b3aad0de745a1659619156f31eab5d3438 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
-@@ -8,2 +8,5 @@ public class GoBackend {
+@@ -6,10 +6,25 @@ public class GoBackend {
+     @Nullable
+     public static native String awgGetConfig(int handle);
  
 +    @Nullable
 +    public static native String awgGetNetworkTelemetry(int handle);
 +
      public static native int awgGetSocketV4(int handle);
-@@ -12,2 +15,14 @@ public class GoBackend {
+ 
+     public static native int awgGetSocketV6(int handle);
  
 +    public static native int awgCloseUdp(int handle);
 +
@@ -23,11 +26,15 @@ index 3f1682085725bd58ff6129cead962820ce7a5eb0..a8e936b3aad0de745a1659619156f31e
 +    public static native long awgHandshakeProbeTimeoutMillis(int handle);
 +
      public static native void awgTurnOff(int handle);
+ 
+     public static native int awgTurnOn(String ifName, int tunFd, String settings);
 diff --git a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 index 2bb8026ab3d4207eb465f7428de309a1671ed2ec..de3585073138193920d6bf1b6916c264c8d6de31 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
-@@ -173,2 +173,65 @@ public final class GoBackend implements Backend {
+@@ -171,6 +171,69 @@ public final class GoBackend implements Backend {
+         return stats;
+     }
  
 +    /** Return transport telemetry collected below the WireGuard device counters. */
 +    @Nullable
@@ -93,19 +100,27 @@ index 2bb8026ab3d4207eb465f7428de309a1671ed2ec..de3585073138193920d6bf1b6916c264
 +    }
 +
  
+     /**
+      * Get the last handshake time for a given {@link Tunnel}.
 diff --git a/tunnel/tools/CMakeLists.txt b/tunnel/tools/CMakeLists.txt
 index 8557c5ab88919028443e4a4180741d4fac5aee41..3480c49ada179a75902fd60962f39cae725d413b 100644
 --- a/tunnel/tools/CMakeLists.txt
 +++ b/tunnel/tools/CMakeLists.txt
-@@ -11,2 +11,3 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size
+@@ -9,6 +9,7 @@ add_link_options(LINKER:--build-id=none)
+ add_link_options(-Wl,-z,max-page-size=16384)
+ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
  add_compile_options(-Wall -Werror)
 +set(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO "${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO} -Wl,--strip-all")
  
+ add_executable(libwg-quick.so amneziawg-tools/src/wg-quick/android.c ndk-compat/compat.c)
+ target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DAWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
 diff --git a/tunnel/tools/libwg-go/Makefile b/tunnel/tools/libwg-go/Makefile
 index 9b9c081f236a1e0c2a5f16becad6b2357e60da52..3b34848c35029976c9e4c129a5ae9638889f5901 100644
 --- a/tunnel/tools/libwg-go/Makefile
 +++ b/tunnel/tools/libwg-go/Makefile
-@@ -31,2 +31,10 @@ default: $(DESTDIR)/libwg-go.so
+@@ -29,6 +29,14 @@ GO_HASH_linux-amd64 := 68097bd680839cbc9d464a0edce4f7c333975e27a90246890e9f1078c
+ 
+ default: $(DESTDIR)/libwg-go.so
  
 +WORKSPACE_ROOT := ../../../../..
 +AMNEZIAWG_GO_ROOT := ../../../../amneziawg-go
@@ -116,13 +131,18 @@ index 9b9c081f236a1e0c2a5f16becad6b2357e60da52..3b34848c35029976c9e4c129a5ae9638
 +GO_BUILD_FILES := Makefile $(GO_WORKSPACE_FILES)
 +
  $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL):
-@@ -48,4 +56,4 @@ $(BUILDDIR)/go-$(GO_VERSION)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_T
+ 	mkdir -p "$(dir $@)"
+ 	flock "$@.lock" -c ' \
+@@ -46,7 +54,7 @@ $(BUILDDIR)/go-$(GO_VERSION)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_T
+ 	touch "$@"'
+ 
  $(DESTDIR)/libwg-go.so: export PATH := $(BUILDDIR)/go-$(GO_VERSION)/bin/:$(PATH)
 -$(DESTDIR)/libwg-go.so: $(BUILDDIR)/go-$(GO_VERSION)/.prepared go.mod
 -	go build -tags linux -ldflags="-X github.com/amnezia-vpn/amneziawg-go/ipc.socketDirectory=/data/data/$(ANDROID_PACKAGE_NAME)/cache/amneziawg -buildid=" -v -trimpath -buildvcs=false -o "$@" -buildmode c-shared
 +$(DESTDIR)/libwg-go.so: $(BUILDDIR)/go-$(GO_VERSION)/.prepared $(GO_BUILD_FILES) $(LIBWG_GO_SOURCES) $(AMNEZIAWG_GO_SOURCES)
 +	go build -tags linux -ldflags="-s -w -X github.com/amnezia-vpn/amneziawg-go/ipc.socketDirectory=/data/data/$(ANDROID_PACKAGE_NAME)/cache/amneziawg -buildid=" -v -trimpath -buildvcs=false -o "$@" -buildmode c-shared
  
+ .DELETE_ON_ERROR:
 diff --git a/tunnel/tools/libwg-go/admission_bind.go b/tunnel/tools/libwg-go/admission_bind.go
 new file mode 100644
 index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182887260b4
@@ -475,28 +495,39 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +
 +func (a *admissionBind) BatchSize() int { return a.parser.BatchSize() }
 diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
-index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b3f9923cf 100644
+index 3af343d17d35120cd29f7610281f0d26b77087c8..d8335f6d8711dbe71294eb69e66c4220b49c3235 100644
 --- a/tunnel/tools/libwg-go/api-android.go
 +++ b/tunnel/tools/libwg-go/api-android.go
-@@ -1 +1,3 @@
+@@ -1,3 +1,5 @@
 +//go:build android
 +
  /* SPDX-License-Identifier: Apache-2.0
-@@ -12,4 +14,5 @@ import "C"
+  *
+  * Copyright © 2017-2022 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+@@ -10,14 +12,19 @@ package main
+ import "C"
+ 
  import (
 +	"encoding/json"
 +	"errors"
  	"fmt"
 -	"math"
  	"net"
-@@ -20,2 +23,6 @@ import (
+ 	"os"
+ 	"os/signal"
+ 	"runtime"
+ 	"runtime/debug"
  	"strings"
 +	"sync"
 +	"sync/atomic"
 +	"syscall"
 +	"time"
  	"unsafe"
-@@ -48,4 +55,268 @@ func (l AndroidLogger) Printf(format string, args ...interface{}) {
+ 
+ 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
+@@ -46,14 +53,292 @@ func (l AndroidLogger) Printf(format string, args ...interface{}) {
+ }
+ 
  type TunnelHandle struct {
 -	device *device.Device
 -	uapi   net.Listener
@@ -515,14 +546,16 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +type redundantNativeSession struct {
 +	mu     sync.Mutex
 +	tunnel *RedundantTunnel
++	probes *redundantProbeRegistry
 +	slots  [redundantTunnelSlotCount]*redundantNativeSlot
 +	closed bool
 +}
 +
 +type redundantNativeSlotMetrics struct {
-+	Slot      int                     `json:"slot"`
-+	Admitted  bool                    `json:"admitted"`
-+	Telemetry tunnelTelemetrySnapshot `json:"telemetry"`
++	Slot                      int                     `json:"slot"`
++	Admitted                  bool                    `json:"admitted"`
++	LatestHandshakeUnixMillis int64                   `json:"latest_handshake_at_unix_ms"`
++	Telemetry                 tunnelTelemetrySnapshot `json:"telemetry"`
 +}
 +
 +type redundantNativeMetrics struct {
@@ -767,7 +800,7 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +	}
 +	return peek.PeekLookAtSocketFd6()
  }
-@@ -53,2 +324,13 @@ type TunnelHandle struct {
+ 
  var tunnelHandles map[int32]TunnelHandle
 +var tunnelHandlesMutex sync.RWMutex
 +var redundantNativeHandles map[int64]*redundantNativeSession
@@ -781,11 +814,15 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +	return handle, ok
 +}
  
-@@ -56,2 +338,3 @@ func init() {
+ func init() {
  	tunnelHandles = make(map[int32]TunnelHandle)
 +	redundantNativeHandles = make(map[int64]*redundantNativeSession)
  	signals := make(chan os.Signal)
-@@ -74,2 +357,336 @@ func init() {
+ 	signal.Notify(signals, unix.SIGUSR2)
+ 	go func() {
+@@ -72,6 +357,393 @@ func init() {
+ 	}()
+ }
  
 +func lookupRedundantNativeSession(handle int64) (*redundantNativeSession, bool) {
 +	redundantNativeHandlesMutex.RLock()
@@ -827,7 +864,10 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +		_ = nativeTun.Close()
 +		return -1
 +	}
-+	session := &redundantNativeSession{tunnel: dispatcher}
++	session := &redundantNativeSession{
++		tunnel: dispatcher,
++		probes: newRedundantProbeRegistry(dispatcher),
++	}
 +	handle := allocateRedundantNativeHandle(session)
 +	if handle < 0 {
 +		_ = dispatcher.Close()
@@ -906,6 +946,7 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +	if session.closed || runtime == nil || !runtime.admitted {
 +		return -1
 +	}
++	session.probes.CancelSlot(uint32(slot))
 +	if err := runtime.bind.PrepareRebind(0); err != nil {
 +		return -1
 +	}
@@ -1051,6 +1092,7 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +	if session.closed {
 +		return -1
 +	}
++	session.probes.CancelSlot(uint32(slot))
 +	runtime := session.slots[slot]
 +	if runtime == nil {
 +		return 0
@@ -1059,6 +1101,52 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +	resetErr := session.tunnel.ResetSlot(uint32(slot))
 +	session.slots[slot] = nil
 +	if resetErr != nil {
++		return -1
++	}
++	return 0
++}
++
++//export awgRedundantStartProbe
++func awgRedundantStartProbe(handle int64, slot int32, sourceIPv4, targetIPv4, queryName string) int64 {
++	if slot < 0 || slot >= redundantTunnelSlotCount {
++		return -1
++	}
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	runtime := session.slots[slot]
++	if session.closed || runtime == nil || !runtime.admitted {
++		return -1
++	}
++	return session.probes.Start(slot, sourceIPv4, targetIPv4, queryName)
++}
++
++//export awgRedundantProbeStatus
++func awgRedundantProbeStatus(handle int64, token int64) int32 {
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return redundantProbeUnknown
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	if session.closed {
++		return redundantProbeUnknown
++	}
++	return session.probes.Status(token)
++}
++
++//export awgRedundantCancelProbe
++func awgRedundantCancelProbe(handle int64, token int64) int32 {
++	session, ok := lookupRedundantNativeSession(handle)
++	if !ok {
++		return -1
++	}
++	session.mu.Lock()
++	defer session.mu.Unlock()
++	if session.closed || !session.probes.Cancel(token) {
 +		return -1
 +	}
 +	return 0
@@ -1080,7 +1168,8 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +		if runtime != nil {
 +			metrics.Slots = append(metrics.Slots, redundantNativeSlotMetrics{
 +				Slot: slot, Admitted: runtime.admitted,
-+				Telemetry: redactRedundantTelemetry(runtime.telemetry.snapshot()),
++				LatestHandshakeUnixMillis: runtime.device.LatestHandshakeUnixMillis(),
++				Telemetry:                 redactRedundantTelemetry(runtime.telemetry.snapshot()),
 +			})
 +		}
 +	}
@@ -1109,6 +1198,7 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +		return
 +	}
 +	session.closed = true
++	session.probes.CancelAll()
 +	slots := session.slots
 +	session.slots = [redundantTunnelSlotCount]*redundantNativeSlot{}
 +	session.mu.Unlock()
@@ -1122,14 +1212,20 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +}
 +
  //export awgTurnOn
-@@ -82,5 +699,4 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	tag := cstring("AmneziaWG/" + interfaceName)
+@@ -80,15 +752,17 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
+ 	}
  
 -	tun, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
 +	nativeTun, name, err := tun.CreateUnmonitoredTUNFromFD(int(tunFd))
  	if err != nil {
 -		unix.Close(int(tunFd))
  		logger.Errorf("CreateUnmonitoredTUNFromFD: %v", err)
-@@ -90,3 +706,6 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 		return -1
+ 	}
+ 
  	logger.Verbosef("Attaching to interface %v", name)
 -	device := device.NewDevice(tun, conn.NewStdNetBind(), logger)
 +	telemetry := new(tunnelTelemetry)
@@ -1137,43 +1233,69 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +	diagnosticBind := &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
 +	device := device.NewDevice(diagnosticTun, diagnosticBind, logger)
  
-@@ -133,2 +752,4 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	err = device.IpcSet(settings)
+ 	if err != nil {
+@@ -131,6 +805,8 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	logger.Verbosef("Device started")
+ 
  	var i int32
 +	tunnelHandlesMutex.Lock()
 +	defer tunnelHandlesMutex.Unlock()
  	for i = 0; i < math.MaxInt32; i++ {
-@@ -144,3 +765,3 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 		if _, exists := tunnelHandles[i]; !exists {
+ 			break
+@@ -142,17 +818,20 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 		device.Close()
+ 		return -1
  	}
 -	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi}
 +	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi, telemetry: telemetry}
  	return i
-@@ -150,4 +771,6 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ }
+ 
+ //export awgTurnOff
  func awgTurnOff(tunnelHandle int32) {
 +	tunnelHandlesMutex.Lock()
  	handle, ok := tunnelHandles[tunnelHandle]
  	if !ok {
 +		tunnelHandlesMutex.Unlock()
  		return
-@@ -155,2 +778,3 @@ func awgTurnOff(tunnelHandle int32) {
+ 	}
  	delete(tunnelHandles, tunnelHandle)
 +	tunnelHandlesMutex.Unlock()
  	if handle.uapi != nil {
-@@ -163,3 +787,3 @@ func awgTurnOff(tunnelHandle int32) {
+ 		handle.uapi.Close()
+ 	}
+@@ -161,7 +840,7 @@ func awgTurnOff(tunnelHandle int32) {
+ 
+ //export awgGetSocketV4
  func awgGetSocketV4(tunnelHandle int32) int32 {
 -	handle, ok := tunnelHandles[tunnelHandle]
 +	handle, ok := lookupTunnelHandle(tunnelHandle)
  	if !ok {
-@@ -180,3 +804,3 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
+ 		return -1
+ 	}
+@@ -178,7 +857,7 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
+ 
+ //export awgGetSocketV6
  func awgGetSocketV6(tunnelHandle int32) int32 {
 -	handle, ok := tunnelHandles[tunnelHandle]
 +	handle, ok := lookupTunnelHandle(tunnelHandle)
  	if !ok {
-@@ -197,3 +821,3 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
+ 		return -1
+ 	}
+@@ -195,7 +874,7 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
+ 
+ //export awgGetConfig
  func awgGetConfig(tunnelHandle int32) *C.char {
 -	handle, ok := tunnelHandles[tunnelHandle]
 +	handle, ok := lookupTunnelHandle(tunnelHandle)
  	if !ok {
-@@ -208,2 +832,88 @@ func awgGetConfig(tunnelHandle int32) *C.char {
+ 		return nil
+ 	}
+@@ -206,6 +885,92 @@ func awgGetConfig(tunnelHandle int32) *C.char {
+ 	return C.CString(settings)
+ }
  
 +//export awgGetNetworkTelemetry
 +func awgGetNetworkTelemetry(tunnelHandle int32) *C.char {
@@ -1262,15 +1384,21 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..2278d4d262c4cda579a0a230909f8c2b
 +}
 +
  //export awgVersion
+ func awgVersion() *C.char {
+ 	info, ok := debug.ReadBuildInfo()
 diff --git a/tunnel/tools/libwg-go/jni.c b/tunnel/tools/libwg-go/jni.c
-index 237043e561625a6d8bbdec7f215bb323cf1b75cd..59416e689867f06cb6f80c4a08310029e6c33566 100644
+index 237043e561625a6d8bbdec7f215bb323cf1b75cd..607d6a7bcf1f67af1b7b403dbdbb51e7df7de0b2 100644
 --- a/tunnel/tools/libwg-go/jni.c
 +++ b/tunnel/tools/libwg-go/jni.c
-@@ -1 +1,3 @@
+@@ -1,3 +1,5 @@
 +//go:build android
 +
  /* SPDX-License-Identifier: Apache-2.0
-@@ -15,3 +17,57 @@ extern int awgGetSocketV6(int handle);
+  *
+  * Copyright © 2017-2021 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+@@ -13,7 +15,70 @@ extern void awgTurnOff(int handle);
+ extern int awgGetSocketV4(int handle);
+ extern int awgGetSocketV6(int handle);
  extern char *awgGetConfig(int handle);
 +extern char *awgGetNetworkTelemetry(int handle);
 +extern int awgCloseUdp(int handle);
@@ -1289,6 +1417,15 @@ index 237043e561625a6d8bbdec7f215bb323cf1b75cd..59416e689867f06cb6f80c4a08310029
 +extern void awgRedundantAbortPreparation(long long handle, int slot, long long token);
 +extern int awgRedundantSwitchActive(long long handle, int slot);
 +extern int awgRedundantStopSlot(long long handle, int slot);
++extern long long awgRedundantStartProbe(
++	long long handle,
++	int slot,
++	struct go_string source_ipv4,
++	struct go_string target_ipv4,
++	struct go_string query_name
++);
++extern int awgRedundantProbeStatus(long long handle, long long token);
++extern int awgRedundantCancelProbe(long long handle, long long token);
 +extern char *awgRedundantMetrics(long long handle);
 +extern void awgRedundantClose(long long handle);
 +
@@ -1328,7 +1465,11 @@ index 237043e561625a6d8bbdec7f215bb323cf1b75cd..59416e689867f06cb6f80c4a08310029
 +	return result;
 +}
  
-@@ -61,2 +117,43 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetConfig(JNIEnv *en
+ JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgTurnOn(JNIEnv *env, jclass c, jstring ifname, jint tun_fd, jstring settings)
+ {
+@@ -59,6 +124,47 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetConfig(JNIEnv *en
+ 	return ret;
+ }
  
 +JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetNetworkTelemetry(JNIEnv *env, jclass c, jint handle)
 +{
@@ -1372,7 +1513,11 @@ index 237043e561625a6d8bbdec7f215bb323cf1b75cd..59416e689867f06cb6f80c4a08310029
 +}
 +
  JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env, jclass c)
-@@ -71 +168,79 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env,
+ {
+ 	jstring ret;
+@@ -69,3 +175,131 @@ JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env,
+ 	free(version);
+ 	return ret;
  }
 +
 +JNIEXPORT jlong JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeCreate(
@@ -1436,6 +1581,56 @@ index 237043e561625a6d8bbdec7f215bb323cf1b75cd..59416e689867f06cb6f80c4a08310029
 +	return awgRedundantStopSlot((long long)handle, slot) == 0 ? JNI_TRUE : JNI_FALSE;
 +}
 +
++JNIEXPORT jlong JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeStartProbe(
++	JNIEnv *env,
++	jobject self,
++	jlong handle,
++	jint slot,
++	jstring source_ipv4,
++	jstring target_ipv4,
++	jstring query_name)
++{
++	if (source_ipv4 == NULL || target_ipv4 == NULL || query_name == NULL)
++		return -1;
++	const char *source = (*env)->GetStringUTFChars(env, source_ipv4, NULL);
++	if (source == NULL)
++		return -1;
++	const char *target = (*env)->GetStringUTFChars(env, target_ipv4, NULL);
++	if (target == NULL) {
++		(*env)->ReleaseStringUTFChars(env, source_ipv4, source);
++		return -1;
++	}
++	const char *query = (*env)->GetStringUTFChars(env, query_name, NULL);
++	if (query == NULL) {
++		(*env)->ReleaseStringUTFChars(env, target_ipv4, target);
++		(*env)->ReleaseStringUTFChars(env, source_ipv4, source);
++		return -1;
++	}
++	long long token = awgRedundantStartProbe(
++		(long long)handle,
++		slot,
++		(struct go_string){.str = source, .n = (*env)->GetStringUTFLength(env, source_ipv4)},
++		(struct go_string){.str = target, .n = (*env)->GetStringUTFLength(env, target_ipv4)},
++		(struct go_string){.str = query, .n = (*env)->GetStringUTFLength(env, query_name)}
++	);
++	(*env)->ReleaseStringUTFChars(env, query_name, query);
++	(*env)->ReleaseStringUTFChars(env, target_ipv4, target);
++	(*env)->ReleaseStringUTFChars(env, source_ipv4, source);
++	return (jlong)token;
++}
++
++JNIEXPORT jint JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeProbeStatus(
++	JNIEnv *env, jobject self, jlong handle, jlong token)
++{
++	return awgRedundantProbeStatus((long long)handle, (long long)token);
++}
++
++JNIEXPORT jboolean JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeCancelProbe(
++	JNIEnv *env, jobject self, jlong handle, jlong token)
++{
++	return awgRedundantCancelProbe((long long)handle, (long long)token) == 0 ? JNI_TRUE : JNI_FALSE;
++}
++
 +JNIEXPORT jstring JNICALL Java_ru_nelomai_tunnel_JniRedundantNativeApi_nativeMetrics(
 +	JNIEnv *env, jobject self, jlong handle)
 +{
@@ -1497,6 +1692,475 @@ index 0000000000000000000000000000000000000000..cc37b9f52e8254000006eb2f45c1d1eb
 +		!strings.Contains(string(encoded), `"last_udp_receive_errno":113`) {
 +		t.Fatalf("redundant metrics lost bounded errno diagnostics: %s", encoded)
 +	}
++}
+diff --git a/tunnel/tools/libwg-go/redundant_probe.go b/tunnel/tools/libwg-go/redundant_probe.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..29aebbbeff62f0035110f31a6c1d7157e4df8cd3
+--- /dev/null
++++ b/tunnel/tools/libwg-go/redundant_probe.go
+@@ -0,0 +1,286 @@
++package main
++
++import (
++	"crypto/rand"
++	"encoding/binary"
++	"errors"
++	"io"
++	"net"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	redundantProbePending int32 = iota
++	redundantProbeSucceeded
++	redundantProbeFailed
++	redundantProbeUnknown
++)
++
++type redundantNativeProbe struct {
++	slot      uint32
++	token     ProbeToken
++	startedAt time.Time
++}
++
++type redundantProbeRegistry struct {
++	mu        sync.Mutex
++	tunnel    *RedundantTunnel
++	random    io.Reader
++	now       func() time.Time
++	allocator monotonicHandleAllocator
++	probes    map[int64]redundantNativeProbe
++}
++
++func newRedundantProbeRegistry(tunnel *RedundantTunnel) *redundantProbeRegistry {
++	return &redundantProbeRegistry{
++		tunnel: tunnel,
++		random: rand.Reader,
++		now:    time.Now,
++		probes: make(map[int64]redundantNativeProbe),
++	}
++}
++
++func (r *redundantProbeRegistry) Start(slot int32, source, target, queryName string) int64 {
++	if r == nil || r.tunnel == nil || slot < 0 || slot >= redundantTunnelSlotCount {
++		return -1
++	}
++	sourceIP, ok := canonicalProbeSourceIPv4(source)
++	if !ok {
++		return -1
++	}
++	targetIP, ok := canonicalProbeTargetIPv4(target)
++	if !ok || !canonicalProbeQueryName(queryName) {
++		return -1
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	for attempt := 0; attempt < 16; attempt++ {
++		token, ok := r.nextTupleLocked()
++		if !ok {
++			return -1
++		}
++		packet := buildIPv4DNSProbe(sourceIP, targetIP, queryName, token)
++		if packet == nil {
++			return -1
++		}
++		if err := r.tunnel.InjectProbe(uint32(slot), packet, token); err != nil {
++			if errors.Is(err, ErrProbeAlreadyPending) {
++				continue
++			}
++			return -1
++		}
++		opaque := r.allocator.Next()
++		if opaque <= 0 {
++			r.tunnel.CancelProbe(token)
++			return -1
++		}
++		if _, exists := r.probes[opaque]; exists {
++			r.tunnel.CancelProbe(token)
++			return -1
++		}
++		r.probes[opaque] = redundantNativeProbe{
++			slot: uint32(slot), token: token, startedAt: r.now(),
++		}
++		return opaque
++	}
++	return -1
++}
++
++func (r *redundantProbeRegistry) Status(opaque int64) int32 {
++	if r == nil || opaque <= 0 {
++		return redundantProbeUnknown
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	probe, ok := r.probes[opaque]
++	if !ok {
++		return redundantProbeUnknown
++	}
++	if !r.tunnel.ProbeSucceeded(probe.token) {
++		if now := r.now(); !now.Before(probe.startedAt.Add(redundantTunnelProbeRetention)) {
++			delete(r.probes, opaque)
++			r.tunnel.CancelProbe(probe.token)
++			return redundantProbeFailed
++		}
++		return redundantProbePending
++	}
++	delete(r.probes, opaque)
++	return redundantProbeSucceeded
++}
++
++func (r *redundantProbeRegistry) Cancel(opaque int64) bool {
++	if r == nil || opaque <= 0 {
++		return false
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	probe, ok := r.probes[opaque]
++	if !ok {
++		return false
++	}
++	delete(r.probes, opaque)
++	r.tunnel.CancelProbe(probe.token)
++	return true
++}
++
++func (r *redundantProbeRegistry) CancelSlot(slot uint32) {
++	if r == nil {
++		return
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	for opaque, probe := range r.probes {
++		if probe.slot == slot {
++			delete(r.probes, opaque)
++			r.tunnel.CancelProbe(probe.token)
++		}
++	}
++}
++
++func (r *redundantProbeRegistry) CancelAll() {
++	if r == nil {
++		return
++	}
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	for opaque, probe := range r.probes {
++		delete(r.probes, opaque)
++		r.tunnel.CancelProbe(probe.token)
++	}
++}
++
++func (r *redundantProbeRegistry) nextTupleLocked() (ProbeToken, bool) {
++	var bytes [4]byte
++	for attempt := 0; attempt < 16; attempt++ {
++		if _, err := io.ReadFull(r.random, bytes[:]); err != nil {
++			return ProbeToken{}, false
++		}
++		token := ProbeToken{
++			Port:  49152 + binary.BigEndian.Uint16(bytes[:2])%16384,
++			DNSID: binary.BigEndian.Uint16(bytes[2:]),
++		}
++		if token.DNSID == 0 {
++			token.DNSID = 1
++		}
++		collision := false
++		for _, probe := range r.probes {
++			if probe.token == token {
++				collision = true
++				break
++			}
++		}
++		if !collision {
++			return token, true
++		}
++	}
++	return ProbeToken{}, false
++}
++
++func canonicalProbeSourceIPv4(value string) ([4]byte, bool) {
++	var result [4]byte
++	ip, network, err := net.ParseCIDR(value)
++	if err != nil {
++		return result, false
++	}
++	ones, bits := network.Mask.Size()
++	parsed := ip.To4()
++	if parsed == nil || bits != 32 || ones != 32 || value != ip.String()+"/32" {
++		return result, false
++	}
++	copy(result[:], parsed)
++	return result, true
++}
++
++func canonicalProbeTargetIPv4(value string) ([4]byte, bool) {
++	var result [4]byte
++	parsed := net.ParseIP(value).To4()
++	if parsed == nil || strings.Contains(value, "/") || value != net.IP(parsed).String() {
++		return result, false
++	}
++	copy(result[:], parsed)
++	return result, true
++}
++
++func canonicalProbeQueryName(value string) bool {
++	if len(value) == 0 || len(value) > 253 || value != strings.ToLower(value) || strings.HasSuffix(value, ".") {
++		return false
++	}
++	for _, label := range strings.Split(value, ".") {
++		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
++			return false
++		}
++		for index := range label {
++			character := label[index]
++			if !((character >= 'a' && character <= 'z') ||
++				(character >= '0' && character <= '9') || character == '-') {
++				return false
++			}
++		}
++	}
++	return true
++}
++
++func buildIPv4DNSProbe(source, target [4]byte, queryName string, token ProbeToken) []byte {
++	dnsLength := 12 + len(queryName) + 2 + 4
++	packet := make([]byte, 20+8+dnsLength)
++	packet[0] = 0x45
++	packet[1] = 0
++	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
++	packet[6] = 0x40
++	packet[8] = 64
++	packet[9] = 17
++	copy(packet[12:16], source[:])
++	copy(packet[16:20], target[:])
++	binary.BigEndian.PutUint16(packet[20:22], token.Port)
++	binary.BigEndian.PutUint16(packet[22:24], 53)
++	binary.BigEndian.PutUint16(packet[24:26], uint16(8+dnsLength))
++	dns := packet[28:]
++	binary.BigEndian.PutUint16(dns[:2], token.DNSID)
++	binary.BigEndian.PutUint16(dns[2:4], 0x0100)
++	binary.BigEndian.PutUint16(dns[4:6], 1)
++	offset := 12
++	for _, label := range strings.Split(queryName, ".") {
++		dns[offset] = byte(len(label))
++		offset++
++		copy(dns[offset:], label)
++		offset += len(label)
++	}
++	dns[offset] = 0
++	offset++
++	binary.BigEndian.PutUint16(dns[offset:offset+2], 1)
++	binary.BigEndian.PutUint16(dns[offset+2:offset+4], 1)
++	binary.BigEndian.PutUint16(packet[10:12], internetChecksum(packet[:20]))
++	udpChecksum := udpIPv4Checksum(source, target, packet[20:])
++	if udpChecksum == 0 {
++		udpChecksum = 0xffff
++	}
++	binary.BigEndian.PutUint16(packet[26:28], udpChecksum)
++	return packet
++}
++
++func internetChecksum(data []byte) uint16 {
++	var sum uint32
++	for len(data) >= 2 {
++		sum += uint32(binary.BigEndian.Uint16(data[:2]))
++		data = data[2:]
++	}
++	if len(data) == 1 {
++		sum += uint32(data[0]) << 8
++	}
++	for sum>>16 != 0 {
++		sum = sum&0xffff + sum>>16
++	}
++	return ^uint16(sum)
++}
++
++func udpIPv4Checksum(source, target [4]byte, udp []byte) uint16 {
++	pseudo := make([]byte, 12+len(udp))
++	copy(pseudo[:4], source[:])
++	copy(pseudo[4:8], target[:])
++	pseudo[9] = 17
++	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(udp)))
++	copy(pseudo[12:], udp)
++	return internetChecksum(pseudo)
++}
+diff --git a/tunnel/tools/libwg-go/redundant_probe_test.go b/tunnel/tools/libwg-go/redundant_probe_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..03be0804fe90600e2fef9ad83b665e8e0337d28c
+--- /dev/null
++++ b/tunnel/tools/libwg-go/redundant_probe_test.go
+@@ -0,0 +1,171 @@
++package main
++
++import (
++	"encoding/binary"
++	"testing"
++	"time"
++)
++
++func TestRedundantProbeRegistryConsumesOneSuccessfulReply(t *testing.T) {
++	real, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	registry := newRedundantProbeRegistry(tunnel)
++	opaque := registry.Start(1, "10.200.0.2/32", "8.8.8.8", "nelomai.ru")
++	if opaque <= 0 {
++		t.Fatal("probe start failed")
++	}
++	if status := registry.Status(opaque); status != redundantProbePending {
++		t.Fatalf("initial status = %d, want pending", status)
++	}
++	query := readDevicePacket(t, slotB)
++	writeDevicePacket(t, slotB, dnsProbeReply(query))
++	requireNoFakeRealTUNPacket(t, real)
++	if status := registry.Status(opaque); status != redundantProbeSucceeded {
++		t.Fatalf("reply status = %d, want succeeded", status)
++	}
++	if status := registry.Status(opaque); status != redundantProbeUnknown {
++		t.Fatalf("terminal token reuse = %d, want unknown", status)
++	}
++}
++
++func TestRedundantProbeRegistryRejectsWrongTupleAndCancelsTimeout(t *testing.T) {
++	_, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	registry := newRedundantProbeRegistry(tunnel)
++	opaque := registry.Start(1, "10.200.0.2/32", "8.8.8.8", "nelomai.ru")
++	query := readDevicePacket(t, slotB)
++	reply := dnsProbeReply(query)
++	binary.BigEndian.PutUint16(reply[30:32], binary.BigEndian.Uint16(reply[30:32])+1)
++	recomputeProbeChecksums(reply)
++	writeDevicePacket(t, slotB, reply)
++	if status := registry.Status(opaque); status != redundantProbePending {
++		t.Fatalf("wrong tuple status = %d, want pending", status)
++	}
++	if !registry.Cancel(opaque) {
++		t.Fatal("timeout cancellation failed")
++	}
++	if status := registry.Status(opaque); status != redundantProbeUnknown {
++		t.Fatalf("cancelled status = %d, want unknown", status)
++	}
++}
++
++func TestRedundantProbeRegistryFailsAndConsumesAnAbandonedToken(t *testing.T) {
++	_, _, slotB, tunnel := newFakeRedundantTunnel(t)
++	registry := newRedundantProbeRegistry(tunnel)
++	now := time.Unix(1_700_000_000, 0)
++	registry.now = func() time.Time { return now }
++	opaque := registry.Start(1, "10.200.0.2/32", "8.8.8.8", "nelomai.ru")
++	_ = readDevicePacket(t, slotB)
++	now = now.Add(redundantTunnelProbeRetention)
++
++	if status := registry.Status(opaque); status != redundantProbeFailed {
++		t.Fatalf("expired status = %d, want failed", status)
++	}
++	if status := registry.Status(opaque); status != redundantProbeUnknown {
++		t.Fatalf("failed token reuse = %d, want unknown", status)
++	}
++}
++
++func TestRedundantProbeRegistryValidatesSlotAndTemplate(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	registry := newRedundantProbeRegistry(tunnel)
++	invalid := [][4]string{
++		{"2", "10.200.0.2/32", "8.8.8.8", "nelomai.ru"},
++		{"1", "10.200.0.2/24", "8.8.8.8", "nelomai.ru"},
++		{"1", "10.200.0.2/32", "2001:db8::1", "nelomai.ru"},
++		{"1", "10.200.0.2/32", "8.8.8.8", "Nelomai.ru"},
++		{"1", "10.200.0.2/32", "8.8.8.8", "nelomai.ru."},
++	}
++	for _, values := range invalid {
++		slot := int32(values[0][0] - '0')
++		if token := registry.Start(slot, values[1], values[2], values[3]); token != -1 {
++			t.Fatalf("malformed template returned token %d for %v", token, values)
++		}
++	}
++}
++
++func TestRedundantProbeRegistryCancelsOnlyTheSelectedSlot(t *testing.T) {
++	_, slotA, slotB, tunnel := newFakeRedundantTunnel(t)
++	registry := newRedundantProbeRegistry(tunnel)
++	first := registry.Start(0, "10.200.0.2/32", "8.8.8.8", "nelomai.ru")
++	second := registry.Start(1, "10.200.0.2/32", "8.8.4.4", "nelomai.ru")
++	_ = readDevicePacket(t, slotA)
++	_ = readDevicePacket(t, slotB)
++
++	registry.CancelSlot(1)
++
++	if status := registry.Status(first); status != redundantProbePending {
++		t.Fatalf("other slot status = %d, want pending", status)
++	}
++	if status := registry.Status(second); status != redundantProbeUnknown {
++		t.Fatalf("cancelled slot status = %d, want unknown", status)
++	}
++}
++
++func TestRedundantProbeRegistryRejectsDuplicateLiveOpaqueToken(t *testing.T) {
++	_, slotA, slotB, tunnel := newFakeRedundantTunnel(t)
++	registry := newRedundantProbeRegistry(tunnel)
++	first := registry.Start(0, "10.200.0.2/32", "8.8.8.8", "nelomai.ru")
++	_ = readDevicePacket(t, slotA)
++	registry.allocator.next.Store(0)
++
++	if second := registry.Start(1, "10.200.0.2/32", "8.8.4.4", "nelomai.ru"); second != -1 {
++		t.Fatalf("duplicate opaque token returned %d", second)
++	}
++	select {
++	case packet := <-slotB.(*channelTUN).outbound:
++		t.Fatalf("duplicate token retained queued packet: %v", packet.payload)
++	default:
++	}
++	if status := registry.Status(first); status != redundantProbePending {
++		t.Fatalf("original token status = %d, want pending", status)
++	}
++}
++
++func TestRedundantProbeRegistryRejectsClosedSession(t *testing.T) {
++	_, _, _, tunnel := newFakeRedundantTunnel(t)
++	registry := newRedundantProbeRegistry(tunnel)
++	if err := tunnel.Close(); err != nil {
++		t.Fatalf("close tunnel: %v", err)
++	}
++	if token := registry.Start(0, "10.200.0.2/32", "8.8.8.8", "nelomai.ru"); token != -1 {
++		t.Fatalf("closed session returned token %d", token)
++	}
++}
++
++func TestBuiltDNSProbeHasValidIPv4AndUDPChecksums(t *testing.T) {
++	source, _ := canonicalProbeSourceIPv4("10.200.0.2/32")
++	target, _ := canonicalProbeTargetIPv4("8.8.8.8")
++	packet := buildIPv4DNSProbe(source, target, "nelomai.ru", ProbeToken{Port: 5353, DNSID: 7})
++	if internetChecksum(packet[:20]) != 0 {
++		t.Fatal("invalid IPv4 checksum")
++	}
++	if udpIPv4Checksum(source, target, packet[20:]) != 0 {
++		t.Fatal("invalid UDP checksum")
++	}
++}
++
++func dnsProbeReply(query []byte) []byte {
++	reply := append([]byte(nil), query...)
++	source := append([]byte(nil), reply[12:16]...)
++	copy(reply[12:16], reply[16:20])
++	copy(reply[16:20], source)
++	sourcePort := binary.BigEndian.Uint16(reply[20:22])
++	binary.BigEndian.PutUint16(reply[20:22], 53)
++	binary.BigEndian.PutUint16(reply[22:24], sourcePort)
++	reply[30] |= 0x80
++	recomputeProbeChecksums(reply)
++	return reply
++}
++
++func recomputeProbeChecksums(packet []byte) {
++	packet[10], packet[11] = 0, 0
++	packet[26], packet[27] = 0, 0
++	binary.BigEndian.PutUint16(packet[10:12], internetChecksum(packet[:20]))
++	var source, target [4]byte
++	copy(source[:], packet[12:16])
++	copy(target[:], packet[16:20])
++	checksum := udpIPv4Checksum(source, target, packet[20:])
++	if checksum == 0 {
++		checksum = 0xffff
++	}
++	binary.BigEndian.PutUint16(packet[26:28], checksum)
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun.go b/tunnel/tools/libwg-go/redundant_tun.go
 new file mode 100644

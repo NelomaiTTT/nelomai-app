@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use nelomai_contracts::{
     allows_new_connection_intent_operation, BindPeerRequest, Bootstrap, ConnectionIntentCapability,
     ConnectionIntentCapabilityResponse, ConnectionOperationResponse, ConnectionStartRequest,
-    ConnectionStartResponse, EgressMode, ErrorPayload, OperationReconcileRequest,
+    ConnectionStartResponse, EgressMode, ErrorPayload, HealthProbeKind, OperationReconcileRequest,
     OperationReconcileResponse, OperationState, PeerBindingResponse, PeerOptions, ProbeResults,
     RedundantCandidateCommitRequest, RedundantRoleRequest, RedundantRoleResponse,
     RedundantSessionResponse, RedundantStandbyAcquireRequest, RedundantStandbyAcquireResponse,
@@ -385,6 +385,21 @@ fn recovery_v2_preserves_two_member_identity_and_redacts_configs() {
         redundancy.standby.as_ref().unwrap().connection.lease_id,
         "20000000-0000-4000-8000-000000000003"
     );
+    let primary_probe = response.health_probe.as_ref().unwrap();
+    assert_eq!(primary_probe.kind, HealthProbeKind::DnsA);
+    assert_eq!(primary_probe.target_ipv4.to_string(), "8.8.8.8");
+    assert_eq!(primary_probe.query_name, "nelomai.ru");
+    assert_eq!(primary_probe.timeout_ms, 4000);
+    assert_eq!(
+        redundancy
+            .standby
+            .as_ref()
+            .unwrap()
+            .health_probe
+            .target_ipv4
+            .to_string(),
+        "8.8.8.8"
+    );
     assert_eq!(
         response.connection.transport_protocol,
         TransportProtocol::Amneziawg3
@@ -395,7 +410,57 @@ fn recovery_v2_preserves_two_member_identity_and_redacts_configs() {
 }
 
 #[test]
+fn redundant_health_probe_is_required_and_bounded() {
+    let redundant: Value =
+        serde_json::from_str(&fixture("valid/connection-start-redundant-response.json")).unwrap();
+
+    let mut missing = redundant.clone();
+    missing.as_object_mut().unwrap().remove("health_probe");
+    assert!(!schema_is_valid(
+        "connection-start-response.schema.json",
+        &missing
+    ));
+
+    for (field, invalid) in [
+        ("kind", serde_json::json!("http")),
+        ("target_ipv4", serde_json::json!("2001:4860:4860::8888")),
+        ("query_name", serde_json::json!("-invalid.nelomai.ru")),
+        ("timeout_ms", serde_json::json!(999)),
+    ] {
+        let mut value = redundant.clone();
+        value["health_probe"][field] = invalid;
+        assert!(
+            !schema_is_valid("connection-start-response.schema.json", &value),
+            "schema accepted invalid health probe field {field}"
+        );
+        assert!(serde_json::from_value::<ConnectionStartResponse>(value).is_err());
+    }
+
+    let legacy: ConnectionStartResponse =
+        serde_json::from_str(&fixture("valid/connection-start-response.json")).unwrap();
+    assert!(legacy.health_probe.is_none());
+
+    let mut acquire: Value = serde_json::from_str(&fixture(
+        "valid/connection-redundant-standby-acquire-response.json",
+    ))
+    .unwrap();
+    acquire.as_object_mut().unwrap().remove("health_probe");
+    assert!(!schema_is_valid(
+        "connection-redundancy.schema.json",
+        &acquire
+    ));
+    assert!(serde_json::from_value::<RedundantStandbyAcquireResponse>(acquire).is_err());
+}
+
+#[test]
 fn redundancy_operations_enforce_cas_and_recovery_v2_shapes() {
+    let acquire: RedundantStandbyAcquireResponse = serde_json::from_str(&fixture(
+        "valid/connection-redundant-standby-acquire-response.json",
+    ))
+    .unwrap();
+    assert_eq!(acquire.health_probe.kind, HealthProbeKind::DnsA);
+    assert_eq!(acquire.health_probe.timeout_ms, 4000);
+
     let rebase: RedundantRoleResponse = serde_json::from_str(&fixture(
         "valid/connection-redundant-role-rebase-response.json",
     ))

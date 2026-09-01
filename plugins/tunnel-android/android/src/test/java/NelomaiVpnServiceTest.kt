@@ -16,6 +16,47 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun redundantStartCancellationIsExactAndSurvivesUntilWorkerCompletion() {
+        val fence = RedundantStartCancellationFence()
+
+        assertTrue(fence.begin("operation-a"))
+        assertFalse(fence.begin("operation-b"))
+        assertFalse(fence.cancel("operation-b"))
+        assertTrue(fence.cancel("operation-a"))
+        assertTrue(fence.isCancelled("operation-a"))
+
+        fence.complete("operation-a")
+
+        assertFalse(fence.isCancelled("operation-a"))
+        assertTrue(fence.begin("operation-b"))
+    }
+
+    @Test
+    fun redundantWorkDispatcherSerializesAndCoalescesTicksAndNetworkSnapshots() {
+        val queued = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(queued::addLast))
+        var ticks = 0
+        var resumes = 0
+        val networks = mutableListOf<Boolean>()
+
+        assertTrue(dispatcher.tick { ticks += 1 })
+        assertFalse(dispatcher.tick { ticks += 100 })
+        assertTrue(dispatcher.resume { resumes += 1 })
+        assertFalse(dispatcher.resume { resumes += 100 })
+        assertTrue(dispatcher.network(validated = false, networks::add))
+        assertFalse(dispatcher.network(validated = true, networks::add))
+        assertEquals(3, queued.size)
+
+        queued.removeFirst().run()
+        queued.removeFirst().run()
+        queued.removeFirst().run()
+
+        assertEquals(1, ticks)
+        assertEquals(1, resumes)
+        assertEquals(listOf(true), networks)
+        assertTrue(dispatcher.tick { ticks += 1 })
+    }
+    @Test
     fun oneLogicalRedundantSessionEstablishesAndroidTunExactlyOnce() {
         var establishCalls = 0
         val backend = FakeRedundantSessionBackend()
@@ -34,6 +75,41 @@ class NelomaiVpnServiceTest {
         assertEquals(1, establishCalls)
         assertEquals(listOf(41), backend.startedTunFds)
         assertEquals(listOf(1), backend.startedSlots)
+    }
+
+    @Test
+    fun redundantNetworkChangeRoutesToV2OwnerWithoutLegacyRebind() {
+        val owner = ServiceRedundantOwner()
+        var legacyCalls = 0
+
+        assertTrue(routeVpnProcessNetworkChange(
+            RecoveryStoreResult.Success(serviceV2Envelope()),
+            owner,
+            validated = true,
+        ) { legacyCalls += 1 })
+        assertEquals(listOf(true), owner.validatedNetworks)
+        assertEquals(0, legacyCalls)
+
+        assertTrue(routeVpnProcessNetworkChange(
+            RecoveryStoreResult.Success(serviceV1Envelope()),
+            owner,
+            validated = true,
+        ) { legacyCalls += 1 })
+        assertEquals(1, legacyCalls)
+    }
+
+    @Test
+    fun unreadableRecoveryRecordFailsClosedForNetworkChange() {
+        val owner = ServiceRedundantOwner()
+        var legacyCalls = 0
+
+        assertFalse(routeVpnProcessNetworkChange(
+            RecoveryStoreResult.Failure("recovery_record_corrupt"),
+            owner,
+            validated = true,
+        ) { legacyCalls += 1 })
+        assertTrue(owner.validatedNetworks.isEmpty())
+        assertEquals(0, legacyCalls)
     }
 
     @Test
@@ -4319,6 +4395,48 @@ class NelomaiVpnServiceTest {
         0,
         null,
     )
+}
+
+private fun serviceV1Envelope() = AndroidRecoveryEnvelope(
+    formatVersion = ANDROID_RECOVERY_FORMAT,
+    intent = AndroidConnectionIntent.empty(1),
+    leaseTransaction = null,
+    redundantTransaction = null,
+)
+
+private fun serviceV2Envelope() = serviceV1Envelope().copy(
+    redundantTransaction = AndroidRedundantTransaction(
+        desiredActive = true,
+        template = AndroidIntentTemplate(
+            deviceId = "11111111-1111-4111-8111-111111111111",
+            accountScope = "account",
+            layer = "stray",
+            ticConnectionMode = "dynamic",
+            routeMode = "standalone",
+            egressMode = "ipv4",
+            allowAlternate = true,
+        ),
+        sessionId = "22222222-2222-4222-8222-222222222222",
+        slotALeaseId = "lease-a",
+        slotBLeaseId = "lease-b",
+        localActiveLeaseId = "lease-a",
+        standbyDesired = true,
+        roleGeneration = 1,
+        membershipGeneration = 1,
+        startOperationId = "start-operation",
+        startRequestFingerprint = "fingerprint",
+    ),
+)
+
+private class ServiceRedundantOwner : RedundantVpnProcessOwner {
+    val validatedNetworks = mutableListOf<Boolean>()
+    override fun recover(): Boolean = true
+    override fun resume(): Boolean = true
+    override fun revoke(): Boolean = true
+    override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean {
+        validatedNetworks += validated
+        return true
+    }
 }
 
 private class FakeRedundantSessionBackend : RedundantSessionBackend {

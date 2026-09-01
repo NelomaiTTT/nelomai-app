@@ -33,6 +33,7 @@ internal data class PhysicalNetworkSnapshot(
 internal data class PhysicalNetworkState(
     val localRoutes: List<Ipv4Prefix>,
     val networks: List<Network>,
+    val validated: Boolean,
     val fingerprint: String,
 ) {
     val available: Boolean get() = networks.isNotEmpty()
@@ -83,10 +84,12 @@ internal class PhysicalNetworks(context: Context) {
         val eligible = preferValidatedNetworks(physical)
         val routes = canonicalLocalCidrs(eligible.map { it.second })
         val networkIds = eligible.map { (network, _) -> network.toString() }
+        val validated = eligible.any { it.second.validated }
         return PhysicalNetworkState(
             localRoutes = routes,
             networks = eligible.map { it.first },
-            fingerprint = stateFingerprint(networkIds, routes),
+            validated = validated,
+            fingerprint = stateFingerprint(networkIds, routes, validated),
         )
     }
 
@@ -182,8 +185,12 @@ internal class PhysicalNetworks(context: Context) {
         fun fingerprint(routes: List<Ipv4Prefix>): String =
             routes.joinToString(separator = "\n", transform = Ipv4Prefix::canonical)
 
-        fun stateFingerprint(networkIds: List<String>, routes: List<Ipv4Prefix>): String =
-            (networkIds.sorted() + routes.map(Ipv4Prefix::canonical)).joinToString("\n")
+        fun stateFingerprint(
+            networkIds: List<String>,
+            routes: List<Ipv4Prefix>,
+            validated: Boolean = false,
+        ): String = (listOf("validated=$validated") + networkIds.sorted() +
+            routes.map(Ipv4Prefix::canonical)).joinToString("\n")
 
         private fun snapshot(
             capabilities: NetworkCapabilities,

@@ -15,6 +15,76 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class BackgroundConnectionClientTest {
     @Test
+    fun redundantRecoveryReplayMapsCommittedCandidateBackToItsFixedSlot() {
+        val oldA = "10000000-0000-4000-8000-000000000001"
+        val activeB = "10000000-0000-4000-8000-000000000002"
+        val candidateA = "10000000-0000-4000-8000-000000000003"
+        val transaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = AndroidIntentTemplate(
+                deviceId = DEVICE_ID,
+                accountScope = DEVICE_ID,
+                layer = "stray",
+                ticConnectionMode = "dynamic",
+                routeMode = "standalone",
+                egressMode = "ipv4",
+                allowAlternate = true,
+            ),
+            sessionId = "20000000-0000-4000-8000-000000000001",
+            slotALeaseId = oldA,
+            slotBLeaseId = activeB,
+            localActiveLeaseId = activeB,
+            standbyDesired = true,
+            roleGeneration = 3,
+            membershipGeneration = 4,
+            startOperationId = OPERATION_ID,
+            startRequestFingerprint = "a".repeat(64),
+            candidateLeaseId = candidateA,
+            candidateSlot = RedundantSlot.A,
+            retry = AndroidRedundantRetryState(
+                acquirePending = true,
+                acquireOperationId = PREPARE_ID,
+                acquireReplaceLeaseId = oldA,
+            ),
+        )
+        val probe = JSONObject().apply {
+            put("kind", "dns_a")
+            put("target_ipv4", "8.8.8.8")
+            put("query_name", "nelomai.ru")
+            put("timeout_ms", 4_000)
+        }
+        fun connection(leaseId: String) = JSONObject().put("lease_id", leaseId)
+        val payload = JSONObject().apply {
+            put("connection", connection(activeB))
+            put("configuration", "primary-config")
+            put("health_probe", probe)
+            put("redundancy", JSONObject().apply {
+                put("session_id", transaction.sessionId)
+                put("state", "ready")
+                put("role_generation", 3)
+                put("membership_generation", 5)
+                put("virtual_address_v4", "10.200.0.2/32")
+                put("standby_desired", true)
+                put("reason", JSONObject.NULL)
+                put("standby", JSONObject().apply {
+                    put("connection", connection(candidateA))
+                    put("configuration", "candidate-config")
+                    put("health_probe", probe)
+                })
+            })
+        }
+
+        val recovered = redundantRecoveryTransportFromJson(payload, transaction)
+
+        assertEquals(candidateA, recovered.session.slotALeaseId)
+        assertEquals(activeB, recovered.session.slotBLeaseId)
+        assertEquals(activeB, recovered.session.activeLeaseId)
+        assertEquals("10.200.0.2/32", recovered.virtualAddressV4)
+        assertEquals(setOf(activeB, candidateA), recovered.configurations.keys)
+        recovered.configurations.values.forEach { it.fill(0) }
+    }
+
+    @Test
     fun redundantBackgroundPayloadsUseTaskSixSessionContractsWithoutConfiguration() {
         val transaction = AndroidRedundantTransaction(
             desiredActive = true,
@@ -79,6 +149,40 @@ class BackgroundConnectionClientTest {
         assertEquals(2, payload.getInt("recovery_contract_version"))
         assertEquals(1, payload.getInt("redundancy_contract_version"))
         assertTrue(payload.getBoolean("reserve_enabled"))
+    }
+
+    @Test
+    fun redundantRecoveryReplaysTheOriginalReserveFlagAfterStandbyRelease() {
+        val connection = QuickConnectionArgs().apply {
+            layer = "stray"
+            ticConnectionMode = "dynamic"
+            routeMode = "standalone"
+            egressMode = "ipv4"
+            allowAlternate = true
+        }
+        val released = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = AndroidIntentTemplate(
+                DEVICE_ID, "account", "stray", "dynamic", "standalone", "ipv4", true,
+            ),
+            sessionId = "20000000-0000-4000-8000-000000000001",
+            slotALeaseId = "30000000-0000-4000-8000-000000000001",
+            slotBLeaseId = null,
+            localActiveLeaseId = "30000000-0000-4000-8000-000000000001",
+            standbyDesired = false,
+            roleGeneration = 1,
+            membershipGeneration = 2,
+            startOperationId = OPERATION_ID,
+            startRequestFingerprint = FINGERPRINT,
+            startReserveEnabled = false,
+        )
+
+        val payload = backgroundRedundantStartPayload(
+            QuickTunnelTemplate(TunnelOptionsArgs(), connection),
+            released,
+        )
+
+        assertFalse(payload.getBoolean("reserve_enabled"))
     }
 
     @Test

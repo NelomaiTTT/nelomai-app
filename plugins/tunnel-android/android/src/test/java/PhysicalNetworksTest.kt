@@ -2,6 +2,7 @@ package ru.nelomai.tunnel
 
 import java.net.InetAddress
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Test
 
 class PhysicalNetworksTest {
@@ -143,6 +144,18 @@ class PhysicalNetworksTest {
         assertEquals(
             PhysicalNetworks.stateFingerprint(listOf("102", "101"), routes),
             PhysicalNetworks.stateFingerprint(listOf("101", "102"), routes),
+        )
+    }
+
+    @Test
+    fun stateFingerprintChangesWhenNetworkValidationChanges() {
+        val routes = PhysicalNetworks.canonicalCidrs(
+            listOf(physicalNetwork("192.168.1.50/24", wifi = true)),
+        )
+
+        assertNotEquals(
+            PhysicalNetworks.stateFingerprint(listOf("101"), routes, validated = false),
+            PhysicalNetworks.stateFingerprint(listOf("101"), routes, validated = true),
         )
     }
 

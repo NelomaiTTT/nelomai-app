@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use nelomai_contracts::{EgressMode, Layer, RouteMode, SplitTunnelMode, TicConnectionMode};
+use nelomai_contracts::{
+    EgressMode, Layer, RedundancyMemberSlot, RedundantHealthProbe, RouteMode, SplitTunnelMode,
+    TicConnectionMode,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
@@ -157,6 +160,45 @@ pub struct TunnelStartRequest {
     pub options: TunnelOptions,
     pub quick_reconnect: QuickReconnect,
     pub quick_connection: Option<QuickConnection>,
+    pub redundancy: Option<RedundantTunnelStart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedundantTunnelMemberStart {
+    pub slot: RedundancyMemberSlot,
+    pub lease_id: String,
+    pub health_probe: Option<RedundantHealthProbe>,
+}
+
+pub struct RedundantTunnelStandbyStart {
+    pub member: RedundantTunnelMemberStart,
+    pub configuration: TunnelConfiguration,
+}
+
+impl fmt::Debug for RedundantTunnelStandbyStart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedundantTunnelStandbyStart")
+            .field("member", &self.member)
+            .field("configuration", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct RedundantTunnelStart {
+    pub session_id: String,
+    pub operation_id: String,
+    pub request_fingerprint: String,
+    pub reserve_enabled: bool,
+    pub virtual_address_v4: String,
+    pub standby_desired: bool,
+    pub active_lease_id: String,
+    pub local_active_lease_id: String,
+    pub role_generation: u64,
+    pub membership_generation: u64,
+    pub primary: RedundantTunnelMemberStart,
+    pub standby: Option<RedundantTunnelStandbyStart>,
 }
 
 impl TunnelStartRequest {
@@ -166,6 +208,7 @@ impl TunnelStartRequest {
             options: TunnelOptions::default(),
             quick_reconnect: QuickReconnect::Disabled,
             quick_connection: None,
+            redundancy: None,
         }
     }
 }
@@ -178,6 +221,7 @@ impl fmt::Debug for TunnelStartRequest {
             .field("options", &self.options)
             .field("quick_reconnect", &self.quick_reconnect)
             .field("quick_connection", &self.quick_connection)
+            .field("redundancy", &self.redundancy)
             .finish()
     }
 }
@@ -543,12 +587,50 @@ mod tests {
             },
             quick_reconnect: QuickReconnect::Persistent,
             quick_connection: None,
+            redundancy: Some(RedundantTunnelStart {
+                session_id: "session-1".to_string(),
+                operation_id: "operation-1".to_string(),
+                request_fingerprint: "f".repeat(64),
+                reserve_enabled: true,
+                virtual_address_v4: "10.200.0.2/32".to_string(),
+                standby_desired: true,
+                active_lease_id: "lease-a".to_string(),
+                local_active_lease_id: "lease-a".to_string(),
+                role_generation: 0,
+                membership_generation: 0,
+                primary: RedundantTunnelMemberStart {
+                    slot: nelomai_contracts::RedundancyMemberSlot::A,
+                    lease_id: "lease-a".to_string(),
+                    health_probe: Some(nelomai_contracts::RedundantHealthProbe {
+                        kind: nelomai_contracts::HealthProbeKind::DnsA,
+                        target_ipv4: "8.8.8.8".parse().unwrap(),
+                        query_name: "nelomai.ru".to_string(),
+                        timeout_ms: 4000,
+                    }),
+                },
+                standby: Some(RedundantTunnelStandbyStart {
+                    member: RedundantTunnelMemberStart {
+                        slot: nelomai_contracts::RedundancyMemberSlot::B,
+                        lease_id: "lease-b".to_string(),
+                        health_probe: Some(nelomai_contracts::RedundantHealthProbe {
+                            kind: nelomai_contracts::HealthProbeKind::DnsA,
+                            target_ipv4: "8.8.8.8".parse().unwrap(),
+                            query_name: "nelomai.ru".to_string(),
+                            timeout_ms: 4000,
+                        }),
+                    },
+                    configuration: TunnelConfiguration::new(
+                        "[Interface]\nPrivateKey = standby-never-log-this\n".to_string(),
+                    ),
+                }),
+            }),
         };
 
         let debug = format!("{request:?}");
         assert!(!debug.contains("never-log-this"));
         assert!(!debug.contains("com.example.secret"));
         assert!(!debug.contains("203.0.113.0/24"));
+        assert!(!debug.contains("standby-never-log-this"));
         assert!(debug.contains("package_ids_count"));
     }
 

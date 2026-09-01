@@ -165,6 +165,7 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
                     .to_string(),
                     allow_alternate: quick.allow_alternate,
                 });
+        plugin_request.redundancy = request.redundancy.map(Into::into);
 
         let response = self
             .app

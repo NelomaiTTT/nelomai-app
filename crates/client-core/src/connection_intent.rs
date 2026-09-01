@@ -260,6 +260,49 @@ pub(crate) fn request_fingerprint_v1(
     fingerprint
 }
 
+pub(crate) fn request_fingerprint_v2(
+    options: &ConnectOptions,
+    require_measured_selection: bool,
+    reserve_enabled: bool,
+) -> String {
+    let canonical = format!(
+        concat!(
+            "{{\"egress_mode\":\"{}\",",
+            "\"kind\":\"redundant_start\",",
+            "\"layer\":\"{}\",",
+            "\"redundancy_contract_version\":1,",
+            "\"require_measured_selection\":{},",
+            "\"reserve_enabled\":{},",
+            "\"route_mode\":\"{}\",",
+            "\"tic_connection_mode\":\"{}\"}}"
+        ),
+        match options.egress_mode {
+            nelomai_contracts::EgressMode::Ipv4 => "ipv4",
+            nelomai_contracts::EgressMode::PreferIpv6 => "prefer_ipv6",
+        },
+        match options.layer {
+            nelomai_contracts::Layer::Tic => "tic",
+            nelomai_contracts::Layer::Stray => "stray",
+        },
+        require_measured_selection,
+        reserve_enabled,
+        match options.route_mode {
+            nelomai_contracts::RouteMode::Standalone => "standalone",
+            nelomai_contracts::RouteMode::ViaTak => "via_tak",
+        },
+        match options.tic_connection_mode {
+            nelomai_contracts::TicConnectionMode::Personal => "personal",
+            nelomai_contracts::TicConnectionMode::Dynamic => "dynamic",
+        },
+    );
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut fingerprint = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    fingerprint
+}
+
 pub(crate) fn stalled_stop_request_fingerprint_v1(lease_id: &str) -> String {
     let canonical = format!(
         concat!(

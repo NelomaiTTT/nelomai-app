@@ -157,6 +157,7 @@
         "candidate_slot",
         "connection",
         "configuration",
+        "health_probe",
         "reused"
       ],
       "properties": {
@@ -167,6 +168,7 @@
         "candidate_slot": { "enum": ["A", "B"] },
         "connection": { "$ref": "common.schema.json#/$defs/connection" },
         "configuration": { "type": "string", "minLength": 1 },
+        "health_probe": { "$ref": "common.schema.json#/$defs/healthProbe" },
         "reused": { "type": "boolean" }
       },
       "additionalProperties": false

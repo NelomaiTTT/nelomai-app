@@ -2567,6 +2567,7 @@ impl CoreApi for CoordinatorApi {
                 stopped_at: None,
             },
             configuration: "[Interface]\nPrivateKey = secret\n".to_string(),
+            health_probe: None,
             reused: false,
             redundancy: None,
         })

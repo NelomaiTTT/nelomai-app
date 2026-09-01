@@ -56,6 +56,7 @@ impl CoreApi for ProbeApi {
                 stopped_at: None,
             },
             configuration: "PrivateKey = test".to_string(),
+            health_probe: None,
             reused: false,
             redundancy: None,
         })

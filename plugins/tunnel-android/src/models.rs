@@ -1,3 +1,7 @@
+use nelomai_client_tunnel::{
+    RedundantTunnelMemberStart, RedundantTunnelStandbyStart, RedundantTunnelStart,
+};
+use nelomai_contracts::{HealthProbeKind, RedundancyMemberSlot, RedundantHealthProbe};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use zeroize::Zeroizing;
@@ -127,6 +131,139 @@ impl fmt::Debug for TunnelOptions {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedundantHealthProbeRequest {
+    pub kind: String,
+    pub target_ipv4: String,
+    pub query_name: String,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedundantMemberRequest {
+    pub slot: String,
+    pub lease_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_probe: Option<RedundantHealthProbeRequest>,
+}
+
+pub struct RedundantStandbyRequest {
+    pub member: RedundantMemberRequest,
+    pub configuration: Zeroizing<Vec<u8>>,
+}
+
+impl RedundantStandbyRequest {
+    pub fn new(member: RedundantMemberRequest, configuration: &[u8]) -> Self {
+        Self {
+            member,
+            configuration: Zeroizing::new(configuration.to_vec()),
+        }
+    }
+}
+
+impl fmt::Debug for RedundantStandbyRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedundantStandbyRequest")
+            .field("member", &self.member)
+            .field("configuration", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Serialize for RedundantStandbyRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireStandby<'a> {
+            member: &'a RedundantMemberRequest,
+            configuration: &'a [u8],
+        }
+
+        WireStandby {
+            member: &self.member,
+            configuration: self.configuration.as_slice(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedundantStartRequest {
+    pub session_id: String,
+    pub operation_id: String,
+    pub request_fingerprint: String,
+    pub reserve_enabled: bool,
+    pub virtual_address_v4: String,
+    pub standby_desired: bool,
+    pub active_lease_id: String,
+    pub local_active_lease_id: String,
+    pub role_generation: u64,
+    pub membership_generation: u64,
+    pub primary: RedundantMemberRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standby: Option<RedundantStandbyRequest>,
+}
+
+impl From<RedundantHealthProbe> for RedundantHealthProbeRequest {
+    fn from(probe: RedundantHealthProbe) -> Self {
+        Self {
+            kind: match probe.kind {
+                HealthProbeKind::DnsA => "dns_a",
+            }
+            .to_string(),
+            target_ipv4: probe.target_ipv4.to_string(),
+            query_name: probe.query_name,
+            timeout_ms: probe.timeout_ms,
+        }
+    }
+}
+
+impl From<RedundantTunnelMemberStart> for RedundantMemberRequest {
+    fn from(member: RedundantTunnelMemberStart) -> Self {
+        Self {
+            slot: match member.slot {
+                RedundancyMemberSlot::A => "A",
+                RedundancyMemberSlot::B => "B",
+            }
+            .to_string(),
+            lease_id: member.lease_id,
+            health_probe: member.health_probe.map(Into::into),
+        }
+    }
+}
+
+impl From<RedundantTunnelStandbyStart> for RedundantStandbyRequest {
+    fn from(standby: RedundantTunnelStandbyStart) -> Self {
+        Self::new(standby.member.into(), standby.configuration.as_bytes())
+    }
+}
+
+impl From<RedundantTunnelStart> for RedundantStartRequest {
+    fn from(start: RedundantTunnelStart) -> Self {
+        Self {
+            session_id: start.session_id,
+            operation_id: start.operation_id,
+            request_fingerprint: start.request_fingerprint,
+            reserve_enabled: start.reserve_enabled,
+            virtual_address_v4: start.virtual_address_v4,
+            standby_desired: start.standby_desired,
+            active_lease_id: start.active_lease_id,
+            local_active_lease_id: start.local_active_lease_id,
+            role_generation: start.role_generation,
+            membership_generation: start.membership_generation,
+            primary: start.primary.into(),
+            standby: start.standby.map(Into::into),
+        }
+    }
+}
+
 pub struct StartTunnelRequest {
     pub api_version: u16,
     pub start_source: String,
@@ -135,6 +272,7 @@ pub struct StartTunnelRequest {
     pub cache_quick_action: bool,
     pub quick_action_valid_until_unix: Option<i64>,
     pub quick_connection: Option<QuickConnectionRequest>,
+    pub redundancy: Option<RedundantStartRequest>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -158,6 +296,7 @@ impl StartTunnelRequest {
             cache_quick_action: false,
             quick_action_valid_until_unix: None,
             quick_connection: None,
+            redundancy: None,
         }
     }
 }
@@ -175,6 +314,7 @@ impl fmt::Debug for StartTunnelRequest {
                 &self.quick_action_valid_until_unix,
             )
             .field("quick_connection", &self.quick_connection)
+            .field("redundancy", &self.redundancy)
             .finish()
     }
 }
@@ -194,6 +334,8 @@ impl Serialize for StartTunnelRequest {
             cache_quick_action: bool,
             quick_action_valid_until_unix: Option<i64>,
             quick_connection: &'a Option<QuickConnectionRequest>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            redundancy: Option<&'a RedundantStartRequest>,
         }
 
         WireRequest {
@@ -204,6 +346,7 @@ impl Serialize for StartTunnelRequest {
             cache_quick_action: self.cache_quick_action,
             quick_action_valid_until_unix: self.quick_action_valid_until_unix,
             quick_connection: &self.quick_connection,
+            redundancy: self.redundancy.as_ref(),
         }
         .serialize(serializer)
     }
@@ -467,6 +610,61 @@ mod tests {
         assert_eq!(value["options"]["applicationMode"], serde_json::Value::Null);
         assert_eq!(value["cacheQuickAction"], false);
         assert_eq!(value["quickActionValidUntilUnix"], serde_json::Value::Null);
+        assert!(value.get("redundancy").is_none());
+    }
+
+    #[test]
+    fn start_request_serializes_both_redundant_members_and_redacts_configs() {
+        let mut request = StartTunnelRequest::new(b"primary-never-log-this");
+        request.redundancy = Some(RedundantStartRequest {
+            session_id: "session-1".to_string(),
+            operation_id: "operation-1".to_string(),
+            request_fingerprint: "f".repeat(64),
+            reserve_enabled: true,
+            virtual_address_v4: "10.200.0.2/32".to_string(),
+            standby_desired: true,
+            active_lease_id: "lease-a".to_string(),
+            local_active_lease_id: "lease-a".to_string(),
+            role_generation: 0,
+            membership_generation: 0,
+            primary: RedundantMemberRequest {
+                slot: "A".to_string(),
+                lease_id: "lease-a".to_string(),
+                health_probe: Some(RedundantHealthProbeRequest {
+                    kind: "dns_a".to_string(),
+                    target_ipv4: "8.8.8.8".to_string(),
+                    query_name: "nelomai.ru".to_string(),
+                    timeout_ms: 4000,
+                }),
+            },
+            standby: Some(RedundantStandbyRequest::new(
+                RedundantMemberRequest {
+                    slot: "B".to_string(),
+                    lease_id: "lease-b".to_string(),
+                    health_probe: Some(RedundantHealthProbeRequest {
+                        kind: "dns_a".to_string(),
+                        target_ipv4: "8.8.8.8".to_string(),
+                        query_name: "nelomai.ru".to_string(),
+                        timeout_ms: 4000,
+                    }),
+                },
+                b"standby-never-log-this",
+            )),
+        });
+
+        let value = serde_json::to_value(&request).unwrap();
+        let debug = format!("{request:?}");
+
+        assert_eq!(value["redundancy"]["primary"]["slot"], "A");
+        assert_eq!(value["redundancy"]["reserveEnabled"], true);
+        assert_eq!(value["redundancy"]["standby"]["member"]["slot"], "B");
+        assert_eq!(value["redundancy"]["standby"]["configuration"][0], b's');
+        assert_eq!(
+            value["redundancy"]["primary"]["healthProbe"]["targetIpv4"],
+            "8.8.8.8"
+        );
+        assert!(!debug.contains("primary-never-log-this"));
+        assert!(!debug.contains("standby-never-log-this"));
     }
 
     #[test]

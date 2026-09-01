@@ -25,6 +25,7 @@ internal const val EXTRA_OPTIONS = "options"
 internal const val EXTRA_CACHE_QUICK_ACTION = "cache_quick_action"
 internal const val EXTRA_QUICK_ACTION_VALID_UNTIL = "quick_action_valid_until"
 internal const val EXTRA_QUICK_CONNECTION = "quick_connection"
+internal const val EXTRA_REDUNDANCY = "redundancy"
 internal const val EXTRA_PROBE = "probe"
 internal const val EXTRA_STATE = "state"
 internal const val EXTRA_DURATION_MILLIS = "duration_millis"
@@ -213,6 +214,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) {
         val configuration = args.configuration.copyOf()
+        val redundant = args.redundancy?.copyForServiceTransport()
         val clientOperationId = UUID.randomUUID().toString()
         try {
             requestBundle(
@@ -229,7 +231,8 @@ internal object TunnelServiceClient {
                         EXTRA_QUICK_ACTION_VALID_UNTIL,
                         args.quickActionValidUntilUnix ?: Long.MIN_VALUE,
                     )
-                    .putExtra(EXTRA_QUICK_CONNECTION, args.quickConnection?.toBundle()),
+                    .putExtra(EXTRA_QUICK_CONNECTION, args.quickConnection?.toBundle())
+                    .putExtra(EXTRA_REDUNDANCY, redundant?.toBundle()),
                 { result ->
                     val state = SessionState.values().firstOrNull {
                         it.wireName == result.getString(EXTRA_STATE)
@@ -241,8 +244,9 @@ internal object TunnelServiceClient {
                 onTimeout = { cancelClientStart(context, clientOperationId) },
             )
         } finally {
-            args.configuration.fill(0)
+            args.clearSensitiveConfigurations()
             configuration.fill(0)
+            redundant?.standby?.configuration?.fill(0)
         }
     }
 
@@ -667,4 +671,92 @@ internal fun Bundle.toQuickConnection(): QuickConnectionArgs = QuickConnectionAr
     it.routeMode = requireNotNull(getString("route_mode"))
     it.egressMode = getString("egress_mode") ?: "ipv4"
     it.allowAlternate = getBoolean("allow_alternate")
+}
+
+private fun RedundantHealthProbeArgs.toBundle(): Bundle = Bundle().apply {
+    putString("kind", kind)
+    putString("target_ipv4", targetIpv4)
+    putString("query_name", queryName)
+    putLong("timeout_ms", timeoutMs)
+}
+
+private fun Bundle.toRedundantHealthProbe(): RedundantHealthProbeArgs =
+    RedundantHealthProbeArgs().also {
+        it.kind = requireNotNull(getString("kind"))
+        it.targetIpv4 = requireNotNull(getString("target_ipv4"))
+        it.queryName = requireNotNull(getString("query_name"))
+        it.timeoutMs = getLong("timeout_ms")
+    }
+
+private fun RedundantMemberArgs.toBundle(): Bundle = Bundle().apply {
+    putString("slot", slot)
+    putString("lease_id", leaseId)
+    putBundle("health_probe", healthProbe?.toBundle())
+}
+
+private fun Bundle.toRedundantMember(): RedundantMemberArgs = RedundantMemberArgs().also {
+    it.slot = requireNotNull(getString("slot"))
+    it.leaseId = requireNotNull(getString("lease_id"))
+    it.healthProbe = getBundle("health_probe")?.toRedundantHealthProbe()
+}
+
+private fun RedundantStartArgs.copyForServiceTransport(): RedundantStartArgs =
+    RedundantStartArgs().also { copy ->
+        copy.sessionId = sessionId
+        copy.operationId = operationId
+        copy.requestFingerprint = requestFingerprint
+        copy.reserveEnabled = reserveEnabled
+        copy.virtualAddressV4 = virtualAddressV4
+        copy.standbyDesired = standbyDesired
+        copy.activeLeaseId = activeLeaseId
+        copy.localActiveLeaseId = localActiveLeaseId
+        copy.roleGeneration = roleGeneration
+        copy.membershipGeneration = membershipGeneration
+        copy.primary = primary
+        copy.standby = standby?.let { source ->
+            RedundantStandbyArgs().also {
+                it.member = source.member
+                it.configuration = source.configuration.copyOf()
+            }
+        }
+    }
+
+internal fun RedundantStartArgs.toBundle(): Bundle = Bundle().apply {
+    putString("session_id", sessionId)
+    putString("operation_id", operationId)
+    putString("request_fingerprint", requestFingerprint)
+    putBoolean("reserve_enabled", reserveEnabled)
+    putString("virtual_address_v4", virtualAddressV4)
+    putBoolean("standby_desired", standbyDesired)
+    putString("active_lease_id", activeLeaseId)
+    putString("local_active_lease_id", localActiveLeaseId)
+    putLong("role_generation", roleGeneration)
+    putLong("membership_generation", membershipGeneration)
+    putBundle("primary", primary.toBundle())
+    standby?.let { value ->
+        putBundle("standby", Bundle().apply {
+            putBundle("member", value.member.toBundle())
+            putByteArray("configuration", value.configuration)
+        })
+    }
+}
+
+internal fun Bundle.toRedundantStart(): RedundantStartArgs = RedundantStartArgs().also {
+    it.sessionId = requireNotNull(getString("session_id"))
+    it.operationId = requireNotNull(getString("operation_id"))
+    it.requestFingerprint = requireNotNull(getString("request_fingerprint"))
+    it.reserveEnabled = getBoolean("reserve_enabled")
+    it.virtualAddressV4 = requireNotNull(getString("virtual_address_v4"))
+    it.standbyDesired = getBoolean("standby_desired")
+    it.activeLeaseId = requireNotNull(getString("active_lease_id"))
+    it.localActiveLeaseId = requireNotNull(getString("local_active_lease_id"))
+    it.roleGeneration = getLong("role_generation")
+    it.membershipGeneration = getLong("membership_generation")
+    it.primary = requireNotNull(getBundle("primary")).toRedundantMember()
+    it.standby = getBundle("standby")?.let { value ->
+        RedundantStandbyArgs().also { standby ->
+            standby.member = requireNotNull(value.getBundle("member")).toRedundantMember()
+            standby.configuration = requireNotNull(value.getByteArray("configuration"))
+        }
+    }
 }

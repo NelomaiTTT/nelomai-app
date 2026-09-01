@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, net::Ipv4Addr};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const MAX_CANDIDATES_OR_PROBES: usize = 20;
@@ -449,11 +449,74 @@ pub enum RedundancyMemberHealth {
     Recovering,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthProbeKind {
+    DnsA,
+}
+
+fn deserialize_health_query_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let valid = !value.is_empty()
+        && value.len() <= 253
+        && value.is_ascii()
+        && value == value.to_ascii_lowercase()
+        && !value.ends_with('.')
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|character| character.is_ascii_alphanumeric() || character == b'-')
+        });
+    if !valid {
+        return Err(serde::de::Error::custom(
+            "health probe query_name must be a canonical ASCII DNS name",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_health_probe_timeout<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if !(1000..=8000).contains(&value) {
+        return Err(serde::de::Error::custom(
+            "health probe timeout_ms must be between 1000 and 8000",
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RedundantHealthProbe {
+    pub kind: HealthProbeKind,
+    pub target_ipv4: Ipv4Addr,
+    #[serde(deserialize_with = "deserialize_health_query_name")]
+    pub query_name: String,
+    #[serde(deserialize_with = "deserialize_health_probe_timeout")]
+    pub timeout_ms: u64,
+}
+
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RedundancyMember {
     pub health: RedundancyMemberHealth,
     pub connection: Connection,
     pub configuration: String,
+    pub health_probe: RedundantHealthProbe,
 }
 
 impl fmt::Debug for RedundancyMember {
@@ -463,6 +526,7 @@ impl fmt::Debug for RedundancyMember {
             .field("health", &self.health)
             .field("connection", &self.connection)
             .field("configuration", &"<redacted>")
+            .field("health_probe", &self.health_probe)
             .finish()
     }
 }
@@ -487,6 +551,8 @@ pub struct ConnectionStartResponse {
     pub request_id: String,
     pub connection: Connection,
     pub configuration: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_probe: Option<RedundantHealthProbe>,
     pub reused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redundancy: Option<RedundancySession>,
@@ -500,6 +566,7 @@ impl fmt::Debug for ConnectionStartResponse {
             .field("request_id", &self.request_id)
             .field("connection", &self.connection)
             .field("configuration", &"<redacted>")
+            .field("health_probe", &self.health_probe)
             .field("reused", &self.reused)
             .field("redundancy", &self.redundancy)
             .finish()
@@ -613,6 +680,7 @@ pub struct RedundantStandbyAcquireResponse {
     pub candidate_slot: RedundancyMemberSlot,
     pub connection: Connection,
     pub configuration: String,
+    pub health_probe: RedundantHealthProbe,
     pub reused: bool,
 }
 
@@ -627,6 +695,7 @@ impl fmt::Debug for RedundantStandbyAcquireResponse {
             .field("candidate_slot", &self.candidate_slot)
             .field("connection", &self.connection)
             .field("configuration", &"<redacted>")
+            .field("health_probe", &self.health_probe)
             .field("reused", &self.reused)
             .finish()
     }

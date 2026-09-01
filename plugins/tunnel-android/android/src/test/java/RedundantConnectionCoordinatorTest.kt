@@ -69,6 +69,15 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun ownerReportsRunningOnlyAfterNativeRecoveryHasStarted() {
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), FakeNative())
+
+        assertFalse(coordinator.isRunning())
+        assertTrue(coordinator.recover())
+        assertTrue(coordinator.isRunning())
+    }
+
+    @Test
     fun recoveryRequiresAndActivatesTheLocalActiveConfigurationWhileStandbyIsBestEffort() {
         val native = FakeNative(startFailures = setOf("lease-b"))
         val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
@@ -103,6 +112,29 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun failedInactiveStandbySchedulesReplacementWithoutReactivatingPrimary() {
+        var nowMs = 4_000_000L
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            native,
+            nowMs = { nowMs },
+        )
+
+        assertTrue(coordinator.slotFailed("lease-b", "standby_unhealthy"))
+        assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+        assertTrue(native.activated.isEmpty())
+        assertEquals(0, panel.roleCalls)
+
+        nowMs += 60_000
+        assertTrue(coordinator.tick())
+        assertEquals(listOf("lease-b"), panel.acquireReplaceLeaseIds)
+        assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+    }
+
+    @Test
     fun revokeClearsDesiredActiveBeforeQueuingOneSessionStop() {
         val store = store(transaction())
         val panel = FakePanel()
@@ -115,6 +147,27 @@ class RedundantConnectionCoordinatorTest {
 
         assertEquals(null, (store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
         assertEquals(1, panel.stopCalls)
+    }
+
+    @Test
+    fun revokeFencePersistsStopWithoutTouchingNativeOrPanel() {
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            native,
+            operationId = { "stop-1" },
+        )
+
+        assertTrue(coordinator.fenceRevoke())
+
+        val fenced = requireNotNull(coordinator.status())
+        assertFalse(fenced.desiredActive)
+        assertEquals("stop-1", fenced.stopOperationId)
+        assertEquals(RedundantStopState.PENDING, fenced.retry.stopState)
+        assertEquals(0, native.stopCalls)
+        assertEquals(0, panel.stopCalls)
     }
 
     @Test
@@ -155,6 +208,189 @@ class RedundantConnectionCoordinatorTest {
         assertEquals(3, transaction.membershipGeneration)
         assertEquals(2, panel.roleCalls)
         assertFalse(transaction.retry.roleObservationPending)
+    }
+
+    @Test
+    fun failedOldPrimaryIsReplacedAfterSixtySecondsWithoutFailback() {
+        var nowMs = 1_000_000L
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            native,
+            nowMs = { nowMs },
+        )
+
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        )))
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-b"), native.activated)
+
+        nowMs += 59_999
+        assertTrue(coordinator.tick())
+        assertTrue(panel.acquireOperationIds.isEmpty())
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+
+        nowMs += 1
+        assertTrue(coordinator.tick())
+        assertEquals(1, panel.acquireOperationIds.size)
+        assertEquals(listOf("lease-a"), panel.acquireReplaceLeaseIds)
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-b"), native.activated)
+        assertTrue(native.events.indexOf("stop:lease-a") < native.events.indexOf("start:candidate"))
+    }
+
+    @Test
+    fun periodicTickConsumesNativeHealthAndSwitchesWithoutLegacyStall() {
+        val native = FakeNative(healthSnapshots = ArrayDeque(listOf(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        ))))
+        var legacyStops = 0
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            FakePanel(),
+            native,
+            onAllSlotsStalled = { legacyStops += 1 },
+        )
+
+        assertTrue(coordinator.tick())
+
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-b"), native.activated)
+        assertEquals(0, legacyStops)
+    }
+
+    @Test
+    fun validatedNetworkHandoffRebindsBothMembersBeforeStabilization() {
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
+
+        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = true))
+
+        assertEquals(listOf("lease-a", "lease-b"), native.rebound)
+    }
+
+    @Test
+    fun replacementDeadlineSurvivesCoordinatorRecreation() {
+        var nowMs = 2_000_000L
+        val store = store(transaction())
+        val panel = FakePanel()
+        val first = RedundantConnectionCoordinator(store, panel, FakeNative(), nowMs = { nowMs })
+
+        assertTrue(first.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        )))
+        val pending = requireNotNull(first.status()).retry
+        assertTrue(pending.acquirePending)
+        assertEquals("lease-a", pending.acquireReplaceLeaseId)
+
+        nowMs += 59_000
+        assertTrue(RedundantConnectionCoordinator(
+            store,
+            panel,
+            FakeNative(),
+            nowMs = { nowMs },
+        ).tick())
+        assertTrue(panel.acquireOperationIds.isEmpty())
+
+        nowMs += 1_000
+        assertTrue(RedundantConnectionCoordinator(
+            store,
+            panel,
+            FakeNative(),
+            nowMs = { nowMs },
+        ).tick())
+        assertEquals(listOf("lease-a"), panel.acquireReplaceLeaseIds)
+    }
+
+    @Test
+    fun recoveredFormerPrimaryCancelsReplacementBeforeDeadline() {
+        var nowMs = 2_500_000L
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            native,
+            nowMs = { nowMs },
+        )
+
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        )))
+        assertTrue(requireNotNull(coordinator.status()).retry.acquirePending)
+
+        nowMs += 15_000L
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(
+                index = 0,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+            healthSlot(index = 1, active = true, health = BackendHealth.READY),
+        )))
+        val recovered = requireNotNull(coordinator.status())
+        assertFalse(recovered.retry.acquirePending)
+        assertEquals(null, recovered.retry.acquireOperationId)
+        assertEquals(null, recovered.retry.acquireReplaceLeaseId)
+        assertEquals(null, recovered.retry.nextRetryAtUnix)
+
+        nowMs += 60_000L
+        assertTrue(coordinator.tick())
+        assertTrue(panel.acquireOperationIds.isEmpty())
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+    }
+
+    @Test
+    fun disablingStandbyCancelsScheduledReplacementForTheSession() {
+        var nowMs = 3_000_000L
+        val panel = FakePanel()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            FakeNative(),
+            nowMs = { nowMs },
+        )
+
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        )))
+        assertTrue(coordinator.releaseStandby())
+        val released = requireNotNull(coordinator.status())
+        assertFalse(released.standbyDesired)
+        assertFalse(released.retry.acquirePending)
+        assertEquals(null, released.retry.nextRetryAtUnix)
+
+        nowMs += 60_000
+        assertTrue(coordinator.tick())
+        assertTrue(panel.acquireOperationIds.isEmpty())
+    }
+
+    @Test
+    fun acquireResponseDisablingStandbyCancelsWorkAndZeroesUnusedConfiguration() {
+        val panel = FakePanel(acquiredSession = session(
+            activeLeaseId = "lease-a",
+            roleGeneration = 2,
+            membershipGeneration = 2,
+            standbyDesired = false,
+        ))
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), panel, native)
+
+        assertFalse(coordinator.acquireAndCommitStandby("acquire-disabled"))
+
+        assertFalse(requireNotNull(coordinator.status()).standbyDesired)
+        assertFalse(requireNotNull(coordinator.status()).retry.acquirePending)
+        assertTrue(panel.candidateConfigurations.single().all { it == 0.toByte() })
+        assertFalse(native.started.contains("candidate"))
     }
 
     @Test
@@ -243,6 +479,158 @@ class RedundantConnectionCoordinatorTest {
         assertTrue(RedundantConnectionCoordinator(store, panel, FakeNative()).acquireAndCommitStandby("different"))
         assertEquals(listOf("acquire-empty", "acquire-empty"), panel.acquireOperationIds)
         assertEquals(listOf(null, null), panel.acquireReplaceLeaseIds)
+    }
+
+    @Test
+    fun replacementCommitUsesCanonicalActiveAndGenerationsReturnedByAcquire() {
+        var nowMs = 1_000_000L
+        val acquired = session(
+            activeLeaseId = "lease-b",
+            roleGeneration = 8,
+            membershipGeneration = 4,
+        )
+        val panel = FakePanel(acquiredSession = acquired)
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction(localActiveLeaseId = "lease-b")),
+            panel,
+            native,
+            nowMs = { nowMs },
+        )
+
+        assertTrue(coordinator.acquireAndCommitStandby("replace-a", replaceLeaseId = "lease-a"))
+        assertEquals(0, panel.commitCalls)
+        native.healthSnapshots += listOf(
+            healthSlot(
+                index = 0,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs,
+            ),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        )
+        nowMs += 15_000L
+        assertTrue(coordinator.tick())
+
+        val committed = panel.commitTransactions.single()
+        assertEquals("lease-b", committed.localActiveLeaseId)
+        assertEquals(8, committed.roleGeneration)
+        assertEquals(4, committed.membershipGeneration)
+    }
+
+    @Test
+    fun unvalidatedNetworkCannotCommitAnOtherwiseReadyCandidate() {
+        var nowMs = 1_000_000L
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction(localActiveLeaseId = "lease-a").copy(slotBLeaseId = null)),
+            panel,
+            native,
+            nowMs = { nowMs },
+        )
+        assertTrue(coordinator.acquireAndCommitStandby("acquire-1"))
+        assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
+        native.healthSnapshots.addLast(listOf(
+            healthSlot(index = 0, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+        ))
+
+        assertTrue(coordinator.tick())
+
+        assertEquals(0, panel.commitCalls)
+        assertTrue(requireNotNull(coordinator.status()).retry.acquirePending)
+    }
+
+    @Test
+    fun processDeathReplaysCandidateTransportAndWaitsForFreshReadiness() {
+        var nowMs = 1_000_000L
+        val pending = transaction(localActiveLeaseId = "lease-b").copy(
+            candidateLeaseId = "candidate",
+            candidateSlot = RedundantSlot.A,
+            retry = AndroidRedundantRetryState(
+                acquirePending = true,
+                acquireOperationId = "acquire-1",
+                acquireReplaceLeaseId = "lease-a",
+            ),
+        )
+        val store = store(pending)
+        val panel = FakePanel(acquiredSession = session(
+            activeLeaseId = "lease-b",
+            roleGeneration = 8,
+            membershipGeneration = 4,
+        ))
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store,
+            panel,
+            native,
+            nowMs = { nowMs },
+        )
+
+        assertTrue(coordinator.recover())
+        assertEquals(listOf("acquire-1"), panel.acquireOperationIds)
+        assertEquals(listOf("lease-a"), panel.acquireReplaceLeaseIds)
+        assertTrue(native.events.indexOf("stop:lease-a") < native.events.indexOf("start:candidate"))
+        assertEquals(0, panel.commitCalls)
+
+        native.healthSnapshots.addLast(listOf(
+            healthSlot(
+                index = 0,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs,
+            ),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        ))
+        assertTrue(coordinator.tick())
+        assertEquals(0, panel.commitCalls)
+
+        nowMs += 15_000L
+        native.healthSnapshots.addLast(listOf(
+            healthSlot(
+                index = 0,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        ))
+        assertTrue(coordinator.tick())
+        assertEquals(1, panel.commitCalls)
+        assertFalse(requireNotNull(coordinator.status()).retry.acquirePending)
+    }
+
+    @Test
+    fun disabledStandbyFencesPersistedCandidateReplay() {
+        val pending = transaction().copy(
+            standbyDesired = false,
+            candidateLeaseId = "candidate",
+            candidateSlot = RedundantSlot.B,
+            retry = AndroidRedundantRetryState(
+                nextRetryAtUnix = 1,
+                acquirePending = true,
+                acquireOperationId = "acquire-1",
+                acquireReplaceLeaseId = "lease-b",
+            ),
+        )
+        val panel = FakePanel()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(pending), panel, native)
+
+        assertTrue(coordinator.tick())
+
+        val fenced = requireNotNull(coordinator.status())
+        assertFalse(fenced.retry.acquirePending)
+        assertEquals(null, fenced.candidateLeaseId)
+        assertEquals(null, fenced.candidateSlot)
+        assertTrue(panel.acquireOperationIds.isEmpty())
+        assertFalse(native.started.contains("candidate"))
     }
 
     @Test
@@ -339,16 +727,35 @@ class RedundantConnectionCoordinatorTest {
         roleGeneration: Long,
         membershipGeneration: Long,
         slotBLeaseId: String = "lease-b",
+        standbyDesired: Boolean = true,
     ) = BackgroundRedundantSession(
         sessionId = "22222222-2222-4222-8222-222222222222",
         state = "connected",
         activeLeaseId = activeLeaseId,
         slotALeaseId = "lease-a",
         slotBLeaseId = slotBLeaseId,
-        standbyDesired = true,
+        standbyDesired = standbyDesired,
         roleGeneration = roleGeneration,
         membershipGeneration = membershipGeneration,
         reason = null,
+    )
+
+    private fun healthSlot(
+        index: Int,
+        active: Boolean = false,
+        health: BackendHealth = BackendHealth.WARMING,
+        hardFailure: Boolean = false,
+        handshakeFresh: Boolean = false,
+        consecutiveProbeSuccesses: Int = 0,
+        stableSinceMs: Long? = null,
+    ) = SlotObservation(
+        index = index,
+        active = active,
+        health = health,
+        hardFailure = hardFailure,
+        handshakeFresh = handshakeFresh,
+        consecutiveProbeSuccesses = consecutiveProbeSuccesses,
+        stableSinceMs = stableSinceMs,
     )
 }
 
@@ -369,29 +776,46 @@ private class FakeNative(
     private val usable: Set<String> = setOf("lease-a", "lease-b"),
     private val startFailures: Set<String> = emptySet(),
     private val stopResults: ArrayDeque<Boolean> = ArrayDeque(),
+    val healthSnapshots: ArrayDeque<List<SlotObservation>> = ArrayDeque(),
 ) : RedundantConnectionNative {
     val started = mutableListOf<String>()
     val activated = mutableListOf<String>()
+    val rebound = mutableListOf<String>()
+    val events = mutableListOf<String>()
     var stopCalls = 0
-    override fun start(leaseId: String, configuration: ByteArray): Boolean {
+    override fun start(
+        leaseId: String,
+        slot: RedundantSlot,
+        configuration: ByteArray,
+        healthProbe: BackgroundRedundantHealthProbe?,
+    ): Boolean {
         started += leaseId
+        events += "start:$leaseId"
         return leaseId !in startFailures
     }
     override fun activate(leaseId: String): Boolean = (leaseId in usable).also {
         if (it) activated += leaseId
     }
-    override fun stopSlot(leaseId: String): Boolean = leaseId in usable
+    override fun stopSlot(leaseId: String): Boolean = (leaseId in usable).also {
+        if (it) events += "stop:$leaseId"
+    }
     override fun stop(): Boolean {
         stopCalls += 1
         return stopResults.removeFirstOrNull() ?: true
     }
     override fun isUsable(leaseId: String): Boolean = leaseId in usable
+    override fun rebind(leaseId: String): Boolean = (leaseId in usable).also {
+        if (it) rebound += leaseId
+    }
+    override fun healthObservations(): List<SlotObservation> =
+        healthSnapshots.removeFirstOrNull() ?: emptyList()
 }
 
 private class FakePanel(
     private val role: RedundantRoleResponse? = null,
     private val configurations: Map<String, ByteArray>? = null,
     private val recoveredSession: BackgroundRedundantSession? = null,
+    private val acquiredSession: BackgroundRedundantSession? = null,
     private val stopResults: ArrayDeque<Boolean> = ArrayDeque(),
     private val roleFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val acquireFailures: ArrayDeque<Boolean> = ArrayDeque(),
@@ -402,6 +826,8 @@ private class FakePanel(
     var commitCalls = 0
     val acquireOperationIds = mutableListOf<String>()
     val acquireReplaceLeaseIds = mutableListOf<String?>()
+    val commitTransactions = mutableListOf<AndroidRedundantTransaction>()
+    val candidateConfigurations = mutableListOf<ByteArray>()
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
         RedundantRecoveryResponse(
             session = recoveredSession ?: BackgroundRedundantSession(
@@ -429,6 +855,20 @@ private class FakePanel(
             role ?: RedundantRoleResponse("accepted", transaction.localActiveLeaseId!!, session())
         }
     }
+    override fun releaseStandby(
+        transaction: AndroidRedundantTransaction,
+        inactiveLeaseId: String,
+    ): BackgroundRedundantSession = BackgroundRedundantSession(
+        sessionId = transaction.sessionId,
+        state = "connected",
+        activeLeaseId = transaction.localActiveLeaseId,
+        slotALeaseId = transaction.slotALeaseId.takeIf { it != inactiveLeaseId },
+        slotBLeaseId = transaction.slotBLeaseId.takeIf { it != inactiveLeaseId },
+        standbyDesired = false,
+        roleGeneration = transaction.roleGeneration,
+        membershipGeneration = transaction.membershipGeneration + 1,
+        reason = null,
+    )
     override fun acquireStandby(
         transaction: AndroidRedundantTransaction,
         operationId: String,
@@ -437,8 +877,14 @@ private class FakePanel(
         acquireOperationIds += operationId
         acquireReplaceLeaseIds += replaceLeaseId
         if (acquireFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
+        val configuration = "candidate-config".toByteArray().also(candidateConfigurations::add)
         return BackgroundRedundantCandidate(
-            session(), "candidate", RedundantSlot.B, QuickConnectionArgs(), "candidate-config".toByteArray(),
+            acquiredSession ?: session(activeLeaseId = transaction.localActiveLeaseId!!),
+            "candidate",
+            if (replaceLeaseId == transaction.slotALeaseId) RedundantSlot.A else RedundantSlot.B,
+            QuickConnectionArgs(),
+            configuration,
+            BackgroundRedundantHealthProbe("dns_a", "8.8.8.8", "nelomai.ru", 4_000),
         )
     }
     override fun commitCandidate(
@@ -446,22 +892,45 @@ private class FakePanel(
         candidateLeaseId: String,
     ): BackgroundRedundantSession {
         commitCalls += 1
+        commitTransactions += transaction
         if (commitFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
-        return session()
+        return session(
+            activeLeaseId = transaction.localActiveLeaseId!!,
+            roleGeneration = transaction.roleGeneration,
+            membershipGeneration = transaction.membershipGeneration + 1,
+            slotALeaseId = if (transaction.retry.acquireReplaceLeaseId == transaction.slotALeaseId) {
+                candidateLeaseId
+            } else {
+                transaction.slotALeaseId
+            },
+            slotBLeaseId = if (transaction.retry.acquireReplaceLeaseId == transaction.slotBLeaseId ||
+                transaction.slotBLeaseId == null
+            ) {
+                candidateLeaseId
+            } else {
+                transaction.slotBLeaseId
+            },
+        )
     }
     override fun stop(transaction: AndroidRedundantTransaction): Boolean {
         stopCalls += 1
         return stopResults.removeFirstOrNull() ?: true
     }
-    private fun session() = BackgroundRedundantSession(
+    private fun session(
+        activeLeaseId: String = "lease-a",
+        roleGeneration: Long = 2,
+        membershipGeneration: Long = 2,
+        slotALeaseId: String? = "lease-a",
+        slotBLeaseId: String? = "lease-b",
+    ) = BackgroundRedundantSession(
         sessionId = "22222222-2222-4222-8222-222222222222",
         state = "connected",
-        activeLeaseId = "lease-a",
-        slotALeaseId = "lease-a",
-        slotBLeaseId = "lease-b",
+        activeLeaseId = activeLeaseId,
+        slotALeaseId = slotALeaseId,
+        slotBLeaseId = slotBLeaseId,
         standbyDesired = true,
-        roleGeneration = 2,
-        membershipGeneration = 2,
+        roleGeneration = roleGeneration,
+        membershipGeneration = membershipGeneration,
         reason = null,
     )
 }

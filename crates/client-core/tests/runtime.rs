@@ -19,8 +19,8 @@ use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
     ConnectionOperationRequest, ConnectionOperationResponse, ConnectionStartRequest,
     ConnectionStartResponse, Device, EgressMode, Layer, LeaseStatus, OperationReconcileRequest,
-    OperationReconcileResponse, OperationState, PeerBinding, Platform, ProbeResult, RouteMode,
-    TicConnectionMode, UpdateState,
+    OperationReconcileResponse, OperationState, PeerBinding, Platform, ProbeResult,
+    RedundantStopRequest, RouteMode, TicConnectionMode, UpdateState,
 };
 use std::collections::VecDeque;
 use std::sync::{
@@ -222,6 +222,8 @@ struct MemoryTunnel {
     blocked_rebinds: AtomicUsize,
     rebind_release: Notify,
     configuration: Mutex<Option<String>>,
+    redundant_session_id: Mutex<Option<String>>,
+    standby_configuration: Mutex<Option<String>>,
     options: Mutex<Option<TunnelOptions>>,
     status: Mutex<TunnelStatus>,
     operation_events: Mutex<Option<Arc<Mutex<Vec<&'static str>>>>>,
@@ -231,6 +233,13 @@ struct MemoryTunnel {
 impl TunnelController for MemoryTunnel {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        if let Some(redundancy) = request.redundancy.as_ref() {
+            *self.redundant_session_id.lock().unwrap() = Some(redundancy.session_id.clone());
+            *self.standby_configuration.lock().unwrap() = redundancy
+                .standby
+                .as_ref()
+                .map(|standby| standby.configuration.expose().to_string());
+        }
         if self.block_start.load(Ordering::SeqCst) {
             self.start_release.notified().await;
         }
@@ -381,6 +390,8 @@ struct MockApi {
     start_requests: Mutex<Vec<ConnectionStartRequest>>,
     operation_ids: Mutex<Vec<String>>,
     stop_calls: AtomicUsize,
+    redundant_stop_calls: AtomicUsize,
+    redundant_stop_requests: Mutex<Vec<RedundantStopRequest>>,
     stop_failures: AtomicUsize,
     stop_error: Mutex<Option<CoreApiError>>,
     stop_apply_then_fail_once: AtomicBool,
@@ -397,6 +408,7 @@ struct MockApi {
     pinned_start: AtomicBool,
     awg3_start: AtomicBool,
     warm_start: AtomicBool,
+    redundant_start: AtomicBool,
     mismatched_egress: AtomicBool,
     start_lease_override: Mutex<Option<String>>,
     bootstrap_connection: Mutex<Option<Connection>>,
@@ -420,6 +432,8 @@ impl MockApi {
             start_requests: Mutex::new(Vec::new()),
             operation_ids: Mutex::new(Vec::new()),
             stop_calls: AtomicUsize::new(0),
+            redundant_stop_calls: AtomicUsize::new(0),
+            redundant_stop_requests: Mutex::new(Vec::new()),
             stop_failures: AtomicUsize::new(0),
             stop_error: Mutex::new(None),
             stop_apply_then_fail_once: AtomicBool::new(false),
@@ -436,6 +450,7 @@ impl MockApi {
             pinned_start: AtomicBool::new(false),
             awg3_start: AtomicBool::new(false),
             warm_start: AtomicBool::new(false),
+            redundant_start: AtomicBool::new(false),
             mismatched_egress: AtomicBool::new(false),
             start_lease_override: Mutex::new(None),
             bootstrap_connection: Mutex::new(None),
@@ -579,6 +594,12 @@ impl CoreApi for MockApi {
         if self.warm_start.load(Ordering::SeqCst) {
             response.connection.status = LeaseStatus::Warm;
         }
+        if self.redundant_start.load(Ordering::SeqCst) {
+            response = serde_json::from_str(include_str!(
+                "../../../contracts/fixtures/valid/connection-start-redundant-response.json"
+            ))
+            .unwrap();
+        }
         Ok(response)
     }
 
@@ -657,6 +678,27 @@ impl CoreApi for MockApi {
                     LeaseStatus::Warm
                 },
                 stopped_at: Some("2026-07-26T10:00:00Z".to_string()),
+                ..connection(&request.lease_id)
+            },
+        })
+    }
+
+    async fn stop_redundant_connection(
+        &self,
+        _access_token: &str,
+        request: &RedundantStopRequest,
+    ) -> Result<ConnectionOperationResponse, CoreApiError> {
+        self.redundant_stop_calls.fetch_add(1, Ordering::SeqCst);
+        self.redundant_stop_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        Ok(ConnectionOperationResponse {
+            api_version: ApiVersion::V1,
+            request_id: "req-redundant-stop".to_string(),
+            connection: Connection {
+                status: LeaseStatus::Released,
+                stopped_at: Some("2026-09-01T10:00:00Z".to_string()),
                 ..connection(&request.lease_id)
             },
         })
@@ -755,6 +797,7 @@ fn start_response(lease_id: &str) -> ConnectionStartResponse {
         request_id: "req-start".to_string(),
         connection: connection(lease_id),
         configuration: "[Interface]\nPrivateKey = tunnel-secret\n".to_string(),
+        health_probe: None,
         reused: false,
         redundancy: None,
     }
@@ -809,6 +852,159 @@ fn options() -> ConnectOptions {
         probes: Vec::new(),
         allow_alternate: false,
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_v2_passes_both_configs_without_persisting_them() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.start_recovery_v2(options(), 1_700_000_000, true)
+        .await
+        .unwrap();
+
+    let request = api.start_requests.lock().unwrap().last().unwrap().clone();
+    assert_eq!(request.recovery_contract_version, Some(2));
+    assert_eq!(request.redundancy_contract_version, Some(1));
+    assert_eq!(request.reserve_enabled, Some(true));
+    assert_eq!(
+        request.request_fingerprint.as_deref(),
+        Some("03bf9fabd0f53c63b5ae673eeb6d8230126aa89ec3cc998ea419d74c1cf0c2d3")
+    );
+    assert_eq!(
+        tunnel.redundant_session_id.lock().unwrap().as_deref(),
+        Some("20000000-0000-4000-8000-000000000001")
+    );
+    assert!(tunnel
+        .standby_configuration
+        .lock()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|value| value.contains("standby-delivered-only-to-core")));
+    let stored = store.load().unwrap().unwrap();
+    assert!(stored.saved_connection.is_none());
+    let serialized = serde_json::to_string(&stored).unwrap();
+    assert!(!serialized.contains("primary-delivered-only-to-core"));
+    assert!(!serialized.contains("standby-delivered-only-to-core"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_v2_uses_a_fresh_operation_instead_of_a_cached_lease_id() {
+    let store = Arc::new(MemoryStore::new(auth()));
+    let first_api = Arc::new(MockApi::new(0));
+    let first = ClientCore::new(
+        first_api,
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    first.start(options(), 1_700_000_000).await.unwrap();
+    let cached_lease_id = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .saved_connection
+        .unwrap()
+        .lease_id;
+
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        store,
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start_recovery_v2(options(), 1_700_000_001, true)
+        .await
+        .unwrap();
+
+    let requests = api.start_requests.lock().unwrap();
+    assert_ne!(requests[0].operation_id, cached_lease_id);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_v2_local_failure_uses_only_the_redundant_stop_contract() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+
+    assert!(core
+        .start_recovery_v2(options(), 1_700_000_000, true)
+        .await
+        .is_err());
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+    let stops = api.redundant_stop_requests.lock().unwrap();
+    assert_eq!(stops[0].session_id, "20000000-0000-4000-8000-000000000001");
+    assert_eq!(stops[0].lease_id, "20000000-0000-4000-8000-000000000002");
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_entry_exactly_replays_a_pending_recovery_v2_start() {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let mut stored_auth = auth();
+    stored_auth.pending_start = Some(StoredPendingStart {
+        operation_id: "pending-v2-operation".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        allow_alternate: false,
+        probes: Vec::new(),
+        recovery_contract_version: Some(2),
+        redundancy_contract_version: Some(1),
+        reserve_enabled: Some(true),
+        request_fingerprint: Some(
+            "03bf9fabd0f53c63b5ae673eeb6d8230126aa89ec3cc998ea419d74c1cf0c2d3".to_string(),
+        ),
+        cancel_operation_id: None,
+    });
+    let store = Arc::new(MemoryStore::new(stored_auth));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.start(options(), 1_700_000_000).await.unwrap();
+
+    let requests = api.start_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].operation_id, "pending-v2-operation");
+    assert_eq!(requests[0].recovery_contract_version, Some(2));
+    assert_eq!(requests[0].redundancy_contract_version, Some(1));
+    assert_eq!(requests[0].reserve_enabled, Some(true));
+    assert_eq!(
+        requests[0].request_fingerprint.as_deref(),
+        Some("03bf9fabd0f53c63b5ae673eeb6d8230126aa89ec3cc998ea419d74c1cf0c2d3")
+    );
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2212,6 +2408,8 @@ async fn reconstructed_core_without_authoritative_bootstrap_replays_failed_start
     stored_auth.pending_compensation_stop = Some(StoredPendingCompensationStop {
         operation_id: "durable-stop".to_string(),
         lease_id: "issued-lease".to_string(),
+        recovery_contract_version: None,
+        redundant_session_id: None,
         accept_warm: true,
         failure_code: None,
     });
@@ -2244,6 +2442,45 @@ async fn reconstructed_core_without_authoritative_bootstrap_replays_failed_start
 
 #[cfg(not(target_os = "android"))]
 #[tokio::test]
+async fn reconstructed_core_replays_recovery_v2_compensation_without_legacy_stop() {
+    let mut stored_auth = auth();
+    stored_auth.pending_compensation_stop = Some(StoredPendingCompensationStop {
+        operation_id: "durable-v2-stop".to_string(),
+        lease_id: "20000000-0000-4000-8000-000000000002".to_string(),
+        recovery_contract_version: Some(2),
+        redundant_session_id: Some("20000000-0000-4000-8000-000000000001".to_string()),
+        accept_warm: true,
+        failure_code: None,
+    });
+    let store = Arc::new(MemoryStore::new(stored_auth));
+    let api = Arc::new(MockApi::new(0));
+    let core = ClientCore::new(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+
+    core.reconcile_pending_operation_for_retry().await.unwrap();
+
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+    let requests = api.redundant_stop_requests.lock().unwrap();
+    assert_eq!(requests[0].operation_id, "durable-v2-stop");
+    assert_eq!(
+        requests[0].session_id,
+        "20000000-0000-4000-8000-000000000001"
+    );
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .is_none());
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
 async fn reconstructed_legacy_pinned_compensation_migrates_before_exact_replay() {
     let mut stored_auth = auth();
     stored_auth.pending_start = Some(StoredPendingStart {
@@ -2255,6 +2492,8 @@ async fn reconstructed_legacy_pinned_compensation_migrates_before_exact_replay()
         allow_alternate: true,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -2273,6 +2512,8 @@ async fn reconstructed_legacy_pinned_compensation_migrates_before_exact_replay()
     stored_auth.pending_compensation_stop = Some(StoredPendingCompensationStop {
         operation_id: "legacy-pinned-stop".to_string(),
         lease_id: "legacy-pinned-lease".to_string(),
+        recovery_contract_version: None,
+        redundant_session_id: None,
         accept_warm: false,
         failure_code: Some("tunnel_handshake_timeout".to_string()),
     });
@@ -2336,6 +2577,8 @@ async fn unrelated_dynamic_connection_cannot_migrate_a_legacy_fixed_compensation
     stored_auth.pending_compensation_stop = Some(StoredPendingCompensationStop {
         operation_id: "legacy-fixed-stop".to_string(),
         lease_id: "legacy-fixed-lease".to_string(),
+        recovery_contract_version: None,
+        redundant_session_id: None,
         accept_warm: false,
         failure_code: None,
     });
@@ -2375,6 +2618,8 @@ async fn reconstructed_terminal_compensation_does_not_accept_a_warm_personal_res
     stored_auth.pending_compensation_stop = Some(StoredPendingCompensationStop {
         operation_id: "terminal-stop".to_string(),
         lease_id: "personal-lease".to_string(),
+        recovery_contract_version: None,
+        redundant_session_id: None,
         accept_warm: false,
         failure_code: None,
     });
@@ -2501,6 +2746,8 @@ async fn interrupted_start_reuses_its_durable_operation_id() {
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -2571,6 +2818,8 @@ fn persisted_pending_start_is_cancellable_immediately_after_core_construction() 
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -2598,6 +2847,8 @@ async fn legacy_entry_replays_the_stored_recovery_contract_without_mutating_it()
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: Some(1),
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: Some("stored-fingerprint".to_string()),
         cancel_operation_id: None,
     });
@@ -2634,6 +2885,8 @@ async fn legacy_entry_replays_the_stored_recovery_contract_without_mutating_it()
             allow_alternate: false,
             probes: Vec::new(),
             recovery_contract_version: Some(1),
+            redundancy_contract_version: None,
+            reserve_enabled: None,
             request_fingerprint: Some("stored-fingerprint".to_string()),
             cancel_operation_id: None,
         })
@@ -2654,6 +2907,8 @@ async fn recovery_entry_replays_the_stored_legacy_contract_without_mutating_it()
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -2701,6 +2956,8 @@ async fn a_different_start_intent_cannot_replace_an_unresolved_operation() {
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -2752,6 +3009,8 @@ async fn allow_alternate_is_part_of_the_durable_start_intent() {
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -2800,6 +3059,8 @@ async fn a_start_with_durable_cancellation_in_progress_cannot_be_replayed() {
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: Some("stable-stop-operation".to_string()),
     });
@@ -3042,6 +3303,8 @@ async fn fixed_stale_release_rejects_warm_and_keeps_its_durable_compensation() {
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -3520,6 +3783,8 @@ async fn replacing_a_finished_start_operation_drops_its_old_cancel_operation_id(
         allow_alternate: false,
         probes: Vec::new(),
         recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
         request_fingerprint: None,
         cancel_operation_id: None,
     });
@@ -5302,6 +5567,8 @@ async fn legacy_pending_clears_after_probe_validation_proves_no_operation_exists
             allow_alternate: false,
             probes,
             recovery_contract_version: None,
+            redundancy_contract_version: None,
+            reserve_enabled: None,
             request_fingerprint: None,
             cancel_operation_id: None,
         });

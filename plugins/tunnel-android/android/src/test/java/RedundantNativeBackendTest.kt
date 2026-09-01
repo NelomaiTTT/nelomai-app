@@ -76,6 +76,19 @@ class RedundantNativeBackendTest {
     }
 
     @Test
+    fun recoveredLocalActiveCanCreateTheNativeSessionDirectlyInSlotB() {
+        val native = FakeRedundantNativeApi()
+        val backend = RedundantNativeBackend(native) { true }
+
+        val session = backend.start(41, 1, "recovered-active-secret".toByteArray())
+
+        assertNotNull(session)
+        assertTrue(native.activeSocketSet(0).isEmpty())
+        assertEquals(listOf(101, 102), native.activeSocketSet(1))
+        assertTrue(backend.switchActive(requireNotNull(session), 1))
+    }
+
+    @Test
     fun reusedNativeHandleBelongsToTheNewSessionAfterClose() {
         val native = FakeRedundantNativeApi().apply {
             createHandles = ArrayDeque(listOf(7L, 7L))
@@ -207,7 +220,97 @@ class RedundantNativeBackendTest {
         assertEquals(listOf(41), closedTunFds)
         assertArrayEquals(ByteArray(configuration.size), configuration)
     }
+
+    @Test
+    fun probeIsSlotScopedAndTerminalStatusConsumesOpaqueToken() {
+        val native = FakeRedundantNativeApi()
+        val backend = RedundantNativeBackend(native) { true }
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+        assertTrue(backend.startSlot(session, 1, "standby-secret".toByteArray()))
+        val template = NativeDnsProbeTemplate("10.200.0.2/32", "8.8.8.8", "nelomai.ru")
+
+        val token = requireNotNull(backend.startProbe(session, 1, template))
+
+        assertEquals(FakeProbeStart(7L, 1, template), native.probeStarts.single())
+        assertEquals(NativeProbeStatus.PENDING, backend.probeStatus(session, token))
+        native.probeStatuses[token] = 1
+        assertEquals(NativeProbeStatus.SUCCEEDED, backend.probeStatus(session, token))
+        assertEquals(NativeProbeStatus.UNKNOWN, backend.probeStatus(session, token))
+    }
+
+    @Test
+    fun malformedProbeTemplateNeverCrossesNativeBoundary() {
+        val native = FakeRedundantNativeApi()
+        val backend = RedundantNativeBackend(native) { true }
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+
+        assertEquals(
+            null,
+            backend.startProbe(
+                session,
+                0,
+                NativeDnsProbeTemplate("10.200.0.2/24", "2001:db8::1", "Nelomai.ru."),
+            ),
+        )
+
+        assertTrue(native.probeStarts.isEmpty())
+    }
+
+    @Test
+    fun rebindCancelsOnlyProbesForItsExactSlot() {
+        val native = FakeRedundantNativeApi()
+        val backend = RedundantNativeBackend(native) { true }
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+        assertTrue(backend.startSlot(session, 1, "standby-secret".toByteArray()))
+        val template = NativeDnsProbeTemplate("10.200.0.2/32", "8.8.8.8", "nelomai.ru")
+        val primary = requireNotNull(backend.startProbe(session, 0, template))
+        val standby = requireNotNull(backend.startProbe(session, 1, template))
+
+        assertTrue(backend.rebind(session, 1))
+
+        assertEquals(listOf(standby), native.cancelledProbes)
+        assertEquals(NativeProbeStatus.PENDING, backend.probeStatus(session, primary))
+        assertEquals(NativeProbeStatus.UNKNOWN, backend.probeStatus(session, standby))
+    }
+
+    @Test
+    fun stoppingSlotCancelsItsProbeWithoutAffectingOtherSlot() {
+        val native = FakeRedundantNativeApi()
+        val backend = RedundantNativeBackend(native) { true }
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+        assertTrue(backend.startSlot(session, 1, "standby-secret".toByteArray()))
+        val template = NativeDnsProbeTemplate("10.200.0.2/32", "8.8.8.8", "nelomai.ru")
+        val primary = requireNotNull(backend.startProbe(session, 0, template))
+        val standby = requireNotNull(backend.startProbe(session, 1, template))
+
+        assertTrue(backend.stopSlot(session, 1))
+
+        assertEquals(listOf(standby), native.cancelledProbes)
+        assertEquals(NativeProbeStatus.PENDING, backend.probeStatus(session, primary))
+        assertEquals(NativeProbeStatus.UNKNOWN, backend.probeStatus(session, standby))
+    }
+
+    @Test
+    fun duplicateLiveOpaqueTokenFailsClosed() {
+        val native = FakeRedundantNativeApi().apply { fixedProbeToken = 71L }
+        val backend = RedundantNativeBackend(native) { true }
+        val session = requireNotNull(backend.start(41, "primary-secret".toByteArray()))
+        assertTrue(backend.startSlot(session, 1, "standby-secret".toByteArray()))
+        val template = NativeDnsProbeTemplate("10.200.0.2/32", "8.8.8.8", "nelomai.ru")
+        assertEquals(71L, backend.startProbe(session, 0, template))
+
+        assertEquals(null, backend.startProbe(session, 1, template))
+
+        assertEquals(listOf(71L), native.cancelledProbes)
+        assertEquals(NativeProbeStatus.UNKNOWN, backend.probeStatus(session, 71L))
+    }
 }
+
+private data class FakeProbeStart(
+    val handle: Long,
+    val slot: Int,
+    val template: NativeDnsProbeTemplate,
+)
 
 private class FakeRedundantNativeApi : RedundantNativeApi {
     var createHandles = ArrayDeque(listOf(7L))
@@ -222,6 +325,11 @@ private class FakeRedundantNativeApi : RedundantNativeApi {
     val releaseSwitch = CountDownLatch(1)
     val stoppedSlots = mutableListOf<Int>()
     val closedSessions = mutableListOf<Long>()
+    val probeStarts = mutableListOf<FakeProbeStart>()
+    val probeStatuses = mutableMapOf<Long, Int>()
+    val cancelledProbes = mutableListOf<Long>()
+    var fixedProbeToken: Long? = null
+    private var nextProbeToken = 71L
     private var nextPreparationToken = 1L
     private val prepared = mutableMapOf<Int, LongArray>()
     private val active = mutableMapOf<Int, List<Int>>()
@@ -264,6 +372,31 @@ private class FakeRedundantNativeApi : RedundantNativeApi {
     override fun stopSlot(handle: Long, slot: Int): Boolean {
         stoppedSlots += slot
         active.remove(slot)
+        return true
+    }
+
+    override fun startProbe(
+        handle: Long,
+        slot: Int,
+        sourceIpv4: String,
+        targetIpv4: String,
+        queryName: String,
+    ): Long {
+        val token = fixedProbeToken ?: nextProbeToken++
+        probeStarts += FakeProbeStart(
+            handle,
+            slot,
+            NativeDnsProbeTemplate(sourceIpv4, targetIpv4, queryName),
+        )
+        probeStatuses.putIfAbsent(token, 0)
+        return token
+    }
+
+    override fun probeStatus(handle: Long, token: Long): Int = probeStatuses[token] ?: 3
+
+    override fun cancelProbe(handle: Long, token: Long): Boolean {
+        cancelledProbes += token
+        probeStatuses.remove(token)
         return true
     }
 

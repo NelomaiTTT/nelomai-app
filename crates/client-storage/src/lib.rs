@@ -83,6 +83,10 @@ pub struct StoredPendingStart {
     pub probes: Vec<ProbeResult>,
     #[serde(default)]
     pub recovery_contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy_contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_enabled: Option<bool>,
     #[serde(default)]
     pub request_fingerprint: Option<String>,
     #[serde(default)]
@@ -101,6 +105,10 @@ pub struct StoredPendingStalledStop {
 pub struct StoredPendingCompensationStop {
     pub operation_id: String,
     pub lease_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundant_session_id: Option<String>,
     #[serde(default)]
     pub accept_warm: bool,
     #[serde(default)]
@@ -556,8 +564,35 @@ mod tests {
 
         assert!(pending.accept_warm);
         let encoded = serde_json::to_value(pending).unwrap();
+        assert!(!encoded
+            .as_object()
+            .unwrap()
+            .contains_key("recovery_contract_version"));
+        assert!(!encoded
+            .as_object()
+            .unwrap()
+            .contains_key("redundant_session_id"));
         assert!(encoded.as_object().unwrap().contains_key("failure_code"));
         assert!(encoded["failure_code"].is_null());
+    }
+
+    #[test]
+    fn recovery_v2_compensation_identity_round_trips_without_configuration() {
+        let pending = StoredPendingCompensationStop {
+            operation_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            recovery_contract_version: Some(2),
+            redundant_session_id: Some("33333333-3333-4333-8333-333333333333".to_string()),
+            accept_warm: true,
+            failure_code: None,
+        };
+
+        let encoded = serde_json::to_string(&pending).unwrap();
+        assert!(!encoded.contains("PrivateKey"));
+        assert_eq!(
+            serde_json::from_str::<StoredPendingCompensationStop>(&encoded).unwrap(),
+            pending
+        );
     }
 
     #[test]

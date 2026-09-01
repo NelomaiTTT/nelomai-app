@@ -6,15 +6,17 @@ use nelomai_client_storage::{
     StoredPendingStart,
 };
 use nelomai_client_tunnel::{
-    QuickConnection, QuickReconnect, TunnelConfiguration, TunnelController, TunnelError,
-    TunnelOptions, TunnelStartRequest, TunnelStatus, TunnelTransport,
+    QuickConnection, QuickReconnect, RedundantTunnelMemberStart, RedundantTunnelStandbyStart,
+    RedundantTunnelStart, TunnelConfiguration, TunnelController, TunnelError, TunnelOptions,
+    TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
 use nelomai_contracts::{
     AccessState, Bootstrap, Connection, ConnectionOperationRequest, ConnectionOperationResponse,
     ConnectionStartRequest, ConnectionStartResponse, EgressMode, Layer, LeaseStatus, OperationKind,
     OperationReconcileRequest, OperationReconcileResponse, OperationState, ProbeResult,
-    RedundantCandidateCommitRequest, RedundantRoleRequest, RedundantRoleResponse,
-    RedundantSessionResponse, RedundantStandbyAcquireRequest, RedundantStandbyAcquireResponse,
+    RecoveryContractV2, RedundancyMemberSlot, RedundancyState, RedundantCandidateCommitRequest,
+    RedundantRoleRequest, RedundantRoleResponse, RedundantSessionResponse,
+    RedundantStandbyAcquireRequest, RedundantStandbyAcquireResponse,
     RedundantStandbyReleaseRequest, RedundantStopRequest, RouteMode, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult, SplitTunnelPolicy, SplitTunnelRevision,
     SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
@@ -1680,9 +1682,31 @@ where
             now_unix,
             true,
             ConnectionStartContract::Legacy,
+            false,
             cancel_epoch,
         )
         .await
+    }
+
+    pub async fn start_recovery_v2(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        reserve_enabled: bool,
+    ) -> Result<Connection, CoreError> {
+        let cancel_epoch = self.begin_start_attempt();
+        let result = self
+            .start_internal(
+                options,
+                now_unix,
+                true,
+                ConnectionStartContract::RecoveryV2,
+                reserve_enabled,
+                cancel_epoch,
+            )
+            .await;
+        self.finish_start_attempt();
+        result
     }
 
     #[cfg(not(target_os = "android"))]
@@ -1712,6 +1736,7 @@ where
             now_unix,
             false,
             ConnectionStartContract::RecoveryV1,
+            false,
             cancel_epoch,
         )
         .await
@@ -1723,6 +1748,7 @@ where
         now_unix: i64,
         allow_internal_retry: bool,
         requested_contract: ConnectionStartContract,
+        requested_reserve_enabled: bool,
         cancel_epoch: StartCancellationEpoch,
     ) -> Result<Connection, CoreError> {
         let options = options.normalized_for_layer();
@@ -1788,41 +1814,78 @@ where
         };
         self.ensure_start_not_cancelled(cancel_epoch)?;
         let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
-        let (contract, operation_id, recovery_contract_version, request_fingerprint) =
-            match stored.pending_start.as_ref() {
-                Some(pending) => {
-                    let (contract, version, fingerprint) = pending_start_contract(pending)?;
-                    (contract, pending.operation_id.clone(), version, fingerprint)
-                }
-                None => {
-                    let require_measured_selection = requested_contract
-                        == ConnectionStartContract::RecoveryV1
-                        && (options.layer != Layer::Tic
-                            || options.tic_connection_mode == TicConnectionMode::Dynamic);
-                    let fingerprint = (requested_contract == ConnectionStartContract::RecoveryV1)
-                        .then(|| {
-                            connection_intent::request_fingerprint_v1(
-                                &options,
-                                require_measured_selection,
-                            )
-                        });
-                    (
-                        requested_contract,
+        let (
+            contract,
+            operation_id,
+            recovery_contract_version,
+            redundancy_contract_version,
+            reserve_enabled,
+            request_fingerprint,
+        ) = match stored.pending_start.as_ref() {
+            Some(pending) => {
+                let (contract, recovery, redundancy, reserve, fingerprint) =
+                    pending_start_contract(pending)?;
+                (
+                    contract,
+                    pending.operation_id.clone(),
+                    recovery,
+                    redundancy,
+                    reserve,
+                    fingerprint,
+                )
+            }
+            None => {
+                let require_measured_selection = matches!(
+                    requested_contract,
+                    ConnectionStartContract::RecoveryV1 | ConnectionStartContract::RecoveryV2
+                ) && (options.layer != Layer::Tic
+                    || options.tic_connection_mode == TicConnectionMode::Dynamic);
+                let fingerprint = match requested_contract {
+                    ConnectionStartContract::Legacy => None,
+                    ConnectionStartContract::RecoveryV1 => {
+                        Some(connection_intent::request_fingerprint_v1(
+                            &options,
+                            require_measured_selection,
+                        ))
+                    }
+                    ConnectionStartContract::RecoveryV2 => {
+                        Some(connection_intent::request_fingerprint_v2(
+                            &options,
+                            require_measured_selection,
+                            requested_reserve_enabled,
+                        ))
+                    }
+                };
+                (
+                    requested_contract,
+                    if requested_contract == ConnectionStartContract::RecoveryV2 {
+                        Uuid::new_v4().to_string()
+                    } else {
                         reusable_operation_id(&stored, &options, now_unix)
-                            .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                        fingerprint.as_ref().map(|_| 1),
-                        fingerprint,
-                    )
-                }
-            };
+                            .unwrap_or_else(|| Uuid::new_v4().to_string())
+                    },
+                    match requested_contract {
+                        ConnectionStartContract::Legacy => None,
+                        ConnectionStartContract::RecoveryV1 => Some(1),
+                        ConnectionStartContract::RecoveryV2 => Some(2),
+                    },
+                    (requested_contract == ConnectionStartContract::RecoveryV2).then_some(1),
+                    (requested_contract == ConnectionStartContract::RecoveryV2)
+                        .then_some(requested_reserve_enabled),
+                    fingerprint,
+                )
+            }
+        };
         let replay_probes = stored
             .pending_start
             .as_ref()
             .map(|pending| pending.probes.clone())
             .unwrap_or_else(|| options.probes.clone());
-        let require_measured_selection = contract == ConnectionStartContract::RecoveryV1
-            && (options.layer != Layer::Tic
-                || options.tic_connection_mode == TicConnectionMode::Dynamic);
+        let require_measured_selection = matches!(
+            contract,
+            ConnectionStartContract::RecoveryV1 | ConnectionStartContract::RecoveryV2
+        ) && (options.layer != Layer::Tic
+            || options.tic_connection_mode == TicConnectionMode::Dynamic);
         let mut operation_id = operation_id;
         self.logger.record(CoreLogEvent {
             kind: "connection.egress_selected",
@@ -1848,6 +1911,8 @@ where
                 allow_alternate: options.allow_alternate,
                 probes: options.probes.clone(),
                 recovery_contract_version,
+                redundancy_contract_version,
+                reserve_enabled,
                 request_fingerprint: request_fingerprint.clone(),
                 cancel_operation_id: None,
             });
@@ -1867,8 +1932,8 @@ where
             allow_alternate: options.allow_alternate,
             require_measured_selection,
             recovery_contract_version,
-            redundancy_contract_version: None,
-            reserve_enabled: None,
+            redundancy_contract_version,
+            reserve_enabled,
             request_fingerprint,
         };
         let panel_started = Instant::now();
@@ -1901,6 +1966,10 @@ where
                 return Err(error);
             }
         };
+        let redundant_session_id = response
+            .redundancy
+            .as_ref()
+            .map(|redundancy| redundancy.session_id.as_str());
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             return Err(self
                 .compensate_cancelled_start(
@@ -1908,6 +1977,7 @@ where
                     &response.connection,
                     &response.request_id,
                     &operation_id,
+                    redundant_session_id,
                     FailedStartStage::Preparation,
                     false,
                 )
@@ -1929,6 +1999,7 @@ where
                     &response.connection,
                     &response.request_id,
                     &operation_id,
+                    redundant_session_id,
                     FailedStartStage::Preparation,
                     &error,
                 )
@@ -1986,6 +2057,7 @@ where
                             &response.connection,
                             &response.request_id,
                             &operation_id,
+                            redundant_session_id,
                             FailedStartStage::Preparation,
                             &error,
                         )
@@ -2008,12 +2080,36 @@ where
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Sync)
                 .await;
         }
+        let redundant_start = match redundant_tunnel_start(
+            &response,
+            &operation_id,
+            request.request_fingerprint.as_deref(),
+            request.reserve_enabled,
+        ) {
+            Ok(start) => start,
+            Err(error) => {
+                let compensation_error = self
+                    .compensate_failed_start(
+                        &access_token,
+                        &response.connection,
+                        &response.request_id,
+                        &operation_id,
+                        redundant_session_id,
+                        FailedStartStage::Preparation,
+                        &error,
+                    )
+                    .await
+                    .err();
+                return Err(compensation_error.unwrap_or(error));
+            }
+        };
+        let is_redundant = redundant_start.is_some();
         let kind = stored_connection_kind(&response.connection);
         let valid_until_unix = match kind {
             StoredConnectionKind::DynamicWarm => Some(now_unix.saturating_add(3_600)),
             StoredConnectionKind::Fixed | StoredConnectionKind::Pinned => None,
         };
-        let saved_connection = StoredConnection {
+        let saved_connection = (!is_redundant).then(|| StoredConnection {
             lease_id: response.connection.lease_id.clone(),
             pool_id: response.connection.pool_id.clone(),
             layer: response.connection.layer,
@@ -2024,16 +2120,20 @@ where
             kind,
             configuration: response.configuration.clone(),
             valid_until_unix,
-        };
+        });
         // The start request may rotate the tokens after an unauthorized response.
         // Reload before persisting the connection so stale credentials cannot
         // overwrite the freshly rotated session.
         let mut current_stored = self.load_auth()?;
-        if kind == StoredConnectionKind::Pinned {
-            current_stored.pinned_connection = Some(saved_connection);
-            current_stored.saved_connection = None;
+        if let Some(saved_connection) = saved_connection {
+            if kind == StoredConnectionKind::Pinned {
+                current_stored.pinned_connection = Some(saved_connection);
+                current_stored.saved_connection = None;
+            } else {
+                current_stored.saved_connection = Some(saved_connection);
+            }
         } else {
-            current_stored.saved_connection = Some(saved_connection);
+            current_stored.saved_connection = None;
         }
         if self.store.save(&current_stored).is_err() {
             let error = CoreError::Storage;
@@ -2043,6 +2143,7 @@ where
                     &response.connection,
                     &response.request_id,
                     &operation_id,
+                    redundant_session_id,
                     FailedStartStage::Storage,
                     &error,
                 )
@@ -2058,11 +2159,12 @@ where
             .start(TunnelStartRequest {
                 configuration,
                 options: tunnel_options.clone(),
-                quick_reconnect: match valid_until_unix {
-                    Some(valid_until_unix) => QuickReconnect::Until(valid_until_unix),
-                    None => QuickReconnect::Persistent,
+                quick_reconnect: match (is_redundant, valid_until_unix) {
+                    (true, _) => QuickReconnect::Disabled,
+                    (false, Some(valid_until_unix)) => QuickReconnect::Until(valid_until_unix),
+                    (false, None) => QuickReconnect::Persistent,
                 },
-                quick_connection: Some(QuickConnection {
+                quick_connection: (!is_redundant).then(|| QuickConnection {
                     lease_id: response.connection.lease_id.clone(),
                     layer: response.connection.layer,
                     tic_connection_mode: response.connection.tic_connection_mode,
@@ -2070,6 +2172,7 @@ where
                     egress_mode: response.connection.egress_mode,
                     allow_alternate: options.allow_alternate,
                 }),
+                redundancy: redundant_start,
             })
             .await;
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
@@ -2079,6 +2182,7 @@ where
                     &response.connection,
                     &response.request_id,
                     &operation_id,
+                    redundant_session_id,
                     FailedStartStage::Local,
                     true,
                 )
@@ -2101,6 +2205,7 @@ where
                     &response.connection,
                     &response.request_id,
                     &operation_id,
+                    redundant_session_id,
                     FailedStartStage::Local,
                     &error,
                 )
@@ -2117,7 +2222,7 @@ where
             },
             elapsed_millis(local_start_started),
         );
-        if transport == TunnelTransport::AmneziaWg3 {
+        if transport == TunnelTransport::AmneziaWg3 && !is_redundant {
             let handshake_result = self
                 .ensure_awg3_handshake(
                     &operation_id,
@@ -2132,6 +2237,7 @@ where
                         &response.connection,
                         &response.request_id,
                         &operation_id,
+                        redundant_session_id,
                         FailedStartStage::Local,
                         true,
                     )
@@ -2144,6 +2250,7 @@ where
                         &response.connection,
                         &response.request_id,
                         &operation_id,
+                        redundant_session_id,
                         FailedStartStage::Local,
                         &error,
                     )
@@ -2164,6 +2271,7 @@ where
                     &response.connection,
                     &response.request_id,
                     &operation_id,
+                    redundant_session_id,
                     FailedStartStage::Local,
                     true,
                 )
@@ -2294,11 +2402,25 @@ where
                 .ok_or(CoreError::SavedConnectionUnavailable);
         }
         if self.pending_start_active.load(Ordering::SeqCst) {
+            let pending_is_recovery_v2 = self
+                .store
+                .load()
+                .ok()
+                .flatten()
+                .and_then(|stored| stored.pending_start)
+                .is_some_and(|pending| pending.recovery_contract_version == Some(2));
+            if pending_is_recovery_v2 {
+                return Err(unresolved_start_operation_error());
+            }
             let current = self.state.lock().await.connection.clone();
             if let Some(current) = current {
                 let accept_warm = stored_connection_accepts_warm(&current);
-                let pending =
-                    self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None)?;
+                let pending = self.pending_compensation_stop_identity(
+                    &current.lease_id,
+                    accept_warm,
+                    None,
+                    None,
+                )?;
                 self.resume_pending_compensation_stop(pending).await?;
                 return self
                     .state
@@ -2500,6 +2622,11 @@ where
             return Err(CoreError::Storage);
         }
         let pending = self.migrate_legacy_pending_compensation_stop(pending, current.as_ref())?;
+        if pending_compensation_redundant_session(&pending)?.is_some() {
+            return self
+                .replay_pending_compensation_stop_without_connection(pending)
+                .await;
+        }
         if current.is_none() {
             return self
                 .replay_pending_compensation_stop_without_connection(pending)
@@ -2530,9 +2657,6 @@ where
     ) -> Result<(), CoreError> {
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
-        if self.state.lock().await.connection.is_some() {
-            return Err(CoreError::Storage);
-        }
         self.set_phase(Phase::Stopping).await;
         if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
             self.tunnel.stop().await?;
@@ -2563,20 +2687,12 @@ where
             return Err(CoreError::Storage);
         }
         let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
-        let request = ConnectionOperationRequest {
-            operation_id: pending.operation_id.clone(),
-            lease_id: pending.lease_id.clone(),
-            failure_code: pending.failure_code.clone(),
-        };
-        let response = match self
-            .retry_operation(&access_token, &request, ConnectionOperation::Stop)
-            .await
-        {
+        let response = match self.retry_compensation_stop(&access_token, &pending).await {
             Ok(response) => response,
             Err(error) => {
                 self.logger.record(CoreLogEvent {
                     kind: "connection.stop_failed",
-                    operation_id: Some(request.operation_id),
+                    operation_id: Some(pending.operation_id.clone()),
                     request_id: None,
                     code: Some(error.to_string()),
                 });
@@ -2600,7 +2716,7 @@ where
         };
         self.logger.record(CoreLogEvent {
             kind: "connection.stopped",
-            operation_id: Some(request.operation_id),
+            operation_id: Some(pending.operation_id.clone()),
             request_id: Some(response.request_id),
             code: None,
         });
@@ -2956,7 +3072,7 @@ where
         };
         let accept_warm = stored_connection_accepts_warm(&current);
         let pending =
-            self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None)?;
+            self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None, None)?;
         match self
             .stop_internal(None, true, Some(&pending.operation_id), pending.accept_warm)
             .await
@@ -3086,6 +3202,7 @@ where
                 now_unix,
                 false,
                 ConnectionStartContract::RecoveryV1,
+                false,
                 cancel_epoch,
             )
             .await;
@@ -3312,6 +3429,7 @@ where
                     egress_mode: saved.egress_mode,
                     allow_alternate: false,
                 }),
+                redundancy: None,
             })
             .await
         {
@@ -3487,6 +3605,15 @@ where
         let Some(connection) = stale else {
             return Ok(());
         };
+        if stored
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| pending.recovery_contract_version == Some(2))
+        {
+            // The exact v2 replay returns the session identity needed for a safe stop.
+            // Never release one member through the legacy endpoint before that replay.
+            return Ok(());
+        }
         if !matches!(
             self.tunnel.status().await?,
             TunnelStatus::Stopped | TunnelStatus::Failed
@@ -3499,7 +3626,12 @@ where
             .pending_start
             .as_ref()
             .map(|_| {
-                self.pending_compensation_stop_identity(&connection.lease_id, accept_warm, None)
+                self.pending_compensation_stop_identity(
+                    &connection.lease_id,
+                    accept_warm,
+                    None,
+                    None,
+                )
             })
             .transpose()?;
         let request = ConnectionOperationRequest {
@@ -3614,10 +3746,17 @@ where
         lease_id: &str,
         accept_warm: bool,
         failure_code: Option<&str>,
+        redundant_session_id: Option<&str>,
     ) -> Result<StoredPendingCompensationStop, CoreError> {
+        if redundant_session_id.is_some_and(str::is_empty) {
+            return Err(CoreError::Storage);
+        }
+        let recovery_contract_version = redundant_session_id.map(|_| 2);
         let mut stored = self.load_auth()?;
         if let Some(pending) = stored.pending_compensation_stop.as_ref() {
             if pending.lease_id != lease_id
+                || pending.recovery_contract_version != recovery_contract_version
+                || pending.redundant_session_id.as_deref() != redundant_session_id
                 || pending.accept_warm != accept_warm
                 || pending.failure_code.as_deref() != failure_code
             {
@@ -3628,6 +3767,8 @@ where
         let pending = StoredPendingCompensationStop {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: lease_id.to_string(),
+            recovery_contract_version,
+            redundant_session_id: redundant_session_id.map(str::to_string),
             accept_warm,
             failure_code: failure_code.map(str::to_string),
         };
@@ -4108,6 +4249,7 @@ where
         connection: &Connection,
         request_id: &str,
         operation_id: &str,
+        redundant_session_id: Option<&str>,
         stage: FailedStartStage,
         error: &CoreError,
     ) -> Result<(), CoreError> {
@@ -4122,6 +4264,7 @@ where
             &connection.lease_id,
             accept_warm,
             failure_code.as_deref(),
+            redundant_session_id,
         ) {
             Ok(pending) => pending,
             Err(storage_error) => {
@@ -4149,11 +4292,6 @@ where
                 });
                 return Err(storage_error);
             }
-        };
-        let compensation_request = ConnectionOperationRequest {
-            operation_id: durable_compensation.operation_id.clone(),
-            lease_id: durable_compensation.lease_id.clone(),
-            failure_code: durable_compensation.failure_code.clone(),
         };
         if stage.local_start_may_be_incomplete()
             && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
@@ -4189,11 +4327,7 @@ where
             }
         }
         let (connection, mut phase) = match self
-            .retry_operation(
-                access_token,
-                &compensation_request,
-                ConnectionOperation::Stop,
-            )
+            .retry_compensation_stop(access_token, &durable_compensation)
             .await
         {
             Ok(compensation) => {
@@ -4210,7 +4344,7 @@ where
                     };
                     self.logger.record(CoreLogEvent {
                         kind: "connection.start_compensation_failed",
-                        operation_id: Some(compensation_request.operation_id.clone()),
+                        operation_id: Some(durable_compensation.operation_id.clone()),
                         request_id: None,
                         code: Some(compensation_error.to_string()),
                     });
@@ -4243,7 +4377,7 @@ where
             Err(compensation_error) => {
                 self.logger.record(CoreLogEvent {
                     kind: "connection.start_compensation_failed",
-                    operation_id: Some(compensation_request.operation_id.clone()),
+                    operation_id: Some(durable_compensation.operation_id.clone()),
                     request_id: None,
                     code: Some(compensation_error.to_string()),
                 });
@@ -4286,6 +4420,7 @@ where
         connection: &Connection,
         request_id: &str,
         operation_id: &str,
+        redundant_session_id: Option<&str>,
         stage: FailedStartStage,
         _local_runtime_may_be_up: bool,
     ) -> CoreError {
@@ -4296,6 +4431,7 @@ where
                 connection,
                 request_id,
                 operation_id,
+                redundant_session_id,
                 stage,
                 &cancellation_error,
             )
@@ -4444,6 +4580,60 @@ where
             }
         }
     }
+
+    async fn retry_compensation_stop(
+        &self,
+        access_token: &str,
+        pending: &StoredPendingCompensationStop,
+    ) -> Result<ConnectionOperationResponse, CoreError> {
+        let Some(session_id) = pending_compensation_redundant_session(pending)? else {
+            return self
+                .retry_operation(
+                    access_token,
+                    &ConnectionOperationRequest {
+                        operation_id: pending.operation_id.clone(),
+                        lease_id: pending.lease_id.clone(),
+                        failure_code: pending.failure_code.clone(),
+                    },
+                    ConnectionOperation::Stop,
+                )
+                .await;
+        };
+        let request = RedundantStopRequest {
+            operation_id: pending.operation_id.clone(),
+            lease_id: pending.lease_id.clone(),
+            recovery_contract_version: RecoveryContractV2,
+            session_id: session_id.to_string(),
+        };
+        let delays = self.retry_policy.delays_millis();
+        let mut retry_index = 0;
+        let mut access_token = access_token.to_string();
+        let mut refreshed = false;
+        loop {
+            match self
+                .api
+                .stop_redundant_connection(&access_token, &request)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(CoreApiError::Unauthorized) if !refreshed => {
+                    access_token = self.refresh_access_token(&access_token).await?;
+                    refreshed = true;
+                }
+                Err(CoreApiError::Retryable) if retry_index < delays.len() => {
+                    let delay = delays[retry_index];
+                    retry_index += 1;
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                }
+                Err(error) => {
+                    self.set_phase(phase_for_api_error(&error)).await;
+                    return Err(error.into());
+                }
+            }
+        }
+    }
 }
 
 fn reusable_operation_id(
@@ -4481,6 +4671,19 @@ fn reusable_operation_id(
         .map(|saved| saved.lease_id.clone())
 }
 
+fn pending_compensation_redundant_session(
+    pending: &StoredPendingCompensationStop,
+) -> Result<Option<&str>, CoreError> {
+    match (
+        pending.recovery_contract_version,
+        pending.redundant_session_id.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(2), Some(session_id)) if !session_id.is_empty() => Ok(Some(session_id)),
+        _ => Err(CoreError::Storage),
+    }
+}
+
 fn pending_start_matches_options(pending: &StoredPendingStart, options: &ConnectOptions) -> bool {
     pending.layer == options.layer
         && pending.tic_connection_mode == options.tic_connection_mode
@@ -4491,17 +4694,39 @@ fn pending_start_matches_options(pending: &StoredPendingStart, options: &Connect
 
 fn pending_start_contract(
     pending: &StoredPendingStart,
-) -> Result<(ConnectionStartContract, Option<u32>, Option<String>), CoreError> {
+) -> Result<
+    (
+        ConnectionStartContract,
+        Option<u32>,
+        Option<u32>,
+        Option<bool>,
+        Option<String>,
+    ),
+    CoreError,
+> {
     match (
         pending.recovery_contract_version,
+        pending.redundancy_contract_version,
+        pending.reserve_enabled,
         pending.request_fingerprint.as_ref(),
     ) {
-        (None, None) => Ok((ConnectionStartContract::Legacy, None, None)),
-        (Some(1), Some(fingerprint)) if !fingerprint.is_empty() => Ok((
+        (None, None, None, None) => Ok((ConnectionStartContract::Legacy, None, None, None, None)),
+        (Some(1), None, None, Some(fingerprint)) if !fingerprint.is_empty() => Ok((
             ConnectionStartContract::RecoveryV1,
             Some(1),
+            None,
+            None,
             Some(fingerprint.clone()),
         )),
+        (Some(2), Some(1), Some(reserve_enabled), Some(fingerprint)) if !fingerprint.is_empty() => {
+            Ok((
+                ConnectionStartContract::RecoveryV2,
+                Some(2),
+                Some(1),
+                Some(reserve_enabled),
+                Some(fingerprint.clone()),
+            ))
+        }
         _ => Err(CoreError::Storage),
     }
 }
@@ -4696,10 +4921,119 @@ fn transient_start_rejection(code: &str) -> bool {
     code == "configuration_fetch_failed"
 }
 
+fn redundant_tunnel_start(
+    response: &ConnectionStartResponse,
+    operation_id: &str,
+    request_fingerprint: Option<&str>,
+    reserve_enabled: Option<bool>,
+) -> Result<Option<RedundantTunnelStart>, CoreError> {
+    let Some(redundancy) = response.redundancy.as_ref() else {
+        return Ok(None);
+    };
+    let Some(request_fingerprint) = request_fingerprint.filter(|value| value.len() == 64) else {
+        return Err(CoreError::Api(CoreApiError::Rejected {
+            code: "invalid_client_api_response".to_string(),
+            message: "Панель вернула резервную сессию без отпечатка операции.".to_string(),
+            retry_after_seconds: None,
+        }));
+    };
+    let Some(reserve_enabled) = reserve_enabled else {
+        return Err(CoreError::Api(CoreApiError::Rejected {
+            code: "invalid_client_api_response".to_string(),
+            message: "Панель вернула резервную сессию без исходного режима резерва.".to_string(),
+            retry_after_seconds: None,
+        }));
+    };
+    let primary_probe = response.health_probe.clone();
+    if redundancy.state != RedundancyState::Disabled && primary_probe.is_none() {
+        return Err(CoreError::Api(CoreApiError::Rejected {
+            code: "invalid_client_api_response".to_string(),
+            message: "Панель не вернула проверку основного подключения.".to_string(),
+            retry_after_seconds: None,
+        }));
+    }
+    if redundancy.state == RedundancyState::Disabled
+        && (redundancy.standby_desired || redundancy.standby.is_some())
+    {
+        return Err(CoreError::Api(CoreApiError::Rejected {
+            code: "invalid_client_api_response".to_string(),
+            message: "Панель вернула противоречивую отключённую резервную сессию.".to_string(),
+            retry_after_seconds: None,
+        }));
+    }
+    let standby = redundancy
+        .standby
+        .as_ref()
+        .map(|member| RedundantTunnelStandbyStart {
+            member: RedundantTunnelMemberStart {
+                slot: RedundancyMemberSlot::B,
+                lease_id: member.connection.lease_id.clone(),
+                health_probe: Some(member.health_probe.clone()),
+            },
+            configuration: TunnelConfiguration::new(member.configuration.clone()),
+        });
+    Ok(Some(RedundantTunnelStart {
+        session_id: redundancy.session_id.clone(),
+        operation_id: operation_id.to_string(),
+        request_fingerprint: request_fingerprint.to_string(),
+        reserve_enabled,
+        virtual_address_v4: redundancy.virtual_address_v4.clone(),
+        standby_desired: redundancy.standby_desired,
+        active_lease_id: response.connection.lease_id.clone(),
+        local_active_lease_id: response.connection.lease_id.clone(),
+        role_generation: redundancy.role_generation,
+        membership_generation: redundancy.membership_generation,
+        primary: RedundantTunnelMemberStart {
+            slot: RedundancyMemberSlot::A,
+            lease_id: response.connection.lease_id.clone(),
+            health_probe: primary_probe,
+        },
+        standby,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nelomai_client_tunnel::TunnelStatus;
+
+    #[test]
+    fn redundant_response_maps_both_members_into_tunnel_start() {
+        let response: ConnectionStartResponse = serde_json::from_str(include_str!(
+            "../../../contracts/fixtures/valid/connection-start-redundant-response.json"
+        ))
+        .unwrap();
+
+        let start =
+            redundant_tunnel_start(&response, "operation-1", Some(&"f".repeat(64)), Some(true))
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(start.session_id, "20000000-0000-4000-8000-000000000001");
+        assert!(start.reserve_enabled);
+        assert_eq!(
+            start.primary.slot,
+            nelomai_contracts::RedundancyMemberSlot::A
+        );
+        assert_eq!(
+            start.primary.lease_id,
+            "20000000-0000-4000-8000-000000000002"
+        );
+        let standby = start.standby.as_ref().unwrap();
+        assert_eq!(
+            standby.member.slot,
+            nelomai_contracts::RedundancyMemberSlot::B
+        );
+        assert_eq!(
+            standby.member.lease_id,
+            "20000000-0000-4000-8000-000000000003"
+        );
+        assert!(standby
+            .configuration
+            .expose()
+            .contains("standby-delivered-only-to-core"));
+        assert!(!format!("{start:?}").contains("standby-delivered-only-to-core"));
+    }
 
     #[test]
     fn pending_compensation_uses_a_generic_release_error() {
