@@ -720,8 +720,15 @@ internal class RedundantConnectionCoordinator(
             val reason = requireNotNull(transaction.retry.pendingRoleReason)
             val response = try {
                 panel.reportRole(transaction, reason)
-            } catch (_: Throwable) {
-                return false
+            } catch (error: Throwable) {
+                if (error !is BackgroundConnectionException ||
+                    error.code != REDUNDANT_ROLE_MEMBERSHIP_CONFLICT
+                ) {
+                    return false
+                }
+                transaction = recoverPendingRoleMembershipLocked(transaction)
+                    ?: return false
+                return@repeat
             }
             val canonical = transaction.withCanonical(response.session)
             if (response.action == "rebase") {
@@ -736,6 +743,33 @@ internal class RedundantConnectionCoordinator(
             }
         }
         return false
+    }
+
+    private fun recoverPendingRoleMembershipLocked(
+        transaction: AndroidRedundantTransaction,
+    ): AndroidRedundantTransaction? {
+        val response = try {
+            panel.recover(transaction)
+        } catch (_: Throwable) {
+            return null
+        }
+        return try {
+            val pendingRoleLeaseId = transaction.retry.pendingRoleLeaseId ?: return null
+            if (response.session.sessionId != transaction.sessionId ||
+                pendingRoleLeaseId != transaction.localActiveLeaseId ||
+                !response.session.containsCurrentLease(pendingRoleLeaseId)
+            ) {
+                emitTotalLossCommandLocked(transaction)
+                return null
+            }
+            val canonical = transaction.withRecoveredCanonical(response.session).copy(
+                localActiveLeaseId = pendingRoleLeaseId,
+            )
+            if (!persistExactTransaction(transaction, canonical)) return null
+            status()
+        } finally {
+            response.configurations.values.forEach { it.fill(0) }
+        }
     }
 
     override fun releaseStandby(): Boolean = synchronized(gate) {
@@ -1234,6 +1268,7 @@ internal class RedundantConnectionCoordinator(
 
     private companion object {
         const val HEALTH_FAILOVER_REASON = "primary_unhealthy"
+        const val REDUNDANT_ROLE_MEMBERSHIP_CONFLICT = "session_membership_conflict"
         const val MAX_PENDING_NATIVE_SWITCH_ATTEMPTS = 3
         const val PRIMARY_READINESS_TIMEOUT_MILLIS = 30_000L
         const val REPLACEMENT_DELAY_SECONDS = 60L

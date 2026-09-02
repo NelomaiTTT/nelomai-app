@@ -1327,6 +1327,102 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun terminalRoleConflictRecoversCanonicalMembershipAndRetriesExactPendingRole() {
+        val recoveredConfigurations = mapOf(
+            "lease-a" to "secret-a".toByteArray(),
+            "lease-b" to "secret-b".toByteArray(),
+        )
+        val panel = FakePanel(
+            role = RedundantRoleResponse(
+                action = "accepted",
+                localActiveLeaseId = "lease-a",
+                session = session(
+                    activeLeaseId = "lease-a",
+                    roleGeneration = 7,
+                    membershipGeneration = 4,
+                ),
+            ),
+            configurations = recoveredConfigurations,
+            recoveredSession = session(
+                activeLeaseId = "lease-a",
+                roleGeneration = 7,
+                membershipGeneration = 4,
+            ),
+            roleFailureCodes = ArrayDeque(listOf("session_membership_conflict")),
+        )
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), panel, FakeNative())
+
+        assertTrue(coordinator.reportLocalRole("primary_unhealthy"))
+
+        val recovered = requireNotNull(coordinator.status())
+        assertEquals(2, panel.roleCalls)
+        assertEquals(1, panel.recoverCalls)
+        assertEquals(7L, recovered.roleGeneration)
+        assertEquals(4L, recovered.membershipGeneration)
+        assertFalse(recovered.retry.roleObservationPending)
+        assertTrue(recoveredConfigurations.values.all { bytes -> bytes.all { it == 0.toByte() } })
+    }
+
+    @Test
+    fun terminalRoleConflictFailsClosedWhenPendingActiveLeaseWasRemoved() {
+        val recoveredConfigurations = mapOf(
+            "replacement-a" to "replacement-secret".toByteArray(),
+        )
+        val panel = FakePanel(
+            configurations = recoveredConfigurations,
+            recoveredSession = BackgroundRedundantSession(
+                sessionId = "22222222-2222-4222-8222-222222222222",
+                state = "connected",
+                activeLeaseId = "replacement-a",
+                slotALeaseId = "replacement-a",
+                slotBLeaseId = null,
+                standbyDesired = true,
+                roleGeneration = 7,
+                membershipGeneration = 4,
+                reason = null,
+            ),
+            roleFailureCodes = ArrayDeque(listOf("session_membership_conflict")),
+        )
+        var totalLossCallbacks = 0
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            FakeNative(),
+            onAllSlotsStalled = { totalLossCallbacks += 1 },
+        )
+
+        assertFalse(coordinator.reportLocalRole("primary_unhealthy"))
+        assertFalse(coordinator.reportLocalRole("primary_unhealthy"))
+
+        assertEquals(1, panel.roleCalls)
+        assertEquals(1, panel.recoverCalls)
+        assertEquals(1, totalLossCallbacks)
+        assertTrue(requireNotNull(coordinator.status()).retry.roleObservationPending)
+        assertTrue(recoveredConfigurations.values.all { bytes -> bytes.all { it == 0.toByte() } })
+    }
+
+    @Test
+    fun terminalRoleConflictKeepsObservationPendingWhenRecoveryTransportFails() {
+        val panel = FakePanel(
+            roleFailureCodes = ArrayDeque(listOf("session_membership_conflict")),
+            recoverFailures = ArrayDeque(listOf(true)),
+        )
+        var totalLossCallbacks = 0
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            FakeNative(),
+            onAllSlotsStalled = { totalLossCallbacks += 1 },
+        )
+
+        assertFalse(coordinator.reportLocalRole("primary_unhealthy"))
+
+        assertEquals(1, panel.recoverCalls)
+        assertEquals(0, totalLossCallbacks)
+        assertTrue(requireNotNull(coordinator.status()).retry.roleObservationPending)
+    }
+
+    @Test
     fun recoveryDrainsPendingRoleObservationAfterProcessRecreation() {
         val pending = transaction(localActiveLeaseId = "lease-b").copy(
             retry = AndroidRedundantRetryState(
@@ -1796,6 +1892,8 @@ private class FakePanel(
     private val acquiredSession: BackgroundRedundantSession? = null,
     private val stopResults: ArrayDeque<Boolean> = ArrayDeque(),
     private val roleFailures: ArrayDeque<Boolean> = ArrayDeque(),
+    private val roleFailureCodes: ArrayDeque<String> = ArrayDeque(),
+    private val recoverFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val acquireFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val commitFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val releaseFailures: ArrayDeque<Boolean> = ArrayDeque(),
@@ -1806,6 +1904,7 @@ private class FakePanel(
 ) : RedundantConnectionPanel {
     var stopCalls = 0
     var roleCalls = 0
+    var recoverCalls = 0
     var commitCalls = 0
     val acquireOperationIds = mutableListOf<String>()
     val acquireReplaceLeaseIds = mutableListOf<String?>()
@@ -1814,6 +1913,10 @@ private class FakePanel(
     val releasedLeaseIds = mutableListOf<String>()
     val releaseAttempts = mutableListOf<String?>()
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
+        recoverCalls += 1
+        if (recoverFailures.removeFirstOrNull() == true) {
+            throw BackgroundConnectionException("offline")
+        }
         recoverEntered?.countDown()
         releaseRecovery?.let { check(it.await(2, TimeUnit.SECONDS)) }
         return RedundantRecoveryResponse(
@@ -1837,6 +1940,7 @@ private class FakePanel(
     }
     override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
         roleCalls += 1
+        roleFailureCodes.removeFirstOrNull()?.let { throw BackgroundConnectionException(it) }
         if (roleFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
         return if (role?.action == "rebase" && roleCalls > 1) {
             RedundantRoleResponse("accepted", transaction.localActiveLeaseId!!, role.session)
