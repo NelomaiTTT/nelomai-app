@@ -369,6 +369,7 @@ private data class PendingRedundantStop(
     val owner: RedundantVpnProcessOwner?,
     val serviceGeneration: Long,
     val localClosed: Boolean,
+    val allowRestart: Boolean,
 )
 
 private data class PendingRedundantStopAttempt(
@@ -736,6 +737,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private lateinit var connectionIntentAttemptDispatcher: AndroidConnectionIntentAttemptDispatcher
     private lateinit var logoutCoordinator: AndroidLogoutCoordinator
     private lateinit var backgroundLogoutLifecycle: BackgroundLogoutServiceLifecycle
+    private lateinit var redundantTotalLossLifecycle: RedundantTotalLossLifecycle
     private val connectionIntentDispatch = AndroidConnectionIntentDispatchState()
     private val connectionIntentAdmission = AndroidConnectionIntentAdmission()
     private val connectionIntentRuntimeFence = AndroidRuntimeStartDispatchFence()
@@ -774,6 +776,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     owner = null,
                     serviceGeneration = serviceGeneration,
                     localClosed = true,
+                    allowRestart = it.allowRestart,
                 )
             }
             is RecoveryStoreResult.Failure -> {
@@ -855,6 +858,20 @@ class NelomaiVpnService : GoBackend.VpnService() {
             beginRedundantStop = ::beginBackgroundLogoutRedundantStop,
             runLogout = ::runBackgroundLogoutAttempt,
             scheduleRetry = ::scheduleNextBackgroundLogoutRetry,
+            stopIfIdle = ::stopIfIdle,
+        )
+        redundantTotalLossLifecycle = RedundantTotalLossLifecycle(
+            currentServiceGeneration = { VPN_PROCESS_SERVICE_GENERATION.get() },
+            barrierPending = ::redundantStartBlocked,
+            logoutState = ::backgroundLogoutState,
+            recovery = recoveryStore::read,
+            post = { restoreHandler.post(it) },
+            retryCleanup = {
+                schedulePendingRedundantStopRetry()
+                scheduleRetainedRedundantOwnerRetry()
+            },
+            resume = ::resumeDurableWorkAfterRedundantBarrier,
+            scheduleLogout = ::scheduleLogoutAttempt,
             stopIfIdle = ::stopIfIdle,
         )
         runCatching { AutomaticDiagnostics.initialize(applicationContext) }
@@ -1263,6 +1280,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
             probeSourceIpv4 = probeSourceIpv4,
             initialNetworkValidated = physicalState.validated,
         )
+        val ownerServiceGeneration = serviceGeneration
+        var coordinatorOwner: RedundantConnectionCoordinator? = null
         val coordinator = RedundantConnectionCoordinator(
             recoveryStore,
             ServiceRedundantConnectionPanel(::serviceActiveCredential),
@@ -1270,7 +1289,17 @@ class NelomaiVpnService : GoBackend.VpnService() {
             healthMonitor = RedundantHealthMonitor(
                 initialNetworkValidated = physicalState.validated,
             ),
-            onAllSlotsStalled = { TunnelLog.warning("redundant.session_stalled") },
+            onAllSlotsStalled = {
+                coordinatorOwner?.let { owner ->
+                    restoreHandler.post {
+                        handleRedundantTotalLoss(
+                            ownerServiceGeneration = ownerServiceGeneration,
+                            startOperationId = transaction.startOperationId,
+                            owner = owner,
+                        )
+                    }
+                }
+            },
             onReserveStateChanged = { state ->
                 AutomaticDiagnostics.onRedundantStateChanged(
                     state?.wireName,
@@ -1286,6 +1315,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             expectedStartOperationId = transaction.startOperationId,
             mutationFence = redundantMutationFence,
         )
+        coordinatorOwner = coordinator
         if (!installActive) return coordinator to native
         val callbackIdentity = RedundantPhysicalNetworkCallbackIdentity(
             serviceGeneration = serviceGeneration,
@@ -1323,6 +1353,65 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
         restoreHandler.post(redundantHealthTick)
         return coordinator to native
+    }
+
+    private fun handleRedundantTotalLoss(
+        ownerServiceGeneration: Long,
+        startOperationId: String,
+        owner: RedundantConnectionCoordinator,
+    ) {
+        val installed = redundantVpnOwnerSlot.snapshot()
+        val recovery = recoveryStore.read()
+        when (redundantTotalLossCommandDisposition(
+            ownerServiceGeneration = ownerServiceGeneration,
+            currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+            serviceDestroyed = serviceDestroyed,
+            startOperationId = startOperationId,
+            installedStartOperationId = installed?.startOperationId,
+            installedOwnerMatches = installed?.owner === owner,
+            stopPending = pendingRedundantStop != null,
+            tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+            stopLookupPending = redundantStopLookupBarrier.hasPending(),
+            logoutState = backgroundLogoutState(),
+            recovery = recovery,
+        )) {
+            RedundantTotalLossCommandDisposition.IGNORE -> return
+            RedundantTotalLossCommandDisposition.FAIL_CLOSED_STOP -> {
+                TunnelLog.warning("redundant.session_stalled", "recovery_unreadable")
+                beginFailClosedRedundantStop(startOperationId, owner)
+                return
+            }
+            RedundantTotalLossCommandDisposition.PREPARE_RESTART_AND_STOP -> Unit
+        }
+        val transaction = requireNotNull(
+            (recovery as RecoveryStoreResult.Success).value.redundantTransaction,
+        )
+        val prepared = recoveryStore.prepareRedundantTotalLoss(
+            expectedStartOperationId = startOperationId,
+            replay = AndroidStartReplay(
+                startOperationId = UUID.randomUUID().toString(),
+                contractVersion = 1,
+                requestFingerprint = androidConnectionIntentFingerprint(
+                    transaction.template,
+                    requiresMeasuredCandidateSelection(
+                        transaction.template.layer,
+                        transaction.template.ticConnectionMode,
+                        transaction.template.allowAlternate,
+                    ),
+                ),
+            ),
+        )
+        val restartPrepared = (prepared as? RecoveryStoreResult.Success)
+            ?.value?.redundantTransaction?.retry?.totalLossRestartReplay != null
+        TunnelLog.warning(
+            "redundant.session_stalled",
+            if (restartPrepared) "restart_prepared" else "restart_prepare_failed",
+        )
+        beginFailClosedRedundantStop(
+            startOperationId = startOperationId,
+            owner = owner,
+            allowRestart = restartPrepared,
+        )
     }
 
     private fun applyRedundantPhysicalNetworks(
@@ -1424,6 +1513,28 @@ class NelomaiVpnService : GoBackend.VpnService() {
     ): Boolean {
         val durableTransaction = (recovery as? RecoveryStoreResult.Success)
             ?.value?.redundantTransaction ?: return false
+        if (durableTransaction.retry.totalLossRestartReplay != null) {
+            val replayServiceGeneration = serviceGeneration
+            restoreHandler.post {
+                if (serviceDestroyed ||
+                    replayServiceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() ||
+                    pendingRedundantStop != null
+                ) {
+                    return@post
+                }
+                val current = (recoveryStore.read() as? RecoveryStoreResult.Success)
+                    ?.value?.redundantTransaction?.takeIf {
+                        it.startOperationId == durableTransaction.startOperationId &&
+                            it.retry.totalLossRestartReplay != null
+                    } ?: return@post
+                beginFailClosedRedundantStop(
+                    startOperationId = current.startOperationId,
+                    owner = redundantOwnerForOperation(current.startOperationId),
+                    allowRestart = true,
+                )
+            }
+            return true
+        }
         val transaction = activeRedundantTransactionForCurrentWork(
             recovery = recovery,
             expectedStartOperationId = durableTransaction.startOperationId,
@@ -1452,6 +1563,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun beginFailClosedRedundantStop(
         startOperationId: String,
         owner: RedundantVpnProcessOwner?,
+        allowRestart: Boolean = false,
     ): Boolean {
         val existing = pendingRedundantStop
         if (existing != null && existing.startOperationId != startOperationId) {
@@ -1467,12 +1579,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
             } else {
                 existing.localClosed
             },
+            allowRestart = existing.allowRestart && allowRestart,
         ) ?: PendingRedundantStop(
                 startOperationId = startOperationId,
                 tombstone = null,
                 owner = owner,
                 serviceGeneration = serviceGeneration,
                 localClosed = owner == null,
+                allowRestart = allowRestart,
         )
         pendingRedundantStop = pending
         invalidateConnectionIntentStarts()
@@ -1482,23 +1596,47 @@ class NelomaiVpnService : GoBackend.VpnService() {
             desiredActive = null,
             changed = true,
         )
-        val tombstone = when (val result = redundantCancelTombstones.persist(startOperationId)) {
+        val tombstone = when (val result = redundantCancelTombstones.persist(
+            startOperationId,
+            pending.allowRestart,
+        )) {
             is RecoveryStoreResult.Success -> result.value
             is RecoveryStoreResult.Failure -> {
                 TunnelLog.warning("redundant.cancel_tombstone_save_failed", result.code)
                 null
             }
         }
-        val durablePending = pending.copy(tombstone = tombstone ?: pending.tombstone)
+        val effectiveTombstone = tombstone ?: pending.tombstone
+        val durablePending = pending.copy(
+            tombstone = effectiveTombstone,
+            allowRestart = pending.allowRestart &&
+                (effectiveTombstone?.allowRestart ?: true),
+        )
         pendingRedundantStop = durablePending
         if (durablePending.tombstone != null) redundantCancelTombstoneUnreadable = false
+        val durableStopFence = if (durablePending.allowRestart) {
+            true
+        } else {
+            val stopOperationId = durablePending.tombstone?.stopOperationId
+                ?: UUID.randomUUID().toString()
+            when (val result = recoveryStore.cancelRedundantIntentAndDeferStop(
+                stopOperationId = stopOperationId,
+                expectedStartOperationId = startOperationId,
+            )) {
+                is RecoveryStoreResult.Success -> true
+                is RecoveryStoreResult.Failure -> {
+                    TunnelLog.warning("redundant.stop_fence_failed", result.code)
+                    false
+                }
+            }
+        }
         if (owner == null && durablePending.tombstone != null) {
             redundantStartOperation.completeCancelled(startOperationId)
         }
         idleStopDebouncer.cancel()
         if (owner == null || existing?.owner != null) {
             schedulePendingRedundantStopRetry()
-            return durablePending.tombstone != null
+            return durablePending.tombstone != null && durableStopFence
         }
         executeRedundantCleanup {
             val locallyStopped = runCatching(owner::closeLocal).getOrDefault(false)
@@ -1516,7 +1654,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 schedulePendingRedundantStopRetry()
             }
         }
-        return durablePending.tombstone != null
+        return durablePending.tombstone != null && durableStopFence
     }
 
     private fun schedulePendingRedundantStopRetry() {
@@ -1545,6 +1683,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                                 owner = null,
                                 serviceGeneration = serviceGeneration,
                                 localClosed = true,
+                                allowRestart = tombstone.allowRestart,
                             )
                             schedulePendingRedundantStopRetry()
                         },
@@ -1564,7 +1703,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
         executeRedundantCleanup {
             val tombstone = pending.tombstone ?: when (
-                val persisted = redundantCancelTombstones.persist(pending.startOperationId)
+                val persisted = redundantCancelTombstones.persist(
+                    pending.startOperationId,
+                    pending.allowRestart,
+                )
             ) {
                 is RecoveryStoreResult.Success -> persisted.value
                 is RecoveryStoreResult.Failure -> {
@@ -1580,7 +1722,26 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     RedundantRevokeResult(fenced = false, stopped = false)
                 }
                 transaction == null -> {
-                    RedundantRevokeResult(fenced = true, stopped = true)
+                    val envelope = (recovery as RecoveryStoreResult.Success).value
+                    val promotedForThisStop = envelope.intent.retry
+                        .redundantTotalLossSourceStartOperationId == pending.startOperationId
+                    if (!pending.allowRestart && promotedForThisStop) {
+                        val cancelled = recoveryStore.cancelRedundantIntentAndDeferStop(
+                            stopOperationId = tombstone.stopOperationId,
+                            expectedStartOperationId = pending.startOperationId,
+                        ) is RecoveryStoreResult.Success
+                        RedundantRevokeResult(fenced = cancelled, stopped = cancelled)
+                    } else {
+                        val terminalForBarrier = if (pending.allowRestart) {
+                            promotedForThisStop || !envelope.intent.desiredActive
+                        } else {
+                            !envelope.intent.desiredActive && envelope.leaseTransaction == null
+                        }
+                        RedundantRevokeResult(
+                            fenced = terminalForBarrier,
+                            stopped = terminalForBarrier,
+                        )
+                    }
                 }
                 transaction.startOperationId != pending.startOperationId -> {
                     runCatching { pending.owner?.closeLocal() }
@@ -1592,10 +1753,31 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         ?: redundantOwnerForOperation(pending.startOperationId),
                     createCleanupOwner = ::createRedundantCleanupCoordinator,
                     deferStop = {
-                        recoveryStore.deferRedundantStop(
-                            stopOperationId = tombstone.stopOperationId,
-                            expectedStartOperationId = pending.startOperationId,
-                        ) is RecoveryStoreResult.Success
+                        val restartStillAllowed = pendingRedundantStop?.takeIf {
+                            it.startOperationId == pending.startOperationId &&
+                                it.serviceGeneration == pending.serviceGeneration
+                        }?.allowRestart == true
+                        val durableRestartAllowed =
+                            (redundantCancelTombstones.read() as? RecoveryStoreResult.Success)
+                                ?.value?.takeIf {
+                                    it.startOperationId == tombstone.startOperationId &&
+                                        it.stopOperationId == tombstone.stopOperationId
+                                }?.allowRestart == true
+                        val restartPrepared = restartStillAllowed &&
+                            durableRestartAllowed &&
+                            transaction.retry.totalLossRestartReplay != null
+                        val fenced = if (restartPrepared) {
+                            recoveryStore.deferRedundantStop(
+                                stopOperationId = tombstone.stopOperationId,
+                                expectedStartOperationId = pending.startOperationId,
+                            )
+                        } else {
+                            recoveryStore.cancelRedundantIntentAndDeferStop(
+                                stopOperationId = tombstone.stopOperationId,
+                                expectedStartOperationId = pending.startOperationId,
+                            )
+                        }
+                        fenced is RecoveryStoreResult.Success
                     },
                     closeTemporaryOwner = ::closeOrRetainRedundantOwner,
                 )
@@ -1672,6 +1854,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     owner = replacementOwner,
                     serviceGeneration = serviceGeneration,
                     localClosed = replacementOwner == null,
+                    allowRestart = replacement.allowRestart,
                 )
                 completeRedundantStopWaiters(current.startOperationId, attempt.result)
                 completeFrameworkRevokeAfterCleanupAttempt()
@@ -1684,7 +1867,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 detachCompletedRedundantOwner(current)
                 completeRedundantStopWaiters(current.startOperationId, attempt.result)
                 completeFrameworkRevokeAfterCleanupAttempt()
-                completeRedundantStopServiceLifecycle()
+                completeRedundantStopServiceLifecycle(current.serviceGeneration)
                 return
             }
             RedundantTombstoneClearDisposition.CONFIRMED -> Unit
@@ -1704,15 +1887,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
         completeRedundantStopWaiters(current.startOperationId, attempt.result)
         completeFrameworkRevokeAfterCleanupAttempt()
-        completeRedundantStopServiceLifecycle()
+        completeRedundantStopServiceLifecycle(current.serviceGeneration)
     }
 
-    private fun completeRedundantStopServiceLifecycle() {
+    private fun completeRedundantStopServiceLifecycle(ownerServiceGeneration: Long) {
         if (serviceDestroyed) {
             redundantExecutor.shutdown()
             stopIfIdle()
         } else {
-            backgroundLogoutLifecycle.onRedundantStopCompleted()
+            redundantTotalLossLifecycle.onCleanupAcknowledged(ownerServiceGeneration)
         }
     }
 
@@ -5587,7 +5770,9 @@ internal class AndroidConnectionIntentCoordinator(
             return null
         }
         return when (envelope.intent.retry.pendingAction) {
-        "validate_capability" -> {
+        "validate_capability",
+        "redundant_total_loss_restart",
+        -> {
             // Older versions allocated the operation before capability validation. This marker
             // therefore belongs to an already-durable operation and must resume service-owned.
             store.clearPendingRetryAction(envelope.intent.generation)

@@ -88,6 +88,7 @@ internal data class AndroidRetryState(
     val reconcileOnceUsed: Boolean = false,
     val terminalDiagnosticPending: Boolean = false,
     val pendingAction: String? = null,
+    val redundantTotalLossSourceStartOperationId: String? = null,
 )
 
 internal data class AndroidConnectionIntent(
@@ -189,6 +190,9 @@ internal data class AndroidRedundantRetryState(
     val pendingNativeMembershipGeneration: Long? = null,
     val pendingNativeSwitchReason: String? = null,
     val pendingNativeSwitchAttempt: Int = 0,
+    val totalLossRestartReplay: AndroidStartReplay? = null,
+    val totalLossIntentGeneration: Long? = null,
+    val totalLossSourceStartOperationId: String? = null,
 )
 
 /** Safe recovery-v2 control state. Configurations and private keys remain ephemeral. */
@@ -350,6 +354,9 @@ internal object AndroidRecoveryEnvelopeCodec {
         put("reconcileOnceUsed", retry.reconcileOnceUsed)
         put("terminalDiagnosticPending", retry.terminalDiagnosticPending)
         retry.pendingAction?.let { put("pendingAction", it) }
+        retry.redundantTotalLossSourceStartOperationId?.let {
+            put("redundantTotalLossSourceStartOperationId", it)
+        }
     }
 
     private fun retryFromJson(payload: JSONObject) = AndroidRetryState(
@@ -372,8 +379,12 @@ internal object AndroidRecoveryEnvelopeCodec {
                 "terminal_after_cleanup",
                 "initial_terminal_report_pending",
                 "initial_terminal_after_cleanup",
+                "redundant_total_loss_restart",
             ))
         },
+        redundantTotalLossSourceStartOperationId = payload.optionalString(
+            "redundantTotalLossSourceStartOperationId",
+        )?.also(::requireSafeValue),
     )
 
     private fun leaseToJson(transaction: AndroidLeaseTransaction) = JSONObject().apply {
@@ -459,6 +470,19 @@ internal object AndroidRecoveryEnvelopeCodec {
                 put("pendingNativeSwitchReason", it)
             }
             put("pendingNativeSwitchAttempt", transaction.retry.pendingNativeSwitchAttempt)
+            transaction.retry.totalLossRestartReplay?.let { replay ->
+                put("totalLossRestartReplay", JSONObject().apply {
+                    put("startOperationId", replay.startOperationId)
+                    put("contractVersion", replay.contractVersion)
+                    put("requestFingerprint", replay.requestFingerprint)
+                })
+            }
+            transaction.retry.totalLossIntentGeneration?.let {
+                put("totalLossIntentGeneration", it)
+            }
+            transaction.retry.totalLossSourceStartOperationId?.let {
+                put("totalLossSourceStartOperationId", it)
+            }
         })
     }
 
@@ -503,6 +527,17 @@ internal object AndroidRecoveryEnvelopeCodec {
                 ),
                 pendingNativeSwitchReason = retry.optionalString("pendingNativeSwitchReason"),
                 pendingNativeSwitchAttempt = retry.optInt("pendingNativeSwitchAttempt", 0),
+                totalLossRestartReplay = retry.optJSONObject("totalLossRestartReplay")?.let {
+                    AndroidStartReplay(
+                        startOperationId = it.getString("startOperationId"),
+                        contractVersion = it.getInt("contractVersion"),
+                        requestFingerprint = it.getString("requestFingerprint"),
+                    )
+                },
+                totalLossIntentGeneration = retry.optionalLong("totalLossIntentGeneration"),
+                totalLossSourceStartOperationId = retry.optionalString(
+                    "totalLossSourceStartOperationId",
+                ),
             ),
         )
     }
@@ -536,8 +571,12 @@ internal object AndroidRecoveryEnvelopeCodec {
                 "terminal_after_cleanup",
                 "initial_terminal_report_pending",
                 "initial_terminal_after_cleanup",
+                "redundant_total_loss_restart",
             ),
         )
+        require((envelope.intent.retry.pendingAction == "redundant_total_loss_restart") ==
+            (envelope.intent.retry.redundantTotalLossSourceStartOperationId != null))
+        envelope.intent.retry.redundantTotalLossSourceStartOperationId?.let(::validateSafeValue)
         require(
             envelope.intent.retry.terminalDiagnosticPending ==
                 (envelope.intent.retry.pendingAction == "initial_terminal_report_pending"),
@@ -614,6 +653,9 @@ internal object AndroidRecoveryEnvelopeCodec {
                 transaction.retry.pendingNativeSourceLeaseId,
                 transaction.retry.pendingNativeActiveLeaseId,
                 transaction.retry.pendingNativeSwitchReason,
+                transaction.retry.totalLossRestartReplay?.startOperationId,
+                transaction.retry.totalLossRestartReplay?.requestFingerprint,
+                transaction.retry.totalLossSourceStartOperationId,
             ).forEach(::validateSafeValue)
             require(transaction.localActiveLeaseId == null ||
                 transaction.containsCurrentLease(transaction.localActiveLeaseId))
@@ -661,6 +703,29 @@ internal object AndroidRecoveryEnvelopeCodec {
             if (transaction.retry.pendingNativeActiveLeaseId == null) {
                 require(transaction.retry.pendingNativeSwitchAttempt == 0)
             }
+            val totalLossFields = listOf(
+                transaction.retry.totalLossRestartReplay,
+                transaction.retry.totalLossIntentGeneration,
+                transaction.retry.totalLossSourceStartOperationId,
+            )
+            require(totalLossFields.all { it == null } || totalLossFields.all { it != null })
+            transaction.retry.totalLossRestartReplay?.let { replay ->
+                require(replay.contractVersion > 0)
+                require(replay.startOperationId != transaction.startOperationId)
+                require(transaction.retry.totalLossIntentGeneration == envelope.intent.generation)
+                require(transaction.retry.totalLossSourceStartOperationId ==
+                    transaction.startOperationId)
+                require(envelope.intent.desiredActive)
+            }
+        }
+        if (envelope.intent.retry.pendingAction == "redundant_total_loss_restart") {
+            val transaction = requireNotNull(envelope.leaseTransaction)
+            require(envelope.redundantTransaction == null)
+            require(envelope.intent.desiredActive)
+            require(transaction.phase == LeasePhase.START_PENDING)
+            require(transaction.leaseId == null && transaction.stopOperationId == null)
+            require(transaction.startOperationId !=
+                envelope.intent.retry.redundantTotalLossSourceStartOperationId)
         }
         if (envelope.intent.retry.pendingAction == "terminal_after_cleanup") {
             val transaction = requireNotNull(envelope.leaseTransaction)
@@ -806,7 +871,86 @@ internal class AndroidRecoveryStore(
         ) {
             return@synchronized RecoveryStoreResult.Failure("redundant_stop_not_acknowledged")
         }
-        persist(clearDisarmedEpisode(current).copy(redundantTransaction = null))
+        val replay = transaction.retry.totalLossRestartReplay
+        val restartExact = replay != null && current.intent.desiredActive &&
+            transaction.retry.totalLossIntentGeneration == current.intent.generation &&
+            transaction.retry.totalLossSourceStartOperationId == transaction.startOperationId
+        if (!restartExact) {
+            return@synchronized persist(
+                clearDisarmedEpisode(current).copy(redundantTransaction = null),
+            )
+        }
+        val nextGeneration = current.intent.generation.checkedIncrement()
+            ?: return@synchronized RecoveryStoreResult.Failure(
+                "connection_intent_generation_exhausted",
+            )
+        val nextDiagnosticsEpisodeId = nextAndroidDiagnosticsEpisodeId(
+            current.intent.diagnosticsEpisodeId,
+            nextGeneration,
+        ) ?: return@synchronized RecoveryStoreResult.Failure(
+            "connection_diagnostics_episode_exhausted",
+        )
+        persist(current.copy(
+            intent = current.intent.copy(
+                generation = nextGeneration,
+                diagnosticsEpisodeId = nextDiagnosticsEpisodeId,
+                desiredActive = true,
+                armedHistory = false,
+                template = transaction.template,
+                retry = AndroidRetryState(
+                    pendingAction = "redundant_total_loss_restart",
+                    redundantTotalLossSourceStartOperationId = transaction.startOperationId,
+                ),
+            ),
+            leaseTransaction = AndroidLeaseTransaction(
+                generation = nextGeneration,
+                bootCount = current.intent.bootCount,
+                phase = LeasePhase.START_PENDING,
+                leaseId = null,
+                stopOperationId = null,
+                replay = normalizeReplay(requireNotNull(replay)),
+            ),
+            redundantTransaction = null,
+        ))
+    }
+
+    fun prepareRedundantTotalLoss(
+        expectedStartOperationId: String,
+        replay: AndroidStartReplay,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        val currentResult = readLocked()
+        if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
+        val current = (currentResult as RecoveryStoreResult.Success).value
+        val transaction = current.redundantTransaction
+            ?: return@synchronized RecoveryStoreResult.Failure("redundant_recovery_not_found")
+        if (transaction.startOperationId != expectedStartOperationId) {
+            return@synchronized RecoveryStoreResult.Failure(
+                "redundant_recovery_generation_conflict",
+            )
+        }
+        if (!current.intent.desiredActive || !transaction.desiredActive ||
+            transaction.retry.stopState != RedundantStopState.NONE
+        ) {
+            return@synchronized RecoveryStoreResult.Failure("redundant_stop_pending")
+        }
+        if (transaction.retry.totalLossRestartReplay != null) {
+            return@synchronized RecoveryStoreResult.Success(current)
+        }
+        val normalized = try {
+            normalizeReplay(replay)
+        } catch (_: Throwable) {
+            return@synchronized RecoveryStoreResult.Failure("connection_intent_invalid")
+        }
+        if (normalized.startOperationId == transaction.startOperationId) {
+            return@synchronized RecoveryStoreResult.Failure("connection_intent_invalid")
+        }
+        persist(current.copy(redundantTransaction = transaction.copy(
+            retry = transaction.retry.copy(
+                totalLossRestartReplay = normalized,
+                totalLossIntentGeneration = current.intent.generation,
+                totalLossSourceStartOperationId = transaction.startOperationId,
+            ),
+        )))
     }
 
     fun deferRedundantStop(
@@ -830,6 +974,61 @@ internal class AndroidRecoveryStore(
                 pendingNativeSwitchAttempt = 0,
             ),
         )
+    }
+
+    fun cancelRedundantIntentAndDeferStop(
+        stopOperationId: String,
+        expectedStartOperationId: String,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        val currentResult = readLocked()
+        if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
+        val current = (currentResult as RecoveryStoreResult.Success).value
+        val transaction = current.redundantTransaction
+        if (transaction == null) {
+            return@synchronized if (current.intent.desiredActive &&
+                current.intent.retry.pendingAction == "redundant_total_loss_restart" &&
+                current.intent.retry.redundantTotalLossSourceStartOperationId ==
+                expectedStartOperationId
+            ) {
+                persist(clearDisarmedEpisode(current))
+            } else {
+                RecoveryStoreResult.Failure("redundant_recovery_not_found")
+            }
+        }
+        if (transaction.startOperationId != expectedStartOperationId) {
+            return@synchronized RecoveryStoreResult.Failure(
+                "redundant_recovery_generation_conflict",
+            )
+        }
+        val normalizedStopOperationId = transaction.stopOperationId
+            ?: stopOperationId.also(AndroidRecoveryEnvelopeCodec::validateSafeValue)
+        persist(current.copy(
+            intent = current.intent.copy(desiredActive = false),
+            redundantTransaction = transaction.copy(
+                desiredActive = false,
+                stopOperationId = normalizedStopOperationId,
+                candidateLeaseId = null,
+                candidateSlot = null,
+                retry = transaction.retry.copy(
+                    stopState = RedundantStopState.PENDING,
+                    roleObservationPending = false,
+                    pendingRoleLeaseId = null,
+                    pendingRoleReason = null,
+                    acquirePending = false,
+                    acquireOperationId = null,
+                    acquireReplaceLeaseId = null,
+                    pendingNativeSourceLeaseId = null,
+                    pendingNativeActiveLeaseId = null,
+                    pendingNativeActiveSlot = null,
+                    pendingNativeMembershipGeneration = null,
+                    pendingNativeSwitchReason = null,
+                    pendingNativeSwitchAttempt = 0,
+                    totalLossRestartReplay = null,
+                    totalLossIntentGeneration = null,
+                    totalLossSourceStartOperationId = null,
+                ),
+            ),
+        ))
     }
 
     fun beginStart(
@@ -1169,7 +1368,10 @@ internal class AndroidRecoveryStore(
         val current = (currentResult as RecoveryStoreResult.Success).value
         if (current.intent.generation != expectedGeneration) return@synchronized generationConflict()
         persist(current.copy(intent = current.intent.copy(
-            retry = current.intent.retry.copy(pendingAction = null),
+            retry = current.intent.retry.copy(
+                pendingAction = null,
+                redundantTotalLossSourceStartOperationId = null,
+            ),
         )))
     }
 

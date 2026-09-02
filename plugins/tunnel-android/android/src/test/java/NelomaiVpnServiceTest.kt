@@ -310,6 +310,46 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun explicitStopDurablyDowngradesATotalLossRestartTombstone() {
+        val backend = ServiceCancelTombstoneBackend()
+        val store = RedundantCancelTombstoneStore(backend) { "stop-operation-a" }
+
+        val totalLoss = store.persist("start-operation-a", allowRestart = true)
+        val explicit = store.persist("start-operation-a", allowRestart = false)
+
+        assertEquals(
+            RecoveryStoreResult.Success(RedundantCancelTombstone(
+                "start-operation-a",
+                "stop-operation-a",
+                allowRestart = true,
+            )),
+            totalLoss,
+        )
+        assertEquals(
+            RecoveryStoreResult.Success(RedundantCancelTombstone(
+                "start-operation-a",
+                "stop-operation-a",
+                allowRestart = false,
+            )),
+            explicit,
+        )
+        assertEquals(explicit, RedundantCancelTombstoneStore(backend).read())
+    }
+
+    @Test
+    fun legacyExplicitTombstoneRemainsReadableAndClearable() {
+        val backend = ServiceCancelTombstoneBackend().apply {
+            record = "1\nstart-operation-a\nstop-operation-a"
+        }
+        val store = RedundantCancelTombstoneStore(backend)
+        val expected = RedundantCancelTombstone("start-operation-a", "stop-operation-a")
+
+        assertEquals(RecoveryStoreResult.Success(expected), store.read())
+        assertTrue(store.clear(expected))
+        assertEquals(null, backend.record)
+    }
+
+    @Test
     fun corruptCancelTombstoneFailsClosedInsteadOfAllowingResume() {
         val backend = ServiceCancelTombstoneBackend().apply { record = "broken" }
 
@@ -3151,6 +3191,52 @@ class NelomaiVpnServiceTest {
 
         assertEquals(1, redundantSchedules)
         assertEquals(0, connectionSchedules)
+    }
+
+    @Test
+    fun serviceLifecycleNeverTreatsBareDesiredActiveAsDurableWork() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        store.setDesiredActive(0, true).successEnvelope()
+        var schedules = 0
+        val lifecycle = ConnectionIntentServiceLifecycle(
+            coordinator = coordinator(store),
+            schedule = { schedules += 1 },
+        )
+
+        assertFalse(lifecycle.onEnsureRunning())
+        assertEquals(0, schedules)
+    }
+
+    @Test
+    fun promotedTotalLossReplayResumesAsRealConnectionIntentWork() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
+        store.beginRedundant(transaction).successEnvelope()
+        store.prepareRedundantTotalLoss(
+            transaction.startOperationId,
+            AndroidStartReplay("replacement-start", 1, "replacement-fingerprint"),
+        ).successEnvelope()
+        store.deferRedundantStop("v2-stop", transaction.startOperationId).successEnvelope()
+        store.updateRedundant(transaction.startOperationId) { current ->
+            current.copy(retry = current.retry.copy(
+                stopState = RedundantStopState.ACKNOWLEDGED,
+            ))
+        }.successEnvelope()
+        store.completeRedundantStop("v2-stop", transaction.startOperationId).successEnvelope()
+        var redundantSchedules = 0
+        var connectionSchedules = 0
+        val lifecycle = ConnectionIntentServiceLifecycle(
+            coordinator = coordinator(store),
+            scheduleRedundant = {
+                redundantSchedules += 1
+                true
+            },
+            schedule = { connectionSchedules += 1 },
+        )
+
+        assertTrue(lifecycle.onEnsureRunning())
+        assertEquals(0, redundantSchedules)
+        assertEquals(1, connectionSchedules)
     }
 
     @Test

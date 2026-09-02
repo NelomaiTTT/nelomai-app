@@ -682,6 +682,106 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun totalLossReplayIsPersistedOnceAndPromotedOnlyAfterAcknowledgedCleanup() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginRedundant(redundantTransaction("v2-start")).success()
+        val replay = AndroidStartReplay("replacement-start", 1, "replacement-fingerprint")
+
+        store.prepareRedundantTotalLoss("v2-start", replay).success()
+        store.prepareRedundantTotalLoss(
+            "v2-start",
+            AndroidStartReplay("ignored-start", 1, "ignored-fingerprint"),
+        ).success()
+        val prepared = requireNotNull(store.read().success().redundantTransaction)
+        assertEquals(replay, prepared.retry.totalLossRestartReplay)
+        assertEquals(0L, prepared.retry.totalLossIntentGeneration)
+
+        store.deferRedundantStop("v2-stop", "v2-start").success()
+        store.updateRedundant("v2-start") { transaction ->
+            transaction.copy(retry = transaction.retry.copy(
+                stopState = RedundantStopState.ACKNOWLEDGED,
+            ))
+        }.success()
+        val promoted = store.completeRedundantStop("v2-stop", "v2-start").success()
+
+        assertNull(promoted.redundantTransaction)
+        assertTrue(promoted.intent.desiredActive)
+        assertEquals(1L, promoted.intent.generation)
+        assertEquals(LeasePhase.START_PENDING, promoted.leaseTransaction?.phase)
+        assertEquals(replay, promoted.leaseTransaction?.replay)
+        assertEquals("redundant_total_loss_restart", promoted.intent.retry.pendingAction)
+        assertEquals(
+            "v2-start",
+            promoted.intent.retry.redundantTotalLossSourceStartOperationId,
+        )
+
+        val admitted = store.clearPendingRetryAction(promoted.intent.generation).success()
+        assertNull(admitted.intent.retry.pendingAction)
+        assertNull(admitted.intent.retry.redundantTotalLossSourceStartOperationId)
+    }
+
+    @Test
+    fun explicitRedundantStopWinsAndClearsEveryRestartAndSwitchFence() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginRedundant(redundantTransaction("v2-start").copy(
+            retry = AndroidRedundantRetryState(
+                roleObservationPending = true,
+                pendingRoleLeaseId = "lease-a",
+                pendingRoleReason = "primary_unhealthy",
+                pendingNativeSourceLeaseId = "lease-a",
+                pendingNativeActiveLeaseId = "lease-b",
+                pendingNativeActiveSlot = RedundantSlot.B,
+                pendingNativeMembershipGeneration = 0,
+                pendingNativeSwitchReason = "primary_unhealthy",
+            ),
+        )).success()
+        store.prepareRedundantTotalLoss(
+            "v2-start",
+            AndroidStartReplay("replacement-start", 1, "replacement-fingerprint"),
+        ).success()
+
+        val stopped = store.cancelRedundantIntentAndDeferStop(
+            "v2-stop",
+            "v2-start",
+        ).success()
+        val transaction = requireNotNull(stopped.redundantTransaction)
+
+        assertFalse(stopped.intent.desiredActive)
+        assertFalse(transaction.desiredActive)
+        assertEquals(RedundantStopState.PENDING, transaction.retry.stopState)
+        assertNull(transaction.retry.totalLossRestartReplay)
+        assertNull(transaction.retry.pendingNativeActiveLeaseId)
+        assertFalse(transaction.retry.roleObservationPending)
+    }
+
+    @Test
+    fun explicitStopCanCancelAPromotedTotalLossRestartByItsSourceOperation() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginRedundant(redundantTransaction("v2-start")).success()
+        store.prepareRedundantTotalLoss(
+            "v2-start",
+            AndroidStartReplay("replacement-start", 1, "replacement-fingerprint"),
+        ).success()
+        store.deferRedundantStop("v2-stop", "v2-start").success()
+        store.updateRedundant("v2-start") { transaction ->
+            transaction.copy(retry = transaction.retry.copy(
+                stopState = RedundantStopState.ACKNOWLEDGED,
+            ))
+        }.success()
+        store.completeRedundantStop("v2-stop", "v2-start").success()
+
+        val cancelled = store.cancelRedundantIntentAndDeferStop(
+            "late-explicit-stop",
+            "v2-start",
+        ).success()
+
+        assertFalse(cancelled.intent.desiredActive)
+        assertNull(cancelled.redundantTransaction)
+        assertNull(cancelled.leaseTransaction)
+        assertNull(cancelled.intent.retry.pendingAction)
+    }
+
+    @Test
     fun legacyBeginStartIsRejectedWhileAV2TransactionOwnsTheEnvelope() {
         val backend = FakeEncryptedRecordBackend()
         val store = store(backend)

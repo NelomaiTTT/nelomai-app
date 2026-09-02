@@ -578,6 +578,23 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun totalLossPublishesOneSerializedLifecycleCallback() {
+        var totalLossCallbacks = 0
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            FakePanel(),
+            FakeNative(usable = emptySet()),
+            onAllSlotsStalled = { totalLossCallbacks += 1 },
+        )
+
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+
+        assertEquals(1, totalLossCallbacks)
+        assertTrue(requireNotNull(coordinator.status()).retry.sessionStalledRecorded)
+    }
+
+    @Test
     fun failedInactiveStandbySchedulesReplacementWithoutReactivatingPrimary() {
         var nowMs = 4_000_000L
         val panel = FakePanel()

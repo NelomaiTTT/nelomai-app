@@ -5,11 +5,13 @@ import java.util.UUID
 
 private const val REDUNDANT_CANCEL_PREFERENCES = "nelomai-redundant-cancel"
 private const val REDUNDANT_CANCEL_RECORD = "tombstone"
-private const val REDUNDANT_CANCEL_FORMAT = "1"
+private const val REDUNDANT_CANCEL_LEGACY_FORMAT = "1"
+private const val REDUNDANT_CANCEL_FORMAT = "2"
 
 internal data class RedundantCancelTombstone(
     val startOperationId: String,
     val stopOperationId: String,
+    val allowRestart: Boolean = false,
 )
 
 internal interface RedundantCancelTombstoneBackend {
@@ -28,7 +30,10 @@ internal class RedundantCancelTombstoneStore(
         RecoveryStoreResult.Failure("redundant_cancel_tombstone_corrupt")
     }
 
-    fun persist(startOperationId: String): RecoveryStoreResult<RedundantCancelTombstone> {
+    fun persist(
+        startOperationId: String,
+        allowRestart: Boolean = false,
+    ): RecoveryStoreResult<RedundantCancelTombstone> {
         repeat(2) {
             val encoded = try {
                 backend.read()
@@ -41,13 +46,26 @@ internal class RedundantCancelTombstoneStore(
                 return RecoveryStoreResult.Failure("redundant_cancel_tombstone_corrupt")
             }
             if (current != null) {
-                return if (current.startOperationId == startOperationId) {
-                    RecoveryStoreResult.Success(current)
-                } else {
-                    RecoveryStoreResult.Failure("redundant_cancel_tombstone_busy")
+                if (current.startOperationId != startOperationId) {
+                    return RecoveryStoreResult.Failure("redundant_cancel_tombstone_busy")
                 }
+                val stopWins = current.copy(
+                    allowRestart = current.allowRestart && allowRestart,
+                )
+                if (stopWins == current) return RecoveryStoreResult.Success(current)
+                val replaced = try {
+                    backend.compareAndWrite(encoded, encode(stopWins))
+                } catch (_: Throwable) {
+                    false
+                }
+                if (replaced) return RecoveryStoreResult.Success(stopWins)
+                return@repeat
             }
-            val tombstone = RedundantCancelTombstone(startOperationId, operationId())
+            val tombstone = RedundantCancelTombstone(
+                startOperationId,
+                operationId(),
+                allowRestart,
+            )
             val replacement = try {
                 encode(tombstone)
             } catch (_: Throwable) {
@@ -64,7 +82,8 @@ internal class RedundantCancelTombstoneStore(
     }
 
     fun clear(expected: RedundantCancelTombstone): Boolean = try {
-        backend.compareAndClear(encode(expected))
+        backend.compareAndClear(encode(expected)) ||
+            (!expected.allowRestart && backend.compareAndClear(encodeLegacy(expected)))
     } catch (_: Throwable) {
         false
     }
@@ -76,15 +95,38 @@ internal class RedundantCancelTombstoneStore(
             REDUNDANT_CANCEL_FORMAT,
             tombstone.startOperationId,
             tombstone.stopOperationId,
+            tombstone.allowRestart.toString(),
+        ).joinToString("\n")
+    }
+
+    private fun encodeLegacy(tombstone: RedundantCancelTombstone): String {
+        require(!tombstone.allowRestart)
+        requireValidId(tombstone.startOperationId)
+        requireValidId(tombstone.stopOperationId)
+        return listOf(
+            REDUNDANT_CANCEL_LEGACY_FORMAT,
+            tombstone.startOperationId,
+            tombstone.stopOperationId,
         ).joinToString("\n")
     }
 
     private fun decode(value: String): RedundantCancelTombstone {
         val fields = value.split('\n')
-        require(fields.size == 3 && fields[0] == REDUNDANT_CANCEL_FORMAT)
+        require(fields[0] in setOf(REDUNDANT_CANCEL_LEGACY_FORMAT, REDUNDANT_CANCEL_FORMAT))
+        require((fields[0] == REDUNDANT_CANCEL_LEGACY_FORMAT && fields.size == 3) ||
+            (fields[0] == REDUNDANT_CANCEL_FORMAT && fields.size == 4))
         requireValidId(fields[1])
         requireValidId(fields[2])
-        return RedundantCancelTombstone(fields[1], fields[2])
+        val allowRestart = if (fields[0] == REDUNDANT_CANCEL_LEGACY_FORMAT) {
+            false
+        } else {
+            when (fields[3]) {
+                "true" -> true
+                "false" -> false
+                else -> throw IllegalArgumentException("invalid_redundant_cancel_tombstone")
+            }
+        }
+        return RedundantCancelTombstone(fields[1], fields[2], allowRestart)
     }
 
     private fun requireValidId(value: String) {
