@@ -173,6 +173,15 @@ internal class ServiceRedundantConnectionNative(
         var urgentRxPacketsAtStart: Long? = null,
         var urgentCorroboratedFailures: Int = 0,
         var urgentEvidence: Boolean = false,
+        var invalidMetricsSnapshots: Int = 0,
+    )
+
+    private data class NativeSlotHealthMetrics(
+        val admitted: Boolean,
+        val closed: Boolean,
+        val latestHandshakeUnixMs: Long,
+        val txPackets: Long,
+        val rxPackets: Long,
     )
 
     private val gate = Any()
@@ -328,25 +337,22 @@ internal class ServiceRedundantConnectionNative(
         val nativeSession = session ?: return@synchronized emptyList()
         val epochNow = epochNowMs()
         val elapsedNow = elapsedNowMs()
-        val metrics = runCatching { backend.metrics(nativeSession)?.let(::JSONObject) }.getOrNull()
-        val metricsBySlot = metrics?.optJSONArray("slots")?.let { array ->
-            (0 until array.length()).associate { index ->
-                val value = array.getJSONObject(index)
-                value.getInt("slot") to value
-            }
-        }.orEmpty()
+        val metricsBySlot = parseHealthMetricsLocked(
+            runCatching { backend.metrics(nativeSession) }.getOrNull(),
+        ) ?: return@synchronized invalidHealthObservationsLocked()
+        slots.values.forEach { it.invalidMetricsSnapshots = 0 }
         slots.values.sortedBy { it.slot.index }.map { runtime ->
-            val nativeMetrics = metricsBySlot[runtime.slot.index]
-            val telemetry = nativeMetrics?.optJSONObject("telemetry")
-            val txPackets = telemetry?.optLong("udp_send_packets") ?: runtime.previousTxPackets
-            val rxPackets = telemetry?.optLong("udp_receive_packets") ?: runtime.previousRxPackets
+            val nativeMetrics = requireNotNull(metricsBySlot[runtime.slot.index])
+            val txPackets = nativeMetrics.txPackets
+            val rxPackets = nativeMetrics.rxPackets
             advanceProbeLocked(nativeSession, runtime, elapsedNow, txPackets, rxPackets)
             runtime.previousTxPackets = txPackets
             runtime.previousRxPackets = rxPackets
-            val latestHandshake = nativeMetrics?.optLong("latest_handshake_at_unix_ms") ?: 0L
+            val latestHandshake = nativeMetrics.latestHandshakeUnixMs
             val handshakeFresh = latestHandshake > 0L && epochNow >= latestHandshake &&
                 epochNow - latestHandshake <= HANDSHAKE_FRESH_MILLIS
-            val admitted = nativeMetrics?.optBoolean("admitted", true) ?: (metrics == null)
+            val admitted = nativeMetrics.admitted
+            val closed = nativeMetrics.closed
             val ready = handshakeFresh &&
                 runtime.consecutiveProbeSuccesses >= READY_PROBE_SUCCESSES &&
                 elapsedNow >= runtime.startedAtElapsedMs &&
@@ -355,12 +361,12 @@ internal class ServiceRedundantConnectionNative(
                 index = runtime.slot.index,
                 active = runtime.slot == activeSlot,
                 health = when {
-                    !admitted || runtime.hardFailure -> BackendHealth.UNHEALTHY
+                    closed || !admitted || runtime.hardFailure -> BackendHealth.UNHEALTHY
                     ready -> BackendHealth.READY
                     runtime.probeFailed -> BackendHealth.SUSPECT
                     else -> BackendHealth.WARMING
                 },
-                hardFailure = !admitted || runtime.hardFailure,
+                hardFailure = closed || !admitted || runtime.hardFailure,
                 probeFailed = runtime.probeFailed,
                 independentFailureSignal = runtime.urgentEvidence,
                 softFailureStartedAtMs = runtime.urgentStartedAtElapsedMs,
@@ -370,6 +376,68 @@ internal class ServiceRedundantConnectionNative(
                 stableSinceMs = runtime.startedAtElapsedMs,
             )
         }
+    }
+
+    private fun parseHealthMetricsLocked(payload: String?): Map<Int, NativeSlotHealthMetrics>? {
+        val root = payload?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null
+        val array = root.optJSONArray("slots") ?: return null
+        if (array.length() != slots.size) return null
+        val result = linkedMapOf<Int, NativeSlotHealthMetrics>()
+        for (position in 0 until array.length()) {
+            val value = array.optJSONObject(position) ?: return null
+            val slot = value.exactNonNegativeLong("slot")?.toInt() ?: return null
+            if (slot !in 0..1 || result.containsKey(slot) ||
+                slots.keys.none { it.index == slot }
+            ) return null
+            val admitted = value.opt("admitted") as? Boolean ?: return null
+            val closed = value.opt("closed") as? Boolean ?: return null
+            val latestHandshake = value.exactNonNegativeLong("latest_handshake_at_unix_ms")
+                ?: return null
+            val telemetry = value.optJSONObject("telemetry") ?: return null
+            val txPackets = telemetry.exactNonNegativeLong("udp_send_packets") ?: return null
+            val rxPackets = telemetry.exactNonNegativeLong("udp_receive_packets") ?: return null
+            result[slot] = NativeSlotHealthMetrics(
+                admitted = admitted,
+                closed = closed,
+                latestHandshakeUnixMs = latestHandshake,
+                txPackets = txPackets,
+                rxPackets = rxPackets,
+            )
+        }
+        return result
+    }
+
+    private fun invalidHealthObservationsLocked(): List<SlotObservation> =
+        slots.values.sortedBy { it.slot.index }.map { runtime ->
+            runtime.invalidMetricsSnapshots =
+                (runtime.invalidMetricsSnapshots + 1).coerceAtMost(INVALID_METRICS_FAILURE_BUDGET)
+            val failedClosed = runtime.invalidMetricsSnapshots >= INVALID_METRICS_FAILURE_BUDGET
+            SlotObservation(
+                index = runtime.slot.index,
+                active = runtime.slot == activeSlot,
+                health = when {
+                    failedClosed || runtime.hardFailure -> BackendHealth.UNHEALTHY
+                    runtime.probeFailed -> BackendHealth.SUSPECT
+                    else -> BackendHealth.WARMING
+                },
+                hardFailure = failedClosed || runtime.hardFailure,
+                probeFailed = runtime.probeFailed,
+                independentFailureSignal = runtime.urgentEvidence,
+                softFailureStartedAtMs = runtime.urgentStartedAtElapsedMs,
+                corroboratedProbeFailures = runtime.urgentCorroboratedFailures,
+                consecutiveProbeSuccesses = runtime.consecutiveProbeSuccesses,
+                stableSinceMs = runtime.startedAtElapsedMs,
+            )
+        }
+
+    private fun JSONObject.exactNonNegativeLong(name: String): Long? {
+        val number = opt(name) as? Number ?: return null
+        if (number is Float || number is Double) return null
+        val value = number.toLong()
+        if (value < 0L || number.toDouble().isNaN() || number.toDouble() != value.toDouble()) {
+            return null
+        }
+        return value
     }
 
     private fun advanceProbeLocked(
@@ -554,6 +622,7 @@ internal class ServiceRedundantConnectionNative(
         const val URGENT_PROBE_TIMEOUT_MILLIS = 2_000L
         const val URGENT_SEQUENCE_DEADLINE_MILLIS = 8_000L
         const val REQUIRED_URGENT_FAILURES = 2
+        const val INVALID_METRICS_FAILURE_BUDGET = 3
         const val HANDSHAKE_FRESH_MILLIS = 180_000L
     }
 }

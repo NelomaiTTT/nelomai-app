@@ -1,16 +1,26 @@
 diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
-index 2278d4d262c4cda579a0a230909f8c2b3f9923cf..38fc77db64fda2810692d77dd9c377668546dd72 100644
+index 80c51be4cb03381b80952cf52fb542493fdf4007..13125bdc533b0242d43c9518260c6bdd6052f3b4 100644
 --- a/tunnel/tools/libwg-go/api-android.go
 +++ b/tunnel/tools/libwg-go/api-android.go
-@@ -17,2 +17,3 @@ import (
+@@ -15,6 +15,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
  	"fmt"
 +	"math"
  	"net"
-@@ -160,2 +161,3 @@ func (t *tunnelTelemetry) shouldCaptureEndpoint(now int64) bool {
+ 	"os"
+ 	"os/signal"
+@@ -133,6 +134,7 @@ func (t *tunnelTelemetry) shouldCaptureEndpoint(now int64) bool {
+ }
+ 
  func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
 +	memory := readGoMemoryStats()
  	return tunnelTelemetrySnapshot{
-@@ -173,2 +175,10 @@ func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
+ 		TunReadPackets: t.tunReadPackets.Load(), TunReadBytes: t.tunReadBytes.Load(),
+ 		TunReadErrors: t.tunReadErrors.Load(), TunWritePackets: t.tunWritePackets.Load(),
+@@ -146,6 +148,14 @@ func (t *tunnelTelemetry) snapshot() tunnelTelemetrySnapshot {
+ 		LastUdpRecvAt: t.lastUdpRecvAt.Load(), LastSendError: atomicString(&t.lastSendError),
+ 		LastRecvError: atomicString(&t.lastRecvError), Endpoint: atomicString(&t.endpoint),
  		LastSendErrno: int(t.lastSendErrno.Load()), LastRecvErrno: int(t.lastRecvErrno.Load()),
 +		GoHeapAlloc: memory.HeapAlloc, GoHeapSys: memory.HeapSys,
 +		GoHeapIdle: memory.HeapIdle, GoHeapInuse: memory.HeapInuse,
@@ -21,7 +31,11 @@ index 2278d4d262c4cda579a0a230909f8c2b3f9923cf..38fc77db64fda2810692d77dd9c37766
 +		GoDeviceCloses: goDeviceCloses.Load(), GoStarting: goDevicesStarting.Load(),
 +		GoActiveDevices: activeTunnelCount(),
  	}
-@@ -328,2 +337,15 @@ var redundantNativeHandlesMutex sync.RWMutex
+ }
+ 
+@@ -301,6 +311,19 @@ var tunnelHandlesMutex sync.RWMutex
+ var redundantNativeHandles map[int64]*redundantNativeSession
+ var redundantNativeHandlesMutex sync.RWMutex
  var redundantNativeHandleAllocator monotonicHandleAllocator
 +var goDeviceStarts atomic.Uint64
 +var goDeviceStartFailures atomic.Uint64
@@ -37,7 +51,11 @@ index 2278d4d262c4cda579a0a230909f8c2b3f9923cf..38fc77db64fda2810692d77dd9c37766
 +const goMemoryStatsIntervalMillis int64 = 10_000
 +const goMemoryCleanupDelay = time.Second
  
-@@ -336,3 +358,66 @@ func lookupTunnelHandle(tunnelHandle int32) (TunnelHandle, bool) {
+ func lookupTunnelHandle(tunnelHandle int32) (TunnelHandle, bool) {
+ 	tunnelHandlesMutex.RLock()
+@@ -309,7 +332,70 @@ func lookupTunnelHandle(tunnelHandle int32) (TunnelHandle, bool) {
+ 	return handle, ok
+ }
  
 +func activeTunnelCount() int {
 +	tunnelHandlesMutex.RLock()
@@ -104,24 +122,36 @@ index 2278d4d262c4cda579a0a230909f8c2b3f9923cf..38fc77db64fda2810692d77dd9c37766
  func init() {
 +	debug.SetMemoryLimit(goBackendMemoryLimitBytes)
  	tunnelHandles = make(map[int32]TunnelHandle)
-@@ -693,2 +778,6 @@ func awgRedundantClose(handle int64) {
+ 	redundantNativeHandles = make(map[int64]*redundantNativeSession)
+ 	signals := make(chan os.Signal)
+@@ -715,6 +801,10 @@ func awgRedundantClose(handle int64) {
+ 
+ //export awgTurnOn
  func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
 +	beginGoDeviceStart()
 +	startSucceeded := false
 +	defer func() { finishGoDeviceStart(startSucceeded) }()
 +
  	tag := cstring("AmneziaWG/" + interfaceName)
-@@ -710,2 +799,3 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	logger := &device.Logger{
+ 		Verbosef: AndroidLogger{level: C.ANDROID_LOG_DEBUG, tag: tag}.Printf,
+@@ -732,11 +822,12 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	diagnosticTun := &diagnosticTun{Device: nativeTun, telemetry: telemetry}
+ 	diagnosticBind := &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
  	device := device.NewDevice(diagnosticTun, diagnosticBind, logger)
 +	goDeviceStarts.Add(1)
  
-@@ -713,4 +803,4 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	err = device.IpcSet(settings)
  	if err != nil {
 -		unix.Close(int(tunFd))
  		logger.Errorf("IpcSet: %v", err)
 +		closeGoDevice(device)
  		return -1
-@@ -745,4 +835,6 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	}
+ 	device.DisableSomeRoamingForBrokenMobileSemantics()
+@@ -767,8 +858,10 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	err = device.Up()
+ 	if err != nil {
  		logger.Errorf("Unable to bring up device: %v", err)
 -		uapiFile.Close()
 -		device.Close()
@@ -130,7 +160,11 @@ index 2278d4d262c4cda579a0a230909f8c2b3f9923cf..38fc77db64fda2810692d77dd9c37766
 +		}
 +		closeGoDevice(device)
  		return -1
-@@ -761,4 +853,6 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	}
+ 	logger.Verbosef("Device started")
+@@ -783,11 +876,14 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	}
+ 	if i == math.MaxInt32 {
  		logger.Errorf("Unable to find empty handle")
 -		uapiFile.Close()
 -		device.Close()
@@ -139,38 +173,24 @@ index 2278d4d262c4cda579a0a230909f8c2b3f9923cf..38fc77db64fda2810692d77dd9c37766
 +		}
 +		closeGoDevice(device)
  		return -1
-@@ -766,2 +860,3 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+ 	}
  	tunnelHandles[i] = TunnelHandle{device: device, uapi: uapi, telemetry: telemetry}
 +	startSucceeded = true
  	return i
-@@ -782,3 +877,4 @@ func awgTurnOff(tunnelHandle int32) {
+ }
+ 
+@@ -804,7 +900,8 @@ func awgTurnOff(tunnelHandle int32) {
+ 	if handle.uapi != nil {
+ 		handle.uapi.Close()
  	}
 -	handle.device.Close()
 +	closeGoDevice(handle.device)
 +	releaseUnusedGoMemory()
  }
-diff --git a/tunnel/tools/libwg-go/telemetry_snapshot.go b/tunnel/tools/libwg-go/telemetry_snapshot.go
-index bb25c104dd47299373a2923c5cee04034e845fa4..407832729a0bb8b7825f7cfea50c55ff19086610 100644
---- a/tunnel/tools/libwg-go/telemetry_snapshot.go
-+++ b/tunnel/tools/libwg-go/telemetry_snapshot.go
-@@ -29,2 +29,16 @@ type tunnelTelemetrySnapshot struct {
- 	Endpoint        string `json:"endpoint,omitempty"`
-+	GoHeapAlloc     uint64 `json:"go_heap_alloc_bytes"`
-+	GoHeapSys       uint64 `json:"go_heap_sys_bytes"`
-+	GoHeapIdle      uint64 `json:"go_heap_idle_bytes"`
-+	GoHeapInuse     uint64 `json:"go_heap_inuse_bytes"`
-+	GoHeapReleased  uint64 `json:"go_heap_released_bytes"`
-+	GoStackInuse    uint64 `json:"go_stack_inuse_bytes"`
-+	GoGCCycles      uint32 `json:"go_gc_cycles"`
-+	GoGoroutines    int    `json:"go_goroutines"`
-+	GoMemoryLimit   int64  `json:"go_memory_limit_bytes"`
-+	GoDeviceStarts  uint64 `json:"go_device_starts"`
-+	GoStartFailures uint64 `json:"go_device_start_failures"`
-+	GoDeviceCloses  uint64 `json:"go_device_closes"`
-+	GoStarting      int64  `json:"go_devices_starting"`
-+	GoActiveDevices int    `json:"go_active_devices"`
- }
+ 
+ //export awgGetSocketV4
 diff --git a/tunnel/tools/libwg-go/redundant_metrics_test.go b/tunnel/tools/libwg-go/redundant_metrics_test.go
+index cc37b9f52e8254000006eb2f45c1d1eb289dab0b..126c7f7f8d9845a735a54d9a83f0b322c25a3e13 100644
 --- a/tunnel/tools/libwg-go/redundant_metrics_test.go
 +++ b/tunnel/tools/libwg-go/redundant_metrics_test.go
 @@ -38,3 +38,15 @@ func TestRedundantMetricsExcludeEndpointAndArbitraryErrorText(t *testing.T) {
@@ -189,3 +209,28 @@ diff --git a/tunnel/tools/libwg-go/redundant_metrics_test.go b/tunnel/tools/libw
 +		t.Fatalf("redundant metrics lost Go goroutine count: %s", encoded)
 +	}
 +}
+diff --git a/tunnel/tools/libwg-go/telemetry_snapshot.go b/tunnel/tools/libwg-go/telemetry_snapshot.go
+index bb25c104dd47299373a2923c5cee04034e845fa4..fd28e020324627fa55b4fe7dc7ccc600b300df01 100644
+--- a/tunnel/tools/libwg-go/telemetry_snapshot.go
++++ b/tunnel/tools/libwg-go/telemetry_snapshot.go
+@@ -27,6 +27,20 @@ type tunnelTelemetrySnapshot struct {
+ 	LastSendErrno   int    `json:"last_udp_send_errno,omitempty"`
+ 	LastRecvErrno   int    `json:"last_udp_receive_errno,omitempty"`
+ 	Endpoint        string `json:"endpoint,omitempty"`
++	GoHeapAlloc     uint64 `json:"go_heap_alloc_bytes"`
++	GoHeapSys       uint64 `json:"go_heap_sys_bytes"`
++	GoHeapIdle      uint64 `json:"go_heap_idle_bytes"`
++	GoHeapInuse     uint64 `json:"go_heap_inuse_bytes"`
++	GoHeapReleased  uint64 `json:"go_heap_released_bytes"`
++	GoStackInuse    uint64 `json:"go_stack_inuse_bytes"`
++	GoGCCycles      uint32 `json:"go_gc_cycles"`
++	GoGoroutines    int    `json:"go_goroutines"`
++	GoMemoryLimit   int64  `json:"go_memory_limit_bytes"`
++	GoDeviceStarts  uint64 `json:"go_device_starts"`
++	GoStartFailures uint64 `json:"go_device_start_failures"`
++	GoDeviceCloses  uint64 `json:"go_device_closes"`
++	GoStarting      int64  `json:"go_devices_starting"`
++	GoActiveDevices int    `json:"go_active_devices"`
+ }
+ 
+ func redactRedundantTelemetry(snapshot tunnelTelemetrySnapshot) tunnelTelemetrySnapshot {

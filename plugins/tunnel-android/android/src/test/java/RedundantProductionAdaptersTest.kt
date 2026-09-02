@@ -360,6 +360,48 @@ class RedundantProductionAdaptersTest {
         assertTrue(native.healthObservations().single().hardFailure)
     }
 
+    @Test
+    fun nativeClosedSlotIsAnImmediateHardFailure() {
+        val backend = RecordingSessionBackend()
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        backend.metricsOverride = {
+            """{"slots":[{"slot":0,"admitted":true,"closed":true,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"udp_send_packets":0,"udp_receive_packets":0}}]}"""
+        }
+
+        val observation = native.healthObservations().single()
+
+        assertTrue(observation.hardFailure)
+        assertEquals(BackendHealth.UNHEALTHY, observation.health)
+    }
+
+    @Test
+    fun malformedNativeMetricsFailClosedOnlyAfterBoundedBudgetAndValidSnapshotResetsIt() {
+        val backend = RecordingSessionBackend()
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        backend.metricsOverride = { """{"slots":[]}""" }
+
+        assertFalse(native.healthObservations().single().hardFailure)
+        assertFalse(native.healthObservations().single().hardFailure)
+        assertTrue(native.healthObservations().single().hardFailure)
+
+        backend.metricsOverride = null
+        assertFalse(native.healthObservations().single().hardFailure)
+        backend.metricsOverride = { """{"slots":[{"slot":"0","admitted":"true"}]}""" }
+        assertFalse(native.healthObservations().single().hardFailure)
+    }
+
     private fun probe() = BackgroundRedundantHealthProbe(
         kind = "dns_a",
         targetIpv4 = "8.8.8.8",
@@ -427,6 +469,7 @@ private class RecordingSessionBackend(
     val rebindFailures = mutableSetOf<Int>()
     var latestProbeToken: Long? = null
     var countProbeSend = true
+    var metricsOverride: (() -> String?)? = null
     private val admitted = mutableSetOf<Int>()
     private var nextToken = 1L
 
@@ -480,13 +523,16 @@ private class RecordingSessionBackend(
     override fun cancelProbe(session: NativeSession, token: Long): Boolean =
         probeStatuses.remove(token) != null
 
-    override fun metrics(session: NativeSession): String =
-        admitted.sorted().joinToString(
+    override fun metrics(session: NativeSession): String? {
+        val override = metricsOverride
+        if (override != null) return override()
+        return admitted.sorted().joinToString(
             prefix = "{\"slots\":[",
             postfix = "]}",
         ) { slot ->
-            """{"slot":$slot,"admitted":true,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"udp_send_packets":$udpSendPackets,"udp_receive_packets":$udpReceivePackets}}"""
+            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"udp_send_packets":$udpSendPackets,"udp_receive_packets":$udpReceivePackets}}"""
         }
+    }
 
     override fun close(session: NativeSession) {
         admitted.clear()
