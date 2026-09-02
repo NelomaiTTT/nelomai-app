@@ -3042,6 +3042,74 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun logoutLifecycleStopsRedundantRecoveryBeforeLogoutAndResumesAfterCleanup() {
+        val redundant = serviceV2Envelope()
+        val transaction = requireNotNull(redundant.redundantTransaction)
+        var recovery: RecoveryStoreResult<AndroidRecoveryEnvelope> =
+            RecoveryStoreResult.Success(redundant)
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            hasPendingLogout = { true },
+            recovery = { recovery },
+            beginRedundantStop = { events += "stop:${it.startOperationId}" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        assertTrue(lifecycle.resume())
+        assertEquals(
+            listOf("stop:${transaction.startOperationId}"),
+            events,
+        )
+
+        recovery = RecoveryStoreResult.Success(redundant.copy(redundantTransaction = null))
+        lifecycle.onRedundantStopCompleted()
+
+        assertEquals(
+            listOf(
+                "stop:${transaction.startOperationId}",
+                "logout",
+            ),
+            events,
+        )
+    }
+
+    @Test
+    fun logoutLifecycleRetriesWithoutFinalizingWhenRecoveryIsUnreadable() {
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            hasPendingLogout = { true },
+            recovery = { RecoveryStoreResult.Failure("recovery_read_failed") },
+            beginRedundantStop = { events += "stop" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        assertTrue(lifecycle.resume())
+
+        assertEquals(listOf("retry"), events)
+    }
+
+    @Test
+    fun completedRedundantStopBecomesIdleWhenLogoutIsNoLongerPending() {
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            hasPendingLogout = { false },
+            recovery = { RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1)) },
+            beginRedundantStop = { events += "stop" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        lifecycle.onRedundantStopCompleted()
+
+        assertEquals(listOf("idle"), events)
+    }
+
+    @Test
     fun stickyRestartPrioritizesPendingLogoutThatAlsoHasDurableCleanup() {
         val backend = ServiceRecoveryBackend()
         val store = recoveryStore(backend)

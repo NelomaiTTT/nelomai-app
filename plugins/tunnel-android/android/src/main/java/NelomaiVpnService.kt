@@ -718,6 +718,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private lateinit var connectionIntentLifecycle: ConnectionIntentServiceLifecycle
     private lateinit var connectionIntentAttemptDispatcher: AndroidConnectionIntentAttemptDispatcher
     private lateinit var logoutCoordinator: AndroidLogoutCoordinator
+    private lateinit var backgroundLogoutLifecycle: BackgroundLogoutServiceLifecycle
     private val connectionIntentDispatch = AndroidConnectionIntentDispatchState()
     private val connectionIntentAdmission = AndroidConnectionIntentAdmission()
     private val connectionIntentRuntimeFence = AndroidRuntimeStartDispatchFence()
@@ -825,6 +826,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
             AndroidBackgroundCredentialStores.open(applicationContext),
             connectionIntentCoordinator,
         )
+        backgroundLogoutLifecycle = BackgroundLogoutServiceLifecycle(
+            hasPendingLogout = ::hasPendingBackgroundLogout,
+            recovery = recoveryStore::read,
+            beginRedundantStop = ::beginBackgroundLogoutRedundantStop,
+            runLogout = ::runBackgroundLogoutAttempt,
+            scheduleRetry = ::scheduleNextBackgroundLogoutRetry,
+            stopIfIdle = ::stopIfIdle,
+        )
         runCatching { AutomaticDiagnostics.initialize(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.initialize_failed", error = it) }
         activeService = this
@@ -841,6 +850,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             promoteToForeground()
         }
         if (intent == null) {
+            if (connectionIntentLifecycle.onStickyRestart()) return START_STICKY
             val stickyRecovery = recoveryStore.read()
             if (!shouldEnterLegacyVpnRecovery(stickyRecovery)) {
                 // A v2 envelope (or an unreadable store) owns this restart.  Do not let
@@ -857,11 +867,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_ENSURE_RUNNING -> {
                 if (redundantStartBlocked()) {
                     schedulePendingRedundantStopRetry()
+                } else if (connectionIntentLifecycle.onEnsureRunning()) {
+                    Unit
                 } else {
                     val recovery = recoveryStore.read()
                     if (!shouldEnterLegacyVpnRecovery(recovery)) {
                         dispatchRedundantResume(recovery)
-                    } else if (!connectionIntentLifecycle.onEnsureRunning()) {
+                    } else {
                         restoreDesiredTunnel("ensure_running")
                     }
                 }
@@ -1637,8 +1649,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 detachCompletedRedundantOwner(current)
                 completeRedundantStopWaiters(current.startOperationId, attempt.result)
                 completeFrameworkRevokeAfterCleanupAttempt()
-                if (serviceDestroyed) redundantExecutor.shutdown()
-                stopIfIdle()
+                completeRedundantStopServiceLifecycle()
                 return
             }
             RedundantTombstoneClearDisposition.CONFIRMED -> Unit
@@ -1658,8 +1669,16 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
         completeRedundantStopWaiters(current.startOperationId, attempt.result)
         completeFrameworkRevokeAfterCleanupAttempt()
-        if (serviceDestroyed) redundantExecutor.shutdown()
-        stopIfIdle()
+        completeRedundantStopServiceLifecycle()
+    }
+
+    private fun completeRedundantStopServiceLifecycle() {
+        if (serviceDestroyed) {
+            redundantExecutor.shutdown()
+            stopIfIdle()
+        } else {
+            backgroundLogoutLifecycle.onRedundantStopCompleted()
+        }
     }
 
     private fun detachCompletedRedundantOwner(completed: PendingRedundantStop) {
@@ -3390,6 +3409,26 @@ class NelomaiVpnService : GoBackend.VpnService() {
             restoreHandler.postDelayed(logoutRetry, delayMillis)
             return
         }
+        backgroundLogoutLifecycle.resume()
+    }
+
+    private fun beginBackgroundLogoutRedundantStop(
+        transaction: AndroidRedundantTransaction,
+    ) {
+        redundantStartOperation.cancel(transaction.startOperationId)
+        QuickTunnelController.updateState(
+            applicationContext,
+            SessionState.STOPPING,
+            desiredActive = false,
+            changed = true,
+        )
+        beginFailClosedRedundantStop(
+            transaction.startOperationId,
+            redundantOwnerForOperation(transaction.startOperationId),
+        )
+    }
+
+    private fun runBackgroundLogoutAttempt() {
         credentialExecutor.execute {
             val step = logoutCoordinator.runOnce(
                 ServiceConnectionIntentPanel(),
@@ -3399,19 +3438,23 @@ class NelomaiVpnService : GoBackend.VpnService() {
             )
             restoreHandler.post {
                 if (step == AndroidLogoutStep.RETRY) {
-                    val delay = RESTORE_RETRY_DELAYS_MILLIS[
-                        restoreRetryAttempt.coerceAtMost(
-                            RESTORE_RETRY_DELAYS_MILLIS.lastIndex,
-                        )
-                    ]
-                    restoreRetryAttempt += 1
-                    scheduleLogoutAttempt(delay)
+                    scheduleNextBackgroundLogoutRetry()
                 } else {
                     restoreRetryAttempt = 0
                     stopIfIdle()
                 }
             }
         }
+    }
+
+    private fun scheduleNextBackgroundLogoutRetry() {
+        val delay = RESTORE_RETRY_DELAYS_MILLIS[
+            restoreRetryAttempt.coerceAtMost(
+                RESTORE_RETRY_DELAYS_MILLIS.lastIndex,
+            )
+        ]
+        restoreRetryAttempt += 1
+        scheduleLogoutAttempt(delay)
     }
 
     private fun hasPendingBackgroundLogout(): Boolean = when (
@@ -4742,6 +4785,30 @@ internal data class ConnectionIntentServiceStatus(
     val lastErrorCode: String?,
     val reserveState: String? = null,
 )
+
+internal class BackgroundLogoutServiceLifecycle(
+    private val hasPendingLogout: () -> Boolean,
+    private val recovery: () -> RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    private val beginRedundantStop: (AndroidRedundantTransaction) -> Unit,
+    private val runLogout: () -> Unit,
+    private val scheduleRetry: () -> Unit,
+    private val stopIfIdle: () -> Unit,
+) {
+    fun resume(): Boolean {
+        if (!hasPendingLogout()) return false
+        when (val current = recovery()) {
+            is RecoveryStoreResult.Failure -> scheduleRetry()
+            is RecoveryStoreResult.Success -> current.value.redundantTransaction?.let {
+                beginRedundantStop(it)
+            } ?: runLogout()
+        }
+        return true
+    }
+
+    fun onRedundantStopCompleted() {
+        if (!resume()) stopIfIdle()
+    }
+}
 
 internal class ConnectionIntentServiceLifecycle(
     private val coordinator: AndroidConnectionIntentCoordinator,
