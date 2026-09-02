@@ -1,5 +1,5 @@
 diff --git a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
-index 3f168208..a8e936b3 100644
+index 3f1682085725bd58ff6129cead962820ce7a5eb0..a8e936b3aad0de745a1659619156f31eab5d3438 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/GoBackend.java
 @@ -6,10 +6,25 @@ public class GoBackend {
@@ -29,7 +29,7 @@ index 3f168208..a8e936b3 100644
  
      public static native int awgTurnOn(String ifName, int tunFd, String settings);
 diff --git a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
-index 2bb8026a..de358507 100644
+index 2bb8026ab3d4207eb465f7428de309a1671ed2ec..de3585073138193920d6bf1b6916c264c8d6de31 100644
 --- a/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 +++ b/tunnel/src/main/java/org/amnezia/awg/backend/GoBackend.java
 @@ -171,6 +171,69 @@ public final class GoBackend implements Backend {
@@ -103,7 +103,7 @@ index 2bb8026a..de358507 100644
      /**
       * Get the last handshake time for a given {@link Tunnel}.
 diff --git a/tunnel/tools/CMakeLists.txt b/tunnel/tools/CMakeLists.txt
-index 8557c5ab..3480c49a 100644
+index 8557c5ab88919028443e4a4180741d4fac5aee41..3480c49ada179a75902fd60962f39cae725d413b 100644
 --- a/tunnel/tools/CMakeLists.txt
 +++ b/tunnel/tools/CMakeLists.txt
 @@ -9,6 +9,7 @@ add_link_options(LINKER:--build-id=none)
@@ -115,10 +115,23 @@ index 8557c5ab..3480c49a 100644
  add_executable(libwg-quick.so amneziawg-tools/src/wg-quick/android.c ndk-compat/compat.c)
  target_compile_options(libwg-quick.so PUBLIC -std=gnu11 -include ${CMAKE_CURRENT_SOURCE_DIR}/ndk-compat/compat.h -DAWG_PACKAGE_NAME=\"${ANDROID_PACKAGE_NAME}\")
 diff --git a/tunnel/tools/libwg-go/Makefile b/tunnel/tools/libwg-go/Makefile
-index 9b9c081f..3b34848c 100644
+index 9b9c081f236a1e0c2a5f16becad6b2357e60da52..ca9d7b5c84f1cdc2ac9fa864e9bb7e204ead0e21 100644
 --- a/tunnel/tools/libwg-go/Makefile
 +++ b/tunnel/tools/libwg-go/Makefile
-@@ -29,6 +29,14 @@ GO_HASH_linux-amd64 := 68097bd680839cbc9d464a0edce4f7c333975e27a90246890e9f1078c
+@@ -20,33 +20,47 @@ export GOARCH := $(NDK_GO_ARCH_MAP_$(ANDROID_ARCH_NAME))
+ export GOOS := android
+ export CGO_ENABLED := 1
+ 
+-GO_VERSION := 1.24.2
++GO_VERSION := 1.25.0
+ GO_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]')-$(NDK_GO_ARCH_MAP_$(shell uname -m))
+ GO_TARBALL := go$(GO_VERSION).$(GO_PLATFORM).tar.gz
+-GO_HASH_darwin-amd64 := 238d9c065d09ff6af229d2e3b8b5e85e688318d69f4006fb85a96e41c216ea83
+-GO_HASH_darwin-arm64 := b70f8b3c5b4ccb0ad4ffa5ee91cd38075df20fdbd953a1daedd47f50fbcff47a
+-GO_HASH_linux-amd64 := 68097bd680839cbc9d464a0edce4f7c333975e27a90246890e9f1078c7e702ad
++GO_HASH_darwin-amd64 := 5bd60e823037062c2307c71e8111809865116714d6f6b410597cf5075dfd80ef
++GO_HASH_darwin-arm64 := 544932844156d8172f7a28f77f2ac9c15a23046698b6243f633b0a0b00c0749c
++GO_HASH_linux-amd64 := 2852af0cb20a13139b3448992e69b868e50ed0f8a1e5940ee1de9e19a123b613
  
  default: $(DESTDIR)/libwg-go.so
  
@@ -128,12 +141,31 @@ index 9b9c081f..3b34848c 100644
 +LIBWG_GO_SOURCES := $(shell find . -type f $(NATIVE_SOURCE_PATTERN))
 +AMNEZIAWG_GO_SOURCES := $(shell find $(AMNEZIAWG_GO_ROOT) -type f $(NATIVE_SOURCE_PATTERN))
 +GO_WORKSPACE_FILES := $(wildcard go.mod go.sum $(WORKSPACE_ROOT)/go.work $(WORKSPACE_ROOT)/go.work.sum)
-+GO_BUILD_FILES := Makefile $(GO_WORKSPACE_FILES)
++LOCK_RUNNER := ./with-file-lock.sh
++GO_BUILD_FILES := Makefile $(LOCK_RUNNER) $(GO_WORKSPACE_FILES)
 +
  $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL):
  	mkdir -p "$(dir $@)"
- 	flock "$@.lock" -c ' \
-@@ -46,7 +54,7 @@ $(BUILDDIR)/go-$(GO_VERSION)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_T
+-	flock "$@.lock" -c ' \
++	sh "$(LOCK_RUNNER)" "$@.lock" sh -c ' \
+ 	[ -f "$@" ] && exit 0; \
+ 	curl -o "$@.tmp" "https://dl.google.com/go/$(GO_TARBALL)" && \
+-	echo "$(GO_HASH_$(GO_PLATFORM))  $@.tmp" | sha256sum -c && \
++	if command -v sha256sum >/dev/null 2>&1; then \
++	  actual_hash="$$(sha256sum "$@.tmp" | awk '\''{print $$1}'\'')"; \
++	else \
++	  actual_hash="$$(shasum -a 256 "$@.tmp" | awk '\''{print $$1}'\'')"; \
++	fi && \
++	test "$$actual_hash" = "$(GO_HASH_$(GO_PLATFORM))" && \
+ 	mv "$@.tmp" "$@"'
+ 
+ $(BUILDDIR)/go-$(GO_VERSION)/.prepared: $(GRADLE_USER_HOME)/caches/golang/$(GO_TARBALL)
+ 	mkdir -p "$(dir $@)"
+-	flock "$@.lock" -c ' \
++	sh "$(LOCK_RUNNER)" "$@.lock" sh -c ' \
+ 	[ -f "$@" ] && exit 0; \
+ 	tar -C "$(dir $@)" --strip-components=1 -xzf "$^" && \
+ 	patch -p1 -f -N -r- -d "$(dir $@)" < goruntime-boottime-over-monotonic.diff && \
  	touch "$@"'
  
  $(DESTDIR)/libwg-go.so: export PATH := $(BUILDDIR)/go-$(GO_VERSION)/bin/:$(PATH)
@@ -145,7 +177,7 @@ index 9b9c081f..3b34848c 100644
  .DELETE_ON_ERROR:
 diff --git a/tunnel/tools/libwg-go/admission_bind.go b/tunnel/tools/libwg-go/admission_bind.go
 new file mode 100644
-index 00000000..41d0650a
+index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182887260b4
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/admission_bind.go
 @@ -0,0 +1,345 @@
@@ -495,7 +527,7 @@ index 00000000..41d0650a
 +
 +func (a *admissionBind) BatchSize() int { return a.parser.BatchSize() }
 diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
-index 3af343d1..ede62453 100644
+index 3af343d17d35120cd29f7610281f0d26b77087c8..81794465362628d8a200cdc62dd780fb1466083d 100644
 --- a/tunnel/tools/libwg-go/api-android.go
 +++ b/tunnel/tools/libwg-go/api-android.go
 @@ -1,3 +1,5 @@
@@ -793,7 +825,7 @@ index 3af343d1..ede62453 100644
  	signals := make(chan os.Signal)
  	signal.Notify(signals, unix.SIGUSR2)
  	go func() {
-@@ -72,6 +330,393 @@ func init() {
+@@ -72,6 +330,392 @@ func init() {
  	}()
  }
  
@@ -831,7 +863,6 @@ index 3af343d1..ede62453 100644
 +	nativeTun, err := createOwnedRedundantTUNFromFD(
 +		int(tunFd),
 +		tun.CreateUnmonitoredTUNFromFD,
-+		unix.Close,
 +	)
 +	if err != nil {
 +		return -1
@@ -1187,7 +1218,7 @@ index 3af343d1..ede62453 100644
  //export awgTurnOn
  func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  	tag := cstring("AmneziaWG/" + interfaceName)
-@@ -80,15 +725,17 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+@@ -80,15 +724,17 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  		Errorf:   AndroidLogger{level: C.ANDROID_LOG_ERROR, tag: tag}.Printf,
  	}
  
@@ -1208,7 +1239,7 @@ index 3af343d1..ede62453 100644
  
  	err = device.IpcSet(settings)
  	if err != nil {
-@@ -131,6 +778,8 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+@@ -131,6 +777,8 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  	logger.Verbosef("Device started")
  
  	var i int32
@@ -1217,7 +1248,7 @@ index 3af343d1..ede62453 100644
  	for i = 0; i < math.MaxInt32; i++ {
  		if _, exists := tunnelHandles[i]; !exists {
  			break
-@@ -142,17 +791,20 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
+@@ -142,17 +790,20 @@ func awgTurnOn(interfaceName string, tunFd int32, settings string) int32 {
  		device.Close()
  		return -1
  	}
@@ -1239,7 +1270,7 @@ index 3af343d1..ede62453 100644
  	if handle.uapi != nil {
  		handle.uapi.Close()
  	}
-@@ -161,7 +813,7 @@ func awgTurnOff(tunnelHandle int32) {
+@@ -161,7 +812,7 @@ func awgTurnOff(tunnelHandle int32) {
  
  //export awgGetSocketV4
  func awgGetSocketV4(tunnelHandle int32) int32 {
@@ -1248,7 +1279,7 @@ index 3af343d1..ede62453 100644
  	if !ok {
  		return -1
  	}
-@@ -178,7 +830,7 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
+@@ -178,7 +829,7 @@ func awgGetSocketV4(tunnelHandle int32) int32 {
  
  //export awgGetSocketV6
  func awgGetSocketV6(tunnelHandle int32) int32 {
@@ -1257,7 +1288,7 @@ index 3af343d1..ede62453 100644
  	if !ok {
  		return -1
  	}
-@@ -195,7 +847,7 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
+@@ -195,7 +846,7 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
  
  //export awgGetConfig
  func awgGetConfig(tunnelHandle int32) *C.char {
@@ -1266,7 +1297,7 @@ index 3af343d1..ede62453 100644
  	if !ok {
  		return nil
  	}
-@@ -206,6 +858,92 @@ func awgGetConfig(tunnelHandle int32) *C.char {
+@@ -206,6 +857,92 @@ func awgGetConfig(tunnelHandle int32) *C.char {
  	return C.CString(settings)
  }
  
@@ -1360,7 +1391,7 @@ index 3af343d1..ede62453 100644
  func awgVersion() *C.char {
  	info, ok := debug.ReadBuildInfo()
 diff --git a/tunnel/tools/libwg-go/jni.c b/tunnel/tools/libwg-go/jni.c
-index 237043e5..607d6a7b 100644
+index 237043e561625a6d8bbdec7f215bb323cf1b75cd..607d6a7bcf1f67af1b7b403dbdbb51e7df7de0b2 100644
 --- a/tunnel/tools/libwg-go/jni.c
 +++ b/tunnel/tools/libwg-go/jni.c
 @@ -1,3 +1,5 @@
@@ -1622,7 +1653,7 @@ index 237043e5..607d6a7b 100644
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_metrics_test.go b/tunnel/tools/libwg-go/redundant_metrics_test.go
 new file mode 100644
-index 00000000..cc37b9f5
+index 0000000000000000000000000000000000000000..cc37b9f52e8254000006eb2f45c1d1eb289dab0b
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_metrics_test.go
 @@ -0,0 +1,40 @@
@@ -1668,7 +1699,7 @@ index 00000000..cc37b9f5
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_probe.go b/tunnel/tools/libwg-go/redundant_probe.go
 new file mode 100644
-index 00000000..29aebbbe
+index 0000000000000000000000000000000000000000..29aebbbeff62f0035110f31a6c1d7157e4df8cd3
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_probe.go
 @@ -0,0 +1,286 @@
@@ -1960,7 +1991,7 @@ index 00000000..29aebbbe
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_probe_test.go b/tunnel/tools/libwg-go/redundant_probe_test.go
 new file mode 100644
-index 00000000..03be0804
+index 0000000000000000000000000000000000000000..03be0804fe90600e2fef9ad83b665e8e0337d28c
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_probe_test.go
 @@ -0,0 +1,171 @@
@@ -2137,7 +2168,7 @@ index 00000000..03be0804
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_real_writer.go b/tunnel/tools/libwg-go/redundant_real_writer.go
 new file mode 100644
-index 00000000..2e203c34
+index 0000000000000000000000000000000000000000..2e203c34efafb44259ef507fee758d5e8e1e4cd7
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_real_writer.go
 @@ -0,0 +1,78 @@
@@ -2221,7 +2252,7 @@ index 00000000..2e203c34
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_real_writer_android.go b/tunnel/tools/libwg-go/redundant_real_writer_android.go
 new file mode 100644
-index 00000000..1a2fc7ed
+index 0000000000000000000000000000000000000000..1a2fc7ed1b7d2d5d741ea3ed93075228a2635c72
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_real_writer_android.go
 @@ -0,0 +1,59 @@
@@ -2286,7 +2317,7 @@ index 00000000..1a2fc7ed
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_real_writer_nonandroid.go b/tunnel/tools/libwg-go/redundant_real_writer_nonandroid.go
 new file mode 100644
-index 00000000..22367bf4
+index 0000000000000000000000000000000000000000..22367bf402b79624e978d68e0d95df5be5e39131
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_real_writer_nonandroid.go
 @@ -0,0 +1,11 @@
@@ -2303,7 +2334,7 @@ index 00000000..22367bf4
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_real_writer_test.go b/tunnel/tools/libwg-go/redundant_real_writer_test.go
 new file mode 100644
-index 00000000..176fa449
+index 0000000000000000000000000000000000000000..176fa4497a19e1c97f9eddc53a4324d511414644
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_real_writer_test.go
 @@ -0,0 +1,56 @@
@@ -2365,7 +2396,7 @@ index 00000000..176fa449
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_session_runtime.go b/tunnel/tools/libwg-go/redundant_session_runtime.go
 new file mode 100644
-index 00000000..ab32e591
+index 0000000000000000000000000000000000000000..ab32e591d7af0a35142bf524b1252f06fa064c8c
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_session_runtime.go
 @@ -0,0 +1,152 @@
@@ -2523,7 +2554,7 @@ index 00000000..ab32e591
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_session_runtime_test.go b/tunnel/tools/libwg-go/redundant_session_runtime_test.go
 new file mode 100644
-index 00000000..b5e14312
+index 0000000000000000000000000000000000000000..b5e14312c40c3384263ccafbcf991c591e611eeb
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_session_runtime_test.go
 @@ -0,0 +1,100 @@
@@ -2629,7 +2660,7 @@ index 00000000..b5e14312
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun.go b/tunnel/tools/libwg-go/redundant_tun.go
 new file mode 100644
-index 00000000..1c04fe05
+index 0000000000000000000000000000000000000000..1c04fe05d05520f94f62f392595ecd809bab3fd5
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun.go
 @@ -0,0 +1,1033 @@
@@ -3668,10 +3699,10 @@ index 00000000..1c04fe05
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_fd.go b/tunnel/tools/libwg-go/redundant_tun_fd.go
 new file mode 100644
-index 00000000..db86e1e5
+index 0000000000000000000000000000000000000000..e5235630f336f963ea3596fbd29af4dcdbf573d7
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_fd.go
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,21 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -3679,12 +3710,10 @@ index 00000000..db86e1e5
 +import "github.com/amnezia-vpn/amneziawg-go/v3/tun"
 +
 +// createOwnedRedundantTUNFromFD transfers ownership at the call boundary.
-+// The returned device owns fd on success; closeFD releases it when the
-+// platform constructor fails before it can return an owner.
++// The platform constructor consumes fd on success and on every error.
 +func createOwnedRedundantTUNFromFD(
 +	fd int,
 +	create func(int) (tun.Device, string, error),
-+	closeFD func(int) error,
 +) (tun.Device, error) {
 +	device, _, err := create(fd)
 +	if err == nil {
@@ -3692,17 +3721,15 @@ index 00000000..db86e1e5
 +	}
 +	if device != nil {
 +		_ = device.Close()
-+	} else {
-+		_ = closeFD(fd)
 +	}
 +	return nil, err
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_fd_test.go b/tunnel/tools/libwg-go/redundant_tun_fd_test.go
 new file mode 100644
-index 00000000..9c385825
+index 0000000000000000000000000000000000000000..38ee324365e666f96989e873925aa434f1d2696b
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_fd_test.go
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,55 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -3714,9 +3741,10 @@ index 00000000..9c385825
 +	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 +)
 +
-+func TestOwnedRedundantTunCreateFailureClosesTransferredFD(t *testing.T) {
++var _ func(int, func(int) (tun.Device, string, error)) (tun.Device, error) = createOwnedRedundantTUNFromFD
++
++func TestOwnedRedundantTunCreateFailureDoesNotCloseConsumedFDAgain(t *testing.T) {
 +	createFailure := errors.New("create TUN failed")
-+	closedFD := -1
 +	device, err := createOwnedRedundantTUNFromFD(
 +		41,
 +		func(fd int) (tun.Device, string, error) {
@@ -3724,10 +3752,6 @@ index 00000000..9c385825
 +				t.Fatalf("create fd = %d, want 41", fd)
 +			}
 +			return nil, "", createFailure
-+		},
-+		func(fd int) error {
-+			closedFD = fd
-+			return nil
 +		},
 +	)
 +
@@ -3737,13 +3761,33 @@ index 00000000..9c385825
 +	if !errors.Is(err, createFailure) {
 +		t.Fatalf("create error = %v, want %v", err, createFailure)
 +	}
-+	if closedFD != 41 {
-+		t.Fatalf("closed fd = %d, want 41", closedFD)
++}
++
++func TestOwnedRedundantTunCreateErrorClosesReturnedDevice(t *testing.T) {
++	createFailure := errors.New("create TUN failed after ownership")
++	owned := newFakeRealTUN()
++	device, err := createOwnedRedundantTUNFromFD(
++		42,
++		func(int) (tun.Device, string, error) {
++			return owned, "fake-real-tun", createFailure
++		},
++	)
++
++	if device != nil {
++		t.Fatal("failed create returned a device")
++	}
++	if !errors.Is(err, createFailure) {
++		t.Fatalf("create error = %v, want %v", err, createFailure)
++	}
++	select {
++	case <-owned.closed:
++	default:
++		t.Fatal("returned device was not closed")
 +	}
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_test.go b/tunnel/tools/libwg-go/redundant_tun_test.go
 new file mode 100644
-index 00000000..c841f5ac
+index 0000000000000000000000000000000000000000..c841f5ac5d03b3a7da1f9e3ed30bd022c2406f15
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_test.go
 @@ -0,0 +1,1507 @@
@@ -5256,7 +5300,7 @@ index 00000000..c841f5ac
 +}
 diff --git a/tunnel/tools/libwg-go/telemetry_snapshot.go b/tunnel/tools/libwg-go/telemetry_snapshot.go
 new file mode 100644
-index 00000000..bb25c104
+index 0000000000000000000000000000000000000000..bb25c104dd47299373a2923c5cee04034e845fa4
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/telemetry_snapshot.go
 @@ -0,0 +1,37 @@
@@ -5297,3 +5341,52 @@ index 00000000..bb25c104
 +	snapshot.Endpoint = ""
 +	return snapshot
 +}
+diff --git a/tunnel/tools/libwg-go/with-file-lock.sh b/tunnel/tools/libwg-go/with-file-lock.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..11657f756cfc30fa64f6311b511b969a3bf33cfc
+--- /dev/null
++++ b/tunnel/tools/libwg-go/with-file-lock.sh
+@@ -0,0 +1,43 @@
++#!/bin/sh
++set -eu
++
++if [ "$#" -lt 2 ]; then
++    printf 'usage: %s LOCK_FILE COMMAND [ARG...]\n' "$0" >&2
++    exit 64
++fi
++
++lock_file=$1
++shift
++
++if command -v flock >/dev/null 2>&1; then
++    exec flock "$lock_file" "$@"
++fi
++
++if ! command -v shlock >/dev/null 2>&1; then
++    printf 'no supported file lock utility is available\n' >&2
++    exit 69
++fi
++
++attempt=0
++while ! shlock -f "$lock_file" -p "$$"; do
++    attempt=$((attempt + 1))
++    if [ "$attempt" -ge 300 ]; then
++        printf 'timed out waiting for file lock: %s\n' "$lock_file" >&2
++        exit 75
++    fi
++    sleep 0.1
++done
++
++release_lock() {
++    owner_pid=
++    if [ -f "$lock_file" ]; then
++        IFS= read -r owner_pid < "$lock_file" || owner_pid=
++    fi
++    if [ "$owner_pid" = "$$" ]; then
++        rm -f "$lock_file"
++    fi
++}
++
++trap 'release_lock' EXIT
++trap 'exit 130' HUP INT TERM
++"$@"
