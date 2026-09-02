@@ -398,6 +398,40 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun inMemoryRedundantStopIdentityDoesNotTouchDurableRecovery() {
+        var durableReads = 0
+
+        val operationId = resolveRedundantStopOperationId(
+            pendingStopOperationId = null,
+            pendingStartOperationId = "pending-start",
+            ownerStartOperationId = "owner-start",
+        ) {
+            durableReads += 1
+            RecoveryStoreResult.Success(serviceV2Envelope())
+        }
+
+        assertEquals("pending-start", operationId)
+        assertEquals(0, durableReads)
+    }
+
+    @Test
+    fun durableRedundantStopIdentityIsReadOnlyAfterMemoryMiss() {
+        var durableReads = 0
+
+        val operationId = resolveRedundantStopOperationId(
+            pendingStopOperationId = null,
+            pendingStartOperationId = null,
+            ownerStartOperationId = null,
+        ) {
+            durableReads += 1
+            RecoveryStoreResult.Success(serviceV2Envelope())
+        }
+
+        assertEquals("start-operation", operationId)
+        assertEquals(1, durableReads)
+    }
+
+    @Test
     fun unresolvedRedundantCleanupBlocksEveryKindOfNewStart() {
         assertTrue(redundantCleanupBlocksNewStarts(
             pendingStop = true,
@@ -611,6 +645,7 @@ class NelomaiVpnServiceTest {
         val slot = RedundantVpnOwnerSlot()
         val previous = ServiceRedundantOwner()
         val replacement = ServiceRedundantOwner()
+        val cleanup = RetainedRedundantOwnerCleanup()
         slot.install(previous, "start-a")
         var failure: Throwable? = null
 
@@ -620,6 +655,7 @@ class NelomaiVpnServiceTest {
                 slot = slot,
                 owner = replacement,
                 startOperationId = "start-b",
+                closeOwner = cleanup::closeOrRetain,
             ) {
                 throw IllegalStateException("monitor_failed")
             }
@@ -631,6 +667,61 @@ class NelomaiVpnServiceTest {
         assertEquals(1, previous.closeCalls)
         assertEquals(1, replacement.closeCalls)
         assertNull(slot.snapshot())
+    }
+
+    @Test
+    fun failedOwnerCloseIsRetainedUntilARetrySucceeds() {
+        val owner = ServiceRedundantOwner(closeResults = ArrayDeque(listOf(false, true)))
+        val cleanup = RetainedRedundantOwnerCleanup()
+
+        assertFalse(cleanup.closeOrRetain(owner))
+        assertTrue(cleanup.hasPending())
+        assertEquals(1, owner.closeCalls)
+
+        assertFalse(cleanup.retry())
+        assertFalse(cleanup.hasPending())
+        assertEquals(2, owner.closeCalls)
+    }
+
+    @Test
+    fun ownerReplacementHandsFailedPreviousCloseToRetainedCleanup() {
+        val slot = RedundantVpnOwnerSlot()
+        val previous = ServiceRedundantOwner(closeResults = ArrayDeque(listOf(false, true)))
+        val replacement = ServiceRedundantOwner()
+        val cleanup = RetainedRedundantOwnerCleanup()
+        slot.install(previous, "start-a")
+
+        assertTrue(
+            installRedundantVpnOwnerSafely(
+                mutationFence = RedundantOperationMutationFence(),
+                slot = slot,
+                owner = replacement,
+                startOperationId = "start-b",
+                closeOwner = cleanup::closeOrRetain,
+                initializeAuxiliaryState = {},
+            ),
+        )
+
+        assertTrue(cleanup.hasPending())
+        assertEquals(InstalledRedundantVpnOwner(replacement, "start-b"), slot.snapshot())
+        assertFalse(cleanup.retry())
+        assertEquals(2, previous.closeCalls)
+    }
+
+    @Test
+    fun throwingOwnerCloseIsRetainedWithoutDuplicatingTheOwner() {
+        val owner = ServiceRedundantOwner(
+            closeResults = ArrayDeque(listOf(null, true)),
+        )
+        val cleanup = RetainedRedundantOwnerCleanup()
+
+        assertFalse(cleanup.closeOrRetain(owner))
+        assertFalse(cleanup.closeOrRetain(owner))
+        assertTrue(cleanup.hasPending())
+
+        assertFalse(cleanup.retry())
+        assertFalse(cleanup.hasPending())
+        assertEquals(2, owner.closeCalls)
     }
 
     @Test
@@ -5168,7 +5259,9 @@ private fun serviceV2Envelope() = serviceV1Envelope().copy(
     ),
 )
 
-private class ServiceRedundantOwner : RedundantVpnProcessOwner {
+private class ServiceRedundantOwner(
+    private val closeResults: ArrayDeque<Boolean?> = ArrayDeque(),
+) : RedundantVpnProcessOwner {
     val validatedNetworks = mutableListOf<Boolean>()
     var closeCalls = 0
     override fun recover(): Boolean = true
@@ -5176,7 +5269,9 @@ private class ServiceRedundantOwner : RedundantVpnProcessOwner {
     override fun revoke(): Boolean = true
     override fun closeLocal(): Boolean {
         closeCalls += 1
-        return true
+        if (closeResults.isEmpty()) return true
+        return closeResults.removeFirst()
+            ?: throw IllegalStateException("close_failed")
     }
     override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean {
         validatedNetworks += validated

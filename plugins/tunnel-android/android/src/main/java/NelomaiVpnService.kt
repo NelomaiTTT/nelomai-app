@@ -273,6 +273,7 @@ internal fun installRedundantVpnOwnerSafely(
     slot: RedundantVpnOwnerSlot,
     owner: RedundantVpnProcessOwner,
     startOperationId: String,
+    closeOwner: (RedundantVpnProcessOwner) -> Unit,
     initializeAuxiliaryState: () -> Unit,
 ): Boolean {
     var previous: InstalledRedundantVpnOwner? = null
@@ -283,11 +284,11 @@ internal fun installRedundantVpnOwnerSafely(
         true
     }
     if (swapped && previous?.owner !== owner) {
-        runCatching { previous?.owner?.closeLocal() }
+        previous?.owner?.let(closeOwner)
     }
     if (!accepted) {
         if (swapped) {
-            runCatching { slot.removeIf(startOperationId, owner)?.owner?.closeLocal() }
+            slot.removeIf(startOperationId, owner)?.owner?.let(closeOwner)
         }
         return false
     }
@@ -296,13 +297,45 @@ internal fun installRedundantVpnOwnerSafely(
             slot.runIfCurrent(startOperationId, owner, initializeAuxiliaryState)
         }
         if (!initialized) {
-            runCatching { slot.removeIf(startOperationId, owner)?.owner?.closeLocal() }
+            slot.removeIf(startOperationId, owner)?.owner?.let(closeOwner)
         }
         initialized
     } catch (error: Throwable) {
-        runCatching { slot.removeIf(startOperationId, owner)?.owner?.closeLocal() }
+        slot.removeIf(startOperationId, owner)?.owner?.let(closeOwner)
         throw error
     }
+}
+
+/** Retains process owners by identity until their local native session closes successfully. */
+internal class RetainedRedundantOwnerCleanup {
+    private val gate = Any()
+    private val retained = java.util.IdentityHashMap<RedundantVpnProcessOwner, Unit>()
+
+    fun closeOrRetain(owner: RedundantVpnProcessOwner): Boolean {
+        val shouldClose = synchronized(gate) {
+            if (retained.containsKey(owner)) false else {
+                retained[owner] = Unit
+                true
+            }
+        }
+        if (!shouldClose) return false
+        val closed = runCatching(owner::closeLocal).getOrDefault(false)
+        if (closed) synchronized(gate) { retained.remove(owner) }
+        return closed
+    }
+
+    /** Retries each retained owner once and returns whether another retry remains necessary. */
+    fun retry(): Boolean {
+        val snapshot = synchronized(gate) { retained.keys.toList() }
+        snapshot.forEach { owner ->
+            if (runCatching(owner::closeLocal).getOrDefault(false)) {
+                synchronized(gate) { retained.remove(owner) }
+            }
+        }
+        return hasPending()
+    }
+
+    fun hasPending(): Boolean = synchronized(gate) { retained.isNotEmpty() }
 }
 
 private data class PendingRedundantStop(
@@ -507,6 +540,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private lateinit var recoveryStore: AndroidRecoveryStore
     private lateinit var redundantCancelTombstones: RedundantCancelTombstoneStore
     private val redundantVpnOwnerSlot = RedundantVpnOwnerSlot()
+    private val retainedRedundantOwnerCleanup = RetainedRedundantOwnerCleanup()
     private val redundantVpnOwner: RedundantVpnProcessOwner?
         get() = redundantVpnOwnerSlot.snapshot()?.owner
     @Volatile private var pendingRedundantStop: PendingRedundantStop? = null
@@ -516,6 +550,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     >()
     @Volatile private var redundantCancelTombstoneUnreadable = false
     private val redundantStopRetry = Runnable { retryPendingRedundantStop() }
+    private val retainedRedundantOwnerRetry = Runnable { retryRetainedRedundantOwners() }
     private var serviceDestroyed = false
     private var redundantPhysicalNetworks: PhysicalNetworks? = null
     private val redundantHealthTick = object : Runnable {
@@ -1081,6 +1116,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             slot = redundantVpnOwnerSlot,
             owner = coordinator,
             startOperationId = transaction.startOperationId,
+            closeOwner = ::closeOrRetainRedundantOwner,
         ) {
             AndroidSplitTunnel.replaceVpnRoutes(
                 AndroidSplitTunnel.mergeExcludedRoutes(options.excludedRoutes, localRoutes),
@@ -1499,11 +1535,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun detachCompletedRedundantOwner(completed: PendingRedundantStop) {
         val removed = redundantVpnOwnerSlot.removeIf(completed.startOperationId)
         if (removed == null) {
-            runCatching { completed.owner?.closeLocal() }
+            completed.owner?.let(::closeOrRetainRedundantOwner)
             return
         }
         restoreHandler.removeCallbacks(redundantHealthTick)
-        runCatching { removed.owner.closeLocal() }
+        closeOrRetainRedundantOwner(removed.owner)
         redundantPhysicalNetworks?.stop()
         redundantPhysicalNetworks = null
     }
@@ -1539,6 +1575,41 @@ class NelomaiVpnService : GoBackend.VpnService() {
         )
     }
 
+    private fun closeOrRetainRedundantOwner(owner: RedundantVpnProcessOwner) {
+        if (retainedRedundantOwnerCleanup.closeOrRetain(owner)) return
+        TunnelLog.warning("redundant.local_close_deferred")
+        scheduleRetainedRedundantOwnerRetry()
+    }
+
+    private fun scheduleRetainedRedundantOwnerRetry() {
+        if (!retainedRedundantOwnerCleanup.hasPending()) return
+        restoreHandler.removeCallbacks(retainedRedundantOwnerRetry)
+        restoreHandler.postDelayed(
+            retainedRedundantOwnerRetry,
+            REDUNDANT_STOP_RETRY_MILLIS,
+        )
+    }
+
+    private fun retryRetainedRedundantOwners() {
+        dispatchRedundantWork(
+            dispatcher = redundantWork,
+            fallbackDispatcher = VPN_PROCESS_CLEANUP_WORK,
+            action = {
+                val pending = retainedRedundantOwnerCleanup.retry()
+                restoreHandler.post {
+                    if (pending) {
+                        scheduleRetainedRedundantOwnerRetry()
+                    } else if (serviceDestroyed) {
+                        scheduleIdleProcessRecycle(null)
+                    } else {
+                        stopIfIdle()
+                    }
+                }
+            },
+            onRejected = ::scheduleRetainedRedundantOwnerRetry,
+        )
+    }
+
     private fun resolveRedundantEndpoints(config: Config) {
         repeat(3) { attempt ->
             val unresolved = config.peers.mapNotNull { peer ->
@@ -1560,86 +1631,122 @@ class NelomaiVpnService : GoBackend.VpnService() {
             return
         }
         val pendingCancelled = redundantStartOperation.cancel(clientOperationId)
-        val recovery = recoveryStore.read()
-        val transaction = (recovery as? RecoveryStoreResult.Success)
-            ?.value?.redundantTransaction
-        if (recovery is RecoveryStoreResult.Failure) {
-            TunnelLog.warning("redundant.start_cancel_recovery_failed", recovery.code)
-            if (pendingCancelled) {
-                beginFailClosedRedundantStop(
-                    clientOperationId,
-                    redundantOwnerForOperation(clientOperationId),
-                )
-            } else {
-                stopIfIdle()
+        val knownInMemory = pendingCancelled ||
+            pendingRedundantStop?.startOperationId == clientOperationId ||
+            redundantVpnOwnerSlot.snapshot()?.startOperationId == clientOperationId
+        if (knownInMemory) {
+            beginCancelledRedundantStartStop(clientOperationId)
+            return
+        }
+        readRecoveryForRedundantStop { recovery ->
+            val cancelledWhileReading = redundantStartOperation.cancel(clientOperationId)
+            val transaction = (recovery as? RecoveryStoreResult.Success)
+                ?.value?.redundantTransaction
+            if (recovery is RecoveryStoreResult.Failure) {
+                TunnelLog.warning("redundant.start_cancel_recovery_failed", recovery.code)
+                if (cancelledWhileReading) {
+                    beginCancelledRedundantStartStop(clientOperationId)
+                } else {
+                    stopIfIdle()
+                }
+                return@readRecoveryForRedundantStop
             }
-            return
+            if (transaction?.startOperationId == clientOperationId || cancelledWhileReading) {
+                beginCancelledRedundantStartStop(clientOperationId)
+                return@readRecoveryForRedundantStop
+            }
+            TunnelRuntime.cancelClientStart(applicationContext, clientOperationId)
+            stopIfIdle()
         }
-        if (transaction?.startOperationId == clientOperationId || pendingCancelled) {
-            QuickTunnelController.updateState(
-                applicationContext,
-                SessionState.STOPPING,
-                desiredActive = false,
-            )
-            beginFailClosedRedundantStop(
-                clientOperationId,
-                redundantOwnerForOperation(clientOperationId),
-            )
-            return
-        }
-        TunnelRuntime.cancelClientStart(applicationContext, clientOperationId)
-        stopIfIdle()
+    }
+
+    private fun beginCancelledRedundantStartStop(clientOperationId: String) {
+        QuickTunnelController.updateState(
+            applicationContext,
+            SessionState.STOPPING,
+            desiredActive = false,
+        )
+        beginFailClosedRedundantStop(
+            clientOperationId,
+            redundantOwnerForOperation(clientOperationId),
+        )
     }
 
     private fun handleClientStop(intent: Intent) {
         val receiver = intent.resultReceiver()
-        if (intent.getIntExtra(EXTRA_API_VERSION, 0) != TUNNEL_API_VERSION) {
+        val apiVersion = intent.getIntExtra(EXTRA_API_VERSION, 0)
+        if (apiVersion != TUNNEL_API_VERSION) {
             receiver.sendError("unsupported_api_version")
             return
         }
         val pendingOperationId = redundantStartOperation.cancelPending()
-        val recovery = recoveryStore.read()
         val installedOwner = redundantVpnOwnerSlot.snapshot()
-        val redundantOperationId = redundantStopOperationId(
+        val inMemoryOperationId = inMemoryRedundantStopOperationId(
             pendingStopOperationId = pendingRedundantStop?.startOperationId,
-            recovery = recovery,
             pendingStartOperationId = pendingOperationId,
             ownerStartOperationId = installedOwner?.startOperationId,
         )
-        if (redundantOperationId != null) {
-            QuickTunnelController.updateState(
-                applicationContext,
-                SessionState.STOPPING,
-                desiredActive = false,
+        if (inMemoryOperationId != null) {
+            beginClientRedundantStop(inMemoryOperationId, installedOwner, receiver)
+            return
+        }
+        readRecoveryForRedundantStop { recovery ->
+            val currentPendingOperationId = redundantStartOperation.cancelPending()
+            val currentOwner = redundantVpnOwnerSlot.snapshot()
+            val redundantOperationId = redundantStopOperationId(
+                pendingStopOperationId = pendingRedundantStop?.startOperationId,
+                recovery = recovery,
+                pendingStartOperationId = currentPendingOperationId,
+                ownerStartOperationId = currentOwner?.startOperationId,
             )
-            redundantStopWaiters.getOrPut(redundantOperationId, ::mutableListOf).add { result ->
-                if (!result.fenced) {
-                    receiver.sendError("redundant_stop_fence_failed")
-                } else if (result.stopped) {
-                    receiver.sendOperation(SessionState.STOPPED, 0)
-                } else {
-                    receiver.sendError("redundant_stop_pending")
-                }
+            if (redundantOperationId != null) {
+                beginClientRedundantStop(redundantOperationId, currentOwner, receiver)
+            } else if (recovery is RecoveryStoreResult.Failure) {
+                receiver.sendError("redundant_stop_fence_failed")
+            } else {
+                beginLegacyClientStop(apiVersion, receiver)
             }
-            beginFailClosedRedundantStop(
-                redundantOperationId,
-                installedOwner?.takeIf {
-                    it.startOperationId == redundantOperationId
-                }?.owner,
-            )
-            return
         }
-        if (recovery is RecoveryStoreResult.Failure) {
-            receiver.sendError("redundant_stop_fence_failed")
-            return
+    }
+
+    private fun beginClientRedundantStop(
+        redundantOperationId: String,
+        installedOwner: InstalledRedundantVpnOwner?,
+        receiver: ResultReceiver?,
+    ) {
+        QuickTunnelController.updateState(
+            applicationContext,
+            SessionState.STOPPING,
+            desiredActive = false,
+        )
+        redundantStopWaiters.getOrPut(redundantOperationId, ::mutableListOf).add { result ->
+            if (!result.fenced) {
+                receiver.sendError("redundant_stop_fence_failed")
+            } else if (result.stopped) {
+                receiver.sendOperation(SessionState.STOPPED, 0)
+            } else {
+                receiver.sendError("redundant_stop_pending")
+            }
         }
+        beginFailClosedRedundantStop(
+            redundantOperationId,
+            installedOwner?.takeIf {
+                it.startOperationId == redundantOperationId
+            }?.owner,
+        )
+    }
+
+    private fun beginLegacyClientStop(
+        apiVersion: Int,
+        receiver: ResultReceiver?,
+    ) {
         QuickTunnelController.updateState(
             applicationContext,
             SessionState.STOPPING,
             desiredActive = false,
         )
         TunnelRuntime.stop(
-            intent.getIntExtra(EXTRA_API_VERSION, 0),
+            apiVersion,
             { state, duration ->
                 QuickTunnelController.updateState(
                     applicationContext,
@@ -1660,6 +1767,22 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 )
                 receiver.sendError(code)
                 stopIfIdle()
+            },
+        )
+    }
+
+    private fun readRecoveryForRedundantStop(
+        complete: (RecoveryStoreResult<AndroidRecoveryEnvelope>) -> Unit,
+    ) {
+        dispatchRedundantWork(
+            dispatcher = redundantWork,
+            fallbackDispatcher = VPN_PROCESS_CLEANUP_WORK,
+            action = {
+                val recovery = recoveryStore.read()
+                restoreHandler.post { complete(recovery) }
+            },
+            onRejected = {
+                complete(RecoveryStoreResult.Failure("redundant_recovery_dispatch_rejected"))
             },
         )
     }
@@ -2494,31 +2617,58 @@ class NelomaiVpnService : GoBackend.VpnService() {
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
         val pendingStartOperationId = redundantStartOperation.cancelPending()
-        val recovery = recoveryStore.read()
         val installedOwner = redundantVpnOwnerSlot.snapshot()
-        val redundantStopOperationId = redundantStopOperationId(
+        val inMemoryOperationId = inMemoryRedundantStopOperationId(
             pendingStopOperationId = pendingRedundantStop?.startOperationId,
-            recovery = recovery,
             pendingStartOperationId = pendingStartOperationId,
             ownerStartOperationId = installedOwner?.startOperationId,
         )
-        if (redundantStopOperationId != null) {
-            if (!redundantRevokeLifecycle.begin()) return
-            beginFailClosedRedundantStop(
-                redundantStopOperationId,
-                installedOwner?.takeIf {
-                    it.startOperationId == redundantStopOperationId
-                }?.owner,
-            )
-            retryPendingRedundantStop()
-            QuickTunnelController.updateState(
-                applicationContext,
-                SessionState.STOPPING,
-                desiredActive = null,
-                changed = true,
-            )
+        if (!redundantRevokeLifecycle.begin()) return
+        if (inMemoryOperationId != null) {
+            beginRedundantRevoke(inMemoryOperationId, installedOwner)
             return
         }
+        readRecoveryForRedundantStop { recovery ->
+            val currentPendingOperationId = redundantStartOperation.cancelPending()
+            val currentOwner = redundantVpnOwnerSlot.snapshot()
+            val redundantStopOperationId = redundantStopOperationId(
+                pendingStopOperationId = pendingRedundantStop?.startOperationId,
+                recovery = recovery,
+                pendingStartOperationId = currentPendingOperationId
+                    ?: pendingStartOperationId,
+                ownerStartOperationId = currentOwner?.startOperationId,
+            )
+            if (redundantStopOperationId != null) {
+                beginRedundantRevoke(redundantStopOperationId, currentOwner)
+            } else {
+                routeLegacyOrUnreadableVpnRevoke(recovery)
+            }
+        }
+    }
+
+    private fun beginRedundantRevoke(
+        redundantStopOperationId: String,
+        installedOwner: InstalledRedundantVpnOwner?,
+    ) {
+        beginFailClosedRedundantStop(
+            redundantStopOperationId,
+            installedOwner?.takeIf {
+                it.startOperationId == redundantStopOperationId
+            }?.owner,
+        )
+        retryPendingRedundantStop()
+        QuickTunnelController.updateState(
+            applicationContext,
+            SessionState.STOPPING,
+            desiredActive = null,
+            changed = true,
+        )
+    }
+
+    private fun routeLegacyOrUnreadableVpnRevoke(
+        recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    ) {
+        redundantRevokeLifecycle.cleanupFinished()
         val routed = routeVpnProcessRevoke(recovery, redundantVpnOwner) {
             val disposition = routeAndroidVpnRevoke(
                 dispatch = connectionIntentDispatch,
@@ -2537,11 +2687,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
             (disposition.cancelled as? AndroidCoordinatorResult.Failure)?.let {
                 TunnelLog.warning("service.vpn_revoke_cancel_failed", it.code)
             }
-            applyAndroidVpnRevokeLifecycle(disposition, ::invokeFrameworkVpnRevoke)
+            applyAndroidVpnRevokeLifecycle(disposition) {
+                redundantRevokeLifecycle.completeFramework(::invokeFrameworkVpnRevoke)
+            }
         }
         if (!routed) {
             TunnelLog.warning("service.vpn_revoke_v2_owner_unavailable")
-            invokeFrameworkVpnRevoke()
+            redundantRevokeLifecycle.completeFramework(::invokeFrameworkVpnRevoke)
         }
     }
 
@@ -2552,7 +2704,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     ) {
         restoreHandler.removeCallbacks(redundantHealthTick)
         val previous = redundantVpnOwnerSlot.install(owner, startOperationId)?.owner
-        if (previous !== owner) runCatching { previous?.closeLocal() }
+        if (previous !== owner) previous?.let(::closeOrRetainRedundantOwner)
         if (owner == null) {
             redundantPhysicalNetworks?.stop()
             redundantPhysicalNetworks = null
@@ -2599,6 +2751,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         when {
             pendingRedundantStop != null -> Unit
             revokePending -> redundantExecutor.shutdown()
+            retainedRedundantOwnerCleanup.hasPending() -> redundantExecutor.shutdown()
             else -> redundantExecutor.shutdownNow()
         }
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
@@ -2617,7 +2770,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun scheduleIdleProcessRecycle(memory: AutomaticDiagnosticsProcessMemory?) {
-        if (pendingRedundantStop != null || redundantCancelTombstoneUnreadable) return
+        if (pendingRedundantStop != null ||
+            redundantCancelTombstoneUnreadable ||
+            retainedRedundantOwnerCleanup.hasPending()
+        ) return
         if (!shouldRecycleIdleVpnProcess(
                 TunnelRuntime.state(),
                 QuickTunnelController.desiredActive(applicationContext),
@@ -2658,7 +2814,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
         // Seal any legacy projection first; the actual desired/generation pair below
         // comes from one encrypted recovery-envelope read.
         QuickTunnelController.desiredActive(applicationContext)
-        pendingRedundantStop?.startOperationId?.let { operationId ->
+        val pendingStartOperationId = redundantStartOperation.cancelPending()
+        val installedOwner = redundantVpnOwnerSlot.snapshot()
+        inMemoryRedundantStopOperationId(
+            pendingStopOperationId = pendingRedundantStop?.startOperationId,
+            pendingStartOperationId = pendingStartOperationId,
+            ownerStartOperationId = installedOwner?.startOperationId,
+        )?.let { operationId ->
             performRedundantQuickStop(operationId, receiver)
             return
         }
@@ -2671,9 +2833,25 @@ class NelomaiVpnService : GoBackend.VpnService() {
             schedulePendingRedundantStopRetry()
             return
         }
-        val quickDispatch = when (val result = connectionIntentCoordinator.quickToggle(
-            connectionIntentDispatch,
-        )) {
+        dispatchRedundantWork(
+            dispatcher = redundantWork,
+            fallbackDispatcher = VPN_PROCESS_CLEANUP_WORK,
+            action = {
+                val result = connectionIntentCoordinator.quickToggle(connectionIntentDispatch)
+                restoreHandler.post { applyBackgroundToggleResult(result, receiver) }
+            },
+            onRejected = {
+                receiver.sendError("redundant_recovery_dispatch_rejected")
+                stopIfIdle()
+            },
+        )
+    }
+
+    private fun applyBackgroundToggleResult(
+        result: RecoveryStoreResult<AndroidQuickToggleDispatch>,
+        receiver: ResultReceiver?,
+    ) {
+        val quickDispatch = when (result) {
             is RecoveryStoreResult.Success -> result.value
             is RecoveryStoreResult.Failure -> {
                 redundantVpnOwnerSlot.snapshot()?.startOperationId?.let { operationId ->
@@ -2818,12 +2996,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
             receiver.sendError("redundant_stop_pending")
             return
         }
-        when (val recovery = recoveryStore.read()) {
-            is RecoveryStoreResult.Success -> receiver?.send(
-                SERVICE_RESULT_OK,
-                redundantStoppingConnectionIntentStatus(recovery.value).toBundle(),
-            )
-            is RecoveryStoreResult.Failure -> receiver.sendError("redundant_stop_pending")
+        readRecoveryForRedundantStop { recovery ->
+            when (recovery) {
+                is RecoveryStoreResult.Success -> receiver?.send(
+                    SERVICE_RESULT_OK,
+                    redundantStoppingConnectionIntentStatus(recovery.value).toBundle(),
+                )
+                is RecoveryStoreResult.Failure -> receiver.sendError("redundant_stop_pending")
+            }
         }
     }
 
@@ -3299,7 +3479,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun stopIfIdle() {
         if (pendingRedundantStop != null ||
             redundantCancelTombstoneUnreadable ||
-            redundantRevokeLifecycle.hasPendingCleanup()
+            redundantRevokeLifecycle.hasPendingCleanup() ||
+            retainedRedundantOwnerCleanup.hasPending()
         ) return
         applyAndroidVpnServiceIdleLifecycle(
             debouncer = idleStopDebouncer,

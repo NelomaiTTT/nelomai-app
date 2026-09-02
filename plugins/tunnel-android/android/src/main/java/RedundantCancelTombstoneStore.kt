@@ -173,9 +173,29 @@ internal fun redundantStopOperationId(
     recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
     pendingStartOperationId: String?,
     ownerStartOperationId: String?,
+): String? = resolveRedundantStopOperationId(
+    pendingStopOperationId,
+    pendingStartOperationId,
+    ownerStartOperationId,
+) { recovery }
+
+internal fun resolveRedundantStopOperationId(
+    pendingStopOperationId: String?,
+    pendingStartOperationId: String?,
+    ownerStartOperationId: String?,
+    durableRecovery: () -> RecoveryStoreResult<AndroidRecoveryEnvelope>,
+): String? = inMemoryRedundantStopOperationId(
+    pendingStopOperationId,
+    pendingStartOperationId,
+    ownerStartOperationId,
+) ?: (durableRecovery() as? RecoveryStoreResult.Success)
+    ?.value?.redundantTransaction?.startOperationId
+
+internal fun inMemoryRedundantStopOperationId(
+    pendingStopOperationId: String?,
+    pendingStartOperationId: String?,
+    ownerStartOperationId: String?,
 ): String? = pendingStopOperationId
-    ?: (recovery as? RecoveryStoreResult.Success)
-        ?.value?.redundantTransaction?.startOperationId
     ?: pendingStartOperationId
     ?: ownerStartOperationId
 
