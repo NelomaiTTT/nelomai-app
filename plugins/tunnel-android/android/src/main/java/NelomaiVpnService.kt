@@ -778,6 +778,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     override fun onCreate() {
         super.onCreate()
         TunnelLog.initialize(applicationContext)
+        AutomaticDiagnostics.captureLegacySessionWatermark(applicationContext)
         TunnelRuntime.initialize(applicationContext)
         recoveryStore = AndroidRecoveryStores.open(applicationContext)
         redundantCancelTombstones = RedundantCancelTombstoneStore(
@@ -932,15 +933,17 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 performBackgroundToggle(intent.resultReceiver())
             }
             intent?.action == ACTION_ENSURE_RUNNING -> {
-                if (ensureConnectionIntentRunningAfterRedundantBarrier()) {
-                    Unit
+                ensureRunningFromDurableState("ensure_running")
+            }
+            intent?.action == ACTION_TASK_REMOVAL_LIVENESS -> {
+                if (QuickTunnelController.desiredActiveSnapshot(applicationContext) == false) {
+                    TunnelLog.info(
+                        "service.task_removal_liveness_skipped",
+                        mapOf("reason" to "user_stopped"),
+                    )
+                    stopIfIdle()
                 } else {
-                    val recovery = recoveryStore.read()
-                    if (!shouldEnterLegacyVpnRecovery(recovery)) {
-                        dispatchRedundantResume(recovery)
-                    } else {
-                        restoreDesiredTunnel("ensure_running")
-                    }
+                    ensureRunningFromDurableState("task_removal_liveness")
                 }
             }
             intent?.action == ACTION_CLIENT_START -> handleClientStart(intent)
@@ -3216,6 +3219,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
         TunnelLog.info("service.ui_task_removed")
         runCatching { AutomaticDiagnostics.onUiTaskRemoved(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.memory_snapshot_failed", error = it) }
+        runCatching {
+            val desiredActive = QuickTunnelController.desiredActiveSnapshot(applicationContext)
+            if (shouldScheduleTaskRemovalLiveness(desiredActive, TunnelRuntime.state())) {
+                VpnTaskRemovalLiveness.schedule(applicationContext)
+            }
+        }.onFailure { error ->
+            TunnelLog.warning("service.task_removal_liveness_schedule_failed", error = error)
+        }
         super.onTaskRemoved(rootIntent)
     }
 
@@ -3612,6 +3623,16 @@ class NelomaiVpnService : GoBackend.VpnService() {
         promoteToForeground()
         TunnelLog.info("service.restore_requested", mapOf("source" to source))
         scheduleConnectionIntentAttempt()
+    }
+
+    private fun ensureRunningFromDurableState(source: String) {
+        if (ensureConnectionIntentRunningAfterRedundantBarrier()) return
+        val recovery = recoveryStore.read()
+        if (!shouldEnterLegacyVpnRecovery(recovery)) {
+            dispatchRedundantResume(recovery)
+        } else {
+            restoreDesiredTunnel(source)
+        }
     }
 
     private fun scheduleConnectionIntentAttempt(delayMillis: Long = 0L) {
@@ -4293,6 +4314,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
         private const val NOTIFICATION_ID = 21
         internal const val ACTION_QUICK_TOGGLE = "ru.nelomai.tunnel.QUICK_TOGGLE"
         internal const val ACTION_ENSURE_RUNNING = "ru.nelomai.tunnel.ENSURE_RUNNING"
+        internal const val ACTION_TASK_REMOVAL_LIVENESS =
+            "ru.nelomai.tunnel.TASK_REMOVAL_LIVENESS"
         internal const val ACTION_CLIENT_START = "ru.nelomai.tunnel.CLIENT_START"
         internal const val ACTION_CANCEL_CLIENT_START =
             "ru.nelomai.tunnel.CANCEL_CLIENT_START"
@@ -4327,6 +4350,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         private val FOREGROUND_ACTIONS = setOf(
             ACTION_QUICK_TOGGLE,
             ACTION_ENSURE_RUNNING,
+            ACTION_TASK_REMOVAL_LIVENESS,
             ACTION_CLIENT_START,
             ACTION_BEGIN_CONNECTION_INTENT,
             ACTION_BEGIN_BACKGROUND_LOGOUT,
@@ -6590,6 +6614,11 @@ internal fun shouldRestoreDesiredTunnel(
     desiredActive: Boolean,
     state: SessionState,
 ): Boolean = desiredActive && state !in setOf(SessionState.RUNNING, SessionState.STARTING)
+
+internal fun shouldScheduleTaskRemovalLiveness(
+    desiredActive: Boolean?,
+    state: SessionState,
+): Boolean = desiredActive != false && state in setOf(SessionState.RUNNING, SessionState.STARTING)
 
 internal fun shouldRetryServiceRestore(code: String): Boolean = code in setOf(
     "background_transport_unavailable",

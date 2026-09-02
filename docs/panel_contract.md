@@ -162,8 +162,11 @@ tail of the privileged tunnel helper log. Passwords, session tokens, and
 WireGuard configuration must never be logged. The panel applies a second
 redaction pass, accepts at most 512 KiB once per minute per device, keeps five
 reports per device for no longer than 30 days, and exposes them only to an
-administrator. Android also persists background reports after tunnel stops and
-six-hour checkpoints. A terminal connection-start failure queues one report
+administrator. Android also persists background reports after tunnel stops,
+unexpected VPN-process interruptions, and six-hour checkpoints. Interrupted
+reports end at the last durable data-plane observation and retain historical
+memory samples without attributing the replacement process to the lost
+session. A terminal connection-start failure queues one report
 with the `connection_start_failed` trigger and no tunnel-session metadata;
 repeated failures share that device-scoped pending report and are rate-limited
 to one new report per device per 15 minutes. The current device identifier is

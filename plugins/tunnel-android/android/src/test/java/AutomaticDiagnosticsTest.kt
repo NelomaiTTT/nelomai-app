@@ -7,6 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -900,6 +901,193 @@ class AutomaticDiagnosticsTest {
         assertEquals(100L, component.getLong("pss_java_heap_bytes"))
         assertEquals(200L, component.getLong("pss_native_heap_bytes"))
         assertEquals(50L, component.getLong("pss_graphics_bytes"))
+    }
+
+    @Test
+    fun structuredMemoryComponentsPreferLiveSmapsRollupOverCachedActivityManagerPss() {
+        val processes = JSONArray().put(
+            JSONObject()
+                .put("processId", 42L)
+                .put("processName", "ru.nelomai.client:vpn")
+                .put("currentResidentMemoryBytes", 400L)
+                .put("currentProportionalMemoryBytes", 500L)
+                .put("currentPrivateDirtyMemoryBytes", 300L)
+                .put("smapsResidentMemoryBytes", 120L)
+                .put("smapsProportionalMemoryBytes", 80L)
+                .put("smapsPrivateDirtyMemoryBytes", 60L)
+                .put("pssCodeBytes", 200L),
+        )
+
+        val components = automaticDiagnosticsResourceComponents(processes)
+        val process = components.getJSONObject(0)
+        val aggregate = components.getJSONObject(1)
+
+        assertEquals("android_smaps_rollup", process.getString("source"))
+        assertEquals(120L, process.getLong("current_resident_memory_bytes"))
+        assertEquals(80L, process.getLong("current_proportional_memory_bytes"))
+        assertEquals(60L, process.getLong("current_private_dirty_memory_bytes"))
+        assertEquals(500L, process.getLong("activity_manager_pss_bytes"))
+        assertEquals(
+            "android_activity_manager_memory_info",
+            process.getString("pss_categories_source"),
+        )
+        assertEquals("android_smaps_rollup_sum", aggregate.getString("source"))
+        assertEquals(120L, aggregate.getLong("current_resident_memory_bytes"))
+        assertEquals(80L, aggregate.getLong("current_proportional_memory_bytes"))
+    }
+
+    @Test
+    fun interruptedSessionEndsAtLastLiveObservationWithinItsInterval() {
+        assertEquals(
+            150L,
+            automaticDiagnosticsInterruptedSessionEnd(
+                startedAt = 100L,
+                lastLiveAt = 150L,
+                observedAt = 200L,
+            ),
+        )
+        assertEquals(
+            100L,
+            automaticDiagnosticsInterruptedSessionEnd(
+                startedAt = 100L,
+                lastLiveAt = null,
+                observedAt = 200L,
+            ),
+        )
+        assertEquals(
+            100L,
+            automaticDiagnosticsInterruptedSessionEnd(
+                startedAt = 100L,
+                lastLiveAt = 50L,
+                observedAt = 200L,
+            ),
+        )
+        assertEquals(
+            200L,
+            automaticDiagnosticsInterruptedSessionEnd(
+                startedAt = 100L,
+                lastLiveAt = 250L,
+                observedAt = 200L,
+            ),
+        )
+    }
+
+    @Test
+    fun durableNormalStopMarkerSurvivesProcessRestartClassification() {
+        val normal = automaticDiagnosticsStoppedSessionSeal(
+            pending = true,
+            pendingTrigger = "tunnel_stopped",
+            pendingEndedAt = 175L,
+            startedAt = 100L,
+            lastLiveAt = 150L,
+            observedAt = 200L,
+        )
+        val interrupted = automaticDiagnosticsStoppedSessionSeal(
+            pending = false,
+            pendingTrigger = null,
+            pendingEndedAt = null,
+            startedAt = 100L,
+            lastLiveAt = 150L,
+            observedAt = 200L,
+        )
+        val legacyNormal = automaticDiagnosticsStoppedSessionSeal(
+            pending = true,
+            pendingTrigger = null,
+            pendingEndedAt = null,
+            startedAt = 100L,
+            lastLiveAt = 160L,
+            observedAt = 200L,
+        )
+        val legacyWithoutEvidence = automaticDiagnosticsStoppedSessionSeal(
+            pending = true,
+            pendingTrigger = null,
+            pendingEndedAt = null,
+            startedAt = 100L,
+            lastLiveAt = null,
+            observedAt = 200L,
+        )
+
+        assertEquals("tunnel_stopped", normal.trigger)
+        assertEquals(175L, normal.endedAt)
+        assertEquals("tunnel_interrupted", interrupted.trigger)
+        assertEquals(150L, interrupted.endedAt)
+        assertEquals("tunnel_stopped", legacyNormal.trigger)
+        assertEquals(160L, legacyNormal.endedAt)
+        assertEquals(100L, legacyWithoutEvidence.endedAt)
+    }
+
+    @Test
+    fun legacySessionWatermarkUsesLastDurableLogBeforeReplacementProcess() {
+        val log = """
+            {"timestamp":"2026-09-02T10:00:00Z","event":"tunnel.data_plane_snapshot"}
+            malformed
+            {"timestamp":"2026-09-02T10:01:00Z","event":"diagnostics.memory_snapshot"}
+            {"timestamp":"2026-09-02T10:03:00Z","event":"replacement.process.event"}
+        """.trimIndent()
+
+        assertEquals(
+            Instant.parse("2026-09-02T10:01:00Z").epochSecond,
+            automaticDiagnosticsLatestLogTimestamp(
+                log,
+                startedAt = Instant.parse("2026-09-02T09:59:00Z").epochSecond,
+                observedAt = Instant.parse("2026-09-02T10:02:00Z").epochSecond,
+            ),
+        )
+    }
+
+    @Test
+    fun interruptedSessionTriggerIsAcceptedByPendingSealRecovery() {
+        assertTrue(automaticDiagnosticsSessionTriggerAllowed("tunnel_interrupted"))
+        assertTrue(automaticDiagnosticsSessionTriggerAllowed("tunnel_stopped"))
+        assertTrue(automaticDiagnosticsSessionTriggerAllowed("six_hour_checkpoint"))
+        assertFalse(automaticDiagnosticsSessionTriggerAllowed("unexpected"))
+    }
+
+    @Test
+    fun interruptedSessionDoesNotAttachMemoryFromTheReplacementProcess() {
+        assertFalse(automaticDiagnosticsIncludeCurrentProcessMemory("tunnel_interrupted"))
+        assertTrue(automaticDiagnosticsIncludeCurrentProcessMemory("tunnel_stopped"))
+        assertTrue(automaticDiagnosticsIncludeCurrentProcessMemory("six_hour_checkpoint"))
+    }
+
+    @Test
+    fun interruptedSessionDoesNotInventAnEmptyAggregateProcessComponent() {
+        val components = automaticDiagnosticsReportResourceComponents(
+            trigger = "tunnel_interrupted",
+            processes = JSONArray().put(
+                JSONObject()
+                    .put("processId", 42L)
+                    .put("processName", "ru.nelomai:replacement")
+                    .put("currentResidentMemoryBytes", 64L),
+            ),
+        )
+
+        assertEquals(0, components.length())
+    }
+
+    @Test
+    fun interruptedSessionMemoryTimelineDoesNotAppendAnEmptyReplacementSample() {
+        val historical = JSONObject()
+            .put("timestamp_unix", 150L)
+            .put("reason", "periodic")
+            .put(
+                "components",
+                JSONArray().put(
+                    JSONObject()
+                        .put("component", "android_vpn_process")
+                        .put("source", "android_smaps_rollup"),
+                ),
+            )
+
+        val samples = automaticDiagnosticsMemorySamplesForReport(
+            samples = listOf(historical),
+            startedAt = 100L,
+            endedAt = 200L,
+            finalSample = null,
+            maximum = 32,
+        )
+
+        assertEquals(listOf("periodic"), samples.map { it.getString("reason") })
     }
 
     @Test

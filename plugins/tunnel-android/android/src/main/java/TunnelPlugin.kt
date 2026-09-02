@@ -2445,6 +2445,7 @@ internal object TunnelRuntime {
                     ),
                 ),
             )
+            applicationContext?.let(AutomaticDiagnostics::onDataPlaneObserved)
         } catch (error: Throwable) {
             TunnelLog.warning("tunnel.data_plane_snapshot_failed", error = error)
         }

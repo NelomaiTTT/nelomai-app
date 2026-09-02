@@ -6323,6 +6323,25 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun taskRemovalLivenessOnlySchedulesForAnActivePossiblyDesiredTunnel() {
+        assertTrue(shouldScheduleTaskRemovalLiveness(true, SessionState.RUNNING))
+        assertTrue(shouldScheduleTaskRemovalLiveness(null, SessionState.STARTING))
+        assertFalse(shouldScheduleTaskRemovalLiveness(false, SessionState.RUNNING))
+        assertFalse(shouldScheduleTaskRemovalLiveness(true, SessionState.STOPPED))
+        assertFalse(shouldScheduleTaskRemovalLiveness(true, SessionState.FAILED))
+    }
+
+    @Test
+    fun scheduledTaskRemovalLivenessDoesNotTrustAProcessLocalDesiredSnapshot() {
+        var dispatches = 0
+
+        val result = dispatchScheduledTaskRemovalLiveness { dispatches += 1 }
+
+        assertTrue(result.isSuccess)
+        assertEquals(1, dispatches)
+    }
+
+    @Test
     fun timedOutStartOnlyCancelsItsOwnActiveSession() {
         assertTrue(shouldCancelActiveClientStart("operation-a", "operation-a"))
         assertFalse(shouldCancelActiveClientStart("operation-a", "operation-b"))

@@ -65,13 +65,91 @@ private const val TUNNEL_START_MEMORY_TOP_MAPPINGS = 12
 private const val AUTOMATIC_DIAGNOSTICS_JOB_ID = 0x4e444941
 private val RETRY_DELAYS_SECONDS = longArrayOf(5 * 60L, 30 * 60L, 2 * 60 * 60L, 6 * 60 * 60L)
 
+internal fun automaticDiagnosticsInterruptedSessionEnd(
+    startedAt: Long,
+    lastLiveAt: Long?,
+    observedAt: Long,
+): Long {
+    val safeObservedAt = maxOf(startedAt, observedAt)
+    return (lastLiveAt ?: startedAt).coerceIn(startedAt, safeObservedAt)
+}
+
+internal data class AutomaticDiagnosticsStoppedSessionSeal(
+    val trigger: String,
+    val endedAt: Long,
+)
+
+internal fun automaticDiagnosticsStoppedSessionSeal(
+    pending: Boolean,
+    pendingTrigger: String?,
+    pendingEndedAt: Long?,
+    startedAt: Long,
+    lastLiveAt: Long?,
+    observedAt: Long,
+): AutomaticDiagnosticsStoppedSessionSeal {
+    if (!pending) {
+        return AutomaticDiagnosticsStoppedSessionSeal(
+            trigger = "tunnel_interrupted",
+            endedAt = automaticDiagnosticsInterruptedSessionEnd(
+                startedAt,
+                lastLiveAt,
+                observedAt,
+            ),
+        )
+    }
+    val trigger = pendingTrigger
+        ?.takeIf { it == "tunnel_stopped" || it == "tunnel_interrupted" }
+        ?: "tunnel_stopped"
+    return AutomaticDiagnosticsStoppedSessionSeal(
+        trigger = trigger,
+        endedAt = (pendingEndedAt ?: lastLiveAt ?: startedAt)
+            .coerceIn(startedAt, maxOf(startedAt, observedAt)),
+    )
+}
+
+internal fun automaticDiagnosticsSessionTriggerAllowed(trigger: String): Boolean = trigger in setOf(
+    "tunnel_stopped",
+    "tunnel_interrupted",
+    "six_hour_checkpoint",
+)
+
+internal fun automaticDiagnosticsIncludeCurrentProcessMemory(trigger: String): Boolean =
+    trigger != "tunnel_interrupted"
+
+internal fun automaticDiagnosticsReportResourceComponents(
+    trigger: String,
+    processes: JSONArray,
+): JSONArray = if (automaticDiagnosticsIncludeCurrentProcessMemory(trigger)) {
+    automaticDiagnosticsResourceComponents(processes)
+} else {
+    JSONArray()
+}
+
+internal fun automaticDiagnosticsLatestLogTimestamp(
+    value: String,
+    startedAt: Long,
+    observedAt: Long,
+): Long? = value.lineSequence().mapNotNull { line ->
+    runCatching {
+        val payload = JSONObject(line)
+        if (payload.has("timestamp_unix")) {
+            payload.getLong("timestamp_unix")
+        } else {
+            Instant.parse(payload.getString("timestamp")).epochSecond
+        }
+    }.getOrNull()?.takeIf { it in startedAt..observedAt }
+}.maxOrNull()
+
 private const val KEY_SESSION_ID = "session_id"
 private const val KEY_SESSION_SEQUENCE = "session_sequence"
 private const val KEY_INTERVAL_STARTED_AT = "interval_started_at"
 private const val KEY_SESSION_RUNNING = "session_running"
 private const val KEY_SESSION_DEVICE_ID = "session_device_id"
 private const val KEY_SESSION_LEASE_ID = "session_lease_id"
+private const val KEY_SESSION_LAST_LIVE_AT = "session_last_live_at"
 private const val KEY_STOPPED_SESSION_PENDING = "stopped_session_pending"
+private const val KEY_STOPPED_SESSION_TRIGGER = "stopped_session_trigger"
+private const val KEY_STOPPED_SESSION_ENDED_AT = "stopped_session_ended_at"
 private const val KEY_PENDING_SEAL = "pending_seal"
 private const val KEY_RETRY_ATTEMPT = "retry_attempt"
 private const val KEY_NEXT_UPLOAD_AT = "next_upload_at"
@@ -572,11 +650,19 @@ internal object AutomaticDiagnostics {
             ensureDirectories(applicationContext)
             val preferences = preferences(applicationContext)
             if (preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
-                markStoppedSessionPending(applicationContext)
+                val stoppedSession = stoppedSessionSeal(preferences)
+                if (!preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
+                    markStoppedSessionPending(
+                        applicationContext,
+                        stoppedSession.trigger,
+                        stoppedSession.endedAt,
+                    )
+                }
                 if (!sealCurrentInterval(
                         applicationContext,
-                        "tunnel_stopped",
+                        stoppedSession.trigger,
                         tunnelRunning = false,
+                        endedAtUnix = stoppedSession.endedAt,
                     )
                 ) {
                     scheduleRetry(applicationContext, "automatic_diagnostics_report_queue_failed")
@@ -596,12 +682,20 @@ internal object AutomaticDiagnostics {
         synchronized(gate) {
             val preferences = preferences(applicationContext)
             if (preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
-                markStoppedSessionPending(applicationContext)
+                val stoppedSession = stoppedSessionSeal(preferences)
+                if (!preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
+                    markStoppedSessionPending(
+                        applicationContext,
+                        stoppedSession.trigger,
+                        stoppedSession.endedAt,
+                    )
+                }
                 check(
                     sealCurrentInterval(
                         applicationContext,
-                        "tunnel_stopped",
+                        stoppedSession.trigger,
                         tunnelRunning = false,
+                        endedAtUnix = stoppedSession.endedAt,
                     ),
                 ) { "automatic_diagnostics_previous_session_not_saved" }
             }
@@ -618,7 +712,10 @@ internal object AutomaticDiagnostics {
                     .putBoolean(KEY_SESSION_RUNNING, true)
                     .putString(KEY_SESSION_DEVICE_ID, deviceId)
                     .putString(KEY_SESSION_LEASE_ID, connectionLeaseId)
+                    .putLong(KEY_SESSION_LAST_LIVE_AT, now)
                     .remove(KEY_STOPPED_SESSION_PENDING)
+                    .remove(KEY_STOPPED_SESSION_TRIGGER)
+                    .remove(KEY_STOPPED_SESSION_ENDED_AT)
                     .remove(KEY_PENDING_SEAL)
                     .commit(),
             ) { "automatic_diagnostics_session_write_failed" }
@@ -643,13 +740,81 @@ internal object AutomaticDiagnostics {
             recordMemorySnapshot(applicationContext, "tunnel_stopping")
             val preferences = preferences(applicationContext)
             if (preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
-                markStoppedSessionPending(applicationContext)
-                if (!sealCurrentInterval(applicationContext, "tunnel_stopped", tunnelRunning = false)) {
+                val endedAt = nowUnix()
+                markStoppedSessionPending(applicationContext, "tunnel_stopped", endedAt)
+                if (!sealCurrentInterval(
+                        applicationContext,
+                        "tunnel_stopped",
+                        tunnelRunning = false,
+                        endedAtUnix = endedAt,
+                    )
+                ) {
                     scheduleRetry(applicationContext, "automatic_diagnostics_report_queue_failed")
                     return
                 }
             }
             scheduleUploadLocked(applicationContext, requestedDelaySeconds = 0)
+        }
+    }
+
+    fun onDataPlaneObserved(context: Context) {
+        val applicationContext = context.applicationContext
+        synchronized(gate) {
+            val preferences = preferences(applicationContext)
+            if (preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
+                val saved = preferences.edit()
+                    .putLong(KEY_SESSION_LAST_LIVE_AT, nowUnix())
+                    .commit()
+                if (!saved) {
+                    TunnelLog.warning(
+                        "diagnostics.last_live_write_failed",
+                        "shared_preferences_commit_failed",
+                    )
+                }
+            }
+        }
+    }
+
+    fun captureLegacySessionWatermark(context: Context) {
+        val applicationContext = context.applicationContext
+        synchronized(gate) {
+            val preferences = preferences(applicationContext)
+            if (!preferences.getBoolean(KEY_SESSION_RUNNING, false) ||
+                preferences.contains(KEY_SESSION_LAST_LIVE_AT) ||
+                preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false) &&
+                preferences.contains(KEY_STOPPED_SESSION_ENDED_AT)
+            ) return
+            val observedAt = nowUnix()
+            val startedAt = preferences.getLong(KEY_INTERVAL_STARTED_AT, 0)
+                .takeIf { it > 0 }
+                ?: return
+            val diagnostics = File(applicationContext.applicationInfo.dataDir, "diagnostics")
+            val log = readTail(
+                File(diagnostics, "android-tunnel.previous.jsonl"),
+                MAX_HELPER_LOG_BYTES / 2,
+            ) + readTail(
+                File(diagnostics, "android-tunnel.jsonl"),
+                MAX_HELPER_LOG_BYTES,
+            )
+            val recoveredAt = automaticDiagnosticsLatestLogTimestamp(
+                log,
+                startedAt,
+                observedAt,
+            ) ?: return
+            val saved = preferences.edit()
+                .putLong(KEY_SESSION_LAST_LIVE_AT, recoveredAt)
+                .commit()
+            if (saved) {
+                TunnelLog.info(
+                    "diagnostics.legacy_last_live_recovered",
+                    mapOf("last_live_at_unix" to recoveredAt),
+                )
+            } else {
+                TunnelLog.warning(
+                    "diagnostics.last_live_write_failed",
+                    "shared_preferences_commit_failed",
+                )
+            }
         }
     }
 
@@ -1035,11 +1200,17 @@ internal object AutomaticDiagnostics {
         TunnelLog.initialize(applicationContext)
         synchronized(gate) {
             ensureDirectories(applicationContext)
-            if (
-                preferences(applicationContext).getBoolean(KEY_SESSION_RUNNING, false)
-                && TunnelRuntime.state() != SessionState.RUNNING
+            val preferences = preferences(applicationContext)
+            if (preferences.getBoolean(KEY_SESSION_RUNNING, false) &&
+                !preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false) &&
+                TunnelRuntime.state() != SessionState.RUNNING
             ) {
-                markStoppedSessionPending(applicationContext)
+                val stoppedSession = stoppedSessionSeal(preferences)
+                markStoppedSessionPending(
+                    applicationContext,
+                    stoppedSession.trigger,
+                    stoppedSession.endedAt,
+                )
             }
         }
         if (!systemJobRunning.compareAndSet(false, true)) {
@@ -1080,10 +1251,29 @@ internal object AutomaticDiagnostics {
         }
     }
 
+    private fun stoppedSessionSeal(
+        preferences: android.content.SharedPreferences,
+    ): AutomaticDiagnosticsStoppedSessionSeal {
+        val observedAt = nowUnix()
+        val startedAt = preferences.getLong(KEY_INTERVAL_STARTED_AT, observedAt)
+        val lastLiveAt = preferences.getLong(KEY_SESSION_LAST_LIVE_AT, 0)
+            .takeIf { it > 0 }
+        return automaticDiagnosticsStoppedSessionSeal(
+            pending = preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false),
+            pendingTrigger = preferences.getString(KEY_STOPPED_SESSION_TRIGGER, null),
+            pendingEndedAt = preferences.getLong(KEY_STOPPED_SESSION_ENDED_AT, 0)
+                .takeIf { it > 0 },
+            startedAt = startedAt,
+            lastLiveAt = lastLiveAt,
+            observedAt = observedAt,
+        )
+    }
+
     private fun sealCurrentInterval(
         context: Context,
         trigger: String,
         tunnelRunning: Boolean,
+        endedAtUnix: Long? = null,
     ): Boolean {
         val preferences = preferences(context)
         val sessionId = preferences.getString(KEY_SESSION_ID, null) ?: return false
@@ -1102,7 +1292,7 @@ internal object AutomaticDiagnostics {
                     deviceId = preferences.getString(KEY_SESSION_DEVICE_ID, null),
                     sequence = sequence,
                     startedAt = startedAt,
-                    endedAt = maxOf(nowUnix(), startedAt),
+                    endedAt = (endedAtUnix ?: nowUnix()).coerceAtLeast(startedAt),
                     tunnelRunning = tunnelRunning,
                     connectionLeaseId = preferences.getString(KEY_SESSION_LEASE_ID, null),
                 )
@@ -1147,7 +1337,10 @@ internal object AutomaticDiagnostics {
                     .remove(KEY_INTERVAL_STARTED_AT)
                     .remove(KEY_SESSION_DEVICE_ID)
                     .remove(KEY_SESSION_LEASE_ID)
+                    .remove(KEY_SESSION_LAST_LIVE_AT)
                     .remove(KEY_STOPPED_SESSION_PENDING)
+                    .remove(KEY_STOPPED_SESSION_TRIGGER)
+                    .remove(KEY_STOPPED_SESSION_ENDED_AT)
                     .putBoolean(KEY_SESSION_RUNNING, false)
             }
             check(editor.commit()) { "automatic_diagnostics_session_write_failed" }
@@ -1164,7 +1357,7 @@ internal object AutomaticDiagnostics {
                 (seal.trigger != trigger || seal.tunnelRunning != tunnelRunning) &&
                 preferences.getBoolean(KEY_SESSION_RUNNING, false)
             ) {
-                sealCurrentInterval(context, trigger, tunnelRunning)
+                sealCurrentInterval(context, trigger, tunnelRunning, endedAtUnix)
             } else {
                 true
             }
@@ -1185,13 +1378,22 @@ internal object AutomaticDiagnostics {
         tunnelRunning: Boolean,
         connectionLeaseId: String?,
     ): JSONObject {
-        val processes = androidProcessMemory(context)
-        logMemorySnapshot(context.packageName, processes, "report_$trigger")
-        val finalMemorySample = automaticDiagnosticsMemorySample(
-            processes,
-            "report_$trigger",
-            endedAt,
-        )
+        val processes = if (automaticDiagnosticsIncludeCurrentProcessMemory(trigger)) {
+            androidProcessMemory(context).also {
+                logMemorySnapshot(context.packageName, it, "report_$trigger")
+            }
+        } else {
+            JSONArray()
+        }
+        val finalMemorySample = processes
+            .takeIf { automaticDiagnosticsIncludeCurrentProcessMemory(trigger) }
+            ?.let {
+                automaticDiagnosticsMemorySample(
+                    it,
+                    "report_$trigger",
+                    endedAt,
+                )
+            }
         val memorySamples = memoryTimelineForReport(
             context,
             startedAt,
@@ -1240,7 +1442,10 @@ internal object AutomaticDiagnostics {
                 JSONObject().apply {
                     put("measurement_mode", "session_delta")
                     put("session_duration_ms", (endedAt - startedAt).coerceAtLeast(0).times(1000))
-                    put("components", automaticDiagnosticsResourceComponents(processes))
+                    put(
+                        "components",
+                        automaticDiagnosticsReportResourceComponents(trigger, processes),
+                    )
                     put("memory_samples", memorySamples)
                 },
             )
@@ -1493,9 +1698,9 @@ internal object AutomaticDiagnostics {
             val payload = JSONObject(encoded)
             val reportId = UUID.fromString(payload.getString("report_id")).toString()
             val sessionId = UUID.fromString(payload.getString("session_id")).toString()
-            val trigger = payload.getString("trigger").takeIf {
-                it == "tunnel_stopped" || it == "six_hour_checkpoint"
-            } ?: error("invalid diagnostics trigger")
+            val trigger = payload.getString("trigger")
+                .takeIf(::automaticDiagnosticsSessionTriggerAllowed)
+                ?: error("invalid diagnostics trigger")
             val sequence = payload.getInt("sequence").takeIf { it > 0 }
                 ?: error("invalid diagnostics sequence")
             val startedAt = payload.getLong("started_at").takeIf { it > 0 }
@@ -1695,10 +1900,19 @@ internal object AutomaticDiagnostics {
                 if (!preferences.getBoolean(KEY_SESSION_RUNNING, false)) {
                     preferences.edit()
                         .remove(KEY_STOPPED_SESSION_PENDING)
+                        .remove(KEY_STOPPED_SESSION_TRIGGER)
+                        .remove(KEY_STOPPED_SESSION_ENDED_AT)
                         .remove(KEY_PENDING_SEAL)
                         .apply()
                 } else if (preferences.getBoolean(KEY_STOPPED_SESSION_PENDING, false)) {
-                    if (!sealCurrentInterval(context, "tunnel_stopped", tunnelRunning = false)) {
+                    val stoppedSession = stoppedSessionSeal(preferences)
+                    if (!sealCurrentInterval(
+                            context,
+                            stoppedSession.trigger,
+                            tunnelRunning = false,
+                            endedAtUnix = stoppedSession.endedAt,
+                        )
+                    ) {
                         scheduleRetry(context, "automatic_diagnostics_report_queue_failed")
                         return true
                     }
@@ -1862,10 +2076,21 @@ internal object AutomaticDiagnostics {
         )
     }
 
-    private fun markStoppedSessionPending(context: Context) {
-        val saved = preferences(context).edit()
+    private fun markStoppedSessionPending(
+        context: Context,
+        trigger: String,
+        endedAtUnix: Long?,
+    ) {
+        check(trigger == "tunnel_stopped" || trigger == "tunnel_interrupted")
+        val editor = preferences(context).edit()
             .putBoolean(KEY_STOPPED_SESSION_PENDING, true)
-            .commit()
+            .putString(KEY_STOPPED_SESSION_TRIGGER, trigger)
+        if (endedAtUnix == null) {
+            editor.remove(KEY_STOPPED_SESSION_ENDED_AT)
+        } else {
+            editor.putLong(KEY_STOPPED_SESSION_ENDED_AT, endedAtUnix)
+        }
+        val saved = editor.commit()
         scheduleSystemUpload(context, 0)
         check(saved) { "automatic_diagnostics_session_write_failed" }
     }
@@ -1944,7 +2169,7 @@ internal object AutomaticDiagnostics {
         context: Context,
         startedAt: Long,
         endedAt: Long,
-        finalSample: JSONObject,
+        finalSample: JSONObject?,
         capturedMemorySamples: List<JSONObject>? = null,
     ): JSONArray = synchronized(memoryTimelineGate) {
         JSONArray(
@@ -2133,6 +2358,8 @@ internal object AutomaticDiagnostics {
 
 class AutomaticDiagnosticsJobService : JobService() {
     override fun onStartJob(parameters: JobParameters): Boolean {
+        TunnelLog.initialize(applicationContext)
+        AutomaticDiagnostics.captureLegacySessionWatermark(applicationContext)
         AutomaticDiagnostics.runScheduledUpload(applicationContext) {
             jobFinished(parameters, false)
         }
@@ -2157,6 +2384,7 @@ internal fun androidProcessMemory(context: Context): JSONArray {
     if (processes.isEmpty()) {
         val pid = Process.myPid()
         val info = activityManager.getProcessMemoryInfo(intArrayOf(pid)).firstOrNull()
+        val smaps = automaticDiagnosticsReadSmapsRollup(pid)
         return JSONArray().apply {
             put(JSONObject().apply {
                 put("processId", pid.toLong())
@@ -2165,6 +2393,9 @@ internal fun androidProcessMemory(context: Context): JSONArray {
                 putNullable("peakResidentMemoryBytes", processPeakRssBytes(pid))
                 putNullable("currentProportionalMemoryBytes", info?.totalPss?.toLong()?.times(1024L))
                 putNullable("currentPrivateDirtyMemoryBytes", info?.totalPrivateDirty?.toLong()?.times(1024L))
+                putNullable("smapsResidentMemoryBytes", smaps?.residentBytes)
+                putNullable("smapsProportionalMemoryBytes", smaps?.proportionalBytes)
+                putNullable("smapsPrivateDirtyMemoryBytes", smaps?.privateDirtyBytes)
                 putAndroidMemoryStats(info)
             })
         }
@@ -2173,6 +2404,7 @@ internal fun androidProcessMemory(context: Context): JSONArray {
     return JSONArray().apply {
         processes.forEachIndexed { index, process ->
             val info = memory.getOrNull(index)
+            val smaps = automaticDiagnosticsReadSmapsRollup(process.pid)
             put(JSONObject().apply {
                 put("processId", process.pid.toLong())
                 put("processName", process.processName.take(192))
@@ -2180,11 +2412,22 @@ internal fun androidProcessMemory(context: Context): JSONArray {
                 putNullable("peakResidentMemoryBytes", processPeakRssBytes(process.pid))
                 putNullable("currentProportionalMemoryBytes", info?.totalPss?.toLong()?.times(1024L))
                 putNullable("currentPrivateDirtyMemoryBytes", info?.totalPrivateDirty?.toLong()?.times(1024L))
+                putNullable("smapsResidentMemoryBytes", smaps?.residentBytes)
+                putNullable("smapsProportionalMemoryBytes", smaps?.proportionalBytes)
+                putNullable("smapsPrivateDirtyMemoryBytes", smaps?.privateDirtyBytes)
                 putAndroidMemoryStats(info)
             })
         }
     }
 }
+
+private fun automaticDiagnosticsReadSmapsRollup(
+    processId: Int,
+): AutomaticDiagnosticsSmapsRollup? = runCatching {
+    File("/proc/$processId/smaps_rollup").bufferedReader().useLines {
+        automaticDiagnosticsParseSmapsRollup(it)
+    }
+}.getOrNull()
 
 internal fun automaticDiagnosticsMemorySampleDelaysSeconds(): List<Long> = listOf(
     60L,
@@ -2340,11 +2583,11 @@ internal fun automaticDiagnosticsMemorySamplesForReport(
     samples: List<JSONObject>,
     startedAt: Long,
     endedAt: Long,
-    finalSample: JSONObject,
+    finalSample: JSONObject?,
     maximum: Int,
 ): List<JSONObject> {
     val unique = linkedMapOf<String, JSONObject>()
-    (samples + finalSample)
+    (samples + listOfNotNull(finalSample))
         .filter { sample -> sample.optLong("timestamp_unix", -1L) in startedAt..endedAt }
         .forEach { sample ->
             val key = "${sample.optLong("timestamp_unix")}:${sample.optString("reason")}"
@@ -2843,18 +3086,37 @@ internal fun automaticDiagnosticsResourceComponents(
     var peakResidentFound = false
     var proportionalFound = false
     var privateDirtyFound = false
+    var smapsUsed = false
+    var activityManagerUsed = false
     for (index in 0 until processes.length()) {
         val process = processes.getJSONObject(index)
         val name = process.getString("processName")
+        val activityManagerResident = process.optLongOrNull("currentResidentMemoryBytes")
+        val activityManagerPss = process.optLongOrNull("currentProportionalMemoryBytes")
+        val activityManagerPrivateDirty = process.optLongOrNull("currentPrivateDirtyMemoryBytes")
+        val smapsResident = process.optLongOrNull("smapsResidentMemoryBytes")
+        val smapsPss = process.optLongOrNull("smapsProportionalMemoryBytes")
+        val smapsPrivateDirty = process.optLongOrNull("smapsPrivateDirtyMemoryBytes")
+        val currentResident = smapsResident ?: activityManagerResident
+        val currentPss = smapsPss ?: activityManagerPss
+        val currentPrivateDirty = smapsPrivateDirty ?: activityManagerPrivateDirty
+        val hasSmaps = smapsResident != null || smapsPss != null || smapsPrivateDirty != null
+        smapsUsed = smapsUsed || hasSmaps
+        activityManagerUsed = activityManagerUsed || !hasSmaps
         result.put(JSONObject().apply {
             put("component", if (name.endsWith(":vpn")) "android_vpn_process" else "android_ui_process")
-            put("source", "android_activity_manager_memory_info")
+            put(
+                "source",
+                if (hasSmaps) "android_smaps_rollup" else "android_activity_manager_memory_info",
+            )
             put("process_id", process.getLong("processId"))
             put("process_name", name)
-            copyLong(process, this, "currentResidentMemoryBytes", "current_resident_memory_bytes")
+            putNullable("current_resident_memory_bytes", currentResident)
             copyLong(process, this, "peakResidentMemoryBytes", "peak_resident_memory_bytes")
-            copyLong(process, this, "currentProportionalMemoryBytes", "current_proportional_memory_bytes")
-            copyLong(process, this, "currentPrivateDirtyMemoryBytes", "current_private_dirty_memory_bytes")
+            putNullable("current_proportional_memory_bytes", currentPss)
+            putNullable("current_private_dirty_memory_bytes", currentPrivateDirty)
+            putNullable("activity_manager_pss_bytes", activityManagerPss)
+            putNullable("activity_manager_private_dirty_bytes", activityManagerPrivateDirty)
             copyLong(process, this, "pssJavaHeapBytes", "pss_java_heap_bytes")
             copyLong(process, this, "pssNativeHeapBytes", "pss_native_heap_bytes")
             copyLong(process, this, "pssCodeBytes", "pss_code_bytes")
@@ -2862,8 +3124,20 @@ internal fun automaticDiagnosticsResourceComponents(
             copyLong(process, this, "pssGraphicsBytes", "pss_graphics_bytes")
             copyLong(process, this, "pssPrivateOtherBytes", "pss_private_other_bytes")
             copyLong(process, this, "pssSystemBytes", "pss_system_bytes")
+            if (listOf(
+                    "pssJavaHeapBytes",
+                    "pssNativeHeapBytes",
+                    "pssCodeBytes",
+                    "pssStackBytes",
+                    "pssGraphicsBytes",
+                    "pssPrivateOtherBytes",
+                    "pssSystemBytes",
+                ).any(process::has)
+            ) {
+                put("pss_categories_source", "android_activity_manager_memory_info")
+            }
         })
-        process.optLongOrNull("currentResidentMemoryBytes")?.let {
+        currentResident?.let {
             residentFound = true
             resident = resident.saturatingAdd(it)
         }
@@ -2871,11 +3145,11 @@ internal fun automaticDiagnosticsResourceComponents(
             peakResidentFound = true
             peakResident = peakResident.saturatingAdd(it)
         }
-        process.optLongOrNull("currentProportionalMemoryBytes")?.let {
+        currentPss?.let {
             proportionalFound = true
             proportional = proportional.saturatingAdd(it)
         }
-        process.optLongOrNull("currentPrivateDirtyMemoryBytes")?.let {
+        currentPrivateDirty?.let {
             privateDirtyFound = true
             privateDirty = privateDirty.saturatingAdd(it)
         }
@@ -2883,7 +3157,14 @@ internal fun automaticDiagnosticsResourceComponents(
     if (includeAggregate) {
         result.put(JSONObject().apply {
             put("component", "android_application_processes")
-            put("source", "android_activity_manager_memory_sum")
+            put(
+                "source",
+                when {
+                    smapsUsed && !activityManagerUsed -> "android_smaps_rollup_sum"
+                    smapsUsed -> "android_process_memory_mixed_sum"
+                    else -> "android_activity_manager_memory_sum"
+                },
+            )
             putNullable("current_resident_memory_bytes", resident.takeIf { residentFound })
             putNullable("peak_resident_memory_bytes", peakResident.takeIf { peakResidentFound })
             putNullable("current_proportional_memory_bytes", proportional.takeIf { proportionalFound })
@@ -2903,10 +3184,21 @@ private fun logMemorySnapshot(packageName: String, processes: JSONArray, reason:
                 "process" to if (name.endsWith(":vpn")) "vpn" else if (name == packageName) "ui" else "app",
                 "reason" to reason.take(64),
                 "pid" to process.optLong("processId"),
-                "rss_bytes" to process.optLongOrNull("currentResidentMemoryBytes"),
+                "rss_bytes" to (
+                    process.optLongOrNull("smapsResidentMemoryBytes")
+                        ?: process.optLongOrNull("currentResidentMemoryBytes")
+                    ),
                 "peak_rss_bytes" to process.optLongOrNull("peakResidentMemoryBytes"),
-                "pss_bytes" to process.optLongOrNull("currentProportionalMemoryBytes"),
-                "private_dirty_bytes" to process.optLongOrNull("currentPrivateDirtyMemoryBytes"),
+                "pss_bytes" to (
+                    process.optLongOrNull("smapsProportionalMemoryBytes")
+                        ?: process.optLongOrNull("currentProportionalMemoryBytes")
+                    ),
+                "private_dirty_bytes" to (
+                    process.optLongOrNull("smapsPrivateDirtyMemoryBytes")
+                        ?: process.optLongOrNull("currentPrivateDirtyMemoryBytes")
+                    ),
+                "activity_manager_pss_bytes" to
+                    process.optLongOrNull("currentProportionalMemoryBytes"),
                 "pss_java_heap_bytes" to process.optLongOrNull("pssJavaHeapBytes"),
                 "pss_native_heap_bytes" to process.optLongOrNull("pssNativeHeapBytes"),
                 "pss_code_bytes" to process.optLongOrNull("pssCodeBytes"),
