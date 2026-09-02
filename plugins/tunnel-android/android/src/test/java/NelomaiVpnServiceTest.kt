@@ -145,20 +145,16 @@ class NelomaiVpnServiceTest {
         val events = mutableListOf<String>()
 
         assertTrue(lifecycle.begin())
-        dispatchRedundantRevoke(
-            dispatcher,
-            fence = {
+        dispatchRedundantWork(
+            dispatcher = dispatcher,
+            fallbackDispatcher = dispatcher,
+            action = {
                 events += "fence"
-                true
-            },
-            revoke = {
                 events += "revoke"
-                true
-            },
-            onComplete = {
                 lifecycle.cleanupFinished()
                 lifecycle.completeFramework { events += "framework" }
             },
+            onRejected = {},
         )
 
         assertTrue(lifecycle.hasPendingCleanup())
@@ -182,16 +178,16 @@ class NelomaiVpnServiceTest {
         var frameworkCalls = 0
 
         assertTrue(lifecycle.begin())
-        dispatchRedundantRevoke(
-            dispatcher,
-            fence = { true },
-            revoke = { true },
-            onComplete = {
+        dispatchRedundantWork(
+            dispatcher = dispatcher,
+            fallbackDispatcher = dispatcher,
+            action = {
                 lifecycle.cleanupFinished()
                 main += Runnable {
                     lifecycle.completeFramework { frameworkCalls += 1 }
                 }
             },
+            onRejected = {},
         )
         worker.removeFirst().run()
 
@@ -211,24 +207,193 @@ class NelomaiVpnServiceTest {
         val dispatcher = RedundantVpnWorkDispatcher(Executor {
             throw RejectedExecutionException("destroyed")
         })
-        var result: RedundantRevokeResult? = null
+        val fallbackQueue = ArrayDeque<Runnable>()
+        val fallback = RedundantVpnWorkDispatcher(Executor(fallbackQueue::addLast))
         var frameworkCalls = 0
+        var fenceCalls = 0
+        var revokeCalls = 0
+        var rejectedCalls = 0
 
         assertTrue(lifecycle.begin())
-        dispatchRedundantRevoke(
-            dispatcher,
-            fence = { error("must not run") },
-            revoke = { error("must not run") },
-            onComplete = {
-                result = it
+        dispatchRedundantWork(
+            dispatcher = dispatcher,
+            fallbackDispatcher = fallback,
+            action = {
+                fenceCalls += 1
+                revokeCalls += 1
                 lifecycle.cleanupFinished()
                 lifecycle.completeFramework { frameworkCalls += 1 }
             },
+            onRejected = { rejectedCalls += 1 },
         )
 
-        assertEquals(RedundantRevokeResult(fenced = false, stopped = false), result)
+        assertEquals(0, fenceCalls)
+        assertEquals(1, fallbackQueue.size)
+        fallbackQueue.removeFirst().run()
+
+        assertEquals(1, fenceCalls)
+        assertEquals(1, revokeCalls)
         assertFalse(lifecycle.hasPendingCleanup())
         assertEquals(1, frameworkCalls)
+        assertEquals(0, rejectedCalls)
+    }
+
+    @Test
+    fun cancelTombstoneSurvivesStoreRecreationUntilExactCleanupAcknowledgement() {
+        val backend = ServiceCancelTombstoneBackend()
+        val first = RedundantCancelTombstoneStore(backend) { "stop-operation-a" }
+
+        val persisted = first.persist("start-operation-a")
+
+        assertTrue(persisted is RecoveryStoreResult.Success)
+        val tombstone = (persisted as RecoveryStoreResult.Success).value
+        assertEquals(
+            RedundantCancelTombstone("start-operation-a", "stop-operation-a"),
+            tombstone,
+        )
+        val recreated = RedundantCancelTombstoneStore(backend) { "wrong-stop" }
+        assertEquals(persisted, recreated.read())
+        assertFalse(recreated.clear(
+            RedundantCancelTombstone("start-operation-a", "different-stop"),
+        ))
+        assertEquals(persisted, recreated.read())
+        assertTrue(recreated.clear(tombstone))
+        assertEquals(RecoveryStoreResult.Success(null), recreated.read())
+    }
+
+    @Test
+    fun corruptCancelTombstoneFailsClosedInsteadOfAllowingResume() {
+        val backend = ServiceCancelTombstoneBackend().apply { record = "broken" }
+
+        assertEquals(
+            RecoveryStoreResult.Failure("redundant_cancel_tombstone_corrupt"),
+            RedundantCancelTombstoneStore(backend).read(),
+        )
+    }
+
+    @Test
+    fun unreadableRecoveryAfterPrimaryReadyRequiresFailClosedCleanup() {
+        assertEquals(
+            RedundantPrimaryReadyDisposition.FAIL_CLOSED,
+            redundantPrimaryReadyDisposition(
+                RecoveryStoreResult.Failure("recovery_record_corrupt"),
+            ),
+        )
+        assertEquals(
+            RedundantPrimaryReadyDisposition.RUNNING,
+            redundantPrimaryReadyDisposition(
+                RecoveryStoreResult.Success(serviceV2Envelope()),
+            ),
+        )
+        assertEquals(
+            RedundantPrimaryReadyDisposition.CANCELLED,
+            redundantPrimaryReadyDisposition(
+                RecoveryStoreResult.Success(serviceV2Envelope().copy(
+                    redundantTransaction = serviceV2Envelope().redundantTransaction?.copy(
+                        desiredActive = false,
+                    ),
+                )),
+            ),
+        )
+    }
+
+    @Test
+    fun stoppedIsPublishedOnlyAfterDurableCancellationAndLocalShutdown() {
+        assertFalse(shouldCompleteRedundantCancellation(
+            tombstonePersisted = true,
+            localClosed = false,
+            cleanupStopped = false,
+        ))
+        assertFalse(shouldCompleteRedundantCancellation(
+            tombstonePersisted = false,
+            localClosed = true,
+            cleanupStopped = true,
+        ))
+        assertTrue(shouldCompleteRedundantCancellation(
+            tombstonePersisted = true,
+            localClosed = true,
+            cleanupStopped = false,
+        ))
+        assertTrue(shouldCompleteRedundantCancellation(
+            tombstonePersisted = true,
+            localClosed = false,
+            cleanupStopped = true,
+        ))
+    }
+
+    @Test
+    fun oldServiceCleanupCannotPublishStoppedOverNewGenerationOrTransaction() {
+        assertEquals(
+            RedundantStopCompletionDisposition.PUBLISH_STOPPED,
+            redundantStopCompletionDisposition(
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 7,
+                currentTransactionStartOperationId = null,
+            ),
+        )
+        assertEquals(
+            RedundantStopCompletionDisposition.STALE_ONLY,
+            redundantStopCompletionDisposition(
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 8,
+                currentTransactionStartOperationId = null,
+            ),
+        )
+        assertEquals(
+            RedundantStopCompletionDisposition.STALE_ONLY,
+            redundantStopCompletionDisposition(
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 7,
+                currentTransactionStartOperationId = "new-start-operation",
+            ),
+        )
+    }
+
+    @Test
+    fun tombstoneClearRaceAcknowledgesPeerClearButDoesNotStealNewGeneration() {
+        val expected = RedundantCancelTombstone("start-a", "stop-a")
+        val replacement = RedundantCancelTombstone("start-b", "stop-b")
+
+        assertEquals(
+            RedundantTombstoneClearDisposition.CONFIRMED,
+            redundantTombstoneClearDisposition(
+                cleared = false,
+                durable = RecoveryStoreResult.Success(null),
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 7,
+                expected = expected,
+            ),
+        )
+        assertEquals(
+            RedundantTombstoneClearDisposition.REPLAY_SUPERSEDING,
+            redundantTombstoneClearDisposition(
+                cleared = false,
+                durable = RecoveryStoreResult.Success(replacement),
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 7,
+                expected = expected,
+            ),
+        )
+        assertEquals(
+            RedundantTombstoneClearDisposition.STALE,
+            redundantTombstoneClearDisposition(
+                cleared = false,
+                durable = RecoveryStoreResult.Success(replacement),
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 8,
+                expected = expected,
+            ),
+        )
+        assertEquals(
+            RedundantTombstoneClearDisposition.RETRY,
+            redundantTombstoneClearDisposition(
+                cleared = false,
+                durable = RecoveryStoreResult.Success(expected),
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 7,
+                expected = expected,
+            ),
+        )
     }
 
     @Test
@@ -258,55 +423,46 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
-    fun redundantRevokeFencingAndCleanupRunOnlyOnDispatchedWorker() {
+    fun redundantCleanupRunsOnlyOnDispatchedWorker() {
         val queued = ArrayDeque<Runnable>()
         val dispatcher = RedundantVpnWorkDispatcher(Executor(queued::addLast))
         val events = mutableListOf<String>()
-        var result: RedundantRevokeResult? = null
 
-        dispatchRedundantRevoke(
-            dispatcher,
-            fence = {
+        dispatchRedundantWork(
+            dispatcher = dispatcher,
+            fallbackDispatcher = dispatcher,
+            action = {
                 events += "fence"
-                true
-            },
-            revoke = {
                 events += "revoke"
-                true
             },
-            onComplete = { result = it },
+            onRejected = {},
         )
 
         assertTrue(events.isEmpty())
-        assertNull(result)
         assertEquals(1, queued.size)
 
         queued.removeFirst().run()
 
         assertEquals(listOf("fence", "revoke"), events)
-        assertEquals(RedundantRevokeResult(fenced = true, stopped = true), result)
     }
 
     @Test
-    fun redundantRevokeNeverCleansUpWithoutDurableFence() {
-        val queued = ArrayDeque<Runnable>()
-        val dispatcher = RedundantVpnWorkDispatcher(Executor(queued::addLast))
-        var revokeCalls = 0
-        var result: RedundantRevokeResult? = null
+    fun redundantCleanupReportsWhenBothDispatchersReject() {
+        val rejected = RedundantVpnWorkDispatcher(Executor {
+            throw RejectedExecutionException("destroyed")
+        })
+        var actionCalls = 0
+        var rejectedCalls = 0
 
-        dispatchRedundantRevoke(
-            dispatcher,
-            fence = { false },
-            revoke = {
-                revokeCalls += 1
-                true
-            },
-            onComplete = { result = it },
+        dispatchRedundantWork(
+            dispatcher = rejected,
+            fallbackDispatcher = rejected,
+            action = { actionCalls += 1 },
+            onRejected = { rejectedCalls += 1 },
         )
-        queued.removeFirst().run()
 
-        assertEquals(0, revokeCalls)
-        assertEquals(RedundantRevokeResult(fenced = false, stopped = false), result)
+        assertEquals(0, actionCalls)
+        assertEquals(1, rejectedCalls)
     }
 
     @Test
@@ -4731,6 +4887,24 @@ private class ServiceRecoveryBackend : EncryptedRecordBackend {
     override fun write(plaintext: ByteArray): Boolean {
         if (!writeSucceeds) return false
         record = plaintext.copyOf()
+        return true
+    }
+}
+
+private class ServiceCancelTombstoneBackend : RedundantCancelTombstoneBackend {
+    var record: String? = null
+
+    override fun read(): String? = record
+
+    override fun compareAndWrite(expected: String?, value: String): Boolean {
+        if (record != expected) return false
+        record = value
+        return true
+    }
+
+    override fun compareAndClear(expected: String): Boolean {
+        if (record != expected) return false
+        record = null
         return true
     }
 }
