@@ -202,15 +202,26 @@ internal fun inMemoryRedundantStopOperationId(
 internal fun redundantCleanupBlocksNewStarts(
     pendingStop: Boolean,
     tombstoneUnreadable: Boolean,
-): Boolean = pendingStop || tombstoneUnreadable
+    stopLookupPending: Boolean = false,
+    retainedOwnerCleanupPending: Boolean = false,
+): Boolean = pendingStop || tombstoneUnreadable || stopLookupPending ||
+    retainedOwnerCleanupPending
 
 internal fun activeRedundantTransactionForWork(
     recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
     expectedStartOperationId: String?,
     pendingStop: Boolean,
     tombstoneUnreadable: Boolean,
+    stopLookupPending: Boolean = false,
+    retainedOwnerCleanupPending: Boolean = false,
 ): AndroidRedundantTransaction? {
-    if (redundantCleanupBlocksNewStarts(pendingStop, tombstoneUnreadable)) return null
+    if (redundantCleanupBlocksNewStarts(
+            pendingStop,
+            tombstoneUnreadable,
+            stopLookupPending,
+            retainedOwnerCleanupPending,
+        )
+    ) return null
     val transaction = (recovery as? RecoveryStoreResult.Success)
         ?.value?.redundantTransaction ?: return null
     if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
@@ -226,6 +237,8 @@ internal data class RedundantPhysicalNetworkCallbackState(
     val installedStartOperationId: String?,
     val pendingStop: Boolean,
     val tombstoneUnreadable: Boolean,
+    val stopLookupPending: Boolean = false,
+    val retainedOwnerCleanupPending: Boolean = false,
 )
 
 internal data class RedundantPhysicalNetworkCallbackIdentity(
@@ -238,6 +251,8 @@ internal data class RedundantPhysicalNetworkCallbackIdentity(
             !redundantCleanupBlocksNewStarts(
                 current.pendingStop,
                 current.tombstoneUnreadable,
+                current.stopLookupPending,
+                current.retainedOwnerCleanupPending,
             )
 
     fun applyIfCurrent(
@@ -262,7 +277,14 @@ internal fun shouldApplyConnectionIntentStep(
     pendingStop: Boolean,
     tombstoneUnreadable: Boolean,
     envelope: AndroidRecoveryEnvelope?,
-): Boolean = !redundantCleanupBlocksNewStarts(pendingStop, tombstoneUnreadable) &&
+    stopLookupPending: Boolean = false,
+    retainedOwnerCleanupPending: Boolean = false,
+): Boolean = !redundantCleanupBlocksNewStarts(
+    pendingStop,
+    tombstoneUnreadable,
+    stopLookupPending,
+    retainedOwnerCleanupPending,
+) &&
     envelope != null && envelope.redundantTransaction == null
 
 internal fun shouldCompleteRedundantCancellation(

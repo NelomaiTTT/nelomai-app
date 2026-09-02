@@ -432,6 +432,73 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun queuedStopLookupRechecksMemoryBeforeReadingDurableRecovery() {
+        val worker = ArrayDeque<Runnable>()
+        val caller = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(worker::addLast))
+        val barrier = RedundantStopLookupBarrier()
+        val inMemory = AtomicReference<String?>(null)
+        var durableReads = 0
+        var completed: String? = null
+
+        dispatchWithRedundantStopLookupBarrier(
+            dispatcher = dispatcher,
+            fallbackDispatcher = dispatcher,
+            barrier = barrier,
+            resolveInMemory = inMemory::get,
+            resolveDurable = {
+                durableReads += 1
+                "durable"
+            },
+            postToCaller = { action -> caller.addLast(Runnable(action)) },
+            complete = { completed = it },
+            onRejected = { throw AssertionError("lookup rejected") },
+        )
+
+        assertTrue(barrier.hasPending())
+        inMemory.set("memory")
+        worker.removeFirst().run()
+
+        assertEquals(0, durableReads)
+        assertNull(completed)
+        assertTrue(barrier.hasPending())
+
+        caller.removeFirst().run()
+
+        assertEquals("memory", completed)
+        assertFalse(barrier.hasPending())
+    }
+
+    @Test
+    fun rejectedStopLookupCompletesOnCallerBeforeReleasingBarrier() {
+        val caller = ArrayDeque<Runnable>()
+        val rejected = RedundantVpnWorkDispatcher(Executor {
+            throw RejectedExecutionException("closed")
+        })
+        val barrier = RedundantStopLookupBarrier()
+        var rejections = 0
+
+        dispatchWithRedundantStopLookupBarrier(
+            dispatcher = rejected,
+            fallbackDispatcher = rejected,
+            barrier = barrier,
+            resolveInMemory = { null },
+            resolveDurable = { "durable" },
+            postToCaller = { action -> caller.addLast(Runnable(action)) },
+            complete = { throw AssertionError("lookup unexpectedly completed: $it") },
+            onRejected = { rejections += 1 },
+        )
+
+        assertTrue(barrier.hasPending())
+        assertEquals(0, rejections)
+
+        caller.removeFirst().run()
+
+        assertEquals(1, rejections)
+        assertFalse(barrier.hasPending())
+    }
+
+    @Test
     fun unresolvedRedundantCleanupBlocksEveryKindOfNewStart() {
         assertTrue(redundantCleanupBlocksNewStarts(
             pendingStop = true,
@@ -440,6 +507,16 @@ class NelomaiVpnServiceTest {
         assertTrue(redundantCleanupBlocksNewStarts(
             pendingStop = false,
             tombstoneUnreadable = true,
+        ))
+        assertTrue(redundantCleanupBlocksNewStarts(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            stopLookupPending = true,
+        ))
+        assertTrue(redundantCleanupBlocksNewStarts(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            retainedOwnerCleanupPending = true,
         ))
         assertFalse(redundantCleanupBlocksNewStarts(
             pendingStop = false,
@@ -464,6 +541,20 @@ class NelomaiVpnServiceTest {
             expectedStartOperationId = startOperationId,
             pendingStop = false,
             tombstoneUnreadable = true,
+        ))
+        assertNull(activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active),
+            expectedStartOperationId = startOperationId,
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            stopLookupPending = true,
+        ))
+        assertNull(activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active),
+            expectedStartOperationId = startOperationId,
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            retainedOwnerCleanupPending = true,
         ))
         assertNull(activeRedundantTransactionForWork(
             recovery = RecoveryStoreResult.Success(active.copy(
@@ -516,6 +607,30 @@ class NelomaiVpnServiceTest {
             mutationFence = mutationFence,
             current = {
                 RedundantPhysicalNetworkCallbackState(7, "start-a", true, false)
+            },
+        ) { mutations += 1 })
+        assertFalse(callback.applyIfCurrent(
+            mutationFence = mutationFence,
+            current = {
+                RedundantPhysicalNetworkCallbackState(
+                    7,
+                    "start-a",
+                    pendingStop = false,
+                    tombstoneUnreadable = false,
+                    stopLookupPending = true,
+                )
+            },
+        ) { mutations += 1 })
+        assertFalse(callback.applyIfCurrent(
+            mutationFence = mutationFence,
+            current = {
+                RedundantPhysicalNetworkCallbackState(
+                    7,
+                    "start-a",
+                    pendingStop = false,
+                    tombstoneUnreadable = false,
+                    retainedOwnerCleanupPending = true,
+                )
             },
         ) { mutations += 1 })
         assertTrue(callback.applyIfCurrent(
@@ -616,6 +731,18 @@ class NelomaiVpnServiceTest {
             tombstoneUnreadable = false,
             envelope = null,
         ))
+        assertFalse(shouldApplyConnectionIntentStep(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            envelope = serviceV1Envelope(),
+            stopLookupPending = true,
+        ))
+        assertFalse(shouldApplyConnectionIntentStep(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            envelope = serviceV1Envelope(),
+            retainedOwnerCleanupPending = true,
+        ))
         assertTrue(shouldApplyConnectionIntentStep(
             pendingStop = false,
             tombstoneUnreadable = false,
@@ -706,6 +833,34 @@ class NelomaiVpnServiceTest {
         assertEquals(InstalledRedundantVpnOwner(replacement, "start-b"), slot.snapshot())
         assertFalse(cleanup.retry())
         assertEquals(2, previous.closeCalls)
+    }
+
+    @Test
+    fun rejectedOwnerInstallRetainsCandidateUntilItCloses() {
+        val operationId = "start-a"
+        val fence = RedundantOperationMutationFence().apply { cancel(operationId) }
+        val slot = RedundantVpnOwnerSlot()
+        val candidate = ServiceRedundantOwner(
+            closeResults = ArrayDeque(listOf(false, true)),
+        )
+        val cleanup = RetainedRedundantOwnerCleanup()
+
+        assertFalse(
+            installRedundantVpnOwnerSafely(
+                mutationFence = fence,
+                slot = slot,
+                owner = candidate,
+                startOperationId = operationId,
+                closeOwner = cleanup::closeOrRetain,
+                initializeAuxiliaryState = {},
+            ),
+        )
+
+        assertNull(slot.snapshot())
+        assertEquals(1, candidate.closeCalls)
+        assertTrue(cleanup.hasPending())
+        assertFalse(cleanup.retry())
+        assertEquals(2, candidate.closeCalls)
     }
 
     @Test
