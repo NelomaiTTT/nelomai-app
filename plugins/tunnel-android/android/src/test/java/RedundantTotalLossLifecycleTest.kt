@@ -1,6 +1,8 @@
 package ru.nelomai.tunnel
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RedundantTotalLossLifecycleTest {
@@ -70,6 +72,8 @@ class RedundantTotalLossLifecycleTest {
         assertEquals(0, fixture.resumes)
         fixture.runPosted()
 
+        assertEquals(listOf("starting", "resume"), fixture.events)
+        assertEquals(1, fixture.startingPublications)
         assertEquals(1, fixture.resumes)
         assertEquals(0, fixture.stops)
         assertEquals(0, fixture.cleanupRetries)
@@ -87,6 +91,60 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
+    fun onlyExactPromotedTotalLossEnvelopePublishesStarting() {
+        val exact = restartEnvelope()
+        assertTrue(isExactPromotedRedundantTotalLossRestart(exact))
+
+        val variants = listOf(
+            exact.copy(redundantTransaction = redundantEnvelope().redundantTransaction),
+            exact.copy(intent = exact.intent.copy(desiredActive = false)),
+            exact.copy(intent = exact.intent.copy(
+                retry = exact.intent.retry.copy(pendingAction = "validate_capability"),
+            )),
+            exact.copy(intent = exact.intent.copy(
+                retry = exact.intent.retry.copy(
+                    redundantTotalLossSourceStartOperationId = null,
+                ),
+            )),
+            exact.copy(leaseTransaction = exact.leaseTransaction?.copy(
+                generation = exact.intent.generation + 1,
+            )),
+            exact.copy(leaseTransaction = exact.leaseTransaction?.copy(
+                phase = LeasePhase.LEASE_ACQUIRED,
+            )),
+            exact.copy(leaseTransaction = exact.leaseTransaction?.copy(
+                leaseId = "lease",
+            )),
+            exact.copy(leaseTransaction = exact.leaseTransaction?.copy(
+                replay = exact.leaseTransaction.replay.copy(
+                    startOperationId = requireNotNull(
+                        exact.intent.retry.redundantTotalLossSourceStartOperationId,
+                    ),
+                ),
+            )),
+            exact.copy(leaseTransaction = null),
+        )
+
+        variants.forEach { assertFalse(isExactPromotedRedundantTotalLossRestart(it)) }
+    }
+
+    @Test
+    fun genericDurableStartResumesWithoutPublishingTotalLossStarting() {
+        val generic = restartEnvelope().let { envelope ->
+            envelope.copy(
+                intent = envelope.intent.copy(retry = AndroidRetryState()),
+            )
+        }
+        val fixture = Fixture(recovery = RecoveryStoreResult.Success(generic))
+
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(emptyList<String>(), fixture.events.filter { it == "starting" })
+        assertEquals(1, fixture.resumes)
+    }
+
+    @Test
     fun logoutWinsOverPromotedRestart() {
         val fixture = Fixture(
             recovery = RecoveryStoreResult.Success(restartEnvelope()),
@@ -98,6 +156,7 @@ class RedundantTotalLossLifecycleTest {
 
         assertEquals(1, fixture.logouts)
         assertEquals(0, fixture.resumes)
+        assertEquals(0, fixture.startingPublications)
     }
 
     @Test
@@ -117,8 +176,10 @@ class RedundantTotalLossLifecycleTest {
 
         assertEquals(1, barrier.cleanupRetries)
         assertEquals(0, barrier.resumes)
+        assertEquals(0, barrier.startingPublications)
         assertEquals(1, unreadable.cleanupRetries)
         assertEquals(0, unreadable.resumes)
+        assertEquals(0, unreadable.startingPublications)
     }
 
     @Test
@@ -134,6 +195,22 @@ class RedundantTotalLossLifecycleTest {
         assertEquals(0, fixture.resumes)
         assertEquals(0, fixture.stops)
         assertEquals(0, fixture.cleanupRetries)
+        assertEquals(0, fixture.startingPublications)
+    }
+
+    @Test
+    fun repeatedExactDurableRetryKeepsPublishingStartingBeforeResume() {
+        val fixture = Fixture(recovery = RecoveryStoreResult.Success(restartEnvelope()))
+
+        repeat(2) {
+            fixture.lifecycle.onCleanupAcknowledged(7)
+            fixture.runPosted()
+        }
+
+        assertEquals(
+            listOf("starting", "resume", "starting", "resume"),
+            fixture.events,
+        )
     }
 
     private class Fixture(
@@ -147,6 +224,8 @@ class RedundantTotalLossLifecycleTest {
         var stops = 0
         var cleanupRetries = 0
         var logouts = 0
+        var startingPublications = 0
+        val events = mutableListOf<String>()
         val lifecycle = RedundantTotalLossLifecycle(
             currentServiceGeneration = { generation },
             barrierPending = { barrierPending },
@@ -154,7 +233,14 @@ class RedundantTotalLossLifecycleTest {
             recovery = { recovery },
             post = { posted = it },
             retryCleanup = { cleanupRetries += 1 },
-            resume = { resumes += 1 },
+            publishRestartStarting = {
+                startingPublications += 1
+                events += "starting"
+            },
+            resume = {
+                resumes += 1
+                events += "resume"
+            },
             scheduleLogout = { logouts += 1 },
             stopIfIdle = { stops += 1 },
         )
@@ -168,6 +254,10 @@ class RedundantTotalLossLifecycleTest {
                 generation = 1,
                 desiredActive = true,
                 template = template(),
+                retry = AndroidRetryState(
+                    pendingAction = "redundant_total_loss_restart",
+                    redundantTotalLossSourceStartOperationId = "v2-start",
+                ),
             )
             return AndroidRecoveryEnvelope(
                 formatVersion = ANDROID_RECOVERY_FORMAT,

@@ -42,6 +42,21 @@ internal fun redundantTotalLossCommandDisposition(
     }
 }
 
+internal fun isExactPromotedRedundantTotalLossRestart(
+    envelope: AndroidRecoveryEnvelope,
+): Boolean {
+    val lease = envelope.leaseTransaction ?: return false
+    val sourceStartOperationId =
+        envelope.intent.retry.redundantTotalLossSourceStartOperationId ?: return false
+    return envelope.redundantTransaction == null &&
+        envelope.intent.desiredActive &&
+        envelope.intent.retry.pendingAction == "redundant_total_loss_restart" &&
+        lease.phase == LeasePhase.START_PENDING &&
+        lease.leaseId == null &&
+        lease.generation == envelope.intent.generation &&
+        lease.replay.startOperationId != sourceStartOperationId
+}
+
 /**
  * Resumes only durable work that exists after the redundant stop/tombstone barrier.
  * The queued generation check keeps a completion from an older service instance inert.
@@ -53,6 +68,7 @@ internal class RedundantTotalLossLifecycle(
     private val recovery: () -> RecoveryStoreResult<AndroidRecoveryEnvelope>,
     private val post: (() -> Unit) -> Unit,
     private val retryCleanup: () -> Unit,
+    private val publishRestartStarting: () -> Unit,
     private val resume: () -> Unit,
     private val scheduleLogout: () -> Unit,
     private val stopIfIdle: () -> Unit,
@@ -88,6 +104,9 @@ internal class RedundantTotalLossLifecycle(
                 envelope.leaseTransaction?.phase == LeasePhase.START_PENDING &&
                 envelope.leaseTransaction.leaseId == null
             ) {
+                if (isExactPromotedRedundantTotalLossRestart(envelope)) {
+                    publishRestartStarting()
+                }
                 resume()
             } else if (envelope.intent.desiredActive && envelope.leaseTransaction != null) {
                 retryCleanup()

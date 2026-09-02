@@ -870,7 +870,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 schedulePendingRedundantStopRetry()
                 scheduleRetainedRedundantOwnerRetry()
             },
-            resume = ::resumeDurableWorkAfterRedundantBarrier,
+            publishRestartStarting = {
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.STARTING,
+                    desiredActive = null,
+                    changed = true,
+                )
+            },
+            resume = ::dispatchDurableWorkAfterRedundantBarrier,
             scheduleLogout = ::scheduleLogoutAttempt,
             stopIfIdle = ::stopIfIdle,
         )
@@ -3602,6 +3610,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun resumeDurableWorkAfterRedundantBarrier() {
+        redundantTotalLossLifecycle.onCleanupAcknowledged(serviceGeneration)
+    }
+
+    private fun dispatchDurableWorkAfterRedundantBarrier() {
         if (!redundantStartBlocked() && connectionIntentLifecycle.onEnsureRunning()) return
         stopIfIdle()
     }
