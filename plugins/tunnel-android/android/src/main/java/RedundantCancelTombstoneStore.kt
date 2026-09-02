@@ -129,7 +129,10 @@ internal enum class RedundantPrimaryReadyDisposition {
 
 internal fun redundantPrimaryReadyDisposition(
     recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
-): RedundantPrimaryReadyDisposition = when (recovery) {
+    startCancelled: Boolean = false,
+): RedundantPrimaryReadyDisposition = if (startCancelled) {
+    RedundantPrimaryReadyDisposition.CANCELLED
+} else when (recovery) {
     is RecoveryStoreResult.Failure -> RedundantPrimaryReadyDisposition.FAIL_CLOSED
     is RecoveryStoreResult.Success -> recovery.value.redundantTransaction?.let { transaction ->
         if (transaction.desiredActive && transaction.retry.stopState == RedundantStopState.NONE) {
@@ -317,4 +320,16 @@ internal fun redundantTombstoneClearDisposition(
         RedundantTombstoneClearDisposition.REPLAY_SUPERSEDING
     }
     else -> RedundantTombstoneClearDisposition.STALE
+}
+
+internal fun handleRedundantTombstoneRead(
+    restored: RecoveryStoreResult<RedundantCancelTombstone?>,
+    install: (RedundantCancelTombstone) -> Unit,
+    retry: () -> Unit,
+    resumeDurableWork: () -> Unit,
+) {
+    when (restored) {
+        is RecoveryStoreResult.Failure -> retry()
+        is RecoveryStoreResult.Success -> restored.value?.let(install) ?: resumeDurableWork()
+    }
 }

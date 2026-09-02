@@ -288,6 +288,13 @@ class NelomaiVpnServiceTest {
         assertEquals(
             RedundantPrimaryReadyDisposition.CANCELLED,
             redundantPrimaryReadyDisposition(
+                RecoveryStoreResult.Success(serviceV2Envelope()),
+                startCancelled = true,
+            ),
+        )
+        assertEquals(
+            RedundantPrimaryReadyDisposition.CANCELLED,
+            redundantPrimaryReadyDisposition(
                 RecoveryStoreResult.Success(serviceV2Envelope().copy(
                     redundantTransaction = serviceV2Envelope().redundantTransaction?.copy(
                         desiredActive = false,
@@ -997,6 +1004,20 @@ class NelomaiVpnServiceTest {
                 expected = expected,
             ),
         )
+    }
+
+    @Test
+    fun emptyTombstoneReadResumesDurableWorkAfterBarrier() {
+        val events = mutableListOf<String>()
+
+        handleRedundantTombstoneRead(
+            restored = RecoveryStoreResult.Success(null),
+            install = { events += "install" },
+            retry = { events += "retry" },
+            resumeDurableWork = { events += "resume" },
+        )
+
+        assertEquals(listOf("resume"), events)
     }
 
     @Test
@@ -3025,7 +3046,7 @@ class NelomaiVpnServiceTest {
         var connectionSchedules = 0
         val lifecycle = ConnectionIntentServiceLifecycle(
             coordinator = coordinator(store),
-            hasPendingLogout = { true },
+            logoutState = { BackgroundLogoutReadState.PENDING },
             scheduleLogout = { logoutSchedules += 1 },
             scheduleRedundant = {
                 redundantSchedules += 1
@@ -3049,7 +3070,7 @@ class NelomaiVpnServiceTest {
             RecoveryStoreResult.Success(redundant)
         val events = mutableListOf<String>()
         val lifecycle = BackgroundLogoutServiceLifecycle(
-            hasPendingLogout = { true },
+            logoutState = { BackgroundLogoutReadState.PENDING },
             recovery = { recovery },
             beginRedundantStop = { events += "stop:${it.startOperationId}" },
             runLogout = { events += "logout" },
@@ -3079,7 +3100,7 @@ class NelomaiVpnServiceTest {
     fun logoutLifecycleRetriesWithoutFinalizingWhenRecoveryIsUnreadable() {
         val events = mutableListOf<String>()
         val lifecycle = BackgroundLogoutServiceLifecycle(
-            hasPendingLogout = { true },
+            logoutState = { BackgroundLogoutReadState.PENDING },
             recovery = { RecoveryStoreResult.Failure("recovery_read_failed") },
             beginRedundantStop = { events += "stop" },
             runLogout = { events += "logout" },
@@ -3093,10 +3114,59 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun logoutLifecycleRetriesWhenCredentialStoreIsUnreadable() {
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            logoutState = { BackgroundLogoutReadState.UNREADABLE },
+            recovery = {
+                events += "recovery"
+                RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1))
+            },
+            beginRedundantStop = { events += "stop" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        assertTrue(lifecycle.resume())
+
+        assertEquals(listOf("retry"), events)
+    }
+
+    @Test
+    fun logoutLifecycleWaitsForCancelledRedundantStartToFinish() {
+        var pendingStart = true
+        var recovery = RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1))
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            logoutState = { BackgroundLogoutReadState.PENDING },
+            hasPendingRedundantStart = { pendingStart },
+            recovery = { recovery },
+            beginRedundantStop = { events += "stop" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        assertTrue(lifecycle.resume())
+
+        assertEquals(listOf("retry"), events)
+
+        pendingStart = false
+        recovery = RecoveryStoreResult.Success(
+            serviceV2Envelope().copy(redundantTransaction = transaction),
+        )
+        assertTrue(lifecycle.resume())
+
+        assertEquals(listOf("retry", "stop"), events)
+    }
+
+    @Test
     fun completedRedundantStopBecomesIdleWhenLogoutIsNoLongerPending() {
         val events = mutableListOf<String>()
         val lifecycle = BackgroundLogoutServiceLifecycle(
-            hasPendingLogout = { false },
+            logoutState = { BackgroundLogoutReadState.NONE },
             recovery = { RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1)) },
             beginRedundantStop = { events += "stop" },
             runLogout = { events += "logout" },
@@ -3127,9 +3197,10 @@ class NelomaiVpnServiceTest {
         val lifecycle = ConnectionIntentServiceLifecycle(
             connection,
             schedule = { connectionSchedules += 1 },
-            hasPendingLogout = {
-                credentials.read().credentialSuccess().logoutState?.phase ==
+            logoutState = {
+                if (credentials.read().credentialSuccess().logoutState?.phase ==
                     BackgroundLogoutPhase.PENDING
+                ) BackgroundLogoutReadState.PENDING else BackgroundLogoutReadState.NONE
             },
             scheduleLogout = { logoutSchedules += 1 },
         )
@@ -3139,6 +3210,45 @@ class NelomaiVpnServiceTest {
         assertEquals(0, connectionSchedules)
         assertEquals(1, logoutSchedules)
         assertEquals(LeasePhase.CLEANUP_PENDING, store.load().leaseTransaction?.phase)
+    }
+
+    @Test
+    fun serviceLifecycleTreatsUnreadableCredentialStoreAsPendingLogout() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        store.beginRedundant(requireNotNull(serviceV2Envelope().redundantTransaction))
+            .successEnvelope()
+        var logoutSchedules = 0
+        var redundantSchedules = 0
+        var connectionSchedules = 0
+        val lifecycle = ConnectionIntentServiceLifecycle(
+            coordinator = coordinator(store),
+            logoutState = { BackgroundLogoutReadState.UNREADABLE },
+            scheduleLogout = { logoutSchedules += 1 },
+            scheduleRedundant = {
+                redundantSchedules += 1
+                true
+            },
+            schedule = { connectionSchedules += 1 },
+        )
+
+        assertTrue(lifecycle.onEnsureRunning())
+        assertTrue(lifecycle.hasPendingWork())
+        assertEquals(1, logoutSchedules)
+        assertEquals(0, redundantSchedules)
+        assertEquals(0, connectionSchedules)
+    }
+
+    @Test
+    fun backgroundLogoutBlocksNewClientStartsUntilCredentialStateIsReadableAndClear() {
+        assertEquals(null, backgroundLogoutClientStartFailure(BackgroundLogoutReadState.NONE))
+        assertEquals(
+            "background_credential_logout_pending",
+            backgroundLogoutClientStartFailure(BackgroundLogoutReadState.PENDING),
+        )
+        assertEquals(
+            "background_credential_unavailable",
+            backgroundLogoutClientStartFailure(BackgroundLogoutReadState.UNREADABLE),
+        )
     }
 
     @Test
@@ -5059,6 +5169,39 @@ class NelomaiVpnServiceTest {
         assertEquals(BackgroundLogoutPhase.PENDING, stored.logoutState?.phase)
         assertEquals("device-token", stored.cleanupCredential?.token)
         assertEquals(null, stored.active)
+    }
+
+    @Test
+    fun logoutRunOnceRetriesWithoutFinalizeWhileRedundantRecoveryExists() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        recovery.beginRedundant(requireNotNull(serviceV2Envelope().redundantTransaction))
+            .successEnvelope()
+        val credentials = configuredCredentialStore()
+        val logout = AndroidLogoutCoordinator(
+            credentials,
+            coordinator(recovery),
+            operationId = { "11111111-1111-4111-8111-111111111197" },
+        )
+        assertTrue(logout.begin() is AndroidLogoutResult.Accepted)
+        var finalizeCalls = 0
+
+        val step = logout.runOnce(
+            ServicePanelFake(),
+            ServiceRuntimeFake(),
+            activate = { _, _, _ -> error("logout has no pending activation") },
+            finalize = { _, _, _, _, _ ->
+                finalizeCalls += 1
+                BackgroundLogoutFinalizeResult("device_revoked_cleanup_accepted", 1)
+            },
+        )
+
+        assertEquals(AndroidLogoutStep.RETRY, step)
+        assertEquals(0, finalizeCalls)
+        assertTrue(recovery.load().redundantTransaction != null)
+        assertEquals(
+            BackgroundLogoutPhase.PENDING,
+            credentials.read().credentialSuccess().logoutState?.phase,
+        )
     }
 
     @Test
