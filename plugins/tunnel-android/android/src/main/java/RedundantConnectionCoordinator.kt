@@ -308,12 +308,24 @@ internal class RedundantConnectionCoordinator(
         primaryReadinessFailed = false
         val response = panel.recover(transaction)
         try {
+            if (transaction.retry.hasPendingNativeSwitch() &&
+                !transaction.matchesPendingNativeMembership(response.session)
+            ) {
+                revoke()
+                return@synchronized false
+            }
             val refreshed = transaction.withRecoveredCanonical(response.session)
-            val active = transaction.localActiveLeaseId.takeIf(response.session::containsCurrentLease)
-                ?: response.session.activeLeaseId
-                ?: return@synchronized false
+            val pendingTarget = refreshed.retry.pendingNativeActiveLeaseId
+            val active = pendingTarget ?: transaction.localActiveLeaseId
+                .takeIf(response.session::containsCurrentLease)
+                ?: response.session.activeLeaseId ?: return@synchronized false
             val activeConfiguration = response.configurations[active] ?: return@synchronized false
             val activeSlot = refreshed.slot(active) ?: return@synchronized false
+            if (pendingTarget != null && refreshed != transaction &&
+                !persistExactTransaction(transaction, refreshed)
+            ) {
+                return@synchronized false
+            }
             if (!mutateNative(transaction) {
                     response.virtualAddressV4?.let(native::setProbeSourceIpv4)
                     true
@@ -328,22 +340,53 @@ internal class RedundantConnectionCoordinator(
                     )
                 }
             ) return@synchronized false
-            if (!mutateNative(transaction) { native.activate(active) }) return@synchronized false
+            if (pendingTarget != null) {
+                val source = requireNotNull(refreshed.retry.pendingNativeSourceLeaseId)
+                if (source != active &&
+                    refreshed.retry.pendingNativeSwitchAttempt >=
+                    MAX_PENDING_NATIVE_SWITCH_ATTEMPTS - 1
+                ) {
+                    response.configurations[source]?.let { configuration ->
+                        refreshed.slot(source)?.let { slot ->
+                            mutateNative(refreshed) {
+                                native.start(
+                                    source,
+                                    slot,
+                                    configuration,
+                                    response.healthProbes[source],
+                                )
+                            }
+                        }
+                    }
+                }
+                if (!drainPendingNativeSwitchLocked(refreshed)) return@synchronized false
+            } else if (!mutateNative(refreshed) { native.activate(active) }) {
+                return@synchronized false
+            }
+            val committed = if (pendingTarget != null) {
+                status() ?: return@synchronized false
+            } else {
+                refreshed
+            }
             val standby = listOfNotNull(
                 response.session.slotALeaseId,
                 response.session.slotBLeaseId,
-            ).filter { refreshed.standbyDesired && it != active }.distinct()
+            ).filter { committed.standbyDesired && it != active }.distinct()
             for (leaseId in standby) {
                 val configuration = response.configurations[leaseId] ?: continue
-                refreshed.slot(leaseId)?.let { slot ->
-                    mutateNative(transaction) {
+                committed.slot(leaseId)?.let { slot ->
+                    mutateNative(committed) {
                         native.start(leaseId, slot, configuration, response.healthProbes[leaseId])
                     }
                 }
             }
             // The local active identity wins over a stale canonical role until its observation is sent.
-            val recovered = refreshed.copy(localActiveLeaseId = active)
-            val persisted = persist(recovered)
+            val recovered = committed.copy(localActiveLeaseId = active)
+            val persisted = if (pendingTarget != null) {
+                recovered == committed || persistExactTransaction(committed, recovered)
+            } else {
+                persistExactTransaction(transaction, recovered)
+            }
             if (!persisted) {
                 native.stop()
                 return@synchronized false
@@ -505,6 +548,9 @@ internal class RedundantConnectionCoordinator(
         observations: List<SlotObservation>? = null,
     ): Boolean {
         val transaction = status() ?: return false
+        if (transaction.retry.hasPendingNativeSwitch()) {
+            return drainPendingNativeSwitchLocked(transaction)
+        }
         if (!transaction.standbyDesired) return drainStandbyReleaseLocked(transaction)
         if (transaction.retry.roleObservationPending && !flushRoleObservationLocked()) return false
         val current = status() ?: return false
@@ -530,6 +576,9 @@ internal class RedundantConnectionCoordinator(
             return@synchronized advancePrimaryReadinessLocked(observations)
         }
         if (primaryReadinessFailed) return@synchronized false
+        if (transaction.retry.hasPendingNativeSwitch()) {
+            return@synchronized drainPendingNativeSwitchLocked(transaction)
+        }
         val activeIndex = transaction.slotIndex(transaction.localActiveLeaseId)
             ?: return@synchronized false
         val bounded = observations.map { it.copy(active = it.index == activeIndex) }
@@ -586,6 +635,9 @@ internal class RedundantConnectionCoordinator(
             return@synchronized false
         }
         if (primaryReadinessFailed) return@synchronized false
+        if (transaction.retry.hasPendingNativeSwitch()) {
+            return@synchronized drainPendingNativeSwitchLocked(transaction)
+        }
         if (!transaction.standbyDesired) {
             return@synchronized drainStandbyReleaseLocked(transaction)
         }
@@ -611,13 +663,13 @@ internal class RedundantConnectionCoordinator(
                 true
             }
         ) return@synchronized false
-        listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
-            .distinct()
-            .all { leaseId ->
-                mutateNative(transaction) {
-                    runCatching { native.rebind(leaseId) }.getOrDefault(false)
-                }
+        val results = mutableListOf<Boolean>()
+        for (leaseId in listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId).distinct()) {
+            results += mutateNative(transaction) {
+                runCatching { native.rebind(leaseId) }.getOrDefault(false)
             }
+        }
+        results.all { it }
     }
 
     fun slotFailed(leaseId: String, reason: String): Boolean = synchronized(gate) {
@@ -648,7 +700,7 @@ internal class RedundantConnectionCoordinator(
     private fun reportLocalRoleLocked(reason: String): Boolean {
         val transaction = status() ?: return false
         if (!transaction.desiredActive || transaction.localActiveLeaseId == null) return false
-        val pending = if (transaction.retry.roleObservationPending) transaction else transaction.copy(
+        val pending = transaction.copy(
             retry = transaction.retry.copy(
                 roleObservationPending = true,
                 pendingRoleLeaseId = transaction.localActiveLeaseId,
@@ -686,6 +738,7 @@ internal class RedundantConnectionCoordinator(
 
     override fun releaseStandby(): Boolean = synchronized(gate) {
         val transaction = status() ?: return@synchronized false
+        if (transaction.retry.hasPendingNativeSwitch()) return@synchronized false
         // Fence future acquire/commit before the panel release can be retried.
         val fenced = transaction.copy(
             standbyDesired = false,
@@ -757,6 +810,7 @@ internal class RedundantConnectionCoordinator(
         replaceLeaseId: String? = null,
     ): Boolean = synchronized(gate) {
         val transaction = status() ?: return@synchronized false
+        if (transaction.retry.hasPendingNativeSwitch()) return@synchronized false
         if (!transaction.desiredActive || !transaction.standbyDesired) return@synchronized false
         val replayOperationId = transaction.retry.acquireOperationId ?: operationId
         val replacement = if (transaction.retry.acquirePending) {
@@ -1004,24 +1058,125 @@ internal class RedundantConnectionCoordinator(
         failed: String,
         reason: String,
     ): Boolean {
-        val scheduled = scheduleReplacement(transaction, failed)
-        val updated = scheduled.copy(
+        if (transaction.retry.hasPendingNativeSwitch()) {
+            return drainPendingNativeSwitchLocked(transaction)
+        }
+        val targetSlot = transaction.slot(target) ?: return false
+        if (transaction.localActiveLeaseId != failed || target == failed ||
+            !transaction.containsCurrentLease(target) ||
+            transaction.retry.acquireReplaceLeaseId == target
+        ) {
+            return false
+        }
+        val pending = transaction.copy(
+            retry = transaction.retry.copy(
+                pendingNativeSourceLeaseId = failed,
+                pendingNativeActiveLeaseId = target,
+                pendingNativeActiveSlot = targetSlot,
+                pendingNativeMembershipGeneration = transaction.membershipGeneration,
+                pendingNativeSwitchReason = reason,
+                pendingNativeSwitchAttempt = 0,
+            ),
+        )
+        if (!persistExactTransaction(transaction, pending)) return false
+        return drainPendingNativeSwitchLocked(pending)
+    }
+
+    private fun drainPendingNativeSwitchLocked(
+        pending: AndroidRedundantTransaction,
+    ): Boolean {
+        val retry = pending.retry
+        val source = retry.pendingNativeSourceLeaseId ?: return true
+        val target = retry.pendingNativeActiveLeaseId ?: return false
+        val targetSlot = retry.pendingNativeActiveSlot ?: return false
+        val expectedGeneration = retry.pendingNativeMembershipGeneration ?: return false
+        if (pending.localActiveLeaseId != source || source == target ||
+            pending.membershipGeneration != expectedGeneration ||
+            pending.slot(target) != targetSlot ||
+            !pending.containsCurrentLease(source) || !pending.containsCurrentLease(target)
+        ) {
+            revoke()
+            return false
+        }
+        val activated = mutateNative(pending) {
+            runCatching { native.activate(target) }.getOrDefault(false)
+        }
+        if (!activated) {
+            if (retry.pendingNativeSwitchAttempt < MAX_PENDING_NATIVE_SWITCH_ATTEMPTS - 1) {
+                persistPendingNativeSwitchExact(
+                    pending,
+                    pending.copy(retry = retry.copy(
+                        pendingNativeSwitchAttempt = retry.pendingNativeSwitchAttempt + 1,
+                    )),
+                )
+                return false
+            }
+            return resolveFailedPendingNativeSwitchLocked(pending)
+        }
+        val reason = requireNotNull(retry.pendingNativeSwitchReason)
+        var committed = pending.copy(
             localActiveLeaseId = target,
-            retry = scheduled.retry.copy(
+            retry = retry.clearPendingNativeSwitch().copy(
                 roleObservationPending = true,
                 pendingRoleLeaseId = target,
                 pendingRoleReason = reason,
+                sessionStalledRecorded = false,
             ),
         )
-        if (!persist(updated)) return false
-        if (!mutateNative(updated) { native.activate(target) }) return false
+        committed = scheduleReplacement(committed, source)
+        if (!persistPendingNativeSwitchExact(pending, committed)) return false
         failoverActive = true
-        publishReserveStateLocked(updated, emptyList())
+        publishReserveStateLocked(committed, emptyList())
         onDiagnosticEvent(RedundantDiagnosticEvent.FAILOVER)
         // The dataplane switch is authoritative. A panel outage leaves the durable
         // observation pending and must not roll traffic back to the failed member.
         flushRoleObservationLocked()
         return true
+    }
+
+    private fun resolveFailedPendingNativeSwitchLocked(
+        pending: AndroidRedundantTransaction,
+    ): Boolean {
+        val source = requireNotNull(pending.retry.pendingNativeSourceLeaseId)
+        val target = requireNotNull(pending.retry.pendingNativeActiveLeaseId)
+        val sourceRestored = native.isUsable(source) && mutateNative(pending) {
+            runCatching { native.activate(source) }.getOrDefault(false)
+        }
+        val resolved = if (sourceRestored) {
+            scheduleReplacement(
+                pending.copy(retry = pending.retry.clearPendingNativeSwitch()),
+                target,
+            )
+        } else {
+            pending.copy(retry = pending.retry.clearPendingNativeSwitch().copy(
+                sessionStalledRecorded = true,
+            ))
+        }
+        if (!persistPendingNativeSwitchExact(pending, resolved)) return false
+        if (!sourceRestored) onAllSlotsStalled()
+        return false
+    }
+
+    private fun persistPendingNativeSwitchExact(
+        expected: AndroidRedundantTransaction,
+        updated: AndroidRedundantTransaction,
+    ): Boolean {
+        val result = store.updateRedundant(expected.startOperationId) { current ->
+            if (current.samePendingNativeSwitch(expected)) updated else current
+        }
+        return result is RecoveryStoreResult.Success &&
+            result.value.redundantTransaction == updated
+    }
+
+    private fun persistExactTransaction(
+        expected: AndroidRedundantTransaction,
+        updated: AndroidRedundantTransaction,
+    ): Boolean {
+        val result = store.updateRedundant(expected.startOperationId) { current ->
+            if (current == expected) updated else current
+        }
+        return result is RecoveryStoreResult.Success &&
+            result.value.redundantTransaction == updated
     }
 
     private fun mutateNative(
@@ -1057,6 +1212,7 @@ internal class RedundantConnectionCoordinator(
 
     private companion object {
         const val HEALTH_FAILOVER_REASON = "primary_unhealthy"
+        const val MAX_PENDING_NATIVE_SWITCH_ATTEMPTS = 3
         const val PRIMARY_READINESS_TIMEOUT_MILLIS = 30_000L
         const val REPLACEMENT_DELAY_SECONDS = 60L
         private val REDUNDANT_RELEASE_REBASE_CODES = setOf(
@@ -1103,6 +1259,44 @@ private fun AndroidRedundantRetryState.cancelAcquire(): AndroidRedundantRetrySta
     acquireOperationId = null,
     acquireReplaceLeaseId = null,
 )
+
+private fun AndroidRedundantRetryState.hasPendingNativeSwitch(): Boolean =
+    pendingNativeActiveLeaseId != null
+
+private fun AndroidRedundantRetryState.clearPendingNativeSwitch(): AndroidRedundantRetryState = copy(
+    pendingNativeSourceLeaseId = null,
+    pendingNativeActiveLeaseId = null,
+    pendingNativeActiveSlot = null,
+    pendingNativeMembershipGeneration = null,
+    pendingNativeSwitchReason = null,
+    pendingNativeSwitchAttempt = 0,
+)
+
+private fun AndroidRedundantTransaction.samePendingNativeSwitch(
+    other: AndroidRedundantTransaction,
+): Boolean = startOperationId == other.startOperationId &&
+    sessionId == other.sessionId &&
+    desiredActive == other.desiredActive &&
+    retry.stopState == other.retry.stopState &&
+    slotALeaseId == other.slotALeaseId &&
+    slotBLeaseId == other.slotBLeaseId &&
+    localActiveLeaseId == other.localActiveLeaseId &&
+    membershipGeneration == other.membershipGeneration &&
+    retry.pendingNativeSourceLeaseId == other.retry.pendingNativeSourceLeaseId &&
+    retry.pendingNativeActiveLeaseId == other.retry.pendingNativeActiveLeaseId &&
+    retry.pendingNativeActiveSlot == other.retry.pendingNativeActiveSlot &&
+    retry.pendingNativeMembershipGeneration == other.retry.pendingNativeMembershipGeneration &&
+    retry.pendingNativeSwitchReason == other.retry.pendingNativeSwitchReason &&
+    retry.pendingNativeSwitchAttempt == other.retry.pendingNativeSwitchAttempt
+
+private fun AndroidRedundantTransaction.matchesPendingNativeMembership(
+    session: BackgroundRedundantSession,
+): Boolean = session.sessionId == sessionId &&
+    session.membershipGeneration == retry.pendingNativeMembershipGeneration &&
+    session.slotALeaseId == slotALeaseId &&
+    session.slotBLeaseId == slotBLeaseId &&
+    session.containsCurrentLease(retry.pendingNativeSourceLeaseId) &&
+    session.containsCurrentLease(retry.pendingNativeActiveLeaseId)
 
 private fun AndroidRedundantTransaction.slotIndex(leaseId: String?): Int? {
     if (leaseId == null) return null

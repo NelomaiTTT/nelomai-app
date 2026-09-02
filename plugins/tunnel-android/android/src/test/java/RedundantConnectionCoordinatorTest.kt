@@ -893,6 +893,200 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun firstRebindFailureDoesNotSkipTheSecondCurrentMember() {
+        val native = FakeNative(rebindResults = ArrayDeque(listOf(false, true)))
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
+
+        assertFalse(coordinator.onUnderlyingNetworkChanged(validated = true))
+
+        assertEquals(listOf("lease-a", "lease-b"), native.rebindAttempts)
+        assertEquals(listOf("lease-b"), native.rebound)
+    }
+
+    @Test
+    fun failedWalPersistNeverChangesTheNativeActiveMember() {
+        val backend = CoordinatorRecordBackend()
+        val store = store(transaction(), backend)
+        backend.failOnWriteNumber = backend.writeCount + 1
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store, FakePanel(), native)
+
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+
+        assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+        assertTrue(native.activationAttempts.isEmpty())
+    }
+
+    @Test
+    fun failedNativeActivationLeavesSourceAuthoritativeAndWalPending() {
+        val native = FakeNative(activateResults = ArrayDeque(listOf(false)))
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
+
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+
+        val pending = requireNotNull(coordinator.status())
+        assertEquals("lease-a", pending.localActiveLeaseId)
+        assertEquals("lease-a", pending.retry.pendingNativeSourceLeaseId)
+        assertEquals("lease-b", pending.retry.pendingNativeActiveLeaseId)
+        assertEquals(1, pending.retry.pendingNativeSwitchAttempt)
+        assertFalse(pending.retry.roleObservationPending)
+    }
+
+    @Test
+    fun failedFinalizePersistReplaysTheSameNativeTargetOnNextTick() {
+        val backend = CoordinatorRecordBackend()
+        val store = store(transaction(), backend)
+        backend.failOnWriteNumber = backend.writeCount + 2
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store, FakePanel(), native)
+
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+        assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+        assertEquals("lease-b", coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+
+        assertTrue(coordinator.tick())
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-b", "lease-b"), native.activationAttempts)
+        assertEquals(null, coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+    }
+
+    @Test
+    fun processRecoveryActivatesPendingTargetBeforePublishingItsRole() {
+        val pending = pendingNativeSwitch()
+        val panel = FakePanel(recoveredSession = session(
+            activeLeaseId = "lease-a",
+            roleGeneration = 2,
+            membershipGeneration = 1,
+        ))
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(pending), panel, native)
+
+        assertTrue(coordinator.recover())
+
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals("lease-b", native.started.first())
+        assertEquals("lease-b", native.activationAttempts.first())
+        assertFalse(requireNotNull(coordinator.status()).retry.roleObservationPending)
+        assertEquals(1, panel.roleCalls)
+    }
+
+    @Test
+    fun missingPendingTargetConfigurationRetainsWalWithoutStartingTheSource() {
+        val pending = pendingNativeSwitch()
+        val panel = FakePanel(
+            recoveredSession = session(
+                activeLeaseId = "lease-a",
+                roleGeneration = 2,
+                membershipGeneration = 1,
+            ),
+            configurations = mapOf("lease-a" to byteArrayOf(1)),
+        )
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(pending), panel, native)
+
+        assertFalse(coordinator.recover())
+
+        assertTrue(native.started.isEmpty())
+        assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+        assertEquals("lease-b", coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+    }
+
+    @Test
+    fun stalePendingMembershipFailsClosedInsteadOfRebasingToAnotherMemberSet() {
+        var totalLosses = 0
+        val panel = FakePanel(recoveredSession = session(
+            activeLeaseId = "lease-a",
+            roleGeneration = 2,
+            membershipGeneration = 2,
+            slotBLeaseId = "replacement-b",
+        ))
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(pendingNativeSwitch()),
+            panel,
+            native,
+            onAllSlotsStalled = { totalLosses += 1 },
+        )
+
+        assertFalse(coordinator.recover())
+
+        assertEquals(0, totalLosses)
+        assertEquals(1, panel.stopCalls)
+        assertEquals(1, native.stopCalls)
+        assertEquals(null, coordinator.status())
+    }
+
+    @Test
+    fun pendingActivationRetriesAreBoundedAndReplaceTheFailedTarget() {
+        val native = FakeNative(
+            activateResults = ArrayDeque(listOf(false, false, false, true)),
+        )
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
+
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+        assertFalse(coordinator.tick())
+        assertFalse(coordinator.tick())
+
+        val resolved = requireNotNull(coordinator.status())
+        assertEquals("lease-a", resolved.localActiveLeaseId)
+        assertEquals(null, resolved.retry.pendingNativeActiveLeaseId)
+        assertTrue(resolved.retry.acquirePending)
+        assertEquals("lease-b", resolved.retry.acquireReplaceLeaseId)
+        assertEquals(listOf("lease-b", "lease-b", "lease-b", "lease-a"), native.activationAttempts)
+    }
+
+    @Test
+    fun explicitRevokeClearsPendingSwitchAndPreventsAnotherActivation() {
+        val native = FakeNative(activateResults = ArrayDeque(listOf(false)))
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), native)
+
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+        assertTrue(coordinator.revoke())
+
+        assertEquals(listOf("lease-b"), native.activationAttempts)
+        assertEquals(null, coordinator.status())
+        assertFalse(coordinator.tick())
+        assertEquals(listOf("lease-b"), native.activationAttempts)
+    }
+
+    @Test
+    fun memberBeingReplacedCannotBecomeActiveAndThenBeStoppedByCandidate() {
+        val candidatePending = transaction().copy(
+            candidateLeaseId = "candidate",
+            candidateSlot = RedundantSlot.B,
+            retry = AndroidRedundantRetryState(
+                acquirePending = true,
+                acquireOperationId = "replace-b",
+                acquireReplaceLeaseId = "lease-b",
+            ),
+        )
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(candidatePending), FakePanel(), native)
+
+        assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
+        assertTrue(coordinator.tick())
+
+        assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+        assertTrue(native.activationAttempts.isEmpty())
+        assertTrue("lease-b was not replaced", "stop:lease-b" in native.events)
+    }
+
+    @Test
+    fun repeatedRoleFailuresCoalesceToTheLatestLocalActiveMember() {
+        val panel = FakePanel(roleFailures = ArrayDeque(listOf(true, true)))
+        val transaction = transaction().copy(standbyDesired = false)
+        val coordinator = RedundantConnectionCoordinator(store(transaction), panel, FakeNative())
+
+        assertTrue(coordinator.slotFailed("lease-a", "a_failed"))
+        assertTrue(coordinator.slotFailed("lease-b", "b_failed"))
+
+        val pending = requireNotNull(coordinator.status())
+        assertEquals("lease-a", pending.localActiveLeaseId)
+        assertEquals("lease-a", pending.retry.pendingRoleLeaseId)
+        assertEquals("b_failed", pending.retry.pendingRoleReason)
+    }
+
+    @Test
     fun replacementDeadlineSurvivesCoordinatorRecreation() {
         var nowMs = 2_000_000L
         val store = store(transaction())
@@ -1377,8 +1571,10 @@ class RedundantConnectionCoordinatorTest {
         assertEquals(1, panel.stopCalls)
     }
 
-    private fun store(transaction: AndroidRedundantTransaction): AndroidRecoveryStore {
-        val backend = CoordinatorRecordBackend()
+    private fun store(
+        transaction: AndroidRedundantTransaction,
+        backend: CoordinatorRecordBackend = CoordinatorRecordBackend(),
+    ): AndroidRecoveryStore {
         backend.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope(
             formatVersion = ANDROID_RECOVERY_FORMAT,
             intent = AndroidConnectionIntent.empty(1),
@@ -1387,6 +1583,16 @@ class RedundantConnectionCoordinatorTest {
         )))
         return AndroidRecoveryStore(backend, CoordinatorBootIdentity())
     }
+
+    private fun pendingNativeSwitch() = transaction().copy(
+        retry = AndroidRedundantRetryState(
+            pendingNativeSourceLeaseId = "lease-a",
+            pendingNativeActiveLeaseId = "lease-b",
+            pendingNativeActiveSlot = RedundantSlot.B,
+            pendingNativeMembershipGeneration = 1,
+            pendingNativeSwitchReason = "primary_unhealthy",
+        ),
+    )
 
     private fun emptyStore(): AndroidRecoveryStore {
         val backend = CoordinatorRecordBackend()
@@ -1478,11 +1684,15 @@ class RedundantConnectionCoordinatorTest {
 private class CoordinatorRecordBackend : EncryptedRecordBackend {
     var record: ByteArray? = null
     var failReads = false
+    var failOnWriteNumber: Int? = null
+    var writeCount = 0
     override fun read(): ByteArray? {
         if (failReads) throw IllegalStateException("read_failed")
         return record?.copyOf()
     }
     override fun write(plaintext: ByteArray): Boolean {
+        writeCount += 1
+        if (writeCount == failOnWriteNumber) return false
         record = plaintext.copyOf()
         return true
     }
@@ -1500,10 +1710,14 @@ private class FakeNative(
     private var healthSnapshotFailures: Int = 0,
     private val startEntered: CountDownLatch? = null,
     private val releaseStart: CountDownLatch? = null,
+    private val activateResults: ArrayDeque<Boolean> = ArrayDeque(),
+    private val rebindResults: ArrayDeque<Boolean> = ArrayDeque(),
 ) : RedundantConnectionNative {
     val started = mutableListOf<String>()
     val activated = mutableListOf<String>()
     val rebound = mutableListOf<String>()
+    val activationAttempts = mutableListOf<String>()
+    val rebindAttempts = mutableListOf<String>()
     val events = mutableListOf<String>()
     var stopCalls = 0
     override fun start(
@@ -1518,7 +1732,9 @@ private class FakeNative(
         events += "start:$leaseId"
         return leaseId !in startFailures
     }
-    override fun activate(leaseId: String): Boolean = (leaseId in usable).also {
+    override fun activate(leaseId: String): Boolean =
+        (activateResults.removeFirstOrNull() ?: (leaseId in usable)).also {
+        activationAttempts += leaseId
         if (it) activated += leaseId
     }
     override fun stopSlot(leaseId: String): Boolean = (leaseId in usable).also {
@@ -1529,7 +1745,9 @@ private class FakeNative(
         return stopResults.removeFirstOrNull() ?: true
     }
     override fun isUsable(leaseId: String): Boolean = leaseId in usable
-    override fun rebind(leaseId: String): Boolean = (leaseId in usable).also {
+    override fun rebind(leaseId: String): Boolean =
+        (rebindResults.removeFirstOrNull() ?: (leaseId in usable)).also {
+        rebindAttempts += leaseId
         if (it) rebound += leaseId
     }
     override fun healthObservations(): List<SlotObservation> {

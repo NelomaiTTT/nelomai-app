@@ -598,6 +598,90 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun pendingNativeSwitchRoundTripsWithoutPersistingTunnelConfiguration() {
+        val backend = FakeEncryptedRecordBackend()
+        val pending = redundantTransaction("v2-start").copy(
+            retry = AndroidRedundantRetryState(
+                pendingNativeSourceLeaseId = "lease-a",
+                pendingNativeActiveLeaseId = "lease-b",
+                pendingNativeActiveSlot = RedundantSlot.B,
+                pendingNativeMembershipGeneration = 0,
+                pendingNativeSwitchReason = "primary_unhealthy",
+                pendingNativeSwitchAttempt = 2,
+            ),
+        )
+
+        store(backend).beginRedundant(pending).success()
+        val restored = requireNotNull(store(backend).read().success().redundantTransaction)
+        val plaintext = requireNotNull(backend.record).toString(Charsets.UTF_8).lowercase()
+
+        assertEquals(pending, restored)
+        assertFalse(plaintext.contains("configuration"))
+        assertFalse(plaintext.contains("privatekey"))
+    }
+
+    @Test
+    fun redundantRecordWithoutPendingNativeFieldsRemainsReadable() {
+        val backend = FakeEncryptedRecordBackend()
+        store(backend).beginRedundant(redundantTransaction("v2-start")).success()
+        val payload = org.json.JSONObject(
+            requireNotNull(backend.record).toString(Charsets.UTF_8),
+        )
+        payload.getJSONObject("redundantTransaction").getJSONObject("retry").apply {
+            remove("pendingNativeSourceLeaseId")
+            remove("pendingNativeActiveLeaseId")
+            remove("pendingNativeActiveSlot")
+            remove("pendingNativeMembershipGeneration")
+            remove("pendingNativeSwitchReason")
+            remove("pendingNativeSwitchAttempt")
+        }
+        backend.record = payload.toString().toByteArray(Charsets.UTF_8)
+
+        val restored = requireNotNull(store(backend).read().success().redundantTransaction)
+
+        assertEquals(redundantTransaction("v2-start"), restored)
+    }
+
+    @Test
+    fun pendingNativeSwitchMustTargetTheRecordedMembershipAndSlot() {
+        val invalid = redundantTransaction("v2-start").copy(
+            retry = AndroidRedundantRetryState(
+                pendingNativeSourceLeaseId = "lease-a",
+                pendingNativeActiveLeaseId = "removed-lease",
+                pendingNativeActiveSlot = RedundantSlot.B,
+                pendingNativeMembershipGeneration = 0,
+                pendingNativeSwitchReason = "primary_unhealthy",
+            ),
+        )
+
+        val failure = store(FakeEncryptedRecordBackend()).beginRedundant(invalid).failure()
+
+        assertEquals("redundant_recovery_invalid", failure.code)
+    }
+
+    @Test
+    fun deferredStopAtomicallyClearsPendingNativeSwitch() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginRedundant(redundantTransaction("v2-start").copy(
+            retry = AndroidRedundantRetryState(
+                pendingNativeSourceLeaseId = "lease-a",
+                pendingNativeActiveLeaseId = "lease-b",
+                pendingNativeActiveSlot = RedundantSlot.B,
+                pendingNativeMembershipGeneration = 0,
+                pendingNativeSwitchReason = "primary_unhealthy",
+            ),
+        )).success()
+
+        val stopped = store.deferRedundantStop("v2-stop", "v2-start").success()
+        val retry = requireNotNull(stopped.redundantTransaction).retry
+
+        assertEquals(RedundantStopState.PENDING, retry.stopState)
+        assertNull(retry.pendingNativeSourceLeaseId)
+        assertNull(retry.pendingNativeActiveLeaseId)
+        assertEquals(0, retry.pendingNativeSwitchAttempt)
+    }
+
+    @Test
     fun legacyBeginStartIsRejectedWhileAV2TransactionOwnsTheEnvelope() {
         val backend = FakeEncryptedRecordBackend()
         val store = store(backend)

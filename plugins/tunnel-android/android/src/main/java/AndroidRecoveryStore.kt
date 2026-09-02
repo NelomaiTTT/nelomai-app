@@ -183,6 +183,12 @@ internal data class AndroidRedundantRetryState(
     val acquirePending: Boolean = false,
     val acquireOperationId: String? = null,
     val acquireReplaceLeaseId: String? = null,
+    val pendingNativeSourceLeaseId: String? = null,
+    val pendingNativeActiveLeaseId: String? = null,
+    val pendingNativeActiveSlot: RedundantSlot? = null,
+    val pendingNativeMembershipGeneration: Long? = null,
+    val pendingNativeSwitchReason: String? = null,
+    val pendingNativeSwitchAttempt: Int = 0,
 )
 
 /** Safe recovery-v2 control state. Configurations and private keys remain ephemeral. */
@@ -437,6 +443,22 @@ internal object AndroidRecoveryEnvelopeCodec {
             } else {
                 transaction.retry.acquireReplaceLeaseId?.let { put("acquireReplaceLeaseId", it) }
             }
+            transaction.retry.pendingNativeSourceLeaseId?.let {
+                put("pendingNativeSourceLeaseId", it)
+            }
+            transaction.retry.pendingNativeActiveLeaseId?.let {
+                put("pendingNativeActiveLeaseId", it)
+            }
+            transaction.retry.pendingNativeActiveSlot?.let {
+                put("pendingNativeActiveSlot", it.wireName)
+            }
+            transaction.retry.pendingNativeMembershipGeneration?.let {
+                put("pendingNativeMembershipGeneration", it)
+            }
+            transaction.retry.pendingNativeSwitchReason?.let {
+                put("pendingNativeSwitchReason", it)
+            }
+            put("pendingNativeSwitchAttempt", transaction.retry.pendingNativeSwitchAttempt)
         })
     }
 
@@ -472,6 +494,15 @@ internal object AndroidRecoveryEnvelopeCodec {
                 acquirePending = retry.optBoolean("acquirePending", false),
                 acquireOperationId = retry.optionalString("acquireOperationId"),
                 acquireReplaceLeaseId = retry.optionalString("acquireReplaceLeaseId"),
+                pendingNativeSourceLeaseId = retry.optionalString("pendingNativeSourceLeaseId"),
+                pendingNativeActiveLeaseId = retry.optionalString("pendingNativeActiveLeaseId"),
+                pendingNativeActiveSlot = retry.optionalString("pendingNativeActiveSlot")
+                    ?.let(RedundantSlot::fromWireName),
+                pendingNativeMembershipGeneration = retry.optionalLong(
+                    "pendingNativeMembershipGeneration",
+                ),
+                pendingNativeSwitchReason = retry.optionalString("pendingNativeSwitchReason"),
+                pendingNativeSwitchAttempt = retry.optInt("pendingNativeSwitchAttempt", 0),
             ),
         )
     }
@@ -580,6 +611,9 @@ internal object AndroidRecoveryEnvelopeCodec {
                 transaction.stopOperationId,
                 transaction.candidateLeaseId,
                 transaction.retry.lastErrorCode,
+                transaction.retry.pendingNativeSourceLeaseId,
+                transaction.retry.pendingNativeActiveLeaseId,
+                transaction.retry.pendingNativeSwitchReason,
             ).forEach(::validateSafeValue)
             require(transaction.localActiveLeaseId == null ||
                 transaction.containsCurrentLease(transaction.localActiveLeaseId))
@@ -600,6 +634,32 @@ internal object AndroidRecoveryEnvelopeCodec {
             transaction.retry.acquireReplaceLeaseId?.let { replaceLeaseId ->
                 require(transaction.containsCurrentLease(replaceLeaseId))
                 require(replaceLeaseId != transaction.localActiveLeaseId)
+            }
+            val pendingNativeFields = listOf(
+                transaction.retry.pendingNativeSourceLeaseId,
+                transaction.retry.pendingNativeActiveLeaseId,
+                transaction.retry.pendingNativeActiveSlot,
+                transaction.retry.pendingNativeMembershipGeneration,
+                transaction.retry.pendingNativeSwitchReason,
+            )
+            require(pendingNativeFields.all { it == null } || pendingNativeFields.all { it != null })
+            require(transaction.retry.pendingNativeSwitchAttempt >= 0)
+            transaction.retry.pendingNativeActiveLeaseId?.let { target ->
+                val source = requireNotNull(transaction.retry.pendingNativeSourceLeaseId)
+                val slot = requireNotNull(transaction.retry.pendingNativeActiveSlot)
+                require(transaction.desiredActive)
+                require(transaction.retry.stopState == RedundantStopState.NONE)
+                require(transaction.localActiveLeaseId == source)
+                require(source != target)
+                require(transaction.containsCurrentLease(source))
+                require(transaction.containsCurrentLease(target))
+                require(transaction.retry.pendingNativeMembershipGeneration ==
+                    transaction.membershipGeneration)
+                require((slot == RedundantSlot.A && transaction.slotALeaseId == target) ||
+                    (slot == RedundantSlot.B && transaction.slotBLeaseId == target))
+            }
+            if (transaction.retry.pendingNativeActiveLeaseId == null) {
+                require(transaction.retry.pendingNativeSwitchAttempt == 0)
             }
         }
         if (envelope.intent.retry.pendingAction == "terminal_after_cleanup") {
@@ -760,7 +820,15 @@ internal class AndroidRecoveryStore(
             stopOperationId = transaction.stopOperationId ?: stopOperationId.also(
                 AndroidRecoveryEnvelopeCodec::validateSafeValue,
             ),
-            retry = transaction.retry.copy(stopState = RedundantStopState.PENDING),
+            retry = transaction.retry.copy(
+                stopState = RedundantStopState.PENDING,
+                pendingNativeSourceLeaseId = null,
+                pendingNativeActiveLeaseId = null,
+                pendingNativeActiveSlot = null,
+                pendingNativeMembershipGeneration = null,
+                pendingNativeSwitchReason = null,
+                pendingNativeSwitchAttempt = 0,
+            ),
         )
     }
 
