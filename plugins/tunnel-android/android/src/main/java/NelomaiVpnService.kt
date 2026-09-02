@@ -708,6 +708,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private val redundantStopLookupBarrier = RedundantStopLookupBarrier()
     private val redundantTotalLossCommands =
         RedundantTotalLossCommandLifecycle<DeferredRedundantTotalLoss>()
+    private val redundantTotalLossRetry = RedundantTotalLossRetryScheduler(
+        retry = ::resumeDurableWorkAfterRedundantBarrier,
+        delayMillis = REDUNDANT_STOP_RETRY_MILLIS,
+        scheduleAllowed = { !serviceDestroyed },
+        remove = restoreHandler::removeCallbacks,
+        postDelayed = { task, delay -> restoreHandler.postDelayed(task, delay) },
+    )
     private val redundantVpnOwner: RedundantVpnProcessOwner?
         get() = redundantVpnOwnerSlot.snapshot()?.owner
     @Volatile private var pendingRedundantStop: PendingRedundantStop? = null
@@ -870,6 +877,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         )
         redundantTotalLossLifecycle = RedundantTotalLossLifecycle(
             currentServiceGeneration = { VPN_PROCESS_SERVICE_GENERATION.get() },
+            serviceActive = { !serviceDestroyed },
             barrierPending = ::redundantStartBlocked,
             logoutState = ::backgroundLogoutState,
             recovery = recoveryStore::read,
@@ -888,6 +896,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             },
             resume = ::dispatchDurableWorkAfterRedundantBarrier,
             scheduleLogout = ::scheduleLogoutAttempt,
+            scheduleCredentialRetry = redundantTotalLossRetry::schedule,
             stopIfIdle = ::stopIfIdle,
         )
         runCatching { AutomaticDiagnostics.initialize(applicationContext) }
@@ -1401,6 +1410,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             disposition = disposition,
             barrierPendingAfterDefer = ::redundantStartBlocked,
             replayDeferred = ::resumeDurableWorkAfterRedundantBarrier,
+            scheduleDeferredRetry = redundantTotalLossRetry::schedule,
             prepareRestartAndStop = { accepted ->
                 val transaction = requireNotNull(
                     (recovery as RecoveryStoreResult.Success).value.redundantTransaction,
@@ -3225,6 +3235,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         idleStopDebouncer.cancel()
         cancelRestoreRetry()
         restoreHandler.removeCallbacks(logoutRetry)
+        redundantTotalLossRetry.cancel()
         restoreHandler.removeCallbacks(redundantHealthTick)
         val revokePending = redundantRevokeLifecycle.hasPendingCleanup()
         if (redundantRevokeLifecycle.needsFrameworkCompletion()) {
@@ -3627,7 +3638,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun resumeDurableWorkAfterRedundantBarrier() {
-        resumeDeferredRedundantTotalLossAndDurableWork(
+        dispatchDeferredRedundantTotalLossAndDurableWork(
+            dispatch = { action ->
+                restoreHandler.post {
+                    redundantTotalLossRetry.cancel()
+                    action()
+                }
+            },
+            dispatchAllowed = { !serviceDestroyed },
             lifecycle = redundantTotalLossCommands,
             reprocess = { command ->
                 handleRedundantTotalLoss(

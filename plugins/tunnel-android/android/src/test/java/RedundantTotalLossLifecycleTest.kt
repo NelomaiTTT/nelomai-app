@@ -50,6 +50,10 @@ class RedundantTotalLossLifecycleTest {
             RedundantTotalLossCommandDisposition.IGNORE,
             disposition(logout = BackgroundLogoutReadState.PENDING),
         )
+        assertEquals(
+            RedundantTotalLossCommandDisposition.DEFER_UNTIL_CREDENTIAL_READABLE,
+            disposition(logout = BackgroundLogoutReadState.UNREADABLE),
+        )
     }
 
     @Test
@@ -73,6 +77,26 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
+    fun unreadableCredentialSchedulesRetryWithoutImmediateReplay() {
+        val lifecycle = RedundantTotalLossCommandLifecycle<String>()
+        var retries = 0
+
+        lifecycle.handle(
+            command = "current-owner",
+            disposition =
+                RedundantTotalLossCommandDisposition.DEFER_UNTIL_CREDENTIAL_READABLE,
+            barrierPendingAfterDefer = { error("credential retry read barrier") },
+            replayDeferred = { error("credential retry replayed immediately") },
+            scheduleDeferredRetry = { retries += 1 },
+            prepareRestartAndStop = { error("credential retry prepared restart") },
+            failClosedStop = { error("credential retry failed closed") },
+        )
+
+        assertEquals(1, retries)
+        assertTrue(lifecycle.replay { assertEquals("current-owner", it) })
+    }
+
+    @Test
     fun deferredCommandKeepsLatestIdentityAndReplaysOnlyOnce() {
         val lifecycle = RedundantTotalLossCommandLifecycle<String>()
         val replayed = mutableListOf<String>()
@@ -83,6 +107,7 @@ class RedundantTotalLossLifecycleTest {
                 disposition = RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
                 barrierPendingAfterDefer = { true },
                 replayDeferred = { error("barrier is still pending") },
+                scheduleDeferredRetry = { error("unexpected credential retry") },
                 prepareRestartAndStop = { error("deferred command was prepared") },
                 failClosedStop = { error("deferred command failed closed") },
             )
@@ -109,6 +134,7 @@ class RedundantTotalLossLifecycleTest {
                 disposition = disposition,
                 barrierPendingAfterDefer = { error("terminal command checked a barrier") },
                 replayDeferred = { error("terminal command requested replay") },
+                scheduleDeferredRetry = { error("terminal command scheduled retry") },
                 prepareRestartAndStop = { prepared += it },
                 failClosedStop = { failedClosed += it },
             )
@@ -131,6 +157,7 @@ class RedundantTotalLossLifecycleTest {
             replayDeferred = {
                 assertTrue(lifecycle.replay { replayed += it })
             },
+            scheduleDeferredRetry = { error("unexpected credential retry") },
             prepareRestartAndStop = { error("deferred command was prepared") },
             failClosedStop = { error("deferred command failed closed") },
         )
@@ -140,25 +167,58 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
-    fun barrierResumeReplaysTotalLossBeforeDurableWork() {
+    fun barrierResumeDispatchesReplayAndDurableWorkTogether() {
         val lifecycle = RedundantTotalLossCommandLifecycle<String>()
-        val events = mutableListOf<String>()
         lifecycle.handle(
             command = "current-owner",
             disposition = RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
             barrierPendingAfterDefer = { true },
             replayDeferred = { error("barrier is still pending") },
+            scheduleDeferredRetry = { error("unexpected credential retry") },
             prepareRestartAndStop = { error("deferred command was prepared") },
             failClosedStop = { error("deferred command failed closed") },
         )
+        val events = mutableListOf<String>()
+        var posted: (() -> Unit)? = null
 
-        resumeDeferredRedundantTotalLossAndDurableWork(
+        dispatchDeferredRedundantTotalLossAndDurableWork(
+            dispatch = { posted = it },
+            dispatchAllowed = { true },
             lifecycle = lifecycle,
             reprocess = { events += "total-loss:$it" },
             resumeDurableWork = { events += "durable-work" },
         )
 
+        assertEquals(emptyList<String>(), events)
+        requireNotNull(posted).invoke()
         assertEquals(listOf("total-loss:current-owner", "durable-work"), events)
+    }
+
+    @Test
+    fun invalidatedDispatchDoesNotReplayOrResumeDurableWork() {
+        val lifecycle = RedundantTotalLossCommandLifecycle<String>()
+        lifecycle.handle(
+            command = "current-owner",
+            disposition = RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
+            barrierPendingAfterDefer = { true },
+            replayDeferred = { error("barrier is still pending") },
+            scheduleDeferredRetry = { error("unexpected credential retry") },
+            prepareRestartAndStop = { error("deferred command was prepared") },
+            failClosedStop = { error("deferred command failed closed") },
+        )
+        val events = mutableListOf<String>()
+        var posted: (() -> Unit)? = null
+
+        dispatchDeferredRedundantTotalLossAndDurableWork(
+            dispatch = { posted = it },
+            dispatchAllowed = { false },
+            lifecycle = lifecycle,
+            reprocess = { events += "total-loss:$it" },
+            resumeDurableWork = { events += "durable-work" },
+        )
+
+        requireNotNull(posted).invoke()
+        assertEquals(emptyList<String>(), events)
     }
 
     @Test
@@ -250,6 +310,107 @@ class RedundantTotalLossLifecycleTest {
         assertEquals(0, staleGeneration.failClosedStops)
         assertEquals(0, staleOwner.prepares)
         assertEquals(0, staleOwner.failClosedStops)
+    }
+
+    @Test
+    fun unreadableCredentialRetriesThenPreparesExactlyOnceWhenReadable() {
+        val fixture = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        fixture.logout = BackgroundLogoutReadState.UNREADABLE
+
+        fixture.handle()
+        assertEquals(0, fixture.prepares)
+        assertEquals(1, fixture.scheduledRetries)
+
+        fixture.logout = BackgroundLogoutReadState.NONE
+        fixture.releaseBarrier()
+        fixture.releaseBarrier()
+
+        assertEquals(1, fixture.prepares)
+        assertEquals(0, fixture.failClosedStops)
+    }
+
+    @Test
+    fun realLogoutWinsWhenCredentialBecomesReadableBeforeRetry() {
+        val fixture = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        fixture.logout = BackgroundLogoutReadState.UNREADABLE
+        fixture.handle()
+
+        fixture.logout = BackgroundLogoutReadState.PENDING
+        fixture.releaseBarrier()
+
+        assertEquals(0, fixture.prepares)
+        assertEquals(0, fixture.failClosedStops)
+    }
+
+    @Test
+    fun credentialRetryBecomesInertForChangedGenerationOrOwner() {
+        val staleGeneration = CommandFixture(
+            recovery = RecoveryStoreResult.Success(redundantEnvelope()),
+        )
+        staleGeneration.logout = BackgroundLogoutReadState.UNREADABLE
+        staleGeneration.handle()
+        staleGeneration.currentGeneration = 8
+        staleGeneration.logout = BackgroundLogoutReadState.NONE
+        staleGeneration.releaseBarrier()
+
+        val staleOwner = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        staleOwner.logout = BackgroundLogoutReadState.UNREADABLE
+        staleOwner.handle()
+        staleOwner.installedOwnerMatches = false
+        staleOwner.logout = BackgroundLogoutReadState.NONE
+        staleOwner.releaseBarrier()
+
+        assertEquals(0, staleGeneration.prepares)
+        assertEquals(0, staleGeneration.failClosedStops)
+        assertEquals(0, staleOwner.prepares)
+        assertEquals(0, staleOwner.failClosedStops)
+    }
+
+    @Test
+    fun stopLookupBarrierDefersCredentialRetryUntilLookupRelease() {
+        val fixture = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        fixture.lookupTokens = 1
+        fixture.logout = BackgroundLogoutReadState.UNREADABLE
+
+        fixture.handle()
+        assertEquals(0, fixture.scheduledRetries)
+
+        fixture.lookupTokens = 0
+        fixture.releaseBarrier()
+
+        assertEquals(1, fixture.scheduledRetries)
+        assertEquals(0, fixture.prepares)
+    }
+
+    @Test
+    fun totalLossRetrySchedulerDeduplicatesAndCancelsItsTask() {
+        val scheduled = mutableMapOf<Runnable, Long>()
+        var retries = 0
+        var scheduleAllowed = true
+        val scheduler = RedundantTotalLossRetryScheduler(
+            retry = { retries += 1 },
+            delayMillis = 1_000L,
+            scheduleAllowed = { scheduleAllowed },
+            remove = { scheduled.remove(it) },
+            postDelayed = { task, delay -> scheduled[task] = delay },
+        )
+
+        scheduler.schedule()
+        scheduler.schedule()
+
+        assertEquals(listOf(1_000L), scheduled.values.toList())
+        val task = scheduled.keys.single()
+        scheduled.remove(task)
+        task.run()
+        assertEquals(1, retries)
+
+        scheduler.schedule()
+        scheduler.cancel()
+        assertTrue(scheduled.isEmpty())
+
+        scheduleAllowed = false
+        scheduler.schedule()
+        assertTrue(scheduled.isEmpty())
     }
 
     @Test
@@ -368,6 +529,28 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
+    fun unreadableCredentialRetriesPromotedRestartUntilCredentialIsReadable() {
+        val fixture = Fixture(
+            recovery = RecoveryStoreResult.Success(restartEnvelope()),
+            logout = BackgroundLogoutReadState.UNREADABLE,
+        )
+
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(1, fixture.credentialRetries)
+        assertEquals(0, fixture.logouts)
+        assertEquals(0, fixture.resumes)
+
+        fixture.logoutState = BackgroundLogoutReadState.NONE
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(listOf("starting", "resume"), fixture.events)
+        assertEquals(1, fixture.resumes)
+    }
+
+    @Test
     fun pendingBarrierOrUnreadableRecoveryRetriesWithoutStarting() {
         val barrier = Fixture(
             recovery = RecoveryStoreResult.Success(restartEnvelope()),
@@ -407,6 +590,21 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
+    fun destroyedServiceMakesTheQueuedCompletionANoOp() {
+        val fixture = Fixture(recovery = RecoveryStoreResult.Success(restartEnvelope()))
+        fixture.serviceActive = false
+
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(0, fixture.resumes)
+        assertEquals(0, fixture.stops)
+        assertEquals(0, fixture.cleanupRetries)
+        assertEquals(0, fixture.credentialRetries)
+        assertEquals(0, fixture.startingPublications)
+    }
+
+    @Test
     fun repeatedExactDurableRetryKeepsPublishingStartingBeforeResume() {
         val fixture = Fixture(recovery = RecoveryStoreResult.Success(restartEnvelope()))
 
@@ -432,12 +630,16 @@ class RedundantTotalLossLifecycleTest {
         var stops = 0
         var cleanupRetries = 0
         var logouts = 0
+        var credentialRetries = 0
         var startingPublications = 0
+        var logoutState = logout
+        var serviceActive = true
         val events = mutableListOf<String>()
         val lifecycle = RedundantTotalLossLifecycle(
             currentServiceGeneration = { generation },
+            serviceActive = { serviceActive },
             barrierPending = { barrierPending },
-            logoutState = { logout },
+            logoutState = { logoutState },
             recovery = { recovery },
             post = { posted = it },
             retryCleanup = { cleanupRetries += 1 },
@@ -450,6 +652,7 @@ class RedundantTotalLossLifecycleTest {
                 events += "resume"
             },
             scheduleLogout = { logouts += 1 },
+            scheduleCredentialRetry = { credentialRetries += 1 },
             stopIfIdle = { stops += 1 },
         )
 
@@ -467,6 +670,7 @@ class RedundantTotalLossLifecycleTest {
         var logout = BackgroundLogoutReadState.NONE
         var prepares = 0
         var failClosedStops = 0
+        var scheduledRetries = 0
 
         fun handle() {
             val disposition = redundantTotalLossCommandDisposition(
@@ -487,13 +691,16 @@ class RedundantTotalLossLifecycleTest {
                 disposition = disposition,
                 barrierPendingAfterDefer = { lookupTokens > 0 },
                 replayDeferred = ::releaseBarrier,
+                scheduleDeferredRetry = { scheduledRetries += 1 },
                 prepareRestartAndStop = { prepares += 1 },
                 failClosedStop = { failClosedStops += 1 },
             )
         }
 
         fun releaseBarrier() {
-            resumeDeferredRedundantTotalLossAndDurableWork(
+            dispatchDeferredRedundantTotalLossAndDurableWork(
+                dispatch = { it() },
+                dispatchAllowed = { true },
                 lifecycle = lifecycle,
                 reprocess = { handle() },
                 resumeDurableWork = {},

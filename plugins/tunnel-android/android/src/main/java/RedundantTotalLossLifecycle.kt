@@ -3,6 +3,7 @@ package ru.nelomai.tunnel
 internal enum class RedundantTotalLossCommandDisposition {
     IGNORE,
     DEFER_UNTIL_BARRIER_RELEASE,
+    DEFER_UNTIL_CREDENTIAL_READABLE,
     PREPARE_RESTART_AND_STOP,
     FAIL_CLOSED_STOP,
 }
@@ -22,12 +23,18 @@ internal fun redundantTotalLossCommandDisposition(
 ): RedundantTotalLossCommandDisposition {
     if (serviceDestroyed || ownerServiceGeneration != currentServiceGeneration ||
         installedStartOperationId != startOperationId || !installedOwnerMatches ||
-        stopPending || logoutState != BackgroundLogoutReadState.NONE
+        stopPending
     ) {
+        return RedundantTotalLossCommandDisposition.IGNORE
+    }
+    if (logoutState == BackgroundLogoutReadState.PENDING) {
         return RedundantTotalLossCommandDisposition.IGNORE
     }
     if (tombstoneUnreadable || stopLookupPending) {
         return RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE
+    }
+    if (logoutState == BackgroundLogoutReadState.UNREADABLE) {
+        return RedundantTotalLossCommandDisposition.DEFER_UNTIL_CREDENTIAL_READABLE
     }
     val envelope = when (recovery) {
         is RecoveryStoreResult.Failure -> {
@@ -58,6 +65,7 @@ internal class RedundantTotalLossCommandLifecycle<T : Any> {
         disposition: RedundantTotalLossCommandDisposition,
         barrierPendingAfterDefer: () -> Boolean,
         replayDeferred: () -> Unit,
+        scheduleDeferredRetry: () -> Unit,
         prepareRestartAndStop: (T) -> Unit,
         failClosedStop: (T) -> Unit,
     ) {
@@ -66,6 +74,10 @@ internal class RedundantTotalLossCommandLifecycle<T : Any> {
             RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE -> {
                 synchronized(gate) { deferred = command }
                 if (!barrierPendingAfterDefer()) replayDeferred()
+            }
+            RedundantTotalLossCommandDisposition.DEFER_UNTIL_CREDENTIAL_READABLE -> {
+                synchronized(gate) { deferred = command }
+                scheduleDeferredRetry()
             }
             RedundantTotalLossCommandDisposition.PREPARE_RESTART_AND_STOP -> {
                 prepareRestartAndStop(command)
@@ -85,13 +97,36 @@ internal class RedundantTotalLossCommandLifecycle<T : Any> {
     }
 }
 
-internal fun <T : Any> resumeDeferredRedundantTotalLossAndDurableWork(
+internal class RedundantTotalLossRetryScheduler(
+    retry: () -> Unit,
+    private val delayMillis: Long,
+    private val scheduleAllowed: () -> Boolean,
+    private val remove: (Runnable) -> Unit,
+    private val postDelayed: (Runnable, Long) -> Unit,
+) {
+    private val task = Runnable(retry)
+
+    fun schedule() {
+        remove(task)
+        if (!scheduleAllowed()) return
+        postDelayed(task, delayMillis)
+    }
+
+    fun cancel() = remove(task)
+}
+
+internal fun <T : Any> dispatchDeferredRedundantTotalLossAndDurableWork(
+    dispatch: ((() -> Unit) -> Unit),
+    dispatchAllowed: () -> Boolean,
     lifecycle: RedundantTotalLossCommandLifecycle<T>,
     reprocess: (T) -> Unit,
     resumeDurableWork: () -> Unit,
 ) {
-    lifecycle.replay(reprocess)
-    resumeDurableWork()
+    dispatch {
+        if (!dispatchAllowed()) return@dispatch
+        lifecycle.replay(reprocess)
+        resumeDurableWork()
+    }
 }
 
 internal fun isExactPromotedRedundantTotalLossRestart(
@@ -124,6 +159,7 @@ internal fun shouldRouteConnectionIntentResumeThroughRedundantGate(
  */
 internal class RedundantTotalLossLifecycle(
     private val currentServiceGeneration: () -> Long,
+    private val serviceActive: () -> Boolean,
     private val barrierPending: () -> Boolean,
     private val logoutState: () -> BackgroundLogoutReadState,
     private val recovery: () -> RecoveryStoreResult<AndroidRecoveryEnvelope>,
@@ -132,20 +168,25 @@ internal class RedundantTotalLossLifecycle(
     private val publishRestartStarting: () -> Unit,
     private val resume: () -> Unit,
     private val scheduleLogout: () -> Unit,
+    private val scheduleCredentialRetry: () -> Unit,
     private val stopIfIdle: () -> Unit,
 ) {
     fun onCleanupAcknowledged(ownerServiceGeneration: Long) {
         post {
-            if (ownerServiceGeneration != currentServiceGeneration()) return@post
+            if (!serviceActive() || ownerServiceGeneration != currentServiceGeneration()) {
+                return@post
+            }
             if (barrierPending()) {
                 retryCleanup()
                 return@post
             }
             when (logoutState()) {
-                BackgroundLogoutReadState.PENDING,
-                BackgroundLogoutReadState.UNREADABLE,
-                -> {
+                BackgroundLogoutReadState.PENDING -> {
                     scheduleLogout()
+                    return@post
+                }
+                BackgroundLogoutReadState.UNREADABLE -> {
+                    scheduleCredentialRetry()
                     return@post
                 }
                 BackgroundLogoutReadState.NONE -> Unit
