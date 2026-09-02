@@ -328,7 +328,7 @@ class NelomaiVpnServiceTest {
             redundantStopCompletionDisposition(
                 ownerServiceGeneration = 7,
                 currentServiceGeneration = 7,
-                currentTransactionStartOperationId = null,
+                recovery = RecoveryStoreResult.Success(serviceV1Envelope()),
             ),
         )
         assertEquals(
@@ -336,7 +336,7 @@ class NelomaiVpnServiceTest {
             redundantStopCompletionDisposition(
                 ownerServiceGeneration = 7,
                 currentServiceGeneration = 8,
-                currentTransactionStartOperationId = null,
+                recovery = RecoveryStoreResult.Success(serviceV1Envelope()),
             ),
         )
         assertEquals(
@@ -344,9 +344,114 @@ class NelomaiVpnServiceTest {
             redundantStopCompletionDisposition(
                 ownerServiceGeneration = 7,
                 currentServiceGeneration = 7,
-                currentTransactionStartOperationId = "new-start-operation",
+                recovery = RecoveryStoreResult.Success(serviceV2Envelope()),
             ),
         )
+    }
+
+    @Test
+    fun oldRedundantCleanupWaitsForReadableRecoveryAndNeverOverridesANewLease() {
+        val newLease = recoveryStore(ServiceRecoveryBackend()).beginStart(
+            expectedGeneration = 0,
+            template = template(),
+            replay = AndroidStartReplay("new-start", 1, "new-fingerprint"),
+        ).successEnvelope()
+
+        assertEquals(
+            RedundantStopCompletionDisposition.RETRY,
+            redundantStopCompletionDisposition(
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 7,
+                recovery = RecoveryStoreResult.Failure("recovery_record_corrupt"),
+            ),
+        )
+        assertEquals(
+            RedundantStopCompletionDisposition.STALE_ONLY,
+            redundantStopCompletionDisposition(
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = 7,
+                recovery = RecoveryStoreResult.Success(newLease),
+            ),
+        )
+    }
+
+    @Test
+    fun unreadableRecoveryFallsBackToTheInstalledRedundantOwnerIdentity() {
+        assertEquals(
+            "owner-start",
+            redundantStopOperationId(
+                pendingStopOperationId = null,
+                recovery = RecoveryStoreResult.Failure("recovery_record_corrupt"),
+                pendingStartOperationId = null,
+                ownerStartOperationId = "owner-start",
+            ),
+        )
+        assertEquals(
+            "durable-stop",
+            redundantStopOperationId(
+                pendingStopOperationId = "durable-stop",
+                recovery = RecoveryStoreResult.Success(serviceV2Envelope()),
+                pendingStartOperationId = "pending-start",
+                ownerStartOperationId = "owner-start",
+            ),
+        )
+    }
+
+    @Test
+    fun unresolvedRedundantCleanupBlocksEveryKindOfNewStart() {
+        assertTrue(redundantCleanupBlocksNewStarts(
+            pendingStop = true,
+            tombstoneUnreadable = false,
+        ))
+        assertTrue(redundantCleanupBlocksNewStarts(
+            pendingStop = false,
+            tombstoneUnreadable = true,
+        ))
+        assertFalse(redundantCleanupBlocksNewStarts(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ))
+    }
+
+    @Test
+    fun connectionIntentCallbacksCannotPublishStateDuringRedundantOwnershipOrCleanup() {
+        assertFalse(shouldApplyConnectionIntentStep(
+            pendingStop = true,
+            tombstoneUnreadable = false,
+            envelope = serviceV1Envelope(),
+        ))
+        assertFalse(shouldApplyConnectionIntentStep(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            envelope = serviceV2Envelope(),
+        ))
+        assertFalse(shouldApplyConnectionIntentStep(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            envelope = null,
+        ))
+        assertTrue(shouldApplyConnectionIntentStep(
+            pendingStop = false,
+            tombstoneUnreadable = false,
+            envelope = serviceV1Envelope(),
+        ))
+    }
+
+    @Test
+    fun installedRedundantOwnerAndItsIdentityChangeAsOneSnapshot() {
+        val slot = RedundantVpnOwnerSlot()
+        val owner = ServiceRedundantOwner()
+
+        assertNull(slot.snapshot())
+        assertNull(slot.install(owner, "start-a"))
+        assertEquals(InstalledRedundantVpnOwner(owner, "start-a"), slot.snapshot())
+        assertNull(slot.removeIf("start-b"))
+        assertEquals(InstalledRedundantVpnOwner(owner, "start-a"), slot.snapshot())
+        assertEquals(
+            InstalledRedundantVpnOwner(owner, "start-a"),
+            slot.removeIf("start-a"),
+        )
+        assertNull(slot.snapshot())
     }
 
     @Test
@@ -894,6 +999,53 @@ class NelomaiVpnServiceTest {
         assertEquals(1, recoveryStarts)
         assertEquals(0, legacyStarts)
         assertEquals(LeasePhase.START_PENDING, recovery.load().leaseTransaction?.phase)
+    }
+
+    @Test
+    fun quickOffRoutesARedundantSnapshotToItsDurableStopOperation() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        recovery.beginRedundant(requireNotNull(serviceV2Envelope().redundantTransaction))
+            .successEnvelope()
+        val selected = coordinator(recovery).quickToggle(AndroidConnectionIntentDispatchState())
+            .quickDispatch()
+
+        assertTrue(selected is AndroidQuickToggleDispatch.RedundantStop)
+        assertEquals(
+            "start-operation",
+            (selected as AndroidQuickToggleDispatch.RedundantStop).startOperationId,
+        )
+    }
+
+    @Test
+    fun quickToggleReplaysADisarmedRedundantTransactionInsteadOfStartingANewTunnel() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction).copy(
+            desiredActive = false,
+            stopOperationId = "stop-operation",
+            retry = AndroidRedundantRetryState(stopState = RedundantStopState.PENDING),
+        )
+        recovery.beginRedundant(transaction).successEnvelope()
+
+        val selected = coordinator(recovery).quickToggle(AndroidConnectionIntentDispatchState())
+            .quickDispatch()
+
+        assertTrue(selected is AndroidQuickToggleDispatch.RedundantStop)
+        assertEquals(
+            transaction.startOperationId,
+            (selected as AndroidQuickToggleDispatch.RedundantStop).startOperationId,
+        )
+    }
+
+    @Test
+    fun acceptedRedundantStopImmediatelyProjectsStoppingWithoutRecoveryMutation() {
+        val before = serviceV2Envelope()
+
+        val status = redundantStoppingConnectionIntentStatus(before)
+
+        assertEquals(before.intent.generation, status.generation)
+        assertFalse(status.desiredActive)
+        assertEquals("stopping", status.status)
+        assertEquals(serviceV2Envelope(), before)
     }
 
     @Test

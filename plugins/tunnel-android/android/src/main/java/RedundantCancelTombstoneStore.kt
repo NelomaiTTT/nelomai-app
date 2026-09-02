@@ -143,20 +143,53 @@ internal fun redundantPrimaryReadyDisposition(
 internal enum class RedundantStopCompletionDisposition {
     PUBLISH_STOPPED,
     STALE_ONLY,
+    RETRY,
 }
 
 internal fun redundantStopCompletionDisposition(
     ownerServiceGeneration: Long,
     currentServiceGeneration: Long,
-    currentTransactionStartOperationId: String?,
-): RedundantStopCompletionDisposition = if (
-    ownerServiceGeneration == currentServiceGeneration &&
-    currentTransactionStartOperationId == null
-) {
-    RedundantStopCompletionDisposition.PUBLISH_STOPPED
-} else {
-    RedundantStopCompletionDisposition.STALE_ONLY
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+): RedundantStopCompletionDisposition {
+    if (ownerServiceGeneration != currentServiceGeneration) {
+        return RedundantStopCompletionDisposition.STALE_ONLY
+    }
+    val envelope = when (recovery) {
+        is RecoveryStoreResult.Failure -> return RedundantStopCompletionDisposition.RETRY
+        is RecoveryStoreResult.Success -> recovery.value
+    }
+    return if (envelope.redundantTransaction == null &&
+        envelope.leaseTransaction == null &&
+        !envelope.intent.desiredActive
+    ) {
+        RedundantStopCompletionDisposition.PUBLISH_STOPPED
+    } else {
+        RedundantStopCompletionDisposition.STALE_ONLY
+    }
 }
+
+internal fun redundantStopOperationId(
+    pendingStopOperationId: String?,
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    pendingStartOperationId: String?,
+    ownerStartOperationId: String?,
+): String? = pendingStopOperationId
+    ?: (recovery as? RecoveryStoreResult.Success)
+        ?.value?.redundantTransaction?.startOperationId
+    ?: pendingStartOperationId
+    ?: ownerStartOperationId
+
+internal fun redundantCleanupBlocksNewStarts(
+    pendingStop: Boolean,
+    tombstoneUnreadable: Boolean,
+): Boolean = pendingStop || tombstoneUnreadable
+
+internal fun shouldApplyConnectionIntentStep(
+    pendingStop: Boolean,
+    tombstoneUnreadable: Boolean,
+    envelope: AndroidRecoveryEnvelope?,
+): Boolean = !redundantCleanupBlocksNewStarts(pendingStop, tombstoneUnreadable) &&
+    envelope != null && envelope.redundantTransaction == null
 
 internal fun shouldCompleteRedundantCancellation(
     tombstonePersisted: Boolean,
