@@ -223,6 +223,7 @@ internal class RedundantConnectionCoordinator(
     @Volatile private var candidateWarmupLeaseId: String? = null
     @Volatile private var publishedReserveState: RedundantReserveState? = null
     @Volatile private var failoverActive = false
+    private var totalLossCommandEmitted = false
     private var pendingPrimaryReadiness: PendingPrimaryReadiness? = null
     private var primaryReadinessFailed = false
     private var boundStartOperationId: String? = expectedStartOperationId
@@ -256,6 +257,7 @@ internal class RedundantConnectionCoordinator(
         onPrimaryFailed: () -> Unit = {},
         onPrimaryCancelled: () -> Unit = {},
     ): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val expected = boundStartOperationId
         if (expected != null && expected != transaction.startOperationId) return@synchronized false
         boundStartOperationId = transaction.startOperationId
@@ -300,6 +302,7 @@ internal class RedundantConnectionCoordinator(
 
     /** Replays the v2 session before callers attempt any recovery-v1 flow. */
     override fun recover(): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
@@ -409,6 +412,7 @@ internal class RedundantConnectionCoordinator(
     }
 
     override fun resume(): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized revoke()
@@ -568,6 +572,7 @@ internal class RedundantConnectionCoordinator(
 
     /** Applies one bounded native health snapshot without exposing a member failure to legacy recovery. */
     fun onHealthObservations(observations: List<SlotObservation>): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
@@ -610,18 +615,16 @@ internal class RedundantConnectionCoordinator(
                 reason = HEALTH_FAILOVER_REASON,
             )
         }
-        if (decision.sessionStalled && !transaction.retry.sessionStalledRecorded) {
-            val recorded = transaction.copy(
-                retry = transaction.retry.copy(sessionStalledRecorded = true),
-            )
-            if (!persist(recorded)) return@synchronized false
-            onAllSlotsStalled()
+        if (decision.sessionStalled) {
+            emitTotalLossCommandLocked(transaction)
+            return@synchronized false
         }
         publishReserveStateLocked(status() ?: transaction, bounded)
         true
     }
 
     override fun tick(): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         if (pendingPrimaryReadiness != null) {
             val observations = try {
                 native.healthObservations()
@@ -653,6 +656,7 @@ internal class RedundantConnectionCoordinator(
     }
 
     override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
@@ -673,6 +677,7 @@ internal class RedundantConnectionCoordinator(
     }
 
     fun slotFailed(leaseId: String, reason: String): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.containsCurrentLease(leaseId)) return@synchronized false
         if (leaseId != transaction.localActiveLeaseId) {
@@ -684,18 +689,15 @@ internal class RedundantConnectionCoordinator(
         if (surviving != null) {
             return@synchronized switchActiveLocked(transaction, surviving, leaseId, reason)
         }
-        if (!transaction.retry.sessionStalledRecorded) {
-            val recorded = transaction.copy(
-                retry = transaction.retry.copy(sessionStalledRecorded = true),
-            )
-            if (!persist(recorded)) return@synchronized false
-            onAllSlotsStalled()
-        }
+        emitTotalLossCommandLocked(transaction)
         false
     }
 
     /** Rebase updates canonical generations but never switches a locally active native dataplane. */
-    fun reportLocalRole(reason: String): Boolean = synchronized(gate) { reportLocalRoleLocked(reason) }
+    fun reportLocalRole(reason: String): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
+        reportLocalRoleLocked(reason)
+    }
 
     private fun reportLocalRoleLocked(reason: String): Boolean {
         val transaction = status() ?: return false
@@ -737,6 +739,7 @@ internal class RedundantConnectionCoordinator(
     }
 
     override fun releaseStandby(): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (transaction.retry.hasPendingNativeSwitch()) return@synchronized false
         // Fence future acquire/commit before the panel release can be retried.
@@ -809,6 +812,7 @@ internal class RedundantConnectionCoordinator(
         operationId: String,
         replaceLeaseId: String? = null,
     ): Boolean = synchronized(gate) {
+        if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (transaction.retry.hasPendingNativeSwitch()) return@synchronized false
         if (!transaction.desiredActive || !transaction.standbyDesired) return@synchronized false
@@ -1148,13 +1152,31 @@ internal class RedundantConnectionCoordinator(
                 target,
             )
         } else {
-            pending.copy(retry = pending.retry.clearPendingNativeSwitch().copy(
-                sessionStalledRecorded = true,
-            ))
+            null
         }
-        if (!persistPendingNativeSwitchExact(pending, resolved)) return false
-        if (!sourceRestored) onAllSlotsStalled()
+        if (resolved != null) {
+            if (!persistPendingNativeSwitchExact(pending, resolved)) return false
+        } else {
+            emitTotalLossCommandLocked(pending)
+        }
         return false
+    }
+
+    private fun emitTotalLossCommandLocked(transaction: AndroidRedundantTransaction): Boolean {
+        if (totalLossCommandEmitted || !transaction.desiredActive ||
+            transaction.retry.stopState != RedundantStopState.NONE
+        ) {
+            return false
+        }
+        val current = status() ?: return false
+        if (current.startOperationId != transaction.startOperationId ||
+            !current.desiredActive || current.retry.stopState != RedundantStopState.NONE
+        ) {
+            return false
+        }
+        totalLossCommandEmitted = true
+        onAllSlotsStalled()
+        return true
     }
 
     private fun persistPendingNativeSwitchExact(

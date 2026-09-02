@@ -488,6 +488,13 @@ internal object AndroidRecoveryEnvelopeCodec {
 
     private fun redundantFromJson(payload: JSONObject): AndroidRedundantTransaction {
         val retry = payload.getJSONObject("retry")
+        val totalLossRestartReplay = retry.optJSONObject("totalLossRestartReplay")?.let {
+            AndroidStartReplay(
+                startOperationId = it.getString("startOperationId"),
+                contractVersion = it.getInt("contractVersion"),
+                requestFingerprint = it.getString("requestFingerprint"),
+            )
+        }
         return AndroidRedundantTransaction(
             desiredActive = payload.getBoolean("desiredActive"),
             template = templateFromJson(payload.getJSONObject("template")),
@@ -508,7 +515,10 @@ internal object AndroidRecoveryEnvelopeCodec {
                 attempt = retry.getInt("attempt"),
                 nextRetryAtUnix = retry.optionalLong("nextRetryAtUnix"),
                 lastErrorCode = retry.optionalString("lastErrorCode"),
-                sessionStalledRecorded = retry.optBoolean("sessionStalledRecorded", false),
+                // Older builds wrote this marker before the service callback and
+                // wrote the replay without updating it. Replay presence is the
+                // only durable acknowledgement; normalize both legacy shapes.
+                sessionStalledRecorded = totalLossRestartReplay != null,
                 stopState = retry.optionalString("stopState")?.let(RedundantStopState::fromWireName)
                     ?: if (retry.optBoolean("stopQueued", false)) RedundantStopState.PENDING
                     else RedundantStopState.NONE,
@@ -527,13 +537,7 @@ internal object AndroidRecoveryEnvelopeCodec {
                 ),
                 pendingNativeSwitchReason = retry.optionalString("pendingNativeSwitchReason"),
                 pendingNativeSwitchAttempt = retry.optInt("pendingNativeSwitchAttempt", 0),
-                totalLossRestartReplay = retry.optJSONObject("totalLossRestartReplay")?.let {
-                    AndroidStartReplay(
-                        startOperationId = it.getString("startOperationId"),
-                        contractVersion = it.getInt("contractVersion"),
-                        requestFingerprint = it.getString("requestFingerprint"),
-                    )
-                },
+                totalLossRestartReplay = totalLossRestartReplay,
                 totalLossIntentGeneration = retry.optionalLong("totalLossIntentGeneration"),
                 totalLossSourceStartOperationId = retry.optionalString(
                     "totalLossSourceStartOperationId",
@@ -709,6 +713,8 @@ internal object AndroidRecoveryEnvelopeCodec {
                 transaction.retry.totalLossSourceStartOperationId,
             )
             require(totalLossFields.all { it == null } || totalLossFields.all { it != null })
+            require(transaction.retry.sessionStalledRecorded ==
+                (transaction.retry.totalLossRestartReplay != null))
             transaction.retry.totalLossRestartReplay?.let { replay ->
                 require(replay.contractVersion > 0)
                 require(replay.startOperationId != transaction.startOperationId)
@@ -946,6 +952,7 @@ internal class AndroidRecoveryStore(
         }
         persist(current.copy(redundantTransaction = transaction.copy(
             retry = transaction.retry.copy(
+                sessionStalledRecorded = true,
                 totalLossRestartReplay = normalized,
                 totalLossIntentGeneration = current.intent.generation,
                 totalLossSourceStartOperationId = transaction.startOperationId,
@@ -1023,6 +1030,7 @@ internal class AndroidRecoveryStore(
                     pendingNativeMembershipGeneration = null,
                     pendingNativeSwitchReason = null,
                     pendingNativeSwitchAttempt = 0,
+                    sessionStalledRecorded = false,
                     totalLossRestartReplay = null,
                     totalLossIntentGeneration = null,
                     totalLossSourceStartOperationId = null,

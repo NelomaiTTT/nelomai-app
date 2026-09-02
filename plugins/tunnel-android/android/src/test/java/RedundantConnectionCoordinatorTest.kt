@@ -579,19 +579,32 @@ class RedundantConnectionCoordinatorTest {
 
     @Test
     fun totalLossPublishesOneSerializedLifecycleCallback() {
+        val backend = CoordinatorRecordBackend()
+        val recoveryStore = store(transaction(), backend)
         var totalLossCallbacks = 0
         val coordinator = RedundantConnectionCoordinator(
-            store(transaction()),
+            recoveryStore,
             FakePanel(),
             FakeNative(usable = emptySet()),
             onAllSlotsStalled = { totalLossCallbacks += 1 },
         )
+        val writesBeforeFailure = backend.writeCount
 
         assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
         assertFalse(coordinator.slotFailed("lease-a", "primary_unhealthy"))
 
         assertEquals(1, totalLossCallbacks)
-        assertTrue(requireNotNull(coordinator.status()).retry.sessionStalledRecorded)
+        assertEquals(writesBeforeFailure, backend.writeCount)
+        assertFalse(requireNotNull(coordinator.status()).retry.sessionStalledRecorded)
+
+        val reconstructed = RedundantConnectionCoordinator(
+            recoveryStore,
+            FakePanel(),
+            FakeNative(usable = emptySet()),
+            onAllSlotsStalled = { totalLossCallbacks += 1 },
+        )
+        assertFalse(reconstructed.slotFailed("lease-a", "primary_unhealthy"))
+        assertEquals(2, totalLossCallbacks)
     }
 
     @Test

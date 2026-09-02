@@ -693,6 +693,7 @@ class AndroidRecoveryStoreTest {
             AndroidStartReplay("ignored-start", 1, "ignored-fingerprint"),
         ).success()
         val prepared = requireNotNull(store.read().success().redundantTransaction)
+        assertTrue(prepared.retry.sessionStalledRecorded)
         assertEquals(replay, prepared.retry.totalLossRestartReplay)
         assertEquals(0L, prepared.retry.totalLossIntentGeneration)
 
@@ -752,6 +753,36 @@ class AndroidRecoveryStoreTest {
         assertNull(transaction.retry.totalLossRestartReplay)
         assertNull(transaction.retry.pendingNativeActiveLeaseId)
         assertFalse(transaction.retry.roleObservationPending)
+        assertFalse(transaction.retry.sessionStalledRecorded)
+    }
+
+    @Test
+    fun standaloneSessionStalledMarkerCannotBePersistedWithoutRestartReplay() {
+        val invalid = redundantTransaction("v2-start").copy(
+            retry = AndroidRedundantRetryState(sessionStalledRecorded = true),
+        )
+
+        val failure = store(FakeEncryptedRecordBackend()).beginRedundant(invalid).failure()
+
+        assertEquals("redundant_recovery_invalid", failure.code)
+    }
+
+    @Test
+    fun legacyStandaloneSessionStalledMarkerIsNormalizedToPendingDelivery() {
+        val backend = FakeEncryptedRecordBackend()
+        val recoveryStore = store(backend)
+        recoveryStore.beginRedundant(redundantTransaction("v2-start")).success()
+        val payload = org.json.JSONObject(
+            requireNotNull(backend.record).toString(Charsets.UTF_8),
+        )
+        payload.getJSONObject("redundantTransaction").getJSONObject("retry")
+            .put("sessionStalledRecorded", true)
+        backend.record = payload.toString().toByteArray(Charsets.UTF_8)
+
+        val restored = requireNotNull(store(backend).read().success().redundantTransaction)
+
+        assertFalse(restored.retry.sessionStalledRecorded)
+        assertNull(restored.retry.totalLossRestartReplay)
     }
 
     @Test
