@@ -342,3 +342,14 @@ internal fun handleRedundantTombstoneRead(
         }
     }
 }
+
+internal fun handleRedundantBarrierRelease(
+    ownerServiceGeneration: Long,
+    currentServiceGeneration: Long,
+    serviceDestroyed: Boolean,
+    resumeDurableWork: () -> Unit,
+    completeAfterDestroy: () -> Unit,
+) {
+    if (ownerServiceGeneration != currentServiceGeneration) return
+    if (serviceDestroyed) completeAfterDestroy() else resumeDurableWork()
+}

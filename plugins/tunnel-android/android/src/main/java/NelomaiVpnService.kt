@@ -151,6 +151,12 @@ internal class RedundantStartOperationGate {
         completeLocked(operationId, action)
     }
 
+    fun completeFailure(operationId: String, action: () -> Unit): Boolean = synchronized(gate) {
+        val current = pending?.takeIf { it.operationId == operationId }
+            ?: return@synchronized false
+        completeLocked(operationId, if (current.cancelled) current.onCancelled else action)
+    }
+
     fun completeCancelled(operationId: String): Boolean = synchronized(gate) {
         val current = pending?.takeIf { it.operationId == operationId }
             ?: return@synchronized false
@@ -1112,22 +1118,17 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     }
                 },
                 onPrimaryFailed = {
-                    val cancelled = redundantStartOperation.isCancelled(clientOperationId)
                     coordinator.fenceRevoke()
                     coordinator.revoke()
                     installRedundantVpnOwner(null)
                     restoreHandler.post {
-                        if (cancelled) {
-                            redundantStartOperation.completeCancelled(clientOperationId)
-                        } else {
-                            redundantStartOperation.complete(clientOperationId) {
-                                QuickTunnelController.updateState(
-                                    applicationContext,
-                                    SessionState.FAILED,
-                                    desiredActive = true,
-                                )
-                                receiver.sendError("redundant_start_failed")
-                            }
+                        redundantStartOperation.completeFailure(clientOperationId) {
+                            QuickTunnelController.updateState(
+                                applicationContext,
+                                SessionState.FAILED,
+                                desiredActive = true,
+                            )
+                            receiver.sendError("redundant_start_failed")
                         }
                         finishRedundantStart(clientOperationId)
                         stopIfIdle()
@@ -1144,24 +1145,22 @@ class NelomaiVpnService : GoBackend.VpnService() {
             if (!started) {
                 val current = (recoveryStore.read() as? RecoveryStoreResult.Success)
                     ?.value?.redundantTransaction
-                val cancelled = redundantStartOperation.isCancelled(clientOperationId) ||
-                    current?.desiredActive == false ||
+                if (current?.desiredActive == false ||
                     current?.retry?.stopState?.let { it != RedundantStopState.NONE } == true
+                ) {
+                    redundantStartOperation.cancel(clientOperationId)
+                }
                 coordinator.fenceRevoke()
                 coordinator.revoke()
                 installRedundantVpnOwner(null)
                 restoreHandler.post {
-                    if (cancelled) {
-                        redundantStartOperation.completeCancelled(clientOperationId)
-                    } else {
-                        redundantStartOperation.complete(clientOperationId) {
-                            QuickTunnelController.updateState(
-                                applicationContext,
-                                SessionState.FAILED,
-                                desiredActive = true,
-                            )
-                            receiver.sendError("redundant_start_failed")
-                        }
+                    redundantStartOperation.completeFailure(clientOperationId) {
+                        QuickTunnelController.updateState(
+                            applicationContext,
+                            SessionState.FAILED,
+                            desiredActive = true,
+                        )
+                        receiver.sendError("redundant_start_failed")
                     }
                     finishRedundantStart(clientOperationId)
                     stopIfIdle()
@@ -1182,17 +1181,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 ?: "redundant_start_failed"
             TunnelLog.warning("redundant.start_failed", code)
             restoreHandler.post {
-                if (redundantStartOperation.isCancelled(clientOperationId)) {
-                    redundantStartOperation.completeCancelled(clientOperationId)
-                } else {
-                    redundantStartOperation.complete(clientOperationId) {
-                        QuickTunnelController.updateState(
-                            applicationContext,
-                            SessionState.FAILED,
-                            desiredActive = true,
-                        )
-                        receiver.sendError(code)
-                    }
+                redundantStartOperation.completeFailure(clientOperationId) {
+                    QuickTunnelController.updateState(
+                        applicationContext,
+                        SessionState.FAILED,
+                        desiredActive = true,
+                    )
+                    receiver.sendError(code)
                 }
                 finishRedundantStart(clientOperationId)
                 stopIfIdle()
@@ -1847,6 +1842,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         },
         complete: (ResolvedRedundantStopLookup) -> Unit,
     ) {
+        val lookupServiceGeneration = serviceGeneration
         dispatchWithRedundantStopLookupBarrier(
             dispatcher = redundantWork,
             fallbackDispatcher = VPN_PROCESS_CLEANUP_WORK,
@@ -1878,7 +1874,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     ),
                 )
             },
-            afterComplete = ::resumeDurableWorkAfterRedundantBarrier,
+            afterComplete = {
+                handleRedundantBarrierRelease(
+                    ownerServiceGeneration = lookupServiceGeneration,
+                    currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+                    serviceDestroyed = serviceDestroyed,
+                    resumeDurableWork = ::resumeDurableWorkAfterRedundantBarrier,
+                    completeAfterDestroy = { scheduleIdleProcessRecycle(null) },
+                )
+            },
         )
     }
 
@@ -3450,7 +3454,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             restoreHandler.postDelayed(logoutRetry, delayMillis)
             return
         }
-        backgroundLogoutLifecycle.resume()
+        backgroundLogoutLifecycle.resumeOrStopIfIdle()
     }
 
     private fun beginBackgroundLogoutRedundantStop(
@@ -3818,18 +3822,29 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
 
     private fun stopIfIdle() {
+        if (routeDestroyedServiceIdle(
+                serviceDestroyed = serviceDestroyed,
+                recycle = { scheduleIdleProcessRecycle(null) },
+            )
+        ) return
         if (redundantStartBlocked() ||
             redundantRevokeLifecycle.hasPendingCleanup()
         ) return
+        if (backgroundLogoutLifecycle.onIdleCheck()) return
         applyAndroidVpnServiceIdleLifecycle(
             debouncer = idleStopDebouncer,
             shouldStop = {
-                shouldStopVpnService(
-                    TunnelRuntime.state(),
-                    QuickTunnelController.desiredActive(applicationContext),
-                    backgroundLogoutState() != BackgroundLogoutReadState.NONE,
-                    connectionIntentLifecycle.hasPendingWork(),
-                )
+                if (backgroundLogoutLifecycle.onIdleCheck()) {
+                    false
+                } else {
+                    shouldStopVpnService(
+                        TunnelRuntime.state(),
+                        QuickTunnelController.desiredActive(applicationContext),
+                        pendingLogout = false,
+                        durableConnectionWork = connectionIntentLifecycle
+                            .hasPendingConnectionWork(),
+                    )
+                }
             },
             stop = {
                 ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
@@ -4859,8 +4874,21 @@ internal class BackgroundLogoutServiceLifecycle(
     private val scheduleRetry: () -> Unit,
     private val stopIfIdle: () -> Unit,
 ) {
-    fun resume(): Boolean {
-        when (logoutState()) {
+    fun resume(): Boolean = resume(logoutState())
+
+    fun resumeOrStopIfIdle() {
+        if (!resume()) stopIfIdle()
+    }
+
+    fun onIdleCheck(): Boolean {
+        val state = logoutState()
+        if (state == BackgroundLogoutReadState.NONE) return false
+        resume(state)
+        return true
+    }
+
+    private fun resume(state: BackgroundLogoutReadState): Boolean {
+        when (state) {
             BackgroundLogoutReadState.NONE -> return false
             BackgroundLogoutReadState.UNREADABLE -> {
                 scheduleRetry()
@@ -4908,6 +4936,8 @@ internal class ConnectionIntentServiceLifecycle(
     fun hasPendingWork(): Boolean =
         logoutState() != BackgroundLogoutReadState.NONE || hasDurableWork()
 
+    fun hasPendingConnectionWork(): Boolean = hasDurableWork()
+
     private fun resumeDurableWork(): Boolean {
         if (logoutState() != BackgroundLogoutReadState.NONE) {
             scheduleLogout()
@@ -4946,6 +4976,14 @@ internal fun shouldStopVpnService(
     durableConnectionWork: Boolean,
 ): Boolean = state != SessionState.RUNNING && !desiredActive && !pendingLogout &&
     !durableConnectionWork
+
+internal fun routeDestroyedServiceIdle(
+    serviceDestroyed: Boolean,
+    recycle: () -> Unit,
+): Boolean {
+    if (serviceDestroyed) recycle()
+    return serviceDestroyed
+}
 
 internal fun legacyStartCallbackDesiredActive(
     durableDesiredActive: Boolean,

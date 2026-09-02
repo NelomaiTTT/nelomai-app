@@ -124,6 +124,36 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun redundantStartFailureObservesCancellationMadeAfterWorkerSnapshot() {
+        val outcomes = mutableListOf<String>()
+        val gate = RedundantStartOperationGate()
+
+        assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
+        assertFalse(gate.isCancelled("operation-a"))
+        assertTrue(gate.cancel("operation-a"))
+
+        assertTrue(gate.completeFailure("operation-a") { outcomes += "failed" })
+        gate.finish("operation-a")
+
+        assertEquals(listOf("stopped"), outcomes)
+        assertFalse(gate.hasPending())
+    }
+
+    @Test
+    fun redundantStartFailureStillPublishesFailureWhenNotCancelled() {
+        val outcomes = mutableListOf<String>()
+        val gate = RedundantStartOperationGate()
+
+        assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
+
+        assertTrue(gate.completeFailure("operation-a") { outcomes += "failed" })
+        gate.finish("operation-a")
+
+        assertEquals(listOf("failed"), outcomes)
+        assertFalse(gate.hasPending())
+    }
+
+    @Test
     fun redundantStartReadyAndStopRacePublishesExactlyOneTerminalOutcome() {
         repeat(100) { index ->
             val outcomes = CopyOnWriteArrayList<String>()
@@ -532,6 +562,58 @@ class NelomaiVpnServiceTest {
         assertEquals(listOf("invalidate", "resolve"), events)
         caller.removeFirst().run()
         assertEquals(listOf("invalidate", "resolve", "complete", "resume"), events)
+    }
+
+    @Test
+    fun redundantBarrierReleaseDoesNotResumeDestroyedOrStaleService() {
+        val currentEvents = mutableListOf<String>()
+        handleRedundantBarrierRelease(
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 7,
+            serviceDestroyed = false,
+            resumeDurableWork = { currentEvents += "resume" },
+            completeAfterDestroy = { currentEvents += "destroyed" },
+        )
+        assertEquals(listOf("resume"), currentEvents)
+
+        val destroyedEvents = mutableListOf<String>()
+        handleRedundantBarrierRelease(
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 7,
+            serviceDestroyed = true,
+            resumeDurableWork = { destroyedEvents += "resume" },
+            completeAfterDestroy = { destroyedEvents += "destroyed" },
+        )
+        assertEquals(listOf("destroyed"), destroyedEvents)
+
+        val staleEvents = mutableListOf<String>()
+        handleRedundantBarrierRelease(
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 8,
+            serviceDestroyed = false,
+            resumeDurableWork = { staleEvents += "resume" },
+            completeAfterDestroy = { staleEvents += "destroyed" },
+        )
+        assertTrue(staleEvents.isEmpty())
+    }
+
+    @Test
+    fun destroyedServiceIdlePathRecyclesWithoutEvaluatingDurableWork() {
+        val events = mutableListOf<String>()
+
+        assertTrue(routeDestroyedServiceIdle(
+            serviceDestroyed = true,
+            recycle = { events += "recycle" },
+        ))
+
+        assertEquals(listOf("recycle"), events)
+
+        events.clear()
+        assertFalse(routeDestroyedServiceIdle(
+            serviceDestroyed = false,
+            recycle = { events += "recycle" },
+        ))
+        assertTrue(events.isEmpty())
     }
 
     @Test
@@ -3189,6 +3271,46 @@ class NelomaiVpnServiceTest {
         assertTrue(lifecycle.resume())
 
         assertEquals(listOf("retry"), events)
+    }
+
+    @Test
+    fun unreadableCredentialDuringIdleSchedulesLogoutRetry() {
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            logoutState = { BackgroundLogoutReadState.UNREADABLE },
+            recovery = {
+                events += "recovery"
+                RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1))
+            },
+            beginRedundantStop = { events += "stop" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        assertTrue(lifecycle.onIdleCheck())
+
+        assertEquals(listOf("retry"), events)
+    }
+
+    @Test
+    fun clearedCredentialRetryReturnsServiceToIdleCheck() {
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            logoutState = { BackgroundLogoutReadState.NONE },
+            recovery = {
+                events += "recovery"
+                RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1))
+            },
+            beginRedundantStop = { events += "stop" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        lifecycle.resumeOrStopIfIdle()
+
+        assertEquals(listOf("idle"), events)
     }
 
     @Test
