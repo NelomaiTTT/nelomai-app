@@ -4753,7 +4753,7 @@ internal class ConnectionIntentServiceLifecycle(
     private val schedule: () -> Unit,
 ) {
     fun onRetryTimer() {
-        if (hasDurableWork()) schedule()
+        resumeDurableWork()
     }
 
     fun onStickyRestart(): Boolean = resumeDurableWork()

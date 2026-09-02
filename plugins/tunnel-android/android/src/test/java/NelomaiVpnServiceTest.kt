@@ -2993,6 +2993,55 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun retryTimerResumesRedundantRecoveryWithoutConnectionIntent() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
+        store.beginRedundant(transaction).successEnvelope()
+        var redundantSchedules = 0
+        var connectionSchedules = 0
+        val lifecycle = ConnectionIntentServiceLifecycle(
+            coordinator = coordinator(store),
+            scheduleRedundant = { recovery ->
+                assertEquals(transaction, recovery.successEnvelope().redundantTransaction)
+                redundantSchedules += 1
+                true
+            },
+            schedule = { connectionSchedules += 1 },
+        )
+
+        lifecycle.onRetryTimer()
+
+        assertEquals(1, redundantSchedules)
+        assertEquals(0, connectionSchedules)
+    }
+
+    @Test
+    fun retryTimerPrioritizesPendingLogoutOverRedundantRecovery() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        store.beginRedundant(requireNotNull(serviceV2Envelope().redundantTransaction))
+            .successEnvelope()
+        var logoutSchedules = 0
+        var redundantSchedules = 0
+        var connectionSchedules = 0
+        val lifecycle = ConnectionIntentServiceLifecycle(
+            coordinator = coordinator(store),
+            hasPendingLogout = { true },
+            scheduleLogout = { logoutSchedules += 1 },
+            scheduleRedundant = {
+                redundantSchedules += 1
+                true
+            },
+            schedule = { connectionSchedules += 1 },
+        )
+
+        lifecycle.onRetryTimer()
+
+        assertEquals(1, logoutSchedules)
+        assertEquals(0, redundantSchedules)
+        assertEquals(0, connectionSchedules)
+    }
+
+    @Test
     fun stickyRestartPrioritizesPendingLogoutThatAlsoHasDurableCleanup() {
         val backend = ServiceRecoveryBackend()
         val store = recoveryStore(backend)
