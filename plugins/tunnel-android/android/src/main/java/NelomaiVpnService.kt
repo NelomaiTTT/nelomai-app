@@ -773,6 +773,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             coordinator = connectionIntentCoordinator,
             hasPendingLogout = ::hasPendingBackgroundLogout,
             scheduleLogout = ::scheduleLogoutAttempt,
+            scheduleRedundant = ::dispatchRedundantResume,
             schedule = ::scheduleConnectionIntentAttempt,
         )
         connectionIntentAttemptDispatcher = AndroidConnectionIntentAttemptDispatcher(
@@ -1772,7 +1773,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     } else if (serviceDestroyed) {
                         scheduleIdleProcessRecycle(null)
                     } else {
-                        resumeConnectionIntentAfterRedundantBarrier()
+                        resumeDurableWorkAfterRedundantBarrier()
                     }
                 }
             },
@@ -1818,7 +1819,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     ),
                 )
             },
-            afterComplete = ::resumeConnectionIntentAfterRedundantBarrier,
+            afterComplete = ::resumeDurableWorkAfterRedundantBarrier,
         )
     }
 
@@ -3077,7 +3078,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             },
             afterComplete = {
                 deferredStart?.let { applyBackgroundToggleResult(it, receiver) }
-                resumeConnectionIntentAfterRedundantBarrier()
+                resumeDurableWorkAfterRedundantBarrier()
             },
         )
     }
@@ -3353,7 +3354,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         cancelRestoreRetry()
     }
 
-    private fun resumeConnectionIntentAfterRedundantBarrier() {
+    private fun resumeDurableWorkAfterRedundantBarrier() {
         if (!redundantStartBlocked() && connectionIntentLifecycle.onEnsureRunning()) return
         stopIfIdle()
     }
@@ -4746,6 +4747,9 @@ internal class ConnectionIntentServiceLifecycle(
     private val coordinator: AndroidConnectionIntentCoordinator,
     private val hasPendingLogout: () -> Boolean = { false },
     private val scheduleLogout: () -> Unit = {},
+    private val scheduleRedundant: (
+        RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    ) -> Boolean = { false },
     private val schedule: () -> Unit,
 ) {
     fun onRetryTimer() {
@@ -4763,18 +4767,30 @@ internal class ConnectionIntentServiceLifecycle(
             scheduleLogout()
             return true
         }
-        val durable = hasDurableWork()
+        val recovery = coordinator.status()
+        if ((recovery as? RecoveryStoreResult.Success)
+                ?.value?.redundantTransaction != null
+        ) {
+            return scheduleRedundant(recovery)
+        }
+        val durable = hasDurableConnectionWork(recovery)
         if (durable) schedule()
         return durable
     }
 
     private fun hasDurableWork(): Boolean =
-        (coordinator.status() as? RecoveryStoreResult.Success)
-            ?.value?.let { envelope ->
-                (envelope.leaseTransaction != null ||
-                    envelope.intent.retry.pendingAction == "legacy_runtime_stop") &&
-                    !envelope.isTerminalConnectionIntent()
-            } == true
+        (coordinator.status() as? RecoveryStoreResult.Success)?.value?.let { envelope ->
+            envelope.redundantTransaction != null ||
+                hasDurableConnectionWork(RecoveryStoreResult.Success(envelope))
+        } == true
+
+    private fun hasDurableConnectionWork(
+        recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    ): Boolean = (recovery as? RecoveryStoreResult.Success)?.value?.let { envelope ->
+        (envelope.leaseTransaction != null ||
+            envelope.intent.retry.pendingAction == "legacy_runtime_stop") &&
+            !envelope.isTerminalConnectionIntent()
+    } == true
 }
 
 internal fun shouldStopVpnService(
@@ -5594,6 +5610,7 @@ internal class AndroidConnectionIntentCoordinator(
                     live.intent.generation,
                     leaseId,
                     transaction.stopOperationId ?: operationId(),
+                    restartIfDesired = true,
                 ).coordinatorEnvelopeOrThrow()
                 return cleanup(panel, runtime)
             }
@@ -5755,11 +5772,18 @@ internal class AndroidConnectionIntentCoordinator(
         val result = panel.start(template, transaction)
         val leaseId = result.connection.leaseId
         val live = store.read().coordinatorEnvelopeOrThrow()
-        if (!canStart() || !live.intent.desiredActive ||
+        val startStillAdmitted = canStart()
+        if (!startStillAdmitted || !live.intent.desiredActive ||
             live.intent.generation != transaction.generation
         ) {
             result.configuration.fill(0)
-            store.requireCleanup(live.intent.generation, leaseId, operationId())
+            store.requireCleanup(
+                live.intent.generation,
+                leaseId,
+                operationId(),
+                restartIfDesired = !startStillAdmitted &&
+                    live.intent.generation == transaction.generation,
+            )
                 .coordinatorEnvelopeOrThrow()
             return AndroidCoordinatorStep.CLEANUP_REQUIRED
         }
@@ -5785,8 +5809,15 @@ internal class AndroidConnectionIntentCoordinator(
                     .coordinatorEnvelopeOrThrow()
             } else if (error.code == "tunnel_start_cancelled") {
                 val acquired = store.read().coordinatorEnvelopeOrThrow()
-                if (!acquired.intent.desiredActive) {
-                    store.requireCleanup(acquired.intent.generation, leaseId, operationId())
+                val restartAfterCleanup = !canStart() &&
+                    acquired.intent.generation == transaction.generation
+                if (!acquired.intent.desiredActive || restartAfterCleanup) {
+                    store.requireCleanup(
+                        acquired.intent.generation,
+                        leaseId,
+                        operationId(),
+                        restartIfDesired = restartAfterCleanup,
+                    )
                         .coordinatorEnvelopeOrThrow()
                     return cleanup(panel, runtime)
                 }
@@ -5796,13 +5827,25 @@ internal class AndroidConnectionIntentCoordinator(
         when (runtimeStart) {
             AndroidRuntimeStartFenceResult.CANCELLED_BEFORE_START -> {
                 val cancelled = store.read().coordinatorEnvelopeOrThrow()
-                store.requireCleanup(cancelled.intent.generation, leaseId, operationId())
+                store.requireCleanup(
+                    cancelled.intent.generation,
+                    leaseId,
+                    operationId(),
+                    restartIfDesired = !canStart() &&
+                        cancelled.intent.generation == transaction.generation,
+                )
                     .coordinatorEnvelopeOrThrow()
                 return AndroidCoordinatorStep.CLEANUP_REQUIRED
             }
             AndroidRuntimeStartFenceResult.CANCELLED_AFTER_START -> {
                 val acquired = store.read().coordinatorEnvelopeOrThrow()
-                store.requireCleanup(acquired.intent.generation, leaseId, operationId())
+                store.requireCleanup(
+                    acquired.intent.generation,
+                    leaseId,
+                    operationId(),
+                    restartIfDesired = !canStart() &&
+                        acquired.intent.generation == transaction.generation,
+                )
                     .coordinatorEnvelopeOrThrow()
                 return cleanup(panel, runtime)
             }

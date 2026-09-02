@@ -2604,10 +2604,13 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
-    fun appliedReconcileFromInvalidatedAdmissionIsImmediatelyCompensated() {
+    fun appliedReconcileFromInvalidatedAdmissionIsCompensatedAndRestarted() {
         val store = recoveryStore(ServiceRecoveryBackend())
         val coordinator = coordinator(store)
         coordinator.begin(template())
+        val firstStartOperationId = requireNotNull(
+            store.load().leaseTransaction?.startOperationId,
+        )
         val admission = AndroidConnectionIntentAdmission()
         val ticket = admission.snapshot()
         val panel = ServicePanelFake().apply {
@@ -2618,7 +2621,7 @@ class NelomaiVpnServiceTest {
         val runtime = ServiceRuntimeFake()
 
         assertEquals(
-            AndroidCoordinatorStep.IDLE,
+            AndroidCoordinatorStep.RETRY,
             coordinator.runOnce(
                 panel,
                 runtime,
@@ -2629,7 +2632,10 @@ class NelomaiVpnServiceTest {
         assertEquals(emptyList<String>(), panel.startOperationIds)
         assertEquals(listOf("lease-stale-reconcile"), panel.stopLeaseIds)
         assertEquals(1, runtime.stopCalls)
-        assertNull(store.load().leaseTransaction)
+        val restarted = requireNotNull(store.load().leaseTransaction)
+        assertEquals(LeasePhase.START_PENDING, restarted.phase)
+        assertNull(restarted.leaseId)
+        assertTrue(firstStartOperationId != restarted.startOperationId)
     }
 
     @Test
@@ -2687,13 +2693,53 @@ class NelomaiVpnServiceTest {
         assertEquals(0, runtime.startCalls)
         assertEquals(LeasePhase.CLEANUP_PENDING, store.load().leaseTransaction?.phase)
         assertEquals("lease-admission-panel-race", store.load().leaseTransaction?.leaseId)
+        assertEquals(
+            "new_operation_after_cleanup",
+            store.load().intent.retry.pendingAction,
+        )
     }
 
     @Test
-    fun admissionInvalidatedDuringRuntimeStartIsImmediatelyCompensated() {
+    fun explicitStopAfterAdmissionInvalidationCancelsTheScheduledRestart() {
         val store = recoveryStore(ServiceRecoveryBackend())
         val coordinator = coordinator(store)
         coordinator.begin(template())
+        val admission = AndroidConnectionIntentAdmission()
+        val ticket = admission.snapshot()
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.success(startResult("lease-fenced-then-stopped"))
+            stopResults += Result.success(Unit)
+            onStart = admission::invalidate
+        }
+
+        assertEquals(
+            AndroidCoordinatorStep.CLEANUP_REQUIRED,
+            coordinator.runOnce(
+                panel,
+                ServiceRuntimeFake(),
+                canStart = { admission.isCurrent(ticket) },
+            ),
+        )
+        assertTrue(coordinator.cancelCurrent() is AndroidCoordinatorResult.Accepted)
+        assertEquals(
+            AndroidCoordinatorStep.IDLE,
+            coordinator.runOnce(panel, ServiceRuntimeFake()),
+        )
+
+        assertFalse(store.load().intent.desiredActive)
+        assertNull(store.load().leaseTransaction)
+        assertNull(store.load().intent.retry.pendingAction)
+    }
+
+    @Test
+    fun admissionInvalidatedDuringRuntimeStartIsCompensatedAndRestarted() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template())
+        val firstStartOperationId = requireNotNull(
+            store.load().leaseTransaction?.startOperationId,
+        )
         val admission = AndroidConnectionIntentAdmission()
         val ticket = admission.snapshot()
         val panel = ServicePanelFake().apply {
@@ -2725,7 +2771,7 @@ class NelomaiVpnServiceTest {
         }
 
         assertEquals(
-            AndroidCoordinatorStep.IDLE,
+            AndroidCoordinatorStep.RETRY,
             coordinator.runOnce(
                 panel,
                 runtime,
@@ -2736,7 +2782,11 @@ class NelomaiVpnServiceTest {
         assertEquals(1, runtimeStarts)
         assertEquals(1, runtimeStops)
         assertEquals(listOf("lease-admission-runtime-race"), panel.stopLeaseIds)
-        assertNull(store.load().leaseTransaction)
+        val restarted = requireNotNull(store.load().leaseTransaction)
+        assertTrue(store.load().intent.desiredActive)
+        assertEquals(LeasePhase.START_PENDING, restarted.phase)
+        assertNull(restarted.leaseId)
+        assertTrue(firstStartOperationId != restarted.startOperationId)
     }
 
     @Test
@@ -2917,6 +2967,29 @@ class NelomaiVpnServiceTest {
         assertEquals(2, schedules)
         assertEquals(LeasePhase.CLEANUP_PENDING, store.load().leaseTransaction?.phase)
         assertEquals(pending.startOperationId, store.load().leaseTransaction?.startOperationId)
+    }
+
+    @Test
+    fun serviceLifecycleResumesRedundantRecoveryBeforeConnectionIntent() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
+        store.beginRedundant(transaction).successEnvelope()
+        var redundantSchedules = 0
+        var connectionSchedules = 0
+        val lifecycle = ConnectionIntentServiceLifecycle(
+            coordinator = coordinator(store),
+            scheduleRedundant = { recovery ->
+                assertEquals(transaction, recovery.successEnvelope().redundantTransaction)
+                redundantSchedules += 1
+                true
+            },
+            schedule = { connectionSchedules += 1 },
+        )
+
+        assertTrue(lifecycle.onEnsureRunning())
+
+        assertEquals(1, redundantSchedules)
+        assertEquals(0, connectionSchedules)
     }
 
     @Test

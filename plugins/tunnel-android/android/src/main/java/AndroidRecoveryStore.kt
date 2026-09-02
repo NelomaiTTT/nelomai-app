@@ -1475,12 +1475,20 @@ internal class AndroidRecoveryStore(
         expectedGeneration: Long,
         leaseId: String,
         stopOperationId: String,
+        restartIfDesired: Boolean = false,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         mutateTransaction(expectedGeneration) { current, transaction ->
             val normalizedLease = leaseId.also(AndroidRecoveryEnvelopeCodec::validateSafeValue)
             val existingLease = transaction.leaseId
             require(existingLease == null || existingLease == normalizedLease)
             current.copy(
+                intent = if (restartIfDesired && current.intent.desiredActive) {
+                    current.intent.copy(retry = current.intent.retry.copy(
+                        pendingAction = "new_operation_after_cleanup",
+                    ))
+                } else {
+                    current.intent
+                },
                 leaseTransaction = transaction.copy(
                     bootCount = current.intent.bootCount,
                     phase = LeasePhase.CLEANUP_PENDING,
