@@ -709,7 +709,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     @Volatile private var redundantCancelTombstoneUnreadable = false
     private val redundantStopRetry = Runnable { retryPendingRedundantStop() }
     private val retainedRedundantOwnerRetry = Runnable { retryRetainedRedundantOwners() }
-    private var serviceDestroyed = false
+    @Volatile private var serviceDestroyed = false
     private var redundantPhysicalNetworks: PhysicalNetworks? = null
     private val redundantHealthTick = object : Runnable {
         override fun run() {
@@ -3449,6 +3449,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun scheduleLogoutAttempt(delayMillis: Long = 0L) {
+        if (routeDestroyedServiceIdle(
+                serviceDestroyed = serviceDestroyed,
+                recycle = { scheduleIdleProcessRecycle(null) },
+            )
+        ) return
         restoreHandler.removeCallbacks(logoutRetry)
         if (delayMillis > 0) {
             restoreHandler.postDelayed(logoutRetry, delayMillis)
@@ -3474,20 +3479,41 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun runBackgroundLogoutAttempt() {
-        credentialExecutor.execute {
-            val step = logoutCoordinator.runOnce(
-                ServiceConnectionIntentPanel(),
-                ServiceConnectionIntentRuntime(),
-                activate = BackgroundConnectionClient::activateToken,
-                finalize = BackgroundConnectionClient::finalizeLogout,
-            )
-            restoreHandler.post {
-                if (step == AndroidLogoutStep.RETRY) {
-                    scheduleNextBackgroundLogoutRetry()
-                } else {
-                    restoreRetryAttempt = 0
-                    stopIfIdle()
+        val attemptServiceGeneration = serviceGeneration
+        if (serviceDestroyed) {
+            scheduleIdleProcessRecycle(null)
+            return
+        }
+        try {
+            credentialExecutor.execute {
+                val step = logoutCoordinator.runOnce(
+                    ServiceConnectionIntentPanel(),
+                    ServiceConnectionIntentRuntime(),
+                    activate = BackgroundConnectionClient::activateToken,
+                    finalize = BackgroundConnectionClient::finalizeLogout,
+                )
+                restoreHandler.post {
+                    handleBackgroundLogoutAttemptCompletion(
+                        ownerServiceGeneration = attemptServiceGeneration,
+                        currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+                        serviceDestroyed = serviceDestroyed,
+                        step = step,
+                        scheduleRetry = ::scheduleNextBackgroundLogoutRetry,
+                        complete = {
+                            restoreRetryAttempt = 0
+                            stopIfIdle()
+                        },
+                        completeAfterDestroy = { scheduleIdleProcessRecycle(null) },
+                    )
                 }
+            }
+        } catch (error: RejectedExecutionException) {
+            if (serviceDestroyed ||
+                attemptServiceGeneration != VPN_PROCESS_SERVICE_GENERATION.get()
+            ) {
+                scheduleIdleProcessRecycle(null)
+            } else {
+                throw error
             }
         }
     }
@@ -4983,6 +5009,23 @@ internal fun routeDestroyedServiceIdle(
 ): Boolean {
     if (serviceDestroyed) recycle()
     return serviceDestroyed
+}
+
+internal fun handleBackgroundLogoutAttemptCompletion(
+    ownerServiceGeneration: Long,
+    currentServiceGeneration: Long,
+    serviceDestroyed: Boolean,
+    step: AndroidLogoutStep,
+    scheduleRetry: () -> Unit,
+    complete: () -> Unit,
+    completeAfterDestroy: () -> Unit,
+) {
+    if (ownerServiceGeneration != currentServiceGeneration) return
+    if (serviceDestroyed) {
+        completeAfterDestroy()
+        return
+    }
+    if (step == AndroidLogoutStep.RETRY) scheduleRetry() else complete()
 }
 
 internal fun legacyStartCallbackDesiredActive(

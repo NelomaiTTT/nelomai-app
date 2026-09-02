@@ -3314,6 +3314,57 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun lateLogoutCompletionDoesNotResumeDestroyedOrStaleService() {
+        val destroyedEvents = mutableListOf<String>()
+        handleBackgroundLogoutAttemptCompletion(
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 7,
+            serviceDestroyed = true,
+            step = AndroidLogoutStep.RETRY,
+            scheduleRetry = { destroyedEvents += "retry" },
+            complete = { destroyedEvents += "complete" },
+            completeAfterDestroy = { destroyedEvents += "destroyed" },
+        )
+        assertEquals(listOf("destroyed"), destroyedEvents)
+
+        val staleEvents = mutableListOf<String>()
+        handleBackgroundLogoutAttemptCompletion(
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 8,
+            serviceDestroyed = false,
+            step = AndroidLogoutStep.RETRY,
+            scheduleRetry = { staleEvents += "retry" },
+            complete = { staleEvents += "complete" },
+            completeAfterDestroy = { staleEvents += "destroyed" },
+        )
+        assertTrue(staleEvents.isEmpty())
+
+        val currentEvents = mutableListOf<String>()
+        handleBackgroundLogoutAttemptCompletion(
+            ownerServiceGeneration = 8,
+            currentServiceGeneration = 8,
+            serviceDestroyed = false,
+            step = AndroidLogoutStep.RETRY,
+            scheduleRetry = { currentEvents += "retry" },
+            complete = { currentEvents += "complete" },
+            completeAfterDestroy = { currentEvents += "destroyed" },
+        )
+        assertEquals(listOf("retry"), currentEvents)
+
+        currentEvents.clear()
+        handleBackgroundLogoutAttemptCompletion(
+            ownerServiceGeneration = 8,
+            currentServiceGeneration = 8,
+            serviceDestroyed = false,
+            step = AndroidLogoutStep.COMPLETE,
+            scheduleRetry = { currentEvents += "retry" },
+            complete = { currentEvents += "complete" },
+            completeAfterDestroy = { currentEvents += "destroyed" },
+        )
+        assertEquals(listOf("complete"), currentEvents)
+    }
+
+    @Test
     fun logoutLifecycleWaitsForCancelledRedundantStartToFinish() {
         var pendingStart = true
         var recovery = RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1))
