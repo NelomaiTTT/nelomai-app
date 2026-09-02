@@ -41,7 +41,9 @@ Nelomai активно получает новые функции. Даже пр
 - загрузка stable по требованию после установки;
 - отдельное stable-приложение, второй package ID или второе устройство в
   панели;
-- перенос настроек, lease и recovery-состояния между версиями runtime;
+- перенос lease, активного туннеля и recovery-state между версиями runtime;
+  пользовательские preferences мигрируют только внутри своего слота по явно
+  версионированной схеме;
 - изменение Android hot-standby в maintenance-линии `0.2.16`;
 - поддержка iOS.
 
@@ -147,6 +149,18 @@ logout и чтение состояния авторизации. Операци
 привязан к поколению сессии. Устаревший ответ старого runtime не может
 восстановить токены после logout или новой авторизации.
 
+На desktop контейнер создаёт приватный IPC-канал до запуска runtime. Канал
+передаётся дочернему процессу как наследуемый handle/socketpair, а не как
+глобально доступный named socket. До выдачи токена контейнер сверяет executable
+и его хеш с подписанным манифестом выбранного слота. Секреты не передаются в
+argv, environment, файлы диагностики или логи. Сообщения имеют ограниченный
+размер, timeout, номер протокола и поколение сессии.
+
+На Android broker и runtime связываются через explicit non-exported Binder
+component внутри одного package. Запрос дополнительно содержит слот, runtime-
+версию и поколение сессии; broker сверяет их с активным манифестом. Компонент
+не принимает implicit intent и не экспортируется другим приложениям.
+
 Если платформенному tunnel engine нужна фоновая авторизация, auth-broker
 выдаёт отдельное ограниченное полномочие, привязанное к слоту, runtime-версии и
 поколению общей сессии. Оно не является refresh-токеном. Переключение сначала
@@ -159,20 +173,57 @@ Logout из любого runtime действует на весь контейн
 сессия и очищается `AuthStore`. Настройки слотов разрешено сохранить, но ни один
 runtime после logout не может восстановить туннель без нового входа.
 
+### Миграция существующего StoredAuth
+
+Первый запуск `0.2.16` выполняет однократную журналируемую миграцию
+`auth-storage-v1` под single-instance lock:
+
+1. Прочитать legacy `StoredAuth`, не изменяя и не удаляя его.
+2. Записать общий `AuthStore` во временную защищённую запись с тем же
+   `install_secret`, токенами и новым поколением сессии.
+3. Перенести connection, lease, pending operations, compatibility и остальные
+   известные runtime-поля в namespace latest `0.2.16`.
+4. Перенести Android background credential, recovery и quick-plan записи с
+   сохранением их поколений и cleanup-семантики.
+5. Прочитать обе новые записи обратно, проверить их schema version и
+   контрольные суммы, затем атомарно записать marker `committed`.
+6. Только после успешного bootstrap `0.2.16` заменить legacy-запись
+   совместимым tombstone с тем же `install_secret`, но без токенов, connection
+   и pending state. При возврате к старому приложению пользователь должен
+   войти снова, однако новое устройство в панели не создаётся.
+
+Фазы `legacy_read`, `auth_written`, `runtime_written`, `committed` и
+`verified` идемпотентны. После crash миграция продолжается с последней
+подтверждённой фазы. Пока существует legacy или migration-запись, ошибка
+никогда не вызывает `StoredAuth::new_install`; приложение останавливает вход и
+показывает восстанавливаемую ошибку. Port в `main` обязан мигрировать также
+добавленные после `0.2.15` поля Android hot-standby, не отбрасывая их при
+десериализации.
+
 ## Изоляция состояния runtime
 
-Каждая версия runtime получает собственный namespace хранилища, логически
-эквивалентный:
+Каждый слот получает собственный namespace долговременных пользовательских
+настроек, а каждая версия runtime — отдельный namespace операционного
+tunnel-state:
 
 ```text
-runtime/latest/<runtime-version>/...
-runtime/stable/<runtime-version>/...
+runtime/latest/preferences-v<schema>.json
+runtime/stable/<stable-runtime-version>/preferences-v<schema>.json
+runtime/latest/state/<runtime-version>/...
+runtime/stable/state/<runtime-version>/...
 ```
 
-В namespace находятся preferences, split-tunnel state, сохранённые
-соединения, lease, pending start/stop, recovery, quick plan и runtime-
-диагностика. Один runtime не десериализует состояние другого и не продолжает
-его операции.
+Настройки latest мигрируют между последовательными latest-версиями в пределах
+своего слота и не сбрасываются при обычном обновлении контейнера. Настройки
+одной и той же stable-версии сохраняются, пока она остаётся встроенной. При
+выборе новой stable-версии создаётся её собственный namespace; настройки latest
+в него не копируются.
+
+В versioned state находятся сохранённые соединения, lease, pending start/stop,
+recovery, quick plan и runtime-диагностика. Split-tunnel policy делится на
+пользовательские настройки слота и versioned применённое состояние. Один
+runtime не десериализует операционное состояние другой версии и не продолжает
+его операции, кроме явно переданного общему cleanup journal.
 
 Состояние выбора слота и журнал переключения находятся вне этих namespace.
 Токены и `install_secret` также не входят в runtime-state.
@@ -204,30 +255,49 @@ runtime/stable/<runtime-version>/...
 ### Транзакция переключения
 
 Общий журнал содержит идентификатор операции, исходный и целевой слот,
-контейнерную версию и фазу:
+контейнерную версию, поколение общей сессии и защищённый cleanup-envelope.
+Envelope содержит только сведения, необходимые для остановки: lease и
+redundant-session IDs, operation IDs, fingerprints, версии cleanup-контрактов,
+роль локального engine и ссылку на ограниченное фоновое полномочие. Полная
+tunnel configuration в общий журнал не копируется.
+
+Фазы транзакции:
 
 ```text
-requested -> runtime_stopping -> local_stopped -> cleanup_pending -> complete
+requested -> cleanup_handed_off -> runtime_stopping -> local_stopped
+          -> server_reconciling -> complete
 ```
 
 Порядок действий:
 
 1. Атомарно сохранить ожидающий слот и фазу `requested`.
-2. Запретить новые start/recovery операции исходного runtime.
-3. Штатно остановить туннель, освободить lease и очистить автоматическое
-   восстановление исходного runtime.
-4. Остановить системный VPN service/helper.
-5. После ограниченного таймаута принудительно завершить оставшийся локальный
+2. Запретить новые start/recovery операции исходного runtime и получить от него
+   cleanup-envelope до остановки процесса.
+3. Если runtime не отвечает, восстановить минимальный envelope из общего
+   dispatcher-state и выполнить device-scoped reconciliation через панель.
+4. Штатно остановить туннель, освободить известный lease и очистить
+   автоматическое восстановление исходного runtime.
+5. Остановить системный VPN service/helper.
+6. После ограниченного таймаута принудительно завершить оставшийся локальный
    VPN-процесс.
-6. Сохранить незавершённую серверную очистку как идемпотентный
-   `cleanup_pending`, не возвращая старый туннель.
-7. Завершить транзакцию и разрешить применение целевого слота при следующем
-   полном запуске.
+7. Передать незавершённую серверную очистку общему coordinator и применить
+   целевой слот при следующем полном запуске.
 
 Аварийное завершение на любой фазе не теряет журнал. При следующем запуске
 контейнер завершает локальную очистку и возобновляет идемпотентную серверную
-очистку до разрешения нового tunnel start. Серверное истечение lease остаётся
-последней страховкой, но не заменяет явный cleanup.
+очистку независимо от работоспособности исходного runtime. UI целевого runtime
+не блокируется. Перед первым tunnel start общий coordinator вызывает
+`POST /api/client/v1/connections/runtime-switch/reconcile`. Операция под одним
+device allocation lock завершает известные pending operations и освобождает
+все активные lease/redundant sessions этого устройства, сохраняя peer binding
+и настройки pinned-подключения. Она идемпотентна по operation ID. Только после
+подтверждения `clean` новый runtime может создать туннель; перенос или adoption
+старого туннеля между runtime запрещён.
+
+Если панель недоступна, start возвращает обычную retryable ошибку и повторяет
+reconciliation с ограниченным backoff; приложение и выбранный runtime остаются
+доступны. Ожидание не имеет бесконечной busy-фазы. Серверное истечение lease
+остаётся последней страховкой, но не заменяет явный cleanup.
 
 ## Запуск и сброс выбора после обновления
 
@@ -249,16 +319,57 @@ Updater всегда сообщает панели версию контейне
 участвует в сравнении доступных обновлений, иначе stable будет постоянно
 считать текущий контейнер новым обновлением.
 
+### Транзакция обновления
+
+Установка обновления использует тот же shutdown barrier, что и переключение
+слота. До передачи управления системному installer контейнер:
+
+1. записывает `update_requested` с исходным container/runtime и целевой
+   версией контейнера;
+2. запрещает новый tunnel start и handoff'ит cleanup-envelope;
+3. подтверждает локальную остановку VPN service/helper либо применяет
+   ограниченное принудительное завершение;
+4. сохраняет серверный cleanup для продолжения новым контейнером;
+5. только после этого запускает installer.
+
+Android app data и desktop common state переживают замену пакета. Первый запуск
+нового контейнера сбрасывает слот на latest, завершает update journal и выполняет
+reconciliation до нового tunnel start. Если installer завершился ошибкой и
+старый контейнер остался установлен, он отменяет update journal, сохраняет
+прежний выбор слота и разрешает пользователю повторно запустить прежний
+туннель. Частично установленный privileged dispatcher не считается успешным
+обновлением.
+
 ## Платформенная реализация
 
 ### Android
 
 Используются один APK, один application ID, один `versionCode` и одно системное
-VPN-разрешение. APK содержит общий Activity/service dispatcher и два
-изолированных runtime-пакета. Versioned код, ресурсы, native-библиотеки и
-tunnel engines получают непересекающиеся namespace/entrypoint. Общий
-`VpnService` делегирует выбранному engine основную tunnel-логику и не содержит
-изменяемую продуктовую реализацию.
+VPN-разрешение. Общий `MainActivity` выбирает одну из двух non-exported runtime
+Activity. APK содержит отдельные WebView assets, DEX-код и native-библиотеки
+latest и stable; процесс выбранного runtime загружает только свой набор.
+
+Каждый релиз, начиная с `0.2.16`, собирает из одного source revision два
+варианта: обычный latest и предназначенный для будущего встраивания stable-slot
+artifact. Stable-вариант всегда использует постоянный package namespace
+`ru.nelomai.runtime.stable`, уникальные Android resource prefixes, native
+library name `nelomai_runtime_stable` и версионированный JNI/C ABI
+`nelomai_runtime_v1`. Latest использует отдельные namespace и soname. Поэтому
+опубликованный stable-slot artifact можно включить в будущий APK без
+переименования или повторной сборки.
+
+Android runtime-артефакт является подписанным manifest + ZIP с versioned AAR/
+DEX, WebView assets, native `.so`, tunnel engine, лицензиями и хешами каждого
+файла. Release workflow перед сборкой APK проверяет отсутствие пересекающихся
+class names, JNI exports, sonames, resource names и manifest components между
+двумя слотами.
+
+Общий non-exported `VpnService` является стабильным dispatcher: он выбирает
+engine по проверенному common state и делегирует ему tunnel lifecycle через
+`nelomai_runtime_v1`. В dispatcher не переносится изменяемая recovery,
+маршрутная или серверная логика. После смены слота процесс `:vpn` полностью
+завершается, поэтому Android не должен выгружать один native engine и загружать
+другой в том же процессе.
 
 Quick Settings tile управляет только выбранным runtime. Во время ожидающего
 переключения запуск через плитку блокируется до полного перезапуска, чтобы
@@ -269,22 +380,53 @@ Stable публикуется как внутренний Android runtime-арт
 
 ### macOS
 
-Контейнер запускает выбранный versioned runtime и tunnel helper. Все вложенные
-исполняемые файлы подписываются до финальной подписи и notarization приложения.
-Общий launcher проверяет манифест до запуска дочернего процесса.
+Контейнер запускает выбранный versioned runtime, а общий root-owned dispatcher
+запускает соответствующий tunnel engine из защищённого versioned layout.
+Developer ID и notarization не являются требованием: проект сохраняет текущую
+модель распространения без Developer ID. Целостность обеспечивают подпись
+Tauri updater-пакета, отдельная Ed25519-подпись release/runtime manifest и
+проверка хешей до запуска. Если toolchain требует code signature для структуры
+bundle, применяется воспроизводимая ad-hoc подпись; она не выдаётся за Apple
+notarization.
 
 ### Windows
 
 Одна установленная служба выступает стабильным dispatcher и запускает
 versioned tunnel engine выбранного runtime. Два runtime не регистрируют
-конкурирующие службы и не владеют общей service-конфигурацией напрямую.
+конкурирующие службы и не владеют общей service-конфигурацией напрямую. Только
+общий container broker соединяется с named pipe; служба проверяет его SID,
+точный путь и manifest identity. Runtime-процессы не добавляются в allowlist
+привилегированной службы.
 
 ### Linux
 
-Оба runtime и dispatcher входят в AppImage. Формат, ABI, запуск, IPC и
-тестовый tunnel adapter обязательны в CI. Реальный системный tunnel E2E не
-считается проверенным до появления физической Linux-машины у разработчика или
-тестеров.
+Оба runtime и непривилегированная часть dispatcher входят в AppImage. Формат,
+ABI, запуск, IPC и тестовый tunnel adapter обязательны в CI. Реальный системный
+tunnel E2E не считается проверенным до появления физической Linux-машины у
+разработчика или тестеров.
+
+### Privileged layout desktop
+
+NSIS и Unix helper installer атомарно устанавливают в root/administrator-owned
+каталог:
+
+```text
+dispatcher/<contract-version>/...
+engines/latest/<runtime-version>/...
+engines/stable/<runtime-version>/...
+container-manifest.json
+```
+
+Сначала файлы копируются во временный каталог, затем проверяются по подписанному
+манифесту и только после этого manifest pointer переключается атомарно. Старый
+набор удаляется после подтверждённой остановки его engine. При ошибке pointer и
+работающий набор остаются прежними.
+
+Dispatcher принимает только bounded `start`, `stop`, `status`, `cleanup` и
+`version`, проверяет slot/runtime/hash по root-owned manifest и сериализует
+изменения. На Unix общий broker остаётся единственным unprivileged peer
+root-helper; на Windows сохраняются remote-client rejection, SID и exact-path
+checks. Versioned engine не меняет ACL, службу, launch daemon или socket.
 
 ## Сборка и выпуск
 
@@ -300,29 +442,45 @@ versioned tunnel engine выбранного runtime. Два runtime не рег
 - выпуска встраиваемых runtime-артефактов;
 - тестов и диагностики новой границы.
 
+До выпуска `0.2.16` additive-контракт container/runtime versions и
+device-scoped switch reconciliation должен быть реализован, проверен и отдельно
+развёрнут на панели. Это не включает включение Android hot-standby capability.
+
 Контейнер `0.2.16` содержит один фактически доступный runtime `0.2.16`, поэтому
 тумблер скрыт. Выпуск создаёт обычные установщики и отдельные неизменяемые
 runtime-артефакты для каждой поддерживаемой пары платформа/архитектура.
 
 После проверки инфраструктурные изменения `0.2.16` переносятся в текущий
-`main`. Изменения Android hot-standby не попадают обратно в maintenance-линию.
+`main` отдельным переносом с повторным полным ревью конфликтующих `StoredAuth`,
+Android service, updater и recovery участков. Изменения Android hot-standby не
+попадают обратно в maintenance-линию.
 
 ### Последующие выпуски
 
-Release workflow получает обязательный параметр `stable_version`, например
-`0.2.16`. Для каждой платформы и архитектуры workflow:
+Release workflow получает обязательные параметры `stable_version` и
+`stable_manifest_sha256`, например `0.2.16` и digest подписанного manifest.
+Для каждой платформы и архитектуры workflow:
 
-1. находит опубликованный runtime-артефакт точной версии;
-2. проверяет release identity, подпись, хеш, платформу, архитектуру и
-   runtime-контракт;
+1. находит опубликованный runtime-артефакт точной версии и запрещает draft,
+   prerelease или повторно использованный release identity;
+2. проверяет digest manifest против `stable_manifest_sha256`, его detached
+   Ed25519 signature, commit identity, хеш каждого файла, платформу,
+   архитектуру и runtime-контракт;
 3. проверяет, что версия API/контрактов stable входит в явно поддерживаемый
    панелью диапазон для embedded runtime;
 4. включает артефакт без повторной сборки его исходников;
-5. формирует и подписывает манифест нового контейнера.
+5. формирует и подписывает манифест нового контейнера;
+6. повторно извлекает stable payload из готового APK/app/NSIS/AppImage и
+   сравнивает каждый байт с одобренным manifest, обнаруживая неявное
+   переименование, переподпись или изменение упаковщиком.
 
 Отсутствие или несовместимость любого обязательного stable-артефакта
 останавливает весь release. Workflow не имеет права тихо использовать другую
 версию или собирать latest без stable.
+
+Digest принятого stable manifest записывается в подписанный container manifest
+и release provenance. Изменение asset существующего релиза после публикации не
+меняет уже одобренный digest и приводит к остановке следующей сборки.
 
 Первый контейнер с разными слотами — `0.3.0`: `latest = 0.3.0`,
 `stable = 0.2.16`.
@@ -342,9 +500,9 @@ Release workflow получает обязательный параметр `sta
   повторный login и не отдаёт устаревшие токены.
 - Ошибка штатного stop переходит к ограниченному принудительному локальному
   завершению и сохраняет серверный cleanup для повтора.
-- Pending cleanup не разрешает новому runtime начать туннель, пока безопасная
-  сверка не подтвердит отсутствие конфликтующей операции или пока cleanup не
-  будет завершён.
+- Pending cleanup не блокирует запуск UI целевого runtime. Первый tunnel start
+  выполняет device-scoped reconciliation; при недоступной панели возвращается
+  retryable состояние без бесконечной busy-фазы и без создания второго lease.
 - Runtime crash не меняет слот и не включает автоматический fallback.
 - Ошибка обновления не меняет текущий контейнер или выбор слота.
 - Невозможность доказать совместимость stable останавливает сборку release.
@@ -368,18 +526,42 @@ production-конфигурацию.
 ## Совместимость панели
 
 Панель продолжает видеть одно устройство, определяемое общим
-`install_secret`. Запросы приложения передают отдельно версию контейнера и
-активную версию runtime там, где это нужно для диагностики и capability gate.
-Версия контейнера остаётся единственным источником истины для updater и
-minimum-supported policy. Поэтому standalone `0.2.16` может позднее стать
-неподдерживаемым, не блокируя embedded runtime `0.2.16` внутри поддерживаемого
-контейнера `0.3.0`.
+`install_secret`. Additive API-контракт вводит два обязательных для
+`runtime-v1` значения:
+
+- `container_version` — версия установленного APK/AppImage/app/NSIS;
+- `runtime_version` — версия фактически выполняемого UI/core/tunnel engine.
+
+Login получает оба поля. Bootstrap получает заголовки
+`X-Nelomai-Container-Version` и `X-Nelomai-Runtime-Version`, которые common
+broker добавляет сам и не принимает из недоверенного UI. Фоновые device tokens
+привязываются также к runtime slot и поколению общей сессии. Legacy
+`app_version` и `X-Nelomai-App-Version` сохраняются для старых клиентов и
+интерпретируются как container version; для `runtime-v1` панель проверяет их
+совпадение с `container_version` и не позволяет runtime перезаписать
+контейнерную версию своим номером.
+
+В `AppDevice` хранятся обе последние версии, а существующее `app_version`
+остаётся совместимым alias container version на время миграции. Updater,
+critical/minimum-supported policy и отчёт об установленном выпуске используют
+только container version. Transport selection, capability gate, формат
+tunnel/recovery запросов и embedded API compatibility используют runtime
+version вместе с явными contract/capability versions. Неизвестный runtime не
+получает новую возможность только на основании нового контейнера.
+
+Поэтому standalone `0.2.16` может позднее стать неподдерживаемым, не блокируя
+embedded runtime `0.2.16` внутри поддерживаемого контейнера `0.3.0`.
 
 Совместимость embedded runtime с серверным API учитывается отдельным
 версионированным диапазоном контрактов. Выбранный stable-runtime должен
 оставаться в этом диапазоне, пока он входит хотя бы в один поддерживаемый
 контейнер. Release нельзя создать с runtime, чьи API-контракты панель уже не
 обслуживает.
+
+Panel migration является additive: старые клиенты продолжают присылать одно
+`app_version`, новые ответы не удаляют существующие поля, а административные
+страницы и диагностика явно показывают обе версии. Перед публикацией `0.2.16`
+контракт проверяется на сочетаниях old panel/new app и new panel/old app.
 
 ## Проверки
 
@@ -388,24 +570,38 @@ minimum-supported policy. Поэтому standalone `0.2.16` может позд
 - сериализация и миграция разделённого `AuthStore`;
 - сериализация поколений сессии и защита от позднего refresh после logout;
 - привязка фоновых полномочий к слоту, runtime и поколению сессии;
-- namespace и запрет чтения состояния другого runtime;
+- каждая crash-фаза миграции legacy `StoredAuth` без смены `install_secret`;
+- миграция preferences внутри слота и запрет чтения tunnel-state другой
+  runtime-версии;
 - state machine переключения и восстановление каждой журналируемой фазы;
+- полнота общего cleanup-envelope и восстановление при неработающем исходном
+  runtime;
 - сброс выбора при изменении версии контейнера;
 - проверка манифеста, хеша, архитектуры и диапазона контракта;
+- разделение container/runtime version во всех panel gates;
+- аутентификация IPC peer, ограничения сообщений и session generation;
+- отсутствие пересекающихся Android class/resource/JNI/soname identifiers;
 - маршрутизация tile, tray, autostart и updater в выбранный runtime;
-- запрет tunnel start во время переключения и pending cleanup.
+- запрет tunnel start до device-scoped reconciliation.
 
 ### Интеграционные сценарии
 
 - обновление `0.2.15 -> 0.2.16` без потери аккаунта;
 - обновление `0.2.16 -> 0.3.0` с начальным выбором latest;
+- прерывание миграции `0.2.15 -> 0.2.16` на каждой фазе;
+- rollback к старому приложению читает legacy tombstone с прежним
+  `install_secret`, но без устаревшей сессии;
 - `latest -> stable -> latest` с активным и остановленным туннелем;
 - отмена ожидающего выбора до перезапуска;
 - аварийное завершение на каждой фазе переключения;
 - timeout штатного stop и принудительное завершение VPN-процесса;
-- retry идемпотентного server cleanup;
+- переключение при неработающем исходном runtime и retry идемпотентного
+  device-scoped reconciliation;
 - login, refresh и logout из каждого runtime без дублирования устройства;
-- update check и установка обновления при активном stable;
+- старый и новый panel contract с одной и двумя версиями приложения;
+- update check, неудачная и успешная установка обновления при активном stable;
+- обычное обновление latest сохраняет preferences latest, но не переносит
+  versioned tunnel-state;
 - повреждённый stable и несовместимый runtime-контракт;
 - запуск из UI, Android tile, desktop tray и autostart.
 
@@ -413,16 +609,35 @@ minimum-supported policy. Поэтому standalone `0.2.16` может позд
 
 - Android, macOS и Windows: установка, update, оба runtime и реальный туннель;
 - Android: VPN permission, foreground service, tile и завершение UI-процесса;
-- macOS: подпись, notarization, вложенные executables и helper lifecycle;
+- macOS: Tauri/runtime signatures, хеши, ad-hoc bundle consistency, вложенные
+  executables и helper lifecycle без требования notarization;
 - Windows: installer upgrade, единственная служба и dispatcher lifecycle;
 - Linux: AppImage, подпись/хеш, оба runtime, IPC и тестовый tunnel adapter.
 
 Физический Linux tunnel E2E остаётся непроверенным ограничением до появления
 подходящей машины и явно указывается в release checklist.
 
-## Критерии готовности
+## Критерии готовности 0.2.16
 
-Функция готова, когда:
+Базовый выпуск готов, когда:
+
+- additive panel contract и device-scoped reconciliation развёрнуты и
+  совместимы со старыми приложениями;
+- миграция `0.2.15` сохраняет идентичность, авторизацию и незавершённый cleanup
+  после crash на любой фазе;
+- контейнер запускает единственный latest-runtime, а тумблер корректно скрыт;
+- каждая поддерживаемая платформа выпускает подписанный embeddable stable-slot
+  artifact `0.2.16` без namespace/JNI/resource конфликтов;
+- privileged dispatcher/engine boundary и защищённый IPC проходят
+  платформенные проверки;
+- туннель функционально не регрессировал относительно `0.2.15` на доступных
+  Android, macOS и Windows устройствах;
+- Linux проходит полную автоматическую матрицу с явно отмеченным отсутствием
+  physical tunnel E2E.
+
+## Критерии готовности двух runtime
+
+Первый полный выпуск функции (`0.3.0`) готов, когда:
 
 - все четыре платформы собирают один контейнер с двумя проверенными runtime;
 - пользователь может вручную выбрать stable и вернуться на latest;
@@ -432,6 +647,10 @@ minimum-supported policy. Поэтому standalone `0.2.16` может позд
 - обновление контейнера сбрасывает выбор на latest;
 - latest и stable сохраняют независимые настройки и tunnel-state;
 - release невозможно создать без точного полного набора stable-артефактов;
+- update при активном stable проходит общий shutdown/cleanup barrier и новый
+  контейнер начинает с latest;
+- panel minimum-supported использует container version, а capabilities и
+  tunnel contracts — runtime version;
 - обязательная автоматическая и доступная физическая E2E-матрица проходит;
 - отсутствие Linux physical E2E явно зафиксировано, а не выдано за пройденную
   проверку.
