@@ -168,7 +168,7 @@ internal class RedundantTotalLossLifecycle(
     private val publishRestartStarting: () -> Unit,
     private val resume: () -> Unit,
     private val scheduleLogout: () -> Unit,
-    private val scheduleCredentialRetry: () -> Unit,
+    private val scheduleStateReadRetry: () -> Unit,
     private val stopIfIdle: () -> Unit,
 ) {
     fun onCleanupAcknowledged(ownerServiceGeneration: Long) {
@@ -186,14 +186,14 @@ internal class RedundantTotalLossLifecycle(
                     return@post
                 }
                 BackgroundLogoutReadState.UNREADABLE -> {
-                    scheduleCredentialRetry()
+                    scheduleStateReadRetry()
                     return@post
                 }
                 BackgroundLogoutReadState.NONE -> Unit
             }
             val envelope = when (val current = recovery()) {
                 is RecoveryStoreResult.Failure -> {
-                    retryCleanup()
+                    scheduleStateReadRetry()
                     return@post
                 }
                 is RecoveryStoreResult.Success -> current.value

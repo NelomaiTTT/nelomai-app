@@ -526,6 +526,8 @@ class RedundantTotalLossLifecycleTest {
         assertEquals(1, fixture.logouts)
         assertEquals(0, fixture.resumes)
         assertEquals(0, fixture.startingPublications)
+        assertEquals(0, fixture.stateReadRetries)
+        assertEquals(0, fixture.cleanupRetries)
     }
 
     @Test
@@ -538,9 +540,10 @@ class RedundantTotalLossLifecycleTest {
         fixture.lifecycle.onCleanupAcknowledged(7)
         fixture.runPosted()
 
-        assertEquals(1, fixture.credentialRetries)
+        assertEquals(1, fixture.stateReadRetries)
         assertEquals(0, fixture.logouts)
         assertEquals(0, fixture.resumes)
+        assertEquals(0, fixture.cleanupRetries)
 
         fixture.logoutState = BackgroundLogoutReadState.NONE
         fixture.lifecycle.onCleanupAcknowledged(7)
@@ -551,7 +554,57 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
-    fun pendingBarrierOrUnreadableRecoveryRetriesWithoutStarting() {
+    fun unreadableRecoverySchedulesStateReadRetryInsteadOfBarrierCleanup() {
+        val fixture = Fixture(
+            recovery = RecoveryStoreResult.Failure("recovery_record_read_failed"),
+        )
+
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(1, fixture.stateReadRetries)
+        assertEquals(0, fixture.cleanupRetries)
+        assertEquals(0, fixture.resumes)
+        assertEquals(0, fixture.startingPublications)
+    }
+
+    @Test
+    fun readableRecoveryAfterRetryResumesThePromotedRestart() {
+        val fixture = Fixture(
+            recovery = RecoveryStoreResult.Failure("recovery_record_read_failed"),
+        )
+
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+        fixture.recoveryState = RecoveryStoreResult.Success(restartEnvelope())
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(1, fixture.stateReadRetries)
+        assertEquals(0, fixture.cleanupRetries)
+        assertEquals(listOf("starting", "resume"), fixture.events)
+    }
+
+    @Test
+    fun logoutWinsWhenItStartsAfterARecoveryReadFailure() {
+        val fixture = Fixture(
+            recovery = RecoveryStoreResult.Failure("recovery_record_read_failed"),
+        )
+
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+        fixture.logoutState = BackgroundLogoutReadState.PENDING
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(1, fixture.stateReadRetries)
+        assertEquals(1, fixture.logouts)
+        assertEquals(0, fixture.resumes)
+        assertEquals(0, fixture.startingPublications)
+    }
+
+    @Test
+    fun barrierAndUnreadableRecoveryUseTheirOwnWakeups() {
         val barrier = Fixture(
             recovery = RecoveryStoreResult.Success(restartEnvelope()),
             barrierPending = true,
@@ -566,11 +619,28 @@ class RedundantTotalLossLifecycleTest {
         unreadable.runPosted()
 
         assertEquals(1, barrier.cleanupRetries)
+        assertEquals(0, barrier.stateReadRetries)
         assertEquals(0, barrier.resumes)
         assertEquals(0, barrier.startingPublications)
-        assertEquals(1, unreadable.cleanupRetries)
+        assertEquals(0, unreadable.cleanupRetries)
+        assertEquals(1, unreadable.stateReadRetries)
         assertEquals(0, unreadable.resumes)
         assertEquals(0, unreadable.startingPublications)
+    }
+
+    @Test
+    fun readableSupersedingRedundantWorkDoesNotStartStateReadPolling() {
+        val fixture = Fixture(
+            recovery = RecoveryStoreResult.Success(redundantEnvelope()),
+        )
+
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+
+        assertEquals(1, fixture.cleanupRetries)
+        assertEquals(0, fixture.stateReadRetries)
+        assertEquals(0, fixture.resumes)
+        assertEquals(0, fixture.startingPublications)
     }
 
     @Test
@@ -586,6 +656,7 @@ class RedundantTotalLossLifecycleTest {
         assertEquals(0, fixture.resumes)
         assertEquals(0, fixture.stops)
         assertEquals(0, fixture.cleanupRetries)
+        assertEquals(0, fixture.stateReadRetries)
         assertEquals(0, fixture.startingPublications)
     }
 
@@ -600,7 +671,7 @@ class RedundantTotalLossLifecycleTest {
         assertEquals(0, fixture.resumes)
         assertEquals(0, fixture.stops)
         assertEquals(0, fixture.cleanupRetries)
-        assertEquals(0, fixture.credentialRetries)
+        assertEquals(0, fixture.stateReadRetries)
         assertEquals(0, fixture.startingPublications)
     }
 
@@ -630,9 +701,10 @@ class RedundantTotalLossLifecycleTest {
         var stops = 0
         var cleanupRetries = 0
         var logouts = 0
-        var credentialRetries = 0
+        var stateReadRetries = 0
         var startingPublications = 0
         var logoutState = logout
+        var recoveryState = recovery
         var serviceActive = true
         val events = mutableListOf<String>()
         val lifecycle = RedundantTotalLossLifecycle(
@@ -640,7 +712,7 @@ class RedundantTotalLossLifecycleTest {
             serviceActive = { serviceActive },
             barrierPending = { barrierPending },
             logoutState = { logoutState },
-            recovery = { recovery },
+            recovery = { recoveryState },
             post = { posted = it },
             retryCleanup = { cleanupRetries += 1 },
             publishRestartStarting = {
@@ -652,7 +724,7 @@ class RedundantTotalLossLifecycleTest {
                 events += "resume"
             },
             scheduleLogout = { logouts += 1 },
-            scheduleCredentialRetry = { credentialRetries += 1 },
+            scheduleStateReadRetry = { stateReadRetries += 1 },
             stopIfIdle = { stops += 1 },
         )
 

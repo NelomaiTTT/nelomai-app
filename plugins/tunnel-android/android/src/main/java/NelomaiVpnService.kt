@@ -896,7 +896,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             },
             resume = ::dispatchDurableWorkAfterRedundantBarrier,
             scheduleLogout = ::scheduleLogoutAttempt,
-            scheduleCredentialRetry = redundantTotalLossRetry::schedule,
+            scheduleStateReadRetry = redundantTotalLossRetry::schedule,
             stopIfIdle = ::stopIfIdle,
         )
         runCatching { AutomaticDiagnostics.initialize(applicationContext) }
