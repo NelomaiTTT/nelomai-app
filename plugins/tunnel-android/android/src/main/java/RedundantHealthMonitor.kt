@@ -15,6 +15,8 @@ internal data class SlotObservation(
     val hardFailure: Boolean = false,
     val probeFailed: Boolean = false,
     val independentFailureSignal: Boolean = false,
+    val softFailureStartedAtMs: Long? = null,
+    val corroboratedProbeFailures: Int = 0,
     val handshakeFresh: Boolean = false,
     val consecutiveProbeSuccesses: Int = 0,
     val stableSinceMs: Long? = null,
@@ -27,14 +29,14 @@ internal data class FailoverDecision(
 
 /**
  * Deterministic, session-scoped health state machine. Inputs are bounded native observations;
- * wall-clock time and networking side effects stay outside this class so failover is testable.
+ * Clock sources and networking side effects stay outside this class so failover is testable;
+ * every time value consumed here belongs to one monotonic elapsed-time domain.
  */
 internal class RedundantHealthMonitor(
     private val softFailureConfirmationMs: Long = DEFAULT_SOFT_FAILURE_CONFIRMATION_MS,
     private val rebindStabilizationMs: Long = DEFAULT_REBIND_STABILIZATION_MS,
     initialNetworkValidated: Boolean = true,
 ) {
-    private val softFailureSinceMs = mutableMapOf<Int, Long>()
     private var networkValidated = initialNetworkValidated
     private var suppressFailoverUntilMs = Long.MIN_VALUE
     private var sessionStalledEmitted = false
@@ -46,7 +48,6 @@ internal class RedundantHealthMonitor(
 
     fun onUnderlyingNetworkChanged(nowMs: Long, validated: Boolean) {
         networkValidated = validated
-        softFailureSinceMs.clear()
         suppressFailoverUntilMs = if (validated) {
             saturatingAdd(nowMs, rebindStabilizationMs)
         } else {
@@ -78,7 +79,6 @@ internal class RedundantHealthMonitor(
                 .thenBy(SlotObservation::index))
             .firstOrNull()
         if (candidate != null) {
-            softFailureSinceMs.remove(active.index)
             return FailoverDecision(switchTo = candidate.index, sessionStalled = false)
         }
         sessionStalledEmitted = true
@@ -93,11 +93,11 @@ internal class RedundantHealthMonitor(
             classify(nowMs, observation) == BackendHealth.READY
 
     private fun softFailureConfirmed(nowMs: Long, active: SlotObservation): Boolean {
-        if (!active.probeFailed || !active.independentFailureSignal) {
-            softFailureSinceMs.remove(active.index)
-            return false
-        }
-        val startedAt = softFailureSinceMs.getOrPut(active.index) { nowMs }
+        val startedAt = active.softFailureStartedAtMs
+        if (!active.probeFailed || !active.independentFailureSignal ||
+            active.corroboratedProbeFailures < REQUIRED_CORROBORATED_PROBE_FAILURES ||
+            startedAt == null
+        ) return false
         return nowMs >= startedAt && nowMs - startedAt >= softFailureConfirmationMs
     }
 
@@ -132,6 +132,7 @@ internal class RedundantHealthMonitor(
         const val DEFAULT_REBIND_STABILIZATION_MS = 4_000L
         const val READY_STABILITY_MS = 15_000L
         const val READY_PROBE_SUCCESSES = 3
+        const val REQUIRED_CORROBORATED_PROBE_FAILURES = 2
         val NONE = FailoverDecision(switchTo = null, sessionStalled = false)
     }
 }

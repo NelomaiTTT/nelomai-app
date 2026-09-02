@@ -10,6 +10,122 @@ import org.junit.Test
 
 class RedundantProductionAdaptersTest {
     @Test
+    fun urgentSequenceUsesElapsedTimeAndDoesNotWaitForReadyCadence() {
+        val clock = TestDualClock(
+            epochMs = 1_800_000_000_000L,
+            elapsedMs = 10_000L,
+        )
+        val backend = RecordingSessionBackend { clock.epochMs }
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+            epochNowMs = { clock.epochMs },
+            elapsedNowMs = { clock.elapsedMs },
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        assertTrue(native.activate("lease-a"))
+
+        native.healthObservations()
+        repeat(3) {
+            backend.probeStatuses[requireNotNull(backend.latestProbeToken)] =
+                NativeProbeStatus.SUCCEEDED
+            clock.elapsedMs += 1L
+            native.healthObservations()
+            if (it < 2) {
+                clock.elapsedMs += 5_000L
+                native.healthObservations()
+            }
+        }
+        clock.elapsedMs = 25_000L
+        assertEquals(BackendHealth.READY, native.healthObservations().single().health)
+
+        clock.elapsedMs = 35_003L
+        native.healthObservations()
+        val ordinaryToken = requireNotNull(backend.latestProbeToken)
+        backend.probeStatuses[ordinaryToken] = NativeProbeStatus.FAILED
+        clock.elapsedMs += 1L
+        val suspected = native.healthObservations().single()
+        val urgentOne = requireNotNull(backend.latestProbeToken)
+
+        assertTrue(suspected.independentFailureSignal)
+        assertEquals(clock.elapsedMs, suspected.softFailureStartedAtMs)
+        assertEquals(0, suspected.corroboratedProbeFailures)
+        assertTrue(urgentOne != ordinaryToken)
+
+        clock.elapsedMs += 2_000L
+        native.healthObservations()
+        val urgentTwo = requireNotNull(backend.latestProbeToken)
+        assertTrue(urgentTwo != urgentOne)
+        clock.elapsedMs += 2_000L
+        val corroborated = native.healthObservations().single()
+
+        assertEquals(2, corroborated.corroboratedProbeFailures)
+        assertEquals(35_004L, corroborated.softFailureStartedAtMs)
+        assertTrue(corroborated.independentFailureSignal)
+    }
+
+    @Test
+    fun successfulUrgentProbeClearsRetainedFailureEvidence() {
+        val clock = TestDualClock(epochMs = 1_800_000_000_000L, elapsedMs = 10_000L)
+        val backend = RecordingSessionBackend { clock.epochMs }
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+            epochNowMs = { clock.epochMs },
+            elapsedNowMs = { clock.elapsedMs },
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        assertTrue(native.activate("lease-a"))
+
+        native.healthObservations()
+        val ordinaryToken = requireNotNull(backend.latestProbeToken)
+        backend.probeStatuses[ordinaryToken] = NativeProbeStatus.FAILED
+        clock.elapsedMs += 1L
+        assertTrue(native.healthObservations().single().independentFailureSignal)
+        backend.probeStatuses[requireNotNull(backend.latestProbeToken)] =
+            NativeProbeStatus.SUCCEEDED
+        clock.elapsedMs += 1L
+
+        val recovered = native.healthObservations().single()
+
+        assertFalse(recovered.independentFailureSignal)
+        assertEquals(null, recovered.softFailureStartedAtMs)
+        assertEquals(0, recovered.corroboratedProbeFailures)
+    }
+
+    @Test
+    fun receiveProgressClearsRetainedFailureEvidence() {
+        val fixture = suspectedFixture()
+        fixture.backend.setUdpPackets(sent = 10, received = 1)
+
+        val recovered = fixture.native.healthObservations().single()
+
+        assertFalse(recovered.probeFailed)
+        assertFalse(recovered.independentFailureSignal)
+        assertEquals(null, recovered.softFailureStartedAtMs)
+    }
+
+    @Test
+    fun rebindAndNetworkInvalidationClearRetainedFailureEvidence() {
+        val rebound = suspectedFixture()
+        assertTrue(rebound.native.rebind("lease-a"))
+        val reboundObservation = rebound.native.healthObservations().single()
+        assertFalse(reboundObservation.independentFailureSignal)
+        assertEquals(null, reboundObservation.softFailureStartedAtMs)
+
+        val invalidated = suspectedFixture()
+        invalidated.native.setNetworkValidated(false)
+        val invalidatedObservation = invalidated.native.healthObservations().single()
+        assertFalse(invalidatedObservation.probeFailed)
+        assertFalse(invalidatedObservation.independentFailureSignal)
+        assertEquals(null, invalidatedObservation.softFailureStartedAtMs)
+    }
+
+    @Test
     fun productionPanelRecoveryUsesTheServiceActiveDeviceCredential() {
         val transaction = AndroidRedundantTransaction(
             desiredActive = true,
@@ -107,7 +223,8 @@ class RedundantProductionAdaptersTest {
             establishTun = { 41 },
             prepare = ::prepared,
             probeSourceIpv4 = "10.200.0.2/32",
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
+            elapsedNowMs = { nowMs },
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
         assertTrue(native.activate("lease-a"))
@@ -158,7 +275,8 @@ class RedundantProductionAdaptersTest {
             establishTun = { 41 },
             prepare = ::prepared,
             probeSourceIpv4 = "10.200.0.2/32",
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
+            elapsedNowMs = { nowMs },
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
         assertTrue(native.activate("lease-a"))
@@ -184,7 +302,8 @@ class RedundantProductionAdaptersTest {
             establishTun = { 41 },
             prepare = ::prepared,
             probeSourceIpv4 = "10.200.0.2/32",
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
+            elapsedNowMs = { nowMs },
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
         assertTrue(native.activate("lease-a"))
@@ -248,6 +367,26 @@ class RedundantProductionAdaptersTest {
         timeoutMs = 4_000,
     )
 
+    private fun suspectedFixture(): SuspectedFixture {
+        val clock = TestDualClock(epochMs = 1_800_000_000_000L, elapsedMs = 10_000L)
+        val backend = RecordingSessionBackend { clock.epochMs }
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+            epochNowMs = { clock.epochMs },
+            elapsedNowMs = { clock.elapsedMs },
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        assertTrue(native.activate("lease-a"))
+        native.healthObservations()
+        backend.probeStatuses[requireNotNull(backend.latestProbeToken)] = NativeProbeStatus.FAILED
+        clock.elapsedMs += 1L
+        assertTrue(native.healthObservations().single().independentFailureSignal)
+        return SuspectedFixture(native, backend)
+    }
+
     private fun prepared(@Suppress("UNUSED_PARAMETER") configuration: ByteArray): PreparedRedundantConfiguration =
         PreparedRedundantConfiguration(
             config = Config.parse(ByteArrayInputStream(TEST_CONFIG.toByteArray())),
@@ -267,6 +406,16 @@ class RedundantProductionAdaptersTest {
         """.trimIndent()
     }
 }
+
+private data class SuspectedFixture(
+    val native: ServiceRedundantConnectionNative,
+    val backend: RecordingSessionBackend,
+)
+
+private data class TestDualClock(
+    var epochMs: Long,
+    var elapsedMs: Long,
+)
 
 private class RecordingSessionBackend(
     private val nowMs: () -> Long = { 1_000_000L },

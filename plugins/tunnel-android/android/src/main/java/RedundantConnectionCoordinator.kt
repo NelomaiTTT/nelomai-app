@@ -207,7 +207,7 @@ internal class RedundantConnectionCoordinator(
     private val panel: RedundantConnectionPanel,
     private val native: RedundantConnectionNative,
     private val operationId: () -> String = { UUID.randomUUID().toString() },
-    private val nowMs: () -> Long = System::currentTimeMillis,
+    private val epochNowMs: () -> Long = System::currentTimeMillis,
     private val monotonicMs: () -> Long = {
         TimeUnit.NANOSECONDS.toMillis(System.nanoTime())
     },
@@ -451,7 +451,7 @@ internal class RedundantConnectionCoordinator(
         ) {
             return failPrimaryReadinessLocked(pending)
         }
-        if (observation != null && healthMonitor.ready(nowMs(), observation)) {
+        if (observation != null && healthMonitor.ready(elapsedNow(), observation)) {
             pendingPrimaryReadiness = null
             return completePrimaryReadinessLocked(
                 transaction,
@@ -536,7 +536,7 @@ internal class RedundantConnectionCoordinator(
         val replacingIndex = transaction.slotIndex(transaction.retry.acquireReplaceLeaseId)
         if (transaction.retry.acquirePending && transaction.candidateLeaseId == null &&
             replacingIndex != null && bounded.firstOrNull { it.index == replacingIndex }?.let {
-                healthMonitor.ready(nowMs(), it)
+                healthMonitor.ready(elapsedNow(), it)
             } == true
         ) {
             val recovered = transaction.copy(retry = transaction.retry.cancelAcquire())
@@ -548,7 +548,7 @@ internal class RedundantConnectionCoordinator(
             }
             return@synchronized persisted
         }
-        val decision = healthMonitor.evaluateHealth(nowMs(), bounded)
+        val decision = healthMonitor.evaluateHealth(elapsedNow(), bounded)
         val switchIndex = decision.switchTo
         if (switchIndex != null) {
             val target = transaction.leaseIdAt(switchIndex) ?: return@synchronized false
@@ -606,7 +606,7 @@ internal class RedundantConnectionCoordinator(
             return@synchronized false
         }
         if (!mutateNative(transaction) {
-                healthMonitor.onUnderlyingNetworkChanged(nowMs(), validated)
+                healthMonitor.onUnderlyingNetworkChanged(elapsedNow(), validated)
                 native.setNetworkValidated(validated)
                 true
             }
@@ -894,7 +894,7 @@ internal class RedundantConnectionCoordinator(
         }
         val snapshot = observations ?: runCatching { native.healthObservations() }.getOrNull()
         val observation = snapshot?.singleOrNull { it.index == candidateIndex } ?: return true
-        if (!healthMonitor.ready(nowMs(), observation)) return true
+        if (!healthMonitor.ready(elapsedNow(), observation)) return true
         val session = try {
             panel.commitCandidate(transaction, candidateLeaseId)
         } catch (_: Throwable) {
@@ -1046,10 +1046,10 @@ internal class RedundantConnectionCoordinator(
         ))
     }
 
-    private fun currentUnixSeconds(): Long = nowMs().coerceAtLeast(0L) / 1_000L
+    private fun currentUnixSeconds(): Long = epochNowMs().coerceAtLeast(0L) / 1_000L
 
     private fun replacementDeadlineUnix(): Long {
-        val currentMs = nowMs().coerceAtLeast(0L)
+        val currentMs = epochNowMs().coerceAtLeast(0L)
         val current = currentMs / 1_000L + if (currentMs % 1_000L == 0L) 0L else 1L
         return if (current > Long.MAX_VALUE - REPLACEMENT_DELAY_SECONDS) Long.MAX_VALUE
         else current + REPLACEMENT_DELAY_SECONDS
@@ -1082,7 +1082,7 @@ internal class RedundantConnectionCoordinator(
                 RedundantReserveState.UNAVAILABLE
             observations.isEmpty() -> RedundantReserveState.WARMING
             observations.filterNot(SlotObservation::active).any {
-                healthMonitor.ready(nowMs(), it)
+                healthMonitor.ready(elapsedNow(), it)
             } -> RedundantReserveState.READY
             observations.filterNot(SlotObservation::active).any {
                 it.health == BackendHealth.UNHEALTHY || it.hardFailure
@@ -1093,6 +1093,8 @@ internal class RedundantConnectionCoordinator(
         publishedReserveState = next
         onReserveStateChanged(next)
     }
+
+    private fun elapsedNow(): Long = monotonicMs().coerceAtLeast(0L)
 }
 
 private fun AndroidRedundantRetryState.cancelAcquire(): AndroidRedundantRetryState = copy(

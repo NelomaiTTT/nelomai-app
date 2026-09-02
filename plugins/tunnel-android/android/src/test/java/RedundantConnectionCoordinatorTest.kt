@@ -98,7 +98,7 @@ class RedundantConnectionCoordinatorTest {
             emptyStore(),
             FakePanel(),
             native,
-            nowMs = { 20_000L },
+            epochNowMs = { 20_000L },
             monotonicMs = { 1_000L },
             healthMonitor = RedundantHealthMonitor(
                 rebindStabilizationMs = 0,
@@ -156,7 +156,7 @@ class RedundantConnectionCoordinatorTest {
                 emptyStore(),
                 FakePanel(),
                 FakeNative(),
-                nowMs = { 20_000L },
+                epochNowMs = { 20_000L },
             )
             assertTrue(coordinator.start(
                 transaction(),
@@ -286,7 +286,7 @@ class RedundantConnectionCoordinatorTest {
             AndroidRecoveryStore(backend, CoordinatorBootIdentity()),
             panel,
             native,
-            nowMs = { 20_000L },
+            epochNowMs = { 20_000L },
         )
         assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
         assertTrue(coordinator.start(
@@ -340,7 +340,7 @@ class RedundantConnectionCoordinatorTest {
             emptyStore(),
             FakePanel(),
             FakeNative(),
-            nowMs = { wallMs },
+            epochNowMs = { wallMs },
             monotonicMs = { elapsedMs },
         )
 
@@ -355,6 +355,45 @@ class RedundantConnectionCoordinatorTest {
 
         elapsedMs = 35_000L
         assertFalse(coordinator.tick())
+    }
+
+    @Test
+    fun wallClockJumpsCannotConfirmSoftFailureBeforeElapsedDeadline() {
+        var epochMs = 1_800_000_000_000L
+        var elapsedMs = 10_000L
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            FakePanel(),
+            native,
+            epochNowMs = { epochMs },
+            monotonicMs = { elapsedMs },
+            healthMonitor = RedundantHealthMonitor(rebindStabilizationMs = 0),
+        )
+        val failedAt = elapsedMs
+        fun observations() = listOf(
+            healthSlot(
+                index = 0,
+                active = true,
+                probeFailed = true,
+                independentFailureSignal = true,
+                softFailureStartedAtMs = failedAt,
+                corroboratedProbeFailures = 2,
+            ),
+            healthSlot(index = 1, health = BackendHealth.READY),
+        )
+
+        assertTrue(coordinator.onHealthObservations(observations()))
+        assertTrue(native.activated.isEmpty())
+        epochMs = 1L
+        elapsedMs += 4_999L
+        assertTrue(coordinator.onHealthObservations(observations()))
+        assertTrue(native.activated.isEmpty())
+
+        epochMs = Long.MAX_VALUE
+        elapsedMs += 1L
+        assertTrue(coordinator.onHealthObservations(observations()))
+        assertEquals(listOf("lease-b"), native.activated)
     }
 
     @Test
@@ -468,7 +507,7 @@ class RedundantConnectionCoordinatorTest {
             store(transaction()),
             FakePanel(),
             FakeNative(),
-            nowMs = { 20_000L },
+            epochNowMs = { 20_000L },
             onReserveStateChanged = states::add,
         )
 
@@ -547,7 +586,7 @@ class RedundantConnectionCoordinatorTest {
             store(transaction()),
             panel,
             native,
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
         )
 
         assertTrue(coordinator.slotFailed("lease-b", "standby_unhealthy"))
@@ -788,7 +827,7 @@ class RedundantConnectionCoordinatorTest {
             store(transaction()),
             panel,
             native,
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
         )
 
         assertTrue(coordinator.onHealthObservations(listOf(
@@ -858,7 +897,12 @@ class RedundantConnectionCoordinatorTest {
         var nowMs = 2_000_000L
         val store = store(transaction())
         val panel = FakePanel()
-        val first = RedundantConnectionCoordinator(store, panel, FakeNative(), nowMs = { nowMs })
+        val first = RedundantConnectionCoordinator(
+            store,
+            panel,
+            FakeNative(),
+            epochNowMs = { nowMs },
+        )
 
         assertTrue(first.onHealthObservations(listOf(
             healthSlot(index = 0, active = true, hardFailure = true),
@@ -873,7 +917,7 @@ class RedundantConnectionCoordinatorTest {
             store,
             panel,
             FakeNative(),
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
         ).tick())
         assertTrue(panel.acquireOperationIds.isEmpty())
 
@@ -882,7 +926,7 @@ class RedundantConnectionCoordinatorTest {
             store,
             panel,
             FakeNative(),
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
         ).tick())
         assertEquals(listOf("lease-a"), panel.acquireReplaceLeaseIds)
     }
@@ -896,7 +940,8 @@ class RedundantConnectionCoordinatorTest {
             store(transaction()),
             panel,
             native,
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
         )
 
         assertTrue(coordinator.onHealthObservations(listOf(
@@ -935,7 +980,7 @@ class RedundantConnectionCoordinatorTest {
             store(transaction()),
             panel,
             FakeNative(),
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
         )
 
         assertTrue(coordinator.onHealthObservations(listOf(
@@ -1142,7 +1187,8 @@ class RedundantConnectionCoordinatorTest {
             store(transaction(localActiveLeaseId = "lease-b")),
             panel,
             native,
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
         )
 
         assertTrue(coordinator.acquireAndCommitStandby("replace-a", replaceLeaseId = "lease-a"))
@@ -1174,7 +1220,8 @@ class RedundantConnectionCoordinatorTest {
             store(transaction(localActiveLeaseId = "lease-a").copy(slotBLeaseId = null)),
             panel,
             native,
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
         )
         assertTrue(coordinator.acquireAndCommitStandby("acquire-1"))
         assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
@@ -1217,7 +1264,8 @@ class RedundantConnectionCoordinatorTest {
             store,
             panel,
             native,
-            nowMs = { nowMs },
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
         )
 
         assertTrue(coordinator.recover())
@@ -1398,6 +1446,10 @@ class RedundantConnectionCoordinatorTest {
         active: Boolean = false,
         health: BackendHealth = BackendHealth.WARMING,
         hardFailure: Boolean = false,
+        probeFailed: Boolean = false,
+        independentFailureSignal: Boolean = false,
+        softFailureStartedAtMs: Long? = null,
+        corroboratedProbeFailures: Int = 0,
         handshakeFresh: Boolean = false,
         consecutiveProbeSuccesses: Int = 0,
         stableSinceMs: Long? = null,
@@ -1406,6 +1458,10 @@ class RedundantConnectionCoordinatorTest {
         active = active,
         health = health,
         hardFailure = hardFailure,
+        probeFailed = probeFailed,
+        independentFailureSignal = independentFailureSignal,
+        softFailureStartedAtMs = softFailureStartedAtMs,
+        corroboratedProbeFailures = corroboratedProbeFailures,
         handshakeFresh = handshakeFresh,
         consecutiveProbeSuccesses = consecutiveProbeSuccesses,
         stableSinceMs = stableSinceMs,
