@@ -324,12 +324,21 @@ internal fun redundantTombstoneClearDisposition(
 
 internal fun handleRedundantTombstoneRead(
     restored: RecoveryStoreResult<RedundantCancelTombstone?>,
+    ownerServiceGeneration: Long,
+    currentServiceGeneration: Long,
+    serviceDestroyed: Boolean,
     install: (RedundantCancelTombstone) -> Unit,
     retry: () -> Unit,
     resumeDurableWork: () -> Unit,
+    completeAfterDestroy: () -> Unit,
 ) {
+    if (ownerServiceGeneration != currentServiceGeneration) return
     when (restored) {
         is RecoveryStoreResult.Failure -> retry()
-        is RecoveryStoreResult.Success -> restored.value?.let(install) ?: resumeDurableWork()
+        is RecoveryStoreResult.Success -> restored.value?.let(install) ?: if (serviceDestroyed) {
+            completeAfterDestroy()
+        } else {
+            resumeDurableWork()
+        }
     }
 }

@@ -106,6 +106,24 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun backgroundLogoutWinsOverLateRedundantStartFailure() {
+        val outcomes = mutableListOf<String>()
+        val gate = RedundantStartOperationGate()
+
+        assertTrue(gate.begin("operation-a") { outcomes += "stopped" })
+
+        assertEquals(
+            "operation-a",
+            cancelPendingRedundantStartForBackgroundLogout(gate),
+        )
+        assertFalse(gate.complete("operation-a") { outcomes += "failed" })
+        gate.finish("operation-a")
+
+        assertEquals(listOf("stopped"), outcomes)
+        assertFalse(gate.hasPending())
+    }
+
+    @Test
     fun redundantStartReadyAndStopRacePublishesExactlyOneTerminalOutcome() {
         repeat(100) { index ->
             val outcomes = CopyOnWriteArrayList<String>()
@@ -1012,12 +1030,52 @@ class NelomaiVpnServiceTest {
 
         handleRedundantTombstoneRead(
             restored = RecoveryStoreResult.Success(null),
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 7,
+            serviceDestroyed = false,
             install = { events += "install" },
             retry = { events += "retry" },
             resumeDurableWork = { events += "resume" },
+            completeAfterDestroy = { events += "destroyed" },
         )
 
         assertEquals(listOf("resume"), events)
+    }
+
+    @Test
+    fun staleTombstoneReadDoesNotResumeDurableWork() {
+        val events = mutableListOf<String>()
+
+        handleRedundantTombstoneRead(
+            restored = RecoveryStoreResult.Success(null),
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 8,
+            serviceDestroyed = false,
+            install = { events += "install" },
+            retry = { events += "retry" },
+            resumeDurableWork = { events += "resume" },
+            completeAfterDestroy = { events += "destroyed" },
+        )
+
+        assertTrue(events.isEmpty())
+    }
+
+    @Test
+    fun destroyedServiceCompletesEmptyTombstoneReadWithoutResumingWork() {
+        val events = mutableListOf<String>()
+
+        handleRedundantTombstoneRead(
+            restored = RecoveryStoreResult.Success(null),
+            ownerServiceGeneration = 7,
+            currentServiceGeneration = 7,
+            serviceDestroyed = true,
+            install = { events += "install" },
+            retry = { events += "retry" },
+            resumeDurableWork = { events += "resume" },
+            completeAfterDestroy = { events += "destroyed" },
+        )
+
+        assertEquals(listOf("destroyed"), events)
     }
 
     @Test
@@ -3141,7 +3199,7 @@ class NelomaiVpnServiceTest {
         val events = mutableListOf<String>()
         val lifecycle = BackgroundLogoutServiceLifecycle(
             logoutState = { BackgroundLogoutReadState.PENDING },
-            hasPendingRedundantStart = { pendingStart },
+            hasPendingRedundantBarrier = { pendingStart },
             recovery = { recovery },
             beginRedundantStop = { events += "stop" },
             runLogout = { events += "logout" },
@@ -3160,6 +3218,35 @@ class NelomaiVpnServiceTest {
         assertTrue(lifecycle.resume())
 
         assertEquals(listOf("retry", "stop"), events)
+    }
+
+    @Test
+    fun logoutLifecycleWaitsForDurableRedundantBarrierAfterRestart() {
+        var cleanupPending = true
+        val events = mutableListOf<String>()
+        val lifecycle = BackgroundLogoutServiceLifecycle(
+            logoutState = { BackgroundLogoutReadState.PENDING },
+            hasPendingRedundantBarrier = {
+                backgroundLogoutRedundantBarrierPending(
+                    startPending = false,
+                    cleanupPending = cleanupPending,
+                )
+            },
+            recovery = {
+                RecoveryStoreResult.Success(AndroidRecoveryEnvelope.empty(1))
+            },
+            beginRedundantStop = { events += "stop" },
+            runLogout = { events += "logout" },
+            scheduleRetry = { events += "retry" },
+            stopIfIdle = { events += "idle" },
+        )
+
+        assertTrue(lifecycle.resume())
+        assertEquals(listOf("retry"), events)
+
+        cleanupPending = false
+        assertTrue(lifecycle.resume())
+        assertEquals(listOf("retry", "logout"), events)
     }
 
     @Test
@@ -5205,6 +5292,47 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun logoutRunOnceRechecksRedundantRecoveryBeforeFinalize() {
+        val backend = ServiceRecoveryBackend()
+        val recovery = recoveryStore(backend)
+        val replacementBackend = ServiceRecoveryBackend()
+        val replacementRecovery = recoveryStore(replacementBackend)
+        replacementRecovery.beginRedundant(
+            requireNotNull(serviceV2Envelope().redundantTransaction),
+        ).successEnvelope()
+        val credentials = configuredCredentialStore()
+        val logout = AndroidLogoutCoordinator(
+            credentials,
+            coordinator(recovery),
+            operationId = { "11111111-1111-4111-8111-111111111196" },
+        )
+        assertTrue(logout.begin() is AndroidLogoutResult.Accepted)
+        backend.replaceRecordAfterReads(
+            additionalReads = 2,
+            replacement = replacementBackend.snapshotRecord(),
+        )
+        var finalizeCalls = 0
+
+        val step = logout.runOnce(
+            ServicePanelFake(),
+            ServiceRuntimeFake(),
+            activate = { _, _, _ -> error("logout has no pending activation") },
+            finalize = { _, _, _, _, _ ->
+                finalizeCalls += 1
+                BackgroundLogoutFinalizeResult("device_revoked_cleanup_accepted", 1)
+            },
+        )
+
+        assertEquals(AndroidLogoutStep.RETRY, step)
+        assertEquals(0, finalizeCalls)
+        assertTrue(recovery.load().redundantTransaction != null)
+        assertEquals(
+            BackgroundLogoutPhase.PENDING,
+            credentials.read().credentialSuccess().logoutState?.phase,
+        )
+    }
+
+    @Test
     fun durableLogoutTombstoneIsAcceptedForRetryWhenConnectionRecoveryReadFails() {
         val credentials = configuredCredentialStore()
         val unreadableConnection = AndroidConnectionIntentCoordinator(
@@ -6093,18 +6221,34 @@ private fun CredentialStoreResult<BackgroundCredentialEnvelope>.credentialSucces
 
 private class ServiceRecoveryBackend : EncryptedRecordBackend {
     private var record: ByteArray? = null
+    private var replaceAfterReadCount: Int? = null
+    private var replacementRecord: ByteArray? = null
     var readCount: Int = 0
     var writeSucceeds: Boolean = true
 
     override fun read(): ByteArray? {
         readCount += 1
-        return record?.copyOf()
+        val current = record?.copyOf()
+        if (readCount == replaceAfterReadCount) {
+            record = replacementRecord?.copyOf()
+            replaceAfterReadCount = null
+            replacementRecord = null
+        }
+        return current
     }
 
     override fun write(plaintext: ByteArray): Boolean {
         if (!writeSucceeds) return false
         record = plaintext.copyOf()
         return true
+    }
+
+    fun snapshotRecord(): ByteArray = requireNotNull(record).copyOf()
+
+    fun replaceRecordAfterReads(additionalReads: Int, replacement: ByteArray) {
+        require(additionalReads > 0)
+        replaceAfterReadCount = readCount + additionalReads
+        replacementRecord = replacement.copyOf()
     }
 }
 

@@ -171,6 +171,15 @@ internal class RedundantStartOperationGate {
     }
 }
 
+internal fun cancelPendingRedundantStartForBackgroundLogout(
+    gate: RedundantStartOperationGate,
+): String? = gate.cancelPendingAndComplete()
+
+internal fun backgroundLogoutRedundantBarrierPending(
+    startPending: Boolean,
+    cleanupPending: Boolean,
+): Boolean = startPending || cleanupPending
+
 /** Keeps asynchronous VPN revoke cleanup alive while finalizing the framework callback once. */
 internal class RedundantRevokeLifecycleGate {
     private val gate = Any()
@@ -830,7 +839,12 @@ class NelomaiVpnService : GoBackend.VpnService() {
         )
         backgroundLogoutLifecycle = BackgroundLogoutServiceLifecycle(
             logoutState = ::backgroundLogoutState,
-            hasPendingRedundantStart = redundantStartOperation::hasPending,
+            hasPendingRedundantBarrier = {
+                backgroundLogoutRedundantBarrierPending(
+                    startPending = redundantStartOperation.hasPending(),
+                    cleanupPending = redundantStartBlocked(),
+                )
+            },
             recovery = recoveryStore::read,
             beginRedundantStop = ::beginBackgroundLogoutRedundantStop,
             runLogout = ::runBackgroundLogoutAttempt,
@@ -1519,11 +1533,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun retryPendingRedundantStop() {
         val pending = pendingRedundantStop
         if (pending == null) {
+            val lookupServiceGeneration = serviceGeneration
             executeRedundantCleanup {
                 val restored = redundantCancelTombstones.read()
                 restoreHandler.post {
                     handleRedundantTombstoneRead(
                         restored = restored,
+                        ownerServiceGeneration = lookupServiceGeneration,
+                        currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+                        serviceDestroyed = serviceDestroyed,
                         install = { tombstone ->
                             redundantCancelTombstoneUnreadable = false
                             pendingRedundantStop = PendingRedundantStop(
@@ -1539,6 +1557,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         resumeDurableWork = {
                             redundantCancelTombstoneUnreadable = false
                             resumeDurableWorkAfterRedundantBarrier()
+                        },
+                        completeAfterDestroy = {
+                            redundantCancelTombstoneUnreadable = false
+                            scheduleIdleProcessRecycle(null)
                         },
                     )
                 }
@@ -2438,7 +2460,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             logoutCoordinator.begin()
         }) {
             is AndroidLogoutResult.Accepted -> {
-                redundantStartOperation.cancelPending()
+                cancelPendingRedundantStartForBackgroundLogout(redundantStartOperation)
                 connectionIntentRuntimeFence.cancelActive()
                 intent.resultReceiver()?.send(
                     SERVICE_RESULT_OK,
@@ -4830,7 +4852,7 @@ internal fun backgroundLogoutClientStartFailure(state: BackgroundLogoutReadState
 
 internal class BackgroundLogoutServiceLifecycle(
     private val logoutState: () -> BackgroundLogoutReadState,
-    private val hasPendingRedundantStart: () -> Boolean = { false },
+    private val hasPendingRedundantBarrier: () -> Boolean = { false },
     private val recovery: () -> RecoveryStoreResult<AndroidRecoveryEnvelope>,
     private val beginRedundantStop: (AndroidRedundantTransaction) -> Unit,
     private val runLogout: () -> Unit,
@@ -4846,7 +4868,7 @@ internal class BackgroundLogoutServiceLifecycle(
             }
             BackgroundLogoutReadState.PENDING -> Unit
         }
-        if (hasPendingRedundantStart()) {
+        if (hasPendingRedundantBarrier()) {
             scheduleRetry()
             return true
         }
