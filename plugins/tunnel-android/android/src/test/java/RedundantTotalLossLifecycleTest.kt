@@ -16,6 +16,7 @@ class RedundantTotalLossLifecycleTest {
             ownerMatches: Boolean = true,
             stopPending: Boolean = false,
             tombstoneUnreadable: Boolean = false,
+            stopLookupPending: Boolean = false,
             logout: BackgroundLogoutReadState = BackgroundLogoutReadState.NONE,
         ) = redundantTotalLossCommandDisposition(
             ownerServiceGeneration = 7,
@@ -26,7 +27,7 @@ class RedundantTotalLossLifecycleTest {
             installedOwnerMatches = ownerMatches,
             stopPending = stopPending,
             tombstoneUnreadable = tombstoneUnreadable,
-            stopLookupPending = false,
+            stopLookupPending = stopLookupPending,
             logoutState = logout,
             recovery = recovery,
         )
@@ -37,7 +38,14 @@ class RedundantTotalLossLifecycleTest {
         assertEquals(RedundantTotalLossCommandDisposition.IGNORE, disposition(installed = "new-owner"))
         assertEquals(RedundantTotalLossCommandDisposition.IGNORE, disposition(ownerMatches = false))
         assertEquals(RedundantTotalLossCommandDisposition.IGNORE, disposition(stopPending = true))
-        assertEquals(RedundantTotalLossCommandDisposition.IGNORE, disposition(tombstoneUnreadable = true))
+        assertEquals(
+            RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
+            disposition(tombstoneUnreadable = true),
+        )
+        assertEquals(
+            RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
+            disposition(stopLookupPending = true),
+        )
         assertEquals(
             RedundantTotalLossCommandDisposition.IGNORE,
             disposition(logout = BackgroundLogoutReadState.PENDING),
@@ -62,6 +70,186 @@ class RedundantTotalLossLifecycleTest {
                 recovery = RecoveryStoreResult.Failure("recovery_record_read_failed"),
             ),
         )
+    }
+
+    @Test
+    fun deferredCommandKeepsLatestIdentityAndReplaysOnlyOnce() {
+        val lifecycle = RedundantTotalLossCommandLifecycle<String>()
+        val replayed = mutableListOf<String>()
+
+        listOf("old-owner", "current-owner").forEach { command ->
+            lifecycle.handle(
+                command = command,
+                disposition = RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
+                barrierPendingAfterDefer = { true },
+                replayDeferred = { error("barrier is still pending") },
+                prepareRestartAndStop = { error("deferred command was prepared") },
+                failClosedStop = { error("deferred command failed closed") },
+            )
+        }
+
+        assertTrue(lifecycle.replay { replayed += it })
+        assertFalse(lifecycle.replay { replayed += it })
+        assertEquals(listOf("current-owner"), replayed)
+    }
+
+    @Test
+    fun terminalCommandDispositionsRouteOnlyTheirConsumer() {
+        val lifecycle = RedundantTotalLossCommandLifecycle<String>()
+        val prepared = mutableListOf<String>()
+        val failedClosed = mutableListOf<String>()
+
+        listOf(
+            "ignored" to RedundantTotalLossCommandDisposition.IGNORE,
+            "prepared" to RedundantTotalLossCommandDisposition.PREPARE_RESTART_AND_STOP,
+            "failed" to RedundantTotalLossCommandDisposition.FAIL_CLOSED_STOP,
+        ).forEach { (command, disposition) ->
+            lifecycle.handle(
+                command = command,
+                disposition = disposition,
+                barrierPendingAfterDefer = { error("terminal command checked a barrier") },
+                replayDeferred = { error("terminal command requested replay") },
+                prepareRestartAndStop = { prepared += it },
+                failClosedStop = { failedClosed += it },
+            )
+        }
+
+        assertEquals(listOf("prepared"), prepared)
+        assertEquals(listOf("failed"), failedClosed)
+        assertFalse(lifecycle.replay { error("terminal command was retained") })
+    }
+
+    @Test
+    fun deferredCommandReplaysWhenBarrierClearsDuringEnqueue() {
+        val lifecycle = RedundantTotalLossCommandLifecycle<String>()
+        val replayed = mutableListOf<String>()
+
+        lifecycle.handle(
+            command = "current-owner",
+            disposition = RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
+            barrierPendingAfterDefer = { false },
+            replayDeferred = {
+                assertTrue(lifecycle.replay { replayed += it })
+            },
+            prepareRestartAndStop = { error("deferred command was prepared") },
+            failClosedStop = { error("deferred command failed closed") },
+        )
+
+        assertEquals(listOf("current-owner"), replayed)
+        assertFalse(lifecycle.replay { replayed += it })
+    }
+
+    @Test
+    fun barrierResumeReplaysTotalLossBeforeDurableWork() {
+        val lifecycle = RedundantTotalLossCommandLifecycle<String>()
+        val events = mutableListOf<String>()
+        lifecycle.handle(
+            command = "current-owner",
+            disposition = RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE,
+            barrierPendingAfterDefer = { true },
+            replayDeferred = { error("barrier is still pending") },
+            prepareRestartAndStop = { error("deferred command was prepared") },
+            failClosedStop = { error("deferred command failed closed") },
+        )
+
+        resumeDeferredRedundantTotalLossAndDurableWork(
+            lifecycle = lifecycle,
+            reprocess = { events += "total-loss:$it" },
+            resumeDurableWork = { events += "durable-work" },
+        )
+
+        assertEquals(listOf("total-loss:current-owner", "durable-work"), events)
+    }
+
+    @Test
+    fun lookupReleaseRechecksCurrentCommandAndPreparesOnlyOnce() {
+        val fixture = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        fixture.lookupTokens = 1
+
+        fixture.handle()
+        assertEquals(0, fixture.prepares)
+
+        fixture.lookupTokens = 0
+        fixture.releaseBarrier()
+        fixture.releaseBarrier()
+
+        assertEquals(1, fixture.prepares)
+        assertEquals(0, fixture.failClosedStops)
+    }
+
+    @Test
+    fun actualStopOrLogoutWinsBeforeDeferredCommandReplay() {
+        val stopped = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        stopped.lookupTokens = 1
+        stopped.handle()
+        stopped.stopPending = true
+        stopped.lookupTokens = 0
+        stopped.releaseBarrier()
+
+        val loggedOut = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        loggedOut.lookupTokens = 1
+        loggedOut.handle()
+        loggedOut.logout = BackgroundLogoutReadState.PENDING
+        loggedOut.lookupTokens = 0
+        loggedOut.releaseBarrier()
+
+        assertEquals(0, stopped.prepares)
+        assertEquals(0, stopped.failClosedStops)
+        assertEquals(0, loggedOut.prepares)
+        assertEquals(0, loggedOut.failClosedStops)
+    }
+
+    @Test
+    fun unreadableRecoveryAfterBarrierReleaseFailsClosedWithoutRestart() {
+        val fixture = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        fixture.lookupTokens = 1
+        fixture.handle()
+        fixture.recovery = RecoveryStoreResult.Failure("recovery_record_read_failed")
+        fixture.lookupTokens = 0
+
+        fixture.releaseBarrier()
+
+        assertEquals(0, fixture.prepares)
+        assertEquals(1, fixture.failClosedStops)
+    }
+
+    @Test
+    fun overlappingLookupTokensKeepCommandDeferredUntilLastRelease() {
+        val fixture = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        fixture.lookupTokens = 2
+        fixture.handle()
+
+        fixture.lookupTokens = 1
+        fixture.releaseBarrier()
+        assertEquals(0, fixture.prepares)
+
+        fixture.lookupTokens = 0
+        fixture.releaseBarrier()
+        assertEquals(1, fixture.prepares)
+    }
+
+    @Test
+    fun changedGenerationOrOwnerMakesDeferredCommandInert() {
+        val staleGeneration = CommandFixture(
+            recovery = RecoveryStoreResult.Success(redundantEnvelope()),
+        )
+        staleGeneration.lookupTokens = 1
+        staleGeneration.handle()
+        staleGeneration.currentGeneration = 8
+        staleGeneration.lookupTokens = 0
+        staleGeneration.releaseBarrier()
+
+        val staleOwner = CommandFixture(recovery = RecoveryStoreResult.Success(redundantEnvelope()))
+        staleOwner.lookupTokens = 1
+        staleOwner.handle()
+        staleOwner.installedOwnerMatches = false
+        staleOwner.lookupTokens = 0
+        staleOwner.releaseBarrier()
+
+        assertEquals(0, staleGeneration.prepares)
+        assertEquals(0, staleGeneration.failClosedStops)
+        assertEquals(0, staleOwner.prepares)
+        assertEquals(0, staleOwner.failClosedStops)
     }
 
     @Test
@@ -266,6 +454,51 @@ class RedundantTotalLossLifecycleTest {
         )
 
         fun runPosted() = requireNotNull(posted).invoke()
+    }
+
+    private class CommandFixture(
+        var recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    ) {
+        private val lifecycle = RedundantTotalLossCommandLifecycle<String>()
+        var currentGeneration = 7L
+        var installedOwnerMatches = true
+        var stopPending = false
+        var lookupTokens = 0
+        var logout = BackgroundLogoutReadState.NONE
+        var prepares = 0
+        var failClosedStops = 0
+
+        fun handle() {
+            val disposition = redundantTotalLossCommandDisposition(
+                ownerServiceGeneration = 7,
+                currentServiceGeneration = currentGeneration,
+                serviceDestroyed = false,
+                startOperationId = "v2-start",
+                installedStartOperationId = "v2-start",
+                installedOwnerMatches = installedOwnerMatches,
+                stopPending = stopPending,
+                tombstoneUnreadable = false,
+                stopLookupPending = lookupTokens > 0,
+                logoutState = logout,
+                recovery = recovery,
+            )
+            lifecycle.handle(
+                command = "v2-start",
+                disposition = disposition,
+                barrierPendingAfterDefer = { lookupTokens > 0 },
+                replayDeferred = ::releaseBarrier,
+                prepareRestartAndStop = { prepares += 1 },
+                failClosedStop = { failClosedStops += 1 },
+            )
+        }
+
+        fun releaseBarrier() {
+            resumeDeferredRedundantTotalLossAndDurableWork(
+                lifecycle = lifecycle,
+                reprocess = { handle() },
+                resumeDurableWork = {},
+            )
+        }
     }
 
     companion object {

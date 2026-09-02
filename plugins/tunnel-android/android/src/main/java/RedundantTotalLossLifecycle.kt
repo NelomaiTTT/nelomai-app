@@ -2,6 +2,7 @@ package ru.nelomai.tunnel
 
 internal enum class RedundantTotalLossCommandDisposition {
     IGNORE,
+    DEFER_UNTIL_BARRIER_RELEASE,
     PREPARE_RESTART_AND_STOP,
     FAIL_CLOSED_STOP,
 }
@@ -21,10 +22,12 @@ internal fun redundantTotalLossCommandDisposition(
 ): RedundantTotalLossCommandDisposition {
     if (serviceDestroyed || ownerServiceGeneration != currentServiceGeneration ||
         installedStartOperationId != startOperationId || !installedOwnerMatches ||
-        stopPending || tombstoneUnreadable || stopLookupPending ||
-        logoutState != BackgroundLogoutReadState.NONE
+        stopPending || logoutState != BackgroundLogoutReadState.NONE
     ) {
         return RedundantTotalLossCommandDisposition.IGNORE
+    }
+    if (tombstoneUnreadable || stopLookupPending) {
+        return RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE
     }
     val envelope = when (recovery) {
         is RecoveryStoreResult.Failure -> {
@@ -40,6 +43,55 @@ internal fun redundantTotalLossCommandDisposition(
     } else {
         RedundantTotalLossCommandDisposition.IGNORE
     }
+}
+
+/**
+ * Retains a total-loss command that arrived behind a transient stop/tombstone barrier.
+ * Only the latest command is relevant; every replay removes it before invoking service code.
+ */
+internal class RedundantTotalLossCommandLifecycle<T : Any> {
+    private val gate = Any()
+    private var deferred: T? = null
+
+    fun handle(
+        command: T,
+        disposition: RedundantTotalLossCommandDisposition,
+        barrierPendingAfterDefer: () -> Boolean,
+        replayDeferred: () -> Unit,
+        prepareRestartAndStop: (T) -> Unit,
+        failClosedStop: (T) -> Unit,
+    ) {
+        when (disposition) {
+            RedundantTotalLossCommandDisposition.IGNORE -> Unit
+            RedundantTotalLossCommandDisposition.DEFER_UNTIL_BARRIER_RELEASE -> {
+                synchronized(gate) { deferred = command }
+                if (!barrierPendingAfterDefer()) replayDeferred()
+            }
+            RedundantTotalLossCommandDisposition.PREPARE_RESTART_AND_STOP -> {
+                prepareRestartAndStop(command)
+            }
+            RedundantTotalLossCommandDisposition.FAIL_CLOSED_STOP -> failClosedStop(command)
+        }
+    }
+
+    fun replay(reprocess: (T) -> Unit): Boolean {
+        val command = synchronized(gate) {
+            val current = deferred
+            deferred = null
+            current
+        } ?: return false
+        reprocess(command)
+        return true
+    }
+}
+
+internal fun <T : Any> resumeDeferredRedundantTotalLossAndDurableWork(
+    lifecycle: RedundantTotalLossCommandLifecycle<T>,
+    reprocess: (T) -> Unit,
+    resumeDurableWork: () -> Unit,
+) {
+    lifecycle.replay(reprocess)
+    resumeDurableWork()
 }
 
 internal fun isExactPromotedRedundantTotalLossRestart(

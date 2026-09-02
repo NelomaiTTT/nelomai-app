@@ -378,6 +378,12 @@ private data class PendingRedundantStopAttempt(
     val result: RedundantRevokeResult,
 )
 
+private data class DeferredRedundantTotalLoss(
+    val ownerServiceGeneration: Long,
+    val startOperationId: String,
+    val owner: RedundantConnectionCoordinator,
+)
+
 internal fun runRedundantStopCleanupAttempt(
     transaction: AndroidRedundantTransaction,
     owner: RedundantVpnProcessOwner?,
@@ -700,6 +706,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private val redundantVpnOwnerSlot = RedundantVpnOwnerSlot()
     private val retainedRedundantOwnerCleanup = RetainedRedundantOwnerCleanup()
     private val redundantStopLookupBarrier = RedundantStopLookupBarrier()
+    private val redundantTotalLossCommands =
+        RedundantTotalLossCommandLifecycle<DeferredRedundantTotalLoss>()
     private val redundantVpnOwner: RedundantVpnProcessOwner?
         get() = redundantVpnOwnerSlot.snapshot()?.owner
     @Volatile private var pendingRedundantStop: PendingRedundantStop? = null
@@ -1368,9 +1376,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
         startOperationId: String,
         owner: RedundantConnectionCoordinator,
     ) {
+        val command = DeferredRedundantTotalLoss(
+            ownerServiceGeneration = ownerServiceGeneration,
+            startOperationId = startOperationId,
+            owner = owner,
+        )
         val installed = redundantVpnOwnerSlot.snapshot()
         val recovery = recoveryStore.read()
-        when (redundantTotalLossCommandDisposition(
+        val disposition = redundantTotalLossCommandDisposition(
             ownerServiceGeneration = ownerServiceGeneration,
             currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
             serviceDestroyed = serviceDestroyed,
@@ -1382,43 +1395,47 @@ class NelomaiVpnService : GoBackend.VpnService() {
             stopLookupPending = redundantStopLookupBarrier.hasPending(),
             logoutState = backgroundLogoutState(),
             recovery = recovery,
-        )) {
-            RedundantTotalLossCommandDisposition.IGNORE -> return
-            RedundantTotalLossCommandDisposition.FAIL_CLOSED_STOP -> {
-                TunnelLog.warning("redundant.session_stalled", "recovery_unreadable")
-                beginFailClosedRedundantStop(startOperationId, owner)
-                return
-            }
-            RedundantTotalLossCommandDisposition.PREPARE_RESTART_AND_STOP -> Unit
-        }
-        val transaction = requireNotNull(
-            (recovery as RecoveryStoreResult.Success).value.redundantTransaction,
         )
-        val prepared = recoveryStore.prepareRedundantTotalLoss(
-            expectedStartOperationId = startOperationId,
-            replay = AndroidStartReplay(
-                startOperationId = UUID.randomUUID().toString(),
-                contractVersion = 1,
-                requestFingerprint = androidConnectionIntentFingerprint(
-                    transaction.template,
-                    requiresMeasuredCandidateSelection(
-                        transaction.template.layer,
-                        transaction.template.ticConnectionMode,
-                        transaction.template.allowAlternate,
+        redundantTotalLossCommands.handle(
+            command = command,
+            disposition = disposition,
+            barrierPendingAfterDefer = ::redundantStartBlocked,
+            replayDeferred = ::resumeDurableWorkAfterRedundantBarrier,
+            prepareRestartAndStop = { accepted ->
+                val transaction = requireNotNull(
+                    (recovery as RecoveryStoreResult.Success).value.redundantTransaction,
+                )
+                val prepared = recoveryStore.prepareRedundantTotalLoss(
+                    expectedStartOperationId = accepted.startOperationId,
+                    replay = AndroidStartReplay(
+                        startOperationId = UUID.randomUUID().toString(),
+                        contractVersion = 1,
+                        requestFingerprint = androidConnectionIntentFingerprint(
+                            transaction.template,
+                            requiresMeasuredCandidateSelection(
+                                transaction.template.layer,
+                                transaction.template.ticConnectionMode,
+                                transaction.template.allowAlternate,
+                            ),
+                        ),
                     ),
-                ),
-            ),
-        )
-        val restartPrepared = (prepared as? RecoveryStoreResult.Success)
-            ?.value?.redundantTransaction?.retry?.totalLossRestartReplay != null
-        TunnelLog.warning(
-            "redundant.session_stalled",
-            if (restartPrepared) "restart_prepared" else "restart_prepare_failed",
-        )
-        beginFailClosedRedundantStop(
-            startOperationId = startOperationId,
-            owner = owner,
-            allowRestart = restartPrepared,
+                )
+                val restartPrepared = (prepared as? RecoveryStoreResult.Success)
+                    ?.value?.redundantTransaction?.retry?.totalLossRestartReplay != null
+                TunnelLog.warning(
+                    "redundant.session_stalled",
+                    if (restartPrepared) "restart_prepared" else "restart_prepare_failed",
+                )
+                beginFailClosedRedundantStop(
+                    startOperationId = accepted.startOperationId,
+                    owner = accepted.owner,
+                    allowRestart = restartPrepared,
+                )
+            },
+            failClosedStop = { accepted ->
+                TunnelLog.warning("redundant.session_stalled", "recovery_unreadable")
+                beginFailClosedRedundantStop(accepted.startOperationId, accepted.owner)
+            },
         )
     }
 
@@ -3610,7 +3627,19 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun resumeDurableWorkAfterRedundantBarrier() {
-        redundantTotalLossLifecycle.onCleanupAcknowledged(serviceGeneration)
+        resumeDeferredRedundantTotalLossAndDurableWork(
+            lifecycle = redundantTotalLossCommands,
+            reprocess = { command ->
+                handleRedundantTotalLoss(
+                    ownerServiceGeneration = command.ownerServiceGeneration,
+                    startOperationId = command.startOperationId,
+                    owner = command.owner,
+                )
+            },
+            resumeDurableWork = {
+                redundantTotalLossLifecycle.onCleanupAcknowledged(serviceGeneration)
+            },
+        )
     }
 
     private fun routeConnectionIntentResumeThroughRedundantGate(): Boolean {
