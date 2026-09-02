@@ -470,6 +470,46 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun stopLookupInvalidatesStartsBeforeDispatchAndResumesOnlyAfterBarrierRelease() {
+        val worker = ArrayDeque<Runnable>()
+        val caller = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(worker::addLast))
+        val barrier = RedundantStopLookupBarrier()
+        val events = mutableListOf<String>()
+
+        dispatchWithRedundantStopLookupBarrier(
+            dispatcher = dispatcher,
+            fallbackDispatcher = dispatcher,
+            barrier = barrier,
+            resolveInMemory = { null },
+            resolveDurable = {
+                events += "resolve"
+                "durable"
+            },
+            postToCaller = { action -> caller.addLast(Runnable(action)) },
+            complete = {
+                assertTrue(barrier.hasPending())
+                events += "complete"
+            },
+            onBegin = {
+                assertTrue(barrier.hasPending())
+                events += "invalidate"
+            },
+            onRejected = { throw AssertionError("lookup rejected") },
+            afterComplete = {
+                assertFalse(barrier.hasPending())
+                events += "resume"
+            },
+        )
+
+        assertEquals(listOf("invalidate"), events)
+        worker.removeFirst().run()
+        assertEquals(listOf("invalidate", "resolve"), events)
+        caller.removeFirst().run()
+        assertEquals(listOf("invalidate", "resolve", "complete", "resume"), events)
+    }
+
+    @Test
     fun rejectedStopLookupCompletesOnCallerBeforeReleasingBarrier() {
         val caller = ArrayDeque<Runnable>()
         val rejected = RedundantVpnWorkDispatcher(Executor {
@@ -811,14 +851,14 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
-    fun ownerReplacementHandsFailedPreviousCloseToRetainedCleanup() {
+    fun ownerReplacementWaitsUntilFailedPreviousCloseCompletes() {
         val slot = RedundantVpnOwnerSlot()
         val previous = ServiceRedundantOwner(closeResults = ArrayDeque(listOf(false, true)))
         val replacement = ServiceRedundantOwner()
         val cleanup = RetainedRedundantOwnerCleanup()
         slot.install(previous, "start-a")
 
-        assertTrue(
+        assertFalse(
             installRedundantVpnOwnerSafely(
                 mutationFence = RedundantOperationMutationFence(),
                 slot = slot,
@@ -830,7 +870,8 @@ class NelomaiVpnServiceTest {
         )
 
         assertTrue(cleanup.hasPending())
-        assertEquals(InstalledRedundantVpnOwner(replacement, "start-b"), slot.snapshot())
+        assertNull(slot.snapshot())
+        assertEquals(1, replacement.closeCalls)
         assertFalse(cleanup.retry())
         assertEquals(2, previous.closeCalls)
     }
@@ -861,6 +902,38 @@ class NelomaiVpnServiceTest {
         assertTrue(cleanup.hasPending())
         assertFalse(cleanup.retry())
         assertEquals(2, candidate.closeCalls)
+    }
+
+    @Test
+    fun durableOnlyStopUsesCleanupOwnerWithoutInstallingIt() {
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
+        val slot = RedundantVpnOwnerSlot()
+        val cleanup = RetainedRedundantOwnerCleanup()
+        val cleanupOwner = ServiceRedundantOwner()
+        var creations = 0
+        var deferredStops = 0
+
+        val result = runRedundantStopCleanupAttempt(
+            transaction = transaction,
+            owner = null,
+            createCleanupOwner = {
+                creations += 1
+                cleanupOwner
+            },
+            deferStop = {
+                deferredStops += 1
+                true
+            },
+            closeTemporaryOwner = cleanup::closeOrRetain,
+        )
+
+        assertEquals(RedundantRevokeResult(fenced = true, stopped = true), result)
+        assertEquals(1, creations)
+        assertEquals(1, deferredStops)
+        assertEquals(1, cleanupOwner.revokeCalls)
+        assertEquals(1, cleanupOwner.closeCalls)
+        assertNull(slot.snapshot())
+        assertFalse(cleanup.hasPending())
     }
 
     @Test
@@ -2222,6 +2295,18 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun invalidatedConnectionIntentAdmissionNeverBecomesCurrentAgain() {
+        val admission = AndroidConnectionIntentAdmission()
+        val stale = admission.snapshot()
+
+        assertTrue(admission.isCurrent(stale))
+        admission.invalidate()
+
+        assertFalse(admission.isCurrent(stale))
+        assertTrue(admission.isCurrent(admission.snapshot()))
+    }
+
+    @Test
     fun durableBeginFastLaneCannotBeQueuedBehindRuntimePastTheIpcTimeout() {
         val blockedRuntime = Executors.newSingleThreadExecutor()
         val fastMutation = Executors.newSingleThreadExecutor()
@@ -2470,6 +2555,188 @@ class NelomaiVpnServiceTest {
         assertEquals(LeasePhase.CLEANUP_PENDING, persisted.leaseTransaction?.phase)
         assertEquals("late-lease", persisted.leaseTransaction?.leaseId)
         assertEquals(0, runtime.startCalls)
+    }
+
+    @Test
+    fun invalidatedAdmissionBeforeRecoveryAttemptDoesNotTouchPanelOrRuntime() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template())
+        val panel = ServicePanelFake()
+        val runtime = ServiceRuntimeFake()
+
+        assertEquals(
+            AndroidCoordinatorStep.BUSY,
+            coordinator.runOnce(panel, runtime, canStart = { false }),
+        )
+
+        assertEquals(emptyList<String>(), panel.reconcileOperationIds)
+        assertEquals(emptyList<String>(), panel.startOperationIds)
+        assertEquals(0, runtime.startCalls)
+        assertTrue(store.load().intent.desiredActive)
+        assertEquals(LeasePhase.START_PENDING, store.load().leaseTransaction?.phase)
+    }
+
+    @Test
+    fun admissionInvalidatedDuringReconcileCannotCallPanelStart() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template())
+        val admission = AndroidConnectionIntentAdmission()
+        val ticket = admission.snapshot()
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            onReconcile = admission::invalidate
+        }
+
+        assertEquals(
+            AndroidCoordinatorStep.BUSY,
+            coordinator.runOnce(
+                panel,
+                ServiceRuntimeFake(),
+                canStart = { admission.isCurrent(ticket) },
+            ),
+        )
+
+        assertEquals(1, panel.reconcileOperationIds.size)
+        assertEquals(emptyList<String>(), panel.startOperationIds)
+        assertEquals(LeasePhase.START_PENDING, store.load().leaseTransaction?.phase)
+    }
+
+    @Test
+    fun appliedReconcileFromInvalidatedAdmissionIsImmediatelyCompensated() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template())
+        val admission = AndroidConnectionIntentAdmission()
+        val ticket = admission.snapshot()
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("applied", leaseId = "lease-stale-reconcile")
+            stopResults += Result.success(Unit)
+            onReconcile = admission::invalidate
+        }
+        val runtime = ServiceRuntimeFake()
+
+        assertEquals(
+            AndroidCoordinatorStep.IDLE,
+            coordinator.runOnce(
+                panel,
+                runtime,
+                canStart = { admission.isCurrent(ticket) },
+            ),
+        )
+
+        assertEquals(emptyList<String>(), panel.startOperationIds)
+        assertEquals(listOf("lease-stale-reconcile"), panel.stopLeaseIds)
+        assertEquals(1, runtime.stopCalls)
+        assertNull(store.load().leaseTransaction)
+    }
+
+    @Test
+    fun admissionInvalidatedDuringBindingSyncCannotCallPanelStart() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template().copy(syncBindingPreferences = true))
+        val admission = AndroidConnectionIntentAdmission()
+        val ticket = admission.snapshot()
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            bindingSyncResults += Result.success(Unit)
+            onBindingSync = admission::invalidate
+        }
+
+        assertEquals(
+            AndroidCoordinatorStep.BUSY,
+            coordinator.runOnce(
+                panel,
+                ServiceRuntimeFake(),
+                canStart = { admission.isCurrent(ticket) },
+            ),
+        )
+
+        assertEquals(1, panel.bindingSyncTemplates.size)
+        assertEquals(emptyList<String>(), panel.startOperationIds)
+        assertEquals(LeasePhase.START_PENDING, store.load().leaseTransaction?.phase)
+    }
+
+    @Test
+    fun admissionInvalidatedDuringPanelStartDurablySchedulesCleanup() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template())
+        val admission = AndroidConnectionIntentAdmission()
+        val ticket = admission.snapshot()
+        val result = startResult("lease-admission-panel-race")
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.success(result)
+            onStart = admission::invalidate
+        }
+        val runtime = ServiceRuntimeFake()
+
+        assertEquals(
+            AndroidCoordinatorStep.CLEANUP_REQUIRED,
+            coordinator.runOnce(
+                panel,
+                runtime,
+                canStart = { admission.isCurrent(ticket) },
+            ),
+        )
+
+        assertTrue(result.configuration.all { it == 0.toByte() })
+        assertEquals(0, runtime.startCalls)
+        assertEquals(LeasePhase.CLEANUP_PENDING, store.load().leaseTransaction?.phase)
+        assertEquals("lease-admission-panel-race", store.load().leaseTransaction?.leaseId)
+    }
+
+    @Test
+    fun admissionInvalidatedDuringRuntimeStartIsImmediatelyCompensated() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template())
+        val admission = AndroidConnectionIntentAdmission()
+        val ticket = admission.snapshot()
+        val panel = ServicePanelFake().apply {
+            reconcileResults += reconcile("not_found")
+            startResults += Result.success(startResult("lease-admission-runtime-race"))
+            stopResults += Result.success(Unit)
+        }
+        var runtimeStarts = 0
+        var runtimeStops = 0
+        val runtime = object : AndroidConnectionIntentRuntime {
+            override fun start(
+                result: BackgroundStartResult,
+                operationId: String,
+                isCurrent: () -> Boolean,
+            ): Boolean {
+                if (!isCurrent()) return false
+                runtimeStarts += 1
+                admission.invalidate()
+                result.configuration.fill(0)
+                return true
+            }
+
+            override fun stop(): Boolean {
+                runtimeStops += 1
+                return true
+            }
+
+            override fun isRunning(): Boolean = runtimeStarts > runtimeStops
+        }
+
+        assertEquals(
+            AndroidCoordinatorStep.IDLE,
+            coordinator.runOnce(
+                panel,
+                runtime,
+                canStart = { admission.isCurrent(ticket) },
+            ),
+        )
+
+        assertEquals(1, runtimeStarts)
+        assertEquals(1, runtimeStops)
+        assertEquals(listOf("lease-admission-runtime-race"), panel.stopLeaseIds)
+        assertNull(store.load().leaseTransaction)
     }
 
     @Test
@@ -3380,6 +3647,33 @@ class NelomaiVpnServiceTest {
         dispatcher.request()
         assertEquals(1, queued.size)
         persistedDelayMillis = 0L
+        queued.removeFirst().run()
+
+        assertEquals(1, attempts)
+    }
+
+    @Test
+    fun queuedConnectionAttemptKeepsAdmissionFromItsRequest() {
+        val queued = ArrayDeque<Runnable>()
+        val admission = AndroidConnectionIntentAdmission()
+        var attempts = 0
+        val dispatcher = AndroidConnectionIntentAttemptDispatcher(
+            execute = { queued += it },
+            persistedDelayMillis = { 0L },
+            scheduleAfter = { error("unexpected retry timer") },
+            captureAdmissionTicket = admission::snapshot,
+            attempt = { ticket ->
+                if (admission.isCurrent(ticket)) attempts += 1
+            },
+        )
+
+        dispatcher.request()
+        admission.invalidate()
+        queued.removeFirst().run()
+
+        assertEquals(0, attempts)
+
+        dispatcher.request()
         queued.removeFirst().run()
 
         assertEquals(1, attempts)
@@ -5419,9 +5713,13 @@ private class ServiceRedundantOwner(
 ) : RedundantVpnProcessOwner {
     val validatedNetworks = mutableListOf<Boolean>()
     var closeCalls = 0
+    var revokeCalls = 0
     override fun recover(): Boolean = true
     override fun resume(): Boolean = true
-    override fun revoke(): Boolean = true
+    override fun revoke(): Boolean {
+        revokeCalls += 1
+        return true
+    }
     override fun closeLocal(): Boolean {
         closeCalls += 1
         if (closeResults.isEmpty()) return true
