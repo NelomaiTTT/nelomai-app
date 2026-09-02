@@ -57,6 +57,15 @@ internal fun isExactPromotedRedundantTotalLossRestart(
         lease.replay.startOperationId != sourceStartOperationId
 }
 
+internal fun shouldRouteConnectionIntentResumeThroughRedundantGate(
+    barrierPending: Boolean,
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+): Boolean = barrierPending ||
+    recovery is RecoveryStoreResult.Failure ||
+    isExactPromotedRedundantTotalLossRestart(
+        (recovery as RecoveryStoreResult.Success).value,
+    )
+
 /**
  * Resumes only durable work that exists after the redundant stop/tombstone barrier.
  * The queued generation check keeps a completion from an older service instance inert.

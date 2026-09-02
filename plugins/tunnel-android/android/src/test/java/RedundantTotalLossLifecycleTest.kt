@@ -129,6 +129,26 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
+    fun serviceResumeRoutesOnlyBarrierOrExactPromotionThroughFinalGate() {
+        assertTrue(shouldRouteConnectionIntentResumeThroughRedundantGate(
+            barrierPending = false,
+            recovery = RecoveryStoreResult.Success(restartEnvelope()),
+        ))
+        assertTrue(shouldRouteConnectionIntentResumeThroughRedundantGate(
+            barrierPending = true,
+            recovery = RecoveryStoreResult.Success(stoppedEnvelope()),
+        ))
+        assertTrue(shouldRouteConnectionIntentResumeThroughRedundantGate(
+            barrierPending = false,
+            recovery = RecoveryStoreResult.Failure("recovery_record_read_failed"),
+        ))
+        assertFalse(shouldRouteConnectionIntentResumeThroughRedundantGate(
+            barrierPending = false,
+            recovery = RecoveryStoreResult.Success(stoppedEnvelope()),
+        ))
+    }
+
+    @Test
     fun genericDurableStartResumesWithoutPublishingTotalLossStarting() {
         val generic = restartEnvelope().let { envelope ->
             envelope.copy(

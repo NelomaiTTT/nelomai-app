@@ -898,7 +898,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
             promoteToForeground()
         }
         if (intent == null) {
-            if (connectionIntentLifecycle.onStickyRestart()) return START_STICKY
+            if (resumeStickyConnectionIntentAfterRedundantBarrier()) {
+                return START_STICKY
+            }
             val stickyRecovery = recoveryStore.read()
             if (!shouldEnterLegacyVpnRecovery(stickyRecovery)) {
                 // A v2 envelope (or an unreadable store) owns this restart.  Do not let
@@ -913,9 +915,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 performBackgroundToggle(intent.resultReceiver())
             }
             intent?.action == ACTION_ENSURE_RUNNING -> {
-                if (redundantStartBlocked()) {
-                    schedulePendingRedundantStopRetry()
-                } else if (connectionIntentLifecycle.onEnsureRunning()) {
+                if (ensureConnectionIntentRunningAfterRedundantBarrier()) {
                     Unit
                 } else {
                     val recovery = recoveryStore.read()
@@ -952,7 +952,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent?.action == ACTION_UPDATE_QUICK_DNS -> handleUpdateQuickDns(intent)
             intent?.action == ACTION_TAKE_STATE_CHANGE -> handleTakeStateChange(intent)
             intent?.action == ACTION_ACKNOWLEDGE_STATE_CHANGE -> handleAcknowledgeStateChange(intent)
-            intent == null && connectionIntentLifecycle.onStickyRestart() -> Unit
+            intent == null && resumeStickyConnectionIntentAfterRedundantBarrier() -> Unit
             intent == null && QuickTunnelController.desiredActive(applicationContext) -> {
                 restoreDesiredTunnel("sticky_restart")
             }
@@ -2786,7 +2786,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         )
         if (envelope.logoutState?.phase == BackgroundLogoutPhase.PENDING) {
             promoteToForeground()
-            connectionIntentLifecycle.onEnsureRunning()
+            resumeDurableWorkAfterRedundantBarrier()
         } else {
             stopIfIdle()
         }
@@ -2873,7 +2873,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             } finally {
                 backgroundCredentialProvisionInFlight.set(false)
                 if (provisioned) connectionIntentCoordinator.credentialProvisioningCompleted()
-                connectionIntentLifecycle.onEnsureRunning()
+                resumeDurableWorkAfterRedundantBarrier()
                 stopIfIdle()
             }
         }
@@ -3151,7 +3151,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         changed = true,
                     )
                 },
-                resumePendingWork = connectionIntentLifecycle::onEnsureRunning,
+                resumePendingWork = ::ensureConnectionIntentRunningAfterRedundantBarrier,
             )
             (disposition.cancelled as? AndroidCoordinatorResult.Failure)?.let {
                 TunnelLog.warning("service.vpn_revoke_cancel_failed", it.code)
@@ -3612,6 +3612,27 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun resumeDurableWorkAfterRedundantBarrier() {
         redundantTotalLossLifecycle.onCleanupAcknowledged(serviceGeneration)
     }
+
+    private fun routeConnectionIntentResumeThroughRedundantGate(): Boolean {
+        val recovery = recoveryStore.read()
+        if (!shouldRouteConnectionIntentResumeThroughRedundantGate(
+                barrierPending = redundantStartBlocked(),
+                recovery = recovery,
+            )
+        ) {
+            return false
+        }
+        resumeDurableWorkAfterRedundantBarrier()
+        return true
+    }
+
+    private fun ensureConnectionIntentRunningAfterRedundantBarrier(): Boolean =
+        routeConnectionIntentResumeThroughRedundantGate() ||
+            connectionIntentLifecycle.onEnsureRunning()
+
+    private fun resumeStickyConnectionIntentAfterRedundantBarrier(): Boolean =
+        routeConnectionIntentResumeThroughRedundantGate() ||
+            connectionIntentLifecycle.onStickyRestart()
 
     private fun dispatchDurableWorkAfterRedundantBarrier() {
         if (!redundantStartBlocked() && connectionIntentLifecycle.onEnsureRunning()) return
