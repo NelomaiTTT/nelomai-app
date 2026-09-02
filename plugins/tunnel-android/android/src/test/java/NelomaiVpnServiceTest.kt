@@ -468,42 +468,84 @@ class NelomaiVpnServiceTest {
 
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
-            currentServiceGeneration = 8,
-            installedStartOperationId = "start-a",
-            pendingStop = false,
-            tombstoneUnreadable = false,
+            current = {
+                RedundantPhysicalNetworkCallbackState(8, "start-a", false, false)
+            },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
-            currentServiceGeneration = 7,
-            installedStartOperationId = "start-b",
-            pendingStop = false,
-            tombstoneUnreadable = false,
+            current = {
+                RedundantPhysicalNetworkCallbackState(7, "start-b", false, false)
+            },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
-            currentServiceGeneration = 7,
-            installedStartOperationId = "start-a",
-            pendingStop = true,
-            tombstoneUnreadable = false,
+            current = {
+                RedundantPhysicalNetworkCallbackState(7, "start-a", true, false)
+            },
         ) { mutations += 1 })
         assertTrue(callback.applyIfCurrent(
             mutationFence = mutationFence,
-            currentServiceGeneration = 7,
-            installedStartOperationId = "start-a",
-            pendingStop = false,
-            tombstoneUnreadable = false,
+            current = {
+                RedundantPhysicalNetworkCallbackState(7, "start-a", false, false)
+            },
         ) { mutations += 1 })
         mutationFence.cancel("start-a")
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
-            currentServiceGeneration = 7,
-            installedStartOperationId = "start-a",
-            pendingStop = false,
-            tombstoneUnreadable = false,
+            current = {
+                RedundantPhysicalNetworkCallbackState(7, "start-a", false, false)
+            },
         ) { mutations += 1 })
 
         assertEquals(1, mutations)
+    }
+
+    @Test
+    fun physicalNetworkCallbackReadsReplacementIdentityInsideSerializedFence() {
+        val mutationFence = RedundantOperationMutationFence()
+        val callback = RedundantPhysicalNetworkCallbackIdentity(7, "start-a")
+        val gateEntered = CountDownLatch(1)
+        val releaseGate = CountDownLatch(1)
+        val blocker = Thread {
+            mutationFence.runSerializedIfActive(null) {
+                gateEntered.countDown()
+                check(releaseGate.await(2, TimeUnit.SECONDS))
+                true
+            }
+        }.apply { start() }
+        assertTrue(gateEntered.await(2, TimeUnit.SECONDS))
+        val currentGeneration = AtomicLong(7)
+        val installedOwner = AtomicReference<String?>("start-a")
+        val callbackStarted = CountDownLatch(1)
+        val callbackResult = AtomicReference<Boolean>()
+        val mutations = AtomicInteger(0)
+        val delayed = Thread {
+            callbackStarted.countDown()
+            callbackResult.set(callback.applyIfCurrent(
+                mutationFence = mutationFence,
+                current = {
+                    RedundantPhysicalNetworkCallbackState(
+                        currentGeneration.get(),
+                        installedOwner.get(),
+                        pendingStop = false,
+                        tombstoneUnreadable = false,
+                    )
+                },
+            ) { mutations.incrementAndGet() })
+        }.apply { start() }
+        assertTrue(callbackStarted.await(2, TimeUnit.SECONDS))
+
+        currentGeneration.set(8)
+        installedOwner.set("start-b")
+        releaseGate.countDown()
+        blocker.join(2_000L)
+        delayed.join(2_000L)
+
+        assertFalse(blocker.isAlive)
+        assertFalse(delayed.isAlive)
+        assertEquals(false, callbackResult.get())
+        assertEquals(0, mutations.get())
     }
 
     @Test
@@ -561,6 +603,33 @@ class NelomaiVpnServiceTest {
             InstalledRedundantVpnOwner(owner, "start-a"),
             slot.removeIf("start-a"),
         )
+        assertNull(slot.snapshot())
+    }
+
+    @Test
+    fun failedAuxiliarySetupClosesBothSidesOfOwnerReplacement() {
+        val slot = RedundantVpnOwnerSlot()
+        val previous = ServiceRedundantOwner()
+        val replacement = ServiceRedundantOwner()
+        slot.install(previous, "start-a")
+        var failure: Throwable? = null
+
+        try {
+            installRedundantVpnOwnerSafely(
+                mutationFence = RedundantOperationMutationFence(),
+                slot = slot,
+                owner = replacement,
+                startOperationId = "start-b",
+            ) {
+                throw IllegalStateException("monitor_failed")
+            }
+        } catch (error: Throwable) {
+            failure = error
+        }
+
+        assertEquals("monitor_failed", failure?.message)
+        assertEquals(1, previous.closeCalls)
+        assertEquals(1, replacement.closeCalls)
         assertNull(slot.snapshot())
     }
 
@@ -5101,9 +5170,14 @@ private fun serviceV2Envelope() = serviceV1Envelope().copy(
 
 private class ServiceRedundantOwner : RedundantVpnProcessOwner {
     val validatedNetworks = mutableListOf<Boolean>()
+    var closeCalls = 0
     override fun recover(): Boolean = true
     override fun resume(): Boolean = true
     override fun revoke(): Boolean = true
+    override fun closeLocal(): Boolean {
+        closeCalls += 1
+        return true
+    }
     override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean {
         validatedNetworks += validated
         return true

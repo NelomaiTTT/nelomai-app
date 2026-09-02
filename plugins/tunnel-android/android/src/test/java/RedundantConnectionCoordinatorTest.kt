@@ -714,6 +714,53 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun cleanupCancellationDoesNotWaitForBlockedNativeStartAndRollsItBack() {
+        val nativeStartEntered = CountDownLatch(1)
+        val releaseNativeStart = CountDownLatch(1)
+        val transaction = transaction()
+        val native = FakeNative(
+            startEntered = nativeStartEntered,
+            releaseStart = releaseNativeStart,
+        )
+        val fence = RedundantOperationMutationFence()
+        val coordinator = RedundantConnectionCoordinator(
+            store = emptyStore(),
+            panel = FakePanel(),
+            native = native,
+            expectedStartOperationId = transaction.startOperationId,
+            mutationFence = fence,
+        )
+        val startResult = AtomicReference<Boolean>()
+        val start = Thread {
+            startResult.set(coordinator.start(
+                transaction,
+                configurations = mapOf(
+                    "lease-a" to byteArrayOf(1),
+                    "lease-b" to byteArrayOf(2),
+                ),
+            ))
+        }.apply { start() }
+        assertTrue(nativeStartEntered.await(2, TimeUnit.SECONDS))
+        val cancelCompleted = CountDownLatch(1)
+        val cancel = Thread {
+            fence.cancel(transaction.startOperationId)
+            cancelCompleted.countDown()
+        }.apply { start() }
+
+        val completedBeforeNative = cancelCompleted.await(500, TimeUnit.MILLISECONDS)
+        releaseNativeStart.countDown()
+        start.join(2_000L)
+        cancel.join(2_000L)
+
+        assertTrue(completedBeforeNative)
+        assertFalse(start.isAlive)
+        assertFalse(cancel.isAlive)
+        assertEquals(false, startResult.get())
+        assertTrue(native.activated.isEmpty())
+        assertEquals(1, native.stopCalls)
+    }
+
+    @Test
     fun roleRebaseAdoptsCanonicalGenerationsWithoutRollingBackLocalDataplaneActive() {
         val panel = FakePanel(role = RedundantRoleResponse(
             action = "rebase",
@@ -1395,6 +1442,8 @@ private class FakeNative(
     private val stopResults: ArrayDeque<Boolean> = ArrayDeque(),
     val healthSnapshots: ArrayDeque<List<SlotObservation>> = ArrayDeque(),
     private var healthSnapshotFailures: Int = 0,
+    private val startEntered: CountDownLatch? = null,
+    private val releaseStart: CountDownLatch? = null,
 ) : RedundantConnectionNative {
     val started = mutableListOf<String>()
     val activated = mutableListOf<String>()
@@ -1407,6 +1456,8 @@ private class FakeNative(
         configuration: ByteArray,
         healthProbe: BackgroundRedundantHealthProbe?,
     ): Boolean {
+        startEntered?.countDown()
+        releaseStart?.let { check(it.await(2, TimeUnit.SECONDS)) }
         started += leaseId
         events += "start:$leaseId"
         return leaseId !in startFailures

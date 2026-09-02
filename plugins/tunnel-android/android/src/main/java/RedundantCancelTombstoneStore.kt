@@ -201,34 +201,31 @@ internal fun activeRedundantTransactionForWork(
     }
 }
 
+internal data class RedundantPhysicalNetworkCallbackState(
+    val serviceGeneration: Long,
+    val installedStartOperationId: String?,
+    val pendingStop: Boolean,
+    val tombstoneUnreadable: Boolean,
+)
+
 internal data class RedundantPhysicalNetworkCallbackIdentity(
     val serviceGeneration: Long,
     val startOperationId: String,
 ) {
-    fun isCurrent(
-        currentServiceGeneration: Long,
-        installedStartOperationId: String?,
-        pendingStop: Boolean,
-        tombstoneUnreadable: Boolean,
-    ): Boolean = serviceGeneration == currentServiceGeneration &&
-        startOperationId == installedStartOperationId &&
-        !redundantCleanupBlocksNewStarts(pendingStop, tombstoneUnreadable)
+    fun isCurrent(current: RedundantPhysicalNetworkCallbackState): Boolean =
+        serviceGeneration == current.serviceGeneration &&
+            startOperationId == current.installedStartOperationId &&
+            !redundantCleanupBlocksNewStarts(
+                current.pendingStop,
+                current.tombstoneUnreadable,
+            )
 
     fun applyIfCurrent(
         mutationFence: RedundantOperationMutationFence,
-        currentServiceGeneration: Long,
-        installedStartOperationId: String?,
-        pendingStop: Boolean,
-        tombstoneUnreadable: Boolean,
+        current: () -> RedundantPhysicalNetworkCallbackState,
         action: () -> Unit,
-    ): Boolean = mutationFence.runIfActive(startOperationId) {
-        if (isCurrent(
-                currentServiceGeneration,
-                installedStartOperationId,
-                pendingStop,
-                tombstoneUnreadable,
-            )
-        ) {
+    ): Boolean = mutationFence.runSerializedIfActive(startOperationId) {
+        if (isCurrent(current())) {
             action()
             true
         } else {

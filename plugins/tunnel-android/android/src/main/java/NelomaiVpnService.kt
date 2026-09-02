@@ -242,6 +242,67 @@ internal class RedundantVpnOwnerSlot {
         installed = null
         return current
     }
+
+    @Synchronized
+    fun removeIf(
+        startOperationId: String,
+        owner: RedundantVpnProcessOwner,
+    ): InstalledRedundantVpnOwner? {
+        val current = installed?.takeIf {
+            it.startOperationId == startOperationId && it.owner === owner
+        } ?: return null
+        installed = null
+        return current
+    }
+
+    @Synchronized
+    fun runIfCurrent(
+        startOperationId: String,
+        owner: RedundantVpnProcessOwner,
+        action: () -> Unit,
+    ): Boolean {
+        val current = installed ?: return false
+        if (current.startOperationId != startOperationId || current.owner !== owner) return false
+        action()
+        return true
+    }
+}
+
+internal fun installRedundantVpnOwnerSafely(
+    mutationFence: RedundantOperationMutationFence,
+    slot: RedundantVpnOwnerSlot,
+    owner: RedundantVpnProcessOwner,
+    startOperationId: String,
+    initializeAuxiliaryState: () -> Unit,
+): Boolean {
+    var previous: InstalledRedundantVpnOwner? = null
+    var swapped = false
+    val accepted = mutationFence.runSerializedIfActive(startOperationId) {
+        previous = slot.install(owner, startOperationId)
+        swapped = true
+        true
+    }
+    if (swapped && previous?.owner !== owner) {
+        runCatching { previous?.owner?.closeLocal() }
+    }
+    if (!accepted) {
+        if (swapped) {
+            runCatching { slot.removeIf(startOperationId, owner)?.owner?.closeLocal() }
+        }
+        return false
+    }
+    return try {
+        val initialized = mutationFence.runSerializedIfActive(startOperationId) {
+            slot.runIfCurrent(startOperationId, owner, initializeAuxiliaryState)
+        }
+        if (!initialized) {
+            runCatching { slot.removeIf(startOperationId, owner)?.owner?.closeLocal() }
+        }
+        initialized
+    } catch (error: Throwable) {
+        runCatching { slot.removeIf(startOperationId, owner)?.owner?.closeLocal() }
+        throw error
+    }
 }
 
 private data class PendingRedundantStop(
@@ -1014,9 +1075,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
             serviceGeneration = serviceGeneration,
             startOperationId = transaction.startOperationId,
         )
-        var previousOwner: RedundantVpnProcessOwner? = null
         restoreHandler.removeCallbacks(redundantHealthTick)
-        val installed = redundantMutationFence.runIfActive(transaction.startOperationId) {
+        val installed = installRedundantVpnOwnerSafely(
+            mutationFence = redundantMutationFence,
+            slot = redundantVpnOwnerSlot,
+            owner = coordinator,
+            startOperationId = transaction.startOperationId,
+        ) {
             AndroidSplitTunnel.replaceVpnRoutes(
                 AndroidSplitTunnel.mergeExcludedRoutes(options.excludedRoutes, localRoutes),
                 options.dnsServers,
@@ -1024,20 +1089,19 @@ class NelomaiVpnService : GoBackend.VpnService() {
             setUnderlyingNetworks(
                 physicalState.networks.toTypedArray().takeIf { it.isNotEmpty() },
             )
-            previousOwner = redundantVpnOwnerSlot.install(
-                coordinator,
-                transaction.startOperationId,
-            )?.owner
             redundantPhysicalNetworks?.stop()
-            redundantPhysicalNetworks = PhysicalNetworks(applicationContext).also { monitor ->
+            val monitor = PhysicalNetworks(applicationContext)
+            try {
                 monitor.start { state ->
                     applyRedundantPhysicalNetworks(callbackIdentity, state)
                 }
+                redundantPhysicalNetworks = monitor
+            } catch (error: Throwable) {
+                runCatching(monitor::stop)
+                throw error
             }
-            true
         }
         if (installed) {
-            if (previousOwner !== coordinator) runCatching { previousOwner?.closeLocal() }
             restoreHandler.post(redundantHealthTick)
         }
         return coordinator to native
@@ -1049,20 +1113,25 @@ class NelomaiVpnService : GoBackend.VpnService() {
     ) {
         identity.applyIfCurrent(
             mutationFence = redundantMutationFence,
-            currentServiceGeneration = serviceGeneration,
-            installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId,
-            pendingStop = pendingRedundantStop != null,
-            tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+            current = {
+                RedundantPhysicalNetworkCallbackState(
+                    serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+                    installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId,
+                    pendingStop = pendingRedundantStop != null,
+                    tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+                )
+            },
         ) {
             candidateProbeCache.invalidateNetwork()
             setUnderlyingNetworks(state.networks.toTypedArray().takeIf { it.isNotEmpty() })
             redundantWork.network(state.validated) { latestValidated ->
-                if (!identity.isCurrent(
-                    currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
-                    installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId,
-                    pendingStop = pendingRedundantStop != null,
-                    tombstoneUnreadable = redundantCancelTombstoneUnreadable,
-                )) return@network
+                if (!identity.isCurrent(RedundantPhysicalNetworkCallbackState(
+                        serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+                        installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId,
+                        pendingStop = pendingRedundantStop != null,
+                        tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+                    ))
+                ) return@network
                 val transaction = activeRedundantTransactionForWork(
                     recovery = recoveryStore.read(),
                     expectedStartOperationId = identity.startOperationId,
@@ -1125,7 +1194,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 true
             }
         }
-        redundantMutationFence.runIfActive(installedStartOperationId, apply)
+        redundantMutationFence.runSerializedIfActive(installedStartOperationId, apply)
     }
 
     private fun ensureRedundantCoordinator(

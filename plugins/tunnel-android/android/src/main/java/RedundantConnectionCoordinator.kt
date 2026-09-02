@@ -1,6 +1,7 @@
 package ru.nelomai.tunnel
 
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /** Narrow Task 8/9 seam: native owns the one real TUN and never exposes a vendor backend. */
@@ -32,16 +33,34 @@ internal data class RedundantVpnMetrics(
 
 internal class RedundantOperationMutationFence {
     private val gate = Any()
-    private val cancelled = mutableSetOf<String>()
+    private val cancelled = ConcurrentHashMap.newKeySet<String>()
 
-    fun cancel(startOperationId: String) = synchronized(gate) {
+    fun cancel(startOperationId: String) {
         cancelled += startOperationId
+        // Drain only short serialized service mutations. Native and durable I/O never hold this gate.
+        synchronized(gate) { Unit }
     }
 
-    fun runIfActive(startOperationId: String?, action: () -> Boolean): Boolean =
-        synchronized(gate) {
-            if (startOperationId != null && startOperationId in cancelled) false else action()
+    fun runIfActive(
+        startOperationId: String?,
+        onCancelled: () -> Unit = {},
+        action: () -> Boolean,
+    ): Boolean {
+        if (startOperationId != null && startOperationId in cancelled) return false
+        val result = action()
+        if (startOperationId != null && startOperationId in cancelled) {
+            onCancelled()
+            return false
         }
+        return result
+    }
+
+    fun runSerializedIfActive(
+        startOperationId: String?,
+        action: () -> Boolean,
+    ): Boolean = synchronized(gate) {
+        runIfActive(startOperationId, action = action)
+    }
 }
 
 internal enum class RedundantReserveState(val wireName: String) {
@@ -253,10 +272,10 @@ internal class RedundantConnectionCoordinator(
         }
         val activeSlot = transaction.slot(active) ?: return@synchronized false
         if (!mutateNative(transaction) {
-                native.start(active, activeSlot, activeConfiguration, healthProbes[active]) &&
-                    native.activate(active)
+                native.start(active, activeSlot, activeConfiguration, healthProbes[active])
             }
         ) return@synchronized false
+        if (!mutateNative(transaction) { native.activate(active) }) return@synchronized false
         startStandbyMembersLocked(transaction, active, configurations, healthProbes)
         val current = status()
         if (shouldCancel() || current?.desiredActive != true ||
@@ -297,14 +316,19 @@ internal class RedundantConnectionCoordinator(
             val activeSlot = refreshed.slot(active) ?: return@synchronized false
             if (!mutateNative(transaction) {
                     response.virtualAddressV4?.let(native::setProbeSourceIpv4)
+                    true
+                }
+            ) return@synchronized false
+            if (!mutateNative(transaction) {
                     native.start(
                         active,
                         activeSlot,
                         activeConfiguration,
                         response.healthProbes[active],
-                    ) && native.activate(active)
+                    )
                 }
             ) return@synchronized false
+            if (!mutateNative(transaction) { native.activate(active) }) return@synchronized false
             val standby = listOfNotNull(
                 response.session.slotALeaseId,
                 response.session.slotBLeaseId,
@@ -581,14 +605,19 @@ internal class RedundantConnectionCoordinator(
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
         }
-        mutateNative(transaction) {
-            healthMonitor.onUnderlyingNetworkChanged(nowMs(), validated)
-            native.setNetworkValidated(validated)
-            listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
-                .distinct()
-                .map { leaseId -> runCatching { native.rebind(leaseId) }.getOrDefault(false) }
-                .all { it }
-        }
+        if (!mutateNative(transaction) {
+                healthMonitor.onUnderlyingNetworkChanged(nowMs(), validated)
+                native.setNetworkValidated(validated)
+                true
+            }
+        ) return@synchronized false
+        listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
+            .distinct()
+            .all { leaseId ->
+                mutateNative(transaction) {
+                    runCatching { native.rebind(leaseId) }.getOrDefault(false)
+                }
+            }
     }
 
     fun slotFailed(leaseId: String, reason: String): Boolean = synchronized(gate) {
@@ -998,7 +1027,11 @@ internal class RedundantConnectionCoordinator(
     private fun mutateNative(
         transaction: AndroidRedundantTransaction,
         action: () -> Boolean,
-    ): Boolean = mutationFence.runIfActive(transaction.startOperationId, action)
+    ): Boolean = mutationFence.runIfActive(
+        transaction.startOperationId,
+        onCancelled = { runCatching(native::stop) },
+        action = action,
+    )
 
     private fun scheduleReplacement(
         transaction: AndroidRedundantTransaction,
