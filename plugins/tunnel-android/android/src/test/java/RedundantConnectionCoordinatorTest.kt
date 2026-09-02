@@ -4,6 +4,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class RedundantConnectionCoordinatorTest {
     @Test
@@ -647,6 +650,67 @@ class RedundantConnectionCoordinatorTest {
         assertEquals(0, panel.stopCalls)
         val durable = store.read() as RecoveryStoreResult.Success
         assertEquals(replacement, durable.value.redundantTransaction)
+    }
+
+    @Test
+    fun cleanupAcceptedDuringBlockedRecoveryPreventsEveryLateNativeStart() {
+        val recoveryEntered = CountDownLatch(1)
+        val releaseRecovery = CountDownLatch(1)
+        val transaction = transaction()
+        val native = FakeNative()
+        val fence = RedundantOperationMutationFence()
+        val coordinator = RedundantConnectionCoordinator(
+            store = store(transaction),
+            panel = FakePanel(
+                recoverEntered = recoveryEntered,
+                releaseRecovery = releaseRecovery,
+            ),
+            native = native,
+            expectedStartOperationId = transaction.startOperationId,
+            mutationFence = fence,
+        )
+        val result = AtomicReference<Boolean>()
+        val recovery = Thread { result.set(coordinator.resume()) }.apply { start() }
+        assertTrue(recoveryEntered.await(2, TimeUnit.SECONDS))
+
+        fence.cancel(transaction.startOperationId)
+        releaseRecovery.countDown()
+        recovery.join(2_000L)
+
+        assertFalse(recovery.isAlive)
+        assertEquals(false, result.get())
+        assertTrue(native.started.isEmpty())
+        assertTrue(native.activated.isEmpty())
+    }
+
+    @Test
+    fun cleanupAcceptedBeforeFreshStartPreventsDurableAndNativeActivation() {
+        val transaction = transaction()
+        val store = emptyStore()
+        val native = FakeNative()
+        val fence = RedundantOperationMutationFence().apply {
+            cancel(transaction.startOperationId)
+        }
+        val coordinator = RedundantConnectionCoordinator(
+            store = store,
+            panel = FakePanel(),
+            native = native,
+            expectedStartOperationId = transaction.startOperationId,
+            mutationFence = fence,
+        )
+
+        assertFalse(coordinator.start(
+            transaction,
+            configurations = mapOf(
+                "lease-a" to byteArrayOf(1),
+                "lease-b" to byteArrayOf(2),
+            ),
+        ))
+
+        val recovery = store.read() as RecoveryStoreResult.Success
+        assertEquals(null, recovery.value.redundantTransaction)
+        assertTrue(native.started.isEmpty())
+        assertTrue(native.activated.isEmpty())
     }
 
     @Test
@@ -1382,6 +1446,8 @@ private class FakePanel(
     private val releaseFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val releaseFailureCodes: ArrayDeque<String> = ArrayDeque(),
     private val recoveryHealthProbes: Map<String, BackgroundRedundantHealthProbe> = emptyMap(),
+    private val recoverEntered: CountDownLatch? = null,
+    private val releaseRecovery: CountDownLatch? = null,
 ) : RedundantConnectionPanel {
     var stopCalls = 0
     var roleCalls = 0
@@ -1392,8 +1458,10 @@ private class FakePanel(
     val candidateConfigurations = mutableListOf<ByteArray>()
     val releasedLeaseIds = mutableListOf<String>()
     val releaseAttempts = mutableListOf<String?>()
-    override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
-        RedundantRecoveryResponse(
+    override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
+        recoverEntered?.countDown()
+        releaseRecovery?.let { check(it.await(2, TimeUnit.SECONDS)) }
+        return RedundantRecoveryResponse(
             session = recoveredSession ?: BackgroundRedundantSession(
                 sessionId = transaction.sessionId,
                 state = "connected",
@@ -1411,6 +1479,7 @@ private class FakePanel(
             ),
             healthProbes = recoveryHealthProbes,
         )
+    }
     override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
         roleCalls += 1
         if (roleFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")

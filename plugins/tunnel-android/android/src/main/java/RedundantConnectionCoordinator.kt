@@ -30,6 +30,20 @@ internal data class RedundantVpnMetrics(
     val probeTarget: String?,
 )
 
+internal class RedundantOperationMutationFence {
+    private val gate = Any()
+    private val cancelled = mutableSetOf<String>()
+
+    fun cancel(startOperationId: String) = synchronized(gate) {
+        cancelled += startOperationId
+    }
+
+    fun runIfActive(startOperationId: String?, action: () -> Boolean): Boolean =
+        synchronized(gate) {
+            if (startOperationId != null && startOperationId in cancelled) false else action()
+        }
+}
+
 internal enum class RedundantReserveState(val wireName: String) {
     WARMING("warming"),
     READY("ready"),
@@ -182,6 +196,7 @@ internal class RedundantConnectionCoordinator(
     private val onReserveStateChanged: (RedundantReserveState?) -> Unit = {},
     private val onDiagnosticEvent: (RedundantDiagnosticEvent) -> Unit = {},
     expectedStartOperationId: String? = null,
+    private val mutationFence: RedundantOperationMutationFence = RedundantOperationMutationFence(),
     private val onAllSlotsStalled: () -> Unit = {},
 ) : RedundantVpnProcessOwner {
     private val gate = Any()
@@ -227,15 +242,20 @@ internal class RedundantConnectionCoordinator(
         boundStartOperationId = transaction.startOperationId
         val active = transaction.localActiveLeaseId ?: return@synchronized false
         val activeConfiguration = configurations[active] ?: return@synchronized false
-        if (store.beginRedundant(transaction) !is RecoveryStoreResult.Success) return@synchronized false
+        if (!mutationFence.runIfActive(transaction.startOperationId) {
+                store.beginRedundant(transaction) is RecoveryStoreResult.Success
+            }
+        ) return@synchronized false
         primaryReadinessFailed = false
         if (shouldCancel()) {
             fenceRevoke()
             return@synchronized false
         }
         val activeSlot = transaction.slot(active) ?: return@synchronized false
-        if (!native.start(active, activeSlot, activeConfiguration, healthProbes[active]) ||
-            !native.activate(active)
+        if (!mutateNative(transaction) {
+                native.start(active, activeSlot, activeConfiguration, healthProbes[active]) &&
+                    native.activate(active)
+            }
         ) return@synchronized false
         startStandbyMembersLocked(transaction, active, configurations, healthProbes)
         val current = status()
@@ -269,15 +289,21 @@ internal class RedundantConnectionCoordinator(
         primaryReadinessFailed = false
         val response = panel.recover(transaction)
         try {
-            response.virtualAddressV4?.let(native::setProbeSourceIpv4)
             val refreshed = transaction.withRecoveredCanonical(response.session)
             val active = transaction.localActiveLeaseId.takeIf(response.session::containsCurrentLease)
                 ?: response.session.activeLeaseId
                 ?: return@synchronized false
             val activeConfiguration = response.configurations[active] ?: return@synchronized false
             val activeSlot = refreshed.slot(active) ?: return@synchronized false
-            if (!native.start(active, activeSlot, activeConfiguration, response.healthProbes[active]) ||
-                !native.activate(active)
+            if (!mutateNative(transaction) {
+                    response.virtualAddressV4?.let(native::setProbeSourceIpv4)
+                    native.start(
+                        active,
+                        activeSlot,
+                        activeConfiguration,
+                        response.healthProbes[active],
+                    ) && native.activate(active)
+                }
             ) return@synchronized false
             val standby = listOfNotNull(
                 response.session.slotALeaseId,
@@ -286,7 +312,9 @@ internal class RedundantConnectionCoordinator(
             for (leaseId in standby) {
                 val configuration = response.configurations[leaseId] ?: continue
                 refreshed.slot(leaseId)?.let { slot ->
-                    native.start(leaseId, slot, configuration, response.healthProbes[leaseId])
+                    mutateNative(transaction) {
+                        native.start(leaseId, slot, configuration, response.healthProbes[leaseId])
+                    }
                 }
             }
             // The local active identity wins over a stale canonical role until its observation is sent.
@@ -336,7 +364,9 @@ internal class RedundantConnectionCoordinator(
             val configuration = configurations[leaseId] ?: continue
             // A standby is never allowed to turn a usable active member into a failed start.
             transaction.slot(leaseId)?.let { slot ->
-                native.start(leaseId, slot, configuration, healthProbes[leaseId])
+                mutateNative(transaction) {
+                    native.start(leaseId, slot, configuration, healthProbes[leaseId])
+                }
             }
         }
     }
@@ -547,16 +577,18 @@ internal class RedundantConnectionCoordinator(
     }
 
     override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean = synchronized(gate) {
-        healthMonitor.onUnderlyingNetworkChanged(nowMs(), validated)
-        native.setNetworkValidated(validated)
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
         }
-        listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
-            .distinct()
-            .map { leaseId -> runCatching { native.rebind(leaseId) }.getOrDefault(false) }
-            .all { it }
+        mutateNative(transaction) {
+            healthMonitor.onUnderlyingNetworkChanged(nowMs(), validated)
+            native.setNetworkValidated(validated)
+            listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
+                .distinct()
+                .map { leaseId -> runCatching { native.rebind(leaseId) }.getOrDefault(false) }
+                .all { it }
+        }
     }
 
     fun slotFailed(leaseId: String, reason: String): Boolean = synchronized(gate) {
@@ -752,12 +784,14 @@ internal class RedundantConnectionCoordinator(
             if (replacementLeaseId != null && !native.stopSlot(replacementLeaseId)) {
                 return@synchronized false
             }
-            if (!native.start(
-                    candidate.candidateLeaseId,
-                    candidate.candidateSlot,
-                    candidate.configuration,
-                    candidate.healthProbe,
-                )
+            if (!mutateNative(candidateStaged) {
+                    native.start(
+                        candidate.candidateLeaseId,
+                        candidate.candidateSlot,
+                        candidate.configuration,
+                        candidate.healthProbe,
+                    )
+                }
             ) {
                 return@synchronized false
             }
@@ -809,12 +843,14 @@ internal class RedundantConnectionCoordinator(
                 transaction.retry.acquireReplaceLeaseId?.let { replacement ->
                     if (!native.stopSlot(replacement)) return false
                 }
-                if (!native.start(
-                        candidateLeaseId,
-                        candidateSlot,
-                        replayed.configuration,
-                        replayed.healthProbe,
-                    )
+                if (!mutateNative(refreshed) {
+                        native.start(
+                            candidateLeaseId,
+                            candidateSlot,
+                            replayed.configuration,
+                            replayed.healthProbe,
+                        )
+                    }
                 ) return false
                 candidateWarmupLeaseId = candidateLeaseId
                 if (!persist(refreshed)) return false
@@ -859,6 +895,7 @@ internal class RedundantConnectionCoordinator(
     /** Serialized durable stop barrier; production callers dispatch it on redundant work. */
     override fun fenceRevoke(): Boolean = synchronized(gate) {
         val transaction = status() ?: return false
+        mutationFence.cancel(transaction.startOperationId)
         val fenced = store.deferRedundantStop(
             stopOperationId = transaction.stopOperationId ?: operationId(),
             expectedStartOperationId = transaction.startOperationId,
@@ -893,7 +930,7 @@ internal class RedundantConnectionCoordinator(
         val panelStopped = if (localStopped) try { panel.stop(pending) } catch (_: Throwable) { false } else false
         if (!localStopped || !panelStopped) return@synchronized false
         val acknowledged = pending.copy(retry = pending.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
-        if (!persist(acknowledged)) return@synchronized false
+        if (!persistCleanup(acknowledged)) return@synchronized false
         store.completeRedundantStop(
             stopOperationId = requireNotNull(acknowledged.stopOperationId),
             expectedStartOperationId = acknowledged.startOperationId,
@@ -910,7 +947,12 @@ internal class RedundantConnectionCoordinator(
         runCatching(native::stop).getOrDefault(false)
     }
 
-    private fun persist(transaction: AndroidRedundantTransaction): Boolean {
+    private fun persist(transaction: AndroidRedundantTransaction): Boolean =
+        mutationFence.runIfActive(transaction.startOperationId) {
+            persistCleanup(transaction)
+        }
+
+    private fun persistCleanup(transaction: AndroidRedundantTransaction): Boolean {
         val result = store.updateRedundant(transaction.startOperationId) { current ->
             // A stop fence is monotonic. Work that began before the fence may finish, but its
             // stale snapshot must never make the session desired/active again.
@@ -943,7 +985,7 @@ internal class RedundantConnectionCoordinator(
             ),
         )
         if (!persist(updated)) return false
-        if (!native.activate(target)) return false
+        if (!mutateNative(updated) { native.activate(target) }) return false
         failoverActive = true
         publishReserveStateLocked(updated, emptyList())
         onDiagnosticEvent(RedundantDiagnosticEvent.FAILOVER)
@@ -952,6 +994,11 @@ internal class RedundantConnectionCoordinator(
         flushRoleObservationLocked()
         return true
     }
+
+    private fun mutateNative(
+        transaction: AndroidRedundantTransaction,
+        action: () -> Boolean,
+    ): Boolean = mutationFence.runIfActive(transaction.startOperationId, action)
 
     private fun scheduleReplacement(
         transaction: AndroidRedundantTransaction,

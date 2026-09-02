@@ -434,6 +434,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         Thread(task, "nelomai-redundant-control").apply { isDaemon = true }
     }
     private val redundantWork = RedundantVpnWorkDispatcher(redundantExecutor)
+    private val redundantMutationFence = RedundantOperationMutationFence()
     private val redundantStartOperation = RedundantStartOperationGate()
     private val redundantRevokeLifecycle = RedundantRevokeLifecycleGate()
     private val idleStopDebouncer = IdleStopDebouncer(
@@ -961,13 +962,6 @@ class NelomaiVpnService : GoBackend.VpnService() {
         } else {
             emptyList()
         }
-        AndroidSplitTunnel.replaceVpnRoutes(
-            AndroidSplitTunnel.mergeExcludedRoutes(options.excludedRoutes, localRoutes),
-            options.dnsServers,
-        )
-        setUnderlyingNetworks(
-            physicalState.networks.toTypedArray().takeIf { it.isNotEmpty() },
-        )
         val native = ServiceRedundantConnectionNative(
             backend = RedundantNativeBackend(
                 JniRedundantNativeApi(applicationContext),
@@ -1014,15 +1008,124 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 AutomaticDiagnostics.onRedundantEvent(event, native.diagnosticMetrics())
             },
             expectedStartOperationId = transaction.startOperationId,
+            mutationFence = redundantMutationFence,
         )
-        installRedundantVpnOwner(coordinator, transaction.startOperationId)
-        redundantPhysicalNetworks?.stop()
-        redundantPhysicalNetworks = PhysicalNetworks(applicationContext).also { monitor ->
-            monitor.start { state ->
-                setPhysicalNetworks(state.networks, state.validated)
+        val callbackIdentity = RedundantPhysicalNetworkCallbackIdentity(
+            serviceGeneration = serviceGeneration,
+            startOperationId = transaction.startOperationId,
+        )
+        var previousOwner: RedundantVpnProcessOwner? = null
+        restoreHandler.removeCallbacks(redundantHealthTick)
+        val installed = redundantMutationFence.runIfActive(transaction.startOperationId) {
+            AndroidSplitTunnel.replaceVpnRoutes(
+                AndroidSplitTunnel.mergeExcludedRoutes(options.excludedRoutes, localRoutes),
+                options.dnsServers,
+            )
+            setUnderlyingNetworks(
+                physicalState.networks.toTypedArray().takeIf { it.isNotEmpty() },
+            )
+            previousOwner = redundantVpnOwnerSlot.install(
+                coordinator,
+                transaction.startOperationId,
+            )?.owner
+            redundantPhysicalNetworks?.stop()
+            redundantPhysicalNetworks = PhysicalNetworks(applicationContext).also { monitor ->
+                monitor.start { state ->
+                    applyRedundantPhysicalNetworks(callbackIdentity, state)
+                }
             }
+            true
+        }
+        if (installed) {
+            if (previousOwner !== coordinator) runCatching { previousOwner?.closeLocal() }
+            restoreHandler.post(redundantHealthTick)
         }
         return coordinator to native
+    }
+
+    private fun applyRedundantPhysicalNetworks(
+        identity: RedundantPhysicalNetworkCallbackIdentity,
+        state: PhysicalNetworkState,
+    ) {
+        identity.applyIfCurrent(
+            mutationFence = redundantMutationFence,
+            currentServiceGeneration = serviceGeneration,
+            installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId,
+            pendingStop = pendingRedundantStop != null,
+            tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+        ) {
+            candidateProbeCache.invalidateNetwork()
+            setUnderlyingNetworks(state.networks.toTypedArray().takeIf { it.isNotEmpty() })
+            redundantWork.network(state.validated) { latestValidated ->
+                if (!identity.isCurrent(
+                    currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+                    installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId,
+                    pendingStop = pendingRedundantStop != null,
+                    tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+                )) return@network
+                val transaction = activeRedundantTransactionForWork(
+                    recovery = recoveryStore.read(),
+                    expectedStartOperationId = identity.startOperationId,
+                    pendingStop = pendingRedundantStop != null,
+                    tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+                )
+                if (transaction != null &&
+                    redundantOwnerForOperation(transaction.startOperationId)
+                        ?.onUnderlyingNetworkChanged(latestValidated) != true
+                ) {
+                    TunnelLog.warning("redundant.network_change_failed")
+                }
+            }
+        }
+    }
+
+    private fun applyPluginPhysicalNetworks(
+        networks: List<Network>,
+        validated: Boolean,
+    ) {
+        val installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId
+        val apply = {
+            if (redundantVpnOwnerSlot.snapshot()?.startOperationId != installedStartOperationId ||
+                redundantCleanupBlocksNewStarts(
+                    pendingStop = pendingRedundantStop != null,
+                    tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+                )
+            ) {
+                false
+            } else {
+                candidateProbeCache.invalidateNetwork()
+                setUnderlyingNetworks(networks.toTypedArray().takeIf { it.isNotEmpty() })
+                redundantWork.network(validated) { latestValidated ->
+                    val recovery = recoveryStore.read()
+                    if (!shouldEnterLegacyVpnRecovery(recovery)) {
+                        val transaction = activeRedundantTransactionForWork(
+                            recovery = recovery,
+                            expectedStartOperationId = installedStartOperationId,
+                            pendingStop = pendingRedundantStop != null,
+                            tombstoneUnreadable = redundantCancelTombstoneUnreadable,
+                        )
+                        val changed = transaction?.let {
+                            redundantOwnerForOperation(it.startOperationId)
+                                ?.onUnderlyingNetworkChanged(latestValidated)
+                        } == true
+                        if (transaction != null && !changed) {
+                            TunnelLog.warning("redundant.network_change_failed")
+                        }
+                    } else {
+                        restoreHandler.post {
+                            if (QuickTunnelController.desiredActive(applicationContext)) {
+                                runCatching {
+                                    AutomaticDiagnostics.onConnectionIntentNetworkWakeup()
+                                }
+                                scheduleConnectionIntentAttempt()
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        }
+        redundantMutationFence.runIfActive(installedStartOperationId, apply)
     }
 
     private fun ensureRedundantCoordinator(
@@ -1083,6 +1186,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             schedulePendingRedundantStopRetry()
             return false
         }
+        redundantMutationFence.cancel(startOperationId)
         val pending = existing?.copy(
             owner = existing.owner ?: owner,
             localClosed = if (existing.owner == null && owner != null) {
@@ -3384,43 +3488,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
 
         fun setPhysicalNetworks(networks: List<Network>, validated: Boolean) {
-            activeService?.run {
-                candidateProbeCache.invalidateNetwork()
-                setUnderlyingNetworks(networks.toTypedArray().takeIf { it.isNotEmpty() })
-                if (redundantCleanupBlocksNewStarts(
-                        pendingStop = pendingRedundantStop != null,
-                        tombstoneUnreadable = redundantCancelTombstoneUnreadable,
-                    )
-                ) return@run
-                redundantWork.network(validated) { latestValidated ->
-                    val recovery = recoveryStore.read()
-                    if (!shouldEnterLegacyVpnRecovery(recovery)) {
-                        val transaction = activeRedundantTransactionForWork(
-                            recovery = recovery,
-                            expectedStartOperationId = null,
-                            pendingStop = pendingRedundantStop != null,
-                            tombstoneUnreadable = redundantCancelTombstoneUnreadable,
-                        )
-                        val changed = transaction?.let {
-                            redundantOwnerForOperation(it.startOperationId)
-                                ?.onUnderlyingNetworkChanged(latestValidated)
-                        } == true
-                        if (transaction != null && !changed) {
-                            TunnelLog.warning("redundant.network_change_failed")
-                        }
-                    } else {
-                        restoreHandler.post {
-                            if (QuickTunnelController.desiredActive(applicationContext)) {
-                                runCatching {
-                                    AutomaticDiagnostics.onConnectionIntentNetworkWakeup()
-                                }
-                                scheduleConnectionIntentAttempt()
-                            }
-                        }
-                    }
-                }
-                Unit
-            }
+            activeService?.applyPluginPhysicalNetworks(networks, validated)
         }
 
         private fun quickActionError(code: String): String = when (code) {

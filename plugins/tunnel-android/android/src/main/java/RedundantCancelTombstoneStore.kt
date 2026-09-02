@@ -201,6 +201,42 @@ internal fun activeRedundantTransactionForWork(
     }
 }
 
+internal data class RedundantPhysicalNetworkCallbackIdentity(
+    val serviceGeneration: Long,
+    val startOperationId: String,
+) {
+    fun isCurrent(
+        currentServiceGeneration: Long,
+        installedStartOperationId: String?,
+        pendingStop: Boolean,
+        tombstoneUnreadable: Boolean,
+    ): Boolean = serviceGeneration == currentServiceGeneration &&
+        startOperationId == installedStartOperationId &&
+        !redundantCleanupBlocksNewStarts(pendingStop, tombstoneUnreadable)
+
+    fun applyIfCurrent(
+        mutationFence: RedundantOperationMutationFence,
+        currentServiceGeneration: Long,
+        installedStartOperationId: String?,
+        pendingStop: Boolean,
+        tombstoneUnreadable: Boolean,
+        action: () -> Unit,
+    ): Boolean = mutationFence.runIfActive(startOperationId) {
+        if (isCurrent(
+                currentServiceGeneration,
+                installedStartOperationId,
+                pendingStop,
+                tombstoneUnreadable,
+            )
+        ) {
+            action()
+            true
+        } else {
+            false
+        }
+    }
+}
+
 internal fun shouldAcknowledgeRedundantQuickStop(
     tombstonePersisted: Boolean,
 ): Boolean = tombstonePersisted

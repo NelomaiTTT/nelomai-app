@@ -458,6 +458,55 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun delayedPhysicalNetworkCallbackCannotMutateAReplacementServiceOrOwner() {
+        val mutationFence = RedundantOperationMutationFence()
+        val callback = RedundantPhysicalNetworkCallbackIdentity(
+            serviceGeneration = 7,
+            startOperationId = "start-a",
+        )
+        var mutations = 0
+
+        assertFalse(callback.applyIfCurrent(
+            mutationFence = mutationFence,
+            currentServiceGeneration = 8,
+            installedStartOperationId = "start-a",
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ) { mutations += 1 })
+        assertFalse(callback.applyIfCurrent(
+            mutationFence = mutationFence,
+            currentServiceGeneration = 7,
+            installedStartOperationId = "start-b",
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ) { mutations += 1 })
+        assertFalse(callback.applyIfCurrent(
+            mutationFence = mutationFence,
+            currentServiceGeneration = 7,
+            installedStartOperationId = "start-a",
+            pendingStop = true,
+            tombstoneUnreadable = false,
+        ) { mutations += 1 })
+        assertTrue(callback.applyIfCurrent(
+            mutationFence = mutationFence,
+            currentServiceGeneration = 7,
+            installedStartOperationId = "start-a",
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ) { mutations += 1 })
+        mutationFence.cancel("start-a")
+        assertFalse(callback.applyIfCurrent(
+            mutationFence = mutationFence,
+            currentServiceGeneration = 7,
+            installedStartOperationId = "start-a",
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ) { mutations += 1 })
+
+        assertEquals(1, mutations)
+    }
+
+    @Test
     fun failedCancelTombstoneWriteCannotBeAcknowledgedAcrossProcessRecreation() {
         val backend = ServiceCancelTombstoneBackend().apply { writeSucceeds = false }
         val first = RedundantCancelTombstoneStore(backend) { "stop-operation-a" }
