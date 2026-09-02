@@ -648,6 +648,24 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun staleRedundantCleanupCannotFenceAReplacementTransaction() {
+        val store = store(FakeEncryptedRecordBackend())
+        store.beginRedundant(redundantTransaction("v2-start-b")).success()
+
+        val rejected = store.deferRedundantStop(
+            expectedStartOperationId = "v2-start-a",
+            stopOperationId = "v2-stop-a",
+        ).failure()
+        val current = requireNotNull(store.read().success().redundantTransaction)
+
+        assertEquals("redundant_recovery_generation_conflict", rejected.code)
+        assertEquals("v2-start-b", current.startOperationId)
+        assertTrue(current.desiredActive)
+        assertNull(current.stopOperationId)
+        assertEquals(RedundantStopState.NONE, current.retry.stopState)
+    }
+
+    @Test
     fun cleanupBlocksANewStartUntilTheTransactionIsConfirmedTerminal() {
         val backend = FakeEncryptedRecordBackend()
         val store = store(backend)
@@ -690,6 +708,20 @@ class AndroidRecoveryStoreTest {
         startOperationId = "start-operation",
         contractVersion = 1,
         requestFingerprint = "fingerprint",
+    )
+
+    private fun redundantTransaction(startOperationId: String) = AndroidRedundantTransaction(
+        desiredActive = true,
+        template = template(),
+        sessionId = "22222222-2222-4222-8222-222222222222",
+        slotALeaseId = "lease-a",
+        slotBLeaseId = "lease-b",
+        localActiveLeaseId = "lease-a",
+        standbyDesired = true,
+        roleGeneration = 0,
+        membershipGeneration = 0,
+        startOperationId = startOperationId,
+        startRequestFingerprint = "v2-fingerprint",
     )
 }
 

@@ -616,6 +616,40 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun staleCoordinatorCannotRevokeAReplacementTransaction() {
+        val backend = CoordinatorRecordBackend()
+        val original = transaction()
+        backend.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope(
+            formatVersion = ANDROID_RECOVERY_FORMAT,
+            intent = AndroidConnectionIntent.empty(1),
+            leaseTransaction = null,
+            redundantTransaction = original,
+        )))
+        val store = AndroidRecoveryStore(backend, CoordinatorBootIdentity())
+        val panel = FakePanel()
+        val native = FakeNative()
+        val stale = RedundantConnectionCoordinator(
+            store = store,
+            panel = panel,
+            native = native,
+            expectedStartOperationId = original.startOperationId,
+        )
+        val replacement = original.copy(startOperationId = "replacement-start-operation")
+        backend.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope(
+            formatVersion = ANDROID_RECOVERY_FORMAT,
+            intent = AndroidConnectionIntent.empty(1),
+            leaseTransaction = null,
+            redundantTransaction = replacement,
+        )))
+
+        assertFalse(stale.revoke())
+        assertEquals(0, native.stopCalls)
+        assertEquals(0, panel.stopCalls)
+        val durable = store.read() as RecoveryStoreResult.Success
+        assertEquals(replacement, durable.value.redundantTransaction)
+    }
+
+    @Test
     fun roleRebaseAdoptsCanonicalGenerationsWithoutRollingBackLocalDataplaneActive() {
         val panel = FakePanel(role = RedundantRoleResponse(
             action = "rebase",

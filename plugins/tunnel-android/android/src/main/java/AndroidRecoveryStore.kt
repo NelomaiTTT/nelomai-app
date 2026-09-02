@@ -685,6 +685,7 @@ internal class AndroidRecoveryStore(
 
     /** Persists only recovery-v2 control state; callers must never pass configuration bytes. */
     fun updateRedundant(
+        expectedStartOperationId: String? = null,
         update: (AndroidRedundantTransaction) -> AndroidRedundantTransaction,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
@@ -692,6 +693,13 @@ internal class AndroidRecoveryStore(
         val current = (currentResult as RecoveryStoreResult.Success).value
         val transaction = current.redundantTransaction
             ?: return@synchronized RecoveryStoreResult.Failure("redundant_recovery_not_found")
+        if (expectedStartOperationId != null &&
+            transaction.startOperationId != expectedStartOperationId
+        ) {
+            return@synchronized RecoveryStoreResult.Failure(
+                "redundant_recovery_generation_conflict",
+            )
+        }
         try {
             persist(current.copy(redundantTransaction = update(transaction)))
         } catch (_: Throwable) {
@@ -724,13 +732,16 @@ internal class AndroidRecoveryStore(
 
     fun completeRedundantStop(
         stopOperationId: String,
+        expectedStartOperationId: String? = null,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
         val current = (currentResult as RecoveryStoreResult.Success).value
         val transaction = current.redundantTransaction
             ?: return@synchronized RecoveryStoreResult.Success(current)
-        if (transaction.desiredActive || transaction.stopOperationId != stopOperationId ||
+        if ((expectedStartOperationId != null &&
+                transaction.startOperationId != expectedStartOperationId) ||
+            transaction.desiredActive || transaction.stopOperationId != stopOperationId ||
             transaction.retry.stopState != RedundantStopState.ACKNOWLEDGED
         ) {
             return@synchronized RecoveryStoreResult.Failure("redundant_stop_not_acknowledged")
@@ -740,7 +751,10 @@ internal class AndroidRecoveryStore(
 
     fun deferRedundantStop(
         stopOperationId: String,
-    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = updateRedundant { transaction ->
+        expectedStartOperationId: String? = null,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = updateRedundant(
+        expectedStartOperationId,
+    ) { transaction ->
         transaction.copy(
             desiredActive = false,
             stopOperationId = transaction.stopOperationId ?: stopOperationId.also(

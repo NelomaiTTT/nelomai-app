@@ -414,6 +414,67 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun delayedRedundantWorkerRejectsCleanupDisarmedAndReplacementTransactions() {
+        val active = serviceV2Envelope()
+        val startOperationId = requireNotNull(active.redundantTransaction).startOperationId
+        var actions = 0
+
+        assertNull(activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active),
+            expectedStartOperationId = startOperationId,
+            pendingStop = true,
+            tombstoneUnreadable = false,
+        ))
+        assertNull(activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active),
+            expectedStartOperationId = startOperationId,
+            pendingStop = false,
+            tombstoneUnreadable = true,
+        ))
+        assertNull(activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active.copy(
+                redundantTransaction = requireNotNull(active.redundantTransaction).copy(
+                    desiredActive = false,
+                ),
+            )),
+            expectedStartOperationId = startOperationId,
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ))
+        assertNull(activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active),
+            expectedStartOperationId = "replacement-operation",
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        ))
+        activeRedundantTransactionForWork(
+            recovery = RecoveryStoreResult.Success(active),
+            expectedStartOperationId = startOperationId,
+            pendingStop = false,
+            tombstoneUnreadable = false,
+        )?.let { actions += 1 }
+
+        assertEquals(1, actions)
+    }
+
+    @Test
+    fun failedCancelTombstoneWriteCannotBeAcknowledgedAcrossProcessRecreation() {
+        val backend = ServiceCancelTombstoneBackend().apply { writeSucceeds = false }
+        val first = RedundantCancelTombstoneStore(backend) { "stop-operation-a" }
+
+        val persisted = first.persist("start-operation-a")
+        val recreated = RedundantCancelTombstoneStore(backend)
+
+        assertEquals(
+            RecoveryStoreResult.Failure("redundant_cancel_tombstone_conflict"),
+            persisted,
+        )
+        assertEquals(RecoveryStoreResult.Success(null), recreated.read())
+        assertFalse(shouldAcknowledgeRedundantQuickStop(tombstonePersisted = false))
+        assertTrue(shouldAcknowledgeRedundantQuickStop(tombstonePersisted = true))
+    }
+
+    @Test
     fun connectionIntentCallbacksCannotPublishStateDuringRedundantOwnershipOrCleanup() {
         assertFalse(shouldApplyConnectionIntentStep(
             pendingStop = true,
@@ -5045,11 +5106,13 @@ private class ServiceRecoveryBackend : EncryptedRecordBackend {
 
 private class ServiceCancelTombstoneBackend : RedundantCancelTombstoneBackend {
     var record: String? = null
+    var writeSucceeds: Boolean = true
 
     override fun read(): String? = record
 
     override fun compareAndWrite(expected: String?, value: String): Boolean {
         if (record != expected) return false
+        if (!writeSucceeds) return false
         record = value
         return true
     }

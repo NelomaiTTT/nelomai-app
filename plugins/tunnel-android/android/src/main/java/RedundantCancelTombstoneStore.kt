@@ -184,6 +184,27 @@ internal fun redundantCleanupBlocksNewStarts(
     tombstoneUnreadable: Boolean,
 ): Boolean = pendingStop || tombstoneUnreadable
 
+internal fun activeRedundantTransactionForWork(
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    expectedStartOperationId: String?,
+    pendingStop: Boolean,
+    tombstoneUnreadable: Boolean,
+): AndroidRedundantTransaction? {
+    if (redundantCleanupBlocksNewStarts(pendingStop, tombstoneUnreadable)) return null
+    val transaction = (recovery as? RecoveryStoreResult.Success)
+        ?.value?.redundantTransaction ?: return null
+    if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
+        return null
+    }
+    return transaction.takeIf {
+        expectedStartOperationId == null || it.startOperationId == expectedStartOperationId
+    }
+}
+
+internal fun shouldAcknowledgeRedundantQuickStop(
+    tombstonePersisted: Boolean,
+): Boolean = tombstonePersisted
+
 internal fun shouldApplyConnectionIntentStep(
     pendingStop: Boolean,
     tombstoneUnreadable: Boolean,

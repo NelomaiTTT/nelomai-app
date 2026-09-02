@@ -181,6 +181,7 @@ internal class RedundantConnectionCoordinator(
     private val healthMonitor: RedundantHealthMonitor = RedundantHealthMonitor(),
     private val onReserveStateChanged: (RedundantReserveState?) -> Unit = {},
     private val onDiagnosticEvent: (RedundantDiagnosticEvent) -> Unit = {},
+    expectedStartOperationId: String? = null,
     private val onAllSlotsStalled: () -> Unit = {},
 ) : RedundantVpnProcessOwner {
     private val gate = Any()
@@ -190,9 +191,19 @@ internal class RedundantConnectionCoordinator(
     @Volatile private var failoverActive = false
     private var pendingPrimaryReadiness: PendingPrimaryReadiness? = null
     private var primaryReadinessFailed = false
+    private var boundStartOperationId: String? = expectedStartOperationId
 
-    fun status(): AndroidRedundantTransaction? =
-        (store.read() as? RecoveryStoreResult.Success)?.value?.redundantTransaction
+    fun status(): AndroidRedundantTransaction? = synchronized(gate) {
+        val transaction = (store.read() as? RecoveryStoreResult.Success)
+            ?.value?.redundantTransaction ?: return@synchronized null
+        val expected = boundStartOperationId
+        if (expected == null) {
+            boundStartOperationId = transaction.startOperationId
+            transaction
+        } else {
+            transaction.takeIf { it.startOperationId == expected }
+        }
+    }
 
     override fun isRunning(): Boolean = recoveryStarted
 
@@ -211,6 +222,9 @@ internal class RedundantConnectionCoordinator(
         onPrimaryFailed: () -> Unit = {},
         onPrimaryCancelled: () -> Unit = {},
     ): Boolean = synchronized(gate) {
+        val expected = boundStartOperationId
+        if (expected != null && expected != transaction.startOperationId) return@synchronized false
+        boundStartOperationId = transaction.startOperationId
         val active = transaction.localActiveLeaseId ?: return@synchronized false
         val activeConfiguration = configurations[active] ?: return@synchronized false
         if (store.beginRedundant(transaction) !is RecoveryStoreResult.Success) return@synchronized false
@@ -845,7 +859,10 @@ internal class RedundantConnectionCoordinator(
     /** Serialized durable stop barrier; production callers dispatch it on redundant work. */
     override fun fenceRevoke(): Boolean = synchronized(gate) {
         val transaction = status() ?: return false
-        val fenced = store.deferRedundantStop(transaction.stopOperationId ?: operationId()) is
+        val fenced = store.deferRedundantStop(
+            stopOperationId = transaction.stopOperationId ?: operationId(),
+            expectedStartOperationId = transaction.startOperationId,
+        ) is
             RecoveryStoreResult.Success
         if (fenced) {
             val pending = pendingPrimaryReadiness
@@ -862,7 +879,10 @@ internal class RedundantConnectionCoordinator(
 
     /** Idempotent best-effort cleanup; callers run it on the dedicated redundant executor. */
     override fun revoke(): Boolean = synchronized(gate) {
-        val beforeFence = status() ?: return@synchronized true
+        val beforeFence = status() ?: return@synchronized when (val current = store.read()) {
+            is RecoveryStoreResult.Failure -> false
+            is RecoveryStoreResult.Success -> current.value.redundantTransaction == null
+        }
         if ((beforeFence.desiredActive || beforeFence.retry.stopState == RedundantStopState.NONE) &&
             !fenceRevoke()
         ) {
@@ -874,7 +894,10 @@ internal class RedundantConnectionCoordinator(
         if (!localStopped || !panelStopped) return@synchronized false
         val acknowledged = pending.copy(retry = pending.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
         if (!persist(acknowledged)) return@synchronized false
-        store.completeRedundantStop(requireNotNull(acknowledged.stopOperationId)) is RecoveryStoreResult.Success
+        store.completeRedundantStop(
+            stopOperationId = requireNotNull(acknowledged.stopOperationId),
+            expectedStartOperationId = acknowledged.startOperationId,
+        ) is RecoveryStoreResult.Success
     }
 
     override fun closeLocal(): Boolean = synchronized(gate) {
@@ -888,7 +911,7 @@ internal class RedundantConnectionCoordinator(
     }
 
     private fun persist(transaction: AndroidRedundantTransaction): Boolean {
-        val result = store.updateRedundant { current ->
+        val result = store.updateRedundant(transaction.startOperationId) { current ->
             // A stop fence is monotonic. Work that began before the fence may finish, but its
             // stale snapshot must never make the session desired/active again.
             if (!current.desiredActive || current.retry.stopState != RedundantStopState.NONE) {
