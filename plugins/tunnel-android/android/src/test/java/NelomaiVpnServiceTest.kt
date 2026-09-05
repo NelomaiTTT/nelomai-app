@@ -17,6 +17,106 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun exhaustionDistinguishesUnreadableLogoutFromKnownPendingLogout() {
+        val backend = ServiceRecoveryBackend().apply { readFails = true }
+        val coordinator = coordinator(recoveryStore(backend))
+        for (logout in listOf(BackgroundLogoutReadState.UNREADABLE, BackgroundLogoutReadState.PENDING)) {
+            val lifecycle = ConnectionIntentServiceLifecycle(
+                coordinator,
+                logoutState = { logout },
+                schedule = {},
+            )
+            assertEquals(
+                logout == BackgroundLogoutReadState.PENDING,
+                shouldRequestConnectionIntentServiceRecovery(
+                    currentOwner = null,
+                    owner = Any(),
+                    ownerOpen = false,
+                    force = true,
+                    hasPendingWork = lifecycle.hasPendingWork(),
+                    recoveryUnreadable = true,
+                    unreadableRetriesExhausted = true,
+                    knownPendingWork = lifecycle.hasKnownPendingWork(),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun unreadableDestroyHandsOffCleanupRemovedFromExecutorQueue() {
+        val backend = ServiceRecoveryBackend()
+        val store = recoveryStore(backend)
+        val coordinator = coordinator(store)
+        coordinator.begin(template())
+        coordinator.cancelCurrent()
+        requireNotNull(store.load().leaseTransaction)
+        val lifecycle = ConnectionIntentServiceLifecycle(coordinator) {}
+        val executor = Executors.newSingleThreadExecutor()
+        val occupied = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val attempts = AtomicInteger(0)
+        val rejections = AtomicInteger(0)
+        try {
+            executor.execute {
+                occupied.countDown()
+                try { release.await() } catch (_: InterruptedException) { }
+            }
+            assertTrue(occupied.await(2, TimeUnit.SECONDS))
+            val dispatcher = AndroidConnectionIntentAttemptDispatcher(
+                execute = executor::execute,
+                persistedDelayMillis = { 0L },
+                scheduleAfter = {},
+                attempt = { attempts.incrementAndGet() },
+                onRejected = { rejections.incrementAndGet() },
+            )
+            dispatcher.request()
+            backend.readFails = true
+            val requestSuccessor = shouldRequestConnectionIntentServiceRecovery(
+                currentOwner = null,
+                owner = Any(),
+                ownerOpen = false,
+                force = false,
+                hasPendingWork = lifecycle.hasPendingWork(),
+                recoveryUnreadable = store.read() is RecoveryStoreResult.Failure,
+            )
+            assertEquals(1, executor.shutdownNow().size)
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+            assertEquals(0, attempts.get())
+            assertEquals(0, rejections.get())
+            assertTrue(requestSuccessor)
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun exhaustedUnreadableSuccessorDoesNotRestartFromLateCallback() {
+        assertFalse(
+            shouldRequestConnectionIntentServiceRecovery(
+                currentOwner = null,
+                owner = Any(),
+                ownerOpen = false,
+                force = true,
+                hasPendingWork = false,
+                recoveryUnreadable = true,
+                unreadableRetriesExhausted = true,
+            ),
+        )
+        assertTrue(
+            shouldRequestConnectionIntentServiceRecovery(
+                currentOwner = null,
+                owner = Any(),
+                ownerOpen = false,
+                force = false,
+                hasPendingWork = true,
+                recoveryUnreadable = false,
+                unreadableRetriesExhausted = true,
+            ),
+        )
+    }
+
+    @Test
     fun executorShutdownDuringTileStopDoesNotEscape() {
         val executor = Executors.newSingleThreadExecutor()
         var attempts = 0
@@ -6776,8 +6876,10 @@ private class ServiceRecoveryBackend : EncryptedRecordBackend {
     private var replacementRecord: ByteArray? = null
     var readCount: Int = 0
     var writeSucceeds: Boolean = true
+    var readFails: Boolean = false
 
     override fun read(): ByteArray? {
+        if (readFails) error("test_recovery_store_unreadable")
         readCount += 1
         val current = record?.copyOf()
         if (readCount == replaceAfterReadCount) {

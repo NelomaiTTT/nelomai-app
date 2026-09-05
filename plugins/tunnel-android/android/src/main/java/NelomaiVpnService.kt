@@ -790,6 +790,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private val logoutRetry = Runnable { scheduleLogoutAttempt() }
     private val unreadableRecoveryRetry = Runnable { retryUnreadableRecoveryStore() }
     private var unreadableRecoveryRetryAttempt = 0
+    @Volatile
+    private var unreadableRecoveryRetriesExhausted = false
 
     override fun getBuilder(): VpnService.Builder =
         object : VpnService.Builder() {
@@ -3328,7 +3330,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         ) {
             return
         }
-        if (runCatching { connectionIntentLifecycle.hasPendingWork() }.getOrDefault(true)) {
+        if (hasPendingOrUnknownRecoveryWork()) {
             return
         }
         TunnelLog.info(
@@ -3346,7 +3348,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 activeService != null ||
                 TunnelRuntime.state() != SessionState.STOPPED ||
                 QuickTunnelController.desiredActive(applicationContext) ||
-                runCatching { connectionIntentLifecycle.hasPendingWork() }.getOrDefault(true)
+                hasPendingOrUnknownRecoveryWork()
             ) {
                 return@Runnable
             }
@@ -3679,12 +3681,16 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun handleEnsureRunning() {
+        unreadableRecoveryRetriesExhausted = false
         handleEnsureRunning(recoveryStore.read())
     }
 
     private fun handleEnsureRunning(
         recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
     ) {
+        if (recovery is RecoveryStoreResult.Success) {
+            unreadableRecoveryRetriesExhausted = false
+        }
         routeAndroidEnsureRunning(
             recovery = recovery,
             route = {
@@ -3731,6 +3737,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             RESTORE_RETRY_DELAYS_MILLIS,
         ) ?: run {
             unreadableRecoveryRetryAttempt = 0
+            unreadableRecoveryRetriesExhausted = true
             TunnelLog.warning("service.recovery_store_unavailable")
             stopIfIdle()
             return
@@ -4144,12 +4151,20 @@ class NelomaiVpnService : GoBackend.VpnService() {
         val currentOwner = activeService
         val hasPendingWork = runCatching { connectionIntentLifecycle.hasPendingWork() }
             .getOrDefault(false)
+        val recoveryUnreadable = runCatching {
+            recoveryStore.read() is RecoveryStoreResult.Failure
+        }.getOrDefault(true)
         if (!shouldRequestConnectionIntentServiceRecovery(
                 currentOwner = currentOwner,
                 owner = this,
                 ownerOpen = serviceCallbackGate.isOpen(),
                 force = force,
                 hasPendingWork = hasPendingWork,
+                recoveryUnreadable = recoveryUnreadable,
+                unreadableRetriesExhausted = unreadableRecoveryRetriesExhausted,
+                knownPendingWork = runCatching {
+                    connectionIntentLifecycle.hasKnownPendingWork()
+                }.getOrDefault(false),
             )
         ) return
         TunnelLog.info("service.recovery_owner_requested", mapOf("reason" to reason))
@@ -4168,6 +4183,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
         serviceCallbackGate.close()
         if (activeService === this) activeService = null
     }
+
+    private fun hasPendingOrUnknownRecoveryWork(): Boolean = runCatching {
+        recoveryStore.read() is RecoveryStoreResult.Failure ||
+            connectionIntentLifecycle.hasPendingWork()
+    }.getOrDefault(true)
 
     private inner class ServiceConnectionIntentPanel : AndroidConnectionIntentPanel {
         override fun reconcile(
@@ -5434,10 +5454,16 @@ internal fun shouldRequestConnectionIntentServiceRecovery(
     ownerOpen: Boolean,
     force: Boolean,
     hasPendingWork: Boolean,
+    recoveryUnreadable: Boolean = false,
+    unreadableRetriesExhausted: Boolean = false,
+    knownPendingWork: Boolean = hasPendingWork,
 ): Boolean {
     if (currentOwner != null && currentOwner !== owner) return false
     if (currentOwner === owner && ownerOpen) return false
-    if (!force && !hasPendingWork) return false
+    // Exhaustion ends this unknown-state recovery episode, including late callbacks.
+    // Known pending work must still be handed off if storage becomes readable again.
+    if (recoveryUnreadable && unreadableRetriesExhausted && !knownPendingWork) return false
+    if (!force && !hasPendingWork && !recoveryUnreadable) return false
     return true
 }
 
@@ -5543,6 +5569,9 @@ internal class ConnectionIntentServiceLifecycle(
 
     fun hasPendingWork(): Boolean =
         logoutState() != BackgroundLogoutReadState.NONE || hasDurableWork()
+
+    fun hasKnownPendingWork(): Boolean =
+        logoutState() == BackgroundLogoutReadState.PENDING || hasDurableWork()
 
     fun hasPendingConnectionWork(): Boolean = hasDurableWork()
 
