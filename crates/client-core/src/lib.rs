@@ -45,6 +45,35 @@ pub trait RuntimeAuthProvider: Send + Sync {
     async fn logout(&self) -> Result<(), CoreError>;
 }
 
+/// The actual Core writer gates, shared with the common owner before Core is
+/// constructed. This is not a cross-process lock or a logout prerequisite.
+#[derive(Default)]
+pub struct RuntimeWriterGates {
+    lifecycle: Arc<Mutex<()>>,
+    intent: Arc<Mutex<()>>,
+    split: Arc<Mutex<()>>,
+    connection: Arc<Mutex<()>>,
+}
+pub struct RuntimeWriterQuiescence {
+    _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    _intent: tokio::sync::OwnedMutexGuard<()>,
+    _split: tokio::sync::OwnedMutexGuard<()>,
+    _connection: tokio::sync::OwnedMutexGuard<()>,
+}
+impl RuntimeWriterGates {
+    pub async fn quiesce(&self) -> RuntimeWriterQuiescence {
+        RuntimeWriterQuiescence {
+            _lifecycle: self.lifecycle.clone().lock_owned().await,
+            _intent: self.intent.clone().lock_owned().await,
+            _split: self.split.clone().lock_owned().await,
+            _connection: self.connection.clone().lock_owned().await,
+        }
+    }
+    pub fn lifecycle(&self) -> Arc<Mutex<()>> {
+        self.lifecycle.clone()
+    }
+}
+
 /// Construct before the broker and Core. It owns only local cancellation and
 /// presentation, and never waits for authentication or lifecycle gates. It does
 /// not erase operational cleanup references or assert remote cleanup success.
@@ -53,6 +82,7 @@ pub struct CoreLocalStop<T> {
     state: Arc<Mutex<CoreState>>,
     epoch: Arc<AtomicU64>,
     wake: Arc<Notify>,
+    writers: Arc<RuntimeWriterGates>,
 }
 impl<T: TunnelController> CoreLocalStop<T> {
     pub fn new(tunnel: Arc<T>) -> Arc<Self> {
@@ -61,7 +91,11 @@ impl<T: TunnelController> CoreLocalStop<T> {
             state: Arc::new(Mutex::new(CoreState::default())),
             epoch: Arc::new(AtomicU64::new(0)),
             wake: Arc::new(Notify::new()),
+            writers: Arc::new(RuntimeWriterGates::default()),
         })
+    }
+    pub fn runtime_writer_gates(&self) -> Arc<RuntimeWriterGates> {
+        self.writers.clone()
     }
     pub async fn stop_local(&self) -> Result<(), CoreError> {
         self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -1182,15 +1216,16 @@ pub struct ClientCore<A, S, T, L> {
     logger: Arc<L>,
     auth: Arc<dyn RuntimeAuthProvider>,
     state: Arc<Mutex<CoreState>>,
-    intent_recovery_gate: Mutex<()>,
+    intent_recovery_gate: Arc<Mutex<()>>,
+    runtime_writers: Arc<RuntimeWriterGates>,
     start_cancel_epoch: Arc<AtomicU64>,
     start_in_progress: AtomicBool,
     pending_start_active: AtomicBool,
     start_retry_wake: Arc<Notify>,
     active_recovery_episode: Mutex<Option<ActiveRecoveryEpisode>>,
-    connection_gate: Mutex<()>,
+    connection_gate: Arc<Mutex<()>>,
     split_tunnel_store: Arc<dyn SplitTunnelStore>,
-    split_tunnel_gate: Mutex<()>,
+    split_tunnel_gate: Arc<Mutex<()>>,
     split_tunnel_packages: RwLock<Vec<SplitTunnelSelectedPackage>>,
     split_tunnel_options: Mutex<TunnelOptions>,
     dns_servers: RwLock<Vec<IpAddr>>,
@@ -1244,15 +1279,16 @@ where
             logger,
             auth,
             state: local.state.clone(),
-            intent_recovery_gate: Mutex::new(()),
+            intent_recovery_gate: local.writers.intent.clone(),
+            runtime_writers: local.writers.clone(),
             start_cancel_epoch: local.epoch.clone(),
             start_in_progress: AtomicBool::new(false),
             pending_start_active: AtomicBool::new(pending_start_active),
             start_retry_wake: local.wake.clone(),
             active_recovery_episode: Mutex::new(None),
-            connection_gate: Mutex::new(()),
+            connection_gate: local.writers.connection.clone(),
             split_tunnel_store,
-            split_tunnel_gate: Mutex::new(()),
+            split_tunnel_gate: local.writers.split.clone(),
             split_tunnel_packages: RwLock::new(Vec::new()),
             split_tunnel_options: Mutex::new(TunnelOptions::default()),
             dns_servers: RwLock::new(Vec::new()),
@@ -1268,6 +1304,9 @@ where
     pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
+    }
+    pub fn runtime_writer_gates(&self) -> Arc<RuntimeWriterGates> {
+        self.runtime_writers.clone()
     }
 
     pub fn set_dns_servers(&self, servers: Vec<IpAddr>) {

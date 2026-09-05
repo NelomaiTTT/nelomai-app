@@ -1110,8 +1110,19 @@ async fn logout_fences_failed_policy_stop_without_restoring_connection() {
     })
     .await
     .unwrap();
+    let gates = fixture.core.runtime_writer_gates();
+    let mut admission = Box::pin(gates.quiesce());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut admission)
+            .await
+            .is_err(),
+        "admission must drain the real held split writer"
+    );
     fixture.tunnel.block_stop.store(false, Ordering::SeqCst);
-    fixture.core.sign_out().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), fixture.core.sign_out())
+        .await
+        .expect("logout does not wait for admission")
+        .unwrap();
     let cleanup = fixture.secret_store.load().unwrap().unwrap();
     fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
     fixture.tunnel.stop_release.notify_one();
@@ -1119,6 +1130,9 @@ async fn logout_fences_failed_policy_stop_without_restoring_connection() {
         pending.await.unwrap(),
         Err(CoreError::StartCancelled)
     ));
+    let _quiescence = tokio::time::timeout(std::time::Duration::from_secs(2), admission)
+        .await
+        .unwrap();
     assert_eq!(fixture.core.state().await.phase, Phase::SignedOut);
     assert!(fixture.core.state().await.connection.is_none());
     assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);

@@ -50,6 +50,14 @@ pub enum BrokerAuthState {
     AuthenticationOutcomeUnknown,
 }
 
+/// State and optional access (including its owner scope) from one protected
+/// record under one broker fence. Never pair two independent observations.
+#[derive(Debug)]
+pub struct BrokerObservation {
+    pub state: BrokerAuthState,
+    pub access: Option<AccessSnapshot>,
+}
+
 #[async_trait]
 pub trait LocalAuthStop: Send + Sync {
     async fn stop_local(&self) -> Result<(), BrokerError>;
@@ -223,8 +231,29 @@ impl AuthBroker {
     }
 
     pub async fn auth_state(&self) -> Result<BrokerAuthState, BrokerError> {
+        Ok(self.observe().await?.state)
+    }
+
+    pub async fn observe(&self) -> Result<BrokerObservation, BrokerError> {
         let _state = self.state.lock().await;
         let auth = self.load()?;
+        let state = Self::observed_state(&auth)?;
+        let access = if state == BrokerAuthState::Active {
+            Self::snapshot(&auth).ok()
+        } else {
+            None
+        };
+        Ok(BrokerObservation {
+            state: if state == BrokerAuthState::Active && access.is_none() {
+                BrokerAuthState::RecoveryRequired
+            } else {
+                state
+            },
+            access,
+        })
+    }
+
+    fn observed_state(auth: &AuthStoreV1) -> Result<BrokerAuthState, BrokerError> {
         let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
         if meta.authentication_outcome_unknown {
             return Ok(BrokerAuthState::AuthenticationOutcomeUnknown);

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_updater::{
     DownloadProgress, InstallResult, InstalledUpdate, UpdateBackend, UpdateBackendError,
     UpdateEndpointPolicy,
@@ -46,7 +47,7 @@ impl<R: Runtime> DesktopUpdateBackend<R> {
 impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
     async fn install(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         expected_version: &str,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError> {
@@ -57,14 +58,19 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .endpoint_policy
             .manifest_url(&target, &current_version)
             .map_err(|_| UpdateBackendError::new("invalid_update_endpoint"))?;
-        let updater = self
+        let mut builder = self
             .app
             .updater_builder()
             .pubkey(self.public_key.clone())
             .endpoints(vec![endpoint])
-            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?
-            .header("Authorization", format!("Bearer {access_token}"))
-            .map_err(|_| UpdateBackendError::new("updater_authorization_failed"))?
+            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
+        // The updater carries these same headers into Update.download().
+        for (name, value) in access_token.bearer_headers() {
+            builder = builder
+                .header(name, value)
+                .map_err(|_| UpdateBackendError::new("updater_authorization_failed"))?;
+        }
+        let updater = builder
             .build()
             .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
         let Some(update) = updater

@@ -1287,6 +1287,8 @@ fn stable_error_code(error: &ApplicationError) -> String {
         ApplicationError::Clock => "clock_unavailable".to_string(),
         ApplicationError::Api(error) => api_code(error),
         ApplicationError::Core(error) => match error {
+            CoreError::AuthenticationOutcomeUnknown => "authentication_outcome_unknown".to_string(),
+            CoreError::AuthRecoveryRequired => "auth_recovery_required".to_string(),
             CoreError::SignedOut => "signed_out".to_string(),
             CoreError::AccessExpired => "access_expired".to_string(),
             CoreError::UpdateRequired => "update_required".to_string(),

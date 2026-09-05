@@ -22,6 +22,30 @@ fn identity() -> RuntimeIdentity {
     }
 }
 
+#[test]
+fn captured_bearer_headers_keep_all_identity_fields_for_update_requests() {
+    let snapshot = AccessSnapshot::new(
+        "synthetic-access".into(),
+        identity(),
+        4,
+        "synthetic-family".into(),
+    )
+    .unwrap();
+    let headers = snapshot.bearer_headers();
+    assert_eq!(
+        headers,
+        [
+            ("authorization", "Bearer synthetic-access".into()),
+            ("x-nelomai-app-version", "0.2.16".into()),
+            ("x-nelomai-container-version", "0.2.16".into()),
+            ("x-nelomai-runtime-version", "0.2.15".into()),
+            ("x-nelomai-runtime-contract-version", "1".into()),
+            ("x-nelomai-runtime-slot", "stable".into()),
+            ("x-nelomai-session-generation", "7".into()),
+        ]
+    );
+}
+
 // The real request boundary must encode the panel contract, not just a builder.
 fn server(response: Value) -> (String, mpsc::Receiver<String>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

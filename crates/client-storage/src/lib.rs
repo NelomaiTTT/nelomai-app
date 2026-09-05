@@ -15,6 +15,10 @@ use thiserror::Error;
 
 mod auth;
 mod migration;
+mod owner_lock;
+pub use owner_lock::ContainerOwnerLock;
+mod startup;
+pub use startup::*;
 mod runtime_state;
 mod split_tunnel;
 

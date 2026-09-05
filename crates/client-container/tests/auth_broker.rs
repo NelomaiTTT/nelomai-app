@@ -64,8 +64,12 @@ fn auth_store() -> Arc<dyn AuthStore> {
 
 #[tokio::test]
 async fn runtime_owner_port_binds_trusted_target_and_keeps_migration_credentials_private() {
-    use nelomai_client_container::{OwnerRuntimeAuth, RuntimeClientProfile};
-    use nelomai_client_core::RuntimeAuthProvider;
+    use nelomai_client_container::{OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile};
+    use nelomai_client_core::{RuntimeAuthProvider, RuntimeWriterGates};
+    use nelomai_client_storage::{
+        ProtectedRuntimeStore, RuntimePaths, RuntimeRecordOwner, RuntimeStateStore, RuntimeStateV1,
+        StoredSplitTunnelState,
+    };
     let state = Arc::new(Panel::default());
     let (api, server) = panel(state.clone()).await;
     let store = auth_store();
@@ -76,7 +80,27 @@ async fn runtime_owner_port_binds_trusted_target_and_keeps_migration_credentials
         architecture: "aarch64".into(),
     };
     let target = RuntimeTarget::from_identity(&identity(7));
-    let port = OwnerRuntimeAuth::new(broker.clone(), target.clone(), profile.clone()).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap();
+    let runtime = ProtectedRuntimeStore::new(Record::default(), paths.clone());
+    let mut value = RuntimeStateV1::import_legacy(
+        &StoredAuth::new_install(),
+        StoredSplitTunnelState::default(),
+        &paths,
+    );
+    value.cleanup_only = false;
+    runtime.save(&value).unwrap();
+    let admission = Arc::new(RuntimeCacheAdmission::new(RuntimeRecordOwner::new(runtime)));
+    let writers = Arc::new(RuntimeWriterGates::default());
+    let port = OwnerRuntimeAuth::new(
+        broker.clone(),
+        target.clone(),
+        profile.clone(),
+        admission.clone(),
+        writers.clone(),
+    )
+    .unwrap();
+    port.admit_empty_current().await.unwrap();
     assert_eq!(port.access(None).await.unwrap().identity(), &identity(7));
     let wrong = OwnerRuntimeAuth::new(
         broker,
@@ -85,6 +109,8 @@ async fn runtime_owner_port_binds_trusted_target_and_keeps_migration_credentials
             ..target
         },
         profile,
+        admission,
+        writers,
     )
     .unwrap();
     assert!(wrong.access(None).await.is_err());

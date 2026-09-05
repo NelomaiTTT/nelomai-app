@@ -73,6 +73,29 @@ impl RuntimePaths {
     }
 }
 
+/// Nonsecret provenance issued by the auth owner, not a server family ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAuthScope {
+    pub auth_epoch: u64,
+    pub family: String,
+    pub identity: RuntimeIdentity,
+}
+impl RuntimeAuthScope {
+    pub fn validate(&self) -> Result<(), StorageError> {
+        self.identity
+            .validate()
+            .map_err(|_| StorageError::RecoveryRequired("invalid runtime auth scope"))?;
+        if self.identity.session_generation.is_none()
+            || self.family.is_empty()
+            || self.family.len() > 256
+        {
+            return Err(StorageError::RecoveryRequired("invalid runtime auth scope"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeStateV1 {
@@ -81,6 +104,9 @@ pub struct RuntimeStateV1 {
     pub runtime_version: String,
     /// Imported legacy state is cleanup input, never an adoptable tunnel.
     pub cleanup_only: bool,
+    /// Absent scope is quarantine, never inferred from the currently logged-in user.
+    #[serde(default)]
+    pub auth_scope: Option<RuntimeAuthScope>,
     pub saved_connection: Option<StoredConnection>,
     pub pinned_connection: Option<StoredConnection>,
     pub pending_start: Option<StoredPendingStart>,
@@ -110,6 +136,7 @@ impl RuntimeStateV1 {
             slot: paths.slot,
             runtime_version: paths.version.clone(),
             cleanup_only: true,
+            auth_scope: None,
             saved_connection: auth.saved_connection.clone(),
             pinned_connection: auth.pinned_connection.clone(),
             pending_start: auth.pending_start.clone(),
@@ -122,6 +149,15 @@ impl RuntimeStateV1 {
     pub fn start_or_recovery_allowed(&self) -> bool {
         !self.cleanup_only
     }
+    pub fn operationally_empty(&self) -> bool {
+        self.saved_connection.is_none()
+            && self.pinned_connection.is_none()
+            && self.pending_start.is_none()
+            && self.pending_stalled_stop.is_none()
+            && self.pending_compensation_stop.is_none()
+            && self.compatibility.is_none()
+            && self.applied_split_tunnel == StoredSplitTunnelState::default()
+    }
     /// Called by the broker only after server/local cleanup acknowledgement.
     pub fn complete_legacy_cleanup(&mut self) {
         self.saved_connection = None;
@@ -132,6 +168,7 @@ impl RuntimeStateV1 {
         self.compatibility = None;
         self.applied_split_tunnel = StoredSplitTunnelState::default();
         self.cleanup_only = false;
+        self.auth_scope = None;
     }
     pub(crate) fn project(&self, auth: &crate::AuthStoreV1) -> StoredAuth {
         StoredAuth {
@@ -187,6 +224,41 @@ impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
             owner: self.clone(),
         }
     }
+    pub fn check_scope(&self, scope: &RuntimeAuthScope) -> Result<(), StorageError> {
+        scope.validate()?;
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let current = self.load_required()?;
+        if current.cleanup_only || current.auth_scope.as_ref() != Some(scope) {
+            return Err(StorageError::RecoveryRequired(
+                "runtime cache belongs to another auth scope",
+            ));
+        }
+        Ok(())
+    }
+    /// Owner/control only: caller holds actual runtime-writer quiescence (or
+    /// has not handed the record to any runtime yet). Never called by access reads.
+    pub fn bind_empty_scope(&self, scope: &RuntimeAuthScope) -> Result<(), StorageError> {
+        scope.validate()?;
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let mut current = self.load_required()?;
+        if current.cleanup_only
+            || !current.operationally_empty()
+            || current.slot != scope.identity.slot
+            || current.runtime_version != scope.identity.runtime_version
+        {
+            return Err(StorageError::RecoveryRequired(
+                "runtime cleanup is required before auth admission",
+            ));
+        }
+        current.auth_scope = Some(scope.clone());
+        self.backend.save(&current)
+    }
     fn load_required(&self) -> Result<RuntimeStateV1, StorageError> {
         self.backend
             .load()?
@@ -217,6 +289,7 @@ impl<S: RuntimeStateStore> RuntimeStateStore for RuntimeOperationalStore<S> {
             .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
         let mut current = self.owner.load_required()?;
         if value.schema_version != current.schema_version
+            || value.auth_scope != current.auth_scope
             || value.slot != current.slot
             || value.runtime_version != current.runtime_version
         {
@@ -270,6 +343,16 @@ impl<R: ProtectedRecordStore> ProtectedRuntimeStore<R> {
         Self { record, paths }
     }
     fn validate(&self, value: &RuntimeStateV1) -> Result<(), StorageError> {
+        if let Some(scope) = &value.auth_scope {
+            scope.validate()?;
+            if scope.identity.slot != value.slot
+                || scope.identity.runtime_version != value.runtime_version
+            {
+                return Err(StorageError::RecoveryRequired(
+                    "runtime auth scope target mismatch",
+                ));
+            }
+        }
         if value.schema_version != 1
             || value.slot != self.paths.slot
             || value.runtime_version != self.paths.version

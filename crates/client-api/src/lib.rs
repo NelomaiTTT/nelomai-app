@@ -158,6 +158,44 @@ impl AccessSnapshot {
     pub fn identity(&self) -> &RuntimeIdentity {
         &self.identity
     }
+    /// Complete immutable Bearer/header pair for owner-authorized transports
+    /// such as the native updater. Never log or persist the returned headers.
+    pub fn bearer_headers(&self) -> [(&'static str, String); 7] {
+        [
+            ("authorization", format!("Bearer {}", self.access_token)),
+            (
+                "x-nelomai-app-version",
+                self.identity.container_version.clone(),
+            ),
+            (
+                "x-nelomai-container-version",
+                self.identity.container_version.clone(),
+            ),
+            (
+                "x-nelomai-runtime-version",
+                self.identity.runtime_version.clone(),
+            ),
+            (
+                "x-nelomai-runtime-contract-version",
+                self.identity.runtime_contract_version.to_string(),
+            ),
+            (
+                "x-nelomai-runtime-slot",
+                match self.identity.slot {
+                    RuntimeSlot::Latest => "latest",
+                    RuntimeSlot::Stable => "stable",
+                }
+                .into(),
+            ),
+            (
+                "x-nelomai-session-generation",
+                self.identity
+                    .session_generation
+                    .expect("validated access snapshot has enrolled identity")
+                    .to_string(),
+            ),
+        ]
+    }
     pub fn auth_epoch(&self) -> u64 {
         self.auth_epoch
     }

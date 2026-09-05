@@ -388,7 +388,7 @@ pub struct ClientApplication<A, S, T, L> {
     api: Arc<A>,
     auth: Arc<dyn RuntimeAuthProvider>,
     core: ClientCore<A, S, T, L>,
-    lifecycle_gate: AsyncMutex<()>,
+    lifecycle_gate: Arc<AsyncMutex<()>>,
     probe_gate: AsyncMutex<()>,
     probe_cache: StdMutex<ProbeCache>,
 }
@@ -425,6 +425,7 @@ where
         local: Arc<CoreLocalStop<T>>,
         logger: Arc<L>,
     ) -> Self {
+        let lifecycle_gate = local.runtime_writer_gates().lifecycle();
         let core = ClientCore::with_split_tunnel_store(
             api.clone(),
             store.clone(),
@@ -437,7 +438,7 @@ where
             api,
             auth,
             core,
-            lifecycle_gate: AsyncMutex::new(()),
+            lifecycle_gate,
             probe_gate: AsyncMutex::new(()),
             probe_cache: StdMutex::new(ProbeCache::default()),
         }
@@ -448,8 +449,10 @@ where
         parameters: LoginParameters,
         now_unix: i64,
     ) -> Result<Bootstrap, ApplicationError> {
-        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        // The owner drains the shared lifecycle/Core writers before issuance.
+        // Do not retain this lock while asking the owner to acquire it.
         self.auth.login(parameters).await?;
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.clear_probe_cache()?;
         self.core.bootstrap(now_unix).await.map_err(Into::into)
     }

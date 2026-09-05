@@ -4,10 +4,16 @@ use async_trait::async_trait;
 use nelomai_client_api::{
     AccessSnapshot, LoginRequest, RuntimeAuthState, RuntimeLogin, RuntimeTarget,
 };
-use nelomai_client_core::{CoreError, CoreLocalStop, RuntimeAuthProvider};
+use nelomai_client_core::{
+    CoreError, CoreLocalStop, RuntimeAuthProvider, RuntimeWriterGates, RuntimeWriterQuiescence,
+};
+use nelomai_client_storage::{RuntimeAuthScope, RuntimeRecordOwner, RuntimeStateStore};
 use nelomai_client_tunnel::TunnelController;
 use nelomai_contracts::Platform;
 use std::sync::Arc;
+use std::time::Duration;
+
+const OWNER_REQUEST_BUDGET: Duration = Duration::from_secs(10);
 
 /// Trusted host facts. RuntimeLogin cannot override these or the target.
 #[derive(Debug, Clone)]
@@ -21,6 +27,53 @@ pub struct OwnerRuntimeAuth {
     broker: Arc<AuthBroker>,
     target: RuntimeTarget,
     profile: RuntimeClientProfile,
+    admission: Arc<dyn RuntimeAdmission>,
+    writers: Arc<RuntimeWriterGates>,
+}
+
+/// Host control capability; the future child implements command/ACK with its
+/// own exact-runtime record owner, never a second container backend writer.
+pub trait RuntimeAdmission: Send + Sync {
+    fn check(&self, access: &AccessSnapshot) -> Result<(), CoreError>;
+    fn bind_empty(
+        &self,
+        access: &AccessSnapshot,
+        quiescence: &RuntimeWriterQuiescence,
+    ) -> Result<(), CoreError>;
+}
+pub struct RuntimeCacheAdmission<S> {
+    owner: Arc<RuntimeRecordOwner<S>>,
+}
+impl<S: RuntimeStateStore> RuntimeCacheAdmission<S> {
+    pub fn new(owner: Arc<RuntimeRecordOwner<S>>) -> Self {
+        Self { owner }
+    }
+    fn scope(access: &AccessSnapshot) -> RuntimeAuthScope {
+        RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        }
+    }
+}
+impl<S: RuntimeStateStore> RuntimeAdmission for RuntimeCacheAdmission<S> {
+    fn check(&self, access: &AccessSnapshot) -> Result<(), CoreError> {
+        self.owner
+            .check_scope(&Self::scope(access))
+            .map_err(|_| CoreError::AuthRecoveryRequired)
+    }
+    fn bind_empty(
+        &self,
+        access: &AccessSnapshot,
+        _: &RuntimeWriterQuiescence,
+    ) -> Result<(), CoreError> {
+        if self.check(access).is_ok() {
+            return Ok(());
+        }
+        self.owner
+            .bind_empty_scope(&Self::scope(access))
+            .map_err(|_| CoreError::AuthRecoveryRequired)
+    }
 }
 impl OwnerRuntimeAuth {
     /// Does not enroll, refresh or erase migration credentials. The coordinator
@@ -29,13 +82,28 @@ impl OwnerRuntimeAuth {
         broker: Arc<AuthBroker>,
         target: RuntimeTarget,
         profile: RuntimeClientProfile,
+        admission: Arc<dyn RuntimeAdmission>,
+        writers: Arc<RuntimeWriterGates>,
     ) -> Result<Self, BrokerError> {
         target.identity(None)?;
         Ok(Self {
             broker,
             target,
             profile,
+            admission,
+            writers,
         })
+    }
+    /// Startup/control only. Migration refs and absent scope never become an
+    /// admitted cache merely because a valid auth snapshot exists.
+    pub async fn admit_empty_current(&self) -> Result<(), CoreError> {
+        let quiescence = tokio::time::timeout(OWNER_REQUEST_BUDGET, self.writers.quiesce())
+            .await
+            .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?;
+        let observation = self.broker.observe().await.map_err(map_error)?;
+        let access =
+            self.check_target(observation.access.ok_or(CoreError::AuthRecoveryRequired)?)?;
+        self.admission.bind_empty(&access, &quiescence)
     }
     fn check_target(&self, value: AccessSnapshot) -> Result<AccessSnapshot, CoreError> {
         if RuntimeTarget::from_identity(value.identity()) != self.target {
@@ -57,10 +125,16 @@ fn map_error(error: BrokerError) -> CoreError {
 #[async_trait]
 impl RuntimeAuthProvider for OwnerRuntimeAuth {
     async fn state(&self) -> Result<RuntimeAuthState, CoreError> {
-        Ok(match self.broker.auth_state().await.map_err(map_error)? {
+        let observation = self.broker.observe().await.map_err(map_error)?;
+        Ok(match observation.state {
             BrokerAuthState::Active => {
-                self.check_target(self.broker.access_token(None).await.map_err(map_error)?)?;
-                RuntimeAuthState::Active
+                let access =
+                    self.check_target(observation.access.ok_or(CoreError::AuthRecoveryRequired)?)?;
+                if self.admission.check(&access).is_ok() {
+                    RuntimeAuthState::Active
+                } else {
+                    RuntimeAuthState::RecoveryRequired
+                }
             }
             BrokerAuthState::RecoveryRequired => RuntimeAuthState::RecoveryRequired,
             BrokerAuthState::LogoutPending => RuntimeAuthState::LogoutPending,
@@ -71,6 +145,12 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
         })
     }
     async fn login(&self, request: RuntimeLogin) -> Result<AccessSnapshot, CoreError> {
+        // Drain actual lifecycle/intent/split/connection writers BEFORE the
+        // broker takes issuance. Logout deliberately never takes this barrier.
+        let deadline = tokio::time::Instant::now() + OWNER_REQUEST_BUDGET;
+        let quiescence = tokio::time::timeout_at(deadline, self.writers.quiesce())
+            .await
+            .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?;
         let request = LoginRequest {
             login: request.login,
             password: request.password,
@@ -81,26 +161,36 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
             architecture: self.profile.architecture.clone(),
             app_version: self.target.container_version.clone(),
         };
-        self.check_target(
-            self.broker
-                .login(&request, &self.target)
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CoreError::Api(nelomai_client_core::CoreApiError::Retryable));
+        }
+        let access = self.check_target(
+            tokio::time::timeout_at(deadline, self.broker.login(&request, &self.target))
                 .await
+                .map_err(|_| CoreError::AuthenticationOutcomeUnknown)?
                 .map_err(map_error)?,
-        )
+        )?;
+        self.admission.bind_empty(&access, &quiescence)?;
+        Ok(access)
     }
     async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
         // Reject a replaced runtime before any refresh side effect. Generation
         // can evolve within the bound target; it is not a launch-time pin.
         let current =
             self.check_target(self.broker.access_token(None).await.map_err(map_error)?)?;
+        self.admission.check(&current)?;
         match stale {
             None => Ok(current),
-            Some(stale) => self.check_target(
-                self.broker
-                    .access_token(Some(stale))
-                    .await
-                    .map_err(map_error)?,
-            ),
+            Some(stale) => {
+                let access = self.check_target(
+                    self.broker
+                        .access_token(Some(stale))
+                        .await
+                        .map_err(map_error)?,
+                )?;
+                self.admission.check(&access)?;
+                Ok(access)
+            }
         }
     }
     async fn logout(&self) -> Result<(), CoreError> {

@@ -2801,9 +2801,11 @@ name = "nelomai-app"
 version = "0.1.7"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "libc",
  "nelomai-client-api",
  "nelomai-client-application",
+ "nelomai-client-container",
  "nelomai-client-core",
  "nelomai-client-storage",
  "nelomai-client-tunnel",
@@ -2869,6 +2871,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "ed25519-dalek",
  "nelomai-client-api",
  "nelomai-client-application",
  "nelomai-client-core",
@@ -2909,8 +2912,10 @@ version = "0.1.0"
 dependencies = [
  "android-native-keyring-store",
  "base64 0.22.1",
+ "ed25519-dalek",
  "keyring",
  "keyring-core",
+ "libc",
  "nelomai-contracts",
  "rand 0.9.5",
  "serde",
@@ -2937,6 +2942,7 @@ name = "nelomai-client-updater"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "nelomai-client-api",
  "nelomai-contracts",
  "semver",
  "serde",

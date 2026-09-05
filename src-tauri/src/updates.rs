@@ -1,4 +1,5 @@
 use crate::platform;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_updater::{
     FileUpdatePreferenceStore, UpdateCoordinator, UpdateOffer, UpdatePhase, UpdatePreferenceStore,
     UpdatePreferences,
@@ -173,7 +174,7 @@ impl NativeUpdater {
 
     pub async fn install_automatically(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
     ) -> Result<UpdateStatusResponse, String> {
         let preferences = *self
             .current_preferences
@@ -196,7 +197,10 @@ impl NativeUpdater {
         self.status()
     }
 
-    pub async fn install_now(&self, access_token: &str) -> Result<UpdateStatusResponse, String> {
+    pub async fn install_now(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<UpdateStatusResponse, String> {
         #[cfg(desktop)]
         if let Some(coordinator) = &self.coordinator {
             coordinator

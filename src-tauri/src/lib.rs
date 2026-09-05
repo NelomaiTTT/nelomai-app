@@ -16,7 +16,15 @@ mod updates;
 
 use nelomai_client_api::ClientApi;
 use nelomai_client_application::{ApplicationError, ClientApplication};
-use nelomai_client_storage::{FileSplitTunnelStore, SystemSecretStore};
+use nelomai_client_container::{
+    AuthBroker, InstalledRuntimeSelection, OwnerRuntimeAuth, RuntimeCacheAdmission,
+    RuntimeClientProfile,
+};
+use nelomai_client_core::CoreLocalStop;
+use nelomai_client_storage::{
+    prepare_runtime_storage, ContainerOwnerLock, ProtectedRuntimeStore, RuntimeOperationalStore,
+    RuntimeRecordOwner, SystemRecordFactory, SystemSecretStore,
+};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri_plugin_tunnel_android::TunnelAndroidExt;
@@ -34,7 +42,7 @@ const AUTOMATIC_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 type NativeApplication = ClientApplication<
     ClientApi,
-    SystemSecretStore,
+    RuntimeOperationalStore<ProtectedRuntimeStore<SystemSecretStore>>,
     platform::PlatformTunnelController,
     diagnostics::AppDiagnostics,
 >;
@@ -82,21 +90,14 @@ impl PushRegistrationScheduler {
         register_android_push(app, application).await;
     }
 
-    pub(crate) async fn logout(
-        &self,
-        app: &tauri::AppHandle,
-        application: &NativeApplication,
-    ) -> Result<(), ApplicationError> {
-        let _guard = self.gate.lock().await;
-        #[cfg(target_os = "android")]
-        {
-            use tauri_plugin_push_android::PushAndroidExt;
-
-            let _ = app.push_android().disable();
-        }
-        #[cfg(not(target_os = "android"))]
-        let _ = app;
-        application.logout().await
+    #[cfg(not(target_os = "android"))]
+    pub(crate) async fn logout<F>(&self, owner_logout: F) -> Result<(), ApplicationError>
+    where
+        F: std::future::Future<Output = Result<(), ApplicationError>>,
+    {
+        // Cancellation must not queue behind an old push HTTP request. Android
+        // native authority handoff uses its separate owner bridge.
+        owner_logout.await
     }
 
     #[cfg(target_os = "android")]
@@ -156,13 +157,37 @@ pub fn run() {
         use tauri::Manager;
 
         let app_data_directory = app.path().app_data_dir()?;
+        // Before any secret read/init on every desktop platform (and Android
+        // host process). The Windows plugin above is only an activation UX.
+        let owner_lock = ContainerOwnerLock::try_acquire(&app_data_directory)?;
+        use base64::Engine;
+        let public_key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
+            .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
+            .transpose()
+            .map_err(|_| {
+                std::io::Error::other("runtime_startup_blocked: invalid pinned manifest key")
+            })?;
+        let selection = InstalledRuntimeSelection::load(
+            &app.path().resource_dir()?.join("runtime"),
+            &app_data_directory.join("common/runtime-selection-v1.json"),
+            public_key.as_deref(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )?;
         #[cfg(target_os = "linux")]
         let fallback = Some(app_data_directory.join("credentials"));
         #[cfg(not(target_os = "linux"))]
         let fallback = None;
 
+        let storage = prepare_runtime_storage(
+            &owner_lock,
+            selection.manifest(),
+            selection.target().runtime_slot,
+            &SystemRecordFactory::new("primary", fallback),
+        )?;
+
         let api = ClientApi::new(PANEL_BASE)
-            .and_then(|api| api.with_app_version(env!("CARGO_PKG_VERSION")))
+            .and_then(|api| api.with_app_version(&selection.target().container_version))
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let resource_baseline = resource_usage::ResourceSnapshot::capture(app.handle());
         let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
@@ -172,13 +197,39 @@ pub fn run() {
         diagnostics.record_named("startup.rust.setup_ready", None, None, None);
         let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
         let preferences = Arc::new(preferences::AppPreferenceStore::new(
-            app_data_directory.join("preferences.json"),
+            nelomai_client_storage::RuntimeStateStore::paths(&storage.runtime)
+                .preferences
+                .clone(),
         ));
+        let local = CoreLocalStop::new(tunnel.clone());
+        let broker = Arc::new(AuthBroker::new(
+            api.clone(),
+            Arc::new(storage.auth),
+            local.clone(),
+        )?);
+        // Migration/full-writer ownership is consumed here; only the paired
+        // field-merge views and narrow admission control survive into runtime.
+        let record_owner = RuntimeRecordOwner::new(storage.runtime);
+        let port = Arc::new(OwnerRuntimeAuth::new(
+            broker.clone(),
+            selection.target().clone(),
+            RuntimeClientProfile {
+                platform: commands::current_platform(),
+                platform_version: None,
+                architecture: std::env::consts::ARCH.into(),
+            },
+            Arc::new(RuntimeCacheAdmission::new(record_owner.clone())),
+            local.runtime_writer_gates(),
+        )?);
+        if tauri::async_runtime::block_on(port.admit_empty_current()).is_err() {
+            diagnostics.record_named("runtime.admission.recovery_required", None, None, None);
+        }
         let application = Arc::new(ClientApplication::with_split_tunnel_store(
             Arc::new(api),
-            Arc::new(SystemSecretStore::new("primary", fallback)),
-            Arc::new(FileSplitTunnelStore::new(&app_data_directory)),
-            tunnel.clone(),
+            Arc::new(record_owner.operational()),
+            Arc::new(record_owner.split()),
+            port.clone(),
+            local,
             diagnostics.clone(),
         ));
         let dns_servers = preferences.get().dns_provider.servers();
@@ -203,6 +254,9 @@ pub fn run() {
         ));
         app.manage(diagnostics.clone());
         app.manage(application.clone());
+        app.manage(owner_lock);
+        app.manage(broker);
+        app.manage(port);
         app.manage(tunnel.clone());
         app.manage(split_tunnel_scheduler.clone());
         app.manage(push_registration_scheduler.clone());
@@ -439,7 +493,7 @@ async fn upload_automatic_diagnostics(
     diagnostics: &diagnostics::AppDiagnostics,
     latest: bool,
 ) -> bool {
-    if application.current_access_token().is_err() {
+    if application.current_access_token().await.is_err() {
         return false;
     }
     let now = current_unix_time();
@@ -523,6 +577,8 @@ fn automatic_upload_error_code(error: &ApplicationError) -> String {
         ApplicationError::Clock => "clock_unavailable".to_string(),
         ApplicationError::Api(error) => api_code(error),
         ApplicationError::Core(error) => match error {
+            CoreError::AuthenticationOutcomeUnknown => "authentication_outcome_unknown".to_string(),
+            CoreError::AuthRecoveryRequired => "auth_recovery_required".to_string(),
             CoreError::SignedOut => "signed_out".to_string(),
             CoreError::AccessExpired => "access_expired".to_string(),
             CoreError::UpdateRequired => "update_required".to_string(),
@@ -544,7 +600,7 @@ fn start_split_tunnel_scheduler(
         interval.tick().await;
         loop {
             interval.tick().await;
-            if application.current_access_token().is_ok() {
+            if application.current_access_token().await.is_ok() {
                 let _ = scheduler.synchronize(&application, false).await;
             }
         }
@@ -1434,7 +1490,7 @@ fn start_push_registration_scheduler(
 async fn register_android_push(app: &tauri::AppHandle, application: &NativeApplication) {
     use tauri_plugin_push_android::PushAndroidExt;
 
-    if application.current_access_token().is_err() {
+    if application.current_access_token().await.is_err() {
         return;
     }
     if let Ok(response) = app.push_android().prepare() {
@@ -1479,6 +1535,29 @@ fn connection_metrics_poll_required(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn logout_enters_owner_while_push_scheduler_is_occupied() {
+        let scheduler = PushRegistrationScheduler::new();
+        let _old_push = scheduler.gate.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(30),
+            scheduler.logout(async {
+                Err(ApplicationError::Core(
+                    nelomai_client_core::CoreError::AuthRecoveryRequired,
+                ))
+            }),
+        )
+        .await
+        .expect("push registration must not delay owner cancellation");
+        assert!(matches!(
+            result,
+            Err(ApplicationError::Core(
+                nelomai_client_core::CoreError::AuthRecoveryRequired
+            ))
+        ));
+    }
 
     #[test]
     fn automatic_upload_diagnostics_preserves_the_stable_failure_reason() {

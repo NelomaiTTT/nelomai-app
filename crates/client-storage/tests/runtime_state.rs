@@ -1,8 +1,8 @@
 use nelomai_client_storage::RuntimePaths;
 use nelomai_client_storage::{
-    ProtectedRecordStore, ProtectedRuntimeStore, RuntimeRecordOwner, RuntimeStateStore,
-    RuntimeStateV1, SplitTunnelStore, StorageError, StoredAuth, StoredCompatibility,
-    StoredSplitTunnelState,
+    ProtectedRecordStore, ProtectedRuntimeStore, RuntimeAuthScope, RuntimeRecordOwner,
+    RuntimeStateStore, RuntimeStateV1, SplitTunnelStore, StorageError, StoredAuth,
+    StoredCompatibility, StoredSplitTunnelState,
 };
 use nelomai_contracts::RuntimeSlot;
 use std::sync::{Arc, Mutex};
@@ -21,6 +21,74 @@ impl ProtectedRecordStore for Raw {
         *self.0.lock().unwrap() = None;
         Ok(())
     }
+}
+
+#[test]
+fn runtime_cache_scope_cannot_be_relabelled_or_inherited_by_a_new_login() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+    let backend = ProtectedRuntimeStore::new(Raw::default(), paths.clone());
+    let mut state = RuntimeStateV1::import_legacy(
+        &StoredAuth::new_install(),
+        StoredSplitTunnelState::default(),
+        &paths,
+    );
+    let a = RuntimeAuthScope {
+        auth_epoch: 1,
+        family: "synthetic-family-a".into(),
+        identity: nelomai_contracts::RuntimeIdentity {
+            slot: RuntimeSlot::Stable,
+            runtime_version: "0.2.16".into(),
+            container_version: "0.2.16".into(),
+            runtime_contract_version: 1,
+            session_generation: Some(1),
+        },
+    };
+    backend.save(&state).unwrap();
+    let owner = RuntimeRecordOwner::new(backend);
+    assert!(owner.check_scope(&a).is_err());
+    assert!(
+        owner.bind_empty_scope(&a).is_err(),
+        "cleanup_only is not constructor-owned"
+    );
+    state.complete_legacy_cleanup();
+    // Explicit stopped-runtime cleanup authority, not an operational view.
+    let backend = ProtectedRuntimeStore::new(Raw::default(), paths);
+    backend.save(&state).unwrap();
+    let owner = RuntimeRecordOwner::new(backend);
+    owner.bind_empty_scope(&a).unwrap();
+    let mut stale = owner.operational().load().unwrap().unwrap();
+    assert!(owner.check_scope(&a).is_ok());
+    let b = RuntimeAuthScope {
+        auth_epoch: 3,
+        family: "synthetic-family-b".into(),
+        ..a.clone()
+    };
+    owner.bind_empty_scope(&b).unwrap();
+    stale.compatibility = Some(StoredCompatibility {
+        update_required: false,
+        observed_at_unix: 5,
+    });
+    assert!(
+        owner.operational().save(&stale).is_err(),
+        "old scope cannot write new family's cache"
+    );
+    let mut active = owner.operational().load().unwrap().unwrap();
+    active.compatibility = stale.compatibility;
+    owner.operational().save(&active).unwrap();
+    assert!(
+        owner.bind_empty_scope(&a).is_err(),
+        "any retained runtime payload is quarantined"
+    );
+    assert!(owner.check_scope(&a).is_err());
+    assert!(owner.check_scope(&b).is_ok());
+    active.auth_scope = None;
+    assert!(owner.operational().save(&active).is_err());
+    owner.split().delete().unwrap();
+    assert_eq!(
+        owner.operational().load().unwrap().unwrap().auth_scope,
+        Some(b)
+    );
 }
 
 #[test]

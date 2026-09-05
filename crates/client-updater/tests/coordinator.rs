@@ -1,4 +1,21 @@
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
+
+fn access() -> AccessSnapshot {
+    AccessSnapshot::new(
+        "access-secret".into(),
+        nelomai_contracts::RuntimeIdentity {
+            container_version: "0.2.16".into(),
+            runtime_version: "0.2.15".into(),
+            runtime_contract_version: 1,
+            slot: nelomai_contracts::RuntimeSlot::Stable,
+            session_generation: Some(7),
+        },
+        4,
+        "synthetic-family".into(),
+    )
+    .unwrap()
+}
 use nelomai_client_updater::{
     DownloadProgress, InstallResult, InstalledUpdate, UpdateBackend, UpdateBackendError,
     UpdateCoordinator, UpdateOffer, UpdatePhase, UpdatePreferences,
@@ -54,10 +71,13 @@ impl RecordingBackend {
 impl UpdateBackend for RecordingBackend {
     async fn install(
         &self,
-        _access_token: &str,
+        access_token: &AccessSnapshot,
         expected_version: &str,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError> {
+        assert_eq!(access_token.bearer_headers(), access().bearer_headers());
+        assert_eq!(access_token.auth_epoch(), 4);
+        assert_eq!(access_token.family(), "synthetic-family");
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.expected_versions
             .lock()
@@ -119,7 +139,7 @@ impl BlockingBackend {
 impl UpdateBackend for BlockingBackend {
     async fn install(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         expected_version: &str,
         _progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError> {
@@ -158,7 +178,7 @@ async fn disabled_automatic_updates_keep_the_offer_available() {
     coordinator.observe(Some(offer()));
 
     let phase = coordinator
-        .install_automatically("access-secret", UpdatePreferences { automatic: false })
+        .install_automatically(&access(), UpdatePreferences { automatic: false })
         .await
         .unwrap();
 
@@ -173,7 +193,7 @@ async fn automatic_update_reports_progress_and_finishes_once() {
     coordinator.observe(Some(offer()));
 
     let phase = coordinator
-        .install_automatically("access-secret", UpdatePreferences::default())
+        .install_automatically(&access(), UpdatePreferences::default())
         .await
         .unwrap();
 
@@ -201,7 +221,7 @@ async fn concurrent_automatic_installs_call_backend_once_after_install() {
         let coordinator = coordinator.clone();
         tokio::spawn(async move {
             coordinator
-                .install_automatically("access-secret", UpdatePreferences::default())
+                .install_automatically(&access(), UpdatePreferences::default())
                 .await
         })
     };
@@ -210,7 +230,7 @@ async fn concurrent_automatic_installs_call_backend_once_after_install() {
         let coordinator = coordinator.clone();
         tokio::spawn(async move {
             coordinator
-                .install_automatically("access-secret", UpdatePreferences::default())
+                .install_automatically(&access(), UpdatePreferences::default())
                 .await
         })
     };
@@ -236,7 +256,7 @@ async fn concurrent_automatic_installs_open_android_installer_once() {
         let coordinator = coordinator.clone();
         tokio::spawn(async move {
             coordinator
-                .install_automatically("access-secret", UpdatePreferences::default())
+                .install_automatically(&access(), UpdatePreferences::default())
                 .await
         })
     };
@@ -245,7 +265,7 @@ async fn concurrent_automatic_installs_open_android_installer_once() {
         let coordinator = coordinator.clone();
         tokio::spawn(async move {
             coordinator
-                .install_automatically("access-secret", UpdatePreferences::default())
+                .install_automatically(&access(), UpdatePreferences::default())
                 .await
         })
     };
@@ -269,11 +289,11 @@ async fn concurrent_manual_install_requests_share_one_backend_operation() {
 
     let first = {
         let coordinator = coordinator.clone();
-        tokio::spawn(async move { coordinator.install_now("access-secret").await })
+        tokio::spawn(async move { coordinator.install_now(&access()).await })
     };
     let second = {
         let coordinator = coordinator.clone();
-        tokio::spawn(async move { coordinator.install_now("access-secret").await })
+        tokio::spawn(async move { coordinator.install_now(&access()).await })
     };
     let (first, second) = tokio::join!(first, second);
 
@@ -288,7 +308,7 @@ async fn newer_offer_is_installed_after_an_older_version_is_ready() {
     coordinator.observe(Some(offer_for("0.2.0")));
 
     assert_eq!(
-        coordinator.install_now("access-secret").await.unwrap(),
+        coordinator.install_now(&access()).await.unwrap(),
         UpdatePhase::ReadyToRestart {
             version: "0.2.0".to_string()
         }
@@ -296,7 +316,7 @@ async fn newer_offer_is_installed_after_an_older_version_is_ready() {
 
     coordinator.observe(Some(offer_for("0.3.0")));
     assert_eq!(
-        coordinator.install_now("access-secret").await.unwrap(),
+        coordinator.install_now(&access()).await.unwrap(),
         UpdatePhase::ReadyToRestart {
             version: "0.3.0".to_string()
         }
@@ -314,7 +334,7 @@ async fn backend_cannot_mark_an_unexpected_version_as_installed() {
     let coordinator = UpdateCoordinator::new(backend);
     coordinator.observe(Some(offer_for("0.2.0")));
 
-    let error = coordinator.install_now("access-secret").await.unwrap_err();
+    let error = coordinator.install_now(&access()).await.unwrap_err();
 
     assert_eq!(
         error.to_string(),
@@ -335,7 +355,7 @@ async fn android_installer_state_is_stable_until_the_app_is_replaced() {
     let coordinator = UpdateCoordinator::new(backend.clone());
     coordinator.observe(Some(offer()));
 
-    let phase = coordinator.install_now("access-secret").await.unwrap();
+    let phase = coordinator.install_now(&access()).await.unwrap();
 
     assert_eq!(
         phase,
@@ -347,16 +367,13 @@ async fn android_installer_state_is_stable_until_the_app_is_replaced() {
     assert_eq!(coordinator.phase(), phase);
     assert_eq!(
         coordinator
-            .install_automatically("access-secret", UpdatePreferences::default())
+            .install_automatically(&access(), UpdatePreferences::default())
             .await
             .unwrap(),
         phase
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 
-    assert_eq!(
-        coordinator.install_now("access-secret").await.unwrap(),
-        phase
-    );
+    assert_eq!(coordinator.install_now(&access()).await.unwrap(), phase);
     assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
 }

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_contracts::UpdateState;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -254,7 +255,7 @@ impl UpdateBackendError {
 pub trait UpdateBackend: Send + Sync {
     async fn install(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         expected_version: &str,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError>;
@@ -307,7 +308,7 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
 
     pub async fn install_automatically(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         preferences: UpdatePreferences,
     ) -> Result<UpdatePhase, UpdateError> {
         if !preferences.automatic {
@@ -323,7 +324,10 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
         self.install_locked(access_token).await
     }
 
-    pub async fn install_now(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
+    pub async fn install_now(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<UpdatePhase, UpdateError> {
         let _guard = self.install_gate.lock().await;
         if matches!(self.phase(), UpdatePhase::ReadyToRestart { .. }) {
             return Ok(self.phase());
@@ -331,7 +335,10 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
         self.install_locked(access_token).await
     }
 
-    async fn install_locked(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
+    async fn install_locked(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<UpdatePhase, UpdateError> {
         let Some(offer) = self
             .offer
             .lock()

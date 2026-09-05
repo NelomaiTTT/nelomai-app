@@ -153,6 +153,8 @@ impl<A: TestAuthApi, S: SecretStore, T: TunnelController> RuntimeAuthProvider
         )
     }
     async fn login(&self, value: RuntimeLogin) -> Result<AccessSnapshot, CoreError> {
+        let writers = self.local.runtime_writer_gates();
+        let _quiescence = writers.quiesce().await;
         self.local.stop_local().await?;
         let _guard = self.gate.lock().await;
         let mut stored = self

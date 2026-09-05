@@ -4,12 +4,14 @@ use async_trait::async_trait;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{post, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use nelomai_client_api::{ClientApi, RuntimeTarget};
 use nelomai_client_application::ClientApplication;
-use nelomai_client_container::{AuthBroker, OwnerRuntimeAuth, RuntimeClientProfile};
+use nelomai_client_container::{
+    AuthBroker, OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile,
+};
 use nelomai_client_core::{
     CoreApi, CoreError, CoreLocalStop, NoopLogger, Phase, RuntimeAuthProvider,
 };
@@ -137,15 +139,20 @@ async fn bearer(State(panel): State<Arc<Panel>>, headers: HeaderMap) -> (StatusC
 
 #[tokio::test]
 async fn actual_application_logout_bypasses_pending_start_and_preserves_exact_runtime_cleanup() {
-    exercise_logout(false).await;
+    exercise_logout(false, false).await;
 }
 
 #[tokio::test]
 async fn actual_owner_stop_failure_never_reports_physical_stop_and_late_poll_cannot_revive_auth() {
-    exercise_logout(true).await;
+    exercise_logout(true, false).await;
 }
 
-async fn exercise_logout(fail_stop: bool) {
+#[tokio::test]
+async fn actual_new_login_cannot_reuse_old_offline_cache_with_no_bootstrap_connection() {
+    exercise_logout(false, true).await;
+}
+
+async fn exercise_logout(fail_stop: bool, new_login: bool) {
     let panel = Arc::new(Panel::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api =
@@ -153,6 +160,12 @@ async fn exercise_logout(fail_stop: bool) {
     let router = Router::new()
         .route("/api/client/v1/auth/logout-runtime", post(logout))
         .route("/api/client/v1/connections/pin-stray", post(bearer))
+        .route("/api/client/v1/auth/login", post(|| async { Json(json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"b-access","access_expires_in":900,"refresh_token":"b-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device-b","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}})) }))
+        .route("/api/client/v1/bootstrap", get(|| async {
+            let mut value: Value = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/bootstrap.json")).unwrap();
+            value["connection"] = Value::Null;
+            Json(value)
+        }))
         .with_state(panel.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -187,20 +200,26 @@ async fn exercise_logout(fail_stop: bool) {
     auth_value.confirmed_identity = Some(identity.clone());
     auth_value.session_generation = Some(7);
     auth.save(&auth_value).unwrap();
-    let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
-    let mut runtime_value =
-        RuntimeStateV1::import_legacy(&legacy, StoredSplitTunnelState::default(), runtime.paths());
-    runtime_value.cleanup_only = false;
-    runtime.save(&runtime_value).unwrap();
-    let owner = RuntimeRecordOwner::new(runtime);
-    let operational = Arc::new(owner.operational());
-    let split = Arc::new(owner.split());
     let tunnel = Arc::new(Tunnel::default());
     tunnel.hold_start.store(true, Ordering::SeqCst);
     tunnel.fail_stop.store(fail_stop, Ordering::SeqCst);
     let local = CoreLocalStop::new(tunnel.clone());
     let broker =
         Arc::new(AuthBroker::new(api.as_ref().clone(), auth.clone(), local.clone()).unwrap());
+    let access = broker.observe().await.unwrap().access.unwrap();
+    let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
+    let mut runtime_value =
+        RuntimeStateV1::import_legacy(&legacy, StoredSplitTunnelState::default(), runtime.paths());
+    runtime_value.cleanup_only = false;
+    runtime_value.auth_scope = Some(RuntimeAuthScope {
+        auth_epoch: access.auth_epoch(),
+        family: access.family().into(),
+        identity: access.identity().clone(),
+    });
+    runtime.save(&runtime_value).unwrap();
+    let owner = RuntimeRecordOwner::new(runtime);
+    let operational = Arc::new(owner.operational());
+    let split = Arc::new(owner.split());
     let port = Arc::new(
         OwnerRuntimeAuth::new(
             broker,
@@ -210,6 +229,8 @@ async fn exercise_logout(fail_stop: bool) {
                 platform_version: None,
                 architecture: "aarch64".into(),
             },
+            Arc::new(RuntimeCacheAdmission::new(owner.clone())),
+            local.runtime_writer_gates(),
         )
         .unwrap(),
     );
@@ -318,6 +339,34 @@ async fn exercise_logout(fail_stop: bool) {
         .path()
         .join("runtime/stable/state/0.2.16/state-v1.json")
         .exists());
+    if new_login {
+        tunnel.hold_start.store(false, Ordering::SeqCst);
+        let retained = operational.load().unwrap();
+        let starts = tunnel.starts.load(Ordering::SeqCst);
+        assert!(application
+            .login(
+                nelomai_client_application::LoginParameters {
+                    login: "b".into(),
+                    password: "synthetic-password".into(),
+                    device_name: "synthetic".into(),
+                },
+                1100
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            auth.load().unwrap().unwrap().access_token.as_deref(),
+            Some("b-access")
+        );
+        assert_eq!(
+            port.state().await.unwrap(),
+            nelomai_client_api::RuntimeAuthState::RecoveryRequired
+        );
+        assert!(application.bootstrap(1100).await.is_err());
+        assert!(application.start_saved_stray_offline(1100).await.is_err());
+        assert_eq!(tunnel.starts.load(Ordering::SeqCst), starts);
+        assert_eq!(operational.load().unwrap(), retained);
+    }
     server.abort();
 }
 
@@ -402,17 +451,23 @@ async fn exercise_split_logout(held_start: usize, fail_forward: bool) {
     auth_value.confirmed_identity = Some(identity.clone());
     auth_value.session_generation = Some(7);
     auth.save(&auth_value).unwrap();
-    let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
-    let mut runtime_value =
-        RuntimeStateV1::import_legacy(&legacy, StoredSplitTunnelState::default(), runtime.paths());
-    runtime_value.cleanup_only = false;
-    runtime.save(&runtime_value).unwrap();
-    let owner = RuntimeRecordOwner::new(runtime);
-    let operational = Arc::new(owner.operational());
     let tunnel = Arc::new(Tunnel::default());
     let local = CoreLocalStop::new(tunnel.clone());
     let broker =
         Arc::new(AuthBroker::new(api.as_ref().clone(), auth.clone(), local.clone()).unwrap());
+    let access = broker.observe().await.unwrap().access.unwrap();
+    let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
+    let mut runtime_value =
+        RuntimeStateV1::import_legacy(&legacy, StoredSplitTunnelState::default(), runtime.paths());
+    runtime_value.cleanup_only = false;
+    runtime_value.auth_scope = Some(RuntimeAuthScope {
+        auth_epoch: access.auth_epoch(),
+        family: access.family().into(),
+        identity: access.identity().clone(),
+    });
+    runtime.save(&runtime_value).unwrap();
+    let owner = RuntimeRecordOwner::new(runtime);
+    let operational = Arc::new(owner.operational());
     let port = Arc::new(
         OwnerRuntimeAuth::new(
             broker,
@@ -422,6 +477,8 @@ async fn exercise_split_logout(held_start: usize, fail_forward: bool) {
                 platform_version: None,
                 architecture: "aarch64".into(),
             },
+            Arc::new(RuntimeCacheAdmission::new(owner.clone())),
+            local.runtime_writer_gates(),
         )
         .unwrap(),
     );

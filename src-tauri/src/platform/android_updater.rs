@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_updater::{
     AndroidManifestError, AndroidUpdateManifest, DownloadProgress, InstallResult, InstalledUpdate,
     UpdateBackend, UpdateBackendError, UpdateEndpointPolicy,
@@ -47,7 +48,7 @@ impl<R: Runtime> AndroidUpdateBackend<R> {
 
     async fn download(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         update: &nelomai_client_updater::ValidatedAndroidUpdate,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<PathBuf, UpdateBackendError> {
@@ -62,10 +63,11 @@ impl<R: Runtime> AndroidUpdateBackend<R> {
         remove_if_exists(&temporary).await?;
         remove_if_exists(&destination).await?;
 
-        let mut response = self
-            .http
-            .get(update.artifact_url.clone())
-            .bearer_auth(access_token)
+        let mut request = self.http.get(update.artifact_url.clone());
+        for (name, value) in access_token.bearer_headers() {
+            request = request.header(name, value);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|_| UpdateBackendError::new("update_download_failed"))?;
@@ -177,7 +179,7 @@ impl<R: Runtime> AndroidUpdateBackend<R> {
 impl<R: Runtime> UpdateBackend for AndroidUpdateBackend<R> {
     async fn install(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         expected_version: &str,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError> {
@@ -186,10 +188,11 @@ impl<R: Runtime> UpdateBackend for AndroidUpdateBackend<R> {
             .endpoint_policy
             .manifest_url(ANDROID_TARGET, &current_version)
             .map_err(|_| UpdateBackendError::new("invalid_update_endpoint"))?;
-        let response = self
-            .http
-            .get(endpoint)
-            .bearer_auth(access_token)
+        let mut request = self.http.get(endpoint);
+        for (name, value) in access_token.bearer_headers() {
+            request = request.header(name, value);
+        }
+        let response = request
             .send()
             .await
             .map_err(|_| UpdateBackendError::new("update_check_failed"))?;

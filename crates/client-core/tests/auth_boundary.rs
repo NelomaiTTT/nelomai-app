@@ -22,6 +22,7 @@ impl RuntimeStateStore for ReadOnlyRuntime {
             slot: RuntimeSlot::Stable,
             runtime_version: "0.2.16".into(),
             cleanup_only: false,
+            auth_scope: None,
             saved_connection: None,
             pinned_connection: None,
             pending_start: None,

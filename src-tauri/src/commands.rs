@@ -1074,6 +1074,8 @@ impl CommandError {
 
     fn from_core(error: CoreError) -> Self {
         match error {
+            CoreError::AuthenticationOutcomeUnknown => Self::new("authentication_outcome_unknown", "Исход входа неизвестен; требуется явный повторный вход"),
+            CoreError::AuthRecoveryRequired => Self::new("auth_recovery_required", "Требуется восстановление авторизации и безопасное завершение старого подключения"),
             CoreError::SignedOut => Self::new("signed_out", "Нужно снова войти в приложение"),
             CoreError::AccessExpired => Self::new("access_expired", "Срок доступа уже истёк"),
             CoreError::UpdateRequired => Self::new(
@@ -1868,7 +1870,8 @@ pub struct LoginCommandRequest {
     login: String,
     password: String,
     device_name: String,
-    platform_version: Option<String>,
+    #[serde(rename = "platformVersion")]
+    _platform_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2298,10 +2301,6 @@ pub async fn app_login(
                 login: request.login,
                 password: request.password,
                 device_name: request.device_name,
-                platform: current_platform(),
-                platform_version: request.platform_version,
-                architecture: std::env::consts::ARCH.to_string(),
-                app_version: env!("CARGO_PKG_VERSION").to_string(),
             },
             now_unix(),
         )
@@ -3414,6 +3413,7 @@ pub async fn app_update_install(
         .map_err(update_command_error)?;
     let access_token = application
         .current_access_token()
+        .await
         .map_err(CommandError::from)?;
     updater
         .install_now(&access_token)
@@ -3677,6 +3677,7 @@ pub async fn app_logout(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
 ) -> Result<(), CommandError> {
+    #[cfg(target_os = "android")]
     cancel_desktop_connection_intent(&app).await;
     #[cfg(target_os = "android")]
     let _background_provision_guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
@@ -3705,9 +3706,16 @@ pub async fn app_logout(
     )
     .await;
     #[cfg(desktop)]
-    prepare_desktop_logout(&app, &application, &diagnostics).await;
-    #[cfg(not(target_os = "android"))]
-    let logout_result = push_registration_scheduler.logout(&app, &application).await;
+    let logout_result = route_desktop_logout(
+        push_registration_scheduler.logout(application.logout()),
+        cancel_desktop_connection_intent(&app),
+        prepare_desktop_logout(&app, &application, &diagnostics),
+    )
+    .await;
+    #[cfg(all(not(desktop), not(target_os = "android")))]
+    let logout_result = push_registration_scheduler
+        .logout(application.logout())
+        .await;
     #[cfg(target_os = "android")]
     let (quick_clear_ticket, quick_plan_result) = ANDROID_UI_START_STOP_COORDINATOR
         .dispatch_projected_clear(|| app.tunnel_android().clear_quick_plan());
@@ -3749,6 +3757,20 @@ pub async fn app_logout(
     Ok(())
 }
 
+#[cfg(desktop)]
+async fn route_desktop_logout<E>(
+    owner: impl std::future::Future<Output = Result<(), E>>,
+    cancel: impl std::future::Future<Output = bool>,
+    prepare: impl std::future::Future<Output = ()>,
+) -> Result<(), E> {
+    // Enter the protected owner before any scheduler/native/diagnostic waits.
+    // A later helper retry cannot turn an owner physical-stop error into ACK.
+    let result = owner.await;
+    cancel.await;
+    prepare.await;
+    result
+}
+
 fn observe_and_schedule_update(
     application: Arc<NativeApplication>,
     updater: Arc<NativeUpdater>,
@@ -3761,7 +3783,7 @@ fn observe_and_schedule_update(
 
 fn schedule_automatic_update(application: Arc<NativeApplication>, updater: Arc<NativeUpdater>) {
     tauri::async_runtime::spawn(async move {
-        let Ok(access_token) = application.current_access_token() else {
+        let Ok(access_token) = application.current_access_token().await else {
             return;
         };
         let _ = updater.install_automatically(&access_token).await;
@@ -4006,22 +4028,22 @@ fn now_unix() -> i64 {
 }
 
 #[cfg(target_os = "android")]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Android
 }
 
 #[cfg(windows)]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Windows
 }
 
 #[cfg(target_os = "macos")]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Macos
 }
 
 #[cfg(target_os = "linux")]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Linux
 }
 
@@ -4029,6 +4051,36 @@ fn current_platform() -> Platform {
 mod tests {
     use super::*;
     use nelomai_contracts::{ApiVersion, LeaseStatus, PeerBinding};
+
+    #[cfg(desktop)]
+    #[tokio::test]
+    async fn desktop_logout_enters_owner_before_native_prelude_and_retains_stop_error() {
+        let entered = std::sync::atomic::AtomicBool::new(false);
+        let release = tokio::sync::Notify::new();
+        let result = route_desktop_logout(
+            async {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>("physical_stop_failed")
+            },
+            async {
+                assert!(
+                    entered.load(std::sync::atomic::Ordering::SeqCst),
+                    "native cancel must follow owner cancellation"
+                );
+                false
+            },
+            async {
+                release.notified().await;
+            },
+        );
+        tokio::pin!(result);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut result)
+            .await
+            .is_err());
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        release.notify_one();
+        assert_eq!(result.await, Err("physical_stop_failed"));
+    }
 
     fn background_capability_snapshot(
         revision: i64,
