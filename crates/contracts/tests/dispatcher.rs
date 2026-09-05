@@ -340,14 +340,27 @@ fn dispatcher_status_and_version_do_not_launch_or_modify_engine_state() {
 fn process_fixture() -> (TempDir, SigningKey) {
     let (directory, key) = fixture();
     let engine = br##"#!/usr/bin/python3
-import json,struct,sys,os
+import json,struct,sys,os,fcntl,time,signal
+root=sys.argv[2]
+lease=open(root+'/engine-owner.lock','a')
+fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
 while True:
     size=sys.stdin.buffer.read(4)
     if not size: break
     value=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
     if value.get('command')=='crash': os._exit(1)
+    if value.get('command')=='hang':
+        signal.alarm(10)
+        if os.fork()==0:
+            signal.alarm(10)
+            time.sleep(60)
+            os._exit(0)
+        open(root+'/persisted-tunnel','w').write('needs recovery')
+        time.sleep(60)
     if value.get('dispatcher_control')=='ready': reply={'engine_ready':True}
-    elif value.get('dispatcher_control')=='stop': reply={'engine_stopped':True}
+    elif value.get('dispatcher_control')=='stop':
+        if os.path.exists(root+'/persisted-tunnel'): os.unlink(root+'/persisted-tunnel')
+        reply={'engine_stopped':True}
     else: reply={'private_operation':value['command'],'preserved':value.get('probe')}
     data=json.dumps(reply).encode()
     sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
@@ -448,6 +461,103 @@ fn real_child_relay_preserves_private_operations_and_shared_mutation_exclusion()
             )
             .ok
     );
+    assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatcher_death_fixture_entry() {
+    let Some(root) = std::env::var_os("NELOMAI_TEST_OWNED_DISPATCHER_ROOT") else {
+        return;
+    };
+    let installation = Installation::for_owner(
+        Path::new(&root),
+        SigningKey::from_bytes(&[81; 32]).verifying_key().to_bytes(),
+        "macos",
+        "aarch64",
+        current_owner(),
+    );
+    let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
+    assert!(
+        dispatcher
+            .handle(
+                DispatcherRequest::Start {
+                    contract_version: 1,
+                    identity: dispatcher.layout.identity.clone()
+                },
+                &mut |_| Ok(())
+            )
+            .ok
+    );
+    let _ = dispatcher.relay(
+        &encode_frame(&json!({"command":"hang"})).unwrap(),
+        &mut |_| Ok(()),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dispatcher_death_terminates_hung_owned_tree_and_recovers_persisted_state() {
+    let (source, key) = process_fixture();
+    let target = tempfile::tempdir().unwrap();
+    let installation = Installation::for_owner(
+        target.path(),
+        key.verifying_key().to_bytes(),
+        "macos",
+        "aarch64",
+        current_owner(),
+    );
+    installation
+        .install(
+            source.path(),
+            &std::env::current_exe().unwrap(),
+            "501",
+            &RealInstallIo,
+        )
+        .unwrap();
+    let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "dispatcher_death_fixture_entry"])
+        .env("NELOMAI_TEST_OWNED_DISPATCHER_ROOT", target.path())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !target.path().join("persisted-tunnel").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture never entered its hung operation"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(MutationGuard::at(&target.path().join("engine-owner.lock")).is_err());
+    owner.kill().unwrap(); // exact owned dispatcher handle, no PID-file adoption
+    owner.wait().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Ok(lease) = MutationGuard::at(&target.path().join("engine-owner.lock")) {
+            drop(lease);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hung owned engine tree survived dispatcher death with lifetime lease"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(target.path().join(ACTIVE_ENGINE_NAME).exists());
+    let mut restarted = ProcessDispatcher::new(installation).unwrap();
+    assert!(
+        restarted
+            .handle(
+                DispatcherRequest::Stop {
+                    contract_version: 1,
+                    identity: restarted.layout.identity.clone()
+                },
+                &mut |_| Ok(())
+            )
+            .ok
+    );
+    assert!(!target.path().join("persisted-tunnel").exists());
     assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
 }
 

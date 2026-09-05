@@ -19,8 +19,20 @@ fn owned_dispatcher() -> (
         .path()
         .join("engines/latest/0.2.16/nelomai-unix-service");
     fs::create_dir_all(engine.parent().unwrap()).unwrap();
-    fs::write(engine, b"synthetic engine").unwrap();
-    let manifest = serde_json::to_vec(&json!({"format_version":1,"container_version":"0.2.16","release_set_id":"owned-test","minimum_runtime_contract":1,"maximum_runtime_contract":1,"slots":[{"slot":"latest","manifest":{"format_version":1,"runtime_version":"0.2.16","source_commit":"0123456789abcdef0123456789abcdef01234567","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"contract_version":1,"files":[{"path":"nelomai-unix-service","role":"executable","size_bytes":16,"sha256":d::digest(b"synthetic engine")}]}}]})).unwrap();
+    let engine_bytes = br#"#!/usr/bin/python3
+import json,struct,sys,fcntl
+lease=open(sys.argv[2]+'/engine-owner.lock','a')
+fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
+while True:
+    size=sys.stdin.buffer.read(4)
+    if not size: break
+    value=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
+    reply={'engine_ready':True} if value.get('dispatcher_control')=='ready' else {'engine_stopped':True}
+    data=json.dumps(reply).encode()
+    sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
+"#;
+    fs::write(engine, engine_bytes).unwrap();
+    let manifest = serde_json::to_vec(&json!({"format_version":1,"container_version":"0.2.16","release_set_id":"owned-test","minimum_runtime_contract":1,"maximum_runtime_contract":1,"slots":[{"slot":"latest","manifest":{"format_version":1,"runtime_version":"0.2.16","source_commit":"0123456789abcdef0123456789abcdef01234567","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"contract_version":1,"files":[{"path":"nelomai-unix-service","role":"executable","size_bytes":engine_bytes.len(),"sha256":d::digest(engine_bytes)}]}}]})).unwrap();
     let key = SigningKey::from_bytes(&[82; 32]);
     let mut signed = nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
     signed.extend(&manifest);
@@ -91,6 +103,64 @@ fn production_dispatcher_socket_uses_verified_identity_and_rejects_foreign_peer(
     assert!(status.success());
     server.join().unwrap();
     assert!(!target.path().join(d::ACTIVE_ENGINE_NAME).exists());
+}
+
+#[tokio::test]
+async fn production_transport_stop_then_passive_poll_preserves_quiescence() {
+    use nelomai_contracts::dispatcher as d;
+    use nelomai_unix_service::{Request, ServiceTransport};
+    let (target, owner) = owned_dispatcher();
+    {
+        let mut dispatcher = owner.lock().unwrap();
+        let identity = dispatcher.layout.identity.clone();
+        assert!(
+            dispatcher
+                .handle(
+                    d::DispatcherRequest::Start {
+                        contract_version: 1,
+                        identity
+                    },
+                    &mut |_| Ok(())
+                )
+                .running
+        );
+    }
+    assert!(target.path().join(d::ACTIVE_ENGINE_NAME).exists());
+    let path = target.path().join("dispatcher.sock");
+    let listener = bind_listener(&path, unsafe { libc::geteuid() }).unwrap();
+    let server_owner = owner.clone();
+    // Stop performs version + stop; each passive poll only reads version.
+    let server = std::thread::spawn(move || {
+        for _ in 0..5 {
+            nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false).unwrap();
+        }
+    });
+    let transport = UnixSocketTransport::with_dispatcher(target.path().join("private.sock"), path);
+    assert_eq!(
+        transport.exchange(Request::stop()).await.unwrap().state,
+        Some(ServiceTunnelState::Stopped)
+    );
+    assert!(!target.path().join(d::ACTIVE_ENGINE_NAME).exists());
+    // Exercise the actual controller contract used by the app's periodic poll.
+    use nelomai_client_tunnel::{TunnelController, TunnelStatus};
+    let controller = nelomai_unix_service::UnixTunnelController::new(transport);
+    assert_eq!(controller.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(controller.service_version().await.unwrap(), "0.2.16");
+    assert!(controller.diagnostics().await.is_err());
+    server.join().unwrap();
+    assert!(!target.path().join(d::ACTIVE_ENGINE_NAME).exists());
+    assert!(
+        !owner
+            .lock()
+            .unwrap()
+            .handle(
+                d::DispatcherRequest::Status {
+                    contract_version: 1
+                },
+                &mut |_| Ok(())
+            )
+            .running
+    );
 }
 
 #[test]

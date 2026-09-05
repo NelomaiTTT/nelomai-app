@@ -799,6 +799,101 @@ pub struct PrimitiveRequest {
     pub engine_primitive: EnginePrimitive,
 }
 
+/// The guardian shares only the new engine's process group and a kernel pipe.
+/// Closing the dispatcher's non-inherited endpoint (including SIGKILL/exit)
+/// kills that group even if the engine is stuck and cannot observe stdio EOF.
+/// A successful daemon-launch command may write one byte to disarm its
+/// transient guardian; persisted tunnel state then owns daemon recovery.
+#[cfg(unix)]
+pub fn own_process_group(
+    command: &mut std::process::Command,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let (owner, guardian) = std::os::unix::net::UnixStream::pair()?;
+    let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.max(1024);
+    unsafe {
+        command.pre_exec(move || {
+            let read_fd = guardian.as_raw_fd();
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            match libc::fork() {
+                -1 => return Err(io::Error::last_os_error()),
+                0 => {
+                    // Async-signal-safe only after fork. Do not inherit locks,
+                    // stdio or another tree's pipe endpoints into the guardian.
+                    if libc::dup2(read_fd, 3) < 0 {
+                        libc::_exit(127);
+                    }
+                    libc::close(0);
+                    libc::close(1);
+                    libc::close(2);
+                    for fd in 4..max_fd {
+                        libc::close(fd as libc::c_int);
+                    }
+                    let mut byte = 0u8;
+                    loop {
+                        let result = libc::read(3, (&mut byte as *mut u8).cast(), 1);
+                        if result == 0 {
+                            break;
+                        }
+                        if result > 0 {
+                            libc::_exit(0);
+                        }
+                        if result < 0
+                            && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                        {
+                            break;
+                        }
+                    }
+                    libc::kill(0, libc::SIGKILL);
+                    libc::_exit(127);
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+    }
+    Ok(owner)
+}
+
+#[cfg(windows)]
+fn own_dispatcher_job() -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError},
+        System::{JobObjects::*, Threading::GetCurrentProcess},
+    };
+    // Deliberately process-lifetime, non-inheritable handle. Assigning the
+    // dispatcher before spawn closes the child-creation/assignment race; all
+    // descendants inherit containment, not the handle that keeps it alive.
+    static JOB: std::sync::OnceLock<Result<usize, u32>> = std::sync::OnceLock::new();
+    let result = JOB.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(GetLastError());
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        ) == 0
+            || AssignProcessToJobObject(job, GetCurrentProcess()) == 0
+        {
+            let error = GetLastError();
+            CloseHandle(job);
+            return Err(error);
+        }
+        Ok(job as usize)
+    });
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| io::Error::from_raw_os_error(*error as i32))
+}
+
 /// Both privileged endpoints share this owner. Private product frames are
 /// forwarded unchanged. Only the inherited engine channel can request an SCM
 /// primitive; the common broker cannot send those responses to the dispatcher.
@@ -806,6 +901,8 @@ pub struct ProcessDispatcher {
     pub installation: Installation,
     pub layout: VerifiedLayout,
     child: Option<std::process::Child>,
+    #[cfg(unix)]
+    tree_owner: Option<std::os::unix::net::UnixStream>,
     channel_failed: bool,
 }
 impl ProcessDispatcher {
@@ -815,6 +912,8 @@ impl ProcessDispatcher {
             installation,
             layout,
             child: None,
+            #[cfg(unix)]
+            tree_owner: None,
             channel_failed: false,
         })
     }
@@ -893,6 +992,8 @@ impl ProcessDispatcher {
             )?;
         }
         let mut command = std::process::Command::new(verified.engine_path());
+        #[cfg(windows)]
+        own_dispatcher_job()?;
         command
             .arg("--engine-mode")
             .arg(&self.installation.root)
@@ -918,9 +1019,15 @@ impl ProcessDispatcher {
                 ),
             );
         }
+        #[cfg(unix)]
+        let tree_owner = own_process_group(&mut command)?;
         match command.spawn() {
             Ok(child) => {
                 self.child = Some(child);
+                #[cfg(unix)]
+                {
+                    self.tree_owner = Some(tree_owner);
+                }
                 self.channel_failed = false;
             }
             Err(error) => {
@@ -946,6 +1053,10 @@ impl ProcessDispatcher {
     ) -> io::Result<()> {
         let marker = self.installation.root.join(ACTIVE_ENGINE_NAME);
         if self.channel_failed {
+            #[cfg(unix)]
+            {
+                self.tree_owner = None;
+            }
             if let Some(child) = self.child.as_mut() {
                 if child.try_wait()?.is_none() {
                     child.kill()?;
@@ -957,6 +1068,10 @@ impl ProcessDispatcher {
         if let Some(child) = self.child.as_mut() {
             if child.try_wait()?.is_some() {
                 self.child = None;
+                #[cfg(unix)]
+                {
+                    self.tree_owner = None;
+                }
             }
         }
         if self.child.is_none() && marker.exists() {
@@ -998,6 +1113,10 @@ impl ProcessDispatcher {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         self.child = None;
+        #[cfg(unix)]
+        {
+            self.tree_owner = None;
+        }
         fs::remove_file(marker)?;
         Ok(())
     }

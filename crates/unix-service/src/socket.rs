@@ -49,8 +49,10 @@ impl RequestWatchdog {
     }
 }
 
+#[derive(Clone)]
 pub struct UnixSocketTransport {
     path: PathBuf,
+    dispatcher_path: Option<PathBuf>,
 }
 
 pub fn prepare_runtime_directory(path: &Path) -> io::Result<()> {
@@ -76,7 +78,20 @@ pub fn prepare_runtime_directory(path: &Path) -> io::Result<()> {
 
 impl UnixSocketTransport {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let dispatcher_path = (path == Path::new(crate::DEFAULT_SOCKET_PATH))
+            .then(|| PathBuf::from(crate::DISPATCHER_SOCKET_PATH));
+        Self {
+            path,
+            dispatcher_path,
+        }
+    }
+
+    pub fn with_dispatcher(path: impl Into<PathBuf>, dispatcher_path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            dispatcher_path: Some(dispatcher_path.into()),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -87,8 +102,10 @@ impl UnixSocketTransport {
         if request.protocol_version() != crate::PROTOCOL_VERSION {
             return Err(ServiceError::UnsupportedProtocol);
         }
-        if self.path == Path::new(crate::DEFAULT_SOCKET_PATH) {
+        if let Some(dispatcher_path) = &self.dispatcher_path {
             use nelomai_contracts::dispatcher as d;
+            let dispatcher_exchange =
+                |request: &d::DispatcherRequest| dispatcher_exchange_at(dispatcher_path, request);
             let version = dispatcher_exchange(&d::DispatcherRequest::Version {
                 contract_version: 1,
             })?;
@@ -107,12 +124,28 @@ impl UnixSocketTransport {
                     Err(ServiceError::Backend("dispatcher_stop_failed".into()))
                 };
             }
-            let started = dispatcher_exchange(&d::DispatcherRequest::Start {
-                contract_version: 1,
-                identity,
-            })?;
-            if !started.ok {
-                return Err(ServiceError::Backend("dispatcher_start_failed".into()));
+            if !matches!(request, Request::Start { .. }) {
+                if !version.running {
+                    return match request {
+                        Request::Status { .. } => {
+                            Ok(Response::success(Some(crate::ServiceTunnelState::Stopped)))
+                        }
+                        Request::Version { .. } => {
+                            let mut response = Response::success(None);
+                            response.service_version = Some(identity.runtime_version);
+                            Ok(response)
+                        }
+                        _ => Err(ServiceError::Backend("engine_not_running".into())),
+                    };
+                }
+            } else {
+                let started = dispatcher_exchange(&d::DispatcherRequest::Start {
+                    contract_version: 1,
+                    identity,
+                })?;
+                if !started.ok {
+                    return Err(ServiceError::Backend("dispatcher_start_failed".into()));
+                }
             }
         }
         let mut stream = UnixStream::connect(&self.path).map_err(transport_error)?;
@@ -127,8 +160,15 @@ impl UnixSocketTransport {
 pub fn dispatcher_exchange(
     request: &nelomai_contracts::dispatcher::DispatcherRequest,
 ) -> Result<nelomai_contracts::dispatcher::DispatcherResponse, ServiceError> {
+    dispatcher_exchange_at(Path::new(crate::DISPATCHER_SOCKET_PATH), request)
+}
+
+fn dispatcher_exchange_at(
+    path: &Path,
+    request: &nelomai_contracts::dispatcher::DispatcherRequest,
+) -> Result<nelomai_contracts::dispatcher::DispatcherResponse, ServiceError> {
     use nelomai_contracts::dispatcher as d;
-    let mut stream = UnixStream::connect(crate::DISPATCHER_SOCKET_PATH).map_err(transport_error)?;
+    let mut stream = UnixStream::connect(path).map_err(transport_error)?;
     configure_stream(&stream)?;
     stream
         .write_all(&d::encode_frame(request).map_err(transport_error)?)
@@ -141,8 +181,8 @@ pub fn dispatcher_exchange(
 #[async_trait]
 impl ServiceTransport for UnixSocketTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || Self::new(path).exchange_blocking(request))
+        let transport = self.clone();
+        tokio::task::spawn_blocking(move || transport.exchange_blocking(request))
             .await
             .map_err(|_| ServiceError::Backend("helper_task_failed".to_string()))?
     }

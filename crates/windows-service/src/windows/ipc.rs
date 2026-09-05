@@ -184,36 +184,7 @@ pub(crate) fn wake_server() {
 }
 
 fn exchange_blocking(request: Request) -> Result<Response, ServiceError> {
-    if request.protocol_version() != crate::PROTOCOL_VERSION {
-        return Err(ServiceError::UnsupportedProtocol);
-    }
-    use nelomai_contracts::dispatcher as d;
-    let ready = dispatcher_exchange(&d::DispatcherRequest::Version {
-        contract_version: 1,
-    })?;
-    let identity = ready
-        .identity
-        .filter(|_| ready.ok && ready.contract_version == 1)
-        .ok_or(ServiceError::UnauthorizedClient)?;
-    if matches!(request, Request::Stop { .. }) {
-        let stopped = dispatcher_exchange(&d::DispatcherRequest::Stop {
-            contract_version: 1,
-            identity,
-        })?;
-        return if stopped.ok {
-            Ok(Response::success(Some(crate::ServiceTunnelState::Stopped)))
-        } else {
-            Err(ServiceError::Backend("dispatcher_stop_failed".into()))
-        };
-    }
-    let started = dispatcher_exchange(&d::DispatcherRequest::Start {
-        contract_version: 1,
-        identity,
-    })?;
-    if !started.ok {
-        return Err(ServiceError::Backend("dispatcher_start_failed".into()));
-    }
-    exchange_private(request)
+    crate::exchange_selected(request, dispatcher_exchange, exchange_private)
 }
 
 fn exchange_private(request: Request) -> Result<Response, ServiceError> {
