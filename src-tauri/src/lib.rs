@@ -233,7 +233,7 @@ pub fn run() {
         let app_data_directory = app.path().app_data_dir()?;
         // Before any secret read/init on every desktop platform (and Android
         // host process). The Windows plugin above is only an activation UX.
-        let owner_lock = ContainerOwnerLock::try_acquire(&app_data_directory)?;
+        let owner_lock = Arc::new(ContainerOwnerLock::try_acquire(&app_data_directory)?);
         use base64::Engine;
         let public_key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
             .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
@@ -243,7 +243,7 @@ pub fn run() {
             })?;
         let selection = InstalledRuntimeSelection::prepare(
             &app.path().resource_dir()?.join("runtime"),
-            &owner_lock,
+            owner_lock.as_ref(),
             public_key.as_deref(),
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -253,8 +253,10 @@ pub fn run() {
         #[cfg(not(target_os = "linux"))]
         let fallback = None;
 
-        let (selection, storage) = selection
-            .prepare_runtime_storage(&owner_lock, &SystemRecordFactory::new("primary", fallback))?;
+        let (selection, storage) = selection.prepare_runtime_storage(
+            owner_lock.as_ref(),
+            &SystemRecordFactory::new("primary", fallback),
+        )?;
 
         let api = ClientApi::new(PANEL_BASE)
             .and_then(|api| api.with_app_version(&selection.target().container_version))

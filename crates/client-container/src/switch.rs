@@ -5,7 +5,12 @@ use nelomai_client_api::RuntimeTarget;
 use nelomai_client_storage::ContainerOwnerLock;
 use nelomai_contracts::{RuntimeIdentity, VerifiedContainerManifest};
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf, sync::Mutex};
+use std::{
+    fs::File,
+    io::{self, Read},
+    path::PathBuf,
+    sync::Arc,
+};
 use uuid::Uuid;
 
 const SWITCH_SCHEMA_VERSION: u32 = 1;
@@ -108,22 +113,22 @@ pub enum SwitchJournalError {
 }
 
 pub struct SwitchCoordinator {
+    owner: Arc<ContainerOwnerLock>,
     path: PathBuf,
     manifest: VerifiedContainerManifest,
-    gate: Mutex<()>,
 }
 
 impl SwitchCoordinator {
-    /// Callers retain the common container owner lock for this coordinator's
-    /// lifetime. The fixed path prevents a second public switch journal.
+    /// Retains the common container owner lock for the coordinator's lifetime.
+    /// The fixed path prevents a second public switch journal.
     pub fn open(
-        owner: &ContainerOwnerLock,
+        owner: Arc<ContainerOwnerLock>,
         manifest: VerifiedContainerManifest,
     ) -> Result<Self, SwitchJournalError> {
         let coordinator = Self {
             path: owner.root().join("common/runtime-switch-v1.json"),
+            owner,
             manifest,
-            gate: Mutex::new(()),
         };
         coordinator.snapshot()?;
         Ok(coordinator)
@@ -133,7 +138,7 @@ impl SwitchCoordinator {
     /// accepts only a complete, frozen Requested record and never replaces
     /// unresolved work.
     pub fn begin_requested(&self, journal: SwitchJournalV1) -> Result<(), SwitchJournalError> {
-        let _guard = self.gate.lock().map_err(|_| SwitchJournalError::Invalid)?;
+        let _guard = self.owner.lock_transition_journal()?;
         validate_journal(&journal)?;
         validate_new_target(&journal, &self.manifest)?;
         if journal.phase != SwitchPhase::Requested
@@ -143,29 +148,37 @@ impl SwitchCoordinator {
         {
             return Err(SwitchJournalError::Invalid);
         }
+        let bytes = serde_json::to_vec(&journal).map_err(|_| SwitchJournalError::Invalid)?;
+        if bytes.len() > MAX_SWITCH_JOURNAL_BYTES {
+            return Err(SwitchJournalError::Invalid);
+        }
         if load_journal(&self.path)?.is_some_and(|current| {
             current.phase != SwitchPhase::Complete || current.resume_operation_id.is_none()
         }) {
             return Err(SwitchJournalError::Pending);
         }
-        let bytes = serde_json::to_vec(&journal).map_err(|_| SwitchJournalError::Invalid)?;
         atomic_nonsecret_write(&self.path, &bytes)?;
         Ok(())
     }
 
     pub fn snapshot(&self) -> Result<Option<SwitchJournalV1>, SwitchJournalError> {
-        let _guard = self.gate.lock().map_err(|_| SwitchJournalError::Invalid)?;
+        let _guard = self.owner.lock_transition_journal()?;
         load_journal(&self.path)
     }
 }
 
 fn load_journal(path: &PathBuf) -> Result<Option<SwitchJournalV1>, SwitchJournalError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) if bytes.len() <= MAX_SWITCH_JOURNAL_BYTES => bytes,
-        Ok(_) => return Err(SwitchJournalError::Invalid),
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    let mut bytes = Vec::new();
+    file.take((MAX_SWITCH_JOURNAL_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SWITCH_JOURNAL_BYTES {
+        return Err(SwitchJournalError::Invalid);
+    }
     let journal: SwitchJournalV1 =
         serde_json::from_slice(&bytes).map_err(|_| SwitchJournalError::Invalid)?;
     validate_journal(&journal)?;
@@ -201,6 +214,7 @@ fn validate_journal(journal: &SwitchJournalV1) -> Result<(), SwitchJournalError>
         .resume_operation_id
         .as_ref()
         .is_some_and(|value| !canonical_uuid(value))
+        || journal.resume_operation_id.is_some() != journal.decision.is_some()
         || journal.retry.as_ref().is_some_and(|retry| {
             retry.attempt == 0 || !(1..=30).contains(&retry.retry_after_seconds)
         })

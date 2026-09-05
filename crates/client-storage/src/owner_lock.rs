@@ -4,12 +4,14 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 #[derive(Debug)]
 pub struct ContainerOwnerLock {
     _file: File,
     root: PathBuf,
+    transition_journal_gate: Mutex<()>,
 }
 impl ContainerOwnerLock {
     pub fn try_acquire(root: &Path) -> io::Result<Self> {
@@ -65,9 +67,21 @@ impl ContainerOwnerLock {
         }
         #[cfg(not(any(unix, windows)))]
         return Err(io::Error::other("container owner locking is unsupported"));
-        Ok(Self { _file: file, root })
+        Ok(Self {
+            _file: file,
+            root,
+            transition_journal_gate: Mutex::new(()),
+        })
     }
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Short process-local serialization for the common transition journal.
+    /// Callers must release this before network, child, or auth waits.
+    pub fn lock_transition_journal(&self) -> io::Result<MutexGuard<'_, ()>> {
+        self.transition_journal_gate
+            .lock()
+            .map_err(|_| io::Error::other("container transition journal lock poisoned"))
     }
 }
