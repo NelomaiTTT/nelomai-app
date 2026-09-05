@@ -103,7 +103,21 @@ impl OwnerRuntimeAuth {
         let observation = self.broker.observe().await.map_err(map_error)?;
         let access =
             self.check_target(observation.access.ok_or(CoreError::AuthRecoveryRequired)?)?;
-        self.admission.bind_empty(&access, &quiescence)
+        self.bind_current(&access, &quiescence).await
+    }
+    async fn bind_current(
+        &self,
+        access: &AccessSnapshot,
+        quiescence: &RuntimeWriterQuiescence,
+    ) -> Result<(), CoreError> {
+        self.broker
+            .with_current_access(access, || {
+                self.admission
+                    .bind_empty(access, quiescence)
+                    .map_err(|_| BrokerError::RecoveryRequired)
+            })
+            .await
+            .map_err(map_error)
     }
     fn check_target(&self, value: AccessSnapshot) -> Result<AccessSnapshot, CoreError> {
         if RuntimeTarget::from_identity(value.identity()) != self.target {
@@ -148,6 +162,10 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
         // Drain actual lifecycle/intent/split/connection writers BEFORE the
         // broker takes issuance. Logout deliberately never takes this barrier.
         let deadline = tokio::time::Instant::now() + OWNER_REQUEST_BUDGET;
+        let fence = tokio::time::timeout_at(deadline, self.broker.capture_login_fence())
+            .await
+            .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?
+            .map_err(map_error)?;
         let quiescence = tokio::time::timeout_at(deadline, self.writers.quiesce())
             .await
             .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?;
@@ -165,12 +183,17 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
             return Err(CoreError::Api(nelomai_client_core::CoreApiError::Retryable));
         }
         let access = self.check_target(
-            tokio::time::timeout_at(deadline, self.broker.login(&request, &self.target))
-                .await
-                .map_err(|_| CoreError::AuthenticationOutcomeUnknown)?
-                .map_err(map_error)?,
+            tokio::time::timeout_at(
+                deadline,
+                self.broker.login_fenced(&request, &self.target, &fence),
+            )
+            .await
+            .map_err(|_| CoreError::AuthenticationOutcomeUnknown)?
+            .map_err(map_error)?,
         )?;
-        self.admission.bind_empty(&access, &quiescence)?;
+        tokio::time::timeout_at(deadline, self.bind_current(&access, &quiescence))
+            .await
+            .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))??;
         Ok(access)
     }
     async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {

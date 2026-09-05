@@ -500,6 +500,35 @@ fn login_request() -> LoginRequest {
 }
 
 #[tokio::test]
+async fn logout_cancels_login_already_waiting_for_broker_issuance() {
+    let state = Arc::new(Panel::default());
+    state.held.store(true, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap());
+    let stale = broker.access_token(None).await.unwrap();
+    let refreshing = broker.clone();
+    let refresh = tokio::spawn(async move { refreshing.access_token(Some(&stale)).await });
+    state.entered.notified().await;
+    let request = login_request();
+    let target = RuntimeTarget::from_identity(&identity(7));
+    let queued = broker.login(&request, &target);
+    tokio::pin!(queued);
+    tokio::select! { biased;
+        _ = &mut queued => panic!("login must wait behind the real HTTP refresh"),
+        _ = tokio::task::yield_now() => {}
+    }
+    broker.logout().await.unwrap();
+    let logged_out = store.load().unwrap();
+    state.release.notify_one();
+    assert!(refresh.await.unwrap().is_err());
+    assert!(matches!(queued.await, Err(BrokerError::Cancelled)));
+    assert!(state.login_requests.lock().unwrap().is_empty());
+    assert_eq!(store.load().unwrap(), logged_out);
+    server.abort();
+}
+
+#[tokio::test]
 async fn cancelled_login_late_family_is_persisted_and_revoked_never_issued() {
     let state = Arc::new(Panel::default());
     state.hold_login.store(true, Ordering::SeqCst);

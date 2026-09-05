@@ -58,6 +58,12 @@ pub struct BrokerObservation {
     pub access: Option<AccessSnapshot>,
 }
 
+/// Owner-captured provenance, never reconstructed from runtime request fields.
+pub(crate) struct LoginFence {
+    epoch: u64,
+    family: String,
+}
+
 #[async_trait]
 pub trait LocalAuthStop: Send + Sync {
     async fn stop_local(&self) -> Result<(), BrokerError>;
@@ -290,12 +296,55 @@ impl AuthBroker {
         request: &LoginRequest,
         target: &RuntimeTarget,
     ) -> Result<AccessSnapshot, BrokerError> {
+        let fence = self.capture_login_fence().await?;
+        self.login_fenced(request, target, &fence).await
+    }
+
+    pub(crate) async fn capture_login_fence(&self) -> Result<LoginFence, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        Ok(LoginFence {
+            epoch: auth.auth_epoch,
+            family: auth
+                .broker
+                .as_ref()
+                .ok_or(BrokerError::RecoveryRequired)?
+                .family
+                .clone(),
+        })
+    }
+
+    pub(crate) async fn with_current_access<T>(
+        &self,
+        access: &AccessSnapshot,
+        bind: impl FnOnce() -> Result<T, BrokerError>,
+    ) -> Result<T, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        Self::active(&auth)?;
+        if Self::snapshot(&auth)? != *access {
+            return Err(BrokerError::Cancelled);
+        }
+        // No await between validating owner provenance and the synchronous
+        // runtime write; logout cannot interleave a stale cache binding.
+        bind()
+    }
+
+    pub(crate) async fn login_fenced(
+        &self,
+        request: &LoginRequest,
+        target: &RuntimeTarget,
+        fence: &LoginFence,
+    ) -> Result<AccessSnapshot, BrokerError> {
         target.identity(None)?;
         let _issuance = self.issuance.lock().await;
         let (ticket, request) = {
             let _state = self.state.lock().await;
             let mut auth = self.load()?;
             let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+            if auth.auth_epoch != fence.epoch || meta.family != fence.family {
+                return Err(BrokerError::Cancelled);
+            }
             if meta.pending_logout.is_some() {
                 return Err(BrokerError::RecoveryRequired);
             }
@@ -640,6 +689,13 @@ impl AuthBroker {
             let _state = self.state.lock().await;
             let mut auth = self.load()?;
             if auth.logout_state == LogoutState::LoggedOut {
+                // Even repeated logout cancels requests that started waiting
+                // while already signed out; it must not reopen that old login.
+                auth.auth_epoch = auth
+                    .auth_epoch
+                    .checked_add(1)
+                    .ok_or(BrokerError::RecoveryRequired)?;
+                self.store.save(&auth)?;
                 drop(_state);
                 return self.stop.stop_local().await;
             }

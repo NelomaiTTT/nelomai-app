@@ -196,11 +196,10 @@ pub fn run() {
         )?);
         diagnostics.record_named("startup.rust.setup_ready", None, None, None);
         let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
-        let preferences = Arc::new(preferences::AppPreferenceStore::new(
-            nelomai_client_storage::RuntimeStateStore::paths(&storage.runtime)
-                .preferences
-                .clone(),
-        ));
+        let preferences = Arc::new(preferences::AppPreferenceStore::open_runtime(
+            &nelomai_client_storage::RuntimeStateStore::paths(&storage.runtime).preferences,
+            &app_data_directory.join("preferences.json"),
+        )?);
         let local = CoreLocalStop::new(tunnel.clone());
         let broker = Arc::new(AuthBroker::new(
             api.clone(),
