@@ -2864,6 +2864,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "nelomai-client-container"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "nelomai-client-api",
+ "nelomai-client-storage",
+ "nelomai-contracts",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nelomai-client-core"
 version = "0.1.0"
 dependencies = [

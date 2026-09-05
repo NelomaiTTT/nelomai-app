@@ -30,6 +30,88 @@ pub struct PendingResumeV1 {
     pub result: Option<ResumeResultV1>,
 }
 
+/// Protected broker journal. The local lineage is a cancellation/provenance
+/// identifier, not a server auth_family_id and never a substitute for identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerMetadataV1 {
+    pub family: String,
+    pub next_attempt: u64,
+    pub pending_request: Option<BrokerRequestV1>,
+    pub completed_resume: Option<CompletedResumeV1>,
+    pub pending_logout: Option<PendingLogoutV1>,
+    #[serde(default)]
+    pub pending_recovery: Option<RecoveryTicketV1>,
+    #[serde(default)]
+    pub cancelled_login: Option<BrokerRequestV1>,
+    #[serde(default)]
+    pub authentication_outcome_unknown: bool,
+    /// Retained only for an unresolved password attempt. Explicit recovery must
+    /// use the same account/install pair so server per-device revocation applies.
+    #[serde(default)]
+    pub pending_login_account: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryTicketV1 {
+    pub operation_id: String,
+    pub auth_epoch: u64,
+    pub attempt: u64,
+    pub family: String,
+    pub identity: RuntimeIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerRequestKind {
+    Refresh,
+    Resume,
+    Login,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredResumeArgumentsV1 {
+    pub reconcile_operation_id: String,
+    pub decision: String,
+    pub target: RuntimeIdentity,
+    pub expected_session_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerRequestV1 {
+    pub kind: BrokerRequestKind,
+    pub operation_id: String,
+    pub attempt: u64,
+    pub auth_epoch: u64,
+    pub source_identity: Option<RuntimeIdentity>,
+    pub resume: Option<StoredResumeArgumentsV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedResumeV1 {
+    pub request: BrokerRequestV1,
+    pub identity: RuntimeIdentity,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingLogoutV1 {
+    pub operation_id: String,
+    pub refresh_proof: String,
+}
+impl fmt::Debug for PendingLogoutV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingLogoutV1")
+            .field("operation_id", &self.operation_id)
+            .field("refresh_proof", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthStoreV1 {
@@ -46,6 +128,8 @@ pub struct AuthStoreV1 {
     pub confirmed_identity: Option<RuntimeIdentity>,
     #[serde(default)]
     pub pending_resume: Option<PendingResumeV1>,
+    #[serde(default)]
+    pub broker: Option<BrokerMetadataV1>,
 }
 
 impl fmt::Debug for ResumeResultV1 {
@@ -90,6 +174,7 @@ impl AuthStoreV1 {
             logout_state: LogoutState::Active,
             confirmed_identity: None,
             pending_resume: None,
+            broker: None,
         }
     }
     pub fn validate(&self) -> Result<(), StorageError> {
@@ -130,6 +215,99 @@ impl AuthStoreV1 {
                     .map_err(|_| StorageError::RecoveryRequired("invalid resume result"))?;
                 if result.identity.session_generation.is_none() || result.access_token.is_empty() {
                     return Err(StorageError::RecoveryRequired("incomplete resume result"));
+                }
+            }
+        }
+        if let Some(meta) = &self.broker {
+            if meta.family.is_empty() || meta.family.len() > 128 {
+                return Err(StorageError::RecoveryRequired("invalid broker lineage"));
+            }
+            if meta
+                .pending_login_account
+                .as_ref()
+                .is_some_and(|s| s.is_empty() || s.len() > 64)
+            {
+                return Err(StorageError::RecoveryRequired(
+                    "invalid pending login account",
+                ));
+            }
+            let validate_request = |request: &BrokerRequestV1| -> Result<(), StorageError> {
+                if request.operation_id.is_empty()
+                    || request.operation_id.len() > 128
+                    || request.attempt == 0
+                    || request.attempt > meta.next_attempt
+                    || request.auth_epoch > self.auth_epoch
+                {
+                    return Err(StorageError::RecoveryRequired(
+                        "invalid broker request ticket",
+                    ));
+                }
+                if let Some(identity) = &request.source_identity {
+                    identity.validate().map_err(|_| {
+                        StorageError::RecoveryRequired("invalid broker source identity")
+                    })?;
+                }
+                if let Some(resume) = &request.resume {
+                    resume.target.validate().map_err(|_| {
+                        StorageError::RecoveryRequired("invalid broker resume target")
+                    })?;
+                    if resume.target.session_generation.is_some()
+                        || resume.reconcile_operation_id.is_empty()
+                        || !matches!(resume.decision.as_str(), "apply" | "cancel")
+                        || resume
+                            .expected_session_generation
+                            .is_some_and(|g| g == 0 || g > i64::MAX as u64)
+                    {
+                        return Err(StorageError::RecoveryRequired(
+                            "invalid broker resume arguments",
+                        ));
+                    }
+                }
+                if (request.kind == BrokerRequestKind::Resume) != request.resume.is_some() {
+                    return Err(StorageError::RecoveryRequired(
+                        "invalid broker request kind",
+                    ));
+                }
+                Ok(())
+            };
+            if let Some(request) = &meta.pending_request {
+                validate_request(request)?;
+            }
+            if let Some(request) = &meta.cancelled_login {
+                validate_request(request)?;
+                if request.kind != BrokerRequestKind::Login {
+                    return Err(StorageError::RecoveryRequired("invalid cancelled login"));
+                }
+            }
+            if let Some(done) = &meta.completed_resume {
+                validate_request(&done.request)?;
+                done.identity.validate().map_err(|_| {
+                    StorageError::RecoveryRequired("invalid completed resume identity")
+                })?;
+                if done.request.kind != BrokerRequestKind::Resume
+                    || done.identity.session_generation.is_none()
+                {
+                    return Err(StorageError::RecoveryRequired("invalid completed resume"));
+                }
+            }
+            if let Some(logout) = &meta.pending_logout {
+                if logout.operation_id.is_empty() || logout.refresh_proof.is_empty() {
+                    return Err(StorageError::RecoveryRequired("invalid logout proof"));
+                }
+            }
+            if let Some(recovery) = &meta.pending_recovery {
+                recovery
+                    .identity
+                    .validate()
+                    .map_err(|_| StorageError::RecoveryRequired("invalid recovery identity"))?;
+                if recovery.operation_id.is_empty()
+                    || recovery.family.is_empty()
+                    || recovery.identity.session_generation.is_none()
+                    || recovery.attempt == 0
+                    || recovery.attempt > meta.next_attempt
+                    || recovery.auth_epoch > self.auth_epoch
+                {
+                    return Err(StorageError::RecoveryRequired("invalid recovery ticket"));
                 }
             }
         }
