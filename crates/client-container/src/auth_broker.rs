@@ -91,6 +91,9 @@ pub struct AuthBroker {
     issuance: Mutex<()>,
 }
 impl AuthBroker {
+    pub(crate) fn owned_install_secret(&self) -> Result<String, BrokerError> {
+        Ok(self.load()?.install_secret)
+    }
     pub fn new(
         api: ClientApi,
         store: Arc<dyn AuthStore>,

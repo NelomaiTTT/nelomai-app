@@ -1,21 +1,22 @@
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use nelomai_client_api::{
-    BackgroundTokenResponse, ClientApi, DiagnosticUploadRequest, DiagnosticUploadResponse,
-    LoginRequest, TokenResponse,
+    AccessSnapshot, BackgroundTokenResponse, ClientApi, DiagnosticUploadRequest,
+    DiagnosticUploadResponse, RuntimeLogin,
 };
 use nelomai_client_core::{
     ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError, CoreError,
-    CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome, SplitTunnelSyncOutcome,
-    StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome, StartCancellationEpoch,
+    CoreLocalStop, CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome, RuntimeAuthProvider,
+    SplitTunnelSyncOutcome, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
+    StartCancellationEpoch,
 };
-use nelomai_client_storage::{MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredAuth};
-use nelomai_client_tunnel::{TunnelController, TunnelError};
+use nelomai_client_storage::{MemorySplitTunnelStore, RuntimeStateStore, SplitTunnelStore};
+use nelomai_client_tunnel::TunnelController;
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
     ConnectionIntentCapabilityResponse, EgressMode, Layer, OperationReconcileRequest,
-    OperationReconcileResponse, PeerBindingResponse, PeerOptions, Platform, ProbeFailureCode,
-    ProbeResult, ProbeResults, RouteMode, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
+    OperationReconcileResponse, PeerBindingResponse, PeerOptions, ProbeFailureCode, ProbeResult,
+    ProbeResults, RouteMode, ServerCandidatesResponse, SplitTunnelAddressRuleScope,
     SplitTunnelAddressRuleUpdate, SplitTunnelPolicy, SplitTunnelSelectedPackage,
     SplitTunnelSettingsUpdate, TicConnectionMode, UpdateState,
 };
@@ -27,29 +28,26 @@ use tokio::sync::Mutex as AsyncMutex;
 const PROBE_REFRESH_SECONDS: i64 = 300;
 const MAX_CONCURRENT_PROBES: usize = 4;
 
-pub struct LoginParameters {
-    pub login: String,
-    pub password: String,
-    pub device_name: String,
-    pub platform: Platform,
-    pub platform_version: Option<String>,
-    pub architecture: String,
-    pub app_version: String,
-}
+pub type LoginParameters = RuntimeLogin;
 
 #[async_trait]
 pub trait ApplicationApi: CoreApi {
-    async fn login(&self, request: &LoginRequest) -> Result<TokenResponse, CoreApiError>;
-    async fn peer_options(&self, access_token: &str) -> Result<PeerOptions, CoreApiError>;
+    async fn peer_options(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<PeerOptions, CoreApiError>;
     async fn bind_peer(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError>;
-    async fn unbind_peer(&self, access_token: &str) -> Result<PeerBindingResponse, CoreApiError>;
+    async fn unbind_peer(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<PeerBindingResponse, CoreApiError>;
     async fn server_candidates(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         layer: Layer,
         egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError>;
@@ -69,10 +67,9 @@ pub trait ApplicationApi: CoreApi {
             .await
             .ok_or(ProbeFailureCode::Unknown)
     }
-    async fn logout(&self, access_token: &str) -> Result<(), CoreApiError>;
     async fn background_token(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<BackgroundTokenResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
@@ -99,14 +96,14 @@ pub trait ApplicationApi: CoreApi {
     }
     async fn upload_diagnostics(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &DiagnosticUploadRequest,
     ) -> Result<DiagnosticUploadResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn notifications(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _cursor: Option<i64>,
         _limit: u32,
     ) -> Result<AppNotificationList, CoreApiError> {
@@ -114,66 +111,86 @@ pub trait ApplicationApi: CoreApi {
     }
     async fn mark_notification_read(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _message_id: i64,
     ) -> Result<AppNotificationReadResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn mark_all_notifications_read(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<AppNotificationReadResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn register_push_token(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _token: &str,
     ) -> Result<(), CoreApiError> {
         Err(CoreApiError::Retryable)
     }
-    async fn unregister_push_token(&self, _access_token: &str) -> Result<(), CoreApiError> {
+    async fn unregister_push_token(
+        &self,
+        _access_token: &AccessSnapshot,
+    ) -> Result<(), CoreApiError> {
         Ok(())
     }
 }
 
 #[async_trait]
 impl ApplicationApi for ClientApi {
-    async fn login(&self, request: &LoginRequest) -> Result<TokenResponse, CoreApiError> {
-        ClientApi::login(self, request).await.map_err(Into::into)
-    }
-
-    async fn peer_options(&self, access_token: &str) -> Result<PeerOptions, CoreApiError> {
-        ClientApi::peer_options(self, access_token)
-            .await
-            .map_err(Into::into)
+    async fn peer_options(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<PeerOptions, CoreApiError> {
+        ClientApi::peer_options(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn bind_peer(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError> {
-        ClientApi::bind_peer(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::bind_peer(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
-    async fn unbind_peer(&self, access_token: &str) -> Result<PeerBindingResponse, CoreApiError> {
-        ClientApi::unbind_peer(self, access_token)
-            .await
-            .map_err(Into::into)
+    async fn unbind_peer(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<PeerBindingResponse, CoreApiError> {
+        ClientApi::unbind_peer(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn server_candidates(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         layer: Layer,
         egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
-        ClientApi::server_candidates(self, access_token, layer, egress_mode)
-            .await
-            .map_err(Into::into)
+        ClientApi::server_candidates(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            layer,
+            egress_mode,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
@@ -196,20 +213,16 @@ impl ApplicationApi for ClientApi {
         ClientApi::probe_candidate_latency_ms(self, probe_url).await
     }
 
-    async fn logout(&self, access_token: &str) -> Result<(), CoreApiError> {
-        ClientApi::logout(self, access_token)
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
-    }
-
     async fn background_token(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
     ) -> Result<BackgroundTokenResponse, CoreApiError> {
-        ClientApi::background_token(self, access_token)
-            .await
-            .map_err(Into::into)
+        ClientApi::background_token(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn background_capabilities(
@@ -244,60 +257,86 @@ impl ApplicationApi for ClientApi {
 
     async fn upload_diagnostics(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &DiagnosticUploadRequest,
     ) -> Result<DiagnosticUploadResponse, CoreApiError> {
-        ClientApi::upload_diagnostics(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::upload_diagnostics(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn notifications(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         cursor: Option<i64>,
         limit: u32,
     ) -> Result<AppNotificationList, CoreApiError> {
-        ClientApi::notifications(self, access_token, cursor, limit)
-            .await
-            .map_err(Into::into)
+        ClientApi::notifications(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            cursor,
+            limit,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn mark_notification_read(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         message_id: i64,
     ) -> Result<AppNotificationReadResponse, CoreApiError> {
-        ClientApi::mark_notification_read(self, access_token, message_id)
-            .await
-            .map_err(Into::into)
+        ClientApi::mark_notification_read(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            message_id,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn mark_all_notifications_read(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
     ) -> Result<AppNotificationReadResponse, CoreApiError> {
-        ClientApi::mark_all_notifications_read(self, access_token)
-            .await
-            .map_err(Into::into)
+        ClientApi::mark_all_notifications_read(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn register_push_token(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         token: &str,
     ) -> Result<(), CoreApiError> {
-        ClientApi::register_push_token(self, access_token, token)
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
+        ClientApi::register_push_token(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            token,
+        )
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
     }
 
-    async fn unregister_push_token(&self, access_token: &str) -> Result<(), CoreApiError> {
-        ClientApi::unregister_push_token(self, access_token)
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
+    async fn unregister_push_token(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<(), CoreApiError> {
+        ClientApi::unregister_push_token(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
     }
 }
 
@@ -347,8 +386,7 @@ impl ProbeCache {
 
 pub struct ClientApplication<A, S, T, L> {
     api: Arc<A>,
-    store: Arc<S>,
-    tunnel: Arc<T>,
+    auth: Arc<dyn RuntimeAuthProvider>,
     core: ClientCore<A, S, T, L>,
     lifecycle_gate: AsyncMutex<()>,
     probe_gate: AsyncMutex<()>,
@@ -358,16 +396,23 @@ pub struct ClientApplication<A, S, T, L> {
 impl<A, S, T, L> ClientApplication<A, S, T, L>
 where
     A: ApplicationApi,
-    S: SecretStore,
+    S: RuntimeStateStore,
     T: TunnelController,
     L: CoreLogger,
 {
-    pub fn new(api: Arc<A>, store: Arc<S>, tunnel: Arc<T>, logger: Arc<L>) -> Self {
+    pub fn new(
+        api: Arc<A>,
+        store: Arc<S>,
+        auth: Arc<dyn RuntimeAuthProvider>,
+        local: Arc<CoreLocalStop<T>>,
+        logger: Arc<L>,
+    ) -> Self {
         Self::with_split_tunnel_store(
             api,
             store,
             Arc::new(MemorySplitTunnelStore::default()),
-            tunnel,
+            auth,
+            local,
             logger,
         )
     }
@@ -376,20 +421,21 @@ where
         api: Arc<A>,
         store: Arc<S>,
         split_tunnel_store: Arc<dyn SplitTunnelStore>,
-        tunnel: Arc<T>,
+        auth: Arc<dyn RuntimeAuthProvider>,
+        local: Arc<CoreLocalStop<T>>,
         logger: Arc<L>,
     ) -> Self {
         let core = ClientCore::with_split_tunnel_store(
             api.clone(),
             store.clone(),
             split_tunnel_store,
-            tunnel.clone(),
+            auth.clone(),
+            local,
             logger,
         );
         Self {
             api,
-            store,
-            tunnel,
+            auth,
             core,
             lifecycle_gate: AsyncMutex::new(()),
             probe_gate: AsyncMutex::new(()),
@@ -403,50 +449,13 @@ where
         now_unix: i64,
     ) -> Result<Bootstrap, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        let install_secret = self
-            .store
-            .load()
-            .map_err(|_| ApplicationError::Storage)?
-            .unwrap_or_else(StoredAuth::new_install)
-            .install_secret;
-        let response = self
-            .api
-            .login(&LoginRequest {
-                login: parameters.login,
-                password: parameters.password,
-                install_secret: install_secret.clone(),
-                device_name: parameters.device_name,
-                platform: parameters.platform,
-                platform_version: parameters.platform_version,
-                architecture: parameters.architecture,
-                app_version: parameters.app_version,
-            })
-            .await?;
-        let _probe_guard = self.probe_gate.lock().await;
-        if let Err(TunnelError::Backend(code)) = self.tunnel.stop().await {
-            self.core
-                .record_tunnel_unavailable("tunnel.stop_before_login.unavailable", code);
-        }
+        self.auth.login(parameters).await?;
         self.clear_probe_cache()?;
-        self.store
-            .save(&StoredAuth {
-                install_secret,
-                access_token: Some(response.access_token),
-                refresh_token: Some(response.refresh_token),
-                saved_connection: None,
-                pinned_connection: None,
-                pending_start: None,
-                pending_stalled_stop: None,
-                pending_compensation_stop: None,
-                compatibility: None,
-            })
-            .map_err(|_| ApplicationError::Storage)?;
-        self.core.reset_split_tunnel_state().await?;
         self.core.bootstrap(now_unix).await.map_err(Into::into)
     }
 
     pub async fn peer_options(&self) -> Result<PeerOptions, ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         let mut options = match self.api.peer_options(&access_token).await {
             Ok(options) => options,
             Err(CoreApiError::Unauthorized) => {
@@ -589,7 +598,7 @@ where
     ) -> Result<PeerBindingResponse, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core.prepare_binding_change().await?;
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         let _probe_guard = self.probe_gate.lock().await;
         let response = match self.api.bind_peer(&access_token, &request).await {
             Ok(response) => response,
@@ -606,7 +615,7 @@ where
     pub async fn unbind_peer(&self) -> Result<PeerBindingResponse, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let _probe_guard = self.probe_gate.lock().await;
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         let response = match self.api.unbind_peer(&access_token).await {
             Ok(response) => response,
             Err(CoreApiError::Unauthorized) => {
@@ -621,39 +630,7 @@ where
     }
 
     pub async fn logout(&self) -> Result<(), ApplicationError> {
-        let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        let _probe_guard = self.probe_gate.lock().await;
-        if let Ok(access_token) = self.access_token() {
-            let _ = self.api.unregister_push_token(&access_token).await;
-            let _ = self.api.logout(&access_token).await;
-        }
-        let result = self.core.sign_out().await;
-        self.clear_probe_cache()?;
-        result.map_err(Into::into)
-    }
-
-    /// Revokes the server-side UI session without changing local authentication.
-    ///
-    /// Android uses this only after native background cleanup explicitly reports
-    /// that it did not take ownership. A failure must leave local credentials in
-    /// place so the user can retry the same revoke safely.
-    pub async fn logout_remote(&self) -> Result<(), ApplicationError> {
-        let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        let _probe_guard = self.probe_gate.lock().await;
-        let access_token = self.access_token()?;
-        let _ = self.api.unregister_push_token(&access_token).await;
-        self.api.logout(&access_token).await.map_err(Into::into)
-    }
-
-    /// Clears local account state without revoking server-side credentials.
-    ///
-    /// Android uses this after it has durably handed remote cleanup to the
-    /// native background logout coordinator. Calling the legacy remote logout
-    /// here would race that coordinator and revoke the credential it still
-    /// needs to finish exact cleanup.
-    pub async fn logout_local(&self) -> Result<(), ApplicationError> {
-        let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        let _probe_guard = self.probe_gate.lock().await;
+        // Enter the protected owner without waiting for lifecycle/probe gates.
         let result = self.core.sign_out().await;
         self.clear_probe_cache()?;
         result.map_err(Into::into)
@@ -669,7 +646,7 @@ where
         if bootstrap.device.id != expected_device_id {
             return Ok(None);
         }
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match ApplicationApi::background_token(self.api.as_ref(), &access_token).await {
             Ok(response) => Ok(Some(response)),
             Err(CoreApiError::Unauthorized) => {
@@ -687,7 +664,7 @@ where
         &self,
         request: &DiagnosticUploadRequest,
     ) -> Result<DiagnosticUploadResponse, ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self.api.upload_diagnostics(&access_token, request).await {
             Ok(response) => Ok(response),
             Err(CoreApiError::Unauthorized) => {
@@ -706,7 +683,7 @@ where
         cursor: Option<i64>,
         limit: u32,
     ) -> Result<AppNotificationList, ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self.api.notifications(&access_token, cursor, limit).await {
             Ok(response) => Ok(response),
             Err(CoreApiError::Unauthorized) => {
@@ -724,7 +701,7 @@ where
         &self,
         message_id: i64,
     ) -> Result<AppNotificationReadResponse, ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self
             .api
             .mark_notification_read(&access_token, message_id)
@@ -745,7 +722,7 @@ where
     pub async fn mark_all_notifications_read(
         &self,
     ) -> Result<AppNotificationReadResponse, ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self.api.mark_all_notifications_read(&access_token).await {
             Ok(response) => Ok(response),
             Err(CoreApiError::Unauthorized) => {
@@ -760,7 +737,7 @@ where
     }
 
     pub async fn register_push_token(&self, token: &str) -> Result<(), ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self.api.register_push_token(&access_token, token).await {
             Ok(()) => Ok(()),
             Err(CoreApiError::Unauthorized) => {
@@ -775,7 +752,7 @@ where
     }
 
     pub async fn unregister_push_token(&self) -> Result<(), ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self.api.unregister_push_token(&access_token).await {
             Ok(()) => Ok(()),
             Err(CoreApiError::Unauthorized) => {
@@ -794,7 +771,7 @@ where
     }
 
     pub async fn refresh_update_state(&self) -> Result<UpdateState, ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self.api.bootstrap(&access_token).await {
             Ok(response) => Ok(response.update),
             Err(CoreApiError::Unauthorized) => {
@@ -853,26 +830,6 @@ where
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core
             .bootstrap_without_refresh(now_unix)
-            .await
-            .map_err(Into::into)
-    }
-
-    pub fn install_secret(&self) -> Result<String, ApplicationError> {
-        self.store
-            .load()
-            .map_err(|_| ApplicationError::Storage)?
-            .map(|stored| stored.install_secret)
-            .ok_or(ApplicationError::Core(CoreError::SignedOut))
-    }
-
-    pub async fn replace_session_tokens(
-        &self,
-        access_token: &str,
-        refresh_token: &str,
-    ) -> Result<(), ApplicationError> {
-        let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        self.core
-            .replace_session_tokens(access_token, refresh_token)
             .await
             .map_err(Into::into)
     }
@@ -1179,16 +1136,12 @@ where
             .map_err(Into::into)
     }
 
-    pub fn current_access_token(&self) -> Result<String, ApplicationError> {
-        self.store
-            .load()
-            .map_err(|_| ApplicationError::Storage)?
-            .and_then(|stored| stored.access_token)
-            .ok_or(ApplicationError::Core(CoreError::SignedOut))
+    pub async fn current_access_token(&self) -> Result<AccessSnapshot, ApplicationError> {
+        self.core.access_snapshot().await.map_err(Into::into)
     }
 
-    fn access_token(&self) -> Result<String, ApplicationError> {
-        self.current_access_token()
+    async fn access_token(&self) -> Result<AccessSnapshot, ApplicationError> {
+        self.current_access_token().await
     }
 
     async fn load_server_candidates(
@@ -1196,7 +1149,7 @@ where
         layer: Layer,
         egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, ApplicationError> {
-        let access_token = self.access_token()?;
+        let access_token = self.access_token().await?;
         match self
             .api
             .server_candidates(&access_token, layer, egress_mode)

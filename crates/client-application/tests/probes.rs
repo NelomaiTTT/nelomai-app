@@ -1,4 +1,6 @@
+mod support;
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_api::{LoginRequest, TokenResponse};
 use nelomai_client_application::{ApplicationApi, ApplicationError, ClientApplication};
 use nelomai_client_core::{ConnectOptions, CoreApi, CoreApiError, CoreError, NoopLogger};
@@ -25,17 +27,13 @@ struct ProbeApi {
 
 #[async_trait]
 impl CoreApi for ProbeApi {
-    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
-        unreachable!("refresh is not used by this test")
-    }
-
-    async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
+    async fn bootstrap(&self, _access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
         unreachable!("bootstrap is not used by this test")
     }
 
     async fn start_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         *self.start_request.lock().unwrap() = Some(request.clone());
@@ -63,7 +61,7 @@ impl CoreApi for ProbeApi {
 
     async fn stop_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("stop is not used by this test")
@@ -71,7 +69,7 @@ impl CoreApi for ProbeApi {
 
     async fn pin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("pin is not used by this test")
@@ -79,7 +77,7 @@ impl CoreApi for ProbeApi {
 
     async fn unpin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("unpin is not used by this test")
@@ -88,29 +86,31 @@ impl CoreApi for ProbeApi {
 
 #[async_trait]
 impl ApplicationApi for ProbeApi {
-    async fn login(&self, _request: &LoginRequest) -> Result<TokenResponse, CoreApiError> {
-        unreachable!("login is not used by this test")
-    }
-
-    async fn peer_options(&self, _access_token: &str) -> Result<PeerOptions, CoreApiError> {
+    async fn peer_options(
+        &self,
+        _access_token: &AccessSnapshot,
+    ) -> Result<PeerOptions, CoreApiError> {
         unreachable!("peer options are not used by this test")
     }
 
     async fn bind_peer(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError> {
         unreachable!("peer binding is not used by this test")
     }
 
-    async fn unbind_peer(&self, _access_token: &str) -> Result<PeerBindingResponse, CoreApiError> {
+    async fn unbind_peer(
+        &self,
+        _access_token: &AccessSnapshot,
+    ) -> Result<PeerBindingResponse, CoreApiError> {
         unreachable!("peer unbinding is not used by this test")
     }
 
     async fn server_candidates(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         layer: Layer,
         egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
@@ -129,10 +129,6 @@ impl ApplicationApi for ProbeApi {
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
         self.probe_calls.fetch_add(1, Ordering::SeqCst);
         (!self.all_probes_fail.load(Ordering::SeqCst) && probe_url.contains("fast")).then_some(24.5)
-    }
-
-    async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
-        Ok(())
     }
 }
 
@@ -413,7 +409,7 @@ async fn probe_tokens_are_not_reused_after_logout() {
 }
 
 fn application() -> (
-    ClientApplication<ProbeApi, MemoryStore, StoppedTunnel, NoopLogger>,
+    ClientApplication<ProbeApi, support::LegacyRuntime<MemoryStore>, StoppedTunnel, NoopLogger>,
     Arc<ProbeApi>,
 ) {
     let api = Arc::new(ProbeApi {
@@ -433,7 +429,7 @@ fn application() -> (
     });
     *store.0.lock().unwrap() = Some(auth);
     (
-        ClientApplication::new(
+        support::application(
             api.clone(),
             store,
             Arc::new(StoppedTunnel),
@@ -450,5 +446,20 @@ fn candidate(id: &str, layer: Layer, probe_url: &str) -> ServerCandidate {
         region_label: "Тест".to_string(),
         probe_url: probe_url.to_string(),
         expires_at: "2030-01-01T00:00:00Z".to_string(),
+    }
+}
+
+#[async_trait]
+impl support::TestAuthApi for ProbeApi {
+    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
+        unreachable!("refresh is not used by this test")
+    }
+
+    async fn login(&self, _request: &LoginRequest) -> Result<TokenResponse, CoreApiError> {
+        unreachable!("login is not used by this test")
+    }
+
+    async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
+        Ok(())
     }
 }

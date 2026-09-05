@@ -1,4 +1,6 @@
+mod support;
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_api::TokenResponse;
 use nelomai_client_core::{
     split_tunnel_active, ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError,
@@ -1085,7 +1087,7 @@ async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
     });
     let split_store = Arc::new(FailingSplitTunnelStore::default());
     let logger = Arc::new(TestLogger::default());
-    let core = ClientCore::with_split_tunnel_store(
+    let core = support::core_with_split(
         api,
         secret_store,
         split_store.clone(),
@@ -1627,7 +1629,7 @@ async fn detector_cancellation_journals_compensation_before_local_stop_and_recon
     fixture.core.finish_start_attempt();
     fixture.tunnel.block_stop.store(false, Ordering::SeqCst);
     fixture.tunnel.stop_release.notify_waiters();
-    let reconstructed = ClientCore::with_split_tunnel_store(
+    let reconstructed = support::core_with_split(
         fixture.api.clone(),
         fixture.secret_store.clone(),
         fixture.split_store.clone(),
@@ -2182,7 +2184,12 @@ async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy(
 }
 
 struct CoordinatorFixture {
-    core: ClientCore<CoordinatorApi, TestSecretStore, CoordinatorTunnel, TestLogger>,
+    core: ClientCore<
+        CoordinatorApi,
+        support::LegacyRuntime<TestSecretStore>,
+        CoordinatorTunnel,
+        TestLogger,
+    >,
     api: Arc<CoordinatorApi>,
     tunnel: Arc<CoordinatorTunnel>,
     split_store: Arc<MemorySplitTunnelStore>,
@@ -2209,7 +2216,7 @@ fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
     });
     let split_store = Arc::new(MemorySplitTunnelStore::default());
     let logger = Arc::new(TestLogger::default());
-    let core = ClientCore::with_split_tunnel_store(
+    let core = support::core_with_split(
         api.clone(),
         secret_store.clone(),
         split_store.clone(),
@@ -2493,11 +2500,7 @@ impl CoordinatorApi {
 
 #[async_trait]
 impl CoreApi for CoordinatorApi {
-    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
-        Err(CoreApiError::Retryable)
-    }
-
-    async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
+    async fn bootstrap(&self, _access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
         self.available()?;
         let connection = self.bootstrap_connection.lock().unwrap().clone();
         Ok(Bootstrap {
@@ -2545,7 +2548,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn start_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         self.available()?;
@@ -2574,7 +2577,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn stop_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         self.stop_calls.fetch_add(1, Ordering::SeqCst);
@@ -2609,7 +2612,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn pin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
@@ -2617,7 +2620,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn unpin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
@@ -2625,7 +2628,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn split_tunnel_revision(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelRevision, CoreApiError> {
         self.available()?;
         self.revision_calls.fetch_add(1, Ordering::SeqCst);
@@ -2634,7 +2637,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn split_tunnel_policy(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         self.available()?;
         if !self.policy_online.load(Ordering::SeqCst) {
@@ -2646,7 +2649,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn update_split_tunnel_settings(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &SplitTunnelSettingsUpdate,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         self.available()?;
@@ -2656,7 +2659,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn report_split_tunnel_apply_result(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &SplitTunnelApplyResult,
     ) -> Result<(), CoreApiError> {
         self.available()?;
@@ -2671,5 +2674,12 @@ impl CoreApi for CoordinatorApi {
         }
         self.apply_results.lock().unwrap().push(request.clone());
         Ok(())
+    }
+}
+
+#[async_trait]
+impl support::TestAuthApi for CoordinatorApi {
+    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
     }
 }

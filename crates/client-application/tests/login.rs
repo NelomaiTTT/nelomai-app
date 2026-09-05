@@ -1,6 +1,8 @@
+mod support;
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_api::{AuthDevice, LoginRequest, TokenResponse};
-use nelomai_client_application::{ApplicationApi, ClientApplication, LoginParameters};
+use nelomai_client_application::{ApplicationApi, LoginParameters};
 use nelomai_client_core::{CoreApi, CoreApiError, NoopLogger, Phase};
 use nelomai_client_storage::{
     SecretStore, StorageError, StoredAuth, StoredCompatibility, StoredConnection,
@@ -64,31 +66,7 @@ impl FakeApi {
 
 #[async_trait]
 impl CoreApi for FakeApi {
-    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
-        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(TokenResponse {
-            api_version: ApiVersion::V1,
-            request_id: "refresh-request".to_string(),
-            token_type: "Bearer".to_string(),
-            access_token: "fresh-access".to_string(),
-            access_expires_in: 900,
-            refresh_token: "fresh-refresh".to_string(),
-            refresh_expires_in: 7_776_000,
-            access: active_access(),
-            device: AuthDevice {
-                id: "device-1".to_string(),
-                name: "Laptop".to_string(),
-                platform: Platform::Macos,
-                container_version: None,
-                runtime_version: None,
-                runtime_contract_version: None,
-                runtime_slot: None,
-                session_generation: None,
-            },
-        })
-    }
-
-    async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
+    async fn bootstrap(&self, _access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
         let call = self.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
         if self.reject_first_bootstrap && call == 0 {
             return Err(CoreApiError::Unauthorized);
@@ -98,7 +76,7 @@ impl CoreApi for FakeApi {
 
     async fn start_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         unreachable!("start is not used by this test")
@@ -106,7 +84,7 @@ impl CoreApi for FakeApi {
 
     async fn stop_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("stop is not used by this test")
@@ -114,7 +92,7 @@ impl CoreApi for FakeApi {
 
     async fn pin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("pin is not used by this test")
@@ -122,7 +100,7 @@ impl CoreApi for FakeApi {
 
     async fn unpin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("unpin is not used by this test")
@@ -131,44 +109,26 @@ impl CoreApi for FakeApi {
 
 #[async_trait]
 impl ApplicationApi for FakeApi {
-    async fn login(&self, request: &LoginRequest) -> Result<TokenResponse, CoreApiError> {
-        *self.login_request.lock().unwrap() = Some(request.clone());
-        Ok(TokenResponse {
-            api_version: ApiVersion::V1,
-            request_id: "login-request".to_string(),
-            token_type: "Bearer".to_string(),
-            access_token: "new-access".to_string(),
-            access_expires_in: 900,
-            refresh_token: "new-refresh".to_string(),
-            refresh_expires_in: 7_776_000,
-            access: active_access(),
-            device: AuthDevice {
-                id: "device-1".to_string(),
-                name: "Laptop".to_string(),
-                platform: Platform::Macos,
-                container_version: None,
-                runtime_version: None,
-                runtime_contract_version: None,
-                runtime_slot: None,
-                session_generation: None,
-            },
-        })
-    }
-
-    async fn peer_options(&self, _access_token: &str) -> Result<PeerOptions, CoreApiError> {
+    async fn peer_options(
+        &self,
+        _access_token: &AccessSnapshot,
+    ) -> Result<PeerOptions, CoreApiError> {
         Ok(peer_options())
     }
 
     async fn bind_peer(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError> {
         *self.bind_request.lock().unwrap() = Some(request.clone());
         Ok(binding_response(request))
     }
 
-    async fn unbind_peer(&self, _access_token: &str) -> Result<PeerBindingResponse, CoreApiError> {
+    async fn unbind_peer(
+        &self,
+        _access_token: &AccessSnapshot,
+    ) -> Result<PeerBindingResponse, CoreApiError> {
         if self.unbind_fails {
             return Err(CoreApiError::Retryable);
         }
@@ -182,7 +142,7 @@ impl ApplicationApi for FakeApi {
 
     async fn server_candidates(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _layer: Layer,
         _egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
@@ -191,15 +151,6 @@ impl ApplicationApi for FakeApi {
 
     async fn probe_latency_ms(&self, _probe_url: &str) -> Option<f64> {
         unreachable!("server probes are not used by this test")
-    }
-
-    async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
-        self.logout_calls.fetch_add(1, Ordering::SeqCst);
-        if self.logout_fails {
-            Err(CoreApiError::Retryable)
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -280,12 +231,12 @@ impl TunnelController for TrackingTunnel {
 }
 
 #[tokio::test]
-async fn login_preserves_install_identity_but_drops_previous_account_state() {
+async fn application_login_preserves_runtime_cleanup_owned_by_coordinator() {
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let tunnel = Arc::new(TrackingTunnel::default());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store.clone(),
         tunnel.clone(),
@@ -298,10 +249,6 @@ async fn login_preserves_install_identity_but_drops_previous_account_state() {
                 login: "new-user".to_string(),
                 password: "password-secret".to_string(),
                 device_name: "Laptop".to_string(),
-                platform: Platform::Macos,
-                platform_version: Some("15.5".to_string()),
-                architecture: "aarch64".to_string(),
-                app_version: "0.1.0".to_string(),
             },
             1_800_000_000,
         )
@@ -315,7 +262,10 @@ async fn login_preserves_install_identity_but_drops_previous_account_state() {
     assert_eq!(stored.install_secret, "stable-install-secret");
     assert_eq!(stored.access_token.as_deref(), Some("new-access"));
     assert_eq!(stored.refresh_token.as_deref(), Some("new-refresh"));
-    assert!(stored.saved_connection.is_none());
+    assert_eq!(
+        stored.pinned_connection,
+        previous_account().saved_connection
+    );
     assert_eq!(tunnel.stop_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         stored.compatibility,
@@ -327,10 +277,10 @@ async fn login_preserves_install_identity_but_drops_previous_account_state() {
 }
 
 #[tokio::test]
-async fn unavailable_tunnel_service_does_not_block_login() {
+async fn unavailable_local_stop_is_reported_before_owner_login() {
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
-    let application = ClientApplication::new(
+    let application = support::application(
         api,
         store.clone(),
         Arc::new(UnavailableTunnel),
@@ -343,26 +293,12 @@ async fn unavailable_tunnel_service_does_not_block_login() {
                 login: "windows-user".to_string(),
                 password: "password-secret".to_string(),
                 device_name: "Windows PC".to_string(),
-                platform: Platform::Windows,
-                platform_version: Some("11".to_string()),
-                architecture: "x86_64".to_string(),
-                app_version: "0.1.0".to_string(),
             },
             1_800_000_000,
         )
-        .await
-        .unwrap();
-
-    assert_eq!(response.request_id, "bootstrap-request");
-    assert_eq!(
-        store
-            .value
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|stored| stored.access_token.as_deref()),
-        Some("new-access")
-    );
+        .await;
+    assert!(response.is_err());
+    assert!(store.value.lock().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -371,7 +307,7 @@ async fn peer_selection_lists_unused_peers_first_and_preserves_comments() {
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let application =
-        ClientApplication::new(api, store, Arc::new(StoppedTunnel), Arc::new(NoopLogger));
+        support::application(api, store, Arc::new(StoppedTunnel), Arc::new(NoopLogger));
 
     let options = application.peer_options().await.unwrap();
 
@@ -395,7 +331,7 @@ async fn background_token_is_not_issued_for_a_stale_device_scope() {
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let application =
-        ClientApplication::new(api, store, Arc::new(StoppedTunnel), Arc::new(NoopLogger));
+        support::application(api, store, Arc::new(StoppedTunnel), Arc::new(NoopLogger));
 
     let response = application
         .background_token_for_device("device-from-previous-account", 1_800_000_000)
@@ -410,7 +346,7 @@ async fn binding_uses_the_peer_selected_by_the_user() {
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store,
         Arc::new(StoppedTunnel),
@@ -443,40 +379,42 @@ async fn failed_unbind_keeps_the_local_tunnel_and_saved_configuration() {
     *store.value.lock().unwrap() = Some(previous_account());
     let tunnel = Arc::new(TrackingTunnel::default());
     let application =
-        ClientApplication::new(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
+        support::application(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
 
     assert!(application.unbind_peer().await.is_err());
 
     assert_eq!(tunnel.stop_calls.load(Ordering::SeqCst), 0);
-    assert!(store
-        .value
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .saved_connection
-        .is_some());
+    assert_eq!(
+        store
+            .value
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .pinned_connection,
+        previous_account().saved_connection
+    );
 }
 
 #[tokio::test]
-async fn logout_clears_account_and_stops_tunnel_when_server_is_unavailable() {
+async fn failed_logout_stops_locally_without_erasing_owner_cleanup_material() {
     let api = Arc::new(FakeApi::new(bootstrap()).with_logout_failure());
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let tunnel = Arc::new(TrackingTunnel::default());
     let application =
-        ClientApplication::new(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
+        support::application(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
 
-    application.logout().await.unwrap();
+    assert!(application.logout().await.is_err());
 
     assert_eq!(tunnel.stop_calls.load(Ordering::SeqCst), 1);
     let stored = store.value.lock().unwrap().clone().unwrap();
     assert_eq!(stored.install_secret, "stable-install-secret");
-    assert!(stored.access_token.is_none());
-    assert!(stored.refresh_token.is_none());
-    assert!(stored.saved_connection.is_none());
+    assert!(stored.access_token.is_some());
+    assert!(stored.refresh_token.is_some());
+    assert!(stored.saved_connection.is_some());
     assert!(stored.pinned_connection.is_none());
-    assert!(stored.compatibility.is_none());
+    assert_eq!(stored.compatibility, previous_account().compatibility);
     assert_eq!(
         application.state().await.phase,
         nelomai_client_core::Phase::SignedOut
@@ -484,21 +422,21 @@ async fn logout_clears_account_and_stops_tunnel_when_server_is_unavailable() {
 }
 
 #[tokio::test]
-async fn local_logout_clears_account_without_calling_remote_revoke() {
+async fn logout_uses_the_owner_instead_of_an_independent_runtime_revoke() {
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
     let tunnel = Arc::new(TrackingTunnel::default());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store.clone(),
         tunnel.clone(),
         Arc::new(NoopLogger),
     );
 
-    application.logout_local().await.unwrap();
+    application.logout().await.unwrap();
 
-    assert_eq!(api.logout_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.logout_calls.load(Ordering::SeqCst), 1);
     assert_eq!(tunnel.stop_calls.load(Ordering::SeqCst), 1);
     let stored = store.value.lock().unwrap().clone().unwrap();
     assert!(stored.access_token.is_none());
@@ -507,45 +445,45 @@ async fn local_logout_clears_account_without_calling_remote_revoke() {
 }
 
 #[tokio::test]
-async fn remote_logout_success_revokes_without_clearing_local_authentication() {
+async fn successful_owner_logout_disables_runtime_access() {
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store.clone(),
         Arc::new(TrackingTunnel::default()),
         Arc::new(NoopLogger),
     );
 
-    application.logout_remote().await.unwrap();
+    application.logout().await.unwrap();
 
     assert_eq!(api.logout_calls.load(Ordering::SeqCst), 1);
     let stored = store.value.lock().unwrap().clone().unwrap();
-    assert!(stored.access_token.is_some());
-    assert!(stored.refresh_token.is_some());
-    assert!(application.current_access_token().is_ok());
+    assert!(stored.access_token.is_none());
+    assert!(stored.refresh_token.is_none());
+    assert!(application.current_access_token().await.is_err());
 }
 
 #[tokio::test]
-async fn remote_logout_failure_keeps_local_authentication_for_retry() {
+async fn failed_owner_logout_keeps_retry_material_but_blocks_runtime_access() {
     let api = Arc::new(FakeApi::new(bootstrap()).with_logout_failure());
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store.clone(),
         Arc::new(TrackingTunnel::default()),
         Arc::new(NoopLogger),
     );
 
-    assert!(application.logout_remote().await.is_err());
+    assert!(application.logout().await.is_err());
 
     assert_eq!(api.logout_calls.load(Ordering::SeqCst), 1);
     let stored = store.value.lock().unwrap().clone().unwrap();
     assert!(stored.access_token.is_some());
     assert!(stored.refresh_token.is_some());
-    assert!(application.current_access_token().is_ok());
+    assert!(application.current_access_token().await.is_err());
 }
 
 #[tokio::test]
@@ -553,7 +491,7 @@ async fn refresh_update_state_returns_required_offer_without_changing_core_phase
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store,
         Arc::new(StoppedTunnel),
@@ -581,7 +519,7 @@ async fn refresh_update_state_refreshes_an_expired_access_token_once() {
     let api = Arc::new(FakeApi::new(bootstrap()).rejecting_first_bootstrap());
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store.clone(),
         Arc::new(StoppedTunnel),
@@ -602,7 +540,7 @@ async fn cold_bootstrap_applies_update_required_after_warm_refresh_does_not() {
     let api = Arc::new(FakeApi::new(bootstrap()));
     let store = Arc::new(MemoryStore::default());
     *store.value.lock().unwrap() = Some(previous_account());
-    let application = ClientApplication::new(
+    let application = support::application(
         api.clone(),
         store,
         Arc::new(StoppedTunnel),
@@ -736,5 +674,65 @@ fn active_access() -> Access {
         can_login: true,
         can_connect: true,
         expires_at: None,
+    }
+}
+
+#[async_trait]
+impl support::TestAuthApi for FakeApi {
+    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
+        self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(TokenResponse {
+            api_version: ApiVersion::V1,
+            request_id: "refresh-request".to_string(),
+            token_type: "Bearer".to_string(),
+            access_token: "fresh-access".to_string(),
+            access_expires_in: 900,
+            refresh_token: "fresh-refresh".to_string(),
+            refresh_expires_in: 7_776_000,
+            access: active_access(),
+            device: AuthDevice {
+                id: "device-1".to_string(),
+                name: "Laptop".to_string(),
+                platform: Platform::Macos,
+                container_version: None,
+                runtime_version: None,
+                runtime_contract_version: None,
+                runtime_slot: None,
+                session_generation: None,
+            },
+        })
+    }
+
+    async fn login(&self, request: &LoginRequest) -> Result<TokenResponse, CoreApiError> {
+        *self.login_request.lock().unwrap() = Some(request.clone());
+        Ok(TokenResponse {
+            api_version: ApiVersion::V1,
+            request_id: "login-request".to_string(),
+            token_type: "Bearer".to_string(),
+            access_token: "new-access".to_string(),
+            access_expires_in: 900,
+            refresh_token: "new-refresh".to_string(),
+            refresh_expires_in: 7_776_000,
+            access: active_access(),
+            device: AuthDevice {
+                id: "device-1".to_string(),
+                name: "Laptop".to_string(),
+                platform: Platform::Macos,
+                container_version: None,
+                runtime_version: None,
+                runtime_contract_version: None,
+                runtime_slot: None,
+                session_generation: None,
+            },
+        })
+    }
+
+    async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
+        self.logout_calls.fetch_add(1, Ordering::SeqCst);
+        if self.logout_fails {
+            Err(CoreApiError::Retryable)
+        } else {
+            Ok(())
+        }
     }
 }

@@ -61,6 +61,47 @@ fn auth_store() -> Arc<dyn AuthStore> {
     store.save(&value).unwrap();
     store
 }
+
+#[tokio::test]
+async fn runtime_owner_port_binds_trusted_target_and_keeps_migration_credentials_private() {
+    use nelomai_client_container::{OwnerRuntimeAuth, RuntimeClientProfile};
+    use nelomai_client_core::RuntimeAuthProvider;
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap());
+    let profile = RuntimeClientProfile {
+        platform: nelomai_contracts::Platform::Macos,
+        platform_version: None,
+        architecture: "aarch64".into(),
+    };
+    let target = RuntimeTarget::from_identity(&identity(7));
+    let port = OwnerRuntimeAuth::new(broker.clone(), target.clone(), profile.clone()).unwrap();
+    assert_eq!(port.access(None).await.unwrap().identity(), &identity(7));
+    let wrong = OwnerRuntimeAuth::new(
+        broker,
+        RuntimeTarget {
+            runtime_slot: RuntimeSlot::Stable,
+            ..target
+        },
+        profile,
+    )
+    .unwrap();
+    assert!(wrong.access(None).await.is_err());
+    assert!(
+        wrong.state().await.is_err(),
+        "offline admission also respects the trusted target"
+    );
+    assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+    let mut legacy = store.load().unwrap().unwrap();
+    legacy.session_generation = None;
+    legacy.confirmed_identity = None;
+    store.save(&legacy).unwrap();
+    assert!(port.access(None).await.is_err());
+    assert_eq!(store.load().unwrap().unwrap(), legacy);
+    assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
 fn response(generation: u64, access: &str) -> Value {
     json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer",
         "access_token":access,"access_expires_in":900,"refresh_token":"successor-refresh","refresh_expires_in":3600,

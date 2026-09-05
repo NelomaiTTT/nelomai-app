@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fmt,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +160,107 @@ pub trait RuntimeStateStore: Send + Sync {
     fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError>;
     fn save(&self, value: &RuntimeStateV1) -> Result<(), StorageError>;
 }
+
+/// Sole live-process owner of one exact runtime record. Startup migration and
+/// stopped-runtime coordination must relinquish all full-writer handles before
+/// this owner is handed to a runtime. This mutex is not a cross-process lock:
+/// the container must enforce single-process ownership separately.
+pub struct RuntimeRecordOwner<S> {
+    backend: S,
+    gate: Mutex<()>,
+}
+
+impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
+    pub fn new(backend: S) -> Arc<Self> {
+        Arc::new(Self {
+            backend,
+            gate: Mutex::new(()),
+        })
+    }
+    pub fn operational(self: &Arc<Self>) -> RuntimeOperationalStore<S> {
+        RuntimeOperationalStore {
+            owner: self.clone(),
+        }
+    }
+    pub fn split(self: &Arc<Self>) -> RuntimeSplitTunnelStore<S> {
+        RuntimeSplitTunnelStore {
+            owner: self.clone(),
+        }
+    }
+    fn load_required(&self) -> Result<RuntimeStateV1, StorageError> {
+        self.backend
+            .load()?
+            .ok_or(StorageError::RecoveryRequired("missing runtime record"))
+    }
+}
+
+pub struct RuntimeOperationalStore<S> {
+    owner: Arc<RuntimeRecordOwner<S>>,
+}
+impl<S: RuntimeStateStore> RuntimeStateStore for RuntimeOperationalStore<S> {
+    fn paths(&self) -> &RuntimePaths {
+        self.owner.backend.paths()
+    }
+    fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError> {
+        let _guard = self
+            .owner
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        self.owner.load_required().map(Some)
+    }
+    fn save(&self, value: &RuntimeStateV1) -> Result<(), StorageError> {
+        let _guard = self
+            .owner
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let mut current = self.owner.load_required()?;
+        if value.schema_version != current.schema_version
+            || value.slot != current.slot
+            || value.runtime_version != current.runtime_version
+        {
+            return Err(StorageError::RecoveryRequired(
+                "runtime schema or exact version mismatch",
+            ));
+        }
+        current.saved_connection = value.saved_connection.clone();
+        current.pinned_connection = value.pinned_connection.clone();
+        current.pending_start = value.pending_start.clone();
+        current.pending_stalled_stop = value.pending_stalled_stop.clone();
+        current.pending_compensation_stop = value.pending_compensation_stop.clone();
+        current.compatibility = value.compatibility.clone();
+        self.owner.backend.save(&current)
+    }
+}
+
+pub struct RuntimeSplitTunnelStore<S> {
+    owner: Arc<RuntimeRecordOwner<S>>,
+}
+impl<S: RuntimeStateStore> crate::SplitTunnelStore for RuntimeSplitTunnelStore<S> {
+    fn load(&self) -> Result<StoredSplitTunnelState, StorageError> {
+        let _guard = self
+            .owner
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        Ok(self.owner.load_required()?.applied_split_tunnel)
+    }
+    fn save(&self, value: &StoredSplitTunnelState) -> Result<(), StorageError> {
+        let _guard = self
+            .owner
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let mut current = self.owner.load_required()?;
+        current.applied_split_tunnel = crate::split_tunnel::normalized_checked_state(value)?;
+        self.owner.backend.save(&current)
+    }
+    fn delete(&self) -> Result<(), StorageError> {
+        self.save(&StoredSplitTunnelState::default())
+    }
+}
+
 pub struct ProtectedRuntimeStore<R> {
     record: R,
     paths: RuntimePaths,

@@ -217,7 +217,7 @@ impl SplitTunnelStore for MemorySplitTunnelStore {
     }
 }
 
-fn normalized_checked_state(
+pub(crate) fn normalized_checked_state(
     state: &StoredSplitTunnelState,
 ) -> Result<StoredSplitTunnelState, StorageError> {
     let state = state.clone().normalized();

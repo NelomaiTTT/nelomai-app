@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 async-trait = "0.1"
 nelomai-client-api = { path = "../client-api" }
+nelomai-client-core = { path = "../client-core" }
+nelomai-client-tunnel = { path = "../client-tunnel" }
 nelomai-client-storage = { path = "../client-storage" }
 nelomai-contracts = { path = "../contracts" }
 serde = { version = "1", features = ["derive"] }
@@ -17,7 +19,7 @@ tokio = { version = "1", features = ["sync", "time", "io-util", "net", "rt"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+nelomai-client-application = { path = "../client-application" }
 axum = "0.8"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
-

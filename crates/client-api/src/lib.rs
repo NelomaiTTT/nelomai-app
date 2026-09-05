@@ -61,6 +61,33 @@ impl RuntimeTarget {
     }
 }
 
+/// Runtime password ingress. The trusted owner supplies platform and target
+/// identity, and reads install identity from protected storage.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogin {
+    pub login: String,
+    pub password: String,
+    pub device_name: String,
+}
+impl fmt::Debug for RuntimeLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeLogin")
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAuthState {
+    Active,
+    RecoveryRequired,
+    LogoutPending,
+    LoggedOut,
+    AuthenticationOutcomeUnknown,
+}
+
 /// One broker-issued credential/identity pair. Runtime transport may carry this
 /// access-only record, never the protected auth store or refresh token.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

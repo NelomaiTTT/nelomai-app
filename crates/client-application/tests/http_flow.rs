@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
@@ -6,15 +7,15 @@ use axum::{
     Json, Router,
 };
 use nelomai_client_api::ClientApi;
-use nelomai_client_application::{ClientApplication, LoginParameters};
+use nelomai_client_application::LoginParameters;
 use nelomai_client_core::{ConnectOptions, NoopLogger, Phase};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     BindPeerRequest, EgressMode, Layer, OperationKind, OperationReconcileRequest, OperationState,
-    Platform, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelSelectedPackage,
-    SplitTunnelSettingsUpdate, TicConnectionMode,
+    RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
+    SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
+    TicConnectionMode,
 };
 use serde_json::{json, Value};
 use std::{
@@ -118,7 +119,7 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     let store = Arc::new(MemoryStore::default());
     let tunnel = Arc::new(RecordingTunnel::default());
     let application =
-        ClientApplication::new(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
+        support::application(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
 
     let initial = application
         .login(
@@ -126,10 +127,6 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
                 login: "test".to_string(),
                 password: "password".to_string(),
                 device_name: "Test Mac".to_string(),
-                platform: Platform::Macos,
-                platform_version: Some("15.5".to_string()),
-                architecture: "aarch64".to_string(),
-                app_version: "0.1.0".to_string(),
             },
             NOW,
         )
