@@ -7,6 +7,7 @@ use crate::{
 };
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
+use nelomai_client_container::{RuntimeSwitchStatusV1, SwitchCoordinator};
 use nelomai_client_core::{
     split_tunnel_active, ConnectOptions, CoreApiError, CoreError, CoreState, Phase,
     SplitTunnelContext,
@@ -15,8 +16,9 @@ use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
     ConnectionIntentCapability, EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
-    Platform, ProbeResults, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    Platform, ProbeResults, RouteMode, RuntimeSlot, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelMode, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "android")]
@@ -3242,6 +3244,43 @@ pub async fn app_update_restart(
     }
     stop_for_shutdown(&app, &application).await?;
     app.restart();
+}
+
+fn runtime_switch_error() -> CommandError {
+    CommandError::new(
+        "runtime_switch_recovery_required",
+        "Переключение runtime требует безопасного восстановления",
+    )
+}
+
+#[tauri::command]
+pub fn app_runtime_switch_status(
+    coordinator: State<'_, Arc<SwitchCoordinator>>,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    coordinator.status().map_err(|_| runtime_switch_error())
+}
+
+#[tauri::command]
+pub async fn app_runtime_switch_request(
+    coordinator: State<'_, Arc<SwitchCoordinator>>,
+    slot: RuntimeSlot,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    coordinator
+        .request(slot)
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    coordinator.status().map_err(|_| runtime_switch_error())
+}
+
+#[tauri::command]
+pub async fn app_runtime_switch_cancel(
+    coordinator: State<'_, Arc<SwitchCoordinator>>,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    coordinator
+        .cancel_pending()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    coordinator.status().map_err(|_| runtime_switch_error())
 }
 
 #[derive(Clone, Serialize)]

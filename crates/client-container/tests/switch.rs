@@ -5,15 +5,16 @@ use nelomai_client_container::{
     SwitchCoordinator, SwitchJournalError, SwitchJournalV1, SwitchPhase,
 };
 use nelomai_client_storage::{
-    ContainerOwnerLock, RuntimePaths, RuntimeStateV1, StoredAuth, StoredConnection,
-    StoredConnectionKind, StoredPendingCompensationStop, StoredPendingStart,
-    StoredSplitTunnelState,
+    ContainerOwnerLock, RuntimeAuthScope, RuntimeCleanupOperationV1, RuntimeCleanupSnapshotV1,
+    RuntimePaths, RuntimeStateV1, StoredAuth, StoredConnection, StoredConnectionKind,
+    StoredPendingCompensationStop, StoredPendingStart, StoredSplitTunnelState,
 };
 use nelomai_contracts::{
     verify_container_manifest, ContainerManifestV1, RuntimeArtifactManifestV1, RuntimeFileRole,
     RuntimeFileV1, RuntimeIdentity, RuntimeSlot, RuntimeSlotManifestV1,
     CONTAINER_MANIFEST_SIGNATURE_DOMAIN,
 };
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Barrier};
 
 fn manifest_for(version: &str) -> nelomai_contracts::VerifiedContainerManifest {
@@ -114,6 +115,59 @@ fn requested_for_operation(
         Some(7),
         cleanup_envelope,
     )
+}
+
+fn enrolled_journal_with_snapshot(target: RuntimeTarget) -> serde_json::Value {
+    let identity = RuntimeIdentity {
+        slot: RuntimeSlot::Stable,
+        runtime_version: "0.2.15".into(),
+        runtime_contract_version: 1,
+        container_version: "0.2.16".into(),
+        session_generation: Some(7),
+    };
+    let scope = RuntimeAuthScope {
+        auth_epoch: 4,
+        family: "family-a".into(),
+        identity: identity.clone(),
+    };
+    let snapshot = RuntimeCleanupSnapshotV1 {
+        slot: identity.slot,
+        runtime_version: identity.runtime_version.clone(),
+        auth_scope: Some(scope.clone()),
+        lease_ids: vec!["lease-a".into()],
+        operations: vec![RuntimeCleanupOperationV1 {
+            operation_id: "operation-a".into(),
+            request_fingerprint: Some("a".repeat(64)),
+            contract_version: Some(1),
+        }],
+        cleanup_only: false,
+    };
+    let envelope =
+        CleanupEnvelopeV1::from_runtime_snapshot(&snapshot, CleanupEngineRoleV1::Primary, None)
+            .unwrap();
+    let scope_wire = serde_json::json!({
+        "auth_epoch": scope.auth_epoch,
+        "family": scope.family,
+        "identity": identity,
+        "device_id": "device-a",
+    });
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&scope_wire).unwrap())
+    );
+    let mut journal = serde_json::to_value(SwitchJournalV1::requested(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "b".repeat(64),
+        Some(scope.identity),
+        Some("device-a".into()),
+        fingerprint,
+        target,
+        Some(7),
+        envelope,
+    ))
+    .unwrap();
+    journal["runtime_snapshot"] = serde_json::to_value(snapshot).unwrap();
+    journal
 }
 
 fn requested_with_serialized_len(target: RuntimeTarget, desired: usize) -> SwitchJournalV1 {
@@ -243,6 +297,49 @@ fn recovered_journal_rejects_either_half_of_resume_authority() {
 }
 
 #[test]
+fn recovered_journal_rejects_every_snapshot_source_and_envelope_crosslink_break() {
+    let target =
+        RuntimeTarget::from_identity(&manifest().identity(RuntimeSlot::Latest, None).unwrap());
+    let valid = enrolled_journal_with_snapshot(target);
+    let mutations: Vec<Box<dyn Fn(&mut serde_json::Value)>> = vec![
+        Box::new(|value| value["runtime_snapshot"]["slot"] = serde_json::json!("latest")),
+        Box::new(|value| value["runtime_snapshot"]["runtime_version"] = serde_json::json!("9.9.9")),
+        Box::new(|value| value["runtime_snapshot"]["cleanup_only"] = serde_json::json!(true)),
+        Box::new(|value| {
+            value["runtime_snapshot"]["auth_scope"]["family"] = serde_json::json!("family-b")
+        }),
+        Box::new(|value| value["source_device_id"] = serde_json::json!("device-b")),
+        Box::new(|value| {
+            value["runtime_snapshot"]["lease_ids"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!("extra-lease"))
+        }),
+        Box::new(|value| {
+            value["runtime_snapshot"]["operations"][0]["request_fingerprint"] =
+                serde_json::Value::Null
+        }),
+    ];
+
+    for mutate in mutations {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("common")).unwrap();
+        let mut corrupted = valid.clone();
+        mutate(&mut corrupted);
+        std::fs::write(
+            root.path().join("common/runtime-switch-v1.json"),
+            serde_json::to_vec(&corrupted).unwrap(),
+        )
+        .unwrap();
+        let lock = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+        assert!(matches!(
+            SwitchCoordinator::open(lock, manifest()),
+            Err(SwitchJournalError::Invalid)
+        ));
+    }
+}
+
+#[test]
 fn coordinators_retain_the_os_owner_and_share_one_same_root_write_gate() {
     let root = tempfile::tempdir().unwrap();
     let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
@@ -326,6 +423,52 @@ fn cleanup_envelope_round_trips_without_a_secret_or_tunnel_configuration_surface
     let mut value = serde_json::to_value(cleanup()).unwrap();
     value["configuration"] = serde_json::json!("secret-value");
     assert!(serde_json::from_value::<CleanupEnvelopeV1>(value).is_err());
+}
+
+#[test]
+fn public_cleanup_projection_rejects_every_secret_marker_and_oversized_aggregate() {
+    for marker in [
+        "PrivateKey=value",
+        "private_key=value",
+        "access_token=value",
+        "refresh_token=value",
+        "install_secret=value",
+        "Authorization: value",
+        "Bearer value",
+        "[Interface]",
+    ] {
+        let snapshot = RuntimeCleanupSnapshotV1 {
+            slot: RuntimeSlot::Latest,
+            runtime_version: "0.2.16".into(),
+            auth_scope: None,
+            lease_ids: vec![marker.into()],
+            operations: Vec::new(),
+            cleanup_only: true,
+        };
+        assert!(CleanupEnvelopeV1::from_runtime_snapshot(
+            &snapshot,
+            CleanupEngineRoleV1::Primary,
+            None,
+        )
+        .is_err());
+    }
+
+    let snapshot = RuntimeCleanupSnapshotV1 {
+        slot: RuntimeSlot::Latest,
+        runtime_version: "0.2.16".into(),
+        auth_scope: None,
+        lease_ids: (0..1024)
+            .map(|index| format!("{index:04}{}", "x".repeat(252)))
+            .collect(),
+        operations: Vec::new(),
+        cleanup_only: true,
+    };
+    assert!(CleanupEnvelopeV1::from_runtime_snapshot(
+        &snapshot,
+        CleanupEngineRoleV1::Primary,
+        None,
+    )
+    .is_err());
 }
 
 #[test]

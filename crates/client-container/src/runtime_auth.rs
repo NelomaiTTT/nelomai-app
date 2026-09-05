@@ -1,7 +1,7 @@
 //! In-process ownership adapter. Private-channel runtime transport is separate.
 use crate::{
     AuthBroker, BrokerAuthState, BrokerError, LocalAuthStop, LocalStopReceiptV1,
-    RuntimeSwitchControl, TransitionSourceSnapshot,
+    RuntimeCleanupHandoff, RuntimeSwitchControl, TransitionSourceSnapshot,
 };
 use async_trait::async_trait;
 use nelomai_client_api::{
@@ -64,19 +64,22 @@ impl RuntimeForceStop for UnavailableRuntimeForceStop {
 }
 
 pub struct RuntimeRecordSwitchControl<S, T> {
-    records: Vec<Arc<RuntimeRecordOwner<S>>>,
+    target: Arc<RuntimeRecordOwner<S>>,
+    retained: Vec<Arc<RuntimeRecordOwner<S>>>,
     local: Arc<CoreLocalStop<T>>,
     force: Arc<dyn RuntimeForceStop>,
 }
 
 impl<S: RuntimeStateStore, T: TunnelController> RuntimeRecordSwitchControl<S, T> {
     pub fn new(
-        records: Vec<Arc<RuntimeRecordOwner<S>>>,
+        target: Arc<RuntimeRecordOwner<S>>,
+        retained: Vec<Arc<RuntimeRecordOwner<S>>>,
         local: Arc<CoreLocalStop<T>>,
         force: Arc<dyn RuntimeForceStop>,
     ) -> Self {
         Self {
-            records,
+            target,
+            retained,
             local,
             force,
         }
@@ -86,7 +89,7 @@ impl<S: RuntimeStateStore, T: TunnelController> RuntimeRecordSwitchControl<S, T>
         &self,
         snapshot: &RuntimeCleanupSnapshotV1,
     ) -> Result<&Arc<RuntimeRecordOwner<S>>, BrokerError> {
-        let mut matching = self.records.iter().filter(|owner| {
+        let mut matching = self.retained.iter().chain([&self.target]).filter(|owner| {
             owner
                 .cleanup_snapshot()
                 .is_ok_and(|current| current == *snapshot)
@@ -97,6 +100,22 @@ impl<S: RuntimeStateStore, T: TunnelController> RuntimeRecordSwitchControl<S, T>
         }
         Ok(record)
     }
+
+    fn target_for_access(
+        &self,
+        access: &AccessSnapshot,
+    ) -> Result<&Arc<RuntimeRecordOwner<S>>, BrokerError> {
+        self.retained
+            .iter()
+            .chain([&self.target])
+            .find(|owner| {
+                owner.cleanup_snapshot().is_ok_and(|current| {
+                    current.slot == access.identity().slot
+                        && current.runtime_version == access.identity().runtime_version
+                })
+            })
+            .ok_or(BrokerError::RecoveryRequired)
+    }
 }
 
 #[async_trait]
@@ -106,31 +125,35 @@ impl<S: RuntimeStateStore, T: TunnelController> RuntimeSwitchControl
     async fn handoff_cleanup(
         &self,
         source: &TransitionSourceSnapshot,
-    ) -> Result<RuntimeCleanupSnapshotV1, BrokerError> {
-        let _quiescence = tokio::time::timeout(
+    ) -> Result<RuntimeCleanupHandoff, BrokerError> {
+        let quiescence = tokio::time::timeout(
             OWNER_REQUEST_BUDGET,
             self.local.runtime_writer_gates().quiesce(),
         )
         .await
         .map_err(|_| BrokerError::Timeout)?;
-        let mut matches = self.records.iter().filter_map(|owner| {
-            let snapshot = owner.cleanup_snapshot().ok()?;
-            if source.matches_runtime_scope(snapshot.auth_scope.as_ref())
-                && source.identity().is_none_or(|identity| {
-                    identity.slot == snapshot.slot
-                        && identity.runtime_version == snapshot.runtime_version
-                })
-            {
-                Some(snapshot)
-            } else {
-                None
-            }
-        });
+        let mut matches = self
+            .retained
+            .iter()
+            .chain([&self.target])
+            .filter_map(|owner| {
+                let snapshot = owner.cleanup_snapshot().ok()?;
+                if source.matches_runtime_scope(snapshot.auth_scope.as_ref())
+                    && source.identity().is_none_or(|identity| {
+                        identity.slot == snapshot.slot
+                            && identity.runtime_version == snapshot.runtime_version
+                    })
+                {
+                    Some(snapshot)
+                } else {
+                    None
+                }
+            });
         let snapshot = matches.next().ok_or(BrokerError::RecoveryRequired)?;
         if matches.next().is_some() {
             return Err(BrokerError::RecoveryRequired);
         }
-        Ok(snapshot)
+        Ok(RuntimeCleanupHandoff::new(snapshot, quiescence))
     }
 
     async fn graceful_stop(
@@ -171,33 +194,37 @@ impl<S: RuntimeStateStore, T: TunnelController> RuntimeSwitchControl
         )
         .await
         .map_err(|_| BrokerError::Timeout)?;
-        let source = self.record_for_snapshot(snapshot)?;
-        source.complete_cleanup(snapshot)?;
-        let target = self
-            .records
-            .iter()
-            .find(|owner| {
-                owner.cleanup_snapshot().is_ok_and(|current| {
-                    current.slot == access.identity().slot
-                        && current.runtime_version == access.identity().runtime_version
-                })
-            })
-            .ok_or(BrokerError::RecoveryRequired)?;
-        if !Arc::ptr_eq(source, target) {
-            let target_snapshot = target.cleanup_snapshot()?;
-            if !target_snapshot.cleanup_only
-                || !target_snapshot.lease_ids.is_empty()
-                || !target_snapshot.operations.is_empty()
-            {
-                return Err(BrokerError::RecoveryRequired);
-            }
-            target.complete_cleanup(&target_snapshot)?;
-        }
-        target.bind_empty_scope(&RuntimeAuthScope {
+        let target = self.target_for_access(access)?;
+        let target_snapshot = target.cleanup_snapshot()?;
+        let target_scope = RuntimeAuthScope {
             auth_epoch: access.auth_epoch(),
             family: access.family().into(),
             identity: access.identity().clone(),
-        })?;
+        };
+        if !target_snapshot.cleanup_only
+            && target_snapshot.auth_scope.as_ref() == Some(&target_scope)
+        {
+            if let Ok(source) = self.record_for_snapshot(snapshot) {
+                if !Arc::ptr_eq(source, target) {
+                    source.complete_cleanup(snapshot)?;
+                }
+            }
+            return Ok(());
+        }
+        let source = self.record_for_snapshot(snapshot)?;
+        if Arc::ptr_eq(source, target) {
+            source.complete_cleanup_and_bind(snapshot, &target_scope)?;
+            return Ok(());
+        }
+        if !target_snapshot.cleanup_only
+            || !target_snapshot.lease_ids.is_empty()
+            || !target_snapshot.operations.is_empty()
+            || target_snapshot.auth_scope.is_some()
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        target.complete_cleanup_and_bind(&target_snapshot, &target_scope)?;
+        source.complete_cleanup(snapshot)?;
         Ok(())
     }
 }

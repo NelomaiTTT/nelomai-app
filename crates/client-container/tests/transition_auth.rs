@@ -6,17 +6,22 @@ use axum::{
     Json, Router,
 };
 use nelomai_client_api::{
-    LoginRequest, RuntimeSwitchReconcileRequest, RuntimeSwitchState, RuntimeTarget,
+    AccessSnapshot, LoginRequest, RuntimeSwitchReconcileRequest, RuntimeSwitchState, RuntimeTarget,
 };
 use nelomai_client_container::{
     AuthBroker, BrokerError, FrozenReconcileRequest, LocalAuthStop, LocalStopReceiptV1,
-    ResumeArguments, RuntimeSwitchControl, SwitchCoordinator, SwitchPhase, SwitchProgress,
+    ResumeArguments, RuntimeCleanupHandoff, RuntimeRecordSwitchControl, RuntimeSwitchControl,
+    SlotSelectionV1, SwitchCoordinator, SwitchPhase, SwitchProgress, UnavailableRuntimeForceStop,
 };
+use nelomai_client_core::{CoreLocalStop, RuntimeWriterGates};
 use nelomai_client_storage::{
     AuthStore, AuthStoreV1, BrokerMetadataV1, BrokerRequestKind, BrokerRequestV1,
-    ContainerOwnerLock, ProtectedAuthStore, ProtectedRecordStore, RuntimeCleanupSnapshotV1,
-    StorageError, StoredAuth, TransitionAuthorityV1, TransitionDispatchStateV1,
+    ContainerOwnerLock, ProtectedAuthStore, ProtectedRecordStore, ProtectedRuntimeStore,
+    RuntimeCleanupSnapshotV1, RuntimePaths, RuntimeRecordOwner, RuntimeStateStore, RuntimeStateV1,
+    StorageError, StoredAuth, StoredConnection, StoredConnectionKind, StoredSplitTunnelState,
+    TransitionAuthorityV1, TransitionDispatchStateV1,
 };
+use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     verify_container_manifest, ContainerManifestV1, Platform, RuntimeArtifactManifestV1,
     RuntimeFileRole, RuntimeFileV1, RuntimeSlot, RuntimeSlotManifestV1,
@@ -87,9 +92,68 @@ impl ProtectedRecordStore for Record {
     }
 }
 
+struct FailOnceRuntimeStore {
+    inner: ProtectedRuntimeStore<Record>,
+    fail_after_commit: Arc<AtomicUsize>,
+}
+impl RuntimeStateStore for FailOnceRuntimeStore {
+    fn paths(&self) -> &RuntimePaths {
+        self.inner.paths()
+    }
+    fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError> {
+        self.inner.load()
+    }
+    fn save(&self, value: &RuntimeStateV1) -> Result<(), StorageError> {
+        self.inner.save(value)?;
+        if self.fail_after_commit.swap(0, Ordering::SeqCst) == 1 {
+            return Err(StorageError::RecoveryRequired(
+                "synthetic crash after runtime record save",
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct SaveGate {
     inner: Arc<dyn AuthStore>,
     saves_until_cancel: AtomicUsize,
+}
+
+struct FailAfterAtomicLegacyRefresh {
+    inner: Arc<dyn AuthStore>,
+    armed: AtomicUsize,
+}
+impl FailAfterAtomicLegacyRefresh {
+    fn new(inner: Arc<dyn AuthStore>) -> Self {
+        Self {
+            inner,
+            armed: AtomicUsize::new(0),
+        }
+    }
+    fn arm(&self) {
+        self.armed.store(1, Ordering::SeqCst);
+    }
+}
+impl AuthStore for FailAfterAtomicLegacyRefresh {
+    fn load(&self) -> Result<Option<AuthStoreV1>, StorageError> {
+        self.inner.load()
+    }
+    fn save(&self, value: &AuthStoreV1) -> Result<(), StorageError> {
+        self.inner.save(value)?;
+        let atomic_completion = value.broker.as_ref().is_some_and(|meta| {
+            meta.pending_request.is_none()
+                && meta
+                    .transition_authorities
+                    .iter()
+                    .any(|authority| authority.legacy_refresh_completed)
+        });
+        if atomic_completion && self.armed.swap(0, Ordering::SeqCst) == 1 {
+            return Err(StorageError::RecoveryRequired(
+                "synthetic crash after atomic legacy refresh save",
+            ));
+        }
+        Ok(())
+    }
 }
 impl SaveGate {
     fn new(inner: Arc<dyn AuthStore>) -> Self {
@@ -138,32 +202,81 @@ impl LocalAuthStop for Stop {
 }
 
 #[derive(Default)]
+struct SwitchTunnel(AtomicUsize);
+
+#[async_trait]
+impl TunnelController for SwitchTunnel {
+    async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+        Ok(())
+    }
+    async fn stop(&self) -> Result<(), TunnelError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        Ok(TunnelStatus::Stopped)
+    }
+}
+
+#[derive(Default)]
 struct SwitchControl {
     handoffs: AtomicUsize,
     stops: AtomicUsize,
     completions: AtomicUsize,
+    writer_gates: Arc<RuntimeWriterGates>,
+    race_writer: AtomicUsize,
+    writer_waiting: Arc<Notify>,
+    writer_acquired: Arc<AtomicUsize>,
 }
 #[async_trait]
 impl RuntimeSwitchControl for SwitchControl {
     async fn handoff_cleanup(
         &self,
-        _source: &nelomai_client_container::TransitionSourceSnapshot,
-    ) -> Result<RuntimeCleanupSnapshotV1, BrokerError> {
+        source: &nelomai_client_container::TransitionSourceSnapshot,
+    ) -> Result<RuntimeCleanupHandoff, BrokerError> {
         self.handoffs.fetch_add(1, Ordering::SeqCst);
-        Ok(RuntimeCleanupSnapshotV1 {
-            slot: RuntimeSlot::Latest,
-            runtime_version: "0.2.16".into(),
-            auth_scope: None,
+        let auth_scope =
+            source
+                .identity()
+                .map(|identity| nelomai_client_storage::RuntimeAuthScope {
+                    auth_epoch: source.auth_epoch(),
+                    family: source.family().into(),
+                    identity: identity.clone(),
+                });
+        let snapshot = RuntimeCleanupSnapshotV1 {
+            slot: source
+                .identity()
+                .map_or(RuntimeSlot::Latest, |identity| identity.slot),
+            runtime_version: source.identity().map_or_else(
+                || "0.2.16".into(),
+                |identity| identity.runtime_version.clone(),
+            ),
+            auth_scope,
             lease_ids: vec!["lease-a".into()],
             operations: Vec::new(),
-            cleanup_only: true,
-        })
+            cleanup_only: source.identity().is_none(),
+        };
+        let quiescence = self.writer_gates.quiesce().await;
+        if self.race_writer.load(Ordering::SeqCst) == 1 {
+            let waiting = self.writer_waiting.notified();
+            let gate = self.writer_gates.lifecycle();
+            let entered = self.writer_waiting.clone();
+            let acquired = self.writer_acquired.clone();
+            tokio::spawn(async move {
+                entered.notify_one();
+                let _writer = gate.lock_owned().await;
+                acquired.store(1, Ordering::SeqCst);
+            });
+            waiting.await;
+        }
+        Ok(RuntimeCleanupHandoff::new(snapshot, quiescence))
     }
     async fn graceful_stop(
         &self,
         _operation_id: &str,
         _snapshot: &RuntimeCleanupSnapshotV1,
     ) -> Result<(), BrokerError> {
+        assert_eq!(self.writer_acquired.load(Ordering::SeqCst), 0);
         self.stops.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -611,6 +724,30 @@ async fn exact_first_reconcile_401_updates_proof_once_and_lost_reply_replays_exa
             .len(),
         1
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn crash_after_atomic_legacy_refresh_save_never_rotates_the_family_twice() {
+    let state = Arc::new(Panel::default());
+    state.reject_reconcile_access.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let inner = legacy_store();
+    let store = Arc::new(FailAfterAtomicLegacyRefresh::new(inner));
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    store.arm();
+
+    assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
+    drop(broker);
+    let reopened = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+    assert_eq!(
+        reopened.reconcile_transition(frozen).await.unwrap().state,
+        RuntimeSwitchState::Clean
+    );
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
     server.abort();
 }
 
@@ -1133,7 +1270,20 @@ async fn coordinator_runs_the_real_broker_flow_and_recovery_stays_complete() {
     let broker = Arc::new(AuthBroker::new(api, store, Arc::new(Stop)).unwrap());
     let root = tempfile::tempdir().unwrap();
     let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
     let control = Arc::new(SwitchControl::default());
+    control.race_writer.store(1, Ordering::SeqCst);
     let coordinator = SwitchCoordinator::open(owner, manifest())
         .unwrap()
         .attach(broker, control.clone());
@@ -1150,8 +1300,195 @@ async fn coordinator_runs_the_real_broker_flow_and_recovery_stays_complete() {
     assert_eq!(control.handoffs.load(Ordering::SeqCst), 1);
     assert_eq!(control.stops.load(Ordering::SeqCst), 1);
     assert_eq!(control.completions.load(Ordering::SeqCst), 1);
+    for _ in 0..10 {
+        if control.writer_acquired.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.writer_acquired.load(Ordering::SeqCst), 1);
     assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn actual_record_control_clears_the_frozen_source_and_binds_only_resumed_scope() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state).await;
+    let store = legacy_store();
+    let tunnel = Arc::new(SwitchTunnel::default());
+    let local = CoreLocalStop::new(tunnel.clone());
+    let broker = Arc::new(AuthBroker::new(api, store, local.clone()).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap();
+    let backend = ProtectedRuntimeStore::new(Record::default(), paths);
+    let mut legacy = StoredAuth::new_install();
+    legacy.saved_connection = Some(StoredConnection {
+        lease_id: "lease-a".into(),
+        pool_id: None,
+        layer: nelomai_contracts::Layer::Stray,
+        tic_connection_mode: nelomai_contracts::TicConnectionMode::Dynamic,
+        route_mode: nelomai_contracts::RouteMode::Standalone,
+        egress_mode: nelomai_contracts::EgressMode::Ipv4,
+        probe_url: None,
+        kind: StoredConnectionKind::Fixed,
+        configuration: "PrivateKey = synthetic-not-exported".into(),
+        valid_until_unix: None,
+    });
+    backend
+        .save(&RuntimeStateV1::import_legacy(
+            &legacy,
+            StoredSplitTunnelState::default(),
+            backend.paths(),
+        ))
+        .unwrap();
+    let record_owner = RuntimeRecordOwner::new(backend);
+    let control = Arc::new(RuntimeRecordSwitchControl::new(
+        record_owner.clone(),
+        Vec::new(),
+        local,
+        Arc::new(UnavailableRuntimeForceStop),
+    ));
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let coordinator = SwitchCoordinator::open(owner, manifest())
+        .unwrap()
+        .attach(broker, control);
+
+    assert_eq!(
+        coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+        SwitchProgress::Ready
+    );
+    let completed = record_owner.cleanup_snapshot().unwrap();
+    assert!(!completed.cleanup_only);
+    assert!(completed.lease_ids.is_empty());
+    assert!(completed.operations.is_empty());
+    assert_eq!(
+        completed
+            .auth_scope
+            .as_ref()
+            .unwrap()
+            .identity
+            .session_generation,
+        Some(1)
+    );
+    assert_eq!(tunnel.0.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn runtime_admission_replays_after_the_atomic_record_save_committed_before_error() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap();
+    let inner = ProtectedRuntimeStore::new(Record::default(), paths);
+    inner
+        .save(&RuntimeStateV1::import_legacy(
+            &StoredAuth::new_install(),
+            StoredSplitTunnelState::default(),
+            inner.paths(),
+        ))
+        .unwrap();
+    let fail_after_commit = Arc::new(AtomicUsize::new(1));
+    let owner = RuntimeRecordOwner::new(FailOnceRuntimeStore {
+        inner,
+        fail_after_commit,
+    });
+    let local = CoreLocalStop::new(Arc::new(SwitchTunnel::default()));
+    let control = RuntimeRecordSwitchControl::new(
+        owner.clone(),
+        Vec::new(),
+        local,
+        Arc::new(UnavailableRuntimeForceStop),
+    );
+    let snapshot = owner.cleanup_snapshot().unwrap();
+    let access = AccessSnapshot::new(
+        "resumed-access".into(),
+        target().identity(Some(1)).unwrap(),
+        1,
+        "family-a".into(),
+    )
+    .unwrap();
+    let receipt = LocalStopReceiptV1 {
+        operation_id: "11111111-1111-4111-8111-111111111111".into(),
+        source_scope_fingerprint: "a".repeat(64),
+        runtime_slot: snapshot.slot,
+        runtime_version: snapshot.runtime_version.clone(),
+        forced: false,
+    };
+
+    assert!(control
+        .complete_cleanup_and_admit(&snapshot, &receipt, &access)
+        .await
+        .is_err());
+    control
+        .complete_cleanup_and_admit(&snapshot, &receipt, &access)
+        .await
+        .unwrap();
+    let completed = owner.cleanup_snapshot().unwrap();
+    assert!(!completed.cleanup_only);
+    assert_eq!(
+        completed.auth_scope.unwrap().identity.session_generation,
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn coordinator_persists_bounded_retry_before_an_offline_dispatch() {
+    let api = nelomai_client_api::ClientApi::new("http://127.0.0.1:9")
+        .unwrap()
+        .with_app_version("0.2.16")
+        .unwrap();
+    let broker = Arc::new(AuthBroker::new(api, enrolled_store(), Arc::new(Stop)).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let coordinator = SwitchCoordinator::open(owner.clone(), manifest())
+        .unwrap()
+        .attach(broker.clone(), control.clone());
+
+    assert_eq!(
+        coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+        SwitchProgress::Pending {
+            retry_after_seconds: 1
+        }
+    );
+    drop(coordinator);
+    let reopened = SwitchCoordinator::open(owner, manifest())
+        .unwrap()
+        .attach(broker, control);
+    assert_eq!(
+        reopened.recover().await.unwrap(),
+        SwitchProgress::Pending {
+            retry_after_seconds: 1
+        }
+    );
+    assert_eq!(
+        reopened.status().unwrap().phase,
+        Some(SwitchPhase::ServerReconciling)
+    );
 }
 
 #[tokio::test]

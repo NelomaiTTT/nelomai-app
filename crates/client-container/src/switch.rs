@@ -1,13 +1,16 @@
 //! Durable nonsecret switch ownership. Network/auth/stop execution is added by
 //! later checkpoints; this foundation only creates and reloads Requested work.
 use crate::{
-    atomic_nonsecret_write, valid_fingerprint, AuthBroker, BrokerError, CleanupEngineRoleV1,
+    atomic_nonsecret_write, current_selection, digest_json, finish_selection,
+    set_pending_selection, valid_fingerprint, AuthBroker, BrokerError, CleanupEngineRoleV1,
     CleanupEnvelopeV1, FrozenReconcileRequest, ResumeArguments,
 };
 use async_trait::async_trait;
 use nelomai_client_api::{
-    AccessSnapshot, RuntimeSwitchReconcileRequest, RuntimeSwitchState, RuntimeTarget,
+    AccessSnapshot, ClientApiError, RuntimeSwitchReconcileRequest, RuntimeSwitchState,
+    RuntimeTarget,
 };
+use nelomai_client_core::{CoreError, RuntimeStartPreflight, RuntimeWriterQuiescence};
 use nelomai_client_storage::{ContainerOwnerLock, RuntimeCleanupSnapshotV1};
 use nelomai_contracts::{RuntimeIdentity, VerifiedContainerManifest};
 use serde::{Deserialize, Serialize};
@@ -137,12 +140,39 @@ pub enum SwitchProgress {
     Pending { retry_after_seconds: u32 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSwitchStatusV1 {
+    pub selected_slot: nelomai_contracts::RuntimeSlot,
+    pub pending_slot: Option<nelomai_contracts::RuntimeSlot>,
+    pub stable_available: bool,
+    pub phase: Option<SwitchPhase>,
+}
+
+pub struct RuntimeCleanupHandoff {
+    snapshot: RuntimeCleanupSnapshotV1,
+    _quiescence: RuntimeWriterQuiescence,
+}
+
+impl RuntimeCleanupHandoff {
+    pub fn new(snapshot: RuntimeCleanupSnapshotV1, quiescence: RuntimeWriterQuiescence) -> Self {
+        Self {
+            snapshot,
+            _quiescence: quiescence,
+        }
+    }
+
+    pub fn snapshot(&self) -> &RuntimeCleanupSnapshotV1 {
+        &self.snapshot
+    }
+}
+
 #[async_trait]
 pub trait RuntimeSwitchControl: Send + Sync {
     async fn handoff_cleanup(
         &self,
         source: &crate::TransitionSourceSnapshot,
-    ) -> Result<RuntimeCleanupSnapshotV1, BrokerError>;
+    ) -> Result<RuntimeCleanupHandoff, BrokerError>;
     async fn graceful_stop(
         &self,
         operation_id: &str,
@@ -187,6 +217,7 @@ pub struct SwitchCoordinator {
     manifest: VerifiedContainerManifest,
     broker: Option<Arc<AuthBroker>>,
     control: Option<Arc<dyn RuntimeSwitchControl>>,
+    required_initial_target: Option<nelomai_contracts::RuntimeSlot>,
     execution: tokio::sync::Mutex<()>,
 }
 
@@ -203,6 +234,7 @@ impl SwitchCoordinator {
             manifest,
             broker: None,
             control: None,
+            required_initial_target: None,
             execution: tokio::sync::Mutex::new(()),
         };
         coordinator.snapshot()?;
@@ -216,6 +248,11 @@ impl SwitchCoordinator {
     ) -> Self {
         self.broker = Some(broker);
         self.control = Some(control);
+        self
+    }
+
+    pub fn require_initial_transition(mut self, target: nelomai_contracts::RuntimeSlot) -> Self {
+        self.required_initial_target = Some(target);
         self
     }
 
@@ -251,6 +288,20 @@ impl SwitchCoordinator {
         load_journal(&self.path)
     }
 
+    pub fn status(&self) -> Result<RuntimeSwitchStatusV1, SwitchError> {
+        let selection =
+            current_selection(&self.owner, &self.manifest).map_err(SwitchJournalError::Io)?;
+        Ok(RuntimeSwitchStatusV1 {
+            selected_slot: selection.selected_slot,
+            pending_slot: selection.pending_slot,
+            stable_available: self
+                .manifest
+                .selected(nelomai_contracts::RuntimeSlot::Stable)
+                .is_some(),
+            phase: self.snapshot()?.map(|journal| journal.phase),
+        })
+    }
+
     pub async fn request(
         &self,
         target_slot: nelomai_contracts::RuntimeSlot,
@@ -264,7 +315,8 @@ impl SwitchCoordinator {
         }
         let (broker, control) = self.components()?;
         let source = broker.transition_source().await?;
-        let runtime_snapshot = control.handoff_cleanup(&source).await?;
+        let handoff = control.handoff_cleanup(&source).await?;
+        let runtime_snapshot = handoff.snapshot().clone();
         if !source.matches_runtime_scope(runtime_snapshot.auth_scope.as_ref())
             || source.identity().is_some_and(|identity| {
                 identity.slot != runtime_snapshot.slot
@@ -313,7 +365,9 @@ impl SwitchCoordinator {
         );
         journal.runtime_snapshot = Some(runtime_snapshot);
         self.begin_requested(journal)?;
-        self.update(|journal| journal.phase = SwitchPhase::CleanupHandedOff)?;
+        set_pending_selection(&self.owner, &self.manifest, target_slot)
+            .map_err(SwitchJournalError::Io)?;
+        self.stop_handoff(control, handoff).await?;
         self.recover_locked(broker, control).await
     }
 
@@ -324,6 +378,14 @@ impl SwitchCoordinator {
     }
 
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
+        if self.snapshot()?.is_none() {
+            if let Some(target) = self.required_initial_target {
+                return match self.request(target).await? {
+                    SwitchProgress::Ready => Ok(()),
+                    SwitchProgress::Pending { .. } => Err(SwitchError::RecoveryRequired),
+                };
+            }
+        }
         match self.recover().await? {
             SwitchProgress::Ready => Ok(()),
             SwitchProgress::Pending { .. } => Err(SwitchError::RecoveryRequired),
@@ -361,51 +423,17 @@ impl SwitchCoordinator {
                 .as_ref()
                 .ok_or(SwitchError::RecoveryRequired)?;
             match journal.phase {
-                SwitchPhase::Requested => {
+                SwitchPhase::Requested
+                | SwitchPhase::CleanupHandedOff
+                | SwitchPhase::RuntimeStopping => {
                     let source = broker.transition_source().await?;
+                    let handoff = control.handoff_cleanup(&source).await?;
                     if !source.matches_runtime_scope(snapshot.auth_scope.as_ref())
-                        || control.handoff_cleanup(&source).await? != *snapshot
+                        || handoff.snapshot() != snapshot
                     {
                         return Err(SwitchError::RecoveryRequired);
                     }
-                    self.update(|journal| journal.phase = SwitchPhase::CleanupHandedOff)?;
-                }
-                SwitchPhase::CleanupHandedOff => {
-                    self.update(|journal| journal.phase = SwitchPhase::RuntimeStopping)?;
-                }
-                SwitchPhase::RuntimeStopping => {
-                    let forced = if journal.force_stop_requested {
-                        control.force_stop(&journal.operation_id, snapshot).await?;
-                        true
-                    } else {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            control.graceful_stop(&journal.operation_id, snapshot),
-                        )
-                        .await
-                        {
-                            Ok(result) => {
-                                result?;
-                                false
-                            }
-                            Err(_) => {
-                                self.update(|journal| journal.force_stop_requested = true)?;
-                                control.force_stop(&journal.operation_id, snapshot).await?;
-                                true
-                            }
-                        }
-                    };
-                    let receipt = LocalStopReceiptV1 {
-                        operation_id: journal.operation_id.clone(),
-                        source_scope_fingerprint: journal.source_scope_fingerprint.clone(),
-                        runtime_slot: snapshot.slot,
-                        runtime_version: snapshot.runtime_version.clone(),
-                        forced,
-                    };
-                    self.update(|journal| {
-                        journal.local_stop_receipt = Some(receipt);
-                        journal.phase = SwitchPhase::LocalStopped;
-                    })?;
+                    self.stop_handoff(control, handoff).await?;
                 }
                 SwitchPhase::LocalStopped => {
                     self.update(|journal| journal.phase = SwitchPhase::ServerReconciling)?;
@@ -419,6 +447,19 @@ impl SwitchCoordinator {
                             });
                         }
                     }
+                    let attempt = journal
+                        .retry
+                        .as_ref()
+                        .map_or(1, |retry| retry.attempt.saturating_add(1).min(32));
+                    let delay = retry_delay(attempt);
+                    self.update(|journal| {
+                        journal.retry = Some(SwitchRetryV1 {
+                            attempt,
+                            retry_after_seconds: delay,
+                            retry_not_before_unix_ms: unix_time_ms()
+                                .saturating_add(u64::from(delay) * 1000),
+                        });
+                    })?;
                     let request = journal.reconcile_request();
                     let frozen = FrozenReconcileRequest::from_persisted(
                         request,
@@ -429,17 +470,21 @@ impl SwitchCoordinator {
                         journal.source_scope_fingerprint.clone(),
                         Some(&journal.request_fingerprint),
                     )?;
-                    let receipt = broker.reconcile_transition(frozen).await?;
+                    let receipt = match broker.reconcile_transition(frozen).await {
+                        Ok(receipt) => receipt,
+                        Err(BrokerError::Timeout)
+                        | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
+                            return Ok(SwitchProgress::Pending {
+                                retry_after_seconds: delay,
+                            });
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     if receipt.state == RuntimeSwitchState::Retry {
-                        let attempt = journal.retry.as_ref().map_or(1, |retry| retry.attempt + 1);
-                        let exponential = 1_u32
-                            .checked_shl((attempt - 1).min(5))
-                            .unwrap_or(30)
-                            .min(30);
                         let delay = receipt
                             .retry_after_seconds
-                            .unwrap_or(exponential)
-                            .max(exponential)
+                            .unwrap_or(delay)
+                            .max(delay)
                             .min(30);
                         self.update(|journal| {
                             journal.retry = Some(SwitchRetryV1 {
@@ -501,11 +546,72 @@ impl SwitchCoordinator {
                     control
                         .complete_cleanup_and_admit(snapshot, local, access)
                         .await?;
+                    let selected = match decision {
+                        SwitchDecision::Apply => journal.target_identity.runtime_slot,
+                        SwitchDecision::Cancel => {
+                            journal
+                                .source_identity
+                                .as_ref()
+                                .ok_or(SwitchError::RecoveryRequired)?
+                                .slot
+                        }
+                    };
+                    finish_selection(&self.owner, &self.manifest, selected)
+                        .map_err(SwitchJournalError::Io)?;
                     self.update(|journal| journal.phase = SwitchPhase::Complete)?;
                 }
                 SwitchPhase::Complete => return Ok(SwitchProgress::Ready),
             }
         }
+    }
+
+    async fn stop_handoff(
+        &self,
+        control: &Arc<dyn RuntimeSwitchControl>,
+        handoff: RuntimeCleanupHandoff,
+    ) -> Result<(), SwitchError> {
+        let journal = self.snapshot()?.ok_or(SwitchJournalError::Invalid)?;
+        let snapshot = handoff.snapshot();
+        if journal.runtime_snapshot.as_ref() != Some(snapshot) {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        if journal.phase == SwitchPhase::Requested {
+            self.update(|journal| journal.phase = SwitchPhase::CleanupHandedOff)?;
+        }
+        self.update(|journal| journal.phase = SwitchPhase::RuntimeStopping)?;
+        let forced = if journal.force_stop_requested {
+            control.force_stop(&journal.operation_id, snapshot).await?;
+            true
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.graceful_stop(&journal.operation_id, snapshot),
+            )
+            .await
+            {
+                Ok(result) => {
+                    result?;
+                    false
+                }
+                Err(_) => {
+                    self.update(|journal| journal.force_stop_requested = true)?;
+                    control.force_stop(&journal.operation_id, snapshot).await?;
+                    true
+                }
+            }
+        };
+        let receipt = LocalStopReceiptV1 {
+            operation_id: journal.operation_id,
+            source_scope_fingerprint: journal.source_scope_fingerprint,
+            runtime_slot: snapshot.slot,
+            runtime_version: snapshot.runtime_version.clone(),
+            forced,
+        };
+        self.update(|journal| {
+            journal.local_stop_receipt = Some(receipt);
+            journal.phase = SwitchPhase::LocalStopped;
+        })?;
+        Ok(())
     }
 
     fn update(
@@ -522,6 +628,16 @@ impl SwitchCoordinator {
         }
         atomic_nonsecret_write(&self.path, &bytes)?;
         Ok(journal)
+    }
+}
+
+#[async_trait]
+impl RuntimeStartPreflight for SwitchCoordinator {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        match SwitchCoordinator::before_tunnel_start(self).await {
+            Ok(()) => Ok(()),
+            Err(_) => Err(CoreError::AuthRecoveryRequired),
+        }
     }
 }
 
@@ -550,6 +666,13 @@ fn unix_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or_default()
+}
+
+fn retry_delay(attempt: u32) -> u32 {
+    1_u32
+        .checked_shl(attempt.saturating_sub(1).min(5))
+        .unwrap_or(30)
+        .min(30)
 }
 
 fn load_journal(path: &PathBuf) -> Result<Option<SwitchJournalV1>, SwitchJournalError> {
@@ -601,7 +724,7 @@ fn validate_journal(journal: &SwitchJournalV1) -> Result<(), SwitchJournalError>
         .is_some_and(|value| !canonical_uuid(value))
         || journal.resume_operation_id.is_some() != journal.decision.is_some()
         || journal.retry.as_ref().is_some_and(|retry| {
-            retry.attempt == 0
+            !(1..=32).contains(&retry.attempt)
                 || !(1..=30).contains(&retry.retry_after_seconds)
                 || retry.retry_not_before_unix_ms == 0
         })
@@ -613,14 +736,7 @@ fn validate_journal(journal: &SwitchJournalV1) -> Result<(), SwitchJournalError>
         return Err(SwitchJournalError::Invalid);
     }
     if let Some(snapshot) = &journal.runtime_snapshot {
-        if snapshot.runtime_version.is_empty()
-            || snapshot.runtime_version.len() > 64
-            || snapshot.operations.iter().any(|operation| {
-                operation.request_fingerprint.is_some() != operation.contract_version.is_some()
-            })
-        {
-            return Err(SwitchJournalError::Invalid);
-        }
+        validate_runtime_snapshot(journal, snapshot)?;
     }
     if matches!(
         journal.phase,
@@ -646,6 +762,50 @@ fn validate_journal(journal: &SwitchJournalV1) -> Result<(), SwitchJournalError>
         }
     } else if journal.local_stop_receipt.is_some() {
         return Err(SwitchJournalError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_runtime_snapshot(
+    journal: &SwitchJournalV1,
+    snapshot: &RuntimeCleanupSnapshotV1,
+) -> Result<(), SwitchJournalError> {
+    if snapshot.runtime_version.is_empty()
+        || snapshot.runtime_version.len() > 64
+        || snapshot.operations.iter().any(|operation| {
+            operation.request_fingerprint.is_some() != operation.contract_version.is_some()
+        })
+    {
+        return Err(SwitchJournalError::Invalid);
+    }
+    let projected =
+        CleanupEnvelopeV1::from_runtime_snapshot(snapshot, CleanupEngineRoleV1::Primary, None)
+            .map_err(|_| SwitchJournalError::Invalid)?;
+    if projected != journal.cleanup_envelope {
+        return Err(SwitchJournalError::Invalid);
+    }
+    match (&journal.source_identity, &snapshot.auth_scope) {
+        (None, None) if snapshot.cleanup_only => {}
+        (Some(identity), Some(scope)) if !snapshot.cleanup_only => {
+            scope.validate().map_err(|_| SwitchJournalError::Invalid)?;
+            if &scope.identity != identity
+                || snapshot.slot != identity.slot
+                || snapshot.runtime_version != identity.runtime_version
+            {
+                return Err(SwitchJournalError::Invalid);
+            }
+            let fingerprint = digest_json(&serde_json::json!({
+                "auth_epoch": scope.auth_epoch,
+                "family": scope.family,
+                "identity": identity,
+                "device_id": journal.source_device_id,
+            }))
+            .map_err(|_| SwitchJournalError::Invalid)?;
+            if fingerprint != journal.source_scope_fingerprint {
+                return Err(SwitchJournalError::Invalid);
+            }
+        }
+        _ => return Err(SwitchJournalError::Invalid),
     }
     Ok(())
 }

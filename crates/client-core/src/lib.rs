@@ -1187,6 +1187,20 @@ pub enum CoreError {
     SplitTunnel(String),
 }
 
+#[async_trait]
+pub trait RuntimeStartPreflight: Send + Sync {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError>;
+}
+
+pub struct AllowRuntimeStart;
+
+#[async_trait]
+impl RuntimeStartPreflight for AllowRuntimeStart {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
 impl From<TunnelError> for CoreError {
     fn from(error: TunnelError) -> Self {
         match error {

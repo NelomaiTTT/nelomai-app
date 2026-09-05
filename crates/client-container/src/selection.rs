@@ -177,6 +177,84 @@ impl PreparedInstalledRuntimeSelection {
     }
 }
 
+pub(crate) fn set_pending_selection(
+    owner: &ContainerOwnerLock,
+    manifest: &VerifiedContainerManifest,
+    pending: RuntimeSlot,
+) -> io::Result<()> {
+    update_selection(owner, manifest, |state| {
+        state.pending_slot = (state.selected_slot != pending).then_some(pending);
+    })
+}
+
+pub(crate) fn finish_selection(
+    owner: &ContainerOwnerLock,
+    manifest: &VerifiedContainerManifest,
+    selected: RuntimeSlot,
+) -> io::Result<()> {
+    update_selection(owner, manifest, |state| {
+        state.selected_slot = selected;
+        state.pending_slot = None;
+    })
+}
+
+pub(crate) fn current_selection(
+    owner: &ContainerOwnerLock,
+    manifest: &VerifiedContainerManifest,
+) -> io::Result<SlotSelectionV1> {
+    let _guard = owner.lock_transition_journal()?;
+    let path = owner.root().join("common/runtime-selection-v1.json");
+    let bytes = read_bounded(&path, MAX_SELECTION_BYTES)?;
+    let stored: StoredSlotSelectionV1 = serde_json::from_slice(&bytes).map_err(|_| blocked())?;
+    let state = SlotSelectionV1 {
+        container_version: stored.container_version,
+        selected_slot: stored.selected_slot,
+        pending_slot: stored.pending_slot,
+    };
+    if stored.schema_version != SELECTION_SCHEMA_VERSION
+        || state.container_version != manifest.manifest().container_version
+        || manifest.selected(state.selected_slot).is_none()
+        || state
+            .pending_slot
+            .is_some_and(|slot| manifest.selected(slot).is_none())
+    {
+        return Err(blocked());
+    }
+    Ok(state)
+}
+
+fn update_selection(
+    owner: &ContainerOwnerLock,
+    manifest: &VerifiedContainerManifest,
+    change: impl FnOnce(&mut SlotSelectionV1),
+) -> io::Result<()> {
+    let _guard = owner.lock_transition_journal()?;
+    let path = owner.root().join("common/runtime-selection-v1.json");
+    let bytes = read_bounded(&path, MAX_SELECTION_BYTES)?;
+    let stored: StoredSlotSelectionV1 = serde_json::from_slice(&bytes).map_err(|_| blocked())?;
+    let mut state = SlotSelectionV1 {
+        container_version: stored.container_version,
+        selected_slot: stored.selected_slot,
+        pending_slot: stored.pending_slot,
+    };
+    if stored.schema_version != SELECTION_SCHEMA_VERSION
+        || state.container_version != manifest.manifest().container_version
+        || manifest.selected(state.selected_slot).is_none()
+    {
+        return Err(blocked());
+    }
+    change(&mut state);
+    validate_basic_selection(&state)?;
+    if manifest.selected(state.selected_slot).is_none()
+        || state
+            .pending_slot
+            .is_some_and(|slot| manifest.selected(slot).is_none())
+    {
+        return Err(blocked());
+    }
+    atomic_nonsecret_write(&path, &state.to_persisted_bytes()?)
+}
+
 fn from_verified(
     manifest: VerifiedContainerManifest,
     state: SlotSelectionV1,

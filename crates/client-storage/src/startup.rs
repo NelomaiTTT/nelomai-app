@@ -50,6 +50,7 @@ impl ProtectedRecordFactory for SystemRecordFactory {
 pub struct PreparedRuntimeStorage<R> {
     pub auth: ProtectedAuthStore<R>,
     pub runtime: ProtectedRuntimeStore<R>,
+    pub retained: Vec<ProtectedRuntimeStore<R>>,
     pub migration: Option<MigrationOutcome>,
 }
 
@@ -171,7 +172,9 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     if let Some(record) = &migration_record {
         paths_from_namespace(root, &record.runtime_namespace)?;
         known.insert(record.runtime_namespace.clone());
-        if record.runtime_namespace != selected_paths.namespace() {
+        if record.runtime_namespace != selected_paths.namespace()
+            && record.phase != MigrationPhase::Complete
+        {
             return recovery();
         }
     }
@@ -206,8 +209,20 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         records.record(&format!("{}:pending-write-v1", selected_paths.namespace())),
         selected_paths.clone(),
     );
-    let namespaces: Vec<_> = known.into_iter().collect();
-    if legacy.is_some() || migration_record.is_some() {
+    let mut inventory_namespaces: BTreeSet<String> = marker
+        .as_ref()
+        .map(|marker| marker.namespaces.iter().cloned().collect())
+        .unwrap_or_default();
+    inventory_namespaces.extend(occupied.iter().cloned());
+    inventory_namespaces.insert(selected_paths.namespace().to_owned());
+    let namespaces: Vec<_> = inventory_namespaces.into_iter().collect();
+    let migration_complete = migration_record
+        .as_ref()
+        .is_some_and(|record| record.phase == MigrationPhase::Complete);
+    if migration_complete && split_exists {
+        return recovery();
+    }
+    if !migration_complete && (legacy.is_some() || migration_record.is_some()) {
         // A legacy source is not provenance for another occupied runtime.
         // Only a committed common inventory can anchor those retained records.
         if occupied.iter().any(|namespace| {
@@ -261,6 +276,12 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         return Ok(PreparedRuntimeStorage {
             auth,
             runtime,
+            retained: retained_runtime_stores(
+                records,
+                root,
+                &occupied,
+                selected_paths.namespace(),
+            )?,
             migration: Some(outcome),
         });
     }
@@ -271,10 +292,26 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
         if marker.committed {
             let current =
                 current_auth.ok_or(StorageError::RecoveryRequired("common auth anchor missing"))?;
-            if digest(&current.install_secret)? != marker.install_sha256
-                || runtime.load()?.is_none()
-            {
+            if digest(&current.install_secret)? != marker.install_sha256 {
                 return recovery();
+            }
+            let expected_new_runtime = RuntimeStateV1::empty(&selected_paths, true);
+            let current_runtime = runtime.load()?;
+            if occupied.iter().any(|namespace| {
+                namespace != selected_paths.namespace() && !marker.namespaces.contains(namespace)
+            }) || current_runtime.as_ref().is_some_and(|state| {
+                !marker
+                    .namespaces
+                    .contains(&selected_paths.namespace().to_owned())
+                    && state != &expected_new_runtime
+            }) {
+                return recovery();
+            }
+            if current_runtime.is_none() {
+                if occupied.is_empty() || !pending.is_empty() {
+                    return recovery();
+                }
+                runtime.save(&expected_new_runtime)?;
             }
             if !pending.is_empty() {
                 if pending.len() != 1
@@ -296,6 +333,12 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
             return Ok(PreparedRuntimeStorage {
                 auth,
                 runtime,
+                retained: retained_runtime_stores(
+                    records,
+                    root,
+                    &occupied,
+                    selected_paths.namespace(),
+                )?,
                 migration: None,
             });
         }
@@ -385,6 +428,25 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     Ok(PreparedRuntimeStorage {
         auth,
         runtime,
+        retained: Vec::new(),
         migration: None,
     })
+}
+
+fn retained_runtime_stores<F: ProtectedRecordFactory>(
+    records: &F,
+    root: &Path,
+    occupied: &[String],
+    selected_namespace: &str,
+) -> Result<Vec<ProtectedRuntimeStore<F::Record>>, StorageError> {
+    occupied
+        .iter()
+        .filter(|namespace| namespace.as_str() != selected_namespace)
+        .map(|namespace| {
+            Ok(ProtectedRuntimeStore::new(
+                records.record(namespace),
+                paths_from_namespace(root, namespace)?,
+            ))
+        })
+        .collect()
 }

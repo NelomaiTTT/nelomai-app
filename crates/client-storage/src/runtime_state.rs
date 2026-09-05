@@ -145,6 +145,23 @@ impl fmt::Debug for RuntimeStateV1 {
     }
 }
 impl RuntimeStateV1 {
+    pub fn empty(paths: &RuntimePaths, cleanup_only: bool) -> Self {
+        Self {
+            schema_version: 1,
+            slot: paths.slot,
+            runtime_version: paths.version.clone(),
+            cleanup_only,
+            auth_scope: None,
+            saved_connection: None,
+            pinned_connection: None,
+            pending_start: None,
+            pending_stalled_stop: None,
+            pending_compensation_stop: None,
+            compatibility: None,
+            applied_split_tunnel: StoredSplitTunnelState::default(),
+        }
+    }
+
     pub fn import_legacy(
         auth: &StoredAuth,
         split: StoredSplitTunnelState,
@@ -352,6 +369,34 @@ impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
             ));
         }
         current.complete_legacy_cleanup();
+        self.backend.save(&current)
+    }
+    /// Atomically clears and rebinds a same-record transition. This avoids an
+    /// unrecoverable gap between destructive cleanup and target admission.
+    pub fn complete_cleanup_and_bind(
+        &self,
+        frozen: &RuntimeCleanupSnapshotV1,
+        scope: &RuntimeAuthScope,
+    ) -> Result<(), StorageError> {
+        scope.validate()?;
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let mut current = self.load_required()?;
+        if !current.cleanup_only && current.auth_scope.as_ref() == Some(scope) {
+            return Ok(());
+        }
+        if cleanup_snapshot(&current) != *frozen
+            || current.slot != scope.identity.slot
+            || current.runtime_version != scope.identity.runtime_version
+        {
+            return Err(StorageError::RecoveryRequired(
+                "runtime cleanup snapshot changed",
+            ));
+        }
+        current.complete_legacy_cleanup();
+        current.auth_scope = Some(scope.clone());
         self.backend.save(&current)
     }
     /// Owner/control only: caller holds actual runtime-writer quiescence (or

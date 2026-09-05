@@ -3,8 +3,13 @@ use async_trait::async_trait;
 use nelomai_client_api::AccessSnapshot;
 use nelomai_client_api::{LoginRequest, TokenResponse};
 use nelomai_client_application::{ApplicationApi, ApplicationError, ClientApplication};
-use nelomai_client_core::{ConnectOptions, CoreApi, CoreApiError, CoreError, NoopLogger};
-use nelomai_client_storage::{SecretStore, StorageError, StoredAuth, StoredCompatibility};
+use nelomai_client_core::{
+    ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLocalStop, NoopLogger,
+    RuntimeStartPreflight,
+};
+use nelomai_client_storage::{
+    MemorySplitTunnelStore, SecretStore, StorageError, StoredAuth, StoredCompatibility,
+};
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     ApiVersion, BindPeerRequest, Bootstrap, Connection, ConnectionOperationRequest,
@@ -412,6 +417,15 @@ fn application() -> (
     ClientApplication<ProbeApi, support::LegacyRuntime<MemoryStore>, StoppedTunnel, NoopLogger>,
     Arc<ProbeApi>,
 ) {
+    application_with_preflight(Arc::new(nelomai_client_core::AllowRuntimeStart))
+}
+
+fn application_with_preflight(
+    preflight: Arc<dyn RuntimeStartPreflight>,
+) -> (
+    ClientApplication<ProbeApi, support::LegacyRuntime<MemoryStore>, StoppedTunnel, NoopLogger>,
+    Arc<ProbeApi>,
+) {
     let api = Arc::new(ProbeApi {
         candidate_calls: AtomicUsize::new(0),
         probe_calls: AtomicUsize::new(0),
@@ -428,15 +442,78 @@ fn application() -> (
         observed_at_unix: 1_800_000_000,
     });
     *store.0.lock().unwrap() = Some(auth);
-    (
-        support::application(
-            api.clone(),
-            store,
-            Arc::new(StoppedTunnel),
-            Arc::new(NoopLogger),
-        ),
-        api,
-    )
+    let local = CoreLocalStop::new(Arc::new(StoppedTunnel));
+    let auth = Arc::new(support::TestOwner::new(
+        api.clone(),
+        store.clone(),
+        local.clone(),
+    ));
+    let application = ClientApplication::with_split_tunnel_store_and_preflight(
+        api.clone(),
+        Arc::new(support::LegacyRuntime::new(store)),
+        Arc::new(MemorySplitTunnelStore::default()),
+        auth,
+        local,
+        Arc::new(NoopLogger),
+        preflight,
+    );
+    (application, api)
+}
+
+struct RejectStart(AtomicUsize);
+
+#[async_trait]
+impl RuntimeStartPreflight for RejectStart {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(CoreError::AuthRecoveryRequired)
+    }
+}
+
+#[tokio::test]
+async fn every_application_start_path_runs_transition_preflight_before_network_or_tunnel_work() {
+    let preflight = Arc::new(RejectStart(AtomicUsize::new(0)));
+    let (application, api) = application_with_preflight(preflight.clone());
+    let options = ConnectOptions {
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probes: Vec::new(),
+        allow_alternate: true,
+    };
+    assert!(matches!(
+        application.start(options.clone(), 1_800_000_000).await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    assert!(matches!(
+        application
+            .start_without_probe_refresh(options.clone(), 1_800_000_000)
+            .await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    #[cfg(not(target_os = "android"))]
+    assert!(matches!(
+        application
+            .connection_intent_attempt(options.clone(), 1_800_000_000)
+            .await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    #[cfg(not(target_os = "android"))]
+    assert!(matches!(
+        application
+            .replace_stalled_connection(options, 1_800_000_000)
+            .await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    assert!(matches!(
+        application.start_saved_stray_offline(1_800_000_000).await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    #[cfg(not(target_os = "android"))]
+    assert_eq!(preflight.0.load(Ordering::SeqCst), 5);
+    assert!(api.start_request.lock().unwrap().is_none());
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 0);
 }
 
 fn candidate(id: &str, layer: Layer, probe_url: &str) -> ServerCandidate {

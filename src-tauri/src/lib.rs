@@ -18,12 +18,15 @@ use nelomai_client_api::ClientApi;
 use nelomai_client_application::{ApplicationError, ClientApplication};
 use nelomai_client_container::{
     AuthBroker, InstalledRuntimeSelection, OwnerRuntimeAuth, RuntimeCacheAdmission,
-    RuntimeClientProfile,
+    RuntimeClientProfile, RuntimeRecordSwitchControl, SwitchCoordinator,
+    UnavailableRuntimeForceStop,
 };
 use nelomai_client_core::CoreLocalStop;
 use nelomai_client_storage::{
-    ContainerOwnerLock, ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner,
-    SystemRecordFactory, SystemSecretStore,
+    acknowledge_migration_bootstrap, ContainerOwnerLock, FileMigrationJournal,
+    FileSplitTunnelStore, LegacyMigrationSource, MigrationOutcome, ProtectedAuthStore,
+    ProtectedRecordFactory, ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner,
+    RuntimeStateStore, SystemRecordFactory, SystemSecretStore,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -253,10 +256,9 @@ pub fn run() {
         #[cfg(not(target_os = "linux"))]
         let fallback = None;
 
-        let (selection, storage) = selection.prepare_runtime_storage(
-            owner_lock.as_ref(),
-            &SystemRecordFactory::new("primary", fallback),
-        )?;
+        let records = SystemRecordFactory::new("primary", fallback.clone());
+        let (selection, storage) =
+            selection.prepare_runtime_storage(owner_lock.as_ref(), &records)?;
 
         let api = ClientApi::new(PANEL_BASE)
             .and_then(|api| api.with_app_version(&selection.target().container_version))
@@ -285,8 +287,17 @@ pub fn run() {
             Arc::new(storage.auth),
             owner_stop,
         )?);
-        // Migration/full-writer ownership is consumed here; only the paired
-        // field-merge views and narrow admission control survive into runtime.
+        let migration = storage.migration;
+        let target_paths = storage.runtime.paths().clone();
+        let requires_transition = storage
+            .runtime
+            .load()?
+            .is_some_and(|state| state.cleanup_only);
+        let retained_record_owners: Vec<_> = storage
+            .retained
+            .into_iter()
+            .map(RuntimeRecordOwner::new)
+            .collect();
         let record_owner = RuntimeRecordOwner::new(storage.runtime);
         let port = Arc::new(OwnerRuntimeAuth::new(
             broker.clone(),
@@ -299,16 +310,28 @@ pub fn run() {
             Arc::new(RuntimeCacheAdmission::new(record_owner.clone())),
             local.runtime_writer_gates(),
         )?);
-        if tauri::async_runtime::block_on(port.admit_empty_current()).is_err() {
-            diagnostics.record_named("runtime.admission.recovery_required", None, None, None);
+        let switch_control = Arc::new(RuntimeRecordSwitchControl::new(
+            record_owner.clone(),
+            retained_record_owners,
+            local.clone(),
+            Arc::new(UnavailableRuntimeForceStop),
+        ));
+        let mut switch_coordinator =
+            SwitchCoordinator::open(owner_lock.clone(), selection.manifest().clone())?
+                .attach(broker.clone(), switch_control);
+        if requires_transition {
+            switch_coordinator =
+                switch_coordinator.require_initial_transition(selection.state().selected_slot);
         }
-        let application = Arc::new(ClientApplication::with_split_tunnel_store(
+        let switch_coordinator = Arc::new(switch_coordinator);
+        let application = Arc::new(ClientApplication::with_split_tunnel_store_and_preflight(
             Arc::new(api),
             Arc::new(record_owner.operational()),
             Arc::new(record_owner.split()),
             port.clone(),
             local,
             diagnostics.clone(),
+            switch_coordinator.clone(),
         ));
         let dns_servers = preferences.get().dns_provider.servers();
         application.set_dns_servers(dns_servers.clone());
@@ -335,6 +358,7 @@ pub fn run() {
         app.manage(owner_lock);
         app.manage(broker);
         app.manage(port);
+        app.manage(switch_coordinator.clone());
         app.manage(tunnel.clone());
         app.manage(split_tunnel_scheduler.clone());
         app.manage(push_registration_scheduler.clone());
@@ -372,6 +396,29 @@ pub fn run() {
             application,
             push_registration_scheduler,
         );
+        let recovery = switch_coordinator;
+        tauri::async_runtime::spawn(async move {
+            if recovery.before_tunnel_start().await.is_ok()
+                && matches!(migration, Some(MigrationOutcome::AwaitingBootstrap))
+            {
+                let records = SystemRecordFactory::new("primary", fallback);
+                let auth = ProtectedAuthStore::new(records.record("auth-v1"));
+                let runtime = ProtectedRuntimeStore::new(
+                    records.record(target_paths.namespace()),
+                    target_paths,
+                );
+                let split = FileSplitTunnelStore::new(&app_data_directory);
+                let journal = FileMigrationJournal::new(
+                    app_data_directory.join("common/auth-migration-v1.json"),
+                );
+                let _ = acknowledge_migration_bootstrap(
+                    &LegacyMigrationSource::new(records.legacy(), &split),
+                    &auth,
+                    &runtime,
+                    &journal,
+                );
+            }
+        });
         Ok(())
     });
 
@@ -405,6 +452,9 @@ pub fn run() {
             commands::app_update_set_automatic,
             commands::app_update_install,
             commands::app_update_restart,
+            commands::app_runtime_switch_status,
+            commands::app_runtime_switch_request,
+            commands::app_runtime_switch_cancel,
             commands::app_split_tunnel_state,
             commands::app_split_tunnel_installed_applications,
             commands::app_split_tunnel_save,

@@ -5,10 +5,10 @@ use nelomai_client_api::{
     DiagnosticUploadResponse, RuntimeLogin,
 };
 use nelomai_client_core::{
-    ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError, CoreError,
-    CoreLocalStop, CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome, RuntimeAuthProvider,
-    SplitTunnelSyncOutcome, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
-    StartCancellationEpoch,
+    AllowRuntimeStart, ClientCore, ConnectOptions, ConnectionMetricsContext, CoreApi, CoreApiError,
+    CoreError, CoreLocalStop, CoreLogger, CoreState, Phase, PhysicalNetworkPollOutcome,
+    RuntimeAuthProvider, RuntimeStartPreflight, SplitTunnelSyncOutcome, StalledDataPlaneRecovery,
+    StalledDataPlaneRecoveryOutcome, StartCancellationEpoch,
 };
 use nelomai_client_storage::{MemorySplitTunnelStore, RuntimeStateStore, SplitTunnelStore};
 use nelomai_client_tunnel::TunnelController;
@@ -388,6 +388,7 @@ pub struct ClientApplication<A, S, T, L> {
     api: Arc<A>,
     auth: Arc<dyn RuntimeAuthProvider>,
     core: ClientCore<A, S, T, L>,
+    start_preflight: Arc<dyn RuntimeStartPreflight>,
     lifecycle_gate: Arc<AsyncMutex<()>>,
     probe_gate: AsyncMutex<()>,
     probe_cache: StdMutex<ProbeCache>,
@@ -425,6 +426,26 @@ where
         local: Arc<CoreLocalStop<T>>,
         logger: Arc<L>,
     ) -> Self {
+        Self::with_split_tunnel_store_and_preflight(
+            api,
+            store,
+            split_tunnel_store,
+            auth,
+            local,
+            logger,
+            Arc::new(AllowRuntimeStart),
+        )
+    }
+
+    pub fn with_split_tunnel_store_and_preflight(
+        api: Arc<A>,
+        store: Arc<S>,
+        split_tunnel_store: Arc<dyn SplitTunnelStore>,
+        auth: Arc<dyn RuntimeAuthProvider>,
+        local: Arc<CoreLocalStop<T>>,
+        logger: Arc<L>,
+        start_preflight: Arc<dyn RuntimeStartPreflight>,
+    ) -> Self {
         let lifecycle_gate = local.runtime_writer_gates().lifecycle();
         let core = ClientCore::with_split_tunnel_store(
             api.clone(),
@@ -438,6 +459,7 @@ where
             api,
             auth,
             core,
+            start_preflight,
             lifecycle_gate,
             probe_gate: AsyncMutex::new(()),
             probe_cache: StdMutex::new(ProbeCache::default()),
@@ -864,6 +886,7 @@ where
         now_unix: i64,
         cancel_epoch: StartCancellationEpoch,
     ) -> Result<Connection, ApplicationError> {
+        self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         options = options.normalized_for_layer();
         options.probes = if options.layer == Layer::Tic
@@ -893,6 +916,7 @@ where
         mut options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
+        self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let cancel_epoch = self.core.begin_start_attempt();
         options = options.normalized_for_layer();
@@ -911,6 +935,7 @@ where
         mut options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
+        self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let cancel_epoch = self.core.begin_start_attempt();
         options = options.normalized_for_layer();
@@ -953,6 +978,7 @@ where
         mut options: ConnectOptions,
         now_unix: i64,
     ) -> Result<Connection, ApplicationError> {
+        self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let cancel_epoch = self.core.begin_start_attempt();
         let result = async {
@@ -1132,6 +1158,7 @@ where
         &self,
         now_unix: i64,
     ) -> Result<String, ApplicationError> {
+        self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.core
             .start_saved_stray_offline(now_unix)

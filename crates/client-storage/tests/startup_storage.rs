@@ -70,10 +70,17 @@ impl ProtectedRecordFactory for Records {
     }
 }
 fn manifest() -> nelomai_contracts::VerifiedContainerManifest {
-    let value: serde_json::Value = serde_json::from_str(include_str!(
+    manifest_for("0.2.16")
+}
+
+fn manifest_for(version: &str) -> nelomai_contracts::VerifiedContainerManifest {
+    let mut value: serde_json::Value = serde_json::from_str(include_str!(
         "../../../contracts/fixtures/runtime/container-manifest-v1.json"
     ))
     .unwrap();
+    value["container_version"] = version.into();
+    value["release_set_id"] = format!("runtime-{version}").into();
+    value["slots"][0]["manifest"]["runtime_version"] = version.into();
     let bytes = serde_json::to_vec(&value).unwrap();
     let key = SigningKey::from_bytes(&[83; 32]);
     let mut message = CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
@@ -90,6 +97,67 @@ fn manifest() -> nelomai_contracts::VerifiedContainerManifest {
         arch,
     )
     .unwrap()
+}
+
+#[test]
+fn committed_owner_creates_a_quarantined_new_runtime_without_replacing_auth_or_old_state() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+    let records = Records::default();
+    let old_manifest = manifest();
+    let old = prepare_runtime_storage(&lock, &old_manifest, RuntimeSlot::Latest, &records).unwrap();
+    let original_auth = old.auth.load().unwrap().unwrap();
+    let original_runtime = old.runtime.load().unwrap().unwrap();
+
+    let updated =
+        prepare_runtime_storage(&lock, &manifest_for("0.3.0"), RuntimeSlot::Latest, &records)
+            .unwrap();
+    assert_eq!(updated.auth.load().unwrap(), Some(original_auth));
+    let new_runtime = updated.runtime.load().unwrap().unwrap();
+    assert!(new_runtime.cleanup_only);
+    assert!(new_runtime.auth_scope.is_none());
+    assert!(new_runtime.operationally_empty());
+    assert_eq!(updated.retained.len(), 1);
+    assert_eq!(updated.retained[0].load().unwrap(), Some(original_runtime));
+}
+
+#[test]
+fn completed_legacy_anchor_is_retained_when_a_later_runtime_namespace_is_created() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+    let records = Records::default();
+    let mut legacy = StoredAuth::new_install();
+    legacy.access_token = Some("synthetic-access".into());
+    legacy.refresh_token = Some("synthetic-refresh".into());
+    records.legacy.save(&legacy).unwrap();
+    let old_manifest = manifest();
+    let old = prepare_runtime_storage(&lock, &old_manifest, RuntimeSlot::Latest, &records).unwrap();
+    let mut auth = old.auth.load().unwrap().unwrap();
+    auth.session_generation = Some(1);
+    auth.confirmed_identity = Some(old_manifest.identity(RuntimeSlot::Latest, Some(1)).unwrap());
+    old.auth.save(&auth).unwrap();
+    let mut runtime = old.runtime.load().unwrap().unwrap();
+    runtime.complete_legacy_cleanup();
+    old.runtime.save(&runtime).unwrap();
+    let split = FileSplitTunnelStore::new(root.path());
+    assert_eq!(
+        acknowledge_migration_bootstrap(
+            &LegacyMigrationSource::new(records.legacy(), &split),
+            &old.auth,
+            &old.runtime,
+            &FileMigrationJournal::new(root.path().join("common/auth-migration-v1.json")),
+        )
+        .unwrap(),
+        MigrationOutcome::Complete
+    );
+
+    let updated =
+        prepare_runtime_storage(&lock, &manifest_for("0.3.0"), RuntimeSlot::Latest, &records)
+            .unwrap();
+    assert_eq!(updated.auth.load().unwrap(), Some(auth));
+    assert_eq!(updated.retained.len(), 1);
+    assert_eq!(updated.retained[0].load().unwrap(), Some(runtime));
+    assert!(updated.runtime.load().unwrap().unwrap().cleanup_only);
 }
 
 #[test]

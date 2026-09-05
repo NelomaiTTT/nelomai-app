@@ -7,6 +7,7 @@ use nelomai_client_storage::SecretStore;
 use nelomai_client_tunnel::TunnelController;
 use std::sync::Arc;
 
+#[allow(dead_code)]
 pub fn application<
     A: ApplicationApi + TestAuthApi + 'static,
     S: SecretStore + 'static,
