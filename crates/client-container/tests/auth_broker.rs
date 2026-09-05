@@ -33,6 +33,44 @@ impl ProtectedRecordStore for Record {
 }
 #[derive(Default)]
 struct Stop(AtomicUsize);
+
+#[tokio::test]
+async fn private_scope_logout_rejects_stale_mutation_before_epoch_or_stop() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state).await;
+    let store = auth_store();
+    let stop = Arc::new(Stop::default());
+    let broker = AuthBroker::new(api, store.clone(), stop.clone()).unwrap();
+    let (stamp, _) = broker.observe_stamped().await.unwrap();
+    let revoked = AtomicUsize::new(0);
+    broker
+        .logout_fenced(&stamp, || {
+            revoked.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+    let after = store.load().unwrap();
+    let stop_count = stop.0.load(Ordering::SeqCst);
+    assert!(matches!(
+        broker
+            .logout_fenced(&stamp, || {
+                revoked.fetch_add(1, Ordering::SeqCst);
+            })
+            .await,
+        Err(BrokerError::Cancelled)
+    ));
+    assert_eq!(store.load().unwrap(), after);
+    assert_eq!(stop.0.load(Ordering::SeqCst), stop_count);
+    assert_eq!(revoked.load(Ordering::SeqCst), 1);
+    let (current, observation) = broker.observe_stamped().await.unwrap();
+    assert_ne!(stamp, current);
+    assert_eq!(observation.state, BrokerAuthState::LoggedOut);
+    assert!(matches!(
+        broker.access_token_fenced(&stamp, None).await,
+        Err(BrokerError::Cancelled)
+    ));
+    server.abort();
+}
 #[async_trait]
 impl LocalAuthStop for Stop {
     async fn stop_local(&self) -> Result<(), BrokerError> {

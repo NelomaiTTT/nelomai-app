@@ -2872,6 +2872,7 @@ dependencies = [
  "async-trait",
  "axum",
  "ed25519-dalek",
+ "libc",
  "nelomai-client-api",
  "nelomai-client-application",
  "nelomai-client-core",
@@ -2884,6 +2885,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

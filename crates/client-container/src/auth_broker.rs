@@ -89,6 +89,54 @@ pub struct BrokerObservation {
     pub access: Option<AccessSnapshot>,
 }
 
+/// Nonsecret live provenance. This is not launcher or executable authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeStamp {
+    epoch: u64,
+    family: String,
+    identity: Option<nelomai_contracts::RuntimeIdentity>,
+}
+impl ScopeStamp {
+    pub(crate) fn runtime_scope(
+        &self,
+    ) -> Result<nelomai_client_storage::RuntimeAuthScope, BrokerError> {
+        let scope = nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: self.epoch,
+            family: self.family.clone(),
+            identity: self.identity.clone().ok_or(BrokerError::RecoveryRequired)?,
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+    pub(crate) fn from_access(access: &AccessSnapshot) -> Self {
+        Self {
+            epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: Some(access.identity().clone()),
+        }
+    }
+    fn of(auth: &AuthStoreV1) -> Result<Self, BrokerError> {
+        Ok(Self {
+            epoch: auth.auth_epoch,
+            family: auth
+                .broker
+                .as_ref()
+                .ok_or(BrokerError::RecoveryRequired)?
+                .family
+                .clone(),
+            identity: auth.confirmed_identity.clone(),
+        })
+    }
+    fn check(&self, auth: &AuthStoreV1) -> Result<(), BrokerError> {
+        if *self == Self::of(auth)? {
+            Ok(())
+        } else {
+            Err(BrokerError::Cancelled)
+        }
+    }
+}
+
 /// Owner-captured provenance, never reconstructed from runtime request fields.
 pub(crate) struct LoginFence {
     epoch: u64,
@@ -97,6 +145,10 @@ pub(crate) struct LoginFence {
 
 #[async_trait]
 pub trait LocalAuthStop: Send + Sync {
+    /// Synchronous cancellation boundary after durable epoch persistence.
+    /// Remote adapters enqueue ordered revoke or close the peer on saturation;
+    /// they must not await I/O or suppress subsequent physical/remote cleanup.
+    fn revoke_runtime(&self) {}
     async fn stop_local(&self) -> Result<(), BrokerError>;
     /// Owner-only native cleanup handoff, after durable cancellation and before
     /// revocation HTTP. Must be genuinely asynchronous and preserve late fences.
@@ -278,6 +330,12 @@ impl AuthBroker {
     }
 
     pub async fn observe(&self) -> Result<BrokerObservation, BrokerError> {
+        self.observe_stamped()
+            .await
+            .map(|(_, observation)| observation)
+    }
+
+    pub async fn observe_stamped(&self) -> Result<(ScopeStamp, BrokerObservation), BrokerError> {
         let _state = self.state.lock().await;
         let auth = self.load()?;
         let state = Self::observed_state(&auth)?;
@@ -286,14 +344,17 @@ impl AuthBroker {
         } else {
             None
         };
-        Ok(BrokerObservation {
-            state: if state == BrokerAuthState::Active && access.is_none() {
-                BrokerAuthState::RecoveryRequired
-            } else {
-                state
+        Ok((
+            ScopeStamp::of(&auth)?,
+            BrokerObservation {
+                state: if state == BrokerAuthState::Active && access.is_none() {
+                    BrokerAuthState::RecoveryRequired
+                } else {
+                    state
+                },
+                access,
             },
-            access,
-        })
+        ))
     }
 
     fn observed_state(auth: &AuthStoreV1) -> Result<BrokerAuthState, BrokerError> {
@@ -338,8 +399,18 @@ impl AuthBroker {
     }
 
     pub(crate) async fn capture_login_fence(&self) -> Result<LoginFence, BrokerError> {
+        self.capture_stamped_login_fence(None).await
+    }
+
+    pub(crate) async fn capture_stamped_login_fence(
+        &self,
+        stamp: Option<&ScopeStamp>,
+    ) -> Result<LoginFence, BrokerError> {
         let _state = self.state.lock().await;
         let auth = self.load()?;
+        if let Some(stamp) = stamp {
+            stamp.check(&auth)?;
+        }
         Ok(LoginFence {
             epoch: auth.auth_epoch,
             family: auth
@@ -372,6 +443,17 @@ impl AuthBroker {
         request: &LoginRequest,
         target: &RuntimeTarget,
         fence: &LoginFence,
+    ) -> Result<AccessSnapshot, BrokerError> {
+        self.login_fenced_with_ticket(request, target, fence, |_| {})
+            .await
+    }
+
+    pub(crate) async fn login_fenced_with_ticket(
+        &self,
+        request: &LoginRequest,
+        target: &RuntimeTarget,
+        fence: &LoginFence,
+        on_ticket: impl FnOnce(&BrokerRequestV1) + Send,
     ) -> Result<AccessSnapshot, BrokerError> {
         target.identity(None)?;
         let _issuance = self.issuance.lock().await;
@@ -422,6 +504,7 @@ impl AuthBroker {
                 None,
                 controlled_unknown,
             )?;
+            on_ticket(&ticket);
             let mut request = request.clone();
             request.install_secret = auth.install_secret;
             (ticket, request)
@@ -561,14 +644,37 @@ impl AuthBroker {
         &self,
         stale: Option<&AccessSnapshot>,
     ) -> Result<AccessSnapshot, BrokerError> {
+        self.access_token_inner(None, stale).await
+    }
+
+    pub async fn access_token_fenced(
+        &self,
+        stamp: &ScopeStamp,
+        stale: Option<&AccessSnapshot>,
+    ) -> Result<AccessSnapshot, BrokerError> {
+        self.access_token_inner(Some(stamp), stale).await
+    }
+
+    async fn access_token_inner(
+        &self,
+        stamp: Option<&ScopeStamp>,
+        stale: Option<&AccessSnapshot>,
+    ) -> Result<AccessSnapshot, BrokerError> {
         {
             let _state = self.state.lock().await;
-            Self::active(&self.load()?)?;
+            let auth = self.load()?;
+            if let Some(stamp) = stamp {
+                stamp.check(&auth)?;
+            }
+            Self::active(&auth)?;
         }
         let _issuance = self.issuance.lock().await;
         let (ticket, refresh) = {
             let _state = self.state.lock().await;
             let mut auth = self.load()?;
+            if let Some(stamp) = stamp {
+                stamp.check(&auth)?;
+            }
             Self::active(&auth)?;
             // A lost ordinary refresh response has no idempotency key. Never
             // probe its old token after restart and risk family reuse revocation.
@@ -777,11 +883,55 @@ impl AuthBroker {
     }
 
     pub async fn logout(&self) -> Result<(), BrokerError> {
+        self.logout_inner(None, None, || {}).await
+    }
+
+    /// The callback is synchronous and runs under the same state lock as the
+    /// durable epoch mutation. Remote owners enqueue revoke here, never await I/O.
+    pub async fn logout_fenced(
+        &self,
+        stamp: &ScopeStamp,
+        revoke: impl FnOnce() + Send,
+    ) -> Result<(), BrokerError> {
+        self.logout_inner(Some(stamp), None, revoke).await
+    }
+
+    /// Owner-resolved per-peer intent only; protected tickets never cross IPC.
+    pub(crate) async fn logout_pending_login_fenced(
+        &self,
+        stamp: &ScopeStamp,
+        pending: Option<&BrokerRequestV1>,
+    ) -> Result<(), BrokerError> {
+        self.logout_inner(Some(stamp), pending, || {}).await
+    }
+
+    async fn logout_inner(
+        &self,
+        stamp: Option<&ScopeStamp>,
+        pending_login: Option<&BrokerRequestV1>,
+        revoke: impl FnOnce() + Send,
+    ) -> Result<(), BrokerError> {
         // Deliberately never acquire issuance: a hung refresh/resume cannot
         // delay the durable cancellation fence, local stop, or family revocation.
         let (epoch, proof) = {
             let _state = self.state.lock().await;
             let mut auth = self.load()?;
+            if let Some(stamp) = stamp {
+                if stamp.check(&auth).is_err() {
+                    let ticket = pending_login.ok_or(BrokerError::Cancelled)?;
+                    if ticket.kind != BrokerRequestKind::Login
+                        || !Self::owns_ticket(&auth, ticket)
+                        || stamp.epoch.checked_add(1) != Some(ticket.auth_epoch)
+                        || stamp.identity != ticket.source_identity
+                        || auth
+                            .broker
+                            .as_ref()
+                            .is_none_or(|meta| meta.family != stamp.family)
+                    {
+                        return Err(BrokerError::Cancelled);
+                    }
+                }
+            }
             if auth.logout_state == LogoutState::LoggedOut {
                 // Even repeated logout cancels requests that started waiting
                 // while already signed out; it must not reopen that old login.
@@ -798,6 +948,8 @@ impl AuthBroker {
                     pending_push.pending_push_cleanup_epoch = Some(epoch);
                 }
                 self.store.save(&auth)?;
+                self.stop.revoke_runtime();
+                revoke();
                 drop(_state);
                 if retry_push {
                     let (stop, handoff) = tokio::join!(
@@ -828,6 +980,8 @@ impl AuthBroker {
                 if never_authenticated {
                     auth.logout_state = LogoutState::LoggedOut;
                     self.store.save(&auth)?;
+                    self.stop.revoke_runtime();
+                    revoke();
                     drop(_state);
                     return self.stop.stop_local().await;
                 }
@@ -851,6 +1005,8 @@ impl AuthBroker {
                         });
                 self.store.save(&auth)?;
             }
+            self.stop.revoke_runtime();
+            revoke();
             (
                 auth.auth_epoch,
                 auth.broker.as_ref().and_then(|m| m.pending_logout.clone()),
