@@ -538,6 +538,24 @@ fn unavailable_or_missing_records_never_look_like_an_empty_install() {
 }
 
 #[test]
+fn orphaned_legacy_split_state_is_not_a_fresh_install() {
+    let root = tempfile::tempdir().unwrap();
+    let legacy = Legacy::default();
+    let split = MemorySplitTunnelStore::default();
+    split.save(&split_state()).unwrap();
+    let source = LegacyMigrationSource::new(&legacy, &split);
+    let auth = ProtectedAuthStore::new(Raw::default());
+    let runtime = ProtectedRuntimeStore::new(
+        Raw::default(),
+        RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap(),
+    );
+    let journal = FileMigrationJournal::new(root.path().join("journal.json"));
+    assert!(migrate_legacy_auth(&source, &auth, &runtime, &journal).is_err());
+    assert_eq!(split.load().unwrap(), split_state());
+    assert!(auth.load().unwrap().is_none());
+}
+
+#[test]
 fn tombstone_commit_replays_after_both_journal_boundaries() {
     for phase in [MigrationPhase::Tombstoning, MigrationPhase::Complete] {
         let root = tempfile::tempdir().unwrap();

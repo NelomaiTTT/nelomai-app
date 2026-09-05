@@ -226,7 +226,11 @@ pub fn migrate_legacy_auth(
         }
     }
     let Some(legacy) = source.auth.load()? else {
-        if existing.is_some() || auth.is_some() || runtime.is_some() {
+        if existing.is_some()
+            || auth.is_some()
+            || runtime.is_some()
+            || source.split.load()? != StoredSplitTunnelState::default()
+        {
             return Err(StorageError::RecoveryRequired(
                 "legacy source missing during migration",
             ));
