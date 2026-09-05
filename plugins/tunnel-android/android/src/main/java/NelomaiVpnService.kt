@@ -573,6 +573,7 @@ internal class AndroidConnectionIntentAttemptDispatcher(
     private val scheduleAfter: (Long) -> Unit,
     private val captureAdmissionTicket: () -> Long = { 0L },
     private val attempt: (Long) -> Unit,
+    private val onRejected: () -> Unit = {},
 ) {
     private val gate = Any()
     private var queued = false
@@ -600,6 +601,14 @@ internal class AndroidConnectionIntentAttemptDispatcher(
     private fun dispatch() {
         try {
             execute(Runnable(::runQueuedAttempt))
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            synchronized(gate) {
+                queued = false
+                rerunRequested = false
+                queuedAdmissionTicket = null
+                rerunAdmissionTicket = null
+            }
+            onRejected()
         } catch (error: Throwable) {
             synchronized(gate) {
                 queued = false
@@ -641,6 +650,25 @@ internal class AndroidConnectionIntentAttemptDispatcher(
             }
             if (rerun) dispatch()
         }
+    }
+}
+
+internal class AndroidServiceCallbackGate {
+    private val open = AtomicBoolean(true)
+
+    fun close() {
+        open.set(false)
+    }
+
+    fun isOpen(): Boolean = open.get()
+
+    fun runIfOpen(callback: () -> Unit, onClosed: () -> Unit): Boolean {
+        if (!open.get()) {
+            onClosed()
+            return false
+        }
+        callback()
+        return true
     }
 }
 
@@ -756,9 +784,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private val connectionIntentDispatch = AndroidConnectionIntentDispatchState()
     private val connectionIntentAdmission = AndroidConnectionIntentAdmission()
     private val connectionIntentRuntimeFence = AndroidRuntimeStartDispatchFence()
+    private val serviceCallbackGate = AndroidServiceCallbackGate()
     private val backgroundCredentialProvisionInFlight = AtomicBoolean(false)
     private val candidateProbeCache = BackgroundCandidateProbeCache()
     private val logoutRetry = Runnable { scheduleLogoutAttempt() }
+    private val unreadableRecoveryRetry = Runnable { retryUnreadableRecoveryStore() }
+    private var unreadableRecoveryRetryAttempt = 0
+    @Volatile
+    private var unreadableRecoveryRetriesExhausted = false
 
     override fun getBuilder(): VpnService.Builder =
         object : VpnService.Builder() {
@@ -855,7 +888,14 @@ class NelomaiVpnService : GoBackend.VpnService() {
                             !redundantStartBlocked()
                     },
                 )
-                restoreHandler.post { completeConnectionIntentStep(step) }
+                postConnectionIntentCompletion(step)
+            },
+            onRejected = {
+                abandonServiceForRecovery()
+                requestConnectionIntentServiceRecoveryIfNeeded(
+                    "connection_intent_executor_rejected",
+                    force = true,
+                )
             },
         )
         logoutCoordinator = AndroidLogoutCoordinator(
@@ -932,9 +972,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 cancelRestoreRetry()
                 performBackgroundToggle(intent.resultReceiver())
             }
-            intent?.action == ACTION_ENSURE_RUNNING -> {
-                ensureRunningFromDurableState("ensure_running")
-            }
+            intent?.action == ACTION_ENSURE_RUNNING -> handleEnsureRunning()
             intent?.action == ACTION_TASK_REMOVAL_LIVENESS -> {
                 if (QuickTunnelController.desiredActiveSnapshot(applicationContext) == false) {
                     TunnelLog.info(
@@ -2825,7 +2863,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun handleRotateBackground(intent: Intent) {
         val receiver = intent.resultReceiver()
         val expectedRevision = intent.getLongExtra(EXTRA_CREDENTIAL_REVISION, -1)
-        credentialExecutor.execute {
+        submitCredentialTask {
             try {
                 rotateBackgroundCredential(expectedRevision)
                 receiver.sendSuccess()
@@ -2879,7 +2917,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             return
         }
         backgroundCredentialProvisionInFlight.set(true)
-        credentialExecutor.execute {
+        submitCredentialTask {
             var provisioned = false
             try {
                 provisionBackgroundCredential(
@@ -2996,7 +3034,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             stopIfIdle()
             return
         }
-        credentialExecutor.execute {
+        submitCredentialTask {
             try {
                 val store = AndroidBackgroundCredentialStores.open(applicationContext)
                 val credential = backgroundCredentialForSessionRecovery(store) { envelope ->
@@ -3232,6 +3270,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
 
     override fun onDestroy() {
         serviceDestroyed = true
+        if (activeService === this) activeService = null
+        serviceCallbackGate.close()
         val pendingStartOperationId = redundantStartOperation.cancelPending()
         val installedOwner = redundantVpnOwnerSlot.snapshot()
         val redundantStopOperationId = pendingRedundantStop?.startOperationId
@@ -3246,6 +3286,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         idleStopDebouncer.cancel()
         cancelRestoreRetry()
         restoreHandler.removeCallbacks(logoutRetry)
+        cancelUnreadableRecoveryRetry()
         redundantTotalLossRetry.cancel()
         restoreHandler.removeCallbacks(redundantHealthTick)
         val revokePending = redundantRevokeLifecycle.hasPendingCleanup()
@@ -3257,6 +3298,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         ) {
             installRedundantVpnOwner(null)
         }
+        requestConnectionIntentServiceRecoveryIfNeeded("destroy")
         credentialExecutor.shutdownNow()
         when {
             pendingRedundantStop != null -> Unit
@@ -3267,7 +3309,6 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
         runCatching { AutomaticDiagnostics.onTunnelStopped(applicationContext) }
             .onFailure { TunnelLog.warning("diagnostics.lifecycle_failed", error = it) }
-        activeService = null
         TunnelRuntime.serviceDestroyed()
         AndroidSplitTunnel.clear()
         TunnelLog.info("service.destroyed")
@@ -3289,6 +3330,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
         ) {
             return
         }
+        if (hasPendingOrUnknownRecoveryWork()) {
+            return
+        }
         TunnelLog.info(
             "service.process_recycle_scheduled",
             mapOf(
@@ -3303,7 +3347,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
             if (serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() ||
                 activeService != null ||
                 TunnelRuntime.state() != SessionState.STOPPED ||
-                QuickTunnelController.desiredActive(applicationContext)
+                QuickTunnelController.desiredActive(applicationContext) ||
+                hasPendingOrUnknownRecoveryWork()
             ) {
                 return@Runnable
             }
@@ -3635,7 +3680,88 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
     }
 
+    private fun handleEnsureRunning() {
+        unreadableRecoveryRetriesExhausted = false
+        handleEnsureRunning(recoveryStore.read())
+    }
+
+    private fun handleEnsureRunning(
+        recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    ) {
+        if (recovery is RecoveryStoreResult.Success) {
+            unreadableRecoveryRetriesExhausted = false
+        }
+        routeAndroidEnsureRunning(
+            recovery = recovery,
+            route = {
+                if (recovery is RecoveryStoreResult.Failure) {
+                    false
+                } else {
+                    if (!ensureConnectionIntentRunningAfterRedundantBarrier()) {
+                        if (!shouldEnterLegacyVpnRecovery(recovery)) {
+                            dispatchRedundantResume(recovery)
+                        } else {
+                            restoreDesiredTunnel("ensure_running")
+                        }
+                    }
+                    true
+                }
+            },
+            hasPendingWork = {
+                redundantStartBlocked() || connectionIntentLifecycle.hasPendingWork()
+            },
+            desiredActive = {
+                (recovery as? RecoveryStoreResult.Success)?.value?.let {
+                    it.redundantTransaction?.desiredActive ?: it.intent.desiredActive
+                }
+            },
+            retryUnreadableStore = ::scheduleUnreadableRecoveryRetry,
+            stopIfIdle = {
+                cancelUnreadableRecoveryRetry()
+                stopIfIdle()
+            },
+        )
+    }
+
+    private fun scheduleUnreadableRecoveryRetry() {
+        if (!serviceCallbackGate.isOpen()) {
+            requestConnectionIntentServiceRecoveryIfNeeded(
+                "unreadable_recovery_store",
+                force = true,
+            )
+            return
+        }
+        restoreHandler.removeCallbacks(unreadableRecoveryRetry)
+        val delay = unreadableRecoveryRetryDelay(
+            unreadableRecoveryRetryAttempt,
+            RESTORE_RETRY_DELAYS_MILLIS,
+        ) ?: run {
+            unreadableRecoveryRetryAttempt = 0
+            unreadableRecoveryRetriesExhausted = true
+            TunnelLog.warning("service.recovery_store_unavailable")
+            stopIfIdle()
+            return
+        }
+        unreadableRecoveryRetryAttempt += 1
+        restoreHandler.postDelayed(unreadableRecoveryRetry, delay)
+    }
+
+    private fun retryUnreadableRecoveryStore() {
+        if (!serviceCallbackGate.isOpen()) return
+        val recovery = recoveryStore.read()
+        if (recovery is RecoveryStoreResult.Failure) {
+            scheduleUnreadableRecoveryRetry()
+        } else {
+            unreadableRecoveryRetryAttempt = 0
+            handleEnsureRunning(recovery)
+        }
+    }
+
     private fun scheduleConnectionIntentAttempt(delayMillis: Long = 0L) {
+        if (!serviceCallbackGate.isOpen()) {
+            requestConnectionIntentServiceRecoveryIfNeeded("stale_attempt", force = true)
+            return
+        }
         restoreHandler.removeCallbacks(restoreRetry)
         val envelope = (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)?.value
         if (!shouldApplyConnectionIntentStepNow(envelope)) {
@@ -3728,8 +3854,24 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun scheduleConnectionIntentTimer(delayMillis: Long) {
+        if (!serviceCallbackGate.isOpen()) {
+            requestConnectionIntentServiceRecoveryIfNeeded("stale_timer", force = true)
+            return
+        }
         restoreHandler.removeCallbacks(restoreRetry)
         restoreHandler.postDelayed(restoreRetry, delayMillis.coerceAtLeast(1))
+    }
+
+    private fun submitCredentialTask(task: () -> Unit): Boolean = try {
+        credentialExecutor.execute(task)
+        true
+    } catch (_: java.util.concurrent.RejectedExecutionException) {
+        abandonServiceForRecovery()
+        requestConnectionIntentServiceRecoveryIfNeeded(
+            "credential_executor_rejected",
+            force = true,
+        )
+        false
     }
 
     private fun scheduleLogoutAttempt(delayMillis: Long = 0L) {
@@ -3738,6 +3880,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 recycle = { scheduleIdleProcessRecycle(null) },
             )
         ) return
+        if (!serviceCallbackGate.isOpen()) {
+            requestConnectionIntentServiceRecoveryIfNeeded("stale_logout", force = true)
+            return
+        }
         restoreHandler.removeCallbacks(logoutRetry)
         if (delayMillis > 0) {
             restoreHandler.postDelayed(logoutRetry, delayMillis)
@@ -3768,36 +3914,26 @@ class NelomaiVpnService : GoBackend.VpnService() {
             scheduleIdleProcessRecycle(null)
             return
         }
-        try {
-            credentialExecutor.execute {
-                val step = logoutCoordinator.runOnce(
-                    ServiceConnectionIntentPanel(),
-                    ServiceConnectionIntentRuntime(),
-                    activate = BackgroundConnectionClient::activateToken,
-                    finalize = BackgroundConnectionClient::finalizeLogout,
+        submitCredentialTask {
+            val step = logoutCoordinator.runOnce(
+                ServiceConnectionIntentPanel(),
+                ServiceConnectionIntentRuntime(),
+                activate = BackgroundConnectionClient::activateToken,
+                finalize = BackgroundConnectionClient::finalizeLogout,
+            )
+            postServiceCallback {
+                handleBackgroundLogoutAttemptCompletion(
+                    ownerServiceGeneration = attemptServiceGeneration,
+                    currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
+                    serviceDestroyed = serviceDestroyed,
+                    step = step,
+                    scheduleRetry = ::scheduleNextBackgroundLogoutRetry,
+                    complete = {
+                        restoreRetryAttempt = 0
+                        stopIfIdle()
+                    },
+                    completeAfterDestroy = { scheduleIdleProcessRecycle(null) },
                 )
-                restoreHandler.post {
-                    handleBackgroundLogoutAttemptCompletion(
-                        ownerServiceGeneration = attemptServiceGeneration,
-                        currentServiceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
-                        serviceDestroyed = serviceDestroyed,
-                        step = step,
-                        scheduleRetry = ::scheduleNextBackgroundLogoutRetry,
-                        complete = {
-                            restoreRetryAttempt = 0
-                            stopIfIdle()
-                        },
-                        completeAfterDestroy = { scheduleIdleProcessRecycle(null) },
-                    )
-                }
-            }
-        } catch (error: RejectedExecutionException) {
-            if (serviceDestroyed ||
-                attemptServiceGeneration != VPN_PROCESS_SERVICE_GENERATION.get()
-            ) {
-                scheduleIdleProcessRecycle(null)
-            } else {
-                throw error
             }
         }
     }
@@ -3863,7 +3999,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                                 initialTerminalEnvelope.intent.diagnosticsEpisodeId,
                                 errorCode,
                             ) { outcome ->
-                                restoreHandler.post {
+                                postServiceCallback {
                                     routeInitialTerminalDiagnosticHandoff(
                                         outcome,
                                         acknowledge = {
@@ -3954,6 +4090,104 @@ class NelomaiVpnService : GoBackend.VpnService() {
         }
         TunnelPlugin.refreshQuickTile(applicationContext)
     }
+
+    private fun postConnectionIntentCompletion(step: AndroidCoordinatorStep) {
+        if (!serviceCallbackGate.isOpen()) {
+            handleStaleConnectionIntentCompletion(step)
+            return
+        }
+        val posted = restoreHandler.post {
+            serviceCallbackGate.runIfOpen(
+                callback = { completeConnectionIntentStep(step) },
+                onClosed = { handleStaleConnectionIntentCompletion(step) },
+            )
+        }
+        if (!posted) handleStaleConnectionIntentCompletion(step)
+    }
+
+    private fun postServiceCallback(callback: () -> Unit) {
+        if (!serviceCallbackGate.isOpen()) {
+            requestConnectionIntentServiceRecoveryIfNeeded("stale_callback", force = true)
+            return
+        }
+        val posted = restoreHandler.post {
+            serviceCallbackGate.runIfOpen(
+                callback = callback,
+                onClosed = {
+                    requestConnectionIntentServiceRecoveryIfNeeded(
+                        "stale_callback",
+                        force = true,
+                    )
+                },
+            )
+        }
+        if (!posted) {
+            requestConnectionIntentServiceRecoveryIfNeeded("callback_post_failed", force = true)
+        }
+    }
+
+    private fun handleStaleConnectionIntentCompletion(step: AndroidCoordinatorStep) {
+        val envelope = (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)?.value
+        when (staleConnectionIntentAction(step, envelope)) {
+            AndroidStaleConnectionIntentAction.RESUME ->
+                requestConnectionIntentServiceRecoveryIfNeeded("stale_completion", force = true)
+            AndroidStaleConnectionIntentAction.PUBLISH_STOPPED -> {
+                QuickTunnelController.updateState(
+                    applicationContext,
+                    SessionState.STOPPED,
+                    desiredActive = null,
+                    changed = true,
+                )
+                TunnelPlugin.refreshQuickTile(applicationContext)
+            }
+            AndroidStaleConnectionIntentAction.IGNORE -> Unit
+        }
+    }
+
+    private fun requestConnectionIntentServiceRecoveryIfNeeded(
+        reason: String,
+        force: Boolean = false,
+    ) {
+        val currentOwner = activeService
+        val hasPendingWork = runCatching { connectionIntentLifecycle.hasPendingWork() }
+            .getOrDefault(false)
+        val recoveryUnreadable = runCatching {
+            recoveryStore.read() is RecoveryStoreResult.Failure
+        }.getOrDefault(true)
+        if (!shouldRequestConnectionIntentServiceRecovery(
+                currentOwner = currentOwner,
+                owner = this,
+                ownerOpen = serviceCallbackGate.isOpen(),
+                force = force,
+                hasPendingWork = hasPendingWork,
+                recoveryUnreadable = recoveryUnreadable,
+                unreadableRetriesExhausted = unreadableRecoveryRetriesExhausted,
+                knownPendingWork = runCatching {
+                    connectionIntentLifecycle.hasKnownPendingWork()
+                }.getOrDefault(false),
+            )
+        ) return
+        TunnelLog.info("service.recovery_owner_requested", mapOf("reason" to reason))
+        runCatching {
+            ContextCompat.startForegroundService(
+                applicationContext,
+                Intent(applicationContext, NelomaiVpnService::class.java)
+                    .setAction(ACTION_ENSURE_RUNNING),
+            )
+        }.onFailure { error ->
+            TunnelLog.warning("service.recovery_owner_request_failed", error = error)
+        }
+    }
+
+    private fun abandonServiceForRecovery() {
+        serviceCallbackGate.close()
+        if (activeService === this) activeService = null
+    }
+
+    private fun hasPendingOrUnknownRecoveryWork(): Boolean = runCatching {
+        recoveryStore.read() is RecoveryStoreResult.Failure ||
+            connectionIntentLifecycle.hasPendingWork()
+    }.getOrDefault(true)
 
     private inner class ServiceConnectionIntentPanel : AndroidConnectionIntentPanel {
         override fun reconcile(
@@ -4137,6 +4371,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 recycle = { scheduleIdleProcessRecycle(null) },
             )
         ) return
+        if (!serviceCallbackGate.isOpen()) return
         if (redundantStartBlocked() ||
             redundantRevokeLifecycle.hasPendingCleanup()
         ) return
@@ -4281,6 +4516,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun scheduleRestoreRetry() {
+        if (!serviceCallbackGate.isOpen()) {
+            requestConnectionIntentServiceRecoveryIfNeeded("stale_restore_retry", force = true)
+            return
+        }
         restoreHandler.removeCallbacks(restoreRetry)
         val envelope = (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)
             ?.value
@@ -4301,6 +4540,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun cancelRestoreRetry() {
         restoreHandler.removeCallbacks(restoreRetry)
         restoreRetryAttempt = 0
+    }
+
+    private fun cancelUnreadableRecoveryRetry() {
+        restoreHandler.removeCallbacks(unreadableRecoveryRetry)
+        unreadableRecoveryRetryAttempt = 0
     }
 
     companion object {
@@ -5165,6 +5409,83 @@ internal data class ConnectionIntentServiceStatus(
     val reserveState: String? = null,
 )
 
+internal enum class AndroidStaleConnectionIntentAction {
+    RESUME,
+    PUBLISH_STOPPED,
+    IGNORE,
+}
+
+internal enum class AndroidEnsureRunningDisposition {
+    STOP_IDLE,
+    RETRY_UNREADABLE_STORE,
+    KEEP_RUNNING,
+}
+
+internal fun unreadableRecoveryRetryDelay(attempt: Int, delays: LongArray): Long? =
+    delays.getOrNull(attempt.coerceAtLeast(0))
+
+internal fun routeAndroidEnsureRunning(
+    recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
+    route: () -> Boolean,
+    hasPendingWork: () -> Boolean,
+    desiredActive: () -> Boolean?,
+    retryUnreadableStore: () -> Unit,
+    stopIfIdle: () -> Unit,
+): AndroidEnsureRunningDisposition {
+    val routed = route()
+    val disposition = when {
+        recovery is RecoveryStoreResult.Failure ->
+            AndroidEnsureRunningDisposition.RETRY_UNREADABLE_STORE
+        !routed || hasPendingWork() || desiredActive() == true ->
+            AndroidEnsureRunningDisposition.KEEP_RUNNING
+        else -> AndroidEnsureRunningDisposition.STOP_IDLE
+    }
+    when (disposition) {
+        AndroidEnsureRunningDisposition.STOP_IDLE -> stopIfIdle()
+        AndroidEnsureRunningDisposition.RETRY_UNREADABLE_STORE -> retryUnreadableStore()
+        AndroidEnsureRunningDisposition.KEEP_RUNNING -> Unit
+    }
+    return disposition
+}
+
+internal fun shouldRequestConnectionIntentServiceRecovery(
+    currentOwner: Any?,
+    owner: Any,
+    ownerOpen: Boolean,
+    force: Boolean,
+    hasPendingWork: Boolean,
+    recoveryUnreadable: Boolean = false,
+    unreadableRetriesExhausted: Boolean = false,
+    knownPendingWork: Boolean = hasPendingWork,
+): Boolean {
+    if (currentOwner != null && currentOwner !== owner) return false
+    if (currentOwner === owner && ownerOpen) return false
+    // Exhaustion ends this unknown-state recovery episode, including late callbacks.
+    // Known pending work must still be handed off if storage becomes readable again.
+    if (recoveryUnreadable && unreadableRetriesExhausted && !knownPendingWork) return false
+    if (!force && !hasPendingWork && !recoveryUnreadable) return false
+    return true
+}
+
+internal fun hasDurableConnectionIntentWork(envelope: AndroidRecoveryEnvelope): Boolean =
+    (envelope.leaseTransaction != null ||
+        envelope.intent.retry.pendingAction == "legacy_runtime_stop") &&
+        !envelope.isTerminalConnectionIntent()
+
+internal fun hasDurableVpnServiceWork(envelope: AndroidRecoveryEnvelope): Boolean =
+    envelope.redundantTransaction != null || hasDurableConnectionIntentWork(envelope)
+
+internal fun staleConnectionIntentAction(
+    step: AndroidCoordinatorStep,
+    envelope: AndroidRecoveryEnvelope?,
+): AndroidStaleConnectionIntentAction = when {
+    envelope == null -> AndroidStaleConnectionIntentAction.RESUME
+    hasDurableVpnServiceWork(envelope) -> AndroidStaleConnectionIntentAction.RESUME
+    step == AndroidCoordinatorStep.IDLE && !envelope.intent.desiredActive ->
+        AndroidStaleConnectionIntentAction.PUBLISH_STOPPED
+    else -> AndroidStaleConnectionIntentAction.IGNORE
+}
+
 internal enum class BackgroundLogoutReadState {
     NONE,
     PENDING,
@@ -5249,6 +5570,9 @@ internal class ConnectionIntentServiceLifecycle(
     fun hasPendingWork(): Boolean =
         logoutState() != BackgroundLogoutReadState.NONE || hasDurableWork()
 
+    fun hasKnownPendingWork(): Boolean =
+        logoutState() == BackgroundLogoutReadState.PENDING || hasDurableWork()
+
     fun hasPendingConnectionWork(): Boolean = hasDurableWork()
 
     private fun resumeDurableWork(): Boolean {
@@ -5268,18 +5592,13 @@ internal class ConnectionIntentServiceLifecycle(
     }
 
     private fun hasDurableWork(): Boolean =
-        (coordinator.status() as? RecoveryStoreResult.Success)?.value?.let { envelope ->
-            envelope.redundantTransaction != null ||
-                hasDurableConnectionWork(RecoveryStoreResult.Success(envelope))
-        } == true
+        (coordinator.status() as? RecoveryStoreResult.Success)
+            ?.value?.let(::hasDurableVpnServiceWork) == true
 
     private fun hasDurableConnectionWork(
         recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
-    ): Boolean = (recovery as? RecoveryStoreResult.Success)?.value?.let { envelope ->
-        (envelope.leaseTransaction != null ||
-            envelope.intent.retry.pendingAction == "legacy_runtime_stop") &&
-            !envelope.isTerminalConnectionIntent()
-    } == true
+    ): Boolean = (recovery as? RecoveryStoreResult.Success)
+        ?.value?.let(::hasDurableConnectionIntentWork) == true
 }
 
 internal fun shouldStopVpnService(
