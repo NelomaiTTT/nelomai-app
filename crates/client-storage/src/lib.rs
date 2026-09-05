@@ -13,7 +13,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+mod auth;
+mod migration;
+mod runtime_state;
 mod split_tunnel;
+
+pub use auth::*;
+pub use migration::*;
+pub use runtime_state::*;
 
 pub use split_tunnel::{
     FileSplitTunnelStore, MemorySplitTunnelStore, SplitTunnelStore,
@@ -179,6 +186,15 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self) -> Result<(), StorageError>;
 }
 
+/// Opaque protected records. Implementations must not substitute an empty record
+/// for corrupt or unavailable storage. SystemSecretStore preserves the existing
+/// platform keyring and Linux protected-fallback selection for these bytes.
+pub trait ProtectedRecordStore: Send + Sync {
+    fn load_record(&self) -> Result<Option<Vec<u8>>, StorageError>;
+    fn save_record(&self, bytes: &[u8]) -> Result<(), StorageError>;
+    fn delete_record(&self) -> Result<(), StorageError>;
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("system credential store failed: {0}")]
@@ -193,6 +209,8 @@ pub enum StorageError {
     SplitTunnelStateTooLarge { limit_bytes: usize },
     #[error("split-tunnel memory state is unavailable")]
     SplitTunnelStateLock,
+    #[error("recoverable storage state error: {0}")]
+    RecoveryRequired(&'static str),
 }
 
 pub struct SystemSecretStore {
@@ -209,31 +227,27 @@ impl SystemSecretStore {
         }
     }
 
+    #[cfg(test)]
     fn serialized(auth: &StoredAuth) -> Result<Vec<u8>, StorageError> {
         Ok(serde_json::to_vec(auth)?)
     }
 
     #[cfg(not(target_os = "android"))]
-    fn load_native(&self) -> Result<Option<StoredAuth>, NativeStoreError> {
+    fn load_native(&self) -> Result<Option<Vec<u8>>, NativeStoreError> {
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;
         match entry.get_secret() {
-            Ok(value) => serde_json::from_slice(&value)
-                .map(Some)
-                .map_err(StorageError::from)
-                .map_err(NativeStoreError::Fatal),
+            Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(NativeStoreError::from(error)),
         }
     }
 
     #[cfg(not(target_os = "android"))]
-    fn save_native(&self, auth: &StoredAuth) -> Result<(), NativeStoreError> {
+    fn save_native(&self, bytes: &[u8]) -> Result<(), NativeStoreError> {
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;
-        entry
-            .set_secret(&Self::serialized(auth).map_err(NativeStoreError::Fatal)?)
-            .map_err(NativeStoreError::from)
+        entry.set_secret(bytes).map_err(NativeStoreError::from)
     }
 
     #[cfg(not(target_os = "android"))]
@@ -264,13 +278,10 @@ impl SystemSecretStore {
     }
 
     #[cfg(target_os = "android")]
-    fn load_native(&self) -> Result<Option<StoredAuth>, NativeStoreError> {
+    fn load_native(&self) -> Result<Option<Vec<u8>>, NativeStoreError> {
         let entry = self.android_entry().map_err(NativeStoreError::Fatal)?;
         match entry.get_secret() {
-            Ok(value) => serde_json::from_slice(&value)
-                .map(Some)
-                .map_err(StorageError::from)
-                .map_err(NativeStoreError::Fatal),
+            Ok(value) => Ok(Some(value)),
             Err(keyring_core::Error::NoEntry) => Ok(None),
             Err(error) => Err(NativeStoreError::Fatal(StorageError::Keyring(
                 error.to_string(),
@@ -279,10 +290,10 @@ impl SystemSecretStore {
     }
 
     #[cfg(target_os = "android")]
-    fn save_native(&self, auth: &StoredAuth) -> Result<(), NativeStoreError> {
+    fn save_native(&self, bytes: &[u8]) -> Result<(), NativeStoreError> {
         self.android_entry()
             .map_err(NativeStoreError::Fatal)?
-            .set_secret(&Self::serialized(auth).map_err(NativeStoreError::Fatal)?)
+            .set_secret(bytes)
             .map_err(|error| NativeStoreError::Fatal(StorageError::Keyring(error.to_string())))
     }
 
@@ -304,61 +315,101 @@ impl SystemSecretStore {
             .map(|directory| ProtectedFileStore::new(directory, &self.account))
             .ok_or(StorageError::LinuxFallbackNotConfigured)
     }
-}
 
-impl SecretStore for SystemSecretStore {
-    fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
+    fn load_validated(
+        &self,
+        validate: impl Fn(&[u8]) -> Result<(), StorageError>,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
         match self.load_native() {
-            Ok(Some(value)) => Ok(Some(value)),
+            Ok(Some(value)) => {
+                validate(&value)?;
+                Ok(Some(value))
+            }
             Ok(None) => {
                 #[cfg(target_os = "linux")]
                 if let Some(directory) = &self.linux_fallback_dir {
                     let fallback = ProtectedFileStore::new(directory, &self.account);
-                    if let Some(value) = fallback.load()? {
+                    if let Some(value) = fallback.load_record()? {
+                        // Preserve legacy behavior: invalid legacy JSON must not
+                        // be moved out of the fallback before reporting failure.
+                        validate(&value)?;
                         self.save_native(&value).map_err(|error| match error {
                             NativeStoreError::Unavailable => StorageError::Keyring(
                                 "Secret Service became unavailable during migration".to_string(),
                             ),
                             NativeStoreError::Fatal(error) => error,
                         })?;
-                        fallback.delete()?;
+                        fallback.delete_record()?;
                         return Ok(Some(value));
                     }
                 }
                 Ok(None)
             }
             #[cfg(target_os = "linux")]
-            Err(NativeStoreError::Unavailable) => self.fallback()?.load(),
+            Err(NativeStoreError::Unavailable) => self
+                .fallback()?
+                .load_record()?
+                .map(|value| {
+                    validate(&value)?;
+                    Ok(value)
+                })
+                .transpose(),
             Err(NativeStoreError::Fatal(error)) => Err(error),
         }
     }
+}
+
+impl SecretStore for SystemSecretStore {
+    fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
+        self.load_validated(|bytes| {
+            serde_json::from_slice::<StoredAuth>(bytes)
+                .map(|_| ())
+                .map_err(StorageError::from)
+        })?
+        .map(|bytes| serde_json::from_slice(&bytes).map_err(StorageError::from))
+        .transpose()
+    }
 
     fn save(&self, auth: &StoredAuth) -> Result<(), StorageError> {
-        match self.save_native(auth) {
+        self.save_record(&serde_json::to_vec(auth)?)
+    }
+
+    fn delete(&self) -> Result<(), StorageError> {
+        self.delete_record()
+    }
+}
+
+impl ProtectedRecordStore for SystemSecretStore {
+    fn load_record(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        self.load_validated(|_| Ok(()))
+    }
+
+    fn save_record(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        match self.save_native(bytes) {
             Ok(()) => {
                 #[cfg(target_os = "linux")]
                 if let Some(directory) = &self.linux_fallback_dir {
-                    ProtectedFileStore::new(directory, &self.account).delete()?;
+                    ProtectedFileStore::new(directory, &self.account).delete_record()?;
                 }
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            Err(NativeStoreError::Unavailable) => self.fallback()?.save(auth),
+            Err(NativeStoreError::Unavailable) => self.fallback()?.save_record(bytes),
             Err(NativeStoreError::Fatal(error)) => Err(error),
         }
     }
 
-    fn delete(&self) -> Result<(), StorageError> {
+    fn delete_record(&self) -> Result<(), StorageError> {
         match self.delete_native() {
             Ok(()) => {
                 #[cfg(target_os = "linux")]
                 if let Some(directory) = &self.linux_fallback_dir {
-                    ProtectedFileStore::new(directory, &self.account).delete()?;
+                    ProtectedFileStore::new(directory, &self.account).delete_record()?;
                 }
                 Ok(())
             }
             #[cfg(target_os = "linux")]
-            Err(NativeStoreError::Unavailable) => self.fallback()?.delete(),
+            Err(NativeStoreError::Unavailable) => self.fallback()?.delete_record(),
             Err(NativeStoreError::Fatal(error)) => Err(error),
         }
     }
@@ -400,29 +451,70 @@ impl ProtectedFileStore {
         }
     }
 
-    fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
+    fn load_record(&self) -> Result<Option<Vec<u8>>, StorageError> {
         match fs::read(&self.path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
 
-    fn save(&self, auth: &StoredAuth) -> Result<(), StorageError> {
-        create_protected_dir(&self.directory)?;
-        let temporary = self.path.with_extension("tmp");
-        write_protected_file(&temporary, &SystemSecretStore::serialized(auth)?)?;
-        fs::rename(temporary, &self.path)?;
-        Ok(())
+    fn save_record(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        atomic_private_write(&self.path, bytes)
     }
 
-    fn delete(&self) -> Result<(), StorageError> {
+    fn delete_record(&self) -> Result<(), StorageError> {
         match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent(&self.directory),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
+
+    #[cfg(test)]
+    fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
+        self.load_record()?
+            .map(|bytes| serde_json::from_slice(&bytes).map_err(StorageError::from))
+            .transpose()
+    }
+    #[cfg(test)]
+    fn save(&self, auth: &StoredAuth) -> Result<(), StorageError> {
+        self.save_record(&serde_json::to_vec(auth)?)
+    }
+    #[cfg(test)]
+    fn delete(&self) -> Result<(), StorageError> {
+        self.delete_record()
+    }
+}
+
+pub(crate) fn atomic_private_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or(StorageError::RecoveryRequired("record has no parent"))?;
+    create_protected_dir(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| StorageError::Io(error.error))?;
+    sync_parent(parent)
+}
+
+fn sync_parent(path: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -440,27 +532,6 @@ fn create_protected_dir(path: &Path) -> io::Result<()> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn create_protected_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)
-}
-
-#[cfg(unix)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn write_protected_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
-}
-
-#[cfg(not(unix))]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn write_protected_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    fs::write(path, bytes)
 }
 
 #[cfg(test)]
