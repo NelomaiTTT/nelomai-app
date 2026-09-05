@@ -1,6 +1,7 @@
 use nelomai_client_api::{
     AccessSnapshot, AuthDevice, ClientApi, LoginRequest, RuntimeLogoutRequest,
-    RuntimeResumeRequest, RuntimeTarget,
+    RuntimeResumeRequest, RuntimeSupersedeRequest, RuntimeSwitchReconcileRequest,
+    RuntimeSwitchState, RuntimeTarget,
 };
 use nelomai_contracts::{Platform, RuntimeIdentity, RuntimeSlot};
 use serde_json::{json, Value};
@@ -221,7 +222,7 @@ async fn resume_is_refresh_only_and_decodes_the_actual_response_shape() {
     assert_eq!(result.identity.session_generation, Some(8));
     assert_eq!(result.access_token, "resumed-access");
     let raw = requests.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(raw.starts_with("POST /api/client/v1/runtime/resume "));
+    assert!(raw.starts_with("POST /api/client/v1/auth/runtime/resume "));
     assert!(!raw.to_lowercase().contains("authorization:"));
     let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(
@@ -231,6 +232,190 @@ async fn resume_is_refresh_only_and_decodes_the_actual_response_shape() {
     assert_eq!(body["operation_id"], "11111111-1111-4111-8111-111111111111");
     assert!(!format!("{request:?} {result:?}").contains("synthetic-refresh"));
     assert!(!format!("{result:?}").contains("resumed-access"));
+    handle.join().unwrap();
+}
+
+fn reconcile_request(source_identity: Option<RuntimeIdentity>) -> RuntimeSwitchReconcileRequest {
+    RuntimeSwitchReconcileRequest {
+        operation_id: "11111111-1111-4111-8111-111111111111".into(),
+        source_identity,
+        target_identity: RuntimeTarget {
+            container_version: "0.2.16".into(),
+            runtime_version: "0.2.16".into(),
+            runtime_contract_version: 1,
+            runtime_slot: RuntimeSlot::Latest,
+        },
+        expected_session_generation: Some(7),
+        cleanup_contract_version: 1,
+        lease_ids: vec!["lease-1".into()],
+        redundant_session_ids: vec!["session-1".into()],
+        client_operation_ids: vec!["operation-1".into()],
+    }
+}
+
+#[tokio::test]
+async fn legacy_bootstrap_and_reconcile_strip_every_app_and_runtime_header() {
+    let (url, bootstrap_requests, bootstrap) = server(json!({
+        "device":{"id":"device","name":"test","platform":"macos",
+            "container_version":"legacy","runtime_version":null,
+            "runtime_contract_version":null,"runtime_slot":null,
+            "session_generation":null}
+    }));
+    let api = ClientApi::new(&url)
+        .unwrap()
+        .with_app_version("0.2.16")
+        .unwrap();
+    let device = api.legacy_bootstrap_device("legacy-access").await.unwrap();
+    assert_eq!(device.id, "device");
+    let raw = bootstrap_requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(raw.starts_with("GET /api/client/v1/bootstrap "));
+    assert!(raw
+        .to_lowercase()
+        .contains("authorization: bearer legacy-access"));
+    assert!(!raw.to_lowercase().contains("x-nelomai-"));
+    bootstrap.join().unwrap();
+
+    let (url, reconcile_requests, reconcile) = server(json!({
+        "state":"clean", "operation_id":"11111111-1111-4111-8111-111111111111",
+        "retired_lease_ids":["lease-1"], "retired_session_ids":["session-1"],
+        "retired_operation_ids":["operation-1"], "retry_after_seconds":null
+    }));
+    let mut request = reconcile_request(None);
+    request.expected_session_generation = None;
+    let response = ClientApi::new(&url)
+        .unwrap()
+        .with_app_version("0.2.16")
+        .unwrap()
+        .reconcile_runtime_switch("legacy-access", &request)
+        .await
+        .unwrap();
+    assert_eq!(response.state, RuntimeSwitchState::Clean);
+    let raw = reconcile_requests
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    assert!(raw.starts_with("POST /api/client/v1/connections/runtime-switch/reconcile "));
+    assert!(raw
+        .to_lowercase()
+        .contains("authorization: bearer legacy-access"));
+    assert!(!raw.to_lowercase().contains("x-nelomai-"));
+    let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert!(body["source_identity"].is_null());
+    assert!(body["expected_session_generation"].is_null());
+    assert_eq!(body["target_identity"]["runtime_slot"], "latest");
+    assert!(body["target_identity"].get("slot").is_none());
+    reconcile.join().unwrap();
+}
+
+#[tokio::test]
+async fn enrolled_reconcile_uses_only_the_captured_source_for_headers() {
+    let (url, requests, handle) = server(json!({
+        "state":"retry", "operation_id":"11111111-1111-4111-8111-111111111111",
+        "retired_lease_ids":[], "retired_session_ids":[],
+        "retired_operation_ids":[], "retry_after_seconds":1
+    }));
+    let snapshot = AccessSnapshot::new(
+        "source-access".into(),
+        identity(),
+        3,
+        "source-family".into(),
+    )
+    .unwrap();
+    let api = ClientApi::new(&url)
+        .unwrap()
+        .with_app_version("9.9.9")
+        .unwrap()
+        .with_captured_source(&snapshot)
+        .unwrap();
+    let response = api
+        .reconcile_runtime_switch(
+            snapshot.access_token(),
+            &reconcile_request(Some(identity())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.state, RuntimeSwitchState::Retry);
+    let raw = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    let lower = raw.to_lowercase();
+    assert!(lower.contains("authorization: bearer source-access"));
+    assert!(lower.contains("x-nelomai-app-version: 0.2.16"));
+    assert!(!lower.contains("x-nelomai-app-version: 9.9.9"));
+    let body: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["source_identity"]["runtime_slot"], "stable");
+    assert!(body["source_identity"].get("slot").is_none());
+    assert_eq!(body["source_identity"]["session_generation"], 7);
+    assert_eq!(body["target_identity"]["runtime_slot"], "latest");
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_retry_hint_is_nullable_and_supersede_uses_the_actual_refresh_route() {
+    let (url, requests, handle) = server(json!({
+        "state":"retry", "operation_id":"11111111-1111-4111-8111-111111111111",
+        "retired_lease_ids":[], "retired_session_ids":[],
+        "retired_operation_ids":[], "retry_after_seconds":null
+    }));
+    let api = ClientApi::new(&url).unwrap();
+    let mut reconcile = reconcile_request(None);
+    reconcile.expected_session_generation = None;
+    assert_eq!(
+        api.reconcile_runtime_switch("legacy-access", &reconcile)
+            .await
+            .unwrap()
+            .state,
+        RuntimeSwitchState::Retry
+    );
+    requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    handle.join().unwrap();
+
+    let (url, requests, handle) = server(json!({
+        "state":"clean",
+        "reconcile_operation_id":"33333333-3333-4333-8333-333333333333",
+        "retry_after_seconds":null
+    }));
+    let request = RuntimeSupersedeRequest {
+        refresh_token: "source-refresh".into(),
+        operation_id: "22222222-2222-4222-8222-222222222222".into(),
+        superseded_reconcile_operation_id: "11111111-1111-4111-8111-111111111111".into(),
+        expected_session_generation: Some(7),
+        target_identity: reconcile.target_identity,
+    };
+    let response = ClientApi::new(&url)
+        .unwrap()
+        .supersede_runtime(&request)
+        .await
+        .unwrap();
+    assert_eq!(
+        response.reconcile_operation_id,
+        "33333333-3333-4333-8333-333333333333"
+    );
+    let raw = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(raw.starts_with("POST /api/client/v1/auth/runtime/supersede "));
+    assert!(!raw.to_lowercase().contains("authorization:"));
+    assert!(!format!("{request:?}").contains("source-refresh"));
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_rejects_retirement_receipt_outside_the_frozen_snapshot() {
+    let (url, requests, handle) = server(json!({
+        "state":"clean", "operation_id":"11111111-1111-4111-8111-111111111111",
+        "retired_lease_ids":["foreign-lease"], "retired_session_ids":[],
+        "retired_operation_ids":[], "retry_after_seconds":null
+    }));
+    let mut request = reconcile_request(None);
+    request.expected_session_generation = None;
+    assert_eq!(
+        ClientApi::new(&url)
+            .unwrap()
+            .reconcile_runtime_switch("legacy-access", &request)
+            .await
+            .unwrap_err()
+            .stable_code(),
+        Some("invalid_runtime_switch_response")
+    );
+    requests.recv_timeout(Duration::from_secs(5)).unwrap();
     handle.join().unwrap();
 }
 

@@ -18,11 +18,13 @@ use reqwest::{
     Client as HttpClient, RequestBuilder, Response, StatusCode, Url,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Exact panel target DTO: a target never assigns a server generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +264,188 @@ pub struct RuntimeResumeResponse {
     pub token_type: String,
     pub access_expires_in: u64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSwitchState {
+    Clean,
+    Retry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSwitchReconcileRequest {
+    pub operation_id: String,
+    pub source_identity: Option<RuntimeIdentity>,
+    pub target_identity: RuntimeTarget,
+    pub expected_session_generation: Option<u64>,
+    pub cleanup_contract_version: u32,
+    pub lease_ids: Vec<String>,
+    pub redundant_session_ids: Vec<String>,
+    pub client_operation_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RuntimeIdentityRequestWire<'a> {
+    container_version: &'a str,
+    runtime_version: &'a str,
+    runtime_contract_version: u32,
+    runtime_slot: RuntimeSlot,
+    session_generation: Option<u64>,
+}
+
+impl Serialize for RuntimeSwitchReconcileRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            operation_id: &'a str,
+            source_identity: Option<RuntimeIdentityRequestWire<'a>>,
+            target_identity: &'a RuntimeTarget,
+            expected_session_generation: Option<u64>,
+            cleanup_contract_version: u32,
+            lease_ids: &'a [String],
+            redundant_session_ids: &'a [String],
+            client_operation_ids: &'a [String],
+        }
+        let source_identity =
+            self.source_identity
+                .as_ref()
+                .map(|identity| RuntimeIdentityRequestWire {
+                    container_version: &identity.container_version,
+                    runtime_version: &identity.runtime_version,
+                    runtime_contract_version: identity.runtime_contract_version,
+                    runtime_slot: identity.slot,
+                    session_generation: identity.session_generation,
+                });
+        Wire {
+            operation_id: &self.operation_id,
+            source_identity,
+            target_identity: &self.target_identity,
+            expected_session_generation: self.expected_session_generation,
+            cleanup_contract_version: self.cleanup_contract_version,
+            lease_ids: &self.lease_ids,
+            redundant_session_ids: &self.redundant_session_ids,
+            client_operation_ids: &self.client_operation_ids,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSwitchReconcileResponse {
+    pub state: RuntimeSwitchState,
+    pub operation_id: String,
+    pub retired_lease_ids: Vec<String>,
+    pub retired_session_ids: Vec<String>,
+    pub retired_operation_ids: Vec<String>,
+    pub retry_after_seconds: Option<u32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSupersedeRequest {
+    pub refresh_token: String,
+    pub operation_id: String,
+    pub superseded_reconcile_operation_id: String,
+    pub expected_session_generation: Option<u64>,
+    pub target_identity: RuntimeTarget,
+}
+impl fmt::Debug for RuntimeSupersedeRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeSupersedeRequest")
+            .field("operation_id", &self.operation_id)
+            .field(
+                "superseded_reconcile_operation_id",
+                &self.superseded_reconcile_operation_id,
+            )
+            .field("target_identity", &self.target_identity)
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSupersedeResponse {
+    pub state: RuntimeSwitchState,
+    pub reconcile_operation_id: String,
+    pub retry_after_seconds: Option<u32>,
+}
+
+fn canonical_operation_id(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+fn valid_switch_ids(values: &[String]) -> bool {
+    values.len() <= RUNTIME_SWITCH_IDS_LIMIT
+        && values.iter().all(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+        && values.iter().collect::<HashSet<_>>().len() == values.len()
+}
+
+fn validate_runtime_switch_request(
+    request: &RuntimeSwitchReconcileRequest,
+) -> Result<(), ClientApiError> {
+    request.target_identity.identity(None)?;
+    let source_valid = match &request.source_identity {
+        Some(identity) => {
+            identity.validate().is_ok()
+                && identity.session_generation.is_some()
+                && identity.session_generation == request.expected_session_generation
+        }
+        None => request.expected_session_generation.is_none(),
+    };
+    if !canonical_operation_id(&request.operation_id)
+        || !source_valid
+        || request.cleanup_contract_version != 1
+        || !valid_switch_ids(&request.lease_ids)
+        || !valid_switch_ids(&request.redundant_session_ids)
+        || !valid_switch_ids(&request.client_operation_ids)
+    {
+        return Err(ClientApiError::InvalidPayload {
+            code: "invalid_runtime_switch_request",
+        });
+    }
+    Ok(())
+}
+
+fn validate_runtime_switch_response(
+    request: &RuntimeSwitchReconcileRequest,
+    response: &RuntimeSwitchReconcileResponse,
+) -> Result<(), ClientApiError> {
+    let requested_leases: HashSet<_> = request.lease_ids.iter().collect();
+    let requested_sessions: HashSet<_> = request.redundant_session_ids.iter().collect();
+    let requested_operations: HashSet<_> = request.client_operation_ids.iter().collect();
+    if response.operation_id != request.operation_id
+        || !valid_switch_ids(&response.retired_lease_ids)
+        || !valid_switch_ids(&response.retired_session_ids)
+        || !valid_switch_ids(&response.retired_operation_ids)
+        || response
+            .retry_after_seconds
+            .is_some_and(|seconds| !(1..=30).contains(&seconds))
+        || response
+            .retired_lease_ids
+            .iter()
+            .any(|id| !requested_leases.contains(id))
+        || response
+            .retired_session_ids
+            .iter()
+            .any(|id| !requested_sessions.contains(id))
+        || response
+            .retired_operation_ids
+            .iter()
+            .any(|id| !requested_operations.contains(id))
+    {
+        return Err(ClientApiError::InvalidPayload {
+            code: "invalid_runtime_switch_response",
+        });
+    }
+    Ok(())
+}
 impl fmt::Debug for RuntimeResumeResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RuntimeResumeResponse")
@@ -293,6 +477,7 @@ pub struct RuntimeLogoutResponse {
 const SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT: usize = 1024 * 1024;
 const SPLIT_TUNNEL_SETTINGS_REQUEST_LIMIT: usize = 256 * 1024;
 const SPLIT_TUNNEL_SELECTED_PACKAGES_LIMIT: usize = 512;
+const RUNTIME_SWITCH_IDS_LIMIT: usize = 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -728,6 +913,18 @@ impl ClientApi {
         Ok(self)
     }
 
+    /// Bind an immutable obsolete source without inheriting the selected
+    /// target's app/runtime headers from the base client.
+    pub fn with_captured_source(
+        mut self,
+        snapshot: &AccessSnapshot,
+    ) -> Result<Self, ClientApiError> {
+        self.app_version = None;
+        self.runtime_identity = None;
+        self.scoped_access = None;
+        self.with_access_snapshot(snapshot)
+    }
+
     pub async fn login_runtime(
         &self,
         request: &LoginRequest,
@@ -759,10 +956,45 @@ impl ClientApi {
             .identity(request.expected_session_generation)?;
         self.send_json(
             self.http
-                .post(self.endpoint("runtime/resume")?)
+                .post(self.endpoint("auth/runtime/resume")?)
                 .json(request),
         )
         .await
+    }
+
+    pub async fn supersede_runtime(
+        &self,
+        request: &RuntimeSupersedeRequest,
+    ) -> Result<RuntimeSupersedeResponse, ClientApiError> {
+        request.target_identity.identity(None)?;
+        if !canonical_operation_id(&request.operation_id)
+            || !canonical_operation_id(&request.superseded_reconcile_operation_id)
+            || request
+                .expected_session_generation
+                .is_some_and(|generation| generation == 0 || generation > i64::MAX as u64)
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "invalid_runtime_supersede_request",
+            });
+        }
+        let response: RuntimeSupersedeResponse = self
+            .without_identity_context()
+            .send_json(
+                self.http
+                    .post(self.endpoint("auth/runtime/supersede")?)
+                    .json(request),
+            )
+            .await?;
+        if !canonical_operation_id(&response.reconcile_operation_id)
+            || response
+                .retry_after_seconds
+                .is_some_and(|seconds| !(1..=30).contains(&seconds))
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "invalid_runtime_supersede_response",
+            });
+        }
+        Ok(response)
     }
 
     pub async fn logout_runtime(
@@ -1062,6 +1294,77 @@ impl ClientApi {
 
     pub async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, ClientApiError> {
         self.send_json(self.bootstrap_request(access_token)?).await
+    }
+
+    /// Owner-only legacy observation. This deliberately strips every app and
+    /// runtime binding carried by the base client.
+    pub async fn legacy_bootstrap_device(
+        &self,
+        access_token: &str,
+    ) -> Result<AuthDevice, ClientApiError> {
+        #[derive(Deserialize)]
+        struct Response {
+            device: AuthDevice,
+        }
+        let bare = self.without_identity_context();
+        bare.send_json(
+            bare.http
+                .get(bare.endpoint("bootstrap")?)
+                .bearer_auth(access_token),
+        )
+        .await
+        .map(|response: Response| response.device)
+    }
+
+    /// Owner-only legacy rotation. Unlike ordinary refresh it cannot inherit
+    /// selected-target identity headers.
+    pub async fn legacy_refresh(
+        &self,
+        refresh_token: impl Into<String>,
+    ) -> Result<TokenResponse, ClientApiError> {
+        let bare = self.without_identity_context();
+        bare.send_json(
+            bare.http
+                .post(bare.endpoint("auth/refresh")?)
+                .json(&RefreshRequest {
+                    refresh_token: refresh_token.into(),
+                }),
+        )
+        .await
+    }
+
+    pub async fn reconcile_runtime_switch(
+        &self,
+        access_token: &str,
+        request: &RuntimeSwitchReconcileRequest,
+    ) -> Result<RuntimeSwitchReconcileResponse, ClientApiError> {
+        validate_runtime_switch_request(request)?;
+        let client = if request.source_identity.is_none() {
+            self.without_identity_context()
+        } else {
+            if self.runtime_identity.as_ref() != request.source_identity.as_ref()
+                || self
+                    .scoped_access
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.access_token() != access_token)
+            {
+                return Err(ClientApiError::InvalidPayload {
+                    code: "runtime_access_mismatch",
+                });
+            }
+            self.clone()
+        };
+        let response: RuntimeSwitchReconcileResponse = client
+            .send_json(
+                client
+                    .http
+                    .post(client.endpoint("connections/runtime-switch/reconcile")?)
+                    .bearer_auth(access_token)
+                    .json(request),
+            )
+            .await?;
+        validate_runtime_switch_response(request, &response)?;
+        Ok(response)
     }
 
     pub async fn server_candidates(
@@ -1496,6 +1799,14 @@ impl ClientApi {
 
     fn device_request(&self, request: RequestBuilder, background_token: &str) -> RequestBuilder {
         request.header(AUTHORIZATION, format!("Device {background_token}"))
+    }
+
+    fn without_identity_context(&self) -> Self {
+        let mut bare = self.clone();
+        bare.app_version = None;
+        bare.runtime_identity = None;
+        bare.scoped_access = None;
+        bare
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, ClientApiError> {

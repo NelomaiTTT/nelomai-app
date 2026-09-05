@@ -4,13 +4,17 @@
 use async_trait::async_trait;
 use nelomai_client_api::{
     AccessSnapshot, ClientApi, ClientApiError, LoginRequest, RuntimeLogoutRequest,
-    RuntimeResumeRequest, RuntimeTarget, TokenResponse,
+    RuntimeResumeRequest, RuntimeSwitchReconcileRequest, RuntimeSwitchReconcileResponse,
+    RuntimeSwitchState, RuntimeTarget, TokenResponse,
 };
-use nelomai_client_storage::RecoveryTicketV1;
 use nelomai_client_storage::{
     AuthStore, AuthStoreV1, BrokerMetadataV1, BrokerRequestKind, BrokerRequestV1,
     CompletedResumeV1, LogoutState, PendingLogoutV1, StorageError, StoredResumeArgumentsV1,
+    TransitionAuthorityV1, TransitionReconcileReceiptV1, TransitionResumeEvidenceV1,
+    MAX_TRANSITION_AUTHORITIES,
 };
+use nelomai_client_storage::{RecoveryTicketV1, TransitionDispatchStateV1};
+use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -185,6 +189,140 @@ impl ResumeArguments {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionSourceSnapshot {
+    identity: Option<nelomai_contracts::RuntimeIdentity>,
+    device_id: String,
+    expected_session_generation: Option<u64>,
+    scope_fingerprint: String,
+}
+impl TransitionSourceSnapshot {
+    pub fn identity(&self) -> Option<&nelomai_contracts::RuntimeIdentity> {
+        self.identity.as_ref()
+    }
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+    pub fn expected_session_generation(&self) -> Option<u64> {
+        self.expected_session_generation
+    }
+    pub fn scope_fingerprint(&self) -> &str {
+        &self.scope_fingerprint
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrozenReconcileRequest {
+    request: RuntimeSwitchReconcileRequest,
+    request_fingerprint: String,
+    source_device_id: String,
+    source_scope_fingerprint: String,
+}
+impl FrozenReconcileRequest {
+    pub fn new(
+        request: RuntimeSwitchReconcileRequest,
+        source: &TransitionSourceSnapshot,
+    ) -> Result<Self, BrokerError> {
+        Self::from_persisted(
+            request,
+            source.device_id.clone(),
+            source.scope_fingerprint.clone(),
+            None,
+        )
+    }
+
+    pub fn from_persisted(
+        request: RuntimeSwitchReconcileRequest,
+        source_device_id: String,
+        source_scope_fingerprint: String,
+        expected_request_fingerprint: Option<&str>,
+    ) -> Result<Self, BrokerError> {
+        let request_fingerprint = digest_json(&request)?;
+        if expected_request_fingerprint.is_some_and(|expected| expected != request_fingerprint)
+            || source_device_id.is_empty()
+            || !valid_sha256(&source_scope_fingerprint)
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Ok(Self {
+            request,
+            request_fingerprint,
+            source_device_id,
+            source_scope_fingerprint,
+        })
+    }
+
+    pub fn request(&self) -> &RuntimeSwitchReconcileRequest {
+        &self.request
+    }
+    pub fn request_fingerprint(&self) -> &str {
+        &self.request_fingerprint
+    }
+    pub fn source_device_id(&self) -> &str {
+        &self.source_device_id
+    }
+    pub fn source_scope_fingerprint(&self) -> &str {
+        &self.source_scope_fingerprint
+    }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn digest_json(value: &impl serde::Serialize) -> Result<String, BrokerError> {
+    fn canonical(value: &serde_json::Value, output: &mut Vec<u8>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                output.push(b'{');
+                let mut fields: Vec<_> = fields.iter().collect();
+                fields.sort_unstable_by(|left, right| left.0.cmp(right.0));
+                for (index, (key, value)) in fields.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    output.extend(serde_json::to_vec(key).expect("JSON object key"));
+                    output.push(b':');
+                    canonical(value, output);
+                }
+                output.push(b'}');
+            }
+            serde_json::Value::Array(values) => {
+                output.push(b'[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(b',');
+                    }
+                    canonical(value, output);
+                }
+                output.push(b']');
+            }
+            value => output.extend(serde_json::to_vec(value).expect("JSON scalar")),
+        }
+    }
+    let value = serde_json::to_value(value).map_err(|_| BrokerError::RecoveryRequired)?;
+    let mut bytes = Vec::new();
+    canonical(&value, &mut bytes);
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[derive(Debug)]
+pub struct TransitionResumeReceipt {
+    identity: nelomai_contracts::RuntimeIdentity,
+    current_access: Option<AccessSnapshot>,
+}
+impl TransitionResumeReceipt {
+    pub fn identity(&self) -> &nelomai_contracts::RuntimeIdentity {
+        &self.identity
+    }
+    pub fn current_access(&self) -> Option<&AccessSnapshot> {
+        self.current_access.as_ref()
+    }
+}
+
 pub struct AuthBroker {
     api: ClientApi,
     store: Arc<dyn AuthStore>,
@@ -220,6 +358,7 @@ impl AuthBroker {
                 pending_login_account: None,
                 confirmed_device_id: None,
                 pending_push_cleanup_epoch: None,
+                transition_authorities: Vec::new(),
             });
             store.save(&auth)?;
         } else if let Some(meta) = &mut auth.broker {
@@ -250,6 +389,492 @@ impl AuthBroker {
             return Err(BrokerError::RecoveryRequired);
         }
         Ok(auth)
+    }
+
+    fn save_transition_write(&self, auth: &AuthStoreV1) -> Result<(), BrokerError> {
+        auth.validate_transition_write_budget()?;
+        self.store.save(auth)?;
+        Ok(())
+    }
+
+    fn transition_source_from_auth(
+        auth: &AuthStoreV1,
+    ) -> Result<TransitionSourceSnapshot, BrokerError> {
+        Self::active(auth)?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        let device_id = meta
+            .confirmed_device_id
+            .clone()
+            .ok_or(BrokerError::RecoveryRequired)?;
+        if device_id.is_empty()
+            || auth
+                .confirmed_identity
+                .as_ref()
+                .is_some_and(|identity| identity.session_generation != auth.session_generation)
+            || auth.confirmed_identity.is_none() != auth.session_generation.is_none()
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        let scope = serde_json::json!({
+            "auth_epoch": auth.auth_epoch,
+            "family": meta.family,
+            "identity": auth.confirmed_identity,
+            "device_id": device_id,
+        });
+        Ok(TransitionSourceSnapshot {
+            identity: auth.confirmed_identity.clone(),
+            device_id,
+            expected_session_generation: auth.session_generation,
+            scope_fingerprint: digest_json(&scope)?,
+        })
+    }
+
+    fn valid_legacy_device(
+        device: &nelomai_client_api::AuthDevice,
+        expected: Option<&str>,
+    ) -> Result<(), BrokerError> {
+        if device.id.is_empty()
+            || device.id.len() > 256
+            || expected.is_some_and(|expected| expected != device.id)
+            || device.runtime_version.is_some()
+            || device.runtime_contract_version.is_some()
+            || device.runtime_slot.is_some()
+            || device.session_generation.is_some()
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    pub async fn transition_source(&self) -> Result<TransitionSourceSnapshot, BrokerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let _issuance = self.issuance.lock().await;
+            self.transition_source_locked().await
+        })
+        .await
+        .map_err(|_| BrokerError::Timeout)?
+    }
+
+    async fn transition_source_locked(&self) -> Result<TransitionSourceSnapshot, BrokerError> {
+        let (ticket, access) = {
+            let _state = self.state.lock().await;
+            let mut auth = self.load()?;
+            Self::active(&auth)?;
+            let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+            if meta.pending_recovery.is_some() || meta.pending_logout.is_some() {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            if auth.confirmed_identity.is_some() {
+                if meta.pending_request.is_some() {
+                    return Err(BrokerError::RecoveryRequired);
+                }
+                return Self::transition_source_from_auth(&auth);
+            }
+            if let Some(pending) = &meta.pending_request {
+                match pending.kind {
+                    BrokerRequestKind::LegacyRefresh => return Err(BrokerError::RecoveryRequired),
+                    BrokerRequestKind::LegacyBootstrap => {
+                        let access = auth
+                            .access_token
+                            .clone()
+                            .ok_or(BrokerError::RecoveryRequired)?;
+                        (pending.clone(), access)
+                    }
+                    _ => return Err(BrokerError::RecoveryRequired),
+                }
+            } else if let Some(access) = auth.access_token.clone() {
+                let ticket = self.begin(
+                    &mut auth,
+                    BrokerRequestKind::LegacyBootstrap,
+                    Uuid::new_v4().to_string(),
+                    None,
+                    false,
+                )?;
+                (ticket, access)
+            } else {
+                drop(_state);
+                self.legacy_refresh_locked().await?;
+                let _state = self.state.lock().await;
+                return Self::transition_source_from_auth(&self.load()?);
+            }
+        };
+        self.recheck_ticket(&ticket).await?;
+        let response = self.api.legacy_bootstrap_device(&access).await;
+        let device = match response {
+            Ok(device) => device,
+            Err(ClientApiError::Api { status, code, .. })
+                if status.as_u16() == 401 && code == "invalid_access_token" =>
+            {
+                let _state = self.state.lock().await;
+                let mut auth = self.fenced(&ticket)?;
+                auth.broker
+                    .as_mut()
+                    .ok_or(BrokerError::RecoveryRequired)?
+                    .pending_request = None;
+                self.store.save(&auth)?;
+                drop(_state);
+                self.legacy_refresh_locked().await?;
+                let _state = self.state.lock().await;
+                return Self::transition_source_from_auth(&self.load()?);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let _state = self.state.lock().await;
+        let mut auth = self.fenced(&ticket)?;
+        let expected = auth
+            .broker
+            .as_ref()
+            .and_then(|meta| meta.confirmed_device_id.as_deref());
+        Self::valid_legacy_device(&device, expected)?;
+        let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+        meta.confirmed_device_id = Some(device.id);
+        meta.pending_request = None;
+        self.store.save(&auth)?;
+        Self::transition_source_from_auth(&auth)
+    }
+
+    async fn legacy_refresh_locked(&self) -> Result<(), BrokerError> {
+        let (ticket, refresh) = {
+            let _state = self.state.lock().await;
+            let mut auth = self.load()?;
+            Self::active(&auth)?;
+            let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+            if meta.pending_request.is_some()
+                || meta.pending_recovery.is_some()
+                || meta.pending_logout.is_some()
+                || auth.confirmed_identity.is_some()
+            {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            let refresh = auth
+                .refresh_token
+                .clone()
+                .ok_or(BrokerError::RecoveryRequired)?;
+            let ticket = self.begin(
+                &mut auth,
+                BrokerRequestKind::LegacyRefresh,
+                Uuid::new_v4().to_string(),
+                None,
+                false,
+            )?;
+            (ticket, refresh)
+        };
+        self.recheck_ticket(&ticket).await?;
+        let response = self.api.legacy_refresh(refresh).await?;
+        let _state = self.state.lock().await;
+        let mut auth = self.fenced(&ticket)?;
+        let expected = auth
+            .broker
+            .as_ref()
+            .and_then(|meta| meta.confirmed_device_id.as_deref());
+        Self::valid_legacy_device(&response.device, expected)?;
+        if response.token_type != "Bearer"
+            || response.access_token.is_empty()
+            || response.refresh_token.is_empty()
+            || response.access_expires_in == 0
+            || response.refresh_expires_in == 0
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        auth.access_token = Some(response.access_token);
+        auth.refresh_token = Some(response.refresh_token);
+        let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+        meta.confirmed_device_id = Some(response.device.id);
+        meta.pending_request = None;
+        self.store.save(&auth)?;
+        Ok(())
+    }
+
+    pub async fn reconcile_transition(
+        &self,
+        frozen: FrozenReconcileRequest,
+    ) -> Result<RuntimeSwitchReconcileResponse, BrokerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let _issuance = self.issuance.lock().await;
+            self.reconcile_transition_locked(frozen).await
+        })
+        .await
+        .map_err(|_| BrokerError::Timeout)?
+    }
+
+    async fn reconcile_transition_locked(
+        &self,
+        frozen: FrozenReconcileRequest,
+    ) -> Result<RuntimeSwitchReconcileResponse, BrokerError> {
+        let mut first_dispatch = false;
+        {
+            let _state = self.state.lock().await;
+            let mut auth = self.load()?;
+            let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+            if let Some(authority) = meta
+                .transition_authorities
+                .iter()
+                .find(|authority| authority.reconcile_operation_id == frozen.request.operation_id)
+            {
+                Self::match_transition_authority(authority, &frozen)?;
+                if let Some(receipt) = &authority.reconcile_receipt {
+                    return Self::api_receipt(receipt);
+                }
+            } else {
+                Self::active(&auth)?;
+                if meta.pending_request.is_some()
+                    || meta.pending_recovery.is_some()
+                    || meta.pending_logout.is_some()
+                    || meta.transition_authorities.len() >= MAX_TRANSITION_AUTHORITIES
+                {
+                    return Err(BrokerError::RecoveryRequired);
+                }
+                let source = Self::transition_source_from_auth(&auth)?;
+                if frozen.request.source_identity != source.identity
+                    || frozen.request.expected_session_generation
+                        != source.expected_session_generation
+                    || frozen.source_device_id != source.device_id
+                    || frozen.source_scope_fingerprint != source.scope_fingerprint
+                {
+                    return Err(BrokerError::IdentityMismatch);
+                }
+                let authority = TransitionAuthorityV1 {
+                    schema_version: 1,
+                    reconcile_operation_id: frozen.request.operation_id.clone(),
+                    request_fingerprint: frozen.request_fingerprint.clone(),
+                    source_auth_epoch: auth.auth_epoch,
+                    source_family: meta.family.clone(),
+                    source_identity: auth.confirmed_identity.clone(),
+                    source_device_id: source.device_id,
+                    source_scope_fingerprint: source.scope_fingerprint,
+                    expected_session_generation: auth.session_generation,
+                    target_identity: frozen.request.target_identity.identity(None)?,
+                    cleanup_contract_version: frozen.request.cleanup_contract_version,
+                    cleanup_access_proof: auth
+                        .access_token
+                        .clone()
+                        .ok_or(BrokerError::RecoveryRequired)?,
+                    resume_refresh_proof: auth
+                        .refresh_token
+                        .clone()
+                        .ok_or(BrokerError::RecoveryRequired)?,
+                    dispatch_state: TransitionDispatchStateV1::Captured,
+                    reconcile_receipt: None,
+                    resume_ticket: None,
+                    resume_evidence: None,
+                };
+                auth.broker
+                    .as_mut()
+                    .ok_or(BrokerError::RecoveryRequired)?
+                    .transition_authorities
+                    .push(authority);
+                self.save_transition_write(&auth)?;
+                first_dispatch = true;
+            }
+        }
+
+        for dispatch in 0..2 {
+            let authority = {
+                let _state = self.state.lock().await;
+                let mut auth = self.load()?;
+                let position = auth
+                    .broker
+                    .as_ref()
+                    .and_then(|meta| {
+                        meta.transition_authorities.iter().position(|authority| {
+                            authority.reconcile_operation_id == frozen.request.operation_id
+                        })
+                    })
+                    .ok_or(BrokerError::RecoveryRequired)?;
+                {
+                    let authority = &auth
+                        .broker
+                        .as_ref()
+                        .ok_or(BrokerError::RecoveryRequired)?
+                        .transition_authorities[position];
+                    Self::match_transition_authority(authority, &frozen)?;
+                    if first_dispatch {
+                        Self::match_current_transition_source(&auth, authority)?;
+                    }
+                }
+                let authority = &mut auth
+                    .broker
+                    .as_mut()
+                    .ok_or(BrokerError::RecoveryRequired)?
+                    .transition_authorities[position];
+                authority.dispatch_state = TransitionDispatchStateV1::DispatchIntent;
+                let authority = authority.clone();
+                self.save_transition_write(&auth)?;
+                authority
+            };
+            let result = if let Some(identity) = &authority.source_identity {
+                let snapshot = AccessSnapshot::new(
+                    authority.cleanup_access_proof.clone(),
+                    identity.clone(),
+                    authority.source_auth_epoch,
+                    authority.source_family.clone(),
+                )?;
+                self.api
+                    .clone()
+                    .with_captured_source(&snapshot)?
+                    .reconcile_runtime_switch(snapshot.access_token(), &frozen.request)
+                    .await
+            } else {
+                self.api
+                    .reconcile_runtime_switch(&authority.cleanup_access_proof, &frozen.request)
+                    .await
+            };
+            match result {
+                Ok(receipt) => {
+                    let _state = self.state.lock().await;
+                    let mut auth = self.load()?;
+                    let authority = auth
+                        .broker
+                        .as_mut()
+                        .and_then(|meta| {
+                            meta.transition_authorities.iter_mut().find(|authority| {
+                                authority.reconcile_operation_id == frozen.request.operation_id
+                            })
+                        })
+                        .ok_or(BrokerError::RecoveryRequired)?;
+                    Self::match_transition_authority(authority, &frozen)?;
+                    authority.dispatch_state = TransitionDispatchStateV1::ResponseKnown;
+                    authority.reconcile_receipt = Some(Self::stored_receipt(&receipt));
+                    self.save_transition_write(&auth)?;
+                    return Ok(receipt);
+                }
+                Err(ClientApiError::Api { status, code, .. })
+                    if first_dispatch
+                        && dispatch == 0
+                        && authority.source_identity.is_none()
+                        && status.as_u16() == 401
+                        && code == "invalid_access_token" =>
+                {
+                    {
+                        let _state = self.state.lock().await;
+                        let mut auth = self.load()?;
+                        let entry = auth
+                            .broker
+                            .as_mut()
+                            .and_then(|meta| {
+                                meta.transition_authorities.iter_mut().find(|entry| {
+                                    entry.reconcile_operation_id == frozen.request.operation_id
+                                })
+                            })
+                            .ok_or(BrokerError::RecoveryRequired)?;
+                        entry.dispatch_state = TransitionDispatchStateV1::InvalidAccessRejected;
+                        self.save_transition_write(&auth)?;
+                    }
+                    self.legacy_refresh_locked().await?;
+                    let _state = self.state.lock().await;
+                    let mut auth = self.load()?;
+                    let access = auth
+                        .access_token
+                        .clone()
+                        .ok_or(BrokerError::RecoveryRequired)?;
+                    let refresh = auth
+                        .refresh_token
+                        .clone()
+                        .ok_or(BrokerError::RecoveryRequired)?;
+                    let entry = auth
+                        .broker
+                        .as_mut()
+                        .and_then(|meta| {
+                            meta.transition_authorities.iter_mut().find(|entry| {
+                                entry.reconcile_operation_id == frozen.request.operation_id
+                            })
+                        })
+                        .ok_or(BrokerError::RecoveryRequired)?;
+                    entry.cleanup_access_proof = access;
+                    entry.resume_refresh_proof = refresh;
+                    entry.dispatch_state = TransitionDispatchStateV1::Captured;
+                    self.save_transition_write(&auth)?;
+                }
+                Err(error) => {
+                    let _state = self.state.lock().await;
+                    let mut auth = self.load()?;
+                    let entry = auth
+                        .broker
+                        .as_mut()
+                        .and_then(|meta| {
+                            meta.transition_authorities.iter_mut().find(|entry| {
+                                entry.reconcile_operation_id == frozen.request.operation_id
+                            })
+                        })
+                        .ok_or(BrokerError::RecoveryRequired)?;
+                    entry.dispatch_state = TransitionDispatchStateV1::OutcomeUnknown;
+                    self.save_transition_write(&auth)?;
+                    return Err(error.into());
+                }
+            }
+        }
+        Err(BrokerError::RecoveryRequired)
+    }
+
+    fn match_transition_authority(
+        authority: &TransitionAuthorityV1,
+        frozen: &FrozenReconcileRequest,
+    ) -> Result<(), BrokerError> {
+        if authority.request_fingerprint != frozen.request_fingerprint
+            || authority.source_identity != frozen.request.source_identity
+            || authority.source_device_id != frozen.source_device_id
+            || authority.source_scope_fingerprint != frozen.source_scope_fingerprint
+            || authority.expected_session_generation != frozen.request.expected_session_generation
+            || authority.target_identity != frozen.request.target_identity.identity(None)?
+            || authority.cleanup_contract_version != frozen.request.cleanup_contract_version
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    fn match_current_transition_source(
+        auth: &AuthStoreV1,
+        authority: &TransitionAuthorityV1,
+    ) -> Result<(), BrokerError> {
+        Self::active(auth)?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        if meta.pending_request.is_some()
+            || meta.pending_recovery.is_some()
+            || meta.pending_logout.is_some()
+            || auth.auth_epoch != authority.source_auth_epoch
+            || meta.family != authority.source_family
+            || auth.confirmed_identity != authority.source_identity
+            || meta.confirmed_device_id.as_deref() != Some(authority.source_device_id.as_str())
+            || auth.session_generation != authority.expected_session_generation
+            || auth.access_token.as_deref() != Some(authority.cleanup_access_proof.as_str())
+            || auth.refresh_token.as_deref() != Some(authority.resume_refresh_proof.as_str())
+        {
+            return Err(BrokerError::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn stored_receipt(receipt: &RuntimeSwitchReconcileResponse) -> TransitionReconcileReceiptV1 {
+        TransitionReconcileReceiptV1 {
+            state: match receipt.state {
+                RuntimeSwitchState::Clean => "clean",
+                RuntimeSwitchState::Retry => "retry",
+            }
+            .into(),
+            operation_id: receipt.operation_id.clone(),
+            retired_lease_ids: receipt.retired_lease_ids.clone(),
+            retired_session_ids: receipt.retired_session_ids.clone(),
+            retired_operation_ids: receipt.retired_operation_ids.clone(),
+            retry_after_seconds: receipt.retry_after_seconds,
+        }
+    }
+
+    fn api_receipt(
+        receipt: &TransitionReconcileReceiptV1,
+    ) -> Result<RuntimeSwitchReconcileResponse, BrokerError> {
+        Ok(RuntimeSwitchReconcileResponse {
+            state: match receipt.state.as_str() {
+                "clean" => RuntimeSwitchState::Clean,
+                "retry" => RuntimeSwitchState::Retry,
+                _ => return Err(BrokerError::RecoveryRequired),
+            },
+            operation_id: receipt.operation_id.clone(),
+            retired_lease_ids: receipt.retired_lease_ids.clone(),
+            retired_session_ids: receipt.retired_session_ids.clone(),
+            retired_operation_ids: receipt.retired_operation_ids.clone(),
+            retry_after_seconds: receipt.retry_after_seconds,
+        })
     }
     fn active(auth: &AuthStoreV1) -> Result<(), BrokerError> {
         if auth.logout_state != LogoutState::Active {
@@ -316,6 +941,12 @@ impl AuthBroker {
             return Err(BrokerError::Cancelled);
         }
         Ok(auth)
+    }
+
+    async fn recheck_ticket(&self, ticket: &BrokerRequestV1) -> Result<(), BrokerError> {
+        let _state = self.state.lock().await;
+        self.fenced(ticket)?;
+        Ok(())
     }
 
     fn owns_ticket(auth: &AuthStoreV1, ticket: &BrokerRequestV1) -> bool {
@@ -759,6 +1390,14 @@ impl AuthBroker {
     /// Cleanup coordinator supplies an accepted clean reconcile operation.
     /// Server independently verifies that authority; this method cannot bypass it.
     pub async fn resume(&self, args: ResumeArguments) -> Result<AccessSnapshot, BrokerError> {
+        self.resume_inner(args, None).await
+    }
+
+    async fn resume_inner(
+        &self,
+        args: ResumeArguments,
+        transition_operation_id: Option<&str>,
+    ) -> Result<AccessSnapshot, BrokerError> {
         let stored = args.stored()?;
         let _issuance = self.issuance.lock().await;
         let (ticket, refresh) = {
@@ -808,12 +1447,13 @@ impl AuthBroker {
         };
         let request = RuntimeResumeRequest {
             refresh_token: refresh,
-            operation_id: args.operation_id,
+            operation_id: args.operation_id.clone(),
             expected_session_generation: args.expected_session_generation,
             target_identity: args.target.clone(),
-            reconcile_operation_id: args.reconcile_operation_id,
-            decision: args.decision,
+            reconcile_operation_id: args.reconcile_operation_id.clone(),
+            decision: args.decision.clone(),
         };
+        self.recheck_ticket(&ticket).await?;
         let response = tokio::time::timeout(REQUEST_TIMEOUT, self.api.resume_runtime(&request))
             .await
             .map_err(|_| BrokerError::Timeout)??;
@@ -834,18 +1474,201 @@ impl AuthBroker {
         }
         auth.session_generation = response.identity.session_generation;
         auth.confirmed_identity = Some(response.identity.clone());
-        auth.access_token = Some(response.access_token);
+        auth.access_token = Some(response.access_token.clone());
         let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
         // Resume invalidates ordinary background scope, unlike ordinary refresh.
         meta.family = Uuid::new_v4().to_string();
         meta.pending_recovery = None;
         meta.completed_resume = Some(CompletedResumeV1 {
-            request: ticket,
-            identity: response.identity,
+            request: ticket.clone(),
+            identity: response.identity.clone(),
         });
         meta.pending_request = None;
-        self.store.save(&auth)?;
+        if let Some(operation_id) = transition_operation_id {
+            let authority = meta
+                .transition_authorities
+                .iter_mut()
+                .find(|authority| authority.reconcile_operation_id == operation_id)
+                .ok_or(BrokerError::RecoveryRequired)?;
+            authority.resume_ticket = Some(ticket);
+            authority.resume_evidence = Some(TransitionResumeEvidenceV1 {
+                operation_id: args.operation_id,
+                reconcile_operation_id: args.reconcile_operation_id,
+                decision: args.decision,
+                target_identity: args.target.identity(None)?,
+                identity: response.identity,
+                access_token: response.access_token,
+            });
+            self.save_transition_write(&auth)?;
+        } else {
+            self.store.save(&auth)?;
+        }
         Self::snapshot(&auth)
+    }
+
+    /// Transition-only resume wrapper. It requires the exact protected clean
+    /// reconcile receipt and archives the existing broker resume ticket/result.
+    pub async fn resume_transition(
+        &self,
+        args: ResumeArguments,
+    ) -> Result<TransitionResumeReceipt, BrokerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let historical = {
+                let _state = self.state.lock().await;
+                let auth = self.load()?;
+                let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+                let authority = meta
+                    .transition_authorities
+                    .iter()
+                    .find(|authority| {
+                        authority.reconcile_operation_id == args.reconcile_operation_id
+                    })
+                    .ok_or(BrokerError::RecoveryRequired)?;
+                if let Some(evidence) = &authority.resume_evidence {
+                    if evidence.operation_id != args.operation_id
+                        || evidence.reconcile_operation_id != args.reconcile_operation_id
+                        || evidence.decision != args.decision
+                        || evidence.target_identity != args.target.identity(None)?
+                    {
+                        return Err(BrokerError::Cancelled);
+                    }
+                    let current_access = if meta.completed_resume.as_ref().is_some_and(|done| {
+                        done.request.operation_id == args.operation_id
+                            && done.identity == evidence.identity
+                    }) && auth.confirmed_identity.as_ref()
+                        == Some(&evidence.identity)
+                        && auth.access_token.as_deref() == Some(evidence.access_token.as_str())
+                    {
+                        Some(Self::snapshot(&auth)?)
+                    } else {
+                        None
+                    };
+                    return Ok(TransitionResumeReceipt {
+                        identity: evidence.identity.clone(),
+                        current_access,
+                    });
+                }
+                if authority
+                    .reconcile_receipt
+                    .as_ref()
+                    .is_none_or(|receipt| receipt.state != "clean")
+                    || authority.source_device_id.is_empty()
+                    || authority.expected_session_generation != args.expected_session_generation
+                    || authority.target_identity != args.target.identity(None)?
+                {
+                    return Err(BrokerError::IdentityMismatch);
+                }
+                let source_is_current = authority.source_auth_epoch == auth.auth_epoch
+                    && authority.source_family == meta.family
+                    && authority.source_identity == auth.confirmed_identity
+                    && meta.confirmed_device_id.as_deref()
+                        == Some(authority.source_device_id.as_str());
+                if source_is_current {
+                    None
+                } else {
+                    let ticket = authority
+                        .resume_ticket
+                        .clone()
+                        .ok_or(BrokerError::IdentityMismatch)?;
+                    if ticket.operation_id != args.operation_id
+                        || ticket.resume.as_ref() != Some(&args.stored()?)
+                    {
+                        return Err(BrokerError::Cancelled);
+                    }
+                    Some((ticket, authority.resume_refresh_proof.clone()))
+                }
+            };
+            if let Some((ticket, refresh)) = historical {
+                return self.resume_historical(&args, ticket, refresh).await;
+            }
+            let reconcile_operation_id = args.reconcile_operation_id.clone();
+            let access = self
+                .resume_inner(args, Some(&reconcile_operation_id))
+                .await?;
+            Ok(TransitionResumeReceipt {
+                identity: access.identity().clone(),
+                current_access: Some(access),
+            })
+        })
+        .await
+        .map_err(|_| BrokerError::Timeout)?
+    }
+
+    async fn resume_historical(
+        &self,
+        args: &ResumeArguments,
+        ticket: BrokerRequestV1,
+        refresh: String,
+    ) -> Result<TransitionResumeReceipt, BrokerError> {
+        let _issuance = self.issuance.lock().await;
+        {
+            let _state = self.state.lock().await;
+            let auth = self.load()?;
+            let authority = auth
+                .broker
+                .as_ref()
+                .and_then(|meta| {
+                    meta.transition_authorities.iter().find(|authority| {
+                        authority.reconcile_operation_id == args.reconcile_operation_id
+                    })
+                })
+                .ok_or(BrokerError::RecoveryRequired)?;
+            if authority.resume_ticket.as_ref() != Some(&ticket)
+                || authority.resume_evidence.is_some()
+            {
+                return Err(BrokerError::Cancelled);
+            }
+        }
+        let request = RuntimeResumeRequest {
+            refresh_token: refresh,
+            operation_id: args.operation_id.clone(),
+            expected_session_generation: args.expected_session_generation,
+            target_identity: args.target.clone(),
+            reconcile_operation_id: args.reconcile_operation_id.clone(),
+            decision: args.decision.clone(),
+        };
+        let response = self.api.resume_runtime(&request).await?;
+        let expected_generation = args
+            .expected_session_generation
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(BrokerError::IdentityMismatch)?;
+        if RuntimeTarget::from_identity(&response.identity) != args.target
+            || response.identity.session_generation != Some(expected_generation)
+            || response.token_type != "Bearer"
+            || response.access_token.is_empty()
+            || response.access_expires_in == 0
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        let authority = auth
+            .broker
+            .as_mut()
+            .and_then(|meta| {
+                meta.transition_authorities.iter_mut().find(|authority| {
+                    authority.reconcile_operation_id == args.reconcile_operation_id
+                })
+            })
+            .ok_or(BrokerError::RecoveryRequired)?;
+        if authority.resume_ticket.as_ref() != Some(&ticket) || authority.resume_evidence.is_some()
+        {
+            return Err(BrokerError::Cancelled);
+        }
+        authority.resume_evidence = Some(TransitionResumeEvidenceV1 {
+            operation_id: args.operation_id.clone(),
+            reconcile_operation_id: args.reconcile_operation_id.clone(),
+            decision: args.decision.clone(),
+            target_identity: args.target.identity(None)?,
+            identity: response.identity.clone(),
+            access_token: response.access_token,
+        });
+        self.save_transition_write(&auth)?;
+        Ok(TransitionResumeReceipt {
+            identity: response.identity,
+            current_access: None,
+        })
     }
 
     /// Host-only, after durable native cleanup handoff; never runtime IPC.
@@ -1012,6 +1835,36 @@ impl AuthBroker {
                 {
                     meta.cancelled_login = meta.pending_request.take();
                     meta.authentication_outcome_unknown = true;
+                }
+                if let Some(ticket) = meta
+                    .pending_request
+                    .as_ref()
+                    .filter(|ticket| ticket.kind == BrokerRequestKind::Resume)
+                    .cloned()
+                {
+                    let resume = ticket
+                        .resume
+                        .as_ref()
+                        .ok_or(BrokerError::RecoveryRequired)?;
+                    let authority = meta
+                        .transition_authorities
+                        .iter_mut()
+                        .find(|authority| {
+                            authority.reconcile_operation_id == resume.reconcile_operation_id
+                        })
+                        .ok_or(BrokerError::RecoveryRequired)?;
+                    if authority.source_auth_epoch != ticket.auth_epoch
+                        || authority.source_identity != ticket.source_identity
+                        || ticket.source_device_id.as_deref()
+                            != Some(authority.source_device_id.as_str())
+                        || authority
+                            .resume_ticket
+                            .as_ref()
+                            .is_some_and(|saved| saved != &ticket)
+                    {
+                        return Err(BrokerError::RecoveryRequired);
+                    }
+                    authority.resume_ticket = Some(ticket);
                 }
                 meta.pending_request = None;
                 meta.pending_recovery = None;

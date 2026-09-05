@@ -4,7 +4,11 @@ use nelomai_contracts::RuntimeIdentity;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{fmt, path::PathBuf};
+use std::{collections::HashSet, fmt, path::PathBuf};
+use uuid::Uuid;
+
+pub const MAX_TRANSITION_AUTHORITIES: usize = 16;
+pub const MAX_AUTH_RECORD_WITH_TRANSITION_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +60,93 @@ pub struct BrokerMetadataV1 {
     /// Nonsecret local delivery cleanup, independent of server logout ACK.
     #[serde(default)]
     pub pending_push_cleanup_epoch: Option<u64>,
+    #[serde(default)]
+    pub transition_authorities: Vec<TransitionAuthorityV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionDispatchStateV1 {
+    Captured,
+    DispatchIntent,
+    OutcomeUnknown,
+    InvalidAccessRejected,
+    ResponseKnown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionReconcileReceiptV1 {
+    pub state: String,
+    pub operation_id: String,
+    pub retired_lease_ids: Vec<String>,
+    pub retired_session_ids: Vec<String>,
+    pub retired_operation_ids: Vec<String>,
+    pub retry_after_seconds: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionResumeEvidenceV1 {
+    pub operation_id: String,
+    pub reconcile_operation_id: String,
+    pub decision: String,
+    pub target_identity: RuntimeIdentity,
+    pub identity: RuntimeIdentity,
+    pub access_token: String,
+}
+impl fmt::Debug for TransitionResumeEvidenceV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransitionResumeEvidenceV1")
+            .field("operation_id", &self.operation_id)
+            .field("reconcile_operation_id", &self.reconcile_operation_id)
+            .field("decision", &self.decision)
+            .field("target_identity", &self.target_identity)
+            .field("identity", &self.identity)
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransitionAuthorityV1 {
+    pub schema_version: u32,
+    pub reconcile_operation_id: String,
+    pub request_fingerprint: String,
+    pub source_auth_epoch: u64,
+    pub source_family: String,
+    pub source_identity: Option<RuntimeIdentity>,
+    pub source_device_id: String,
+    pub source_scope_fingerprint: String,
+    pub expected_session_generation: Option<u64>,
+    pub target_identity: RuntimeIdentity,
+    pub cleanup_contract_version: u32,
+    pub cleanup_access_proof: String,
+    pub resume_refresh_proof: String,
+    pub dispatch_state: TransitionDispatchStateV1,
+    pub reconcile_receipt: Option<TransitionReconcileReceiptV1>,
+    pub resume_ticket: Option<BrokerRequestV1>,
+    pub resume_evidence: Option<TransitionResumeEvidenceV1>,
+}
+impl fmt::Debug for TransitionAuthorityV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TransitionAuthorityV1")
+            .field("reconcile_operation_id", &self.reconcile_operation_id)
+            .field("request_fingerprint", &self.request_fingerprint)
+            .field("source_auth_epoch", &self.source_auth_epoch)
+            .field("source_family", &self.source_family)
+            .field("source_identity", &self.source_identity)
+            .field("source_device_id", &self.source_device_id)
+            .field("source_scope_fingerprint", &self.source_scope_fingerprint)
+            .field("target_identity", &self.target_identity)
+            .field("dispatch_state", &self.dispatch_state)
+            .field("reconcile_receipt", &self.reconcile_receipt)
+            .field("resume_ticket", &self.resume_ticket)
+            .field("resume_evidence", &self.resume_evidence)
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +169,8 @@ pub enum BrokerRequestKind {
     Refresh,
     Resume,
     Login,
+    LegacyBootstrap,
+    LegacyRefresh,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +270,15 @@ impl fmt::Debug for AuthStoreV1 {
 }
 
 impl AuthStoreV1 {
+    pub fn validate_transition_write_budget(&self) -> Result<(), StorageError> {
+        if encode_record(self, "auth-v1")?.len() > MAX_AUTH_RECORD_WITH_TRANSITION_BYTES {
+            return Err(StorageError::RecoveryRequired(
+                "protected transition authority budget exceeded",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn from_legacy(legacy: &StoredAuth) -> Self {
         Self {
             schema_version: 1,
@@ -288,6 +390,19 @@ impl AuthStoreV1 {
                         "invalid broker request kind",
                     ));
                 }
+                if matches!(
+                    request.kind,
+                    BrokerRequestKind::LegacyBootstrap | BrokerRequestKind::LegacyRefresh
+                ) && (!canonical_uuid(&request.operation_id)
+                    || request.auth_epoch != self.auth_epoch
+                    || request.source_identity.is_some()
+                    || request.source_device_id != meta.confirmed_device_id
+                    || request.prior_login_outcome_unknown)
+                {
+                    return Err(StorageError::RecoveryRequired(
+                        "invalid legacy transition ticket",
+                    ));
+                }
                 Ok(())
             };
             if let Some(request) = &meta.pending_request {
@@ -330,9 +445,146 @@ impl AuthStoreV1 {
                     return Err(StorageError::RecoveryRequired("invalid recovery ticket"));
                 }
             }
+            if meta.transition_authorities.len() > MAX_TRANSITION_AUTHORITIES
+                || meta
+                    .transition_authorities
+                    .iter()
+                    .map(|authority| authority.reconcile_operation_id.as_str())
+                    .collect::<HashSet<_>>()
+                    .len()
+                    != meta.transition_authorities.len()
+            {
+                return Err(StorageError::RecoveryRequired(
+                    "invalid transition authority collection",
+                ));
+            }
+            for authority in &meta.transition_authorities {
+                validate_transition_authority(authority, &validate_request)?;
+            }
         }
         Ok(())
     }
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+fn valid_ids(values: &[String]) -> bool {
+    values.len() <= 1024
+        && values.iter().all(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+        && values.iter().collect::<HashSet<_>>().len() == values.len()
+}
+
+fn validate_transition_authority(
+    authority: &TransitionAuthorityV1,
+    validate_request: &impl Fn(&BrokerRequestV1) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let source_valid = match &authority.source_identity {
+        Some(identity) => {
+            identity.validate().is_ok()
+                && identity.session_generation.is_some()
+                && identity.session_generation == authority.expected_session_generation
+        }
+        None => authority.expected_session_generation.is_none(),
+    };
+    if authority.schema_version != 1
+        || !canonical_uuid(&authority.reconcile_operation_id)
+        || !valid_digest(&authority.request_fingerprint)
+        || !valid_digest(&authority.source_scope_fingerprint)
+        || authority.source_family.is_empty()
+        || authority.source_family.len() > 128
+        || !source_valid
+        || authority.source_device_id.is_empty()
+        || authority.source_device_id.len() > 256
+        || authority.target_identity.validate().is_err()
+        || authority.target_identity.session_generation.is_some()
+        || authority.cleanup_contract_version != 1
+        || authority.cleanup_access_proof.is_empty()
+        || authority.cleanup_access_proof.len() > 256
+        || authority.resume_refresh_proof.is_empty()
+        || authority.resume_refresh_proof.len() > 256
+        || (authority.dispatch_state == TransitionDispatchStateV1::ResponseKnown)
+            != authority.reconcile_receipt.is_some()
+    {
+        return Err(StorageError::RecoveryRequired(
+            "invalid transition authority",
+        ));
+    }
+    if let Some(receipt) = &authority.reconcile_receipt {
+        if receipt.operation_id != authority.reconcile_operation_id
+            || !matches!(receipt.state.as_str(), "clean" | "retry")
+            || !valid_ids(&receipt.retired_lease_ids)
+            || !valid_ids(&receipt.retired_session_ids)
+            || !valid_ids(&receipt.retired_operation_ids)
+            || receipt
+                .retry_after_seconds
+                .is_some_and(|seconds| !(1..=30).contains(&seconds))
+        {
+            return Err(StorageError::RecoveryRequired(
+                "invalid transition reconcile receipt",
+            ));
+        }
+    }
+    if let Some(ticket) = &authority.resume_ticket {
+        validate_request(ticket)?;
+        let resume = ticket
+            .resume
+            .as_ref()
+            .ok_or(StorageError::RecoveryRequired(
+                "invalid transition resume ticket",
+            ))?;
+        if ticket.kind != BrokerRequestKind::Resume
+            || ticket.auth_epoch != authority.source_auth_epoch
+            || ticket.source_identity != authority.source_identity
+            || ticket.source_device_id.as_deref() != Some(&authority.source_device_id)
+            || resume.reconcile_operation_id != authority.reconcile_operation_id
+            || resume.target != authority.target_identity
+            || resume.expected_session_generation != authority.expected_session_generation
+        {
+            return Err(StorageError::RecoveryRequired(
+                "invalid transition resume ticket",
+            ));
+        }
+    }
+    if let Some(evidence) = &authority.resume_evidence {
+        let ticket = authority
+            .resume_ticket
+            .as_ref()
+            .ok_or(StorageError::RecoveryRequired(
+                "orphan transition resume evidence",
+            ))?;
+        let resume = ticket
+            .resume
+            .as_ref()
+            .ok_or(StorageError::RecoveryRequired(
+                "invalid transition resume evidence",
+            ))?;
+        if evidence.operation_id != ticket.operation_id
+            || evidence.reconcile_operation_id != authority.reconcile_operation_id
+            || evidence.decision != resume.decision
+            || evidence.target_identity != authority.target_identity
+            || evidence.identity.validate().is_err()
+            || evidence.identity.session_generation
+                != authority
+                    .expected_session_generation
+                    .unwrap_or(0)
+                    .checked_add(1)
+            || (RuntimeIdentity {
+                session_generation: None,
+                ..evidence.identity.clone()
+            }) != authority.target_identity
+            || evidence.access_token.is_empty()
+            || evidence.access_token.len() > 256
+        {
+            return Err(StorageError::RecoveryRequired(
+                "invalid transition resume evidence",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub trait AuthStore: Send + Sync {

@@ -284,6 +284,7 @@ fn auth_store() -> Arc<dyn AuthStore> {
         pending_login_account: None,
         confirmed_device_id: Some("device".into()),
         pending_push_cleanup_epoch: None,
+        transition_authorities: Vec::new(),
     });
     store.save(&value).unwrap();
     store
@@ -467,7 +468,7 @@ async fn panel(state: Arc<Panel>) -> (ClientApi, tokio::task::JoinHandle<()>) {
         .route("/api/client/v1/auth/refresh", post(refresh))
         .route("/api/client/v1/auth/login", post(login))
         .route("/api/client/v1/auth/logout-runtime", post(logout))
-        .route("/api/client/v1/runtime/resume", post(resume))
+        .route("/api/client/v1/auth/runtime/resume", post(resume))
         .with_state(state);
     (
         api,
