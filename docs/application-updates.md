@@ -43,9 +43,15 @@ artifact URL. Manual and automatic attempts share one serialized native
 operation. Once the signed package is installed, the UI asks the user to
 restart the application.
 
-The bootstrap request sends `X-Nelomai-App-Version` so the panel records the
-version that is actually running after a self-update. Older clients omit the
-header and remain compatible.
+An unenrolled legacy client may send `X-Nelomai-App-Version` on bootstrap so
+the panel records the container version actually running after a self-update;
+older clients may omit that alias and remain compatible. A runtime-v1 client
+must instead send the complete server-issued identity on authenticated
+requests: container version, runtime version, runtime contract version,
+runtime slot, and session generation. It may also send
+`X-Nelomai-App-Version` only as an alias equal to the container version. These
+are protocol requirements for a future embedded-runtime client, not a claim
+that such a runtime bundle or release is already available.
 
 ## Android boundary
 
