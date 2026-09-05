@@ -1,8 +1,13 @@
 //! Container-owned authentication. Runtime integration is a separate boundary.
 mod auth_broker;
+mod cleanup;
 mod installed_runtime;
 pub mod ipc;
 mod runtime_auth;
+mod selection;
+mod switch;
 pub use auth_broker::*;
-pub use installed_runtime::*;
+pub use cleanup::*;
 pub use runtime_auth::*;
+pub use selection::*;
+pub use switch::*;

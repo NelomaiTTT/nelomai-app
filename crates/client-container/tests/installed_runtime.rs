@@ -3,7 +3,7 @@ use nelomai_client_container::InstalledRuntimeSelection;
 use nelomai_contracts::{RuntimeSlot, CONTAINER_MANIFEST_SIGNATURE_DOMAIN};
 
 #[test]
-fn installed_selection_is_derived_from_verified_manifest_and_never_defaulted() {
+fn installed_selection_requires_manifest_trust_and_an_existing_preference() {
     let root = tempfile::tempdir().unwrap();
     let selected = root.path().join("selection.json");
     let bytes = include_bytes!("../../../contracts/fixtures/runtime/container-manifest-v1.json");
@@ -16,7 +16,11 @@ fn installed_selection_is_derived_from_verified_manifest_and_never_defaulted() {
         key.sign(&signed).to_bytes(),
     )
     .unwrap();
-    std::fs::write(&selected, br#"{"schema_version":1,"slot":"latest"}"#).unwrap();
+    std::fs::write(
+        &selected,
+        br#"{"schema_version":1,"container_version":"0.2.16","selected_slot":"latest","pending_slot":null}"#,
+    )
+    .unwrap();
     let load = |key: Option<&[u8]>| {
         InstalledRuntimeSelection::load(root.path(), &selected, key, "linux", "x86_64")
     };
@@ -25,8 +29,14 @@ fn installed_selection_is_derived_from_verified_manifest_and_never_defaulted() {
     let verified = load(Some(&key.verifying_key().to_bytes())).unwrap();
     assert_eq!(verified.target().runtime_version, "0.2.16");
     assert_eq!(verified.target().runtime_slot, RuntimeSlot::Latest);
-    std::fs::write(&selected, br#"{"schema_version":1,"slot":"stable"}"#).unwrap();
-    assert!(load(Some(&key.verifying_key().to_bytes())).is_err());
+    std::fs::write(
+        &selected,
+        br#"{"schema_version":1,"container_version":"0.2.16","selected_slot":"stable","pending_slot":null}"#,
+    )
+    .unwrap();
+    let recovered = load(Some(&key.verifying_key().to_bytes())).unwrap();
+    assert_eq!(recovered.target().runtime_slot, RuntimeSlot::Latest);
+    assert!(recovered.recovery().is_some());
     std::fs::remove_file(&selected).unwrap();
     assert!(load(Some(&key.verifying_key().to_bytes())).is_err());
 }

@@ -22,8 +22,8 @@ use nelomai_client_container::{
 };
 use nelomai_client_core::CoreLocalStop;
 use nelomai_client_storage::{
-    prepare_runtime_storage, ContainerOwnerLock, ProtectedRuntimeStore, RuntimeOperationalStore,
-    RuntimeRecordOwner, SystemRecordFactory, SystemSecretStore,
+    ContainerOwnerLock, ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner,
+    SystemRecordFactory, SystemSecretStore,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -241,9 +241,9 @@ pub fn run() {
             .map_err(|_| {
                 std::io::Error::other("runtime_startup_blocked: invalid pinned manifest key")
             })?;
-        let selection = InstalledRuntimeSelection::load(
+        let selection = InstalledRuntimeSelection::prepare(
             &app.path().resource_dir()?.join("runtime"),
-            &app_data_directory.join("common/runtime-selection-v1.json"),
+            &owner_lock,
             public_key.as_deref(),
             std::env::consts::OS,
             std::env::consts::ARCH,
@@ -253,12 +253,8 @@ pub fn run() {
         #[cfg(not(target_os = "linux"))]
         let fallback = None;
 
-        let storage = prepare_runtime_storage(
-            &owner_lock,
-            selection.manifest(),
-            selection.target().runtime_slot,
-            &SystemRecordFactory::new("primary", fallback),
-        )?;
+        let (selection, storage) = selection
+            .prepare_runtime_storage(&owner_lock, &SystemRecordFactory::new("primary", fallback))?;
 
         let api = ClientApi::new(PANEL_BASE)
             .and_then(|api| api.with_app_version(&selection.target().container_version))
