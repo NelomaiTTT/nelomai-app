@@ -160,6 +160,33 @@ class NativeAuthScopeTest {
         assertNull(replayed.pending)
     }
 
+    @Test fun delayedRemoteOperationCannotPromoteAtOriginalDeadlineOrAfterWaiterDisappears() {
+        // Same serialized owner request shape as NativeAuthRequest.operation_json.
+        // Six seconds of remote control work leave four seconds at native entry.
+        var now = 7000L
+        val store = BackgroundCredentialStore(MemoryBackend(), nowMillis = { now })
+        val wire = operation().toJson().put("expires_at_unix_ms", 11000L)
+        val owner = NativeOwnerOperation.fromJson(wire)
+        var current = store.beginOwnerOperation(0, owner, false).value()
+        current = store.configure(current.revision, BackgroundCredentialProvision(owner.scope.deviceId,
+            "https://synthetic.invalid", "old-background", 1000, "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(1, true, 1000))).value()
+        current = store.reserveMutation(current.revision, "prepare", owner.scope.deviceId, 1000, 100, "activate").value()
+        val pending = BackgroundPendingToken("staged-background", 1000, 2, "prepare", "activate", 1)
+        current = store.savePendingToken(current.revision, "prepare", pending, 100).value()
+        val retained = current
+        for (late in listOf(11000L, 11001L, 17000L)) {
+            now = late
+            store.withOwnerOperation(owner) {
+                val result = store.promotePending(retained.revision, "activate", 1200)
+                assertEquals(CredentialStoreResult.Failure("background_owner_cancelled"), result)
+            }
+            assertEquals(retained, store.read().value())
+            assertEquals(pending, store.read().value().pending)
+            assertTrue(store.beginOwnerOperation(retained.revision, owner, true) is CredentialStoreResult.Failure)
+        }
+    }
+
     @Test fun newFamilyRequiresFinalizedCleanupAndUnknownLegacyScopeIsNeverAdmitted() {
         val store = BackgroundCredentialStore(MemoryBackend())
         val owner = operation()

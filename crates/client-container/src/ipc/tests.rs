@@ -11,6 +11,274 @@ use std::sync::{
     Arc, Mutex,
 };
 
+// Poll exactly to the next real async boundary; no task abort or scheduler
+// timing may stand in for the broker's own post-wait validation.
+async fn poll_pending<T>(future: std::pin::Pin<&mut impl std::future::Future<Output = T>>) {
+    let mut future = future;
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+
+async fn queued_remote_issuance_is_cancelled(login: bool, expire: bool) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().fallback(move || {
+        let observed = observed.clone();
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, !login);
+    let (stream, mut peer) = private_socketpair().unwrap();
+    let owner = RemoteOwner::new(
+        stream,
+        LaunchBinding::fixture(
+            RuntimeTarget {
+                container_version: "0.2.16".into(),
+                runtime_version: "0.2.16".into(),
+                runtime_contract_version: 1,
+                runtime_slot: RuntimeSlot::Stable,
+            },
+            "queued-peer",
+        ),
+        RuntimeClientProfile {
+            platform: Platform::Macos,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+    )
+    .unwrap();
+    let (stamp, observation) = fixture.broker.observe_stamped().await.unwrap();
+    let request = if login {
+        AuthRequestV1::Login {
+            stamp: Some(stamp),
+            request: RuntimeLogin {
+                login: "synthetic".into(),
+                password: "synthetic".into(),
+                device_name: "fixture".into(),
+            },
+        }
+    } else {
+        AuthRequestV1::AccessToken {
+            stamp: Some(stamp),
+            stale: observation.access,
+        }
+    };
+    let held = crate::auth_broker::hold_test_issuance(&fixture.broker).await;
+    let before = fixture.auth.load().unwrap();
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let work = owner.request(&fixture.broker, 500, request, deadline);
+    tokio::pin!(work);
+    poll_pending(work.as_mut()).await;
+    let control = read_frame(&mut peer, deadline).await.unwrap();
+    let ack = match control.message {
+        MessageV1::Control(ControlV1::Prepare { incarnation }) => ControlAckV1::Prepared {
+            lease: PreparedLease {
+                incarnation,
+                request: control.id,
+                cancel_generation: 0,
+            },
+        },
+        MessageV1::Control(ControlV1::CheckScope { .. }) => ControlAckV1::Done,
+        _ => panic!("expected issuance prerequisite"),
+    };
+    remote::acknowledge_test_control(&owner, control.id, ack);
+    // ACK is already resolved, so this poll reaches the held issuance mutex.
+    poll_pending(work.as_mut()).await;
+    if expire {
+        tokio::time::advance(REQUEST_BUDGET).await;
+    } else {
+        owner.revoke_peer();
+    }
+    drop(held);
+    assert!(work.await.is_err());
+    assert_eq!(
+        fixture.auth.load().unwrap(),
+        before,
+        "queued cancelled request must not persist a protected ticket"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "queued cancelled request must not dispatch HTTP"
+    );
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoked_peer_cannot_issue_queued_login() {
+    queued_remote_issuance_is_cancelled(true, false).await;
+}
+#[tokio::test(start_paused = true)]
+async fn revoked_peer_cannot_issue_queued_refresh() {
+    queued_remote_issuance_is_cancelled(false, false).await;
+}
+#[tokio::test(start_paused = true)]
+async fn expired_peer_cannot_issue_queued_login() {
+    queued_remote_issuance_is_cancelled(true, true).await;
+}
+#[tokio::test(start_paused = true)]
+async fn expired_peer_cannot_issue_queued_refresh() {
+    queued_remote_issuance_is_cancelled(false, true).await;
+}
+
+struct HeldNative {
+    request: Mutex<Option<crate::NativeAuthRequest>>,
+    response: tokio::sync::Mutex<
+        Option<tokio::sync::oneshot::Receiver<nelomai_client_api::TokenResponse>>,
+    >,
+}
+#[async_trait::async_trait]
+impl PrivateBackgroundDispatcher for HeldNative {
+    async fn prepare_revocation(&self, _: u64) -> Result<(), crate::BrokerError> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        request: crate::NativeAuthRequest,
+        _: BackgroundAction,
+    ) -> Result<Option<nelomai_client_api::TokenResponse>, crate::NativeAuthFailure> {
+        *self.request.lock().unwrap() = Some(request);
+        self.response
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .await
+            .map(Some)
+            .map_err(|_| crate::NativeAuthFailure::OutcomeUnknown)
+    }
+}
+
+async fn delayed_remote_native(case: u8) {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&auth).unwrap();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let native = Arc::new(HeldNative {
+        request: Mutex::new(None),
+        response: tokio::sync::Mutex::new(Some(receiver)),
+    });
+    let (stream, mut peer) = private_socketpair().unwrap();
+    let owner = RemoteOwner::new_with_background(
+        stream,
+        LaunchBinding::fixture(
+            RuntimeTarget {
+                container_version: "0.2.16".into(),
+                runtime_version: "0.2.16".into(),
+                runtime_contract_version: 1,
+                runtime_slot: RuntimeSlot::Stable,
+            },
+            "native-budget",
+        ),
+        RuntimeClientProfile {
+            platform: Platform::Macos,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+        Some(native.clone()),
+    )
+    .unwrap();
+    let (stamp, _) = fixture.broker.observe_stamped().await.unwrap();
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let work = owner.request(
+        &fixture.broker,
+        500,
+        AuthRequestV1::BackgroundCredential {
+            stamp: Some(stamp),
+            action: BackgroundAction::Recover,
+        },
+        deadline,
+    );
+    tokio::pin!(work);
+    poll_pending(work.as_mut()).await;
+    let prepare = read_frame(&mut peer, deadline).await.unwrap();
+    assert!(matches!(
+        prepare.message,
+        MessageV1::Control(ControlV1::Prepare { .. })
+    ));
+    tokio::time::advance(Duration::from_secs(4)).await;
+    remote::acknowledge_test_control(
+        &owner,
+        prepare.id,
+        ControlAckV1::Prepared {
+            lease: PreparedLease {
+                incarnation: "native-budget".into(),
+                request: prepare.id,
+                cancel_generation: 0,
+            },
+        },
+    );
+    poll_pending(work.as_mut()).await;
+    let validate = read_frame(&mut peer, deadline).await.unwrap();
+    assert!(matches!(
+        validate.message,
+        MessageV1::Control(ControlV1::ValidateScope { .. })
+    ));
+    tokio::time::advance(Duration::from_secs(2)).await;
+    remote::acknowledge_test_control(&owner, validate.id, ControlAckV1::Done);
+    poll_pending(work.as_mut()).await;
+    let request = native
+        .request
+        .lock()
+        .unwrap()
+        .take()
+        .expect("native operation dispatched");
+    let before = fixture.auth.load().unwrap();
+    if case == 0 {
+        let wire: serde_json::Value =
+            serde_json::from_str(&request.operation_json().unwrap()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let remaining = wire["expires_at_unix_ms"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(now);
+        assert!(
+            (3_900..=4_000).contains(&remaining),
+            "six seconds in controls must leave only four native seconds; got {remaining}ms"
+        );
+        return;
+    }
+    tokio::time::advance(Duration::from_secs(4)).await;
+    if case == 2 {
+        sender.send(recovered_response()).unwrap();
+    }
+    let result = tokio::time::timeout(Duration::from_millis(1), work.as_mut()).await;
+    assert!(
+        matches!(result, Ok(Err(PrivateError::Timeout))),
+        "native wait and ready late callback must expire at the original deadline: {result:?}"
+    );
+    assert_eq!(
+        fixture.auth.load().unwrap(),
+        before,
+        "late callback must not mutate protected auth"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn remote_native_preparation_spends_original_budget() {
+    delayed_remote_native(0).await;
+}
+#[tokio::test(start_paused = true)]
+async fn remote_native_wait_expires_at_original_deadline() {
+    delayed_remote_native(1).await;
+}
+#[tokio::test(start_paused = true)]
+async fn remote_native_ready_late_callback_cannot_mutate_auth() {
+    delayed_remote_native(2).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn frame_read_and_incoming_queue_do_not_regenerate_request_budget() {
     let (mut sender, receiver) = tokio::io::duplex(4096);
@@ -145,6 +413,8 @@ struct Fixture {
     auth: Arc<ProtectedAuthStore<Record>>,
     tunnel: Arc<Tunnel>,
     record: Arc<RuntimeRecordOwner<ProtectedRuntimeStore<Record>>>,
+    auth_backend: Record,
+    runtime_backend: Record,
 }
 impl Fixture {
     fn new(api: ClientApi, active: bool) -> Self {
@@ -164,7 +434,8 @@ impl Fixture {
         pause: Option<Arc<AdmissionPause>>,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
-        let auth = Arc::new(ProtectedAuthStore::new(Record::default()));
+        let auth_backend = Record::default();
+        let auth = Arc::new(ProtectedAuthStore::new(auth_backend.clone()));
         let legacy = StoredAuth::new_install();
         let target = RuntimeTarget {
             container_version: "0.2.16".into(),
@@ -181,7 +452,8 @@ impl Fixture {
         }
         auth.save(&initial_auth).unwrap();
         let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
-        let store = ProtectedRuntimeStore::new(Record::default(), paths);
+        let runtime_backend = Record::default();
+        let store = ProtectedRuntimeStore::new(runtime_backend.clone(), paths);
         let mut initial = RuntimeStateV1::import_legacy(
             &legacy,
             StoredSplitTunnelState::default(),
@@ -189,6 +461,26 @@ impl Fixture {
         );
         initial.cleanup_only = false;
         store.save(&initial).unwrap();
+        Self::from_records(root, api, auth_backend, runtime_backend, background, pause)
+    }
+
+    fn from_records(
+        root: tempfile::TempDir,
+        api: ClientApi,
+        auth_backend: Record,
+        runtime_backend: Record,
+        background: Option<Arc<dyn PrivateBackgroundDispatcher>>,
+        pause: Option<Arc<AdmissionPause>>,
+    ) -> Self {
+        let target = RuntimeTarget {
+            container_version: "0.2.16".into(),
+            runtime_version: "0.2.16".into(),
+            runtime_contract_version: 1,
+            runtime_slot: RuntimeSlot::Stable,
+        };
+        let auth = Arc::new(ProtectedAuthStore::new(auth_backend.clone()));
+        let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+        let store = ProtectedRuntimeStore::new(runtime_backend.clone(), paths);
         let record = RuntimeRecordOwner::new(store);
         let tunnel = Arc::new(Tunnel::default());
         let stop = CoreLocalStop::new(tunnel.clone());
@@ -229,6 +521,8 @@ impl Fixture {
             auth,
             tunnel,
             record,
+            auth_backend,
+            runtime_backend,
         }
     }
 }
@@ -338,6 +632,9 @@ async fn logout_at_prepared_or_committed_ack_prevents_final_grant() {
 }
 
 struct Recover(AtomicUsize);
+fn recovered_response() -> nelomai_client_api::TokenResponse {
+    serde_json::from_value(serde_json::json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"recovered-access","access_expires_in":900,"refresh_token":"recovered-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}})).unwrap()
+}
 #[async_trait::async_trait]
 impl PrivateBackgroundDispatcher for Recover {
     async fn prepare_revocation(&self, _: u64) -> Result<(), crate::BrokerError> {
@@ -350,13 +647,13 @@ impl PrivateBackgroundDispatcher for Recover {
     ) -> Result<Option<nelomai_client_api::TokenResponse>, crate::NativeAuthFailure> {
         assert!(matches!(action, BackgroundAction::Recover));
         self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(serde_json::from_value(serde_json::json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"recovered-access","access_expires_in":900,"refresh_token":"recovered-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}})).unwrap()))
+        Ok(Some(recovered_response()))
     }
 }
 
 #[tokio::test]
 async fn closed_restart_recovers_only_matching_persisted_scope_after_lost_refresh() {
-    for matching in [false, true] {
+    for persisted_scope in ["matching", "missing", "foreign"] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
         let router = axum::Router::new().route(
@@ -367,34 +664,70 @@ async fn closed_restart_recovers_only_matching_persisted_scope_after_lost_refres
             axum::serve(listener, router).await.unwrap();
         });
         let native = Arc::new(Recover(AtomicUsize::new(0)));
-        let fixture = Fixture::with_background(api, true, Some(native.clone()));
+        let fixture = Fixture::with_background(api.clone(), true, Some(native.clone()));
         let mut initial = fixture.auth.load().unwrap().unwrap();
         initial.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
         fixture.auth.save(&initial).unwrap();
         let access = fixture.broker.access_token(None).await.unwrap();
-        if matching {
-            fixture
-                .record
-                .bind_empty_scope(&transport::scope(&access))
-                .unwrap();
+        if persisted_scope != "missing" {
+            let mut scope = transport::scope(&access);
+            if persisted_scope == "foreign" {
+                scope.family = "another-persisted-family".into();
+            }
+            fixture.record.bind_empty_scope(&scope).unwrap();
         }
         assert!(fixture.child.check(&transport::scope(&access)).is_err());
         assert!(fixture.broker.access_token(Some(&access)).await.is_err());
-        assert!(fixture
-            .auth
-            .load()
-            .unwrap()
-            .unwrap()
-            .broker
-            .unwrap()
-            .pending_request
-            .is_some());
+        let failed = fixture.auth.load().unwrap().unwrap();
+        assert_eq!(
+            failed
+                .broker
+                .as_ref()
+                .unwrap()
+                .pending_request
+                .as_ref()
+                .unwrap()
+                .kind,
+            BrokerRequestKind::Refresh
+        );
+        let retained_runtime = fixture.record.operational().load().unwrap();
+        // Copy the actual encoded protected records, then destroy the first
+        // owner, child, transport, gates and runtime record owner completely.
+        let auth_bytes = fixture.auth_backend.load_record().unwrap();
+        let runtime_bytes = fixture.runtime_backend.load_record().unwrap();
+        let old_owner = Arc::downgrade(&fixture.parent);
+        let old_broker = Arc::downgrade(&fixture.broker);
+        drop(fixture);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while old_owner.upgrade().is_some() || old_broker.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old owner and broker must actually terminate before reconstruction");
+        let fixture = Fixture::from_records(
+            tempfile::tempdir().unwrap(),
+            api,
+            Record(Arc::new(Mutex::new(auth_bytes))),
+            Record(Arc::new(Mutex::new(runtime_bytes))),
+            Some(native.clone()),
+            None,
+        );
+        assert_eq!(fixture.auth.load().unwrap(), Some(failed.clone()));
+        assert_eq!(
+            fixture.record.operational().load().unwrap(),
+            retained_runtime
+        );
+        assert!(
+            fixture.child.check(&transport::scope(&access)).is_err(),
+            "fresh child admission starts CLOSED"
+        );
         assert_eq!(
             fixture.client.state().await.unwrap(),
             RuntimeAuthState::RecoveryRequired
         );
         let result = fixture.client.background(BackgroundAction::Recover).await;
-        if matching {
+        if persisted_scope == "matching" {
             assert!(
                 matches!(result, Ok(AuthResponseV1::Access { .. })),
                 "known persisted scope must recover with initial CLOSED latch: {result:?}"
@@ -407,6 +740,12 @@ async fn closed_restart_recovers_only_matching_persisted_scope_after_lost_refres
         } else {
             assert!(result.is_err());
             assert_eq!(native.0.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.auth.load().unwrap(), Some(failed));
+            assert_eq!(
+                fixture.record.operational().load().unwrap(),
+                retained_runtime
+            );
+            assert!(fixture.child.check(&transport::scope(&access)).is_err());
         }
         server.abort();
     }

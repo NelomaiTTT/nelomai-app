@@ -47,6 +47,10 @@ pub struct RemoteOwner {
     pub(super) logins: Mutex<HashMap<u64, (ScopeStamp, Option<BrokerRequestV1>)>>,
     background: Option<Arc<dyn PrivateBackgroundDispatcher>>,
 }
+#[cfg(test)]
+pub(super) fn acknowledge_test_control(owner: &RemoteOwner, id: u64, ack: ControlAckV1) {
+    owner.acks.finish(id, ack).unwrap();
+}
 struct LoginAssociation<'a> {
     owner: &'a RemoteOwner,
     id: u64,
@@ -453,15 +457,21 @@ impl RemoteOwner {
                     app_version: self.binding.target.container_version.clone(),
                 };
                 let access = broker
-                    .login_fenced_with_ticket(&request, &self.binding.target, &fence, |ticket| {
-                        // Lock order is broker state -> peer map. Logout clones
-                        // from the map and drops it BEFORE acquiring broker state.
-                        if let Ok(mut logins) = self.logins.lock() {
-                            if let Some((_, pending)) = logins.get_mut(&id) {
-                                *pending = Some(ticket.clone());
+                    .login_fenced_with_ticket(
+                        &request,
+                        &self.binding.target,
+                        &fence,
+                        || self.live(deadline).map_err(|_| BrokerError::Cancelled),
+                        |ticket| {
+                            // Lock order is broker state -> peer map. Logout clones
+                            // from the map and drops it BEFORE acquiring broker state.
+                            if let Ok(mut logins) = self.logins.lock() {
+                                if let Some((_, pending)) = logins.get_mut(&id) {
+                                    *pending = Some(ticket.clone());
+                                }
                             }
-                        }
-                    })
+                        },
+                    )
                     .await
                     .map_err(broker_error)?;
                 self.commit_and_grant(broker, access, lease, Some(id), deadline)
@@ -491,7 +501,9 @@ impl RemoteOwner {
                 }
                 self.live(deadline)?;
                 let access = broker
-                    .access_token_fenced(&stamp, stale.as_ref())
+                    .access_token_fenced_checked(&stamp, stale.as_ref(), || {
+                        self.live(deadline).map_err(|_| BrokerError::Cancelled)
+                    })
                     .await
                     .map_err(broker_error)?;
                 self.check_target(&access)?;
@@ -596,7 +608,7 @@ impl RemoteOwner {
                     .as_ref()
                     .ok_or(PrivateError::RecoveryRequired)?;
                 let access = broker
-                    .native_auth(
+                    .native_auth_until(
                         |access| {
                             if ScopeStamp::from_access(access) != stamp {
                                 return Err(BrokerError::Cancelled);
@@ -605,6 +617,7 @@ impl RemoteOwner {
                         },
                         |request| native.dispatch(request, action),
                         matches!(action, BackgroundAction::Recover),
+                        deadline,
                     )
                     .await
                     .map_err(broker_error)?;

@@ -859,6 +859,82 @@ async fn explicit_reauthentication_after_logout_preserves_install_identity_and_u
     server.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn local_native_adapter_keeps_ten_seconds_and_rejects_late_completion() {
+    use nelomai_client_container::{OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile};
+    use nelomai_client_core::RuntimeWriterGates;
+    use nelomai_client_storage::{
+        ProtectedRuntimeStore, RuntimePaths, RuntimeRecordOwner, RuntimeStateStore, RuntimeStateV1,
+        StoredSplitTunnelState,
+    };
+    let store = auth_store();
+    let broker = Arc::new(
+        AuthBroker::new(
+            ClientApi::new("http://127.0.0.1:9").unwrap(),
+            store.clone(),
+            Arc::new(Stop::default()),
+        )
+        .unwrap(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ProtectedRuntimeStore::new(
+        Record::default(),
+        RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap(),
+    );
+    let mut empty = RuntimeStateV1::import_legacy(
+        &StoredAuth::new_install(),
+        StoredSplitTunnelState::default(),
+        runtime.paths(),
+    );
+    empty.cleanup_only = false;
+    runtime.save(&empty).unwrap();
+    let port = OwnerRuntimeAuth::new(
+        broker,
+        RuntimeTarget::from_identity(&identity(7)),
+        RuntimeClientProfile {
+            platform: nelomai_contracts::Platform::Macos,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+        Arc::new(RuntimeCacheAdmission::new(RuntimeRecordOwner::new(runtime))),
+        Arc::new(RuntimeWriterGates::default()),
+    )
+    .unwrap();
+    port.admit_empty_current().await.unwrap();
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let dispatched = AtomicBool::new(false);
+    let observed_dispatch = &dispatched;
+    let work = port.recover_background(|request| async move {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!((9_900..=10_000).contains(&request.expires_at_unix_ms.saturating_sub(now)));
+        observed_dispatch.store(true, Ordering::SeqCst);
+        receiver
+            .await
+            .map_err(|_| nelomai_client_container::NativeAuthFailure::OutcomeUnknown)
+    });
+    tokio::pin!(work);
+    tokio::select! { biased;
+        _ = &mut work => panic!("native response is held"),
+        _ = tokio::task::yield_now() => {}
+    }
+    assert!(dispatched.load(Ordering::SeqCst));
+    let pending = store.load().unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(9)).await;
+    tokio::select! { biased;
+        _ = &mut work => panic!("local native retains its full ten seconds"),
+        _ = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(work.await.is_err());
+    assert!(sender
+        .send(serde_json::from_value(response(7, "late-native-access")).unwrap())
+        .is_err());
+    assert_eq!(store.load().unwrap(), pending);
+}
+
 #[test]
 fn broker_error_debug_does_not_expose_server_controlled_secrets() {
     let error = BrokerError::Api(ClientApiError::InvalidBaseUrl("synthetic-secret".into()));

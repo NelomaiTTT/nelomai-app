@@ -192,6 +192,10 @@ pub struct AuthBroker {
     state: Mutex<()>,
     issuance: Mutex<()>,
 }
+#[cfg(test)]
+pub(crate) async fn hold_test_issuance(broker: &AuthBroker) -> tokio::sync::MutexGuard<'_, ()> {
+    broker.issuance.lock().await
+}
 impl AuthBroker {
     pub(crate) fn owned_install_secret(&self) -> Result<String, BrokerError> {
         Ok(self.load()?.install_secret)
@@ -444,7 +448,7 @@ impl AuthBroker {
         target: &RuntimeTarget,
         fence: &LoginFence,
     ) -> Result<AccessSnapshot, BrokerError> {
-        self.login_fenced_with_ticket(request, target, fence, |_| {})
+        self.login_fenced_with_ticket(request, target, fence, || Ok(()), |_| {})
             .await
     }
 
@@ -453,12 +457,14 @@ impl AuthBroker {
         request: &LoginRequest,
         target: &RuntimeTarget,
         fence: &LoginFence,
+        check_request: impl Fn() -> Result<(), BrokerError> + Send,
         on_ticket: impl FnOnce(&BrokerRequestV1) + Send,
     ) -> Result<AccessSnapshot, BrokerError> {
         target.identity(None)?;
         let _issuance = self.issuance.lock().await;
         let (ticket, request) = {
             let _state = self.state.lock().await;
+            check_request()?;
             let mut auth = self.load()?;
             let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
             if auth.auth_epoch != fence.epoch || meta.family != fence.family {
@@ -509,7 +515,7 @@ impl AuthBroker {
             request.install_secret = auth.install_secret;
             (ticket, request)
         };
-        let stop = self.stop.stop_local().await;
+        let stop = self.stop.stop_local().await.and_then(|()| check_request());
         let local_not_issued = stop.is_err();
         let response = if let Err(error) = stop {
             Err(error)
@@ -644,7 +650,7 @@ impl AuthBroker {
         &self,
         stale: Option<&AccessSnapshot>,
     ) -> Result<AccessSnapshot, BrokerError> {
-        self.access_token_inner(None, stale).await
+        self.access_token_inner(None, stale, || Ok(())).await
     }
 
     pub async fn access_token_fenced(
@@ -652,13 +658,25 @@ impl AuthBroker {
         stamp: &ScopeStamp,
         stale: Option<&AccessSnapshot>,
     ) -> Result<AccessSnapshot, BrokerError> {
-        self.access_token_inner(Some(stamp), stale).await
+        self.access_token_fenced_checked(stamp, stale, || Ok(()))
+            .await
+    }
+
+    pub(crate) async fn access_token_fenced_checked(
+        &self,
+        stamp: &ScopeStamp,
+        stale: Option<&AccessSnapshot>,
+        check_request: impl FnOnce() -> Result<(), BrokerError>,
+    ) -> Result<AccessSnapshot, BrokerError> {
+        self.access_token_inner(Some(stamp), stale, check_request)
+            .await
     }
 
     async fn access_token_inner(
         &self,
         stamp: Option<&ScopeStamp>,
         stale: Option<&AccessSnapshot>,
+        check_request: impl FnOnce() -> Result<(), BrokerError>,
     ) -> Result<AccessSnapshot, BrokerError> {
         {
             let _state = self.state.lock().await;
@@ -671,6 +689,7 @@ impl AuthBroker {
         let _issuance = self.issuance.lock().await;
         let (ticket, refresh) = {
             let _state = self.state.lock().await;
+            check_request()?;
             let mut auth = self.load()?;
             if let Some(stamp) = stamp {
                 stamp.check(&auth)?;
@@ -1129,16 +1148,43 @@ impl AuthBroker {
         F: FnOnce(NativeAuthRequest) -> Fut,
         Fut: std::future::Future<Output = Result<Option<TokenResponse>, NativeAuthFailure>>,
     {
-        let fence = self.capture_login_fence().await?;
-        let deadline = std::time::SystemTime::now()
+        self.native_auth_until(
+            check_admission,
+            dispatch,
+            recover,
+            tokio::time::Instant::now() + REQUEST_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(crate) async fn native_auth_until<C, F, Fut>(
+        &self,
+        check_admission: C,
+        dispatch: F,
+        recover: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<AccessSnapshot, BrokerError>
+    where
+        C: FnOnce(&AccessSnapshot) -> Result<(), BrokerError>,
+        F: FnOnce(NativeAuthRequest) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<TokenResponse>, NativeAuthFailure>>,
+    {
+        Self::check_deadline(Some(deadline))?;
+        let expires_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| BrokerError::RecoveryRequired)?
             .as_millis()
-            .saturating_add(10_000);
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            .saturating_add(
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_millis(),
+            );
+        tokio::time::timeout_at(deadline, async {
+            let fence = self.capture_login_fence().await?;
             let _issuance = self.issuance.lock().await;
             let request = {
                 let _state = self.state.lock().await;
+                Self::check_deadline(Some(deadline))?;
                 let mut auth = self.load()?;
                 if auth.auth_epoch != fence.epoch
                     || auth.broker.as_ref().map(|m| m.family.as_str())
@@ -1156,18 +1202,21 @@ impl AuthBroker {
                     ticket,
                     access,
                     install_secret: auth.install_secret,
-                    expires_at_unix_ms: u64::try_from(deadline)
+                    expires_at_unix_ms: u64::try_from(expires_at_unix_ms)
                         .map_err(|_| BrokerError::RecoveryRequired)?,
                 }
             };
             let ticket = request.ticket.clone();
             let response = dispatch(request).await;
+            Self::check_deadline(Some(deadline))?;
             match response {
                 Ok(Some(response)) if recover => {
-                    self.accept_background_recovery(&ticket, response).await
+                    self.accept_background_recovery_inner(&ticket, response, Some(deadline))
+                        .await
                 }
                 other => {
                     let _state = self.state.lock().await;
+                    Self::check_deadline(Some(deadline))?;
                     let mut auth = self.load()?;
                     Self::active(&auth)?;
                     let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
@@ -1208,7 +1257,26 @@ impl AuthBroker {
         ticket: &RecoveryTicketV1,
         response: TokenResponse,
     ) -> Result<AccessSnapshot, BrokerError> {
+        self.accept_background_recovery_inner(ticket, response, None)
+            .await
+    }
+
+    fn check_deadline(deadline: Option<tokio::time::Instant>) -> Result<(), BrokerError> {
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            Err(BrokerError::Timeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn accept_background_recovery_inner(
+        &self,
+        ticket: &RecoveryTicketV1,
+        response: TokenResponse,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<AccessSnapshot, BrokerError> {
         let _state = self.state.lock().await;
+        Self::check_deadline(deadline)?;
         let mut auth = self.load()?;
         Self::active(&auth)?;
         let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
