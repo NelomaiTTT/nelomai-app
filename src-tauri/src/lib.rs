@@ -1708,6 +1708,259 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct PushAuthRecord(Arc<std::sync::Mutex<Option<Vec<u8>>>>);
+    impl nelomai_client_storage::ProtectedRecordStore for PushAuthRecord {
+        fn load_record(&self) -> Result<Option<Vec<u8>>, nelomai_client_storage::StorageError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn save_record(&self, bytes: &[u8]) -> Result<(), nelomai_client_storage::StorageError> {
+            *self.0.lock().unwrap() = Some(bytes.to_vec());
+            Ok(())
+        }
+        fn delete_record(&self) -> Result<(), nelomai_client_storage::StorageError> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    struct PushLoginStop(std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl nelomai_client_container::LocalAuthStop for PushLoginStop {
+        async fn stop_local(&self) -> Result<(), nelomai_client_container::BrokerError> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(nelomai_client_container::BrokerError::RecoveryRequired)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    async fn failed_login_push_replay(outcome: &str) {
+        use nelomai_client_storage::{
+            AuthStore, AuthStoreV1, LogoutState, ProtectedAuthStore, StoredAuth,
+        };
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let local = outcome == "local";
+        let unknown = outcome == "unknown";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, stream) in listener
+                .incoming()
+                .take(if local { 1 } else { 2 })
+                .enumerate()
+            {
+                let mut stream = stream.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    assert!(header.len() < 16384);
+                }
+                let header = String::from_utf8(header).unwrap();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                stream.read_exact(&mut vec![0; length]).unwrap();
+                let (status, body) = if index == 0 {
+                    assert!(header.starts_with("POST /api/client/v1/auth/logout-runtime "));
+                    (
+                        "200 OK",
+                        r#"{"code":"already_inactive","cleanup_reconcile_operation_id":"synthetic"}"#,
+                    )
+                } else {
+                    assert!(header.starts_with("POST /api/client/v1/auth/login "));
+                    if unknown {
+                        ("502 Bad Gateway", "{}")
+                    } else {
+                        (
+                            "401 Unauthorized",
+                            r#"{"request_id":"synthetic","code":"invalid_credentials","message":"rejected"}"#,
+                        )
+                    }
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let record = PushAuthRecord::default();
+        let store = Arc::new(ProtectedAuthStore::new(record.clone()));
+        let mut auth = AuthStoreV1::from_legacy(&StoredAuth::new_install());
+        auth.refresh_token = Some("synthetic-refresh".into());
+        store.save(&auth).unwrap();
+        let stop = Arc::new(PushLoginStop(AtomicBool::new(false)));
+        let broker = AuthBroker::new(api.clone(), store.clone(), stop.clone()).unwrap();
+        let mut pending = store.load().unwrap().unwrap();
+        pending.auth_epoch = 1;
+        pending.logout_state = LogoutState::Pending;
+        pending.broker.as_mut().unwrap().pending_logout =
+            Some(nelomai_client_storage::PendingLogoutV1 {
+                operation_id: "synthetic-logout".into(),
+                refresh_proof: "synthetic-refresh".into(),
+            });
+        store.save(&pending).unwrap();
+        broker.stage_push_cleanup(1).await.unwrap();
+        let scheduler = PushRegistrationScheduler::new();
+        let busy = scheduler.gate.lock().await;
+        broker.logout().await.unwrap();
+        assert_eq!(
+            store.load().unwrap().unwrap().logout_state,
+            LogoutState::LoggedOut
+        );
+        stop.0.store(local, Ordering::SeqCst);
+        assert!(broker
+            .login(
+                &nelomai_client_api::LoginRequest {
+                    login: "synthetic".into(),
+                    password: "synthetic".into(),
+                    install_secret: "ignored".into(),
+                    device_name: "test".into(),
+                    platform: nelomai_contracts::Platform::Macos,
+                    platform_version: None,
+                    architecture: "aarch64".into(),
+                    app_version: "0.2.16".into(),
+                },
+                &nelomai_client_api::RuntimeTarget {
+                    container_version: "0.2.16".into(),
+                    runtime_version: "0.2.16".into(),
+                    runtime_contract_version: 1,
+                    runtime_slot: nelomai_contracts::RuntimeSlot::Latest,
+                },
+            )
+            .await
+            .is_err());
+        server.join().unwrap();
+        let after_login = store.load().unwrap().unwrap();
+        assert_eq!(after_login.auth_epoch, 2);
+        assert_eq!(
+            after_login.logout_state,
+            if unknown {
+                LogoutState::Active
+            } else {
+                LogoutState::LoggedOut
+            }
+        );
+        assert_eq!(
+            after_login
+                .broker
+                .as_ref()
+                .unwrap()
+                .authentication_outcome_unknown,
+            unknown
+        );
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(1));
+        drop(busy);
+        drop(scheduler);
+        drop(broker);
+        drop(store);
+        let store = Arc::new(ProtectedAuthStore::new(record));
+        let broker = AuthBroker::new(api, store.clone(), Arc::new(PushStop)).unwrap();
+        let scheduler = PushRegistrationScheduler::new();
+        let _gate = scheduler.gate.lock().await;
+        let epoch = broker.pending_push_cleanup().await.unwrap().unwrap();
+        let disables = AtomicUsize::new(0);
+        assert!(
+            PushRegistrationScheduler::cleanup_push_locked(&broker, epoch, async {
+                disables.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            "{outcome}: durable cleanup was skipped on restart"
+        );
+        assert_eq!(disables.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+        let mut expected = after_login;
+        expected.broker.as_mut().unwrap().pending_push_cleanup_epoch = None;
+        assert_eq!(
+            store.load().unwrap().unwrap(),
+            expected,
+            "cleanup cannot change login provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_login_push_cleanup_executes_after_restart() {
+        failed_login_push_replay("rejected").await;
+    }
+
+    #[tokio::test]
+    async fn locally_unissued_login_push_cleanup_executes_after_restart() {
+        failed_login_push_replay("local").await;
+    }
+
+    #[tokio::test]
+    async fn unknown_login_push_cleanup_executes_after_restart() {
+        failed_login_push_replay("unknown").await;
+    }
+
+    #[tokio::test]
+    async fn late_push_completion_cannot_clear_newer_logout_cleanup() {
+        use nelomai_client_storage::{AuthStore, AuthStoreV1, LogoutState, StoredAuth};
+        let store = Arc::new(PushAuthMemory::default());
+        store
+            .save(&AuthStoreV1::from_legacy(&StoredAuth::new_install()))
+            .unwrap();
+        let broker = Arc::new(
+            AuthBroker::new(
+                ClientApi::new("http://127.0.0.1:1").unwrap(),
+                store.clone(),
+                Arc::new(PushStop),
+            )
+            .unwrap(),
+        );
+        // Synthetic post-ACK record with a durable, unfinished native handoff.
+        let mut auth = store.load().unwrap().unwrap();
+        auth.auth_epoch = 1;
+        auth.logout_state = LogoutState::LoggedOut;
+        auth.broker.as_mut().unwrap().pending_push_cleanup_epoch = Some(1);
+        store.save(&auth).unwrap();
+        let scheduler = Arc::new(PushRegistrationScheduler::new());
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, completion) = tokio::sync::oneshot::channel();
+        let task = {
+            let broker = broker.clone();
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .cleanup_push(&broker, 1, async {
+                        entered.send(()).unwrap();
+                        completion.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        seen.await.unwrap();
+        broker.logout().await.unwrap();
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(2));
+        assert!(scheduler.gate.try_lock().is_err());
+        release.send(()).unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(nelomai_client_container::BrokerError::Cancelled)
+        ));
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(2));
+        assert!(!scheduler
+            .cleanup_push(&broker, 1, async {
+                panic!("superseded cleanup must not dispatch");
+            })
+            .await
+            .unwrap());
+        assert!(scheduler
+            .cleanup_push(&broker, 2, async { Ok(()) })
+            .await
+            .unwrap());
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn busy_push_cleanup_skips_after_real_owner_login_and_holds_gate_until_completion() {
         use nelomai_client_storage::{AuthStore, AuthStoreV1, LogoutState, StoredAuth};

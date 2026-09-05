@@ -76,18 +76,33 @@ impl LocalAuthStop for NativeStop {
 #[tokio::test(start_paused = true)]
 async fn native_stop_wait_cannot_exceed_owner_budget_or_prevent_handoff_poll() {
     let state = Arc::new(Panel::default());
-    let (api, server) = panel(state).await;
+    let (api, server) = panel(state.clone()).await;
     let store = auth_store();
     let native = Arc::new(NativeStop::default());
     native.hold_stop.store(true, Ordering::SeqCst);
+    // Paused owner time must not race the real local HTTP transport.
+    native.hold.store(true, Ordering::SeqCst);
+    let before = store.load().unwrap().unwrap();
     let broker = AuthBroker::new(api, store.clone(), native.clone()).unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(11), broker.logout())
         .await
         .expect("local native stop must share the bounded owner request budget");
-    assert!(matches!(result, Err(BrokerError::Timeout)));
+    assert!(matches!(result, Err(BrokerError::Timeout)), "{result:?}");
     assert_eq!(native.stops.load(Ordering::SeqCst), 1);
     assert_eq!(native.handoffs.load(Ordering::SeqCst), 1);
-    assert!(store.load().unwrap().unwrap().auth_epoch > 0);
+    assert_eq!(state.logout_calls.load(Ordering::SeqCst), 0);
+    let pending = store.load().unwrap().unwrap();
+    assert_eq!(pending.logout_state, LogoutState::Pending);
+    assert!(pending.auth_epoch > before.auth_epoch);
+    let proof = pending
+        .broker
+        .as_ref()
+        .unwrap()
+        .pending_logout
+        .as_ref()
+        .unwrap();
+    assert!(!proof.operation_id.is_empty());
+    assert_eq!(Some(&proof.refresh_proof), before.refresh_token.as_ref());
     server.abort();
 }
 

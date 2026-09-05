@@ -752,16 +752,13 @@ impl AuthBroker {
     pub async fn push_cleanup_is_current(&self, epoch: u64) -> Result<bool, BrokerError> {
         let _state = self.state.lock().await;
         let auth = self.load()?;
-        Ok(auth.auth_epoch == epoch
-            && matches!(
-                auth.logout_state,
-                LogoutState::Pending | LogoutState::LoggedOut
-            )
-            && auth
-                .broker
-                .as_ref()
-                .and_then(|meta| meta.pending_push_cleanup_epoch)
-                == Some(epoch))
+        // This durable handoff is independent of a later login attempt's epoch
+        // and state. Only accepted login or a newer cleanup supersedes it.
+        Ok(auth
+            .broker
+            .as_ref()
+            .and_then(|meta| meta.pending_push_cleanup_epoch)
+            == Some(epoch))
     }
 
     pub async fn finish_push_cleanup(&self, epoch: u64) -> Result<(), BrokerError> {
@@ -771,13 +768,7 @@ impl AuthBroker {
         if meta.pending_push_cleanup_epoch.is_none() {
             return Ok(());
         }
-        if auth.auth_epoch != epoch
-            || !matches!(
-                auth.logout_state,
-                LogoutState::Pending | LogoutState::LoggedOut
-            )
-            || meta.pending_push_cleanup_epoch != Some(epoch)
-        {
+        if meta.pending_push_cleanup_epoch != Some(epoch) {
             return Err(BrokerError::Cancelled);
         }
         meta.pending_push_cleanup_epoch = None;
