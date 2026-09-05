@@ -6,7 +6,6 @@ use nelomai_windows_service::{
     },
     DefenderStatus, WindowsTunnelController,
 };
-use semver::Version;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -114,15 +113,33 @@ pub async fn diagnostic_helper_log() -> Option<String> {
 }
 
 async fn verify_service_version() -> Result<(), TunnelError> {
-    let installed = tunnel_controller().service_version().await?;
-    let installed = Version::parse(&installed).map_err(|_| tunnel_error("service_outdated"))?;
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| tunnel_error("invalid_app_version"))?;
-    if installed >= current {
-        Ok(())
-    } else {
-        Err(tunnel_error("service_outdated"))
-    }
+    tokio::task::spawn_blocking(|| {
+        use nelomai_contracts::dispatcher::{DispatcherRequest, Installation};
+        let client =
+            std::env::current_exe().map_err(|_| tunnel_error("common_broker_unavailable"))?;
+        let resources = client
+            .parent()
+            .ok_or_else(|| tunnel_error("helper_resources_unavailable"))?
+            .join("runtime");
+        let expected = Installation::production(Path::new("unused"))
+            .and_then(|trust| trust.manifest_identity(&resources))
+            .map_err(|_| tunnel_error("verified_helper_identity_unavailable"))?;
+        let response =
+            nelomai_windows_service::windows::dispatcher_exchange(&DispatcherRequest::Version {
+                contract_version: 1,
+            })
+            .map_err(|_| tunnel_error("service_unavailable"))?;
+        if response.ok
+            && response.contract_version == 1
+            && response.identity.as_ref() == Some(&expected)
+        {
+            Ok(())
+        } else {
+            Err(tunnel_error("service_identity_mismatch"))
+        }
+    })
+    .await
+    .map_err(|_| tunnel_error("service_unavailable"))?
 }
 
 fn bundled_service_path(client_executable: &Path) -> PathBuf {

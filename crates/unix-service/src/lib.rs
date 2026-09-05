@@ -14,9 +14,11 @@ use nelomai_client_tunnel::{
     DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
     TunnelPlatform, TunnelStartRequest, TunnelStatus,
 };
+pub use nelomai_contracts::dispatcher;
 use serde::{Deserialize, Serialize};
 pub use socket::{
-    bind_listener, peer_uid, prepare_runtime_directory, serve_one, UnixSocketTransport,
+    bind_listener, dispatcher_exchange, peer_identity, peer_uid, prepare_runtime_directory,
+    recover_dispatcher, serve_dispatcher_one, serve_one, UnixSocketTransport,
 };
 use std::fmt;
 use thiserror::Error;
@@ -25,6 +27,53 @@ use zeroize::Zeroizing;
 pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/nelomai/tunnel.sock";
+pub const DISPATCHER_SOCKET_PATH: &str = "/var/run/nelomai/dispatcher.sock";
+
+/// The engine owns product behavior; the dispatcher owns sockets and process
+/// lifecycle. EOF is a cleanup request, not permission to leave a tunnel alive.
+pub fn run_engine_channel<B: ServiceTunnelBackend>(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    handler: &mut TunnelRequestHandler<B>,
+) -> std::io::Result<()> {
+    use nelomai_contracts::dispatcher as d;
+    loop {
+        let frame = match d::read_frame(reader, MAX_FRAME_SIZE) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = handler.handle(Request::stop());
+                return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
+        };
+        let control: serde_json::Value =
+            serde_json::from_slice(d::frame_body(&frame, MAX_FRAME_SIZE)?)
+                .unwrap_or(serde_json::Value::Null);
+        let output = match control
+            .get("dispatcher_control")
+            .and_then(|value| value.as_str())
+        {
+            Some("ready") => d::encode_frame(&serde_json::json!({"engine_ready":true}))?,
+            Some("stop") => {
+                let response = handler.handle(Request::stop());
+                d::encode_frame(
+                    &serde_json::json!({"engine_stopped": response.ok && response.state == Some(ServiceTunnelState::Stopped)}),
+                )?
+            }
+            _ => {
+                let response = decode_request(&frame)
+                    .map(|request| handler.handle(request))
+                    .unwrap_or_else(|error| Response::failure(error.code()));
+                encode_response(&response).map_err(|_| d::blocked())?
+            }
+        };
+        writer.write_all(&output)?;
+        writer.flush()?;
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -398,14 +447,16 @@ impl<'de> Deserialize<'de> for Request {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdentity {
     pub uid: u32,
+    pub process_path: std::path::PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientPolicy {
     pub owner_uid: u32,
+    pub installed_client_path: std::path::PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -488,7 +539,7 @@ pub fn authorize_peer(
     policy: &ClientPolicy,
     identity: &ClientIdentity,
 ) -> Result<(), ServiceError> {
-    if policy.owner_uid == identity.uid {
+    if policy.owner_uid == identity.uid && policy.installed_client_path == identity.process_path {
         Ok(())
     } else {
         Err(ServiceError::UnauthorizedClient)

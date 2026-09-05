@@ -21,6 +21,18 @@ fi
 mkdir -p "$OUTPUT"
 install -m 0755 "$HELPER" "$OUTPUT/nelomai-unix-service"
 
+# Task 9 signs this exact versioned tree after adding the common/runtime assets.
+# No key is accepted here and these hash files are not signature substitutes.
+stage_engine_layout() {
+  engine_dir=$OUTPUT/engines/latest/0.2.16
+  dispatcher_dir=$OUTPUT/dispatcher/1
+  mkdir -p "$engine_dir" "$dispatcher_dir"
+  for runtime_file in "$OUTPUT"/*; do
+    if [ -f "$runtime_file" ]; then cp -p "$runtime_file" "$engine_dir/"; fi
+  done
+  install -m 0755 "$HELPER" "$dispatcher_dir/nelomai-unix-service"
+}
+
 if [ "$PLATFORM" != "linux" ] && [ "$PLATFORM" != "macos" ]; then
   echo "Unsupported Unix platform: $PLATFORM" >&2
   exit 1
@@ -40,6 +52,7 @@ chmod 0755 "$OUTPUT/amneziawg-go"
 install -m 0644 "$ROOT/vendor/amneziawg-go/LICENSE" "$OUTPUT/AMNEZIAWG-GO-LICENSE.txt"
 
 if [ "$PLATFORM" = "linux" ]; then
+  install -m 0755 "$ROOT/crates/unix-service/install/resolvconf-linux.sh" "$OUTPUT/resolvconf"
   python3 - "$OUTPUT" "$AMNEZIAWG_GO_COMMIT" <<'PY'
 import hashlib
 import json
@@ -62,6 +75,7 @@ metadata = {
     encoding="utf-8",
 )
 PY
+  stage_engine_layout
   exit 0
 fi
 
@@ -104,3 +118,4 @@ metadata = {
     encoding="utf-8",
 )
 PY
+stage_engine_layout

@@ -1,134 +1,123 @@
-use nelomai_unix_service::{
-    bind_listener, prepare_runtime_directory, serve_one, ClientPolicy, PlatformBackend,
-    TunnelRequestHandler, DEFAULT_SOCKET_PATH,
+use nelomai_contracts::dispatcher::{
+    Installation, MutationGuard, ProcessDispatcher, RealInstallIo,
 };
-use std::path::PathBuf;
+use nelomai_unix_service::{
+    bind_listener, prepare_runtime_directory, run_engine_channel, serve_dispatcher_one,
+    PlatformBackend, TunnelRequestHandler, DEFAULT_SOCKET_PATH, DISPATCHER_SOCKET_PATH,
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
-const DEFAULT_RUNTIME_DIRECTORY: &str = "/var/run/nelomai";
-#[cfg(target_os = "macos")]
-const DEFAULT_WIREGUARD_GO: &str = "/Library/PrivilegedHelperTools/ru.nelomai.tunnel/wireguard-go";
 #[cfg(target_os = "linux")]
-const DEFAULT_AMNEZIAWG_GO: &str = "/usr/local/libexec/nelomai/amneziawg-go";
+const INSTALL_ROOT: &str = "/usr/local/libexec/nelomai";
 #[cfg(target_os = "macos")]
-const DEFAULT_AMNEZIAWG_GO: &str = "/Library/PrivilegedHelperTools/ru.nelomai.tunnel/amneziawg-go";
-
-struct Options {
-    owner_uid: u32,
-    socket: PathBuf,
-    runtime_directory: PathBuf,
-    #[cfg(target_os = "macos")]
-    wireguard_go: PathBuf,
-    amneziawg_go: PathBuf,
-}
+const INSTALL_ROOT: &str = "/Library/PrivilegedHelperTools/ru.nelomai.tunnel";
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("nelomai tunnel helper failed: {error}");
+        eprintln!("nelomai helper failed: {error}");
         std::process::exit(1);
     }
 }
-
-fn run() -> Result<(), String> {
+fn run() -> std::io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
-        return Err("helper must run as root".to_string());
+        return Err(std::io::Error::other("helper must run as root"));
     }
-    let options = parse_options(std::env::args().skip(1))?;
-    if options.owner_uid == 0 {
-        return Err("owner uid must identify an unprivileged user".to_string());
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    match arguments.as_slice() {
+        [mode, source, broker, uid] if mode == "install-layout" => {
+            let owner = uid
+                .to_str()
+                .ok_or_else(nelomai_contracts::dispatcher::blocked)?;
+            if owner
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .is_none()
+            {
+                return Err(nelomai_contracts::dispatcher::blocked());
+            }
+            let layout = Installation::production(Path::new(INSTALL_ROOT))?.install(
+                Path::new(source),
+                Path::new(broker),
+                owner,
+                &RealInstallIo,
+            )?;
+            println!("{}", layout.dispatcher_path().display());
+            Ok(())
+        }
+        [mode, root] if mode == "--engine-mode" => run_engine(Path::new(root)),
+        [mode, published, previous] if mode == "rollback-layout" => {
+            let published = published
+                .to_str()
+                .ok_or_else(nelomai_contracts::dispatcher::blocked)?;
+            let previous = previous
+                .to_str()
+                .ok_or_else(nelomai_contracts::dispatcher::blocked)?;
+            Installation::production(Path::new(INSTALL_ROOT))?.rollback_activation(
+                published,
+                if previous.is_empty() {
+                    None
+                } else {
+                    Some(previous)
+                },
+            )
+        }
+        [mode] if mode == "--dispatcher" => run_dispatcher(Path::new(INSTALL_ROOT)),
+        _ => Err(std::io::Error::other("invalid helper arguments")),
     }
-    if options.socket.parent() != Some(options.runtime_directory.as_path()) {
-        return Err("socket must be located directly in the runtime directory".to_string());
+}
+fn run_dispatcher(root: &Path) -> std::io::Result<()> {
+    prepare_runtime_directory(Path::new("/var/run/nelomai"))?;
+    let mut dispatcher = ProcessDispatcher::new(Installation::production(root)?)?;
+    nelomai_unix_service::recover_dispatcher(&mut dispatcher)
+        .map_err(|_| nelomai_contracts::dispatcher::blocked())?;
+    let uid = dispatcher
+        .layout
+        .broker
+        .owner
+        .parse::<u32>()
+        .map_err(|_| nelomai_contracts::dispatcher::blocked())?;
+    if uid == 0 {
+        return Err(nelomai_contracts::dispatcher::blocked());
     }
-
-    prepare_runtime_directory(&options.runtime_directory).map_err(generic_io)?;
-    let listener = bind_listener(&options.socket, options.owner_uid).map_err(generic_io)?;
-    let policy = ClientPolicy {
-        owner_uid: options.owner_uid,
-    };
-    let backend = create_backend(&options)?;
-    let mut handler = TunnelRequestHandler::new(backend, env!("CARGO_PKG_VERSION"));
-
+    let private = bind_listener(Path::new(DEFAULT_SOCKET_PATH), uid)?;
+    let lifecycle = bind_listener(Path::new(DISPATCHER_SOCKET_PATH), uid)?;
+    let dispatcher = Arc::new(Mutex::new(dispatcher));
+    let private_owner = Arc::clone(&dispatcher);
+    std::thread::spawn(move || loop {
+        let _ = serve_dispatcher_one(&private, &private_owner, true);
+    });
     loop {
-        if let Err(error) = serve_one(&listener, &policy, &mut handler) {
-            eprintln!("nelomai tunnel helper request failed: {}", error.code());
-        }
+        let _ = serve_dispatcher_one(&lifecycle, &dispatcher, false);
     }
 }
-
-fn parse_options(arguments: impl Iterator<Item = String>) -> Result<Options, String> {
-    let mut owner_uid = None;
-    let mut socket = PathBuf::from(DEFAULT_SOCKET_PATH);
-    let mut runtime_directory = PathBuf::from(DEFAULT_RUNTIME_DIRECTORY);
+fn run_engine(root: &Path) -> std::io::Result<()> {
+    let installation = Installation::production(root)?;
+    let layout = installation.load()?;
+    if std::fs::canonicalize(std::env::current_exe()?)? != layout.engine_path() {
+        return Err(nelomai_contracts::dispatcher::blocked());
+    }
+    let _lease = MutationGuard::at(&root.join("engine-owner.lock"))?;
+    let directory: PathBuf = layout
+        .engine_path()
+        .parent()
+        .ok_or_else(nelomai_contracts::dispatcher::blocked)?
+        .into();
+    #[cfg(target_os = "linux")]
+    let backend = PlatformBackend::new(directory.join("amneziawg-go"), "/var/run/nelomai");
     #[cfg(target_os = "macos")]
-    let mut wireguard_go = PathBuf::from(DEFAULT_WIREGUARD_GO);
-    let mut amneziawg_go = PathBuf::from(DEFAULT_AMNEZIAWG_GO);
-    let mut arguments = arguments;
-
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "--owner-uid" => {
-                let value = arguments
-                    .next()
-                    .ok_or_else(|| "missing owner uid".to_string())?;
-                owner_uid = Some(value.parse().map_err(|_| "invalid owner uid".to_string())?);
-            }
-            "--socket" => {
-                socket = absolute_path(arguments.next(), "socket")?;
-            }
-            "--runtime-directory" => {
-                runtime_directory = absolute_path(arguments.next(), "runtime directory")?;
-            }
-            #[cfg(target_os = "macos")]
-            "--wireguard-go" => {
-                wireguard_go = absolute_path(arguments.next(), "wireguard-go")?;
-            }
-            "--amneziawg-go" => {
-                amneziawg_go = absolute_path(arguments.next(), "amneziawg-go")?;
-            }
-            "--version" => {
-                println!("{}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            _ => return Err("unknown helper argument".to_string()),
-        }
-    }
-
-    Ok(Options {
-        owner_uid: owner_uid.ok_or_else(|| "owner uid is required".to_string())?,
-        socket,
-        runtime_directory,
-        #[cfg(target_os = "macos")]
-        wireguard_go,
-        amneziawg_go,
-    })
-}
-
-fn absolute_path(value: Option<String>, name: &str) -> Result<PathBuf, String> {
-    let value = value.ok_or_else(|| format!("missing {name}"))?;
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Err(format!("{name} must be an absolute path"))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn create_backend(options: &Options) -> Result<PlatformBackend, String> {
-    PlatformBackend::new(&options.amneziawg_go, &options.runtime_directory)
-        .map_err(|error| error.code().to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn create_backend(options: &Options) -> Result<PlatformBackend, String> {
-    PlatformBackend::new(
-        &options.wireguard_go,
-        &options.amneziawg_go,
-        &options.runtime_directory,
+    let backend = PlatformBackend::new(
+        directory.join("wireguard-go"),
+        directory.join("amneziawg-go"),
+        "/var/run/nelomai",
+    );
+    let backend = backend.map_err(|_| nelomai_contracts::dispatcher::blocked())?;
+    run_engine_channel(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+        &mut TunnelRequestHandler::new(backend, layout.identity.runtime_version),
     )
-    .map_err(|error| error.code().to_string())
-}
-
-fn generic_io(_error: std::io::Error) -> String {
-    "helper filesystem setup failed".to_string()
 }

@@ -1551,6 +1551,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2962,14 +2972,19 @@ dependencies = [
 name = "nelomai-contracts"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "caseless",
  "ed25519-dalek",
+ "fs2",
  "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "time",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2990,9 +3005,11 @@ dependencies = [
  "base64 0.22.1",
  "defguard_boringtun",
  "defguard_wireguard_rs",
+ "ed25519-dalek",
  "ipnet",
  "libc",
  "nelomai-client-tunnel",
+ "nelomai-contracts",
  "serde",
  "serde_json",
  "sha2",
@@ -3009,6 +3026,7 @@ dependencies = [
  "async-trait",
  "ipnet",
  "nelomai-client-tunnel",
+ "nelomai-contracts",
  "serde",
  "serde_json",
  "sha2",

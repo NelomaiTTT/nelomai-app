@@ -36,6 +36,7 @@ mod bounded_connection_items {
     }
 }
 
+pub mod dispatcher;
 mod runtime;
 mod split_tunnel;
 

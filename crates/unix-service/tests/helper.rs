@@ -169,11 +169,28 @@ fn diagnostics_request_round_trips_through_the_typed_protocol() {
 
 #[test]
 fn peer_authorization_requires_the_installed_owner_uid() {
-    let policy = ClientPolicy { owner_uid: 501 };
+    let policy = ClientPolicy {
+        owner_uid: 501,
+        installed_client_path: "/installed/common-broker".into(),
+    };
 
-    authorize_peer(&policy, &ClientIdentity { uid: 501 }).expect("authorize owner");
+    authorize_peer(
+        &policy,
+        &ClientIdentity {
+            uid: 501,
+            process_path: "/installed/common-broker".into(),
+        },
+    )
+    .expect("authorize owner");
     assert_eq!(
-        authorize_peer(&policy, &ClientIdentity { uid: 502 }).expect_err("reject another user"),
+        authorize_peer(
+            &policy,
+            &ClientIdentity {
+                uid: 502,
+                process_path: "/installed/common-broker".into()
+            }
+        )
+        .expect_err("reject another user"),
         ServiceError::UnauthorizedClient
     );
 }

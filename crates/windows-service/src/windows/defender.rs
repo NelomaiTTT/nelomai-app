@@ -134,7 +134,15 @@ pub fn configure_exclusion(client_executable: &Path) -> Result<(), ServiceError>
     let service_executable = std::env::current_exe()
         .map_err(|error| ServiceError::Backend(format!("resolve service executable: {error}")))?;
     let client_executable = validate_install_location(&service_executable, client_executable)?;
-    let dll_path = client_executable.with_file_name(AWG_DLL_NAME);
+    let layout = nelomai_contracts::dispatcher::Installation::production(
+        &super::install::installation_directory()?,
+    )
+    .and_then(|installation| installation.load())
+    .map_err(|_| ServiceError::UnauthorizedClient)?;
+    if layout.broker.executable != client_executable {
+        return Err(ServiceError::UnauthorizedClient);
+    }
+    let dll_path = layout.engine_path().with_file_name(AWG_DLL_NAME);
     let powershell = powershell_path()
         .ok_or_else(|| ServiceError::Backend("defender_repair_tool_unavailable".to_string()))?;
     let mut command = Command::new(powershell);

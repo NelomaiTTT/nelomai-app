@@ -84,6 +84,37 @@ impl UnixSocketTransport {
     }
 
     fn exchange_blocking(&self, request: Request) -> Result<Response, ServiceError> {
+        if request.protocol_version() != crate::PROTOCOL_VERSION {
+            return Err(ServiceError::UnsupportedProtocol);
+        }
+        if self.path == Path::new(crate::DEFAULT_SOCKET_PATH) {
+            use nelomai_contracts::dispatcher as d;
+            let version = dispatcher_exchange(&d::DispatcherRequest::Version {
+                contract_version: 1,
+            })?;
+            let identity = version
+                .identity
+                .filter(|_| version.ok && version.contract_version == 1)
+                .ok_or(ServiceError::UnauthorizedClient)?;
+            if matches!(request, Request::Stop { .. }) {
+                let stopped = dispatcher_exchange(&d::DispatcherRequest::Stop {
+                    contract_version: 1,
+                    identity,
+                })?;
+                return if stopped.ok {
+                    Ok(Response::success(Some(crate::ServiceTunnelState::Stopped)))
+                } else {
+                    Err(ServiceError::Backend("dispatcher_stop_failed".into()))
+                };
+            }
+            let started = dispatcher_exchange(&d::DispatcherRequest::Start {
+                contract_version: 1,
+                identity,
+            })?;
+            if !started.ok {
+                return Err(ServiceError::Backend("dispatcher_start_failed".into()));
+            }
+        }
         let mut stream = UnixStream::connect(&self.path).map_err(transport_error)?;
         configure_stream(&stream)?;
         let frame = encode_request(&request)?;
@@ -91,6 +122,20 @@ impl UnixSocketTransport {
         let response = read_frame(&mut stream)?;
         decode_response(&response)
     }
+}
+
+pub fn dispatcher_exchange(
+    request: &nelomai_contracts::dispatcher::DispatcherRequest,
+) -> Result<nelomai_contracts::dispatcher::DispatcherResponse, ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    let mut stream = UnixStream::connect(crate::DISPATCHER_SOCKET_PATH).map_err(transport_error)?;
+    configure_stream(&stream)?;
+    stream
+        .write_all(&d::encode_frame(request).map_err(transport_error)?)
+        .map_err(transport_error)?;
+    let frame = d::read_frame(&mut stream, d::MAX_DISPATCHER_FRAME).map_err(transport_error)?;
+    serde_json::from_slice(d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).map_err(transport_error)?)
+        .map_err(|_| ServiceError::InvalidRequest)
 }
 
 #[async_trait]
@@ -138,9 +183,7 @@ pub fn serve_one<B: ServiceTunnelBackend>(
 ) -> Result<(), ServiceError> {
     let (mut stream, _) = listener.accept().map_err(transport_error)?;
     configure_stream(&stream)?;
-    let identity = ClientIdentity {
-        uid: peer_uid(&stream).map_err(transport_error)?,
-    };
+    let identity = peer_identity(&stream).map_err(transport_error)?;
     authorize_peer(policy, &identity)?;
 
     let response = match read_frame(&mut stream).and_then(|frame| decode_request(&frame)) {
@@ -155,6 +198,63 @@ pub fn serve_one<B: ServiceTunnelBackend>(
     let frame = encode_response(&response)?;
     stream.write_all(&frame).map_err(transport_error)?;
     stream.flush().map_err(transport_error)
+}
+
+/// Credentials and executable identity come from the connected kernel peer,
+/// never from request fields. Failure to resolve the process is fail-closed.
+pub fn peer_identity(stream: &UnixStream) -> io::Result<ClientIdentity> {
+    let uid = peer_uid(stream)?;
+    #[cfg(target_os = "linux")]
+    let process_path = {
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut length,
+            )
+        };
+        if result != 0
+            || length as usize != std::mem::size_of::<libc::ucred>()
+            || credentials.pid <= 0
+            || credentials.uid != uid
+        {
+            return Err(io::Error::other("peer identity unavailable"));
+        }
+        fs::read_link(format!("/proc/{}/exe", credentials.pid))?
+    };
+    #[cfg(target_os = "macos")]
+    let process_path = {
+        let mut pid: libc::pid_t = 0;
+        let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                0,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut length,
+            )
+        };
+        if result != 0 || length as usize != std::mem::size_of::<libc::pid_t>() || pid <= 0 {
+            return Err(io::Error::other("peer process unavailable"));
+        }
+        let mut path = vec![0u8; 4096];
+        let count = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        if count <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let end = path
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| io::Error::other("invalid peer path"))?;
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(path[..end].to_vec()))
+    };
+    Ok(ClientIdentity { uid, process_path })
 }
 
 #[cfg(target_os = "macos")]
@@ -214,6 +314,74 @@ fn validate_parent_directory(path: &Path) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+pub fn serve_dispatcher_one(
+    listener: &UnixListener,
+    owner: &Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+    private: bool,
+) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    let (mut stream, _) = listener.accept().map_err(transport_error)?;
+    configure_stream(&stream)?;
+    let watchdog = RequestWatchdog::arm()?;
+    let result = (|| {
+        let identity = peer_identity(&stream).map_err(transport_error)?;
+        let mut dispatcher = owner
+            .try_lock()
+            .map_err(|_| ServiceError::Backend("dispatcher_busy".into()))?;
+        dispatcher
+            .layout
+            .broker
+            .authorize(&identity.uid.to_string(), &identity.process_path)
+            .map_err(|_| ServiceError::UnauthorizedClient)?;
+        let frame = d::read_frame(
+            &mut stream,
+            if private {
+                MAX_FRAME_SIZE
+            } else {
+                d::MAX_DISPATCHER_FRAME
+            },
+        )
+        .map_err(transport_error)?;
+        let output = if private {
+            dispatcher
+                .relay(&frame, &mut |_| Err(d::blocked()))
+                .map_err(transport_error)?
+        } else {
+            let response = d::decode_request(&frame)
+                .map(|request| dispatcher.handle(request, &mut |_| Err(d::blocked())))
+                .unwrap_or_else(|_| d::DispatcherResponse::failure());
+            d::encode_frame(&response).map_err(transport_error)?
+        };
+        stream.write_all(&output).map_err(transport_error)?;
+        stream.flush().map_err(transport_error)
+    })();
+    watchdog.complete();
+    result
+}
+
+pub fn recover_dispatcher(
+    owner: &mut nelomai_contracts::dispatcher::ProcessDispatcher,
+) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    if !owner.installation.root.join(d::ACTIVE_ENGINE_NAME).exists() {
+        return Ok(());
+    }
+    let watchdog = RequestWatchdog::arm()?;
+    let response = owner.handle(
+        d::DispatcherRequest::Stop {
+            contract_version: 1,
+            identity: owner.layout.identity.clone(),
+        },
+        &mut |_| Err(d::blocked()),
+    );
+    watchdog.complete();
+    if response.ok {
+        Ok(())
+    } else {
+        Err(ServiceError::Backend("dispatcher_recovery_pending".into()))
+    }
 }
 
 fn configure_stream(stream: &UnixStream) -> Result<(), ServiceError> {

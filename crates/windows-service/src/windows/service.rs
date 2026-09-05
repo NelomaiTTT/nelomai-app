@@ -1,6 +1,6 @@
 use super::backend::{resolve_endpoint, WindowsServiceBackend};
-use super::install::{load_policy, record_service_diagnostic, record_service_message};
-use super::ipc::{finish_request, wake_server, PipeServer};
+use super::install::{record_service_diagnostic, record_service_message};
+use super::ipc::{finish_frame, wake_server, PipeServer, DISPATCHER_PIPE_NAME};
 use super::routes::WindowsRouteManager;
 use super::{platform_error, wide};
 use crate::{
@@ -107,9 +107,55 @@ fn manager_service_loop() -> Result<(), ServiceError> {
         ServiceControlAccept::empty(),
     )?;
 
-    let server = PipeServer::new(load_policy()?);
-    let mut handler =
-        TunnelRequestHandler::new(WindowsServiceBackend::new()?, env!("CARGO_PKG_VERSION"));
+    use nelomai_contracts::dispatcher as d;
+    let installation = d::Installation::production(&super::install::installation_directory()?)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let dispatcher =
+        d::ProcessDispatcher::new(installation).map_err(|_| ServiceError::UnauthorizedClient)?;
+    let broker = dispatcher.layout.broker.clone();
+    let policy = crate::ClientPolicy {
+        owner_sid: broker.owner.clone(),
+        installed_client_path: broker.executable.clone(),
+    };
+    let server = PipeServer::new(policy.clone(), broker.clone(), DISPATCHER_PIPE_NAME);
+    let private = PipeServer::new(policy, broker, crate::PIPE_NAME);
+    let owner = Arc::new(Mutex::new(dispatcher));
+    let recovery_identity = owner
+        .lock()
+        .map_err(|_| ServiceError::InvalidRequest)?
+        .layout
+        .identity
+        .clone();
+    if owner
+        .lock()
+        .map_err(|_| ServiceError::InvalidRequest)?
+        .installation
+        .root
+        .join(d::ACTIVE_ENGINE_NAME)
+        .exists()
+    {
+        let frame = d::encode_frame(&d::DispatcherRequest::Stop {
+            contract_version: 1,
+            identity: recovery_identity,
+        })
+        .map_err(|_| ServiceError::InvalidRequest)?;
+        let result = serve_owned_frame(&owner, &frame, false);
+        let response: d::DispatcherResponse = serde_json::from_slice(
+            d::frame_body(&result, d::MAX_DISPATCHER_FRAME)
+                .map_err(|_| ServiceError::InvalidRequest)?,
+        )
+        .map_err(|_| ServiceError::InvalidRequest)?;
+        if !response.ok {
+            return Err(ServiceError::Backend("dispatcher_recovery_pending".into()));
+        }
+    }
+    let private_owner = Arc::clone(&owner);
+    std::thread::spawn(move || loop {
+        if let Ok(Some((frame, pipe))) = private.accept() {
+            let output = serve_owned_frame(&private_owner, &frame, true);
+            let _ = finish_frame(pipe, &output);
+        }
+    });
     set_status(
         &status_handle,
         ServiceState::Running,
@@ -118,39 +164,17 @@ fn manager_service_loop() -> Result<(), ServiceError> {
     record_service_message("manager lifecycle", "running");
     while !stopping.load(Ordering::Acquire) {
         match server.accept() {
-            Ok(Some((request, pipe))) => {
+            Ok(Some((frame, pipe))) => {
                 if stopping.load(Ordering::Acquire) {
-                    let _ = finish_request(pipe, &crate::Response::failure("service_stopping"));
+                    let _ = finish_frame(
+                        pipe,
+                        &d::encode_frame(&d::DispatcherResponse::failure())
+                            .map_err(|_| ServiceError::InvalidRequest)?,
+                    );
                     break;
                 }
-                let action = request.diagnostic_name();
-                let lifecycle_event = request.is_lifecycle_event();
-                if lifecycle_event {
-                    record_service_message("manager request", &format!("started action={action}"));
-                }
-                let response = match RequestWatchdog::arm() {
-                    Ok(watchdog) => {
-                        let response = handler.handle(request);
-                        watchdog.complete();
-                        response
-                    }
-                    Err(error) => {
-                        record_service_diagnostic("start request watchdog", &error);
-                        crate::Response::failure(error.code())
-                    }
-                };
-                if lifecycle_event {
-                    record_service_message(
-                        "manager request",
-                        &format!(
-                            "completed action={action} ok={} state={:?} error={}",
-                            response.ok,
-                            response.state,
-                            response.error_code.as_deref().unwrap_or("none")
-                        ),
-                    );
-                }
-                if let Err(error) = finish_request(pipe, &response) {
+                let response = serve_owned_frame(&owner, &frame, false);
+                if let Err(error) = finish_frame(pipe, &response) {
                     record_service_diagnostic("send pipe response", &error);
                 }
             }
@@ -163,11 +187,128 @@ fn manager_service_loop() -> Result<(), ServiceError> {
         }
     }
     record_service_message("manager lifecycle", "SCM stop requested");
+    if let Ok(mut dispatcher) = owner.lock() {
+        let identity = dispatcher.layout.identity.clone();
+        let engine = dispatcher.layout.engine_path();
+        let response = dispatcher.handle(
+            d::DispatcherRequest::Stop {
+                contract_version: 1,
+                identity,
+            },
+            &mut |action| super::install::engine_primitive(action, &engine),
+        );
+        if !response.ok {
+            record_service_message("dispatcher stop", "cleanup remains pending");
+        }
+    }
     set_status(
         &status_handle,
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
     )
+}
+
+fn serve_owned_frame(
+    owner: &Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+    frame: &[u8],
+    private: bool,
+) -> Vec<u8> {
+    use nelomai_contracts::dispatcher as d;
+    let failure = || d::encode_frame(&d::DispatcherResponse::failure()).unwrap_or_default();
+    let Ok(watchdog) = RequestWatchdog::arm() else {
+        return failure();
+    };
+    let output = (|| {
+        let mut dispatcher = owner.try_lock().map_err(|_| d::blocked())?;
+        let engine = dispatcher.layout.engine_path();
+        if private {
+            dispatcher.relay(frame, &mut |action| {
+                super::install::engine_primitive(action, &engine)
+            })
+        } else {
+            let response = dispatcher.handle(d::decode_request(frame)?, &mut |action| {
+                super::install::engine_primitive(action, &engine)
+            });
+            d::encode_frame(&response)
+        }
+    })()
+    .unwrap_or_else(|_: std::io::Error| failure());
+    watchdog.complete();
+    output
+}
+
+pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    use std::io::Write;
+    let installation =
+        d::Installation::production(root).map_err(|_| ServiceError::UnauthorizedClient)?;
+    let layout = installation
+        .load()
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    if std::fs::canonicalize(std::env::current_exe().map_err(|_| ServiceError::UnsafePath)?)
+        .map_err(|_| ServiceError::UnsafePath)?
+        != std::fs::canonicalize(layout.engine_path()).map_err(|_| ServiceError::UnsafePath)?
+    {
+        return Err(ServiceError::UnauthorizedClient);
+    }
+    let _lease = d::MutationGuard::at(&root.join("engine-owner.lock"))
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let mut handler = TunnelRequestHandler::new(
+        WindowsServiceBackend::new()?,
+        layout.identity.runtime_version,
+    );
+    loop {
+        let frame = match d::read_frame(&mut std::io::stdin(), MAX_FRAME_SIZE) {
+            Ok(frame) => frame,
+            Err(_) => {
+                let _ = handler.handle(crate::Request::stop());
+                return Ok(());
+            }
+        };
+        let control: serde_json::Value = serde_json::from_slice(
+            d::frame_body(&frame, MAX_FRAME_SIZE).map_err(|_| ServiceError::InvalidRequest)?,
+        )
+        .unwrap_or(serde_json::Value::Null);
+        let output = match control.get("dispatcher_control").and_then(|value| value.as_str()) {
+            Some("ready") => d::encode_frame(&serde_json::json!({"engine_ready":true})),
+            Some("stop") => { let response = handler.handle(crate::Request::stop()); d::encode_frame(&serde_json::json!({"engine_stopped":response.ok && response.state == Some(crate::ServiceTunnelState::Stopped)})) }
+            _ => { let response = crate::decode_request(&frame).map(|request| handler.handle(request)).unwrap_or_else(|error| crate::Response::failure(error.code())); d::encode_frame(&response) }
+        }.map_err(|_| ServiceError::InvalidRequest)?;
+        std::io::stdout()
+            .write_all(&output)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        std::io::stdout()
+            .flush()
+            .map_err(|_| ServiceError::InvalidRequest)?;
+    }
+}
+
+pub(crate) fn request_primitive(
+    action: nelomai_contracts::dispatcher::EnginePrimitive,
+) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    use std::io::Write;
+    let request = d::encode_frame(&d::PrimitiveRequest {
+        engine_primitive: action,
+    })
+    .map_err(|_| ServiceError::InvalidRequest)?;
+    std::io::stdout()
+        .write_all(&request)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    std::io::stdout()
+        .flush()
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    let frame = d::read_frame(&mut std::io::stdin(), d::MAX_DISPATCHER_FRAME)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    let value: serde_json::Value = serde_json::from_slice(
+        d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).map_err(|_| ServiceError::InvalidRequest)?,
+    )
+    .map_err(|_| ServiceError::InvalidRequest)?;
+    if value.get("primitive_ok") == Some(&serde_json::Value::Bool(true)) {
+        Ok(())
+    } else {
+        Err(ServiceError::Backend("dispatcher_primitive_failed".into()))
+    }
 }
 
 fn set_status(

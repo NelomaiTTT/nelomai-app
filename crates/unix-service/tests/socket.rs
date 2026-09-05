@@ -6,6 +6,175 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use tempfile::tempdir;
 
+fn owned_dispatcher() -> (
+    tempfile::TempDir,
+    std::sync::Arc<std::sync::Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+) {
+    use ed25519_dalek::{Signer, SigningKey};
+    use nelomai_contracts::dispatcher as d;
+    use serde_json::json;
+    let target = tempdir().unwrap();
+    let source = tempdir().unwrap();
+    let engine = source
+        .path()
+        .join("engines/latest/0.2.16/nelomai-unix-service");
+    fs::create_dir_all(engine.parent().unwrap()).unwrap();
+    fs::write(engine, b"synthetic engine").unwrap();
+    let manifest = serde_json::to_vec(&json!({"format_version":1,"container_version":"0.2.16","release_set_id":"owned-test","minimum_runtime_contract":1,"maximum_runtime_contract":1,"slots":[{"slot":"latest","manifest":{"format_version":1,"runtime_version":"0.2.16","source_commit":"0123456789abcdef0123456789abcdef01234567","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"contract_version":1,"files":[{"path":"nelomai-unix-service","role":"executable","size_bytes":16,"sha256":d::digest(b"synthetic engine")}]}}]})).unwrap();
+    let key = SigningKey::from_bytes(&[82; 32]);
+    let mut signed = nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
+    signed.extend(&manifest);
+    fs::write(source.path().join(d::MANIFEST_NAME), manifest).unwrap();
+    fs::write(
+        source.path().join(d::SIGNATURE_NAME),
+        key.sign(&signed).to_bytes(),
+    )
+    .unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let installation = d::Installation::for_owner(
+        target.path(),
+        key.verifying_key().to_bytes(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        uid,
+    );
+    installation
+        .install(
+            source.path(),
+            &std::env::current_exe().unwrap(),
+            &uid.to_string(),
+            &d::RealInstallIo,
+        )
+        .unwrap();
+    let dispatcher = d::ProcessDispatcher::new(installation).unwrap();
+    (
+        target,
+        std::sync::Arc::new(std::sync::Mutex::new(dispatcher)),
+    )
+}
+
+#[test]
+fn production_dispatcher_socket_uses_verified_identity_and_rejects_foreign_peer() {
+    use nelomai_contracts::dispatcher as d;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let (target, owner) = owned_dispatcher();
+    let path = target.path().join("dispatcher.sock");
+    let listener = bind_listener(&path, unsafe { libc::geteuid() }).unwrap();
+    let server_owner = std::sync::Arc::clone(&owner);
+    let server = std::thread::spawn(move || {
+        nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false).unwrap();
+        assert_eq!(
+            nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false),
+            Err(ServiceError::UnauthorizedClient)
+        );
+    });
+    let mut stream = UnixStream::connect(&path).unwrap();
+    stream
+        .write_all(
+            &d::encode_frame(&d::DispatcherRequest::Version {
+                contract_version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let frame = d::read_frame(&mut stream, d::MAX_DISPATCHER_FRAME).unwrap();
+    let response: d::DispatcherResponse =
+        serde_json::from_slice(d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).unwrap()).unwrap();
+    assert!(response.ok && !response.running);
+    assert_eq!(
+        response.identity.as_ref(),
+        Some(&owner.lock().unwrap().layout.identity)
+    );
+    drop(stream);
+    let status = std::process::Command::new("/usr/bin/python3").args(["-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]);\ntry: s.recv(1024)\nexcept ConnectionResetError: pass"] ).arg(path).status().unwrap();
+    assert!(status.success());
+    server.join().unwrap();
+    assert!(!target.path().join(d::ACTIVE_ENGINE_NAME).exists());
+}
+
+#[test]
+fn real_engine_channel_keeps_diagnostics_rebind_and_eof_cleanup() {
+    use nelomai_contracts::dispatcher as d;
+    use nelomai_unix_service::{decode_response, encode_request, run_engine_channel, Request};
+    let mut input = encode_request(&Request::diagnostics()).unwrap();
+    input.extend(encode_request(&Request::rebind_udp()).unwrap());
+    let mut output = Vec::new();
+    let mut handler = TunnelRequestHandler::new(MemoryBackend::default(), "0.2.16");
+    run_engine_channel(&mut input.as_slice(), &mut output, &mut handler).unwrap();
+    let mut bytes = output.as_slice();
+    let diagnostics =
+        decode_response(&d::read_frame(&mut bytes, d::MAX_ENGINE_FRAME).unwrap()).unwrap();
+    assert_eq!(
+        diagnostics.diagnostics.as_deref(),
+        Some("private engine diagnostics")
+    );
+    let rebind = decode_response(&d::read_frame(&mut bytes, d::MAX_ENGINE_FRAME).unwrap()).unwrap();
+    assert_eq!(rebind.state, Some(ServiceTunnelState::Running));
+    assert_eq!(
+        handler.backend().state,
+        ServiceTunnelState::Stopped,
+        "EOF must clean up the tunnel"
+    );
+}
+
+#[test]
+fn malformed_private_json_gets_a_bounded_error_without_abandoning_the_engine() {
+    use nelomai_contracts::dispatcher as d;
+    let mut input = vec![1, 0, 0, 0, b'{'];
+    input.extend(
+        nelomai_unix_service::encode_request(&nelomai_unix_service::Request::status()).unwrap(),
+    );
+    let mut handler = TunnelRequestHandler::new(
+        MemoryBackend {
+            state: ServiceTunnelState::Running,
+        },
+        "test",
+    );
+    let mut output = Vec::new();
+    nelomai_unix_service::run_engine_channel(&mut input.as_slice(), &mut output, &mut handler)
+        .unwrap();
+    let mut bytes = output.as_slice();
+    let error = nelomai_unix_service::decode_response(
+        &d::read_frame(&mut bytes, d::MAX_ENGINE_FRAME).unwrap(),
+    )
+    .unwrap();
+    assert!(!error.ok);
+    let status = nelomai_unix_service::decode_response(
+        &d::read_frame(&mut bytes, d::MAX_ENGINE_FRAME).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status.state, Some(ServiceTunnelState::Running));
+}
+
+#[test]
+fn same_uid_foreign_executable_is_rejected_before_decode() {
+    let directory = tempdir().unwrap();
+    let socket_path = directory.path().join("peer.sock");
+    let uid = unsafe { libc::geteuid() };
+    let listener = bind_listener(&socket_path, uid).unwrap();
+    let server = std::thread::spawn(move || {
+        let policy = ClientPolicy {
+            owner_uid: uid,
+            installed_client_path: fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+        };
+        let mut handler = TunnelRequestHandler::new(MemoryBackend::default(), "test");
+        serve_one(&listener, &policy, &mut handler)
+    });
+    // A distinct real executable with the same UID, just like the runtime child.
+    // Invalid JSON is intentional: authorization must happen before decoding it.
+    let result = std::process::Command::new("/usr/bin/python3")
+        .args(["-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b'\\x01\\x00\\x00\\x00{');\ntry: s.recv(1024)\nexcept ConnectionResetError: pass\ns.close()"])
+        .arg(socket_path)
+        .status()
+        .unwrap();
+    assert!(result.success());
+    assert_eq!(
+        server.join().unwrap(),
+        Err(ServiceError::UnauthorizedClient)
+    );
+}
+
 #[derive(Default)]
 struct MemoryBackend {
     state: ServiceTunnelState,
@@ -29,6 +198,13 @@ impl ServiceTunnelBackend for MemoryBackend {
     fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
         Ok(self.state)
     }
+    fn diagnostics(&self) -> Result<String, ServiceError> {
+        Ok("private engine diagnostics".into())
+    }
+    fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        self.state = ServiceTunnelState::Running;
+        Ok(self.state)
+    }
 }
 
 #[tokio::test]
@@ -45,7 +221,10 @@ async fn unix_socket_round_trip_is_owner_only_and_bounded() {
     assert_eq!(metadata.uid(), uid);
 
     let server = std::thread::spawn(move || {
-        let policy = ClientPolicy { owner_uid: uid };
+        let policy = ClientPolicy {
+            owner_uid: uid,
+            installed_client_path: fs::canonicalize(std::env::current_exe().unwrap()).unwrap(),
+        };
         let mut handler = TunnelRequestHandler::new(MemoryBackend::default(), "test");
         serve_one(&listener, &policy, &mut handler).expect("serve request");
     });

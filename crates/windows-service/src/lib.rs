@@ -3,6 +3,7 @@ use nelomai_client_tunnel::{
     detect_configuration_transport, DesktopTunnelOptions, TunnelCapabilities, TunnelController,
     TunnelError, TunnelMetrics, TunnelPlatform, TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
+pub use nelomai_contracts::dispatcher;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};

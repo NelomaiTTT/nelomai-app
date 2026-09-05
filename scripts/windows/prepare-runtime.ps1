@@ -1,5 +1,6 @@
 param(
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [string]$ServiceExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -138,3 +139,20 @@ $metadata = [ordered]@{
     wintun_dll_sha256 = (Get-FileHash -Algorithm SHA256 (Join-Path $OutputDirectory "wintun.dll")).Hash.ToLowerInvariant()
 }
 $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $OutputDirectory "windows-runtime.json")
+
+# Task 9 must build the service first and sign the complete versioned manifest.
+# Keep the existing metadata as diagnostics; it is not an authentication source.
+if (-not $ServiceExecutable) {
+    $ServiceExecutable = Join-Path $root "target/x86_64-pc-windows-msvc/release/nelomai-windows-service.exe"
+}
+if (-not (Test-Path -LiteralPath $ServiceExecutable -PathType Leaf)) {
+    throw "Versioned Windows service executable is required: $ServiceExecutable"
+}
+Copy-Item -LiteralPath $ServiceExecutable -Destination (Join-Path $OutputDirectory "nelomai-windows-service.exe") -Force
+$engineDirectory = Join-Path $OutputDirectory "engines/latest/0.2.16"
+$dispatcherDirectory = Join-Path $OutputDirectory "dispatcher/1"
+New-Item -ItemType Directory -Force $engineDirectory, $dispatcherDirectory | Out-Null
+Get-ChildItem -LiteralPath $OutputDirectory -File | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $engineDirectory -Force
+}
+Copy-Item -LiteralPath $ServiceExecutable -Destination (Join-Path $dispatcherDirectory "nelomai-windows-service.exe") -Force
