@@ -68,6 +68,10 @@ pub struct SwitchJournalV1 {
     schema_version: u32,
     operation_id: String,
     request_fingerprint: String,
+    #[serde(default)]
+    active_reconcile_operation_id: Option<String>,
+    #[serde(default)]
+    active_session_generation: Option<u64>,
     source_identity: Option<RuntimeIdentity>,
     source_device_id: Option<String>,
     source_scope_fingerprint: String,
@@ -80,6 +84,10 @@ pub struct SwitchJournalV1 {
     resume_operation_id: Option<String>,
     decision: Option<SwitchDecision>,
     retry: Option<SwitchRetryV1>,
+    #[serde(default)]
+    supersede_operation_id: Option<String>,
+    #[serde(default)]
+    supersede_target: Option<RuntimeTarget>,
     #[serde(default)]
     local_stop_receipt: Option<LocalStopReceiptV1>,
     #[serde(default)]
@@ -104,6 +112,8 @@ impl SwitchJournalV1 {
             schema_version: SWITCH_SCHEMA_VERSION,
             operation_id,
             request_fingerprint,
+            active_reconcile_operation_id: None,
+            active_session_generation: None,
             source_identity,
             source_device_id,
             source_scope_fingerprint,
@@ -115,6 +125,8 @@ impl SwitchJournalV1 {
             resume_operation_id: None,
             decision: None,
             retry: None,
+            supersede_operation_id: None,
+            supersede_target: None,
             local_stop_receipt: None,
             force_stop_requested: false,
             cancel_requested: false,
@@ -267,6 +279,10 @@ impl SwitchCoordinator {
             || journal.resume_operation_id.is_some()
             || journal.decision.is_some()
             || journal.retry.is_some()
+            || journal.active_reconcile_operation_id.is_some()
+            || journal.active_session_generation.is_some()
+            || journal.supersede_operation_id.is_some()
+            || journal.supersede_target.is_some()
         {
             return Err(SwitchJournalError::Invalid);
         }
@@ -470,7 +486,7 @@ impl SwitchCoordinator {
                         journal.source_scope_fingerprint.clone(),
                         Some(&journal.request_fingerprint),
                     )?;
-                    let receipt = match broker.reconcile_transition(frozen).await {
+                    let receipt = match broker.reconcile_transition(frozen.clone()).await {
                         Ok(receipt) => receipt,
                         Err(BrokerError::Timeout)
                         | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
@@ -498,6 +514,107 @@ impl SwitchCoordinator {
                             retry_after_seconds: delay,
                         });
                     }
+                    if !journal.cancel_requested {
+                        let selection = current_selection(&self.owner, &self.manifest)
+                            .map_err(SwitchJournalError::Io)?;
+                        let desired_slot =
+                            selection.pending_slot.unwrap_or(selection.selected_slot);
+                        let desired = RuntimeTarget::from_identity(
+                            &self
+                                .manifest
+                                .identity(desired_slot, None)
+                                .map_err(|_| SwitchError::RecoveryRequired)?,
+                        );
+                        if desired != journal.target_identity {
+                            let supersede_operation_id = match &journal.supersede_operation_id {
+                                Some(operation_id)
+                                    if journal.supersede_target.as_ref() == Some(&desired) =>
+                                {
+                                    operation_id.clone()
+                                }
+                                Some(_) => return Err(SwitchError::RecoveryRequired),
+                                None => {
+                                    let operation_id = Uuid::new_v4().to_string();
+                                    let saved_operation_id = operation_id.clone();
+                                    let saved_target = desired.clone();
+                                    self.update(|journal| {
+                                        journal.supersede_operation_id = Some(saved_operation_id);
+                                        journal.supersede_target = Some(saved_target);
+                                    })?;
+                                    operation_id
+                                }
+                            };
+                            let superseded = match broker
+                                .supersede_transition(
+                                    &supersede_operation_id,
+                                    frozen,
+                                    desired.clone(),
+                                )
+                                .await
+                            {
+                                Ok(response) => response,
+                                Err(BrokerError::Timeout)
+                                | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
+                                    return Ok(SwitchProgress::Pending {
+                                        retry_after_seconds: delay,
+                                    });
+                                }
+                                Err(error) => return Err(error.into()),
+                            };
+                            if superseded.state == RuntimeSwitchState::Retry {
+                                let delay = superseded
+                                    .retry_after_seconds
+                                    .unwrap_or(delay)
+                                    .max(delay)
+                                    .min(30);
+                                self.update(|journal| {
+                                    journal.retry = Some(SwitchRetryV1 {
+                                        attempt,
+                                        retry_after_seconds: delay,
+                                        retry_not_before_unix_ms: unix_time_ms()
+                                            .saturating_add(u64::from(delay) * 1000),
+                                    });
+                                })?;
+                                return Ok(SwitchProgress::Pending {
+                                    retry_after_seconds: delay,
+                                });
+                            }
+                            let successor_id = superseded.reconcile_operation_id.clone();
+                            let successor_source = broker.transition_source().await?;
+                            let mut successor_request = journal.reconcile_request();
+                            successor_request.operation_id = successor_id.clone();
+                            successor_request.source_identity =
+                                successor_source.identity().cloned();
+                            successor_request.expected_session_generation =
+                                successor_source.expected_session_generation();
+                            successor_request.target_identity = desired.clone();
+                            let successor =
+                                FrozenReconcileRequest::new(successor_request, &successor_source)?;
+                            let successor_fingerprint = successor.request_fingerprint().to_owned();
+                            self.update(|journal| {
+                                journal.active_reconcile_operation_id = Some(successor_id.clone());
+                                journal.active_session_generation =
+                                    successor_source.expected_session_generation();
+                                journal.target_identity = desired;
+                                journal.request_fingerprint = successor_fingerprint;
+                                journal.retry = None;
+                                journal.resume_operation_id = Some(Uuid::new_v4().to_string());
+                                journal.decision = Some(SwitchDecision::Apply);
+                                journal.phase = SwitchPhase::AuthResuming;
+                            })?;
+                            broker
+                                .finish_supersede(
+                                    &supersede_operation_id,
+                                    &superseded.reconcile_operation_id,
+                                )
+                                .await?;
+                            self.update(|journal| {
+                                journal.supersede_operation_id = None;
+                                journal.supersede_target = None;
+                            })?;
+                            continue;
+                        }
+                    }
                     self.update(|journal| {
                         journal.retry = None;
                         journal.resume_operation_id = Some(Uuid::new_v4().to_string());
@@ -510,6 +627,27 @@ impl SwitchCoordinator {
                     })?;
                 }
                 SwitchPhase::AuthResuming => {
+                    if let Some(retry) = &journal.retry {
+                        if unix_time_ms() < retry.retry_not_before_unix_ms {
+                            return Ok(SwitchProgress::Pending {
+                                retry_after_seconds: retry.retry_after_seconds,
+                            });
+                        }
+                    }
+                    if let (Some(operation_id), Some(supersede_target), Some(successor_id)) = (
+                        journal.supersede_operation_id.as_deref(),
+                        journal.supersede_target.as_ref(),
+                        journal.active_reconcile_operation_id.as_deref(),
+                    ) {
+                        if &journal.target_identity == supersede_target {
+                            broker.finish_supersede(operation_id, successor_id).await?;
+                            self.update(|journal| {
+                                journal.supersede_operation_id = None;
+                                journal.supersede_target = None;
+                            })?;
+                            continue;
+                        }
+                    }
                     let decision = journal.decision.ok_or(SwitchError::RecoveryRequired)?;
                     let target = match decision {
                         SwitchDecision::Apply => journal.target_identity.clone(),
@@ -526,16 +664,138 @@ impl SwitchCoordinator {
                                 .resume_operation_id
                                 .clone()
                                 .ok_or(SwitchError::RecoveryRequired)?,
-                            reconcile_operation_id: journal.operation_id.clone(),
+                            reconcile_operation_id: journal
+                                .active_reconcile_operation_id
+                                .clone()
+                                .unwrap_or_else(|| journal.operation_id.clone()),
                             decision: match decision {
                                 SwitchDecision::Apply => "apply",
                                 SwitchDecision::Cancel => "cancel",
                             }
                             .into(),
                             target,
-                            expected_session_generation: journal.expected_session_generation,
+                            expected_session_generation: journal
+                                .active_session_generation
+                                .or(journal.expected_session_generation),
                         })
                         .await?;
+                    if decision == SwitchDecision::Apply {
+                        let selection = current_selection(&self.owner, &self.manifest)
+                            .map_err(SwitchJournalError::Io)?;
+                        let desired_slot =
+                            selection.pending_slot.unwrap_or(selection.selected_slot);
+                        let desired = RuntimeTarget::from_identity(
+                            &self
+                                .manifest
+                                .identity(desired_slot, None)
+                                .map_err(|_| SwitchError::RecoveryRequired)?,
+                        );
+                        if RuntimeTarget::from_identity(resumed.identity()) != desired {
+                            let source = broker.transition_source().await?;
+                            if source.identity() != Some(resumed.identity()) {
+                                return Err(SwitchError::RecoveryRequired);
+                            }
+                            let predecessor = FrozenReconcileRequest::from_persisted(
+                                journal.reconcile_request(),
+                                journal
+                                    .source_device_id
+                                    .clone()
+                                    .ok_or(SwitchError::RecoveryRequired)?,
+                                journal.source_scope_fingerprint.clone(),
+                                Some(&journal.request_fingerprint),
+                            )?;
+                            let operation_id = match &journal.supersede_operation_id {
+                                Some(operation_id)
+                                    if journal.supersede_target.as_ref() == Some(&desired) =>
+                                {
+                                    operation_id.clone()
+                                }
+                                Some(_) => return Err(SwitchError::RecoveryRequired),
+                                None => {
+                                    let operation_id = Uuid::new_v4().to_string();
+                                    let saved_id = operation_id.clone();
+                                    let saved_target = desired.clone();
+                                    self.update(|journal| {
+                                        journal.supersede_operation_id = Some(saved_id);
+                                        journal.supersede_target = Some(saved_target);
+                                    })?;
+                                    operation_id
+                                }
+                            };
+                            let attempt = journal
+                                .retry
+                                .as_ref()
+                                .map_or(1, |retry| retry.attempt.saturating_add(1).min(32));
+                            let delay = retry_delay(attempt);
+                            self.update(|journal| {
+                                journal.retry = Some(SwitchRetryV1 {
+                                    attempt,
+                                    retry_after_seconds: delay,
+                                    retry_not_before_unix_ms: unix_time_ms()
+                                        .saturating_add(u64::from(delay) * 1000),
+                                });
+                            })?;
+                            let superseded = match broker
+                                .supersede_transition(&operation_id, predecessor, desired.clone())
+                                .await
+                            {
+                                Ok(response) => response,
+                                Err(BrokerError::Timeout)
+                                | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
+                                    return Ok(SwitchProgress::Pending {
+                                        retry_after_seconds: delay,
+                                    });
+                                }
+                                Err(error) => return Err(error.into()),
+                            };
+                            if superseded.state == RuntimeSwitchState::Retry {
+                                let delay = superseded
+                                    .retry_after_seconds
+                                    .unwrap_or(delay)
+                                    .max(delay)
+                                    .min(30);
+                                self.update(|journal| {
+                                    journal.retry = Some(SwitchRetryV1 {
+                                        attempt,
+                                        retry_after_seconds: delay,
+                                        retry_not_before_unix_ms: unix_time_ms()
+                                            .saturating_add(u64::from(delay) * 1000),
+                                    });
+                                })?;
+                                return Ok(SwitchProgress::Pending {
+                                    retry_after_seconds: delay,
+                                });
+                            }
+                            let mut successor_request = journal.reconcile_request();
+                            successor_request.operation_id =
+                                superseded.reconcile_operation_id.clone();
+                            successor_request.source_identity = source.identity().cloned();
+                            successor_request.expected_session_generation =
+                                source.expected_session_generation();
+                            successor_request.target_identity = desired.clone();
+                            let successor =
+                                FrozenReconcileRequest::new(successor_request, &source)?;
+                            let successor_id = superseded.reconcile_operation_id.clone();
+                            let successor_fingerprint = successor.request_fingerprint().to_owned();
+                            self.update(|journal| {
+                                journal.active_reconcile_operation_id = Some(successor_id);
+                                journal.active_session_generation =
+                                    source.expected_session_generation();
+                                journal.target_identity = desired;
+                                journal.request_fingerprint = successor_fingerprint;
+                                journal.resume_operation_id = Some(Uuid::new_v4().to_string());
+                                journal.retry = None;
+                            })?;
+                            broker
+                                .finish_supersede(&operation_id, &superseded.reconcile_operation_id)
+                                .await?;
+                            self.update(|journal| {
+                                journal.supersede_operation_id = None;
+                                journal.supersede_target = None;
+                            })?;
+                            continue;
+                        }
+                    }
                     let access = resumed
                         .current_access()
                         .ok_or(SwitchError::RecoveryRequired)?;
@@ -644,7 +904,10 @@ impl RuntimeStartPreflight for SwitchCoordinator {
 impl SwitchJournalV1 {
     fn reconcile_request(&self) -> RuntimeSwitchReconcileRequest {
         RuntimeSwitchReconcileRequest {
-            operation_id: self.operation_id.clone(),
+            operation_id: self
+                .active_reconcile_operation_id
+                .clone()
+                .unwrap_or_else(|| self.operation_id.clone()),
             source_identity: self.source_identity.clone(),
             target_identity: self.target_identity.clone(),
             expected_session_generation: self.expected_session_generation,
@@ -723,6 +986,29 @@ fn validate_journal(journal: &SwitchJournalV1) -> Result<(), SwitchJournalError>
         .as_ref()
         .is_some_and(|value| !canonical_uuid(value))
         || journal.resume_operation_id.is_some() != journal.decision.is_some()
+        || journal
+            .active_reconcile_operation_id
+            .as_ref()
+            .is_some_and(|value| !canonical_uuid(value) || value == &journal.operation_id)
+        || journal.active_reconcile_operation_id.is_some()
+            != journal.active_session_generation.is_some()
+        || journal
+            .active_session_generation
+            .is_some_and(|generation| generation == 0 || generation > i64::MAX as u64)
+        || journal.supersede_operation_id.is_some() != journal.supersede_target.is_some()
+        || journal
+            .supersede_operation_id
+            .as_ref()
+            .is_some_and(|value| !canonical_uuid(value))
+        || journal
+            .supersede_target
+            .as_ref()
+            .is_some_and(|target| target.identity(None).is_err())
+        || journal.supersede_operation_id.is_some()
+            && !matches!(
+                journal.phase,
+                SwitchPhase::ServerReconciling | SwitchPhase::AuthResuming
+            )
         || journal.retry.as_ref().is_some_and(|retry| {
             !(1..=32).contains(&retry.attempt)
                 || !(1..=30).contains(&retry.retry_after_seconds)

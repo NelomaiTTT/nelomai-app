@@ -357,7 +357,7 @@ pub fn run() {
         app.manage(application.clone());
         app.manage(owner_lock);
         app.manage(broker);
-        app.manage(port);
+        app.manage(port.clone());
         app.manage(switch_coordinator.clone());
         app.manage(tunnel.clone());
         app.manage(split_tunnel_scheduler.clone());
@@ -397,7 +397,9 @@ pub fn run() {
             push_registration_scheduler,
         );
         let recovery = switch_coordinator;
+        let logout_recovery = port.clone();
         tauri::async_runtime::spawn(async move {
+            let _ = logout_recovery.recover_logout_cleanup().await;
             if recovery.before_tunnel_start().await.is_ok()
                 && matches!(migration, Some(MigrationOutcome::AwaitingBootstrap))
             {
@@ -1852,6 +1854,7 @@ mod tests {
             Some(nelomai_client_storage::PendingLogoutV1 {
                 operation_id: "synthetic-logout".into(),
                 refresh_proof: "synthetic-refresh".into(),
+                source: None,
             });
         store.save(&pending).unwrap();
         broker.stage_push_cleanup(1).await.unwrap();
@@ -2058,6 +2061,7 @@ mod tests {
             Some(nelomai_client_storage::PendingLogoutV1 {
                 operation_id: "synthetic-logout".into(),
                 refresh_proof: "synthetic-refresh".into(),
+                source: None,
             });
         store.save(&handoff).unwrap();
         broker.stage_push_cleanup(1).await.unwrap();

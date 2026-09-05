@@ -448,7 +448,7 @@ async fn logout(
         return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
     Ok(Json(
-        json!({"code":"session_revoked_cleanup_accepted","cleanup_reconcile_operation_id":"cleanup"}),
+        json!({"code":"session_revoked_cleanup_accepted","cleanup_reconcile_operation_id":"11111111-1111-4111-8111-111111111111"}),
     ))
 }
 async fn resume(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
@@ -1278,6 +1278,7 @@ async fn known_pending_revocation_cannot_be_discarded_by_fresh_login() {
         Some(nelomai_client_storage::PendingLogoutV1 {
             operation_id: "11111111-1111-4111-8111-111111111111".into(),
             refresh_proof: "initial-refresh".into(),
+            source: None,
         });
     store.save(&pending).unwrap();
     assert!(broker

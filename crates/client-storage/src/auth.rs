@@ -130,6 +130,8 @@ pub struct TransitionAuthorityV1 {
     pub resume_refresh_proof: String,
     #[serde(default)]
     pub legacy_refresh_completed: bool,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     pub dispatch_state: TransitionDispatchStateV1,
     pub reconcile_receipt: Option<TransitionReconcileReceiptV1>,
     pub resume_ticket: Option<BrokerRequestV1>,
@@ -147,6 +149,7 @@ impl fmt::Debug for TransitionAuthorityV1 {
             .field("source_scope_fingerprint", &self.source_scope_fingerprint)
             .field("target_identity", &self.target_identity)
             .field("legacy_refresh_completed", &self.legacy_refresh_completed)
+            .field("superseded_by", &self.superseded_by)
             .field("dispatch_state", &self.dispatch_state)
             .field("reconcile_receipt", &self.reconcile_receipt)
             .field("resume_ticket", &self.resume_ticket)
@@ -216,11 +219,60 @@ pub struct CompletedResumeV1 {
 pub struct PendingLogoutV1 {
     pub operation_id: String,
     pub refresh_proof: String,
+    #[serde(default)]
+    pub source: Option<RuntimeLogoutSourceV1>,
 }
 impl fmt::Debug for PendingLogoutV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingLogoutV1")
             .field("operation_id", &self.operation_id)
+            .field("refresh_proof", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogoutSourceV1 {
+    pub auth_epoch: u64,
+    pub family: String,
+    pub identity: Option<RuntimeIdentity>,
+    pub device_id: String,
+    pub scope_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedRuntimeLogoutV1 {
+    pub operation_id: String,
+    pub source: RuntimeLogoutSourceV1,
+    pub code: String,
+    pub cleanup_reconcile_operation_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingRuntimeSupersedeV1 {
+    pub operation_id: String,
+    pub superseded_reconcile_operation_id: String,
+    pub expected_session_generation: Option<u64>,
+    pub target_identity: RuntimeIdentity,
+    pub source: RuntimeLogoutSourceV1,
+    pub refresh_proof: String,
+    pub response_state: Option<String>,
+    pub response_reconcile_operation_id: Option<String>,
+    pub retry_after_seconds: Option<u32>,
+}
+impl fmt::Debug for PendingRuntimeSupersedeV1 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingRuntimeSupersedeV1")
+            .field("operation_id", &self.operation_id)
+            .field(
+                "superseded_reconcile_operation_id",
+                &self.superseded_reconcile_operation_id,
+            )
+            .field("target_identity", &self.target_identity)
+            .field("response_state", &self.response_state)
             .field("refresh_proof", &"<redacted>")
             .finish()
     }
@@ -244,6 +296,10 @@ pub struct AuthStoreV1 {
     pub pending_resume: Option<PendingResumeV1>,
     #[serde(default)]
     pub broker: Option<BrokerMetadataV1>,
+    #[serde(default)]
+    pub completed_runtime_logout: Option<CompletedRuntimeLogoutV1>,
+    #[serde(default)]
+    pub pending_runtime_supersede: Option<PendingRuntimeSupersedeV1>,
 }
 
 impl fmt::Debug for ResumeResultV1 {
@@ -298,6 +354,8 @@ impl AuthStoreV1 {
             confirmed_identity: None,
             pending_resume: None,
             broker: None,
+            completed_runtime_logout: None,
+            pending_runtime_supersede: None,
         }
     }
     pub fn validate(&self) -> Result<(), StorageError> {
@@ -321,6 +379,67 @@ impl AuthStoreV1 {
                 return Err(StorageError::RecoveryRequired(
                     "confirmed generation mismatch",
                 ));
+            }
+        }
+        if let Some(receipt) = &self.completed_runtime_logout {
+            validate_logout_source(&receipt.source)?;
+            if !canonical_uuid(&receipt.operation_id)
+                || !matches!(
+                    receipt.code.as_str(),
+                    "already_inactive" | "session_revoked_cleanup_accepted"
+                )
+                || receipt
+                    .cleanup_reconcile_operation_id
+                    .as_ref()
+                    .is_some_and(|value| !canonical_uuid(value))
+            {
+                return Err(StorageError::RecoveryRequired(
+                    "invalid completed runtime logout",
+                ));
+            }
+        }
+        if let Some(ticket) = &self.pending_runtime_supersede {
+            validate_logout_source(&ticket.source)?;
+            let response_pair =
+                ticket.response_state.is_some() && ticket.response_reconcile_operation_id.is_some();
+            if !canonical_uuid(&ticket.operation_id)
+                || !canonical_uuid(&ticket.superseded_reconcile_operation_id)
+                || ticket.target_identity.validate().is_err()
+                || ticket.target_identity.session_generation.is_some()
+                || ticket.refresh_proof.is_empty()
+                || ticket.refresh_proof.len() > 256
+                || ticket.source.identity.is_none()
+                || ticket.expected_session_generation
+                    != ticket
+                        .source
+                        .identity
+                        .as_ref()
+                        .and_then(|identity| identity.session_generation)
+                || ticket.response_state.is_some() != response_pair
+                || ticket.response_reconcile_operation_id.is_some() != response_pair
+                || (!response_pair && ticket.retry_after_seconds.is_some())
+            {
+                return Err(StorageError::RecoveryRequired(
+                    "invalid runtime supersede ticket",
+                ));
+            }
+            if response_pair {
+                let state = ticket.response_state.as_deref().unwrap_or_default();
+                let response_id = ticket
+                    .response_reconcile_operation_id
+                    .as_deref()
+                    .unwrap_or_default();
+                if !matches!(state, "clean" | "retry")
+                    || !canonical_uuid(response_id)
+                    || (state == "retry" && response_id != ticket.superseded_reconcile_operation_id)
+                    || ticket
+                        .retry_after_seconds
+                        .is_some_and(|seconds| !(1..=30).contains(&seconds))
+                {
+                    return Err(StorageError::RecoveryRequired(
+                        "invalid runtime supersede response",
+                    ));
+                }
             }
         }
         if let Some(pending) = &self.pending_resume {
@@ -436,6 +555,9 @@ impl AuthStoreV1 {
                 if logout.operation_id.is_empty() || logout.refresh_proof.is_empty() {
                     return Err(StorageError::RecoveryRequired("invalid logout proof"));
                 }
+                if let Some(source) = &logout.source {
+                    validate_logout_source(source)?;
+                }
             }
             if let Some(recovery) = &meta.pending_recovery {
                 recovery
@@ -467,6 +589,24 @@ impl AuthStoreV1 {
             }
             for authority in &meta.transition_authorities {
                 validate_transition_authority(authority, &validate_request)?;
+                if authority.superseded_by.as_ref().is_some_and(|successor| {
+                    meta.transition_authorities.iter().all(|candidate| {
+                        &candidate.reconcile_operation_id != successor
+                            || candidate.source_auth_epoch != authority.source_auth_epoch
+                            || candidate.source_device_id != authority.source_device_id
+                            || ((candidate.source_family != authority.source_family
+                                || candidate.source_identity != authority.source_identity
+                                || candidate.source_scope_fingerprint
+                                    != authority.source_scope_fingerprint)
+                                && authority.resume_evidence.as_ref().is_none_or(|evidence| {
+                                    candidate.source_identity.as_ref() != Some(&evidence.identity)
+                                }))
+                    })
+                }) {
+                    return Err(StorageError::RecoveryRequired(
+                        "invalid transition supersede lineage",
+                    ));
+                }
             }
         }
         Ok(())
@@ -483,6 +623,25 @@ fn valid_ids(values: &[String]) -> bool {
             !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
         })
         && values.iter().collect::<HashSet<_>>().len() == values.len()
+}
+
+fn validate_logout_source(source: &RuntimeLogoutSourceV1) -> Result<(), StorageError> {
+    let identity_valid = match &source.identity {
+        Some(identity) => identity.validate().is_ok() && identity.session_generation.is_some(),
+        None => true,
+    };
+    if !identity_valid
+        || source.family.is_empty()
+        || source.family.len() > 128
+        || source.device_id.is_empty()
+        || source.device_id.len() > 256
+        || !valid_digest(&source.scope_fingerprint)
+    {
+        return Err(StorageError::RecoveryRequired(
+            "invalid runtime logout source",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_transition_authority(
@@ -514,6 +673,10 @@ fn validate_transition_authority(
         || authority.resume_refresh_proof.is_empty()
         || authority.resume_refresh_proof.len() > 256
         || (authority.source_identity.is_some() && authority.legacy_refresh_completed)
+        || authority
+            .superseded_by
+            .as_ref()
+            .is_some_and(|value| !canonical_uuid(value))
         || (authority.dispatch_state == TransitionDispatchStateV1::ResponseKnown)
             != authority.reconcile_receipt.is_some()
     {

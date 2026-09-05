@@ -35,11 +35,18 @@ use std::sync::{
 use tokio::sync::Notify;
 
 fn manifest() -> nelomai_contracts::VerifiedContainerManifest {
+    manifest_for("0.2.16", "0.2.16")
+}
+
+fn manifest_for(
+    container_version: &str,
+    runtime_version: &str,
+) -> nelomai_contracts::VerifiedContainerManifest {
     use ed25519_dalek::{Signer, SigningKey};
     let manifest = ContainerManifestV1 {
         format_version: 1,
-        container_version: "0.2.16".into(),
-        release_set_id: "runtime-0.2.16".into(),
+        container_version: container_version.into(),
+        release_set_id: format!("runtime-{runtime_version}"),
         minimum_runtime_contract: 1,
         maximum_runtime_contract: 1,
         stable_release_set_sha256: None,
@@ -48,7 +55,7 @@ fn manifest() -> nelomai_contracts::VerifiedContainerManifest {
             slot: RuntimeSlot::Latest,
             manifest: RuntimeArtifactManifestV1 {
                 format_version: 1,
-                runtime_version: "0.2.16".into(),
+                runtime_version: runtime_version.into(),
                 source_commit: "0123456789abcdef0123456789abcdef01234567".into(),
                 platform: "linux".into(),
                 architecture: "x86_64".into(),
@@ -227,6 +234,9 @@ struct SwitchControl {
     race_writer: AtomicUsize,
     writer_waiting: Arc<Notify>,
     writer_acquired: Arc<AtomicUsize>,
+    hold_completion: AtomicUsize,
+    completion_entered: Notify,
+    completion_release: Notify,
 }
 #[async_trait]
 impl RuntimeSwitchControl for SwitchControl {
@@ -293,6 +303,10 @@ impl RuntimeSwitchControl for SwitchControl {
         _receipt: &LocalStopReceiptV1,
         _access: &nelomai_client_api::AccessSnapshot,
     ) -> Result<(), BrokerError> {
+        if self.hold_completion.load(Ordering::SeqCst) == 1 {
+            self.completion_entered.notify_one();
+            self.completion_release.notified().await;
+        }
         self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -365,6 +379,8 @@ struct Panel {
     return_retry: AtomicUsize,
     reconcile_bodies: Mutex<Vec<Value>>,
     resume_calls: AtomicUsize,
+    supersede_calls: AtomicUsize,
+    supersede_bodies: Mutex<Vec<Value>>,
     hold_resume: AtomicUsize,
     resume_entered: Notify,
     resume_release: Notify,
@@ -467,6 +483,15 @@ async fn resume(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Jso
         "runtime_slot":body["target_identity"]["runtime_slot"],"session_generation":generation},
         "access_token":"runtime-access","token_type":"Bearer","access_expires_in":900}),
     )
+}
+async fn supersede(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
+    state.supersede_calls.fetch_add(1, Ordering::SeqCst);
+    state.supersede_bodies.lock().unwrap().push(body);
+    Json(json!({
+        "state":"clean",
+        "reconcile_operation_id":"44444444-4444-4444-8444-444444444444",
+        "retry_after_seconds":null
+    }))
 }
 
 #[tokio::test]
@@ -640,6 +665,7 @@ async fn panel(state: Arc<Panel>) -> (nelomai_client_api::ClientApi, tokio::task
             post(reconcile),
         )
         .route("/api/client/v1/auth/runtime/resume", post(resume))
+        .route("/api/client/v1/auth/runtime/supersede", post(supersede))
         .route("/api/client/v1/auth/logout-runtime", post(logout))
         .route("/api/client/v1/auth/login", post(login))
         .with_state(state);
@@ -774,6 +800,52 @@ async fn broker_persists_and_replays_the_exact_server_full_device_snapshot() {
     let replay = reopened.reconcile_transition(frozen).await.unwrap();
     assert_eq!(replay, first);
     assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn clean_supersede_is_protected_replay_and_exposes_only_the_successor_authority() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let predecessor = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    broker
+        .reconcile_transition(predecessor.clone())
+        .await
+        .unwrap();
+    let operation_id = "33333333-3333-4333-8333-333333333333";
+    let first = broker
+        .supersede_transition(operation_id, predecessor.clone(), stable_target())
+        .await
+        .unwrap();
+    let replay = broker
+        .supersede_transition(operation_id, predecessor.clone(), stable_target())
+        .await
+        .unwrap();
+    assert_eq!(first, replay);
+    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.supersede_bodies.lock().unwrap().len(), 1);
+
+    let mut successor_request = predecessor.request().clone();
+    successor_request.operation_id = first.reconcile_operation_id.clone();
+    successor_request.target_identity = stable_target();
+    let successor = FrozenReconcileRequest::new(successor_request, &source).unwrap();
+    assert_eq!(
+        broker.reconcile_transition(successor).await.unwrap().state,
+        RuntimeSwitchState::Clean
+    );
+    broker
+        .finish_supersede(operation_id, &first.reconcile_operation_id)
+        .await
+        .unwrap();
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_runtime_supersede
+        .is_none());
     server.abort();
 }
 
@@ -1115,6 +1187,7 @@ fn insert_reconcile_authority(
         cleanup_access_proof: auth.access_token.clone().unwrap(),
         resume_refresh_proof: auth.refresh_token.clone().unwrap(),
         legacy_refresh_completed: false,
+        superseded_by: None,
         dispatch_state,
         reconcile_receipt: None,
         resume_ticket: None,
@@ -1489,6 +1562,145 @@ async fn coordinator_persists_bounded_retry_before_an_offline_dispatch() {
         reopened.status().unwrap().phase,
         Some(SwitchPhase::ServerReconciling)
     );
+}
+
+#[tokio::test]
+async fn updated_manifest_supersedes_only_the_clean_predecessor_and_resumes_successor() {
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let first = SwitchCoordinator::open(owner.clone(), manifest())
+        .unwrap()
+        .attach(broker.clone(), control.clone());
+    assert!(matches!(
+        first.request(RuntimeSlot::Latest).await.unwrap(),
+        SwitchProgress::Pending { .. }
+    ));
+    drop(first);
+
+    let journal_path = root.path().join("common/runtime-switch-v1.json");
+    let mut journal: Value =
+        serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    journal["retry"]["retry_not_before_unix_ms"] = json!(1);
+    std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.17".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let updated = SwitchCoordinator::open(owner, manifest_for("0.2.17", "0.2.17"))
+        .unwrap()
+        .attach(broker, control);
+    let result = updated.recover().await;
+    assert!(
+        matches!(result, Ok(SwitchProgress::Ready)),
+        "{result:?}; reconcile={}, supersede={}, resume={}, pending={:?}, authorities={:?}, journal={}",
+        state.reconcile_calls.load(Ordering::SeqCst),
+        state.supersede_calls.load(Ordering::SeqCst),
+        state.resume_calls.load(Ordering::SeqCst),
+        store.load().unwrap().unwrap().pending_runtime_supersede,
+        store
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .transition_authorities
+            .iter()
+            .map(|authority| (&authority.reconcile_operation_id, &authority.request_fingerprint))
+            .collect::<Vec<_>>(),
+        serde_json::from_slice::<Value>(&std::fs::read(&journal_path).unwrap()).unwrap()
+    );
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(updated.status().unwrap().selected_slot, RuntimeSlot::Latest);
+    server.abort();
+}
+
+#[tokio::test]
+async fn lost_committed_old_apply_is_replayed_without_old_admission_then_superseded() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let broker = Arc::new(AuthBroker::new(api, store, Arc::new(Stop)).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    control.hold_completion.store(1, Ordering::SeqCst);
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let old = Arc::new(
+        SwitchCoordinator::open(owner.clone(), manifest())
+            .unwrap()
+            .attach(broker.clone(), control.clone()),
+    );
+    let request_owner = old.clone();
+    let request = tokio::spawn(async move { request_owner.request(RuntimeSlot::Latest).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        control.completion_entered.notified(),
+    )
+    .await
+    .unwrap();
+    request.abort();
+    let _ = request.await;
+    drop(old);
+    control.hold_completion.store(0, Ordering::SeqCst);
+    control.completion_release.notify_waiters();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.17".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let updated = SwitchCoordinator::open(owner, manifest_for("0.2.17", "0.2.17"))
+        .unwrap()
+        .attach(broker, control.clone());
+
+    assert_eq!(updated.recover().await.unwrap(), SwitchProgress::Ready);
+    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(control.completions.load(Ordering::SeqCst), 1);
+    server.abort();
 }
 
 #[tokio::test]

@@ -301,7 +301,8 @@ fn recovered_journal_rejects_every_snapshot_source_and_envelope_crosslink_break(
     let target =
         RuntimeTarget::from_identity(&manifest().identity(RuntimeSlot::Latest, None).unwrap());
     let valid = enrolled_journal_with_snapshot(target);
-    let mutations: Vec<Box<dyn Fn(&mut serde_json::Value)>> = vec![
+    type JournalMutation = Box<dyn Fn(&mut serde_json::Value)>;
+    let mutations: Vec<JournalMutation> = vec![
         Box::new(|value| value["runtime_snapshot"]["slot"] = serde_json::json!("latest")),
         Box::new(|value| value["runtime_snapshot"]["runtime_version"] = serde_json::json!("9.9.9")),
         Box::new(|value| value["runtime_snapshot"]["cleanup_only"] = serde_json::json!(true)),

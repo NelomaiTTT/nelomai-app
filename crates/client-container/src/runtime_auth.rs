@@ -11,7 +11,8 @@ use nelomai_client_core::{
     CoreError, CoreLocalStop, RuntimeAuthProvider, RuntimeWriterGates, RuntimeWriterQuiescence,
 };
 use nelomai_client_storage::{
-    RuntimeAuthScope, RuntimeCleanupSnapshotV1, RuntimeRecordOwner, RuntimeStateStore,
+    CompletedRuntimeLogoutV1, RuntimeAuthScope, RuntimeCleanupSnapshotV1, RuntimeRecordOwner,
+    RuntimeStateStore,
 };
 use nelomai_client_tunnel::TunnelController;
 use nelomai_contracts::Platform;
@@ -43,6 +44,11 @@ pub trait RuntimeAdmission: Send + Sync {
     fn bind_empty(
         &self,
         access: &AccessSnapshot,
+        quiescence: &RuntimeWriterQuiescence,
+    ) -> Result<(), CoreError>;
+    fn complete_logout(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
         quiescence: &RuntimeWriterQuiescence,
     ) -> Result<(), CoreError>;
 }
@@ -258,8 +264,65 @@ impl<S: RuntimeStateStore> RuntimeAdmission for RuntimeCacheAdmission<S> {
             .bind_empty_scope(&Self::scope(access))
             .map_err(|_| CoreError::AuthRecoveryRequired)
     }
+    fn complete_logout(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+        _quiescence: &RuntimeWriterQuiescence,
+    ) -> Result<(), CoreError> {
+        let snapshot = self
+            .owner
+            .cleanup_snapshot()
+            .map_err(|_| CoreError::AuthRecoveryRequired)?;
+        let exact_runtime = receipt.source.identity.as_ref().is_none_or(|identity| {
+            snapshot.slot == identity.slot && snapshot.runtime_version == identity.runtime_version
+        });
+        if exact_runtime
+            && snapshot.auth_scope.is_none()
+            && snapshot.lease_ids.is_empty()
+            && snapshot.operations.is_empty()
+            && !snapshot.cleanup_only
+        {
+            return Ok(());
+        }
+        let matches = match (&receipt.source.identity, &snapshot.auth_scope) {
+            (None, None) => snapshot.cleanup_only,
+            (Some(identity), Some(scope)) => {
+                &scope.identity == identity
+                    && scope.auth_epoch == receipt.source.auth_epoch
+                    && scope.family == receipt.source.family
+                    && snapshot.slot == identity.slot
+                    && snapshot.runtime_version == identity.runtime_version
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(CoreError::AuthRecoveryRequired);
+        }
+        self.owner
+            .complete_cleanup(&snapshot)
+            .map_err(|_| CoreError::AuthRecoveryRequired)
+    }
 }
 impl OwnerRuntimeAuth {
+    pub async fn recover_logout_cleanup(&self) -> Result<(), CoreError> {
+        let Some(receipt) = self
+            .broker
+            .completed_runtime_logout()
+            .await
+            .map_err(map_error)?
+        else {
+            return Ok(());
+        };
+        let quiescence = tokio::time::timeout(OWNER_REQUEST_BUDGET, self.writers.quiesce())
+            .await
+            .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?;
+        self.admission.complete_logout(&receipt, &quiescence)?;
+        self.broker
+            .finish_runtime_logout_cleanup(&receipt)
+            .await
+            .map_err(map_error)
+    }
+
     pub async fn recover_background<F, Fut>(&self, dispatch: F) -> Result<AccessSnapshot, CoreError>
     where
         F: FnOnce(crate::NativeAuthRequest) -> Fut,
@@ -444,7 +507,24 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
         }
     }
     async fn logout(&self) -> Result<(), CoreError> {
-        self.broker.logout().await.map_err(map_error)
+        self.broker.logout().await.map_err(map_error)?;
+        let broker = self.broker.clone();
+        let admission = self.admission.clone();
+        let writers = self.writers.clone();
+        tokio::spawn(async move {
+            let Ok(quiescence) =
+                tokio::time::timeout(OWNER_REQUEST_BUDGET, writers.quiesce()).await
+            else {
+                return;
+            };
+            let Ok(Some(receipt)) = broker.completed_runtime_logout().await else {
+                return;
+            };
+            if admission.complete_logout(&receipt, &quiescence).is_ok() {
+                let _ = broker.finish_runtime_logout_cleanup(&receipt).await;
+            }
+        });
+        Ok(())
     }
 }
 

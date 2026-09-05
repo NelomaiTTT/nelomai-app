@@ -46,6 +46,7 @@ fn transition_authority() -> TransitionAuthorityV1 {
         cleanup_access_proof: "synthetic-access-proof".into(),
         resume_refresh_proof: "synthetic-refresh-proof".into(),
         legacy_refresh_completed: false,
+        superseded_by: None,
         dispatch_state: TransitionDispatchStateV1::Captured,
         reconcile_receipt: None,
         resume_ticket: None,
@@ -240,6 +241,7 @@ fn logout_proof_is_protected_payload_not_debug_output() {
     let proof = PendingLogoutV1 {
         operation_id: "op".into(),
         refresh_proof: "synthetic-proof".into(),
+        source: None,
     };
     assert!(serde_json::to_string(&proof)
         .unwrap()

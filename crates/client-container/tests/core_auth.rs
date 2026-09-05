@@ -124,7 +124,7 @@ struct Panel {
 async fn logout(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
     panel.proofs.lock().unwrap().push(body);
     Json(
-        json!({"code":"session_revoked_cleanup_accepted","cleanup_reconcile_operation_id":"synthetic-cleanup"}),
+        json!({"code":"session_revoked_cleanup_accepted","cleanup_reconcile_operation_id":"11111111-1111-4111-8111-111111111111"}),
     )
 }
 async fn bearer(State(panel): State<Arc<Panel>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -206,6 +206,9 @@ async fn exercise_logout(fail_stop: bool, new_login: bool) {
     let local = CoreLocalStop::new(tunnel.clone());
     let broker =
         Arc::new(AuthBroker::new(api.as_ref().clone(), auth.clone(), local.clone()).unwrap());
+    let mut enrolled = auth.load().unwrap().unwrap();
+    enrolled.broker.as_mut().unwrap().confirmed_device_id = Some("device-a".into());
+    auth.save(&enrolled).unwrap();
     let access = broker.observe().await.unwrap().access.unwrap();
     let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
     let mut runtime_value =
@@ -326,10 +329,18 @@ async fn exercise_logout(fail_stop: bool, new_login: bool) {
         Phase::SignedOut
     );
     assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
-    assert_eq!(
-        operational.load().unwrap().unwrap().saved_connection,
-        legacy.saved_connection
-    );
+    for _ in 0..20 {
+        if operational
+            .load()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|state| state.saved_connection.is_none())
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(operational.load().unwrap().unwrap().saved_connection, None);
     assert_eq!(
         panel.proofs.lock().unwrap()[0]["refresh_token"],
         "synthetic-refresh"
@@ -341,31 +352,35 @@ async fn exercise_logout(fail_stop: bool, new_login: bool) {
         .exists());
     if new_login {
         tunnel.hold_start.store(false, Ordering::SeqCst);
-        let retained = operational.load().unwrap();
         let starts = tunnel.starts.load(Ordering::SeqCst);
-        assert!(application
+        application
             .login(
                 nelomai_client_application::LoginParameters {
                     login: "b".into(),
                     password: "synthetic-password".into(),
                     device_name: "synthetic".into(),
                 },
-                1100
+                1100,
             )
             .await
-            .is_err());
+            .unwrap();
         assert_eq!(
             auth.load().unwrap().unwrap().access_token.as_deref(),
             Some("b-access")
         );
         assert_eq!(
             port.state().await.unwrap(),
-            nelomai_client_api::RuntimeAuthState::RecoveryRequired
+            nelomai_client_api::RuntimeAuthState::Active
         );
-        assert!(application.bootstrap(1100).await.is_err());
+        application.bootstrap(1100).await.unwrap();
         assert!(application.start_saved_stray_offline(1100).await.is_err());
         assert_eq!(tunnel.starts.load(Ordering::SeqCst), starts);
-        assert_eq!(operational.load().unwrap(), retained);
+        assert!(operational
+            .load()
+            .unwrap()
+            .unwrap()
+            .saved_connection
+            .is_none());
     }
     server.abort();
 }

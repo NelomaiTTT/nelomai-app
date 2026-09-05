@@ -4,12 +4,14 @@
 use async_trait::async_trait;
 use nelomai_client_api::{
     AccessSnapshot, ClientApi, ClientApiError, LoginRequest, RuntimeLogoutRequest,
-    RuntimeResumeRequest, RuntimeSwitchReconcileRequest, RuntimeSwitchReconcileResponse,
-    RuntimeSwitchState, RuntimeTarget, TokenResponse,
+    RuntimeResumeRequest, RuntimeSupersedeRequest, RuntimeSupersedeResponse,
+    RuntimeSwitchReconcileRequest, RuntimeSwitchReconcileResponse, RuntimeSwitchState,
+    RuntimeTarget, TokenResponse,
 };
 use nelomai_client_storage::{
     AuthStore, AuthStoreV1, BrokerMetadataV1, BrokerRequestKind, BrokerRequestV1,
-    CompletedResumeV1, LogoutState, PendingLogoutV1, StorageError, StoredResumeArgumentsV1,
+    CompletedResumeV1, CompletedRuntimeLogoutV1, LogoutState, PendingLogoutV1,
+    PendingRuntimeSupersedeV1, RuntimeLogoutSourceV1, StorageError, StoredResumeArgumentsV1,
     TransitionAuthorityV1, TransitionReconcileReceiptV1, TransitionResumeEvidenceV1,
     MAX_TRANSITION_AUTHORITIES,
 };
@@ -728,6 +730,7 @@ impl AuthBroker {
                         .clone()
                         .ok_or(BrokerError::RecoveryRequired)?,
                     legacy_refresh_completed: false,
+                    superseded_by: None,
                     dispatch_state: TransitionDispatchStateV1::Captured,
                     reconcile_receipt: None,
                     resume_ticket: None,
@@ -947,6 +950,244 @@ impl AuthBroker {
         Err(BrokerError::RecoveryRequired)
     }
 
+    pub async fn supersede_transition(
+        &self,
+        operation_id: &str,
+        predecessor: FrozenReconcileRequest,
+        target: RuntimeTarget,
+    ) -> Result<RuntimeSupersedeResponse, BrokerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let _issuance = self.issuance.lock().await;
+            self.supersede_transition_locked(operation_id, predecessor, target)
+                .await
+        })
+        .await
+        .map_err(|_| BrokerError::Timeout)?
+    }
+
+    async fn supersede_transition_locked(
+        &self,
+        operation_id: &str,
+        predecessor: FrozenReconcileRequest,
+        target: RuntimeTarget,
+    ) -> Result<RuntimeSupersedeResponse, BrokerError> {
+        let canonical =
+            Uuid::parse_str(operation_id).is_ok_and(|parsed| parsed.to_string() == operation_id);
+        target.identity(None)?;
+        if !canonical {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        let ticket = {
+            let _state = self.state.lock().await;
+            let mut auth = self.load()?;
+            Self::active(&auth)?;
+            let current = Self::transition_source_from_auth(&auth)?;
+            if current.identity.is_none() {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            let authority = auth
+                .broker
+                .as_ref()
+                .and_then(|meta| {
+                    meta.transition_authorities.iter().find(|authority| {
+                        authority.reconcile_operation_id == predecessor.request.operation_id
+                    })
+                })
+                .ok_or(BrokerError::RecoveryRequired)?;
+            Self::match_transition_authority(authority, &predecessor)?;
+            if authority
+                .reconcile_receipt
+                .as_ref()
+                .is_none_or(|receipt| receipt.state != "clean")
+                || (authority.source_identity.as_ref() != current.identity.as_ref()
+                    && authority
+                        .resume_evidence
+                        .as_ref()
+                        .map(|evidence| &evidence.identity)
+                        != current.identity.as_ref())
+            {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            let source = RuntimeLogoutSourceV1 {
+                auth_epoch: current.auth_epoch,
+                family: current.family,
+                identity: current.identity,
+                device_id: current.device_id,
+                scope_fingerprint: current.scope_fingerprint,
+            };
+            let expected = PendingRuntimeSupersedeV1 {
+                operation_id: operation_id.into(),
+                superseded_reconcile_operation_id: predecessor.request.operation_id.clone(),
+                expected_session_generation: source
+                    .identity
+                    .as_ref()
+                    .and_then(|identity| identity.session_generation),
+                target_identity: target.identity(None)?,
+                source,
+                refresh_proof: auth
+                    .refresh_token
+                    .clone()
+                    .ok_or(BrokerError::RecoveryRequired)?,
+                response_state: None,
+                response_reconcile_operation_id: None,
+                retry_after_seconds: None,
+            };
+            match auth.pending_runtime_supersede.clone() {
+                Some(saved) => {
+                    let mut request_only = saved.clone();
+                    request_only.response_state = None;
+                    request_only.response_reconcile_operation_id = None;
+                    request_only.retry_after_seconds = None;
+                    if request_only != expected {
+                        return Err(BrokerError::RecoveryRequired);
+                    }
+                    if let (Some(state), Some(reconcile_operation_id)) = (
+                        saved.response_state.as_deref(),
+                        saved.response_reconcile_operation_id.as_ref(),
+                    ) {
+                        if state == "clean" {
+                            return Ok(RuntimeSupersedeResponse {
+                                state: RuntimeSwitchState::Clean,
+                                reconcile_operation_id: reconcile_operation_id.clone(),
+                                retry_after_seconds: saved.retry_after_seconds,
+                            });
+                        }
+                        if state != "retry" {
+                            return Err(BrokerError::RecoveryRequired);
+                        }
+                        auth.pending_runtime_supersede = Some(request_only.clone());
+                        self.save_transition_write(&auth)?;
+                        request_only
+                    } else {
+                        saved
+                    }
+                }
+                None => {
+                    auth.pending_runtime_supersede = Some(expected.clone());
+                    self.save_transition_write(&auth)?;
+                    expected
+                }
+            }
+        };
+        let request = RuntimeSupersedeRequest {
+            refresh_token: ticket.refresh_proof.clone(),
+            operation_id: ticket.operation_id.clone(),
+            superseded_reconcile_operation_id: ticket.superseded_reconcile_operation_id.clone(),
+            expected_session_generation: ticket.expected_session_generation,
+            target_identity: target.clone(),
+        };
+        let response = self.api.supersede_runtime(&request).await?;
+        if (response.state == RuntimeSwitchState::Retry
+            && response.reconcile_operation_id != ticket.superseded_reconcile_operation_id)
+            || (response.state == RuntimeSwitchState::Clean
+                && response.reconcile_operation_id == ticket.superseded_reconcile_operation_id)
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        if auth.pending_runtime_supersede.as_ref() != Some(&ticket) {
+            return Err(BrokerError::Cancelled);
+        }
+        let current = Self::transition_source_from_auth(&auth)?;
+        if current.auth_epoch != ticket.source.auth_epoch
+            || current.family != ticket.source.family
+            || current.identity != ticket.source.identity
+            || current.device_id != ticket.source.device_id
+            || current.scope_fingerprint != ticket.source.scope_fingerprint
+        {
+            return Err(BrokerError::Cancelled);
+        }
+        if response.state == RuntimeSwitchState::Clean {
+            let mut request = predecessor.request.clone();
+            request.operation_id = response.reconcile_operation_id.clone();
+            request.source_identity = current.identity.clone();
+            request.expected_session_generation = current.expected_session_generation;
+            request.target_identity = target.clone();
+            let successor = FrozenReconcileRequest::new(request, &current)?;
+            let source_identity = current.identity.clone();
+            let cleanup_access_proof = auth
+                .access_token
+                .clone()
+                .ok_or(BrokerError::RecoveryRequired)?;
+            let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+            if meta.transition_authorities.len() >= MAX_TRANSITION_AUTHORITIES {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            let predecessor_authority = meta
+                .transition_authorities
+                .iter_mut()
+                .find(|authority| {
+                    authority.reconcile_operation_id == ticket.superseded_reconcile_operation_id
+                })
+                .ok_or(BrokerError::RecoveryRequired)?;
+            predecessor_authority.superseded_by = Some(response.reconcile_operation_id.clone());
+            meta.transition_authorities.push(TransitionAuthorityV1 {
+                schema_version: 1,
+                reconcile_operation_id: response.reconcile_operation_id.clone(),
+                request_fingerprint: successor.request_fingerprint,
+                source_auth_epoch: current.auth_epoch,
+                source_family: current.family.clone(),
+                source_identity,
+                source_device_id: current.device_id,
+                source_scope_fingerprint: current.scope_fingerprint,
+                expected_session_generation: current.expected_session_generation,
+                target_identity: target.identity(None)?,
+                cleanup_contract_version: predecessor.request.cleanup_contract_version,
+                cleanup_access_proof,
+                resume_refresh_proof: ticket.refresh_proof.clone(),
+                legacy_refresh_completed: false,
+                superseded_by: None,
+                dispatch_state: TransitionDispatchStateV1::ResponseKnown,
+                reconcile_receipt: Some(TransitionReconcileReceiptV1 {
+                    state: "clean".into(),
+                    operation_id: response.reconcile_operation_id.clone(),
+                    retired_lease_ids: Vec::new(),
+                    retired_session_ids: Vec::new(),
+                    retired_operation_ids: Vec::new(),
+                    retry_after_seconds: None,
+                }),
+                resume_ticket: None,
+                resume_evidence: None,
+            });
+        }
+        let saved = auth
+            .pending_runtime_supersede
+            .as_mut()
+            .ok_or(BrokerError::RecoveryRequired)?;
+        saved.response_state = Some(
+            match response.state {
+                RuntimeSwitchState::Clean => "clean",
+                RuntimeSwitchState::Retry => "retry",
+            }
+            .into(),
+        );
+        saved.response_reconcile_operation_id = Some(response.reconcile_operation_id.clone());
+        saved.retry_after_seconds = response.retry_after_seconds;
+        self.save_transition_write(&auth)?;
+        Ok(response)
+    }
+
+    pub async fn finish_supersede(
+        &self,
+        operation_id: &str,
+        reconcile_operation_id: &str,
+    ) -> Result<(), BrokerError> {
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        let Some(ticket) = auth.pending_runtime_supersede.as_ref() else {
+            return Ok(());
+        };
+        if ticket.operation_id != operation_id
+            || ticket.response_state.as_deref() != Some("clean")
+            || ticket.response_reconcile_operation_id.as_deref() != Some(reconcile_operation_id)
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        auth.pending_runtime_supersede = None;
+        self.save_transition_write(&auth)
+    }
+
     fn match_transition_authority(
         authority: &TransitionAuthorityV1,
         frozen: &FrozenReconcileRequest,
@@ -1005,6 +1246,7 @@ impl AuthBroker {
         let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
         if meta.transition_authorities.iter().any(|authority| {
             authority.resume_evidence.is_none()
+                && authority.superseded_by.is_none()
                 && auth.auth_epoch == authority.source_auth_epoch
                 && meta.family == authority.source_family
                 && auth.confirmed_identity == authority.source_identity
@@ -1434,6 +1676,7 @@ impl AuthBroker {
             meta.pending_logout = Some(PendingLogoutV1 {
                 operation_id: Uuid::new_v4().to_string(),
                 refresh_proof: response.refresh_token,
+                source: None,
             });
             meta.cancelled_login = None;
             meta.pending_request = None;
@@ -2003,6 +2246,15 @@ impl AuthBroker {
                     .map_err(|_| BrokerError::Timeout)?;
             }
             if auth.logout_state == LogoutState::Active {
+                let logout_source = Self::transition_source_from_auth(&auth).ok().map(|source| {
+                    RuntimeLogoutSourceV1 {
+                        auth_epoch: source.auth_epoch,
+                        family: source.family,
+                        identity: source.identity,
+                        device_id: source.device_id,
+                        scope_fingerprint: source.scope_fingerprint,
+                    }
+                });
                 let never_authenticated = auth.confirmed_identity.is_none()
                     && auth.access_token.is_none()
                     && auth.refresh_token.is_none()
@@ -2071,6 +2323,7 @@ impl AuthBroker {
                         .map(|refresh_proof| PendingLogoutV1 {
                             operation_id: Uuid::new_v4().to_string(),
                             refresh_proof,
+                            source: logout_source,
                         });
                 self.store.save(&auth)?;
             }
@@ -2133,12 +2386,52 @@ impl AuthBroker {
         auth.refresh_token = None;
         auth.pending_resume = None;
         auth.logout_state = LogoutState::LoggedOut;
+        auth.completed_runtime_logout =
+            proof.source.clone().map(|source| CompletedRuntimeLogoutV1 {
+                operation_id: proof.operation_id.clone(),
+                source,
+                code: response.code.clone(),
+                cleanup_reconcile_operation_id: response.cleanup_reconcile_operation_id.clone(),
+            });
         let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
         meta.pending_logout = None;
         meta.completed_resume = None;
         meta.pending_login_account = None;
         self.store.save(&auth)?;
         stop
+    }
+
+    pub async fn completed_runtime_logout(
+        &self,
+    ) -> Result<Option<CompletedRuntimeLogoutV1>, BrokerError> {
+        let _state = self.state.lock().await;
+        Ok(self.load()?.completed_runtime_logout)
+    }
+
+    pub async fn finish_runtime_logout_cleanup(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+    ) -> Result<(), BrokerError> {
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        match auth.completed_runtime_logout.as_ref() {
+            None => return Ok(()),
+            Some(current) if current == receipt => {}
+            Some(_) => return Err(BrokerError::Cancelled),
+        }
+        if auth
+            .pending_runtime_supersede
+            .as_ref()
+            .is_some_and(|ticket| {
+                ticket.source.family == receipt.source.family
+                    && ticket.source.device_id == receipt.source.device_id
+            })
+        {
+            auth.pending_runtime_supersede = None;
+        }
+        auth.completed_runtime_logout = None;
+        self.store.save(&auth)?;
+        Ok(())
     }
 
     /// Owner-only: issue provenance before invoking a platform recovery. The
