@@ -1,8 +1,9 @@
 use crate::platform;
 use nelomai_client_api::AccessSnapshot;
+use nelomai_client_container::{SwitchCoordinator, UpdateBarrier, UpdatePrepare};
 use nelomai_client_updater::{
-    FileUpdatePreferenceStore, UpdateCoordinator, UpdateOffer, UpdatePhase, UpdatePreferenceStore,
-    UpdatePreferences,
+    FileUpdatePreferenceStore, UpdateBarrierError, UpdateBarrierPhase, UpdateCoordinator,
+    UpdateInstallBarrier, UpdateOffer, UpdatePhase, UpdatePreferenceStore, UpdatePreferences,
 };
 use nelomai_contracts::UpdateState;
 use serde::Serialize;
@@ -43,10 +44,45 @@ pub struct NativeUpdater {
     current_preferences: Mutex<UpdatePreferences>,
     observed_offer: Mutex<Option<UpdateOffer>>,
     refresh_gate: UpdateRefreshGate,
+    barrier: Arc<UpdateBarrier>,
+    installed_container_version: String,
     #[cfg(desktop)]
     coordinator: Option<UpdateCoordinator<platform::updater::DesktopUpdateBackend<Wry>>>,
     #[cfg(target_os = "android")]
     coordinator: Option<UpdateCoordinator<platform::android_updater::AndroidUpdateBackend<Wry>>>,
+}
+
+struct ManagedUpdateBarrier(Arc<UpdateBarrier>);
+
+#[async_trait::async_trait]
+impl UpdateInstallBarrier for ManagedUpdateBarrier {
+    async fn prepare(
+        &self,
+        target_version: &str,
+    ) -> Result<UpdateBarrierPhase, UpdateBarrierError> {
+        match self
+            .0
+            .prepare(target_version)
+            .await
+            .map_err(|_| UpdateBarrierError::new("update_shutdown_failed"))?
+        {
+            UpdatePrepare::LocalStopped => Ok(UpdateBarrierPhase::LocalStopped),
+        }
+    }
+
+    async fn installer_opened(&self) -> Result<(), UpdateBarrierError> {
+        self.0
+            .installer_opened()
+            .await
+            .map_err(|_| UpdateBarrierError::new("update_journal_failed"))
+    }
+
+    async fn installer_failed(&self) -> Result<(), UpdateBarrierError> {
+        self.0
+            .installer_failed()
+            .await
+            .map_err(|_| UpdateBarrierError::new("update_recovery_failed"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -64,7 +100,11 @@ pub struct UpdateStatusResponse {
 }
 
 impl NativeUpdater {
-    pub fn from_build(app: &AppHandle<Wry>) -> Result<Self, tauri::Error> {
+    pub fn from_build(
+        app: &AppHandle<Wry>,
+        switch_coordinator: Arc<SwitchCoordinator>,
+        installed_container_version: String,
+    ) -> Result<Self, tauri::Error> {
         let preferences = FileUpdatePreferenceStore::new(
             app.path()
                 .app_data_dir()?
@@ -72,23 +112,38 @@ impl NativeUpdater {
                 .join("preferences.json"),
         );
         let current_preferences = preferences.load().unwrap_or_default();
+        let barrier = Arc::new(
+            UpdateBarrier::open(switch_coordinator)
+                .map_err(|error| std::io::Error::other(error.to_string()))?,
+        );
+        let managed_barrier: Arc<dyn UpdateInstallBarrier> =
+            Arc::new(ManagedUpdateBarrier(barrier.clone()));
         #[cfg(desktop)]
         let coordinator = platform::updater::DesktopUpdateBackend::from_build(app.clone())
             .ok()
-            .map(|backend| UpdateCoordinator::new(Arc::new(backend)));
+            .map(|backend| UpdateCoordinator::new(Arc::new(backend), managed_barrier.clone()));
         #[cfg(target_os = "android")]
         let coordinator = platform::android_updater::AndroidUpdateBackend::from_build(app.clone())
             .ok()
-            .map(|backend| UpdateCoordinator::new(Arc::new(backend)));
+            .map(|backend| UpdateCoordinator::new(Arc::new(backend), managed_barrier));
 
         Ok(Self {
             preferences,
             current_preferences: Mutex::new(current_preferences),
             observed_offer: Mutex::new(None),
             refresh_gate: UpdateRefreshGate::default(),
+            barrier,
+            installed_container_version,
             #[cfg(any(desktop, target_os = "android"))]
             coordinator,
         })
+    }
+
+    pub async fn recover_installed_container(&self) -> Result<(), String> {
+        self.barrier
+            .recover(&self.installed_container_version)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     pub fn observe(&self, state: &UpdateState) -> Result<(), String> {

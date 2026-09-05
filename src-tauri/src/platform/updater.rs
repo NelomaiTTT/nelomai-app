@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use nelomai_client_api::AccessSnapshot;
 use nelomai_client_updater::{
     DownloadProgress, InstallResult, InstalledUpdate, UpdateBackend, UpdateBackendError,
-    UpdateEndpointPolicy,
+    UpdateBarrierPhase, UpdateEndpointPolicy,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Runtime};
@@ -49,8 +49,10 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
         &self,
         access_token: &AccessSnapshot,
         expected_version: &str,
+        barrier: UpdateBarrierPhase,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError> {
+        debug_assert_eq!(barrier, UpdateBarrierPhase::LocalStopped);
         let target = tauri_plugin_updater::target()
             .ok_or_else(|| UpdateBackendError::new("unsupported_update_target"))?;
         let current_version = self.app.package_info().version.to_string();

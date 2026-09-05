@@ -18,7 +18,7 @@ use nelomai_client_api::ClientApi;
 use nelomai_client_application::{ApplicationError, ClientApplication};
 use nelomai_client_container::{
     AuthBroker, InstalledRuntimeSelection, OwnerRuntimeAuth, RuntimeCacheAdmission,
-    RuntimeClientProfile, RuntimeRecordSwitchControl, SwitchCoordinator,
+    RuntimeClientProfile, RuntimeRecordSwitchControl, SelectionRecovery, SwitchCoordinator,
     UnavailableRuntimeForceStop,
 };
 use nelomai_client_core::CoreLocalStop;
@@ -289,7 +289,10 @@ pub fn run() {
         )?);
         let migration = storage.migration;
         let target_paths = storage.runtime.paths().clone();
-        let requires_transition = storage
+        let requires_transition = matches!(
+            selection.recovery(),
+            Some(SelectionRecovery::ContainerVersionChanged)
+        ) || storage
             .runtime
             .load()?
             .is_some_and(|state| state.cleanup_only);
@@ -367,7 +370,12 @@ pub fn run() {
         app.manage(connection_metrics.clone());
         #[cfg(not(target_os = "android"))]
         app.manage(connection_intent.clone());
-        app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
+        let updater = Arc::new(updates::NativeUpdater::from_build(
+            app.handle(),
+            switch_coordinator.clone(),
+            selection.state().container_version.clone(),
+        )?);
+        app.manage(updater.clone());
         #[cfg(desktop)]
         desktop::setup_tray(app)?;
         start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
@@ -399,9 +407,11 @@ pub fn run() {
         );
         let recovery = switch_coordinator;
         let logout_recovery = port.clone();
+        let update_recovery = updater;
         tauri::async_runtime::spawn(async move {
             let _ = logout_recovery.recover_logout_cleanup().await;
-            if recovery.before_tunnel_start().await.is_ok()
+            if update_recovery.recover_installed_container().await.is_ok()
+                && recovery.before_tunnel_start().await.is_ok()
                 && matches!(migration, Some(MigrationOutcome::AwaitingBootstrap))
             {
                 let records = SystemRecordFactory::new("primary", fallback);

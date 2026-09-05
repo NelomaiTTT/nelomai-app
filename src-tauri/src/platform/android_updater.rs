@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use nelomai_client_api::AccessSnapshot;
 use nelomai_client_updater::{
     AndroidManifestError, AndroidUpdateManifest, DownloadProgress, InstallResult, InstalledUpdate,
-    UpdateBackend, UpdateBackendError, UpdateEndpointPolicy,
+    UpdateBackend, UpdateBackendError, UpdateBarrierPhase, UpdateEndpointPolicy,
 };
 use reqwest::{Client, StatusCode};
 use sha2::{Digest, Sha256};
@@ -181,8 +181,10 @@ impl<R: Runtime> UpdateBackend for AndroidUpdateBackend<R> {
         &self,
         access_token: &AccessSnapshot,
         expected_version: &str,
+        barrier: UpdateBarrierPhase,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError> {
+        debug_assert_eq!(barrier, UpdateBarrierPhase::LocalStopped);
         let current_version = self.app.package_info().version.to_string();
         let endpoint = self
             .endpoint_policy

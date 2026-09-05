@@ -147,6 +147,10 @@ impl SwitchJournalV1 {
     pub fn target_identity(&self) -> &RuntimeTarget {
         &self.target_identity
     }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,13 +332,17 @@ impl SwitchCoordinator {
         target_slot: nelomai_contracts::RuntimeSlot,
     ) -> Result<SwitchProgress, SwitchError> {
         let _execution = self.execution.lock().await;
-        self.request_locked(target_slot).await
+        self.request_locked(target_slot, false).await
     }
 
     async fn request_locked(
         &self,
         target_slot: nelomai_contracts::RuntimeSlot,
+        recovering_installed_update: bool,
     ) -> Result<SwitchProgress, SwitchError> {
+        if !recovering_installed_update && crate::update_barrier_pending(&self.owner)? {
+            return Err(SwitchError::RecoveryRequired);
+        }
         if self
             .snapshot()?
             .is_some_and(|journal| journal.phase != SwitchPhase::Complete)
@@ -405,6 +413,164 @@ impl SwitchCoordinator {
         self.recover_locked(broker, control).await
     }
 
+    pub(crate) fn installed_container_version(&self) -> &str {
+        &self.manifest.manifest().container_version
+    }
+
+    pub(crate) fn owner_lock(&self) -> Arc<ContainerOwnerLock> {
+        self.owner.clone()
+    }
+
+    pub(crate) async fn prepare_update_stop<F>(
+        &self,
+        expected_operation_id: Option<&str>,
+        persist_requested: F,
+    ) -> Result<SwitchJournalV1, SwitchError>
+    where
+        F: FnOnce(&SwitchJournalV1, nelomai_contracts::RuntimeSlot) -> Result<(), SwitchError>,
+    {
+        let _execution = self.execution.lock().await;
+        let (broker, control) = self.components()?;
+        if let Some(expected) = expected_operation_id {
+            let journal = self.snapshot()?.ok_or(SwitchError::RecoveryRequired)?;
+            if journal.operation_id != expected {
+                return Err(SwitchError::RecoveryRequired);
+            }
+            match journal.phase {
+                SwitchPhase::Requested
+                | SwitchPhase::CleanupHandedOff
+                | SwitchPhase::RuntimeStopping => {
+                    let snapshot = journal
+                        .runtime_snapshot
+                        .as_ref()
+                        .ok_or(SwitchError::RecoveryRequired)?;
+                    let source = broker.transition_source().await?;
+                    let handoff = control.handoff_cleanup(&source).await?;
+                    if !source.matches_runtime_scope(snapshot.auth_scope.as_ref())
+                        || handoff.snapshot() != snapshot
+                    {
+                        return Err(SwitchError::RecoveryRequired);
+                    }
+                    self.stop_handoff(control, handoff).await?;
+                }
+                SwitchPhase::LocalStopped => {}
+                _ => return Err(SwitchError::RecoveryRequired),
+            }
+            let stopped = self.snapshot()?.ok_or(SwitchError::RecoveryRequired)?;
+            if stopped.operation_id != expected || stopped.phase != SwitchPhase::LocalStopped {
+                return Err(SwitchError::RecoveryRequired);
+            }
+            return Ok(stopped);
+        }
+        if self
+            .snapshot()?
+            .is_some_and(|journal| journal.phase != SwitchPhase::Complete)
+        {
+            return Err(SwitchJournalError::Pending.into());
+        }
+        let selection =
+            current_selection(&self.owner, &self.manifest).map_err(SwitchJournalError::Io)?;
+        let source = broker.transition_source().await?;
+        let source_identity = source
+            .identity()
+            .cloned()
+            .ok_or(SwitchError::RecoveryRequired)?;
+        let selected_identity = self
+            .manifest
+            .identity(selection.selected_slot, None)
+            .map_err(|_| SwitchError::RecoveryRequired)?;
+        if RuntimeTarget::from_identity(&source_identity)
+            != RuntimeTarget::from_identity(&selected_identity)
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        let handoff = control.handoff_cleanup(&source).await?;
+        let runtime_snapshot = handoff.snapshot().clone();
+        if !source.matches_runtime_scope(runtime_snapshot.auth_scope.as_ref())
+            || source_identity.slot != runtime_snapshot.slot
+            || source_identity.runtime_version != runtime_snapshot.runtime_version
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        let cleanup_envelope = CleanupEnvelopeV1::from_runtime_snapshot(
+            &runtime_snapshot,
+            CleanupEngineRoleV1::Primary,
+            None,
+        )
+        .map_err(|_| SwitchError::RecoveryRequired)?;
+        let target_identity = RuntimeTarget::from_identity(&source_identity);
+        let operation_id = Uuid::new_v4().to_string();
+        let request = RuntimeSwitchReconcileRequest {
+            operation_id: operation_id.clone(),
+            source_identity: Some(source_identity.clone()),
+            target_identity: target_identity.clone(),
+            expected_session_generation: source.expected_session_generation(),
+            cleanup_contract_version: cleanup_envelope.cleanup_contract_version,
+            lease_ids: cleanup_envelope.lease_ids.clone(),
+            redundant_session_ids: cleanup_envelope.redundant_session_ids.clone(),
+            client_operation_ids: cleanup_envelope
+                .operations
+                .iter()
+                .map(|operation| operation.operation_id.clone())
+                .collect(),
+        };
+        let frozen = FrozenReconcileRequest::new(request, &source)?;
+        let mut journal = SwitchJournalV1::requested(
+            operation_id,
+            frozen.request_fingerprint().into(),
+            Some(source_identity),
+            Some(source.device_id().into()),
+            source.scope_fingerprint().into(),
+            target_identity,
+            source.expected_session_generation(),
+            cleanup_envelope,
+        );
+        journal.runtime_snapshot = Some(runtime_snapshot);
+        persist_requested(&journal, selection.selected_slot)?;
+        self.begin_requested(journal)?;
+        self.stop_handoff(control, handoff).await?;
+        let stopped = self.snapshot()?.ok_or(SwitchError::RecoveryRequired)?;
+        if stopped.phase != SwitchPhase::LocalStopped {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        Ok(stopped)
+    }
+
+    pub(crate) async fn cancel_update_stop(
+        &self,
+        operation_id: &str,
+    ) -> Result<SwitchProgress, SwitchError> {
+        let _execution = self.execution.lock().await;
+        let Some(journal) = self.snapshot()? else {
+            return Ok(SwitchProgress::Ready);
+        };
+        if journal.operation_id != operation_id {
+            return if journal.phase == SwitchPhase::Complete {
+                Ok(SwitchProgress::Ready)
+            } else {
+                Err(SwitchError::RecoveryRequired)
+            };
+        }
+        if journal.phase == SwitchPhase::Complete {
+            return match journal.decision {
+                Some(SwitchDecision::Cancel) => Ok(SwitchProgress::Ready),
+                _ => Err(SwitchError::RecoveryRequired),
+            };
+        }
+        let (broker, control) = self.components()?;
+        self.update(|journal| journal.cancel_requested = true)?;
+        self.recover_locked(broker, control).await
+    }
+
+    pub(crate) fn restore_update_selection(
+        &self,
+        previous: nelomai_contracts::RuntimeSlot,
+    ) -> Result<(), SwitchError> {
+        finish_selection(&self.owner, &self.manifest, previous)
+            .map_err(SwitchJournalError::Io)
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn lock_logout_cleanup(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.execution.lock().await
     }
@@ -452,6 +618,21 @@ impl SwitchCoordinator {
 
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
+        if crate::update_barrier_pending(&self.owner)? {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        self.before_tunnel_start_locked(false).await
+    }
+
+    pub(crate) async fn recover_installed_update(&self) -> Result<(), SwitchError> {
+        let _execution = self.execution.lock().await;
+        self.before_tunnel_start_locked(true).await
+    }
+
+    async fn before_tunnel_start_locked(
+        &self,
+        recovering_installed_update: bool,
+    ) -> Result<(), SwitchError> {
         let (broker, control) = self.components()?;
         if matches!(
             self.recover_locked(broker, control).await?,
@@ -467,7 +648,10 @@ impl SwitchCoordinator {
         let target = self
             .required_initial_target
             .ok_or(SwitchError::RecoveryRequired)?;
-        match self.request_locked(target).await? {
+        match self
+            .request_locked(target, recovering_installed_update)
+            .await?
+        {
             SwitchProgress::Ready => {
                 self.initial_transition_satisfied
                     .store(true, Ordering::SeqCst);
@@ -517,6 +701,7 @@ impl SwitchCoordinator {
         if journal
             .as_ref()
             .is_some_and(|journal| journal.phase != SwitchPhase::Complete)
+            || crate::update_barrier_pending(&self.owner)?
             || self.initial_transition_required(journal.as_ref())?
         {
             return Err(SwitchError::RecoveryRequired);
@@ -526,6 +711,9 @@ impl SwitchCoordinator {
 
     pub async fn cancel_pending(&self) -> Result<SwitchProgress, SwitchError> {
         let _execution = self.execution.lock().await;
+        if crate::update_barrier_pending(&self.owner)? {
+            return Err(SwitchError::RecoveryRequired);
+        }
         let (broker, control) = self.components()?;
         self.update(|journal| journal.cancel_requested = true)?;
         self.recover_locked(broker, control).await
