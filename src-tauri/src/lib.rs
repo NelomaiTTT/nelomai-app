@@ -299,7 +299,7 @@ pub fn run() {
             .map(RuntimeRecordOwner::new)
             .collect();
         let record_owner = RuntimeRecordOwner::new(storage.runtime);
-        let port = Arc::new(OwnerRuntimeAuth::new(
+        let port = OwnerRuntimeAuth::new(
             broker.clone(),
             selection.target().clone(),
             RuntimeClientProfile {
@@ -309,7 +309,7 @@ pub fn run() {
             },
             Arc::new(RuntimeCacheAdmission::new(record_owner.clone())),
             local.runtime_writer_gates(),
-        )?);
+        )?;
         let switch_control = Arc::new(RuntimeRecordSwitchControl::new(
             record_owner.clone(),
             retained_record_owners,
@@ -324,6 +324,7 @@ pub fn run() {
                 switch_coordinator.require_initial_transition(selection.state().selected_slot);
         }
         let switch_coordinator = Arc::new(switch_coordinator);
+        let port = Arc::new(port.with_switch_coordinator(switch_coordinator.clone()));
         let application = Arc::new(ClientApplication::with_split_tunnel_store_and_preflight(
             Arc::new(api),
             Arc::new(record_owner.operational()),

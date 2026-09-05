@@ -1188,6 +1188,36 @@ impl AuthBroker {
         self.save_transition_write(&auth)
     }
 
+    /// Reconstruct only the active request's source from protected provenance.
+    /// The public cleanup IDs/target must still reproduce the exact saved hash.
+    pub(crate) async fn restore_transition_request(
+        &self,
+        mut request: RuntimeSwitchReconcileRequest,
+        fingerprint: &str,
+    ) -> Result<FrozenReconcileRequest, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        let authority = auth
+            .broker
+            .as_ref()
+            .and_then(|meta| {
+                meta.transition_authorities
+                    .iter()
+                    .find(|authority| authority.reconcile_operation_id == request.operation_id)
+            })
+            .ok_or(BrokerError::RecoveryRequired)?;
+        request.source_identity = authority.source_identity.clone();
+        request.expected_session_generation = authority.expected_session_generation;
+        let frozen = FrozenReconcileRequest::from_persisted(
+            request,
+            authority.source_device_id.clone(),
+            authority.source_scope_fingerprint.clone(),
+            Some(fingerprint),
+        )?;
+        Self::match_transition_authority(authority, &frozen)?;
+        Ok(frozen)
+    }
+
     fn match_transition_authority(
         authority: &TransitionAuthorityV1,
         frozen: &FrozenReconcileRequest,
@@ -2406,6 +2436,60 @@ impl AuthBroker {
     ) -> Result<Option<CompletedRuntimeLogoutV1>, BrokerError> {
         let _state = self.state.lock().await;
         Ok(self.load()?.completed_runtime_logout)
+    }
+
+    pub(crate) async fn stop_runtime_logout_cleanup(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+    ) -> Result<(), BrokerError> {
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            // Called under actual runtime writer quiescence. Serializing with
+            // issuance also prevents a password login during this stop retry.
+            let _issuance = self.issuance.lock().await;
+            {
+                let _state = self.state.lock().await;
+                let auth = self.load()?;
+                if auth.completed_runtime_logout.as_ref() != Some(receipt)
+                    || auth.logout_state != LogoutState::LoggedOut
+                {
+                    return Err(BrokerError::Cancelled);
+                }
+            }
+            self.stop.stop_local().await
+        })
+        .await
+        .map_err(|_| BrokerError::Timeout)?
+    }
+
+    pub(crate) async fn logout_covers_transition(
+        &self,
+        receipt: &CompletedRuntimeLogoutV1,
+        operation_id: &str,
+        source_scope_fingerprint: &str,
+        source_device_id: Option<&str>,
+    ) -> Result<bool, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        if auth.completed_runtime_logout.as_ref() != Some(receipt) {
+            return Err(BrokerError::Cancelled);
+        }
+        if source_device_id != Some(receipt.source.device_id.as_str()) {
+            return Ok(false);
+        }
+        if source_scope_fingerprint == receipt.source.scope_fingerprint {
+            return Ok(true);
+        }
+        // Resume/supersede may have advanced identity, but only this exact
+        // protected family/epoch can discharge the original cleanup snapshot.
+        Ok(auth.broker.as_ref().is_some_and(|meta| {
+            meta.transition_authorities.iter().any(|authority| {
+                authority.reconcile_operation_id == operation_id
+                    && authority.source_scope_fingerprint == source_scope_fingerprint
+                    && authority.source_device_id == receipt.source.device_id
+                    && authority.source_family == receipt.source.family
+                    && authority.source_auth_epoch == receipt.source.auth_epoch
+            })
+        }))
     }
 
     pub async fn finish_runtime_logout_cleanup(

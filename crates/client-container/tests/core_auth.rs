@@ -304,6 +304,18 @@ async fn exercise_logout(fail_stop: bool, new_login: bool) {
             Phase::Error
         );
         assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Running);
+        let before_cleanup = owner.cleanup_snapshot().unwrap();
+        assert!(
+            port.recover_logout_cleanup().await.is_err(),
+            "failed stop must keep logout cleanup pending"
+        );
+        assert_eq!(owner.cleanup_snapshot().unwrap(), before_cleanup);
+        assert!(auth
+            .load()
+            .unwrap()
+            .unwrap()
+            .completed_runtime_logout
+            .is_some());
         tunnel.hold_status.store(true, Ordering::SeqCst);
         let poll_application = application.clone();
         let poll =

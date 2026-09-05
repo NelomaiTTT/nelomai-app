@@ -29,12 +29,14 @@ pub struct RuntimeClientProfile {
     pub architecture: String,
 }
 
+#[derive(Clone)]
 pub struct OwnerRuntimeAuth {
     broker: Arc<AuthBroker>,
     target: RuntimeTarget,
     profile: RuntimeClientProfile,
     admission: Arc<dyn RuntimeAdmission>,
     writers: Arc<RuntimeWriterGates>,
+    switch_coordinator: Option<Arc<crate::SwitchCoordinator>>,
 }
 
 /// Host control capability; the future child implements command/ACK with its
@@ -304,6 +306,11 @@ impl<S: RuntimeStateStore> RuntimeAdmission for RuntimeCacheAdmission<S> {
     }
 }
 impl OwnerRuntimeAuth {
+    pub fn with_switch_coordinator(mut self, coordinator: Arc<crate::SwitchCoordinator>) -> Self {
+        self.switch_coordinator = Some(coordinator);
+        self
+    }
+
     pub async fn recover_logout_cleanup(&self) -> Result<(), CoreError> {
         let Some(receipt) = self
             .broker
@@ -313,10 +320,38 @@ impl OwnerRuntimeAuth {
         else {
             return Ok(());
         };
+        let _execution = match &self.switch_coordinator {
+            Some(coordinator) => Some(
+                tokio::time::timeout(OWNER_REQUEST_BUDGET, coordinator.lock_logout_cleanup())
+                    .await
+                    .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?,
+            ),
+            None => None,
+        };
         let quiescence = tokio::time::timeout(OWNER_REQUEST_BUDGET, self.writers.quiesce())
             .await
             .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?;
+        match self
+            .broker
+            .completed_runtime_logout()
+            .await
+            .map_err(map_error)?
+        {
+            None => return Ok(()),
+            Some(current) if current == receipt => {}
+            Some(_) => return Err(CoreError::AuthRecoveryRequired),
+        }
+        self.broker
+            .stop_runtime_logout_cleanup(&receipt)
+            .await
+            .map_err(map_error)?;
         self.admission.complete_logout(&receipt, &quiescence)?;
+        if let Some(coordinator) = &self.switch_coordinator {
+            coordinator
+                .retire_logout_journal(&receipt)
+                .await
+                .map_err(|_| CoreError::AuthRecoveryRequired)?;
+        }
         self.broker
             .finish_runtime_logout_cleanup(&receipt)
             .await
@@ -381,6 +416,7 @@ impl OwnerRuntimeAuth {
             profile,
             admission,
             writers,
+            switch_coordinator: None,
         })
     }
     /// Startup/control only. Migration refs and absent scope never become an
@@ -456,6 +492,9 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
             .await
             .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?
             .map_err(map_error)?;
+        tokio::time::timeout_at(deadline, self.recover_logout_cleanup())
+            .await
+            .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))??;
         let quiescence = tokio::time::timeout_at(deadline, self.writers.quiesce())
             .await
             .map_err(|_| CoreError::Api(nelomai_client_core::CoreApiError::Retryable))?;
@@ -508,21 +547,9 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
     }
     async fn logout(&self) -> Result<(), CoreError> {
         self.broker.logout().await.map_err(map_error)?;
-        let broker = self.broker.clone();
-        let admission = self.admission.clone();
-        let writers = self.writers.clone();
+        let recovery = self.clone();
         tokio::spawn(async move {
-            let Ok(quiescence) =
-                tokio::time::timeout(OWNER_REQUEST_BUDGET, writers.quiesce()).await
-            else {
-                return;
-            };
-            let Ok(Some(receipt)) = broker.completed_runtime_logout().await else {
-                return;
-            };
-            if admission.complete_logout(&receipt, &quiescence).is_ok() {
-                let _ = broker.finish_runtime_logout_cleanup(&receipt).await;
-            }
+            let _ = recovery.recover_logout_cleanup().await;
         });
         Ok(())
     }

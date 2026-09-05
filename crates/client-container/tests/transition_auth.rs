@@ -217,6 +217,42 @@ impl AuthStore for SaveGate {
     }
 }
 struct Stop;
+
+struct RejectFirstResumeSave {
+    inner: Arc<dyn AuthStore>,
+    armed: AtomicUsize,
+    reject_logout_consumption: AtomicUsize,
+}
+impl AuthStore for RejectFirstResumeSave {
+    fn load(&self) -> Result<Option<AuthStoreV1>, StorageError> {
+        self.inner.load()
+    }
+    fn save(&self, value: &AuthStoreV1) -> Result<(), StorageError> {
+        if value.completed_runtime_logout.is_none()
+            && self
+                .inner
+                .load()?
+                .is_some_and(|auth| auth.completed_runtime_logout.is_some())
+            && self.reject_logout_consumption.swap(0, Ordering::SeqCst) == 1
+        {
+            return Err(StorageError::RecoveryRequired(
+                "synthetic crash before logout receipt consumption",
+            ));
+        }
+        if value
+            .broker
+            .as_ref()
+            .and_then(|meta| meta.pending_request.as_ref())
+            .is_some_and(|ticket| ticket.kind == BrokerRequestKind::Resume)
+            && self.armed.swap(0, Ordering::SeqCst) == 1
+        {
+            return Err(StorageError::RecoveryRequired(
+                "synthetic crash before resume intent save",
+            ));
+        }
+        self.inner.save(value)
+    }
+}
 #[async_trait]
 impl LocalAuthStop for Stop {
     async fn stop_local(&self) -> Result<(), BrokerError> {
@@ -501,11 +537,11 @@ async fn resume(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Jso
     )
 }
 async fn supersede(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
-    state.supersede_calls.fetch_add(1, Ordering::SeqCst);
+    let call = state.supersede_calls.fetch_add(1, Ordering::SeqCst);
     state.supersede_bodies.lock().unwrap().push(body);
     Json(json!({
         "state":"clean",
-        "reconcile_operation_id":"44444444-4444-4444-8444-444444444444",
+        "reconcile_operation_id":if call == 0 { "44444444-4444-4444-8444-444444444444" } else { "55555555-5555-4555-8555-555555555555" },
         "retry_after_seconds":null
     }))
 }
@@ -1991,6 +2027,275 @@ async fn updated_manifest_supersedes_only_the_clean_predecessor_and_resumes_succ
 
 #[tokio::test]
 async fn lost_committed_old_apply_is_replayed_without_old_admission_then_superseded() {
+    exercise_committed_apply_updates(false).await;
+}
+
+#[tokio::test]
+async fn repeated_updates_recover_active_successor_source_after_committed_apply() {
+    exercise_committed_apply_updates(true).await;
+}
+
+#[tokio::test]
+async fn logout_at_auth_resuming_retires_only_its_barrier_before_new_login_start() {
+    exercise_logout_switch_cleanup(false, false, false).await;
+}
+
+#[tokio::test]
+async fn logout_cleanup_replays_after_journal_retirement_before_receipt_consumption() {
+    exercise_logout_switch_cleanup(false, true, false).await;
+}
+
+#[tokio::test]
+async fn old_logout_cleanup_cannot_stop_new_login_or_retire_barrier_with_unrelated_ack() {
+    exercise_logout_switch_cleanup(true, false, false).await;
+}
+
+#[tokio::test]
+async fn logout_cancels_login_already_waiting_for_prior_logout_cleanup() {
+    exercise_logout_switch_cleanup(false, false, true).await;
+}
+
+#[derive(Default)]
+struct AdmissionTunnel {
+    starts: AtomicUsize,
+    stops: AtomicUsize,
+    hold_next_stop: AtomicUsize,
+    stop_entered: Notify,
+    stop_release: Notify,
+}
+#[async_trait]
+impl TunnelController for AdmissionTunnel {
+    async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn stop(&self) -> Result<(), TunnelError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        if self.hold_next_stop.swap(0, Ordering::SeqCst) == 1 {
+            self.stop_entered.notify_one();
+            self.stop_release.notified().await;
+        }
+        Ok(())
+    }
+    async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        Ok(TunnelStatus::Running)
+    }
+}
+
+async fn exercise_logout_switch_cleanup(
+    unrelated: bool,
+    crash_after_retirement: bool,
+    cancel_waiting_login: bool,
+) {
+    use nelomai_client_container::{OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile};
+    use nelomai_client_core::{NoopLogger, RuntimeAuthProvider};
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = Arc::new(RejectFirstResumeSave {
+        inner: enrolled_store(),
+        armed: AtomicUsize::new(1),
+        reject_logout_consumption: AtomicUsize::new(0),
+    });
+    let tunnel = Arc::new(AdmissionTunnel::default());
+    let local = CoreLocalStop::new(tunnel.clone());
+    let broker = Arc::new(AuthBroker::new(api.clone(), store.clone(), local.clone()).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let backend = ProtectedRuntimeStore::new(
+        Record::default(),
+        RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap(),
+    );
+    let auth = store.load().unwrap().unwrap();
+    let mut runtime = RuntimeStateV1::empty(backend.paths(), false);
+    runtime.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+        auth_epoch: auth.auth_epoch,
+        family: auth.broker.unwrap().family,
+        identity: auth.confirmed_identity.unwrap(),
+    });
+    backend.save(&runtime).unwrap();
+    let record = RuntimeRecordOwner::new(backend);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let control = Arc::new(RuntimeRecordSwitchControl::new(
+        record.clone(),
+        vec![],
+        local.clone(),
+        Arc::new(UnavailableRuntimeForceStop),
+    ));
+    let mut coordinator = Arc::new(
+        SwitchCoordinator::open(owner.clone(), manifest())
+            .unwrap()
+            .attach(broker.clone(), control.clone()),
+    );
+    let make_port = |coordinator: Arc<SwitchCoordinator>| {
+        Arc::new(
+            OwnerRuntimeAuth::new(
+                broker.clone(),
+                target(),
+                RuntimeClientProfile {
+                    platform: Platform::Macos,
+                    platform_version: None,
+                    architecture: "aarch64".into(),
+                },
+                Arc::new(RuntimeCacheAdmission::new(record.clone())),
+                local.runtime_writer_gates(),
+            )
+            .unwrap()
+            .with_switch_coordinator(coordinator),
+        )
+    };
+    let mut port = make_port(coordinator.clone());
+    assert!(coordinator.request(RuntimeSlot::Latest).await.is_err());
+    assert_eq!(
+        coordinator.status().unwrap().phase,
+        Some(SwitchPhase::AuthResuming)
+    );
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 0);
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .transition_authorities[0]
+        .resume_ticket
+        .is_none());
+    broker.logout().await.unwrap();
+    if cancel_waiting_login {
+        tunnel.hold_next_stop.store(1, Ordering::SeqCst);
+        let worker = port.clone();
+        let login = tokio::spawn(async move {
+            worker
+                .login(nelomai_client_api::RuntimeLogin {
+                    login: "b".into(),
+                    password: "synthetic-password".into(),
+                    device_name: "B".into(),
+                })
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tunnel.stop_entered.notified(),
+        )
+        .await
+        .unwrap();
+        broker.logout().await.unwrap();
+        tunnel.stop_release.notify_one();
+        assert!(
+            login.await.unwrap().is_err(),
+            "logout must cancel a login already waiting for cleanup"
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().logout_state,
+            nelomai_client_storage::LogoutState::LoggedOut
+        );
+        server.abort();
+        return;
+    }
+    if unrelated {
+        let pending = coordinator.snapshot().unwrap();
+        let cached = record.cleanup_snapshot().unwrap();
+        let request = LoginRequest {
+            login: "b".into(),
+            password: "synthetic-password".into(),
+            device_name: "B".into(),
+            install_secret: "synthetic-install".into(),
+            platform: Platform::Macos,
+            platform_version: None,
+            architecture: "aarch64".into(),
+            app_version: "0.2.16".into(),
+        };
+        broker.login(&request, &target()).await.unwrap();
+        let newer = store.load().unwrap().unwrap();
+        let stops = tunnel.stops.load(Ordering::SeqCst);
+        assert!(port.recover_logout_cleanup().await.is_err());
+        assert_eq!(store.load().unwrap().unwrap(), newer);
+        assert_eq!(
+            tunnel.stops.load(Ordering::SeqCst),
+            stops,
+            "old receipt must not stop B"
+        );
+        broker.logout().await.unwrap();
+        assert!(port.recover_logout_cleanup().await.is_err());
+        assert_eq!(
+            coordinator.snapshot().unwrap(),
+            pending,
+            "B's ACK must not retire A's barrier"
+        );
+        assert_eq!(record.cleanup_snapshot().unwrap(), cached);
+        assert!(store
+            .load()
+            .unwrap()
+            .unwrap()
+            .completed_runtime_logout
+            .is_some());
+        server.abort();
+        return;
+    }
+    if crash_after_retirement {
+        store.reject_logout_consumption.store(1, Ordering::SeqCst);
+        assert!(port.recover_logout_cleanup().await.is_err());
+        assert!(coordinator.snapshot().unwrap().is_none());
+        assert!(store
+            .load()
+            .unwrap()
+            .unwrap()
+            .completed_runtime_logout
+            .is_some());
+        coordinator = Arc::new(
+            SwitchCoordinator::open(owner.clone(), manifest())
+                .unwrap()
+                .attach(broker.clone(), control),
+        );
+        port = make_port(coordinator.clone());
+    }
+    port.recover_logout_cleanup().await.unwrap();
+    port.login(nelomai_client_api::RuntimeLogin {
+        login: "b".into(),
+        password: "synthetic-password".into(),
+        device_name: "B".into(),
+    })
+    .await
+    .unwrap();
+    let before = store.load().unwrap().unwrap();
+    let application =
+        nelomai_client_application::ClientApplication::with_split_tunnel_store_and_preflight(
+            Arc::new(api),
+            Arc::new(record.operational()),
+            Arc::new(record.split()),
+            port,
+            local,
+            Arc::new(NoopLogger),
+            coordinator.clone(),
+        );
+    coordinator
+        .before_tunnel_start()
+        .await
+        .expect("logout must retire A's pending switch before B starts");
+    let mut fresh = record.operational().load().unwrap().unwrap();
+    fresh.saved_connection = Some(StoredConnection {
+        lease_id: "b-lease".into(),
+        pool_id: None,
+        layer: nelomai_contracts::Layer::Stray,
+        tic_connection_mode: nelomai_contracts::TicConnectionMode::Dynamic,
+        route_mode: nelomai_contracts::RouteMode::Standalone,
+        egress_mode: nelomai_contracts::EgressMode::Ipv4,
+        probe_url: None,
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: "PrivateKey = synthetic-b".into(),
+        valid_until_unix: Some(1_900_000_000),
+    });
+    record.operational().save(&fresh).unwrap();
+    application
+        .start_saved_stray_offline(1_800_000_000)
+        .await
+        .unwrap();
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(store.load().unwrap().unwrap(), before);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+async fn exercise_committed_apply_updates(repeated: bool) {
     let state = Arc::new(Panel::default());
     let (api, server) = panel(state.clone()).await;
     let store = enrolled_store();
@@ -2040,9 +2345,48 @@ async fn lost_committed_old_apply_is_replayed_without_old_admission_then_superse
         .unwrap(),
     )
     .unwrap();
-    let updated = SwitchCoordinator::open(owner, manifest_for("0.2.17", "0.2.17"))
-        .unwrap()
-        .attach(broker, control.clone());
+    let updated = Arc::new(
+        SwitchCoordinator::open(owner.clone(), manifest_for("0.2.17", "0.2.17"))
+            .unwrap()
+            .attach(broker.clone(), control.clone()),
+    );
+
+    if repeated {
+        control.hold_completion.store(1, Ordering::SeqCst);
+        let worker = updated.clone();
+        let recovery = tokio::spawn(async move { worker.recover().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            control.completion_entered.notified(),
+        )
+        .await
+        .unwrap();
+        recovery.abort();
+        let _ = recovery.await;
+        drop(updated);
+        control.hold_completion.store(0, Ordering::SeqCst);
+        write_test_selection(root.path(), "0.2.18");
+        let newest = SwitchCoordinator::open(owner, manifest_for("0.2.18", "0.2.18"))
+            .unwrap()
+            .attach(broker.clone(), control.clone());
+        assert_eq!(newest.recover().await.unwrap(), SwitchProgress::Ready);
+        assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.resume_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            broker
+                .observe()
+                .await
+                .unwrap()
+                .access
+                .unwrap()
+                .identity()
+                .runtime_version,
+            "0.2.18"
+        );
+        assert_eq!(control.completions.load(Ordering::SeqCst), 1);
+        server.abort();
+        return;
+    }
 
     assert_eq!(updated.recover().await.unwrap(), SwitchProgress::Ready);
     assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 1);

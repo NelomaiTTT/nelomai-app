@@ -405,6 +405,51 @@ impl SwitchCoordinator {
         self.recover_locked(broker, control).await
     }
 
+    pub(crate) async fn lock_logout_cleanup(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.execution.lock().await
+    }
+
+    /// Caller holds execution and writer quiescence and has successfully
+    /// stopped/cleared the exact logout source. Keep the protected ACK until
+    /// selection and journal retirement are both durable.
+    pub(crate) async fn retire_logout_journal(
+        &self,
+        receipt: &nelomai_client_storage::CompletedRuntimeLogoutV1,
+    ) -> Result<(), SwitchError> {
+        let Some(journal) = self.snapshot()? else {
+            return Ok(());
+        };
+        let (broker, _) = self.components()?;
+        if !broker
+            .logout_covers_transition(
+                receipt,
+                &journal.operation_id,
+                &journal.source_scope_fingerprint,
+                journal.source_device_id.as_deref(),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let selection =
+            current_selection(&self.owner, &self.manifest).map_err(SwitchJournalError::Io)?;
+        finish_selection(&self.owner, &self.manifest, selection.selected_slot)
+            .map_err(SwitchJournalError::Io)?;
+        let _journal = self
+            .owner
+            .lock_transition_journal()
+            .map_err(SwitchJournalError::Io)?;
+        if load_journal(&self.path)?.as_ref() != Some(&journal) {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        std::fs::remove_file(&self.path).map_err(SwitchJournalError::Io)?;
+        #[cfg(unix)]
+        File::open(self.path.parent().ok_or(SwitchJournalError::Invalid)?)
+            .and_then(|directory| directory.sync_all())
+            .map_err(SwitchJournalError::Io)?;
+        Ok(())
+    }
+
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
         let (broker, control) = self.components()?;
@@ -766,15 +811,12 @@ impl SwitchCoordinator {
                             if source.identity() != Some(resumed.identity()) {
                                 return Err(SwitchError::RecoveryRequired);
                             }
-                            let predecessor = FrozenReconcileRequest::from_persisted(
-                                journal.reconcile_request(),
-                                journal
-                                    .source_device_id
-                                    .clone()
-                                    .ok_or(SwitchError::RecoveryRequired)?,
-                                journal.source_scope_fingerprint.clone(),
-                                Some(&journal.request_fingerprint),
-                            )?;
+                            let predecessor = broker
+                                .restore_transition_request(
+                                    journal.reconcile_request(),
+                                    &journal.request_fingerprint,
+                                )
+                                .await?;
                             let operation_id = match &journal.supersede_operation_id {
                                 Some(operation_id)
                                     if journal.supersede_target.as_ref() == Some(&desired) =>
