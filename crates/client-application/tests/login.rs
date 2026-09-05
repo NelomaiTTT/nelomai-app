@@ -79,6 +79,11 @@ impl CoreApi for FakeApi {
                 id: "device-1".to_string(),
                 name: "Laptop".to_string(),
                 platform: Platform::Macos,
+                container_version: None,
+                runtime_version: None,
+                runtime_contract_version: None,
+                runtime_slot: None,
+                session_generation: None,
             },
         })
     }
@@ -141,6 +146,11 @@ impl ApplicationApi for FakeApi {
                 id: "device-1".to_string(),
                 name: "Laptop".to_string(),
                 platform: Platform::Macos,
+                container_version: None,
+                runtime_version: None,
+                runtime_contract_version: None,
+                runtime_slot: None,
+                session_generation: None,
             },
         })
     }

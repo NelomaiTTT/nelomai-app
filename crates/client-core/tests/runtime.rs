@@ -729,6 +729,11 @@ fn token_response(access_token: &str, refresh_token: &str) -> TokenResponse {
             id: "device-1".to_string(),
             name: "Mac".to_string(),
             platform: Platform::Macos,
+            container_version: None,
+            runtime_version: None,
+            runtime_contract_version: None,
+            runtime_slot: None,
+            session_generation: None,
         },
     }
 }
