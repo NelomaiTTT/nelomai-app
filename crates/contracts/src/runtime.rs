@@ -17,6 +17,7 @@
 
 use std::{collections::HashSet, fmt};
 
+use caseless::Caseless;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -692,7 +693,7 @@ fn portable_path_alias(path: &str) -> Result<String, RuntimeManifestError> {
         {
             return Err(RuntimeManifestError::InvalidPath);
         }
-        let alias: String = segment.nfkc().flat_map(char::to_lowercase).collect();
+        let alias: String = segment.nfkc().default_case_fold().collect();
         let base = alias.split('.').next().unwrap_or_default();
         let reserved = matches!(base, "con" | "prn" | "aux" | "nul")
             || (base.len() == 4

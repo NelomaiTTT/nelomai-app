@@ -355,6 +355,22 @@ fn signed_artifact_rejects_unsafe_portable_paths_and_aliases() {
 }
 
 #[test]
+fn signed_artifact_rejects_full_unicode_casefold_aliases() {
+    for (left, right) in [("bin/σ", "bin/ς"), ("bin/Straße", "bin/STRASSE")] {
+        let mut manifest = artifact("0.2.16", "linux", "x86_64");
+        manifest.files = vec![file(left, 'a'), file(right, 'b')];
+        let bytes = canonical(&manifest);
+        let signature = sign(RUNTIME_MANIFEST_SIGNATURE_DOMAIN, &bytes);
+        assert_eq!(
+            verify_runtime_artifact_manifest(&bytes, &signature, &public_key(), "linux", "x86_64")
+                .unwrap_err(),
+            RuntimeManifestError::DuplicatePath,
+            "accepted aliases {left:?} and {right:?}"
+        );
+    }
+}
+
+#[test]
 fn signed_artifact_rejects_malformed_sha256_and_duplicate_exact_paths() {
     let mut malformed = artifact("0.2.16", "linux", "x86_64");
     malformed.files[0].sha256 = "g".repeat(64);

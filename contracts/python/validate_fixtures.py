@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,24 +44,64 @@ def assert_sha256(value: object) -> None:
     assert all(character in "0123456789abcdef" for character in value)
 
 
+def assert_uint(value: object, maximum: int = 2**32 - 1) -> None:
+    assert type(value) is int and 0 <= value <= maximum
+
+
+def assert_text(value: object, maximum: int = 1024) -> None:
+    assert isinstance(value, str) and 0 < len(value.encode("utf-8")) <= maximum
+    assert not any(unicodedata.category(char) == "Cc" for char in value)
+
+
+def assert_version(value: object) -> None:
+    assert_text(value, 64)
+    assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", value)
+
+
+def assert_commit(value: object) -> None:
+    assert isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+
+
+def portable_path_alias(value: object) -> str:
+    assert_text(value)
+    assert not value.startswith("/") and "\\" not in value
+    aliases = []
+    for segment in value.split("/"):
+        assert segment not in {"", ".", ".."} and not segment.endswith((".", " "))
+        assert not any(char in '<>:"|?*' for char in segment)
+        alias = unicodedata.normalize("NFKC", segment).casefold()
+        base = alias.split(".")[0]
+        assert base not in {"con", "prn", "aux", "nul"}
+        assert not re.fullmatch(r"(?:com|lpt)[1-9]", base)
+        aliases.append(alias)
+    return "/".join(aliases)
+
+
 def assert_artifact_manifest(manifest: dict) -> None:
+    assert isinstance(manifest, dict)
     assert set(manifest) == {
         "format_version", "runtime_version", "source_commit", "platform",
         "architecture", "contract_version", "files",
     }
-    assert manifest["format_version"] == 1
-    assert manifest["contract_version"] == 1
-    assert manifest["runtime_version"]
-    assert manifest["source_commit"]
-    assert manifest["platform"]
-    assert manifest["architecture"]
+    for field in ("format_version", "contract_version"):
+        assert_uint(manifest[field])
+        assert manifest[field] == 1
+    assert_version(manifest["runtime_version"])
+    assert_commit(manifest["source_commit"])
+    assert_text(manifest["platform"])
+    assert_text(manifest["architecture"])
+    assert (manifest["platform"], manifest["architecture"]) in RUNTIME_TARGETS
+    assert isinstance(manifest["files"], list) and 1 <= len(manifest["files"]) <= 4096
     paths = set()
     for entry in manifest["files"]:
+        assert isinstance(entry, dict)
         assert set(entry) == {"path", "size_bytes", "sha256", "role"}
-        assert entry["path"] not in paths
-        paths.add(entry["path"])
-        assert isinstance(entry["size_bytes"], int) and entry["size_bytes"] >= 0
+        alias = portable_path_alias(entry["path"])
+        assert alias not in paths
+        paths.add(alias)
+        assert_uint(entry["size_bytes"], 2**64 - 1)
         assert_sha256(entry["sha256"])
+        assert isinstance(entry["role"], str)
         assert entry["role"] in {
             "executable", "shared_library", "resource", "license", "metadata",
         }
@@ -71,9 +113,16 @@ def validate_runtime_fixtures() -> None:
         "format_version", "container_version", "release_set_id",
         "minimum_runtime_contract", "maximum_runtime_contract", "slots",
     }
+    for field in ("format_version", "minimum_runtime_contract", "maximum_runtime_contract"):
+        assert_uint(container[field])
     assert container["format_version"] == 1
+    assert_version(container["container_version"])
+    assert_text(container["release_set_id"])
     assert container["minimum_runtime_contract"] == 1
     assert container["maximum_runtime_contract"] == 1
+    assert isinstance(container["slots"], list)
+    for slot in container["slots"]:
+        assert isinstance(slot, dict) and set(slot) == {"slot", "manifest"}
     assert [slot["slot"] for slot in container["slots"]] == ["latest"]
     assert_artifact_manifest(container["slots"][0]["manifest"])
 
@@ -86,14 +135,28 @@ def validate_runtime_fixtures() -> None:
         "format_version", "release_set_id", "runtime_version", "source_commit", "artifacts",
     }
     assert "stable_manifest_sha256" not in release_set
+    assert_uint(release_set["format_version"])
+    assert release_set["format_version"] == 1
+    assert_text(release_set["release_set_id"])
+    assert_version(release_set["runtime_version"])
+    assert_commit(release_set["source_commit"])
+    assert isinstance(release_set["artifacts"], list)
     assert len(release_set["artifacts"]) == 4
     targets = set()
     for entry in release_set["artifacts"]:
+        assert isinstance(entry, dict)
         assert set(entry) == {
             "platform", "architecture", "archive_name", "archive_sha256",
             "manifest_name", "manifest_sha256", "signature_name", "signature_sha256",
         }
-        targets.add((entry["platform"], entry["architecture"]))
+        assert_text(entry["platform"])
+        assert_text(entry["architecture"])
+        target = (entry["platform"], entry["architecture"])
+        assert target not in targets
+        targets.add(target)
+        for field in ("archive_name", "manifest_name", "signature_name"):
+            portable_path_alias(entry[field])
+            assert "/" not in entry[field]
         assert_sha256(entry["archive_sha256"])
         assert_sha256(entry["manifest_sha256"])
         assert_sha256(entry["signature_sha256"])
