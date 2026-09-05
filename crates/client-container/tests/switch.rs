@@ -1,10 +1,14 @@
 use ed25519_dalek::{Signer, SigningKey};
 use nelomai_client_api::RuntimeTarget;
 use nelomai_client_container::{
-    CleanupEngineRoleV1, CleanupEnvelopeV1, CleanupOperationV1, SwitchCoordinator,
-    SwitchJournalError, SwitchJournalV1, SwitchPhase,
+    CleanupEngineRoleV1, CleanupEnvelopeV1, CleanupOperationProvenanceV1, CleanupOperationV1,
+    SwitchCoordinator, SwitchJournalError, SwitchJournalV1, SwitchPhase,
 };
-use nelomai_client_storage::ContainerOwnerLock;
+use nelomai_client_storage::{
+    ContainerOwnerLock, RuntimePaths, RuntimeStateV1, StoredAuth, StoredConnection,
+    StoredConnectionKind, StoredPendingCompensationStop, StoredPendingStart,
+    StoredSplitTunnelState,
+};
 use nelomai_contracts::{
     verify_container_manifest, ContainerManifestV1, RuntimeArtifactManifestV1, RuntimeFileRole,
     RuntimeFileV1, RuntimeIdentity, RuntimeSlot, RuntimeSlotManifestV1,
@@ -64,8 +68,10 @@ fn cleanup() -> CleanupEnvelopeV1 {
         redundant_session_ids: vec!["redundant-a".to_owned()],
         operations: vec![CleanupOperationV1 {
             operation_id: "operation-a".to_owned(),
-            request_fingerprint: "a".repeat(64),
-            contract_version: 1,
+            provenance: CleanupOperationProvenanceV1::Verified {
+                request_fingerprint: "a".repeat(64),
+                contract_version: 1,
+            },
         }],
         engine_role: CleanupEngineRoleV1::Primary,
         background_reference: Some("background-a".to_owned()),
@@ -320,4 +326,72 @@ fn cleanup_envelope_round_trips_without_a_secret_or_tunnel_configuration_surface
     let mut value = serde_json::to_value(cleanup()).unwrap();
     value["configuration"] = serde_json::json!("secret-value");
     assert!(serde_json::from_value::<CleanupEnvelopeV1>(value).is_err());
+}
+
+#[test]
+fn actual_runtime_record_projects_known_and_legacy_unknown_cleanup_without_secrets() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap();
+    let mut legacy = StoredAuth::new_install();
+    legacy.saved_connection = Some(StoredConnection {
+        lease_id: "lease-current".into(),
+        pool_id: None,
+        layer: nelomai_contracts::Layer::Tic,
+        tic_connection_mode: nelomai_contracts::TicConnectionMode::Dynamic,
+        route_mode: nelomai_contracts::RouteMode::Standalone,
+        egress_mode: nelomai_contracts::EgressMode::Ipv4,
+        probe_url: None,
+        kind: StoredConnectionKind::Fixed,
+        configuration: "PrivateKey = forbidden-secret".into(),
+        valid_until_unix: None,
+    });
+    legacy.pending_start = Some(StoredPendingStart {
+        operation_id: "legacy-start".into(),
+        layer: nelomai_contracts::Layer::Tic,
+        tic_connection_mode: nelomai_contracts::TicConnectionMode::Dynamic,
+        route_mode: nelomai_contracts::RouteMode::Standalone,
+        egress_mode: nelomai_contracts::EgressMode::Ipv4,
+        allow_alternate: true,
+        probes: Vec::new(),
+        recovery_contract_version: None,
+        request_fingerprint: None,
+        cancel_operation_id: None,
+    });
+    legacy.pending_compensation_stop = Some(StoredPendingCompensationStop {
+        operation_id: "legacy-stop".into(),
+        lease_id: "lease-pending".into(),
+        accept_warm: false,
+        failure_code: None,
+    });
+    let state = RuntimeStateV1::import_legacy(&legacy, StoredSplitTunnelState::default(), &paths);
+
+    let envelope = CleanupEnvelopeV1::from_runtime_state(
+        &state,
+        CleanupEngineRoleV1::Primary,
+        Some("background-a".into()),
+    )
+    .unwrap();
+    assert_eq!(envelope.lease_ids, ["lease-current", "lease-pending"]);
+    assert_eq!(
+        envelope.operations,
+        [
+            CleanupOperationV1 {
+                operation_id: "legacy-start".into(),
+                provenance: CleanupOperationProvenanceV1::LegacyUnknown,
+            },
+            CleanupOperationV1 {
+                operation_id: "legacy-stop".into(),
+                provenance: CleanupOperationProvenanceV1::LegacyUnknown,
+            },
+        ]
+    );
+    let bytes = serde_json::to_string(&envelope).unwrap();
+    for forbidden in [
+        "PrivateKey",
+        "forbidden-secret",
+        "configuration",
+        "install_secret",
+    ] {
+        assert!(!bytes.contains(forbidden));
+    }
 }

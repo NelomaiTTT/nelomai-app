@@ -240,3 +240,43 @@ fn runtime_views_do_not_create_missing_migration_records() {
         .save(&StoredSplitTunnelState::default())
         .is_err());
 }
+
+#[test]
+fn exact_cleanup_snapshot_is_sanitized_and_fences_late_runtime_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap();
+    let backend = ProtectedRuntimeStore::new(Raw::default(), paths.clone());
+    let mut legacy: StoredAuth = serde_json::from_str(
+        r#"{"install_secret":"synthetic-install","saved_connection":{"lease_id":"lease-a","pool_id":null,"layer":"tic","tic_connection_mode":"dynamic","route_mode":"standalone","egress_mode":"ipv4","probe_url":null,"kind":"fixed","configuration":"PrivateKey = secret","valid_until_unix":null}}"#,
+    )
+    .unwrap();
+    legacy.pending_compensation_stop =
+        Some(nelomai_client_storage::StoredPendingCompensationStop {
+            operation_id: "legacy-stop".into(),
+            lease_id: "lease-b".into(),
+            accept_warm: false,
+            failure_code: None,
+        });
+    backend
+        .save(&RuntimeStateV1::import_legacy(
+            &legacy,
+            StoredSplitTunnelState::default(),
+            &paths,
+        ))
+        .unwrap();
+    let owner = RuntimeRecordOwner::new(backend);
+    let frozen = owner.cleanup_snapshot().unwrap();
+    assert_eq!(frozen.lease_ids, ["lease-a", "lease-b"]);
+    assert_eq!(frozen.operations[0].operation_id, "legacy-stop");
+    assert_eq!(frozen.operations[0].request_fingerprint, None);
+
+    let mut changed = owner.operational().load().unwrap().unwrap();
+    changed.saved_connection = None;
+    owner.operational().save(&changed).unwrap();
+    assert!(owner.complete_cleanup(&frozen).is_err());
+    let current = owner.cleanup_snapshot().unwrap();
+    owner.complete_cleanup(&current).unwrap();
+    let final_state = owner.operational().load().unwrap().unwrap();
+    assert!(!final_state.cleanup_only);
+    assert!(final_state.operationally_empty());
+}

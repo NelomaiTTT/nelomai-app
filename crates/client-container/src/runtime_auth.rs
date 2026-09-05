@@ -1,5 +1,8 @@
 //! In-process ownership adapter. Private-channel runtime transport is separate.
-use crate::{AuthBroker, BrokerAuthState, BrokerError, LocalAuthStop};
+use crate::{
+    AuthBroker, BrokerAuthState, BrokerError, LocalAuthStop, LocalStopReceiptV1,
+    RuntimeSwitchControl, TransitionSourceSnapshot,
+};
 use async_trait::async_trait;
 use nelomai_client_api::{
     AccessSnapshot, LoginRequest, RuntimeAuthState, RuntimeLogin, RuntimeTarget,
@@ -7,7 +10,9 @@ use nelomai_client_api::{
 use nelomai_client_core::{
     CoreError, CoreLocalStop, RuntimeAuthProvider, RuntimeWriterGates, RuntimeWriterQuiescence,
 };
-use nelomai_client_storage::{RuntimeAuthScope, RuntimeRecordOwner, RuntimeStateStore};
+use nelomai_client_storage::{
+    RuntimeAuthScope, RuntimeCleanupSnapshotV1, RuntimeRecordOwner, RuntimeStateStore,
+};
 use nelomai_client_tunnel::TunnelController;
 use nelomai_contracts::Platform;
 use std::sync::Arc;
@@ -43,6 +48,158 @@ pub trait RuntimeAdmission: Send + Sync {
 }
 pub struct RuntimeCacheAdmission<S> {
     owner: Arc<RuntimeRecordOwner<S>>,
+}
+
+#[async_trait]
+pub trait RuntimeForceStop: Send + Sync {
+    async fn force_stop(&self, operation_id: &str) -> Result<(), BrokerError>;
+}
+
+pub struct UnavailableRuntimeForceStop;
+#[async_trait]
+impl RuntimeForceStop for UnavailableRuntimeForceStop {
+    async fn force_stop(&self, _: &str) -> Result<(), BrokerError> {
+        Err(BrokerError::RecoveryRequired)
+    }
+}
+
+pub struct RuntimeRecordSwitchControl<S, T> {
+    records: Vec<Arc<RuntimeRecordOwner<S>>>,
+    local: Arc<CoreLocalStop<T>>,
+    force: Arc<dyn RuntimeForceStop>,
+}
+
+impl<S: RuntimeStateStore, T: TunnelController> RuntimeRecordSwitchControl<S, T> {
+    pub fn new(
+        records: Vec<Arc<RuntimeRecordOwner<S>>>,
+        local: Arc<CoreLocalStop<T>>,
+        force: Arc<dyn RuntimeForceStop>,
+    ) -> Self {
+        Self {
+            records,
+            local,
+            force,
+        }
+    }
+
+    fn record_for_snapshot(
+        &self,
+        snapshot: &RuntimeCleanupSnapshotV1,
+    ) -> Result<&Arc<RuntimeRecordOwner<S>>, BrokerError> {
+        let mut matching = self.records.iter().filter(|owner| {
+            owner
+                .cleanup_snapshot()
+                .is_ok_and(|current| current == *snapshot)
+        });
+        let record = matching.next().ok_or(BrokerError::RecoveryRequired)?;
+        if matching.next().is_some() {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Ok(record)
+    }
+}
+
+#[async_trait]
+impl<S: RuntimeStateStore, T: TunnelController> RuntimeSwitchControl
+    for RuntimeRecordSwitchControl<S, T>
+{
+    async fn handoff_cleanup(
+        &self,
+        source: &TransitionSourceSnapshot,
+    ) -> Result<RuntimeCleanupSnapshotV1, BrokerError> {
+        let _quiescence = tokio::time::timeout(
+            OWNER_REQUEST_BUDGET,
+            self.local.runtime_writer_gates().quiesce(),
+        )
+        .await
+        .map_err(|_| BrokerError::Timeout)?;
+        let mut matches = self.records.iter().filter_map(|owner| {
+            let snapshot = owner.cleanup_snapshot().ok()?;
+            if source.matches_runtime_scope(snapshot.auth_scope.as_ref())
+                && source.identity().is_none_or(|identity| {
+                    identity.slot == snapshot.slot
+                        && identity.runtime_version == snapshot.runtime_version
+                })
+            {
+                Some(snapshot)
+            } else {
+                None
+            }
+        });
+        let snapshot = matches.next().ok_or(BrokerError::RecoveryRequired)?;
+        if matches.next().is_some() {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Ok(snapshot)
+    }
+
+    async fn graceful_stop(
+        &self,
+        _: &str,
+        snapshot: &RuntimeCleanupSnapshotV1,
+    ) -> Result<(), BrokerError> {
+        self.record_for_snapshot(snapshot)?;
+        self.local
+            .stop_local()
+            .await
+            .map_err(|_| BrokerError::RecoveryRequired)
+    }
+
+    async fn force_stop(
+        &self,
+        operation_id: &str,
+        snapshot: &RuntimeCleanupSnapshotV1,
+    ) -> Result<(), BrokerError> {
+        self.record_for_snapshot(snapshot)?;
+        self.force.force_stop(operation_id).await
+    }
+
+    async fn complete_cleanup_and_admit(
+        &self,
+        snapshot: &RuntimeCleanupSnapshotV1,
+        receipt: &LocalStopReceiptV1,
+        access: &AccessSnapshot,
+    ) -> Result<(), BrokerError> {
+        if receipt.runtime_slot != snapshot.slot
+            || receipt.runtime_version != snapshot.runtime_version
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        let _quiescence = tokio::time::timeout(
+            OWNER_REQUEST_BUDGET,
+            self.local.runtime_writer_gates().quiesce(),
+        )
+        .await
+        .map_err(|_| BrokerError::Timeout)?;
+        let source = self.record_for_snapshot(snapshot)?;
+        source.complete_cleanup(snapshot)?;
+        let target = self
+            .records
+            .iter()
+            .find(|owner| {
+                owner.cleanup_snapshot().is_ok_and(|current| {
+                    current.slot == access.identity().slot
+                        && current.runtime_version == access.identity().runtime_version
+                })
+            })
+            .ok_or(BrokerError::RecoveryRequired)?;
+        if !Arc::ptr_eq(source, target) {
+            let target_snapshot = target.cleanup_snapshot()?;
+            if !target_snapshot.cleanup_only
+                || !target_snapshot.lease_ids.is_empty()
+                || !target_snapshot.operations.is_empty()
+            {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            target.complete_cleanup(&target_snapshot)?;
+        }
+        target.bind_empty_scope(&RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        })?;
+        Ok(())
+    }
 }
 impl<S: RuntimeStateStore> RuntimeCacheAdmission<S> {
     pub fn new(owner: Arc<RuntimeRecordOwner<S>>) -> Self {

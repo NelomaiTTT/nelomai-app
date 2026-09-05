@@ -94,6 +94,8 @@ pub struct TransitionResumeEvidenceV1 {
     pub target_identity: RuntimeIdentity,
     pub identity: RuntimeIdentity,
     pub access_token: String,
+    pub token_type: String,
+    pub access_expires_in: u64,
 }
 impl fmt::Debug for TransitionResumeEvidenceV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -104,6 +106,8 @@ impl fmt::Debug for TransitionResumeEvidenceV1 {
             .field("target_identity", &self.target_identity)
             .field("identity", &self.identity)
             .field("access_token", &"<redacted>")
+            .field("token_type", &self.token_type)
+            .field("access_expires_in", &self.access_expires_in)
             .finish()
     }
 }
@@ -124,6 +128,8 @@ pub struct TransitionAuthorityV1 {
     pub cleanup_contract_version: u32,
     pub cleanup_access_proof: String,
     pub resume_refresh_proof: String,
+    #[serde(default)]
+    pub legacy_refresh_completed: bool,
     pub dispatch_state: TransitionDispatchStateV1,
     pub reconcile_receipt: Option<TransitionReconcileReceiptV1>,
     pub resume_ticket: Option<BrokerRequestV1>,
@@ -140,6 +146,7 @@ impl fmt::Debug for TransitionAuthorityV1 {
             .field("source_device_id", &self.source_device_id)
             .field("source_scope_fingerprint", &self.source_scope_fingerprint)
             .field("target_identity", &self.target_identity)
+            .field("legacy_refresh_completed", &self.legacy_refresh_completed)
             .field("dispatch_state", &self.dispatch_state)
             .field("reconcile_receipt", &self.reconcile_receipt)
             .field("resume_ticket", &self.resume_ticket)
@@ -506,6 +513,7 @@ fn validate_transition_authority(
         || authority.cleanup_access_proof.len() > 256
         || authority.resume_refresh_proof.is_empty()
         || authority.resume_refresh_proof.len() > 256
+        || (authority.source_identity.is_some() && authority.legacy_refresh_completed)
         || (authority.dispatch_state == TransitionDispatchStateV1::ResponseKnown)
             != authority.reconcile_receipt.is_some()
     {
@@ -529,6 +537,15 @@ fn validate_transition_authority(
         }
     }
     if let Some(ticket) = &authority.resume_ticket {
+        if authority
+            .reconcile_receipt
+            .as_ref()
+            .is_none_or(|receipt| receipt.state != "clean")
+        {
+            return Err(StorageError::RecoveryRequired(
+                "transition resume requires clean reconciliation",
+            ));
+        }
         validate_request(ticket)?;
         let resume = ticket
             .resume
@@ -536,12 +553,29 @@ fn validate_transition_authority(
             .ok_or(StorageError::RecoveryRequired(
                 "invalid transition resume ticket",
             ))?;
+        let expected_target = match resume.decision.as_str() {
+            "apply" => authority.target_identity.clone(),
+            "cancel" => RuntimeIdentity {
+                session_generation: None,
+                ..authority
+                    .source_identity
+                    .clone()
+                    .ok_or(StorageError::RecoveryRequired(
+                        "legacy transition cannot be cancelled",
+                    ))?
+            },
+            _ => {
+                return Err(StorageError::RecoveryRequired(
+                    "invalid transition resume decision",
+                ))
+            }
+        };
         if ticket.kind != BrokerRequestKind::Resume
             || ticket.auth_epoch != authority.source_auth_epoch
             || ticket.source_identity != authority.source_identity
             || ticket.source_device_id.as_deref() != Some(&authority.source_device_id)
             || resume.reconcile_operation_id != authority.reconcile_operation_id
-            || resume.target != authority.target_identity
+            || resume.target != expected_target
             || resume.expected_session_generation != authority.expected_session_generation
         {
             return Err(StorageError::RecoveryRequired(
@@ -562,10 +596,27 @@ fn validate_transition_authority(
             .ok_or(StorageError::RecoveryRequired(
                 "invalid transition resume evidence",
             ))?;
+        let expected_target = match resume.decision.as_str() {
+            "apply" => authority.target_identity.clone(),
+            "cancel" => RuntimeIdentity {
+                session_generation: None,
+                ..authority
+                    .source_identity
+                    .clone()
+                    .ok_or(StorageError::RecoveryRequired(
+                        "legacy transition cannot be cancelled",
+                    ))?
+            },
+            _ => {
+                return Err(StorageError::RecoveryRequired(
+                    "invalid transition resume decision",
+                ))
+            }
+        };
         if evidence.operation_id != ticket.operation_id
             || evidence.reconcile_operation_id != authority.reconcile_operation_id
             || evidence.decision != resume.decision
-            || evidence.target_identity != authority.target_identity
+            || evidence.target_identity != expected_target
             || evidence.identity.validate().is_err()
             || evidence.identity.session_generation
                 != authority
@@ -575,9 +626,11 @@ fn validate_transition_authority(
             || (RuntimeIdentity {
                 session_generation: None,
                 ..evidence.identity.clone()
-            }) != authority.target_identity
+            }) != expected_target
             || evidence.access_token.is_empty()
             || evidence.access_token.len() > 256
+            || evidence.token_type != "Bearer"
+            || evidence.access_expires_in == 0
         {
             return Err(StorageError::RecoveryRequired(
                 "invalid transition resume evidence",

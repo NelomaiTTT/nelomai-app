@@ -45,6 +45,7 @@ fn transition_authority() -> TransitionAuthorityV1 {
         cleanup_contract_version: 1,
         cleanup_access_proof: "synthetic-access-proof".into(),
         resume_refresh_proof: "synthetic-refresh-proof".into(),
+        legacy_refresh_completed: false,
         dispatch_state: TransitionDispatchStateV1::Captured,
         reconcile_receipt: None,
         resume_ticket: None,
@@ -89,6 +90,89 @@ fn transition_authority_is_redacted_and_rejects_torn_or_duplicate_provenance() {
         torn.validate().is_err(),
         "known response requires its receipt"
     );
+}
+
+#[test]
+fn transition_resume_proof_requires_exact_clean_receipt_and_full_access_evidence() {
+    let legacy: StoredAuth =
+        serde_json::from_str(r#"{"install_secret":"synthetic-install"}"#).unwrap();
+    let mut auth = AuthStoreV1::from_legacy(&legacy);
+    let mut authority = transition_authority();
+    authority.dispatch_state = TransitionDispatchStateV1::ResponseKnown;
+    authority.reconcile_receipt = Some(TransitionReconcileReceiptV1 {
+        state: "retry".into(),
+        operation_id: authority.reconcile_operation_id.clone(),
+        retired_lease_ids: Vec::new(),
+        retired_session_ids: Vec::new(),
+        retired_operation_ids: Vec::new(),
+        retry_after_seconds: Some(1),
+    });
+    let ticket = BrokerRequestV1 {
+        kind: BrokerRequestKind::Resume,
+        operation_id: "22222222-2222-4222-8222-222222222222".into(),
+        attempt: 1,
+        auth_epoch: authority.source_auth_epoch,
+        source_identity: None,
+        source_device_id: Some(authority.source_device_id.clone()),
+        prior_login_outcome_unknown: false,
+        resume: Some(StoredResumeArgumentsV1 {
+            reconcile_operation_id: authority.reconcile_operation_id.clone(),
+            decision: "apply".into(),
+            target: authority.target_identity.clone(),
+            expected_session_generation: None,
+        }),
+    };
+    authority.resume_ticket = Some(ticket);
+    auth.auth_epoch = authority.source_auth_epoch;
+    auth.broker = Some(BrokerMetadataV1 {
+        family: authority.source_family.clone(),
+        next_attempt: 1,
+        pending_request: None,
+        pending_logout: None,
+        completed_resume: None,
+        pending_recovery: None,
+        cancelled_login: None,
+        authentication_outcome_unknown: false,
+        pending_login_account: None,
+        confirmed_device_id: Some(authority.source_device_id.clone()),
+        pending_push_cleanup_epoch: None,
+        transition_authorities: vec![authority],
+    });
+    assert!(
+        auth.validate().is_err(),
+        "retry must never authorize resume"
+    );
+
+    let authority = &mut auth.broker.as_mut().unwrap().transition_authorities[0];
+    authority.reconcile_receipt.as_mut().unwrap().state = "clean".into();
+    authority
+        .reconcile_receipt
+        .as_mut()
+        .unwrap()
+        .retry_after_seconds = None;
+    authority.resume_evidence = Some(TransitionResumeEvidenceV1 {
+        operation_id: "22222222-2222-4222-8222-222222222222".into(),
+        reconcile_operation_id: authority.reconcile_operation_id.clone(),
+        decision: "apply".into(),
+        target_identity: authority.target_identity.clone(),
+        identity: RuntimeIdentity {
+            session_generation: Some(1),
+            ..authority.target_identity.clone()
+        },
+        access_token: "synthetic-access".into(),
+        token_type: "Basic".into(),
+        access_expires_in: 900,
+    });
+    assert!(
+        auth.validate().is_err(),
+        "non-Bearer evidence must fail closed"
+    );
+    auth.broker.as_mut().unwrap().transition_authorities[0]
+        .resume_evidence
+        .as_mut()
+        .unwrap()
+        .token_type = "Bearer".into();
+    assert!(auth.validate().is_ok());
 }
 
 #[test]

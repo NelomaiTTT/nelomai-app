@@ -9,19 +9,67 @@ use nelomai_client_api::{
     LoginRequest, RuntimeSwitchReconcileRequest, RuntimeSwitchState, RuntimeTarget,
 };
 use nelomai_client_container::{
-    AuthBroker, BrokerError, FrozenReconcileRequest, LocalAuthStop, ResumeArguments,
+    AuthBroker, BrokerError, FrozenReconcileRequest, LocalAuthStop, LocalStopReceiptV1,
+    ResumeArguments, RuntimeSwitchControl, SwitchCoordinator, SwitchPhase, SwitchProgress,
 };
 use nelomai_client_storage::{
     AuthStore, AuthStoreV1, BrokerMetadataV1, BrokerRequestKind, BrokerRequestV1,
-    ProtectedAuthStore, ProtectedRecordStore, StorageError, StoredAuth,
+    ContainerOwnerLock, ProtectedAuthStore, ProtectedRecordStore, RuntimeCleanupSnapshotV1,
+    StorageError, StoredAuth, TransitionAuthorityV1, TransitionDispatchStateV1,
 };
-use nelomai_contracts::{Platform, RuntimeSlot};
+use nelomai_contracts::{
+    verify_container_manifest, ContainerManifestV1, Platform, RuntimeArtifactManifestV1,
+    RuntimeFileRole, RuntimeFileV1, RuntimeSlot, RuntimeSlotManifestV1,
+    CONTAINER_MANIFEST_SIGNATURE_DOMAIN,
+};
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tokio::sync::Notify;
+
+fn manifest() -> nelomai_contracts::VerifiedContainerManifest {
+    use ed25519_dalek::{Signer, SigningKey};
+    let manifest = ContainerManifestV1 {
+        format_version: 1,
+        container_version: "0.2.16".into(),
+        release_set_id: "runtime-0.2.16".into(),
+        minimum_runtime_contract: 1,
+        maximum_runtime_contract: 1,
+        stable_release_set_sha256: None,
+        stable_platform_manifest_sha256: None,
+        slots: vec![RuntimeSlotManifestV1 {
+            slot: RuntimeSlot::Latest,
+            manifest: RuntimeArtifactManifestV1 {
+                format_version: 1,
+                runtime_version: "0.2.16".into(),
+                source_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                platform: "linux".into(),
+                architecture: "x86_64".into(),
+                contract_version: 1,
+                files: vec![RuntimeFileV1 {
+                    path: "bin/nelomai-runtime".into(),
+                    size_bytes: 17,
+                    sha256: "a".repeat(64),
+                    role: RuntimeFileRole::Executable,
+                }],
+            },
+        }],
+    };
+    let bytes = serde_json::to_vec(&serde_json::to_value(manifest).unwrap()).unwrap();
+    let key = SigningKey::from_bytes(&[59; 32]);
+    let mut signed = CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
+    signed.extend_from_slice(&bytes);
+    verify_container_manifest(
+        &bytes,
+        &key.sign(&signed).to_bytes(),
+        &key.verifying_key().to_bytes(),
+        "linux",
+        "x86_64",
+    )
+    .unwrap()
+}
 
 #[derive(Clone, Default)]
 struct Record(Arc<Mutex<Option<Vec<u8>>>>);
@@ -41,17 +89,20 @@ impl ProtectedRecordStore for Record {
 
 struct SaveGate {
     inner: Arc<dyn AuthStore>,
-    armed: std::sync::atomic::AtomicBool,
+    saves_until_cancel: AtomicUsize,
 }
 impl SaveGate {
     fn new(inner: Arc<dyn AuthStore>) -> Self {
         Self {
             inner,
-            armed: false.into(),
+            saves_until_cancel: AtomicUsize::new(0),
         }
     }
     fn arm(&self) {
-        self.armed.store(true, Ordering::SeqCst);
+        self.arm_after(1);
+    }
+    fn arm_after(&self, saves: usize) {
+        self.saves_until_cancel.store(saves, Ordering::SeqCst);
     }
 }
 impl AuthStore for SaveGate {
@@ -60,7 +111,13 @@ impl AuthStore for SaveGate {
     }
     fn save(&self, value: &AuthStoreV1) -> Result<(), StorageError> {
         self.inner.save(value)?;
-        if self.armed.swap(false, Ordering::SeqCst) {
+        if self
+            .saves_until_cancel
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            == Ok(1)
+        {
             let mut cancelled = value.clone();
             cancelled.auth_epoch += 1;
             cancelled.logout_state = nelomai_client_storage::LogoutState::LoggedOut;
@@ -76,6 +133,54 @@ struct Stop;
 #[async_trait]
 impl LocalAuthStop for Stop {
     async fn stop_local(&self) -> Result<(), BrokerError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SwitchControl {
+    handoffs: AtomicUsize,
+    stops: AtomicUsize,
+    completions: AtomicUsize,
+}
+#[async_trait]
+impl RuntimeSwitchControl for SwitchControl {
+    async fn handoff_cleanup(
+        &self,
+        _source: &nelomai_client_container::TransitionSourceSnapshot,
+    ) -> Result<RuntimeCleanupSnapshotV1, BrokerError> {
+        self.handoffs.fetch_add(1, Ordering::SeqCst);
+        Ok(RuntimeCleanupSnapshotV1 {
+            slot: RuntimeSlot::Latest,
+            runtime_version: "0.2.16".into(),
+            auth_scope: None,
+            lease_ids: vec!["lease-a".into()],
+            operations: Vec::new(),
+            cleanup_only: true,
+        })
+    }
+    async fn graceful_stop(
+        &self,
+        _operation_id: &str,
+        _snapshot: &RuntimeCleanupSnapshotV1,
+    ) -> Result<(), BrokerError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn force_stop(
+        &self,
+        _operation_id: &str,
+        _snapshot: &RuntimeCleanupSnapshotV1,
+    ) -> Result<(), BrokerError> {
+        panic!("graceful stop must not force")
+    }
+    async fn complete_cleanup_and_admit(
+        &self,
+        _snapshot: &RuntimeCleanupSnapshotV1,
+        _receipt: &LocalStopReceiptV1,
+        _access: &nelomai_client_api::AccessSnapshot,
+    ) -> Result<(), BrokerError> {
+        self.completions.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -105,12 +210,30 @@ fn legacy_store() -> Arc<dyn AuthStore> {
     store
 }
 
+fn enrolled_store() -> Arc<dyn AuthStore> {
+    let store = legacy_store();
+    let mut auth = store.load().unwrap().unwrap();
+    let identity = target().identity(Some(7)).unwrap();
+    auth.confirmed_identity = Some(identity);
+    auth.session_generation = Some(7);
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device-a".into());
+    store.save(&auth).unwrap();
+    store
+}
+
 fn target() -> RuntimeTarget {
     RuntimeTarget {
         container_version: "0.2.16".into(),
         runtime_version: "0.2.16".into(),
         runtime_contract_version: 1,
         runtime_slot: RuntimeSlot::Latest,
+    }
+}
+
+fn stable_target() -> RuntimeTarget {
+    RuntimeTarget {
+        runtime_slot: RuntimeSlot::Stable,
+        ..target()
     }
 }
 
@@ -126,7 +249,9 @@ struct Panel {
     reject_reconcile_access: AtomicUsize,
     fail_reconcile: AtomicUsize,
     return_full_device_snapshot: AtomicUsize,
+    return_retry: AtomicUsize,
     reconcile_bodies: Mutex<Vec<Value>>,
+    resume_calls: AtomicUsize,
     hold_resume: AtomicUsize,
     resume_entered: Notify,
     resume_release: Notify,
@@ -202,22 +327,175 @@ async fn reconcile(
             "retry_after_seconds":null}),
         ));
     }
+    if state.return_retry.swap(0, Ordering::SeqCst) == 1 {
+        return Ok(Json(
+            json!({"state":"retry","operation_id":body["operation_id"],
+            "retired_lease_ids":[],"retired_session_ids":[],
+            "retired_operation_ids":[],"retry_after_seconds":1}),
+        ));
+    }
     Ok(Json(
         json!({"state":"clean","operation_id":body["operation_id"],
         "retired_lease_ids":body["lease_ids"],"retired_session_ids":body["redundant_session_ids"],
         "retired_operation_ids":body["client_operation_ids"],"retry_after_seconds":null}),
     ))
 }
-async fn resume(State(state): State<Arc<Panel>>, Json(_): Json<Value>) -> Json<Value> {
+async fn resume(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
+    state.resume_calls.fetch_add(1, Ordering::SeqCst);
     state.resume_entered.notify_one();
     if state.hold_resume.load(Ordering::SeqCst) == 1 {
         state.resume_release.notified().await;
     }
+    let generation = body["expected_session_generation"].as_u64().unwrap_or(0) + 1;
     Json(
-        json!({"identity":{"container_version":"0.2.16","runtime_version":"0.2.16",
-        "runtime_contract_version":1,"runtime_slot":"latest","session_generation":1},
+        json!({"identity":{"container_version":body["target_identity"]["container_version"],
+        "runtime_version":body["target_identity"]["runtime_version"],
+        "runtime_contract_version":body["target_identity"]["runtime_contract_version"],
+        "runtime_slot":body["target_identity"]["runtime_slot"],"session_generation":generation},
         "access_token":"runtime-access","token_type":"Bearer","access_expires_in":900}),
     )
+}
+
+#[tokio::test]
+async fn retry_receipt_replays_the_exact_frozen_request_until_clean() {
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = legacy_store();
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+
+    assert_eq!(
+        broker
+            .reconcile_transition(frozen.clone())
+            .await
+            .unwrap()
+            .state,
+        RuntimeSwitchState::Retry
+    );
+    drop(broker);
+    let reopened = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+    assert_eq!(
+        reopened.reconcile_transition(frozen).await.unwrap().state,
+        RuntimeSwitchState::Clean
+    );
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
+    let bodies = state.reconcile_bodies.lock().unwrap();
+    assert_eq!(bodies[0], bodies[1]);
+    server.abort();
+}
+
+#[tokio::test]
+async fn unresolved_current_transition_fences_ordinary_issuance_but_allows_exact_completion() {
+    let state = Arc::new(Panel::default());
+    state.fail_reconcile.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let broker = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+    let current = broker.access_token(None).await.unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
+
+    assert!(matches!(
+        broker.access_token(Some(&current)).await,
+        Err(BrokerError::RecoveryRequired)
+    ));
+    assert!(matches!(
+        broker
+            .resume(ResumeArguments {
+                operation_id: "22222222-2222-4222-8222-222222222222".into(),
+                reconcile_operation_id: frozen.request().operation_id.clone(),
+                decision: "apply".into(),
+                target: target(),
+                expected_session_generation: Some(7),
+            })
+            .await,
+        Err(BrokerError::RecoveryRequired)
+    ));
+    assert!(matches!(
+        broker.begin_background_recovery().await,
+        Err(BrokerError::RecoveryRequired)
+    ));
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 0);
+
+    broker.reconcile_transition(frozen.clone()).await.unwrap();
+    broker
+        .resume_transition(ResumeArguments {
+            operation_id: "22222222-2222-4222-8222-222222222222".into(),
+            reconcile_operation_id: frozen.request().operation_id.clone(),
+            decision: "apply".into(),
+            target: target(),
+            expected_session_generation: Some(7),
+        })
+        .await
+        .unwrap();
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn enrolled_cancel_resumes_the_frozen_source_without_rewriting_the_apply_target() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state).await;
+    let store = enrolled_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let mut request = reconcile_request(&source);
+    request.target_identity = stable_target();
+    let frozen = FrozenReconcileRequest::new(request, &source).unwrap();
+    broker.reconcile_transition(frozen.clone()).await.unwrap();
+
+    let receipt = broker
+        .resume_transition(ResumeArguments {
+            operation_id: "22222222-2222-4222-8222-222222222222".into(),
+            reconcile_operation_id: frozen.request().operation_id.clone(),
+            decision: "cancel".into(),
+            target: target(),
+            expected_session_generation: Some(7),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt.identity().slot, RuntimeSlot::Latest);
+    let authority = &store
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .transition_authorities[0];
+    assert_eq!(authority.target_identity.slot, RuntimeSlot::Stable);
+    assert_eq!(
+        authority
+            .resume_evidence
+            .as_ref()
+            .unwrap()
+            .target_identity
+            .slot,
+        RuntimeSlot::Latest
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn reconcile_rechecks_cancellation_after_dispatch_intent_before_http() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let gated = Arc::new(SaveGate::new(legacy_store()));
+    let store: Arc<dyn AuthStore> = gated.clone();
+    let broker = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    gated.arm_after(2);
+
+    assert!(matches!(
+        broker.reconcile_transition(frozen).await,
+        Err(BrokerError::Cancelled)
+    ));
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 0);
+    server.abort();
 }
 async fn logout() -> Json<Value> {
     Json(json!({"code":"session_revoked_cleanup_accepted",
@@ -435,6 +713,8 @@ async fn authority_count_and_record_budget_reject_new_work_without_replacing_old
     let first = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
     broker.reconcile_transition(first).await.unwrap();
     let mut auth = store.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().transition_authorities[0].source_family =
+        "historical-family".into();
     let template = auth.broker.as_ref().unwrap().transition_authorities[0].clone();
     for index in 2..=16 {
         let mut entry = template.clone();
@@ -471,6 +751,8 @@ async fn authority_count_and_record_budget_reject_new_work_without_replacing_old
     let first = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
     broker.reconcile_transition(first).await.unwrap();
     let mut auth = store.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().transition_authorities[0].source_family =
+        "historical-family".into();
     let ids: Vec<String> = (0..1024)
         .map(|index| format!("{index:04}-{}", "x".repeat(250)))
         .collect();
@@ -674,6 +956,102 @@ fn reconcile_request(
     }
 }
 
+fn insert_reconcile_authority(
+    store: &Arc<dyn AuthStore>,
+    frozen: &FrozenReconcileRequest,
+    dispatch_state: TransitionDispatchStateV1,
+) {
+    let mut auth = store.load().unwrap().unwrap();
+    let meta = auth.broker.as_ref().unwrap();
+    let authority = TransitionAuthorityV1 {
+        schema_version: 1,
+        reconcile_operation_id: frozen.request().operation_id.clone(),
+        request_fingerprint: frozen.request_fingerprint().into(),
+        source_auth_epoch: auth.auth_epoch,
+        source_family: meta.family.clone(),
+        source_identity: auth.confirmed_identity.clone(),
+        source_device_id: frozen.source_device_id().into(),
+        source_scope_fingerprint: frozen.source_scope_fingerprint().into(),
+        expected_session_generation: auth.session_generation,
+        target_identity: frozen.request().target_identity.identity(None).unwrap(),
+        cleanup_contract_version: frozen.request().cleanup_contract_version,
+        cleanup_access_proof: auth.access_token.clone().unwrap(),
+        resume_refresh_proof: auth.refresh_token.clone().unwrap(),
+        legacy_refresh_completed: false,
+        dispatch_state,
+        reconcile_receipt: None,
+        resume_ticket: None,
+        resume_evidence: None,
+    };
+    auth.broker
+        .as_mut()
+        .unwrap()
+        .transition_authorities
+        .push(authority);
+    store.save(&auth).unwrap();
+}
+
+#[tokio::test]
+async fn durable_captured_and_invalid_access_states_resume_the_one_eligible_legacy_refresh() {
+    for dispatch_state in [
+        TransitionDispatchStateV1::Captured,
+        TransitionDispatchStateV1::InvalidAccessRejected,
+    ] {
+        let state = Arc::new(Panel::default());
+        if dispatch_state == TransitionDispatchStateV1::Captured {
+            state.reject_reconcile_access.store(1, Ordering::SeqCst);
+        }
+        let (api, server) = panel(state.clone()).await;
+        let store = legacy_store();
+        let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+        let source = broker.transition_source().await.unwrap();
+        let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+        insert_reconcile_authority(&store, &frozen, dispatch_state);
+        drop(broker);
+
+        let reopened = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+        assert_eq!(
+            reopened.reconcile_transition(frozen).await.unwrap().state,
+            RuntimeSwitchState::Clean
+        );
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.reconcile_calls.load(Ordering::SeqCst),
+            if dispatch_state == TransitionDispatchStateV1::Captured {
+                2
+            } else {
+                1
+            }
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn unknown_transition_legacy_refresh_never_resends_the_rejected_bearer() {
+    let state = Arc::new(Panel::default());
+    state.reject_reconcile_access.store(1, Ordering::SeqCst);
+    state.fail_refresh.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = legacy_store();
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+    drop(broker);
+
+    let reopened = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+    assert!(matches!(
+        reopened.reconcile_transition(frozen).await,
+        Err(BrokerError::RecoveryRequired)
+    ));
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
 #[tokio::test]
 async fn migrated_owner_bootstraps_reconciles_and_resumes_without_exposing_legacy_access() {
     let state = Arc::new(Panel::default());
@@ -744,6 +1122,35 @@ async fn migrated_owner_bootstraps_reconciles_and_resumes_without_exposing_legac
         store.load().unwrap().unwrap().access_token.as_deref(),
         Some("login-b-access")
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn coordinator_runs_the_real_broker_flow_and_recovery_stays_complete() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = legacy_store();
+    let broker = Arc::new(AuthBroker::new(api, store, Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let coordinator = SwitchCoordinator::open(owner, manifest())
+        .unwrap()
+        .attach(broker, control.clone());
+
+    assert_eq!(
+        coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+        SwitchProgress::Ready
+    );
+    assert_eq!(
+        coordinator.snapshot().unwrap().unwrap().phase(),
+        SwitchPhase::Complete
+    );
+    assert_eq!(coordinator.recover().await.unwrap(), SwitchProgress::Ready);
+    assert_eq!(control.handoffs.load(Ordering::SeqCst), 1);
+    assert_eq!(control.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(control.completions.load(Ordering::SeqCst), 1);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
 

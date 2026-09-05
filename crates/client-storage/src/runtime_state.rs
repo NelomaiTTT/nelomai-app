@@ -115,6 +115,25 @@ pub struct RuntimeStateV1 {
     pub compatibility: Option<StoredCompatibility>,
     pub applied_split_tunnel: StoredSplitTunnelState,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCleanupOperationV1 {
+    pub operation_id: String,
+    pub request_fingerprint: Option<String>,
+    pub contract_version: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCleanupSnapshotV1 {
+    pub slot: RuntimeSlot,
+    pub runtime_version: String,
+    pub auth_scope: Option<RuntimeAuthScope>,
+    pub lease_ids: Vec<String>,
+    pub operations: Vec<RuntimeCleanupOperationV1>,
+    pub cleanup_only: bool,
+}
 impl fmt::Debug for RuntimeStateV1 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RuntimeStateV1")
@@ -192,6 +211,80 @@ impl RuntimeStateV1 {
         self.compatibility = value.compatibility.clone();
     }
 }
+
+fn cleanup_snapshot(state: &RuntimeStateV1) -> RuntimeCleanupSnapshotV1 {
+    let mut lease_ids = Vec::new();
+    for lease_id in state
+        .saved_connection
+        .as_ref()
+        .map(|connection| connection.lease_id.as_str())
+        .into_iter()
+        .chain(
+            state
+                .pinned_connection
+                .as_ref()
+                .map(|connection| connection.lease_id.as_str()),
+        )
+        .chain(
+            state
+                .pending_stalled_stop
+                .as_ref()
+                .map(|pending| pending.lease_id.as_str()),
+        )
+        .chain(
+            state
+                .pending_compensation_stop
+                .as_ref()
+                .map(|pending| pending.lease_id.as_str()),
+        )
+    {
+        if !lease_ids.iter().any(|existing| existing == lease_id) {
+            lease_ids.push(lease_id.to_owned());
+        }
+    }
+    let mut operations = Vec::new();
+    let mut push =
+        |operation_id: &str, request_fingerprint: Option<String>, contract_version: Option<u32>| {
+            if !operations
+                .iter()
+                .any(|existing: &RuntimeCleanupOperationV1| existing.operation_id == operation_id)
+            {
+                operations.push(RuntimeCleanupOperationV1 {
+                    operation_id: operation_id.to_owned(),
+                    request_fingerprint,
+                    contract_version,
+                });
+            }
+        };
+    if let Some(pending) = &state.pending_start {
+        push(
+            &pending.operation_id,
+            pending.request_fingerprint.clone(),
+            pending.recovery_contract_version,
+        );
+        if let Some(cancel_operation_id) = &pending.cancel_operation_id {
+            push(cancel_operation_id, None, None);
+        }
+    }
+    if let Some(pending) = &state.pending_stalled_stop {
+        push(
+            &pending.operation_id,
+            Some(pending.request_fingerprint.clone()),
+            Some(pending.contract_version),
+        );
+    }
+    if let Some(pending) = &state.pending_compensation_stop {
+        push(&pending.operation_id, None, None);
+    }
+    RuntimeCleanupSnapshotV1 {
+        slot: state.slot,
+        runtime_version: state.runtime_version.clone(),
+        auth_scope: state.auth_scope.clone(),
+        lease_ids,
+        operations,
+        cleanup_only: state.cleanup_only,
+    }
+}
 pub trait RuntimeStateStore: Send + Sync {
     fn paths(&self) -> &RuntimePaths;
     fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError>;
@@ -237,6 +330,29 @@ impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
             ));
         }
         Ok(())
+    }
+    pub fn cleanup_snapshot(&self) -> Result<RuntimeCleanupSnapshotV1, StorageError> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        Ok(cleanup_snapshot(&self.load_required()?))
+    }
+    /// Container control only. The caller must hold runtime writer quiescence
+    /// and present matching local/server receipts before invoking this method.
+    pub fn complete_cleanup(&self, frozen: &RuntimeCleanupSnapshotV1) -> Result<(), StorageError> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let mut current = self.load_required()?;
+        if cleanup_snapshot(&current) != *frozen {
+            return Err(StorageError::RecoveryRequired(
+                "runtime cleanup snapshot changed",
+            ));
+        }
+        current.complete_legacy_cleanup();
+        self.backend.save(&current)
     }
     /// Owner/control only: caller holds actual runtime-writer quiescence (or
     /// has not handed the record to any runtime yet). Never called by access reads.
