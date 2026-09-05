@@ -1190,6 +1190,10 @@ pub enum CoreError {
 #[async_trait]
 pub trait RuntimeStartPreflight: Send + Sync {
     async fn before_tunnel_start(&self) -> Result<(), CoreError>;
+    /// Recheck admission while holding the actual lifecycle writer gate.
+    /// This must not recover, wait for coordinator execution, or acquire writer
+    /// quiescence: a transition may already be waiting for this same gate.
+    fn check_start_barrier(&self) -> Result<(), CoreError>;
 }
 
 pub struct AllowRuntimeStart;
@@ -1197,6 +1201,9 @@ pub struct AllowRuntimeStart;
 #[async_trait]
 impl RuntimeStartPreflight for AllowRuntimeStart {
     async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+    fn check_start_barrier(&self) -> Result<(), CoreError> {
         Ok(())
     }
 }

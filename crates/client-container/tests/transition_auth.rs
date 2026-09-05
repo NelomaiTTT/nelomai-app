@@ -42,8 +42,16 @@ fn manifest_for(
     container_version: &str,
     runtime_version: &str,
 ) -> nelomai_contracts::VerifiedContainerManifest {
+    manifest_with_optional_stable(container_version, runtime_version, false)
+}
+
+fn manifest_with_optional_stable(
+    container_version: &str,
+    runtime_version: &str,
+    stable: bool,
+) -> nelomai_contracts::VerifiedContainerManifest {
     use ed25519_dalek::{Signer, SigningKey};
-    let manifest = ContainerManifestV1 {
+    let mut manifest = ContainerManifestV1 {
         format_version: 1,
         container_version: container_version.into(),
         release_set_id: format!("runtime-{runtime_version}"),
@@ -69,6 +77,14 @@ fn manifest_for(
             },
         }],
     };
+    if stable {
+        let mut slot = manifest.slots[0].clone();
+        slot.slot = RuntimeSlot::Stable;
+        slot.manifest.runtime_version = "0.2.15".into();
+        manifest.slots.push(slot);
+        manifest.stable_release_set_sha256 = Some("b".repeat(64));
+        manifest.stable_platform_manifest_sha256 = Some("c".repeat(64));
+    }
     let bytes = serde_json::to_vec(&serde_json::to_value(manifest).unwrap()).unwrap();
     let key = SigningKey::from_bytes(&[59; 32]);
     let mut signed = CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
@@ -1457,6 +1473,338 @@ async fn actual_record_control_clears_the_frozen_source_and_binds_only_resumed_s
         Some(1)
     );
     assert_eq!(tunnel.0.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+fn write_test_selection(root: &std::path::Path, version: &str) {
+    std::fs::create_dir_all(root.join("common")).unwrap();
+    std::fs::write(
+        root.join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: version.into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[derive(Default)]
+struct StartupRecords {
+    records: Mutex<std::collections::HashMap<String, Record>>,
+    legacy: Mutex<Option<StoredAuth>>,
+}
+impl nelomai_client_storage::SecretStore for StartupRecords {
+    fn load(&self) -> Result<Option<StoredAuth>, StorageError> {
+        Ok(self.legacy.lock().unwrap().clone())
+    }
+    fn save(&self, value: &StoredAuth) -> Result<(), StorageError> {
+        *self.legacy.lock().unwrap() = Some(value.clone());
+        Ok(())
+    }
+    fn delete(&self) -> Result<(), StorageError> {
+        panic!("startup must retain install identity")
+    }
+}
+impl nelomai_client_storage::ProtectedRecordFactory for StartupRecords {
+    type Record = Record;
+    fn record(&self, namespace: &str) -> Record {
+        self.records
+            .lock()
+            .unwrap()
+            .entry(namespace.into())
+            .or_default()
+            .clone()
+    }
+    fn legacy(&self) -> &dyn nelomai_client_storage::SecretStore {
+        self
+    }
+}
+
+#[tokio::test]
+async fn completed_enrollment_does_not_mask_admission_of_a_new_namespace() {
+    use nelomai_client_storage::{prepare_runtime_storage, ProtectedRecordFactory};
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let local = CoreLocalStop::new(Arc::new(SwitchTunnel::default()));
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let records = StartupRecords::default();
+    let mut legacy = StoredAuth::new_install();
+    legacy.access_token = Some("legacy-access".into());
+    legacy.refresh_token = Some("legacy-refresh".into());
+    records.legacy().save(&legacy).unwrap();
+    let old_storage =
+        prepare_runtime_storage(&owner, &manifest(), RuntimeSlot::Latest, &records).unwrap();
+    let install_secret = old_storage.auth.load().unwrap().unwrap().install_secret;
+    let store = Arc::new(old_storage.auth);
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), local.clone()).unwrap());
+    let old_record = RuntimeRecordOwner::new(old_storage.runtime);
+    let old = SwitchCoordinator::open(owner.clone(), manifest())
+        .unwrap()
+        .attach(
+            broker.clone(),
+            Arc::new(RuntimeRecordSwitchControl::new(
+                old_record.clone(),
+                vec![],
+                local.clone(),
+                Arc::new(UnavailableRuntimeForceStop),
+            )),
+        )
+        .require_initial_transition(RuntimeSlot::Latest);
+    old.before_tunnel_start().await.unwrap();
+    assert!(!old_record.cleanup_snapshot().unwrap().cleanup_only);
+    let _quiescence = local.runtime_writer_gates().quiesce().await;
+    assert_eq!(
+        nelomai_client_storage::acknowledge_migration_bootstrap(
+            &nelomai_client_storage::LegacyMigrationSource::new(
+                records.legacy(),
+                &nelomai_client_storage::FileSplitTunnelStore::new(root.path())
+            ),
+            store.as_ref(),
+            &old_record.operational(),
+            &nelomai_client_storage::FileMigrationJournal::new(
+                root.path().join("common/auth-migration-v1.json")
+            ),
+        )
+        .unwrap(),
+        nelomai_client_storage::MigrationOutcome::Complete
+    );
+    drop(_quiescence);
+    let old_operation =
+        serde_json::to_value(old.snapshot().unwrap().unwrap()).unwrap()["operation_id"].clone();
+    drop(old);
+    write_test_selection(root.path(), "0.2.17");
+    let updated_manifest = manifest_for("0.2.17", "0.2.17");
+    let new_storage =
+        prepare_runtime_storage(&owner, &updated_manifest, RuntimeSlot::Latest, &records).unwrap();
+    assert_eq!(
+        new_storage.auth.load().unwrap().unwrap().install_secret,
+        install_secret
+    );
+    assert_eq!(new_storage.retained.len(), 1);
+    let new_record = RuntimeRecordOwner::new(new_storage.runtime);
+    let updated = SwitchCoordinator::open(owner, manifest_for("0.2.17", "0.2.17"))
+        .unwrap()
+        .attach(
+            broker,
+            Arc::new(RuntimeRecordSwitchControl::new(
+                new_record.clone(),
+                vec![old_record],
+                local,
+                Arc::new(UnavailableRuntimeForceStop),
+            )),
+        )
+        .require_initial_transition(RuntimeSlot::Latest);
+    updated.before_tunnel_start().await.unwrap();
+    let admitted = new_record.cleanup_snapshot().unwrap();
+    assert!(
+        !admitted.cleanup_only,
+        "completed predecessor cannot admit the new namespace"
+    );
+    assert_eq!(
+        admitted.auth_scope.unwrap().identity.runtime_version,
+        "0.2.17"
+    );
+    assert_ne!(
+        serde_json::to_value(updated.snapshot().unwrap().unwrap()).unwrap()["operation_id"],
+        old_operation
+    );
+    updated.before_tunnel_start().await.unwrap();
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn satisfied_initial_admission_does_not_override_a_later_explicit_slot_switch() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, legacy_store(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let coordinator = SwitchCoordinator::open(
+        owner,
+        manifest_with_optional_stable("0.2.16", "0.2.16", true),
+    )
+    .unwrap()
+    .attach(broker, Arc::new(SwitchControl::default()))
+    .require_initial_transition(RuntimeSlot::Latest);
+    coordinator.before_tunnel_start().await.unwrap();
+    assert_eq!(
+        coordinator.request(RuntimeSlot::Stable).await.unwrap(),
+        SwitchProgress::Ready
+    );
+    coordinator.before_tunnel_start().await.unwrap();
+    assert_eq!(
+        coordinator.status().unwrap().selected_slot,
+        RuntimeSlot::Stable
+    );
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+struct PausedStartPreflight {
+    coordinator: Arc<SwitchCoordinator>,
+    passed: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl nelomai_client_core::RuntimeStartPreflight for PausedStartPreflight {
+    async fn before_tunnel_start(&self) -> Result<(), nelomai_client_core::CoreError> {
+        self.coordinator
+            .before_tunnel_start()
+            .await
+            .map_err(|_| nelomai_client_core::CoreError::AuthRecoveryRequired)?;
+        self.passed.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+    fn check_start_barrier(&self) -> Result<(), nelomai_client_core::CoreError> {
+        nelomai_client_core::RuntimeStartPreflight::check_start_barrier(self.coordinator.as_ref())
+    }
+}
+
+#[derive(Default)]
+struct OfflineRaceTunnel {
+    starts: AtomicUsize,
+    stops: AtomicUsize,
+}
+#[async_trait]
+impl TunnelController for OfflineRaceTunnel {
+    async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        Err(TunnelError::Backend("synthetic start reached".into()))
+    }
+    async fn stop(&self) -> Result<(), TunnelError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        Ok(TunnelStatus::Stopped)
+    }
+}
+
+#[tokio::test]
+async fn offline_start_rechecks_switch_barrier_after_preflight_and_lifecycle_gap() {
+    use nelomai_client_container::{OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile};
+    let state = Arc::new(Panel::default());
+    state.return_retry.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state).await;
+    let store = enrolled_store();
+    let tunnel = Arc::new(OfflineRaceTunnel::default());
+    let local = CoreLocalStop::new(tunnel.clone());
+    let broker = Arc::new(AuthBroker::new(api.clone(), store.clone(), local.clone()).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap();
+    let backend = ProtectedRuntimeStore::new(Record::default(), paths);
+    let auth = store.load().unwrap().unwrap();
+    let mut runtime = RuntimeStateV1::empty(backend.paths(), false);
+    runtime.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+        auth_epoch: auth.auth_epoch,
+        family: auth.broker.unwrap().family,
+        identity: auth.confirmed_identity.unwrap(),
+    });
+    runtime.saved_connection = Some(StoredConnection {
+        lease_id: "lease-a".into(),
+        pool_id: None,
+        layer: nelomai_contracts::Layer::Stray,
+        tic_connection_mode: nelomai_contracts::TicConnectionMode::Dynamic,
+        route_mode: nelomai_contracts::RouteMode::Standalone,
+        egress_mode: nelomai_contracts::EgressMode::Ipv4,
+        probe_url: None,
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: "PrivateKey = synthetic".into(),
+        valid_until_unix: Some(1_900_000_000),
+    });
+    backend.save(&runtime).unwrap();
+    let record = RuntimeRecordOwner::new(backend);
+    let port = Arc::new(
+        OwnerRuntimeAuth::new(
+            broker.clone(),
+            target(),
+            RuntimeClientProfile {
+                platform: Platform::Macos,
+                platform_version: None,
+                architecture: "aarch64".into(),
+            },
+            Arc::new(RuntimeCacheAdmission::new(record.clone())),
+            local.runtime_writer_gates(),
+        )
+        .unwrap(),
+    );
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let coordinator = Arc::new(SwitchCoordinator::open(owner, manifest()).unwrap().attach(
+        broker,
+        Arc::new(RuntimeRecordSwitchControl::new(
+            record.clone(),
+            vec![],
+            local.clone(),
+            Arc::new(UnavailableRuntimeForceStop),
+        )),
+    ));
+    let preflight = Arc::new(PausedStartPreflight {
+        coordinator: coordinator.clone(),
+        passed: Notify::new(),
+        release: Notify::new(),
+    });
+    let application =
+        nelomai_client_application::ClientApplication::with_split_tunnel_store_and_preflight(
+            Arc::new(api),
+            Arc::new(record.operational()),
+            Arc::new(record.split()),
+            port,
+            local.clone(),
+            Arc::new(nelomai_client_core::NoopLogger),
+            preflight.clone(),
+        );
+    let start = application.start_saved_stray_offline(1_800_000_000);
+    tokio::pin!(start);
+    tokio::select! { biased;
+        result = &mut start => panic!("start must pause after preflight: {result:?}"),
+        _ = preflight.passed.notified() => {}
+    }
+    assert!(matches!(
+        coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+        SwitchProgress::Pending { .. }
+    ));
+    assert_eq!(
+        coordinator.status().unwrap().phase,
+        Some(SwitchPhase::ServerReconciling)
+    );
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    preflight.release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), start)
+        .await
+        .expect("barrier recheck must not recover under lifecycle lock");
+    assert_eq!(
+        tunnel.starts.load(Ordering::SeqCst),
+        0,
+        "a queued source start must not invalidate the durable local-stop receipt"
+    );
+    assert!(
+        matches!(
+            result,
+            Err(nelomai_client_application::ApplicationError::Core(
+                nelomai_client_core::CoreError::AuthRecoveryRequired
+            ))
+        ),
+        "{result:?}"
+    );
+    let _quiescence = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        local.runtime_writer_gates().quiesce(),
+    )
+    .await
+    .unwrap();
     server.abort();
 }
 

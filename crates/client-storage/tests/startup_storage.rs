@@ -122,6 +122,53 @@ fn committed_owner_creates_a_quarantined_new_runtime_without_replacing_auth_or_o
 }
 
 #[test]
+fn missing_inventoried_selected_runtime_is_not_recreated_when_another_record_survives() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+    let records = Records::default();
+    prepare_runtime_storage(&lock, &manifest(), RuntimeSlot::Latest, &records).unwrap();
+    let updated_manifest = manifest_for("0.3.0");
+    let updated =
+        prepare_runtime_storage(&lock, &updated_manifest, RuntimeSlot::Latest, &records).unwrap();
+    let namespace = updated.runtime.paths().namespace().to_owned();
+    records.values.lock().unwrap().remove(&namespace);
+    let before = records.values.lock().unwrap().clone();
+    let writes = records.writes.load(Ordering::SeqCst);
+    assert!(
+        prepare_runtime_storage(&lock, &updated_manifest, RuntimeSlot::Latest, &records).is_err()
+    );
+    assert_eq!(*records.values.lock().unwrap(), before);
+    assert_eq!(records.writes.load(Ordering::SeqCst), writes);
+}
+
+#[test]
+fn unregistered_exact_empty_runtime_save_can_replay_before_inventory_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();
+    let records = Records::default();
+    let old = prepare_runtime_storage(&lock, &manifest(), RuntimeSlot::Latest, &records).unwrap();
+    let original_auth = old.auth.load().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.3.0").unwrap();
+    let runtime = ProtectedRuntimeStore::new(records.record(paths.namespace()), paths);
+    let expected = RuntimeStateV1::empty(runtime.paths(), true);
+    // The protected save committed, but the nonsecret inventory still names
+    // only the old namespace, exactly as after interruption between the writes.
+    runtime.save(&expected).unwrap();
+    let writes = records.writes.load(Ordering::SeqCst);
+    let updated =
+        prepare_runtime_storage(&lock, &manifest_for("0.3.0"), RuntimeSlot::Latest, &records)
+            .unwrap();
+    assert_eq!(updated.runtime.load().unwrap(), Some(expected));
+    assert_eq!(updated.auth.load().unwrap(), original_auth);
+    assert_eq!(updated.retained.len(), 1);
+    assert_eq!(records.writes.load(Ordering::SeqCst), writes);
+    assert!(
+        prepare_runtime_storage(&lock, &manifest_for("0.3.0"), RuntimeSlot::Latest, &records)
+            .is_ok()
+    );
+}
+
+#[test]
 fn completed_legacy_anchor_is_retained_when_a_later_runtime_namespace_is_created() {
     let root = tempfile::tempdir().unwrap();
     let lock = ContainerOwnerLock::try_acquire(root.path()).unwrap();

@@ -460,19 +460,38 @@ fn application_with_preflight(
     (application, api)
 }
 
-struct RejectStart(AtomicUsize);
+struct RejectStart {
+    preflight_calls: AtomicUsize,
+    reject_in_preflight: bool,
+}
 
 #[async_trait]
 impl RuntimeStartPreflight for RejectStart {
     async fn before_tunnel_start(&self) -> Result<(), CoreError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_in_preflight {
+            Err(CoreError::AuthRecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
+    fn check_start_barrier(&self) -> Result<(), CoreError> {
         Err(CoreError::AuthRecoveryRequired)
     }
 }
 
 #[tokio::test]
 async fn every_application_start_path_runs_transition_preflight_before_network_or_tunnel_work() {
-    let preflight = Arc::new(RejectStart(AtomicUsize::new(0)));
+    for reject_in_preflight in [true, false] {
+        assert_all_start_paths_reject(Arc::new(RejectStart {
+            preflight_calls: AtomicUsize::new(0),
+            reject_in_preflight,
+        }))
+        .await;
+    }
+}
+
+async fn assert_all_start_paths_reject(preflight: Arc<RejectStart>) {
     let (application, api) = application_with_preflight(preflight.clone());
     let options = ConnectOptions {
         layer: Layer::Stray,
@@ -511,7 +530,7 @@ async fn every_application_start_path_runs_transition_preflight_before_network_o
         Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
     ));
     #[cfg(not(target_os = "android"))]
-    assert_eq!(preflight.0.load(Ordering::SeqCst), 5);
+    assert_eq!(preflight.preflight_calls.load(Ordering::SeqCst), 5);
     assert!(api.start_request.lock().unwrap().is_none());
     assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 0);
 }

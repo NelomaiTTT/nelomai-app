@@ -320,6 +320,13 @@ fn recovered_journal_rejects_every_snapshot_source_and_envelope_crosslink_break(
             value["runtime_snapshot"]["operations"][0]["request_fingerprint"] =
                 serde_json::Value::Null
         }),
+        Box::new(|value| {
+            let operation = value["runtime_snapshot"]["operations"][0].clone();
+            value["runtime_snapshot"]["operations"]
+                .as_array_mut()
+                .unwrap()
+                .push(operation);
+        }),
     ];
 
     for mutate in mutations {

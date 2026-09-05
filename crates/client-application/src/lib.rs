@@ -888,6 +888,7 @@ where
     ) -> Result<Connection, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.start_preflight.check_start_barrier()?;
         options = options.normalized_for_layer();
         options.probes = if options.layer == Layer::Tic
             && options.tic_connection_mode == TicConnectionMode::Personal
@@ -918,6 +919,7 @@ where
     ) -> Result<Connection, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.start_preflight.check_start_barrier()?;
         let cancel_epoch = self.core.begin_start_attempt();
         options = options.normalized_for_layer();
         options.probes.clear();
@@ -937,6 +939,7 @@ where
     ) -> Result<Connection, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.start_preflight.check_start_barrier()?;
         let cancel_epoch = self.core.begin_start_attempt();
         options = options.normalized_for_layer();
         options.probes = if options.layer == Layer::Tic
@@ -980,6 +983,7 @@ where
     ) -> Result<Connection, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.start_preflight.check_start_barrier()?;
         let cancel_epoch = self.core.begin_start_attempt();
         let result = async {
             options = options.normalized_for_layer();
@@ -1160,6 +1164,7 @@ where
     ) -> Result<String, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        self.start_preflight.check_start_barrier()?;
         self.core
             .start_saved_stray_offline(now_unix)
             .await

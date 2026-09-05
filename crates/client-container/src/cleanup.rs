@@ -52,6 +52,15 @@ impl CleanupEnvelopeV1 {
         engine_role: CleanupEngineRoleV1,
         background_reference: Option<String>,
     ) -> Result<Self, CleanupEnvelopeError> {
+        let mut seen = HashSet::new();
+        if snapshot.operations.len() > 1024
+            || snapshot
+                .operations
+                .iter()
+                .any(|operation| !seen.insert(&operation.operation_id))
+        {
+            return Err(CleanupEnvelopeError::Invalid);
+        }
         let mut operations = Vec::new();
         for operation in &snapshot.operations {
             let provenance = match (

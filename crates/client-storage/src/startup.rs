@@ -308,7 +308,13 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
                 return recovery();
             }
             if current_runtime.is_none() {
-                if occupied.is_empty() || !pending.is_empty() {
+                if marker
+                    .namespaces
+                    .iter()
+                    .any(|namespace| namespace == selected_paths.namespace())
+                    || occupied.is_empty()
+                    || !pending.is_empty()
+                {
                     return recovery();
                 }
                 runtime.save(&expected_new_runtime)?;

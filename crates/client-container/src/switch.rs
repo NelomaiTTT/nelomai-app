@@ -18,7 +18,10 @@ use std::{
     fs::File,
     io::{self, Read},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use uuid::Uuid;
 
@@ -230,6 +233,7 @@ pub struct SwitchCoordinator {
     broker: Option<Arc<AuthBroker>>,
     control: Option<Arc<dyn RuntimeSwitchControl>>,
     required_initial_target: Option<nelomai_contracts::RuntimeSlot>,
+    initial_transition_satisfied: AtomicBool,
     execution: tokio::sync::Mutex<()>,
 }
 
@@ -247,6 +251,7 @@ impl SwitchCoordinator {
             broker: None,
             control: None,
             required_initial_target: None,
+            initial_transition_satisfied: AtomicBool::new(false),
             execution: tokio::sync::Mutex::new(()),
         };
         coordinator.snapshot()?;
@@ -323,6 +328,13 @@ impl SwitchCoordinator {
         target_slot: nelomai_contracts::RuntimeSlot,
     ) -> Result<SwitchProgress, SwitchError> {
         let _execution = self.execution.lock().await;
+        self.request_locked(target_slot).await
+    }
+
+    async fn request_locked(
+        &self,
+        target_slot: nelomai_contracts::RuntimeSlot,
+    ) -> Result<SwitchProgress, SwitchError> {
         if self
             .snapshot()?
             .is_some_and(|journal| journal.phase != SwitchPhase::Complete)
@@ -394,18 +406,77 @@ impl SwitchCoordinator {
     }
 
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
-        if self.snapshot()?.is_none() {
-            if let Some(target) = self.required_initial_target {
-                return match self.request(target).await? {
-                    SwitchProgress::Ready => Ok(()),
-                    SwitchProgress::Pending { .. } => Err(SwitchError::RecoveryRequired),
-                };
-            }
+        let _execution = self.execution.lock().await;
+        let (broker, control) = self.components()?;
+        if matches!(
+            self.recover_locked(broker, control).await?,
+            SwitchProgress::Pending { .. }
+        ) {
+            return Err(SwitchError::RecoveryRequired);
         }
-        match self.recover().await? {
-            SwitchProgress::Ready => Ok(()),
+        if !self.initial_transition_required(self.snapshot()?.as_ref())? {
+            self.initial_transition_satisfied
+                .store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+        let target = self
+            .required_initial_target
+            .ok_or(SwitchError::RecoveryRequired)?;
+        match self.request_locked(target).await? {
+            SwitchProgress::Ready => {
+                self.initial_transition_satisfied
+                    .store(true, Ordering::SeqCst);
+                Ok(())
+            }
             SwitchProgress::Pending { .. } => Err(SwitchError::RecoveryRequired),
         }
+    }
+
+    fn initial_transition_required(
+        &self,
+        journal: Option<&SwitchJournalV1>,
+    ) -> Result<bool, SwitchError> {
+        // Startup admission is one obligation. Once fulfilled, a subsequent
+        // explicit slot selection must not be replaced by the startup target.
+        // After restart the host derives the obligation again from the record.
+        if self.initial_transition_satisfied.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let Some(slot) = self.required_initial_target else {
+            return Ok(false);
+        };
+        let target = RuntimeTarget::from_identity(
+            &self
+                .manifest
+                .identity(slot, None)
+                .map_err(|_| SwitchError::RecoveryRequired)?,
+        );
+        let completed_target = journal
+            .filter(|journal| journal.phase == SwitchPhase::Complete)
+            .and_then(|journal| match journal.decision {
+                Some(SwitchDecision::Apply) => Some(journal.target_identity.clone()),
+                Some(SwitchDecision::Cancel) => journal
+                    .source_identity
+                    .as_ref()
+                    .map(RuntimeTarget::from_identity),
+                None => None,
+            });
+        Ok(completed_target.as_ref() != Some(&target))
+    }
+
+    /// Non-recovering admission check used only under the lifecycle writer
+    /// gate. A request must acquire that gate before publishing Requested, so
+    /// the journal cannot cross from ready to pending until this start exits.
+    fn check_start_barrier(&self) -> Result<(), SwitchError> {
+        let journal = self.snapshot()?;
+        if journal
+            .as_ref()
+            .is_some_and(|journal| journal.phase != SwitchPhase::Complete)
+            || self.initial_transition_required(journal.as_ref())?
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        Ok(())
     }
 
     pub async fn cancel_pending(&self) -> Result<SwitchProgress, SwitchError> {
@@ -898,6 +969,9 @@ impl RuntimeStartPreflight for SwitchCoordinator {
             Ok(()) => Ok(()),
             Err(_) => Err(CoreError::AuthRecoveryRequired),
         }
+    }
+    fn check_start_barrier(&self) -> Result<(), CoreError> {
+        SwitchCoordinator::check_start_barrier(self).map_err(|_| CoreError::AuthRecoveryRequired)
     }
 }
 
