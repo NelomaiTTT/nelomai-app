@@ -345,9 +345,7 @@ fn validate_switch_link(
             .is_some_and(|target| !coordinator.is_verified_manifest_target(target))
         || (matches!(
             journal.phase,
-            UpdateJournalPhase::LocalStopped
-                | UpdateJournalPhase::InstallerOpened
-                | UpdateJournalPhase::CancelRequested
+            UpdateJournalPhase::LocalStopped | UpdateJournalPhase::InstallerOpened
         ) && !stopped_or_later)
     {
         return Err(UpdateBarrierError::Invalid);

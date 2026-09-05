@@ -146,6 +146,7 @@ struct Control {
     graceful: AtomicUsize,
     forced: AtomicUsize,
     completed: AtomicUsize,
+    fail_graceful: AtomicUsize,
     fail_force: AtomicUsize,
     stall_graceful: AtomicBool,
     graceful_entered: Notify,
@@ -193,6 +194,9 @@ impl RuntimeSwitchControl for Control {
     ) -> Result<(), BrokerError> {
         self.graceful.fetch_add(1, Ordering::SeqCst);
         self.graceful_entered.notify_one();
+        if self.fail_graceful.swap(0, Ordering::SeqCst) > 0 {
+            return Err(BrokerError::RecoveryRequired);
+        }
         while self.stall_graceful.load(Ordering::SeqCst) {
             self.graceful_release.notified().await;
         }
@@ -537,6 +541,8 @@ struct Panel {
     supersede: AtomicUsize,
     retry_reconcile: AtomicUsize,
     fail_resume: AtomicUsize,
+    resume_apply: AtomicUsize,
+    resume_cancel: AtomicUsize,
 }
 
 async fn reconcile(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
@@ -556,6 +562,15 @@ async fn resume(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     panel.resume.fetch_add(1, Ordering::SeqCst);
+    match body["decision"].as_str() {
+        Some("apply") => {
+            panel.resume_apply.fetch_add(1, Ordering::SeqCst);
+        }
+        Some("cancel") => {
+            panel.resume_cancel.fetch_add(1, Ordering::SeqCst);
+        }
+        _ => {}
+    }
     if panel.fail_resume.swap(0, Ordering::SeqCst) > 0 {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -613,6 +628,41 @@ fn online_coordinator(
             .unwrap()
             .attach(broker, control),
     )
+}
+
+async fn interrupt_after_update_cancel_before_switch_cancel(
+    root: &std::path::Path,
+    barrier: Arc<UpdateBarrier>,
+    coordinator: Arc<SwitchCoordinator>,
+    control: Arc<Control>,
+) -> Value {
+    control.stall_graceful.store(true, Ordering::SeqCst);
+    let prepare = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move { barrier.prepare("0.2.17").await })
+    };
+    control.graceful_entered.notified().await;
+    assert_eq!(
+        barrier.snapshot().unwrap().unwrap().phase(),
+        UpdateJournalPhase::Requested
+    );
+    assert_eq!(
+        coordinator.snapshot().unwrap().unwrap().phase(),
+        SwitchPhase::RuntimeStopping
+    );
+    prepare.abort();
+    let _ = prepare.await;
+    control.release_graceful();
+
+    let switch_path = root.join("common/runtime-switch-v1.json");
+    let original_switch: Value =
+        serde_json::from_slice(&std::fs::read(&switch_path).unwrap()).unwrap();
+    assert_eq!(original_switch["cancel_requested"], false);
+    let update_path = root.join("common/update-journal-v1.json");
+    let mut update: Value = serde_json::from_slice(&std::fs::read(&update_path).unwrap()).unwrap();
+    update["phase"] = json!("cancel_requested");
+    std::fs::write(update_path, serde_json::to_vec(&update).unwrap()).unwrap();
+    original_switch
 }
 
 #[tokio::test]
@@ -1018,5 +1068,147 @@ async fn verified_installed_container_newer_than_the_offer_recovers_to_its_lates
     assert_eq!(updated.status().unwrap().selected_slot, RuntimeSlot::Latest);
     assert_eq!(panel.supersede.load(Ordering::SeqCst), 1);
     assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_pre_stop_cancellation_reopens_and_resumes_as_exact_cancel() {
+    let (panel, api, server) = panel().await;
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let control = Arc::new(Control::default());
+    let coordinator = online_coordinator(
+        owner.clone(),
+        store.clone(),
+        control.clone(),
+        manifest("0.2.16", "0.2.16", false),
+        api.clone(),
+    );
+    let barrier = Arc::new(UpdateBarrier::open(coordinator.clone()).unwrap());
+    let original_switch = interrupt_after_update_cancel_before_switch_cancel(
+        root.path(),
+        barrier.clone(),
+        coordinator,
+        control,
+    )
+    .await;
+    let operation = original_switch["operation_id"].clone();
+    drop(barrier);
+
+    let reopened_coordinator = online_coordinator(
+        owner,
+        store,
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+        api,
+    );
+    let reopened = UpdateBarrier::open(reopened_coordinator.clone()).unwrap();
+    reopened_coordinator.before_tunnel_start().await.unwrap();
+
+    assert!(reopened.snapshot().unwrap().is_none());
+    let completed: Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("common/runtime-switch-v1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(completed["operation_id"], operation);
+    assert_eq!(
+        completed["source_identity"],
+        original_switch["source_identity"]
+    );
+    assert_eq!(
+        completed["cleanup_envelope"],
+        original_switch["cleanup_envelope"]
+    );
+    assert_eq!(
+        completed["runtime_snapshot"],
+        original_switch["runtime_snapshot"]
+    );
+    assert_eq!(completed["decision"], "cancel");
+    assert_eq!(panel.resume_cancel.load(Ordering::SeqCst), 1);
+    assert_eq!(panel.resume_apply.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn failed_pre_stop_cancellation_keeps_exact_work_reopenable_for_admission_retry() {
+    let (panel, api, server) = panel().await;
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let initial_control = Arc::new(Control::default());
+    let initial = online_coordinator(
+        owner.clone(),
+        store.clone(),
+        initial_control.clone(),
+        manifest("0.2.16", "0.2.16", false),
+        api.clone(),
+    );
+    let barrier = Arc::new(UpdateBarrier::open(initial.clone()).unwrap());
+    let original_switch = interrupt_after_update_cancel_before_switch_cancel(
+        root.path(),
+        barrier.clone(),
+        initial,
+        initial_control,
+    )
+    .await;
+    drop(barrier);
+
+    let failing_control = Arc::new(Control::default());
+    failing_control.fail_graceful.store(1, Ordering::SeqCst);
+    let failing = online_coordinator(
+        owner.clone(),
+        store.clone(),
+        failing_control,
+        manifest("0.2.16", "0.2.16", false),
+        api.clone(),
+    );
+    let pending = UpdateBarrier::open(failing.clone()).unwrap();
+    assert!(failing.before_tunnel_start().await.is_err());
+    assert!(pending.snapshot().unwrap().is_some());
+    assert_eq!(
+        failing.snapshot().unwrap().unwrap().phase(),
+        SwitchPhase::RuntimeStopping
+    );
+    let failed_switch: Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("common/runtime-switch-v1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failed_switch["cancel_requested"], true);
+    assert_eq!(
+        failed_switch["operation_id"],
+        original_switch["operation_id"]
+    );
+    drop(pending);
+
+    let recovered = online_coordinator(
+        owner,
+        store,
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+        api,
+    );
+    let reopened = UpdateBarrier::open(recovered.clone()).unwrap();
+    recovered.before_tunnel_start().await.unwrap();
+
+    assert!(reopened.snapshot().unwrap().is_none());
+    let completed: Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("common/runtime-switch-v1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(completed["operation_id"], original_switch["operation_id"]);
+    assert_eq!(
+        completed["source_identity"],
+        original_switch["source_identity"]
+    );
+    assert_eq!(
+        completed["cleanup_envelope"],
+        original_switch["cleanup_envelope"]
+    );
+    assert_eq!(completed["decision"], "cancel");
+    assert_eq!(panel.resume_cancel.load(Ordering::SeqCst), 1);
+    assert_eq!(panel.resume_apply.load(Ordering::SeqCst), 0);
     server.abort();
 }

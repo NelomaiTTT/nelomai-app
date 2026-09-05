@@ -551,6 +551,13 @@ impl SwitchCoordinator {
         operation_id: &str,
     ) -> Result<SwitchProgress, SwitchError> {
         let _execution = self.execution.lock().await;
+        self.cancel_update_stop_locked(operation_id).await
+    }
+
+    async fn cancel_update_stop_locked(
+        &self,
+        operation_id: &str,
+    ) -> Result<SwitchProgress, SwitchError> {
         let Some(journal) = self.snapshot()? else {
             return Ok(SwitchProgress::Ready);
         };
@@ -648,20 +655,28 @@ impl SwitchCoordinator {
         &self,
         recovery: crate::UpdateStartRecovery,
     ) -> Result<(), SwitchError> {
-        let (operation_id, previous_slot) = match recovery {
+        let operation_id = match recovery {
             crate::UpdateStartRecovery::Cancel {
                 operation_id,
                 previous_slot,
-            } => (operation_id, Some(previous_slot)),
-            crate::UpdateStartRecovery::Installed { operation_id } => (operation_id, None),
+            } => {
+                if matches!(
+                    self.cancel_update_stop_locked(&operation_id).await?,
+                    SwitchProgress::Pending { .. }
+                ) {
+                    return Err(SwitchError::RecoveryRequired);
+                }
+                self.restore_update_selection(previous_slot)?;
+                operation_id
+            }
+            crate::UpdateStartRecovery::Installed { operation_id } => {
+                self.before_tunnel_start_locked(true).await?;
+                operation_id
+            }
             crate::UpdateStartRecovery::None | crate::UpdateStartRecovery::Blocked => {
                 return Err(SwitchError::RecoveryRequired)
             }
         };
-        self.before_tunnel_start_locked(true).await?;
-        if let Some(previous_slot) = previous_slot {
-            self.restore_update_selection(previous_slot)?;
-        }
         crate::finish_update_recovery(&self.owner, &operation_id)?;
         Ok(())
     }
