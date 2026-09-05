@@ -15,6 +15,7 @@ fn malformed_protected_broker_metadata_fails_closed_without_new_install() {
         cancelled_login: None,
         authentication_outcome_unknown: false,
         pending_login_account: None,
+        confirmed_device_id: None,
     });
     assert!(auth.validate().is_err());
     assert_eq!(auth.install_secret, "synthetic-install");

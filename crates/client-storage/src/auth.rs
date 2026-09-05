@@ -50,6 +50,9 @@ pub struct BrokerMetadataV1 {
     /// use the same account/install pair so server per-device revocation applies.
     #[serde(default)]
     pub pending_login_account: Option<String>,
+    /// Server device UUID, never derived from the spelling of a login name.
+    #[serde(default)]
+    pub confirmed_device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +90,10 @@ pub struct BrokerRequestV1 {
     pub attempt: u64,
     pub auth_epoch: u64,
     pub source_identity: Option<RuntimeIdentity>,
+    #[serde(default)]
+    pub source_device_id: Option<String>,
+    #[serde(default)]
+    pub prior_login_outcome_unknown: bool,
     pub resume: Option<StoredResumeArgumentsV1>,
 }
 

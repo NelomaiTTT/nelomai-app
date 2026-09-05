@@ -109,6 +109,7 @@ impl AuthBroker {
                 cancelled_login: None,
                 authentication_outcome_unknown: false,
                 pending_login_account: None,
+                confirmed_device_id: None,
             });
             store.save(&auth)?;
         } else if let Some(meta) = &mut auth.broker {
@@ -176,6 +177,7 @@ impl AuthBroker {
         kind: BrokerRequestKind,
         operation_id: String,
         resume: Option<StoredResumeArgumentsV1>,
+        prior_login_outcome_unknown: bool,
     ) -> Result<BrokerRequestV1, BrokerError> {
         Self::active(auth)?;
         let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
@@ -189,6 +191,8 @@ impl AuthBroker {
             attempt: meta.next_attempt,
             auth_epoch: auth.auth_epoch,
             source_identity: auth.confirmed_identity.clone(),
+            source_device_id: meta.confirmed_device_id.clone(),
+            prior_login_outcome_unknown,
             resume,
         };
         meta.pending_request = Some(request.clone());
@@ -198,21 +202,21 @@ impl AuthBroker {
     fn fenced(&self, ticket: &BrokerRequestV1) -> Result<AuthStoreV1, BrokerError> {
         let auth = self.load()?;
         Self::active(&auth)?;
-        if auth.auth_epoch != ticket.auth_epoch
-            || auth.confirmed_identity != ticket.source_identity
-            || auth
-                .broker
-                .as_ref()
-                .is_none_or(|m| m.next_attempt != ticket.attempt)
-            || auth
-                .broker
-                .as_ref()
-                .and_then(|m| m.pending_request.as_ref())
-                != Some(ticket)
-        {
+        if !Self::owns_ticket(&auth, ticket) {
             return Err(BrokerError::Cancelled);
         }
         Ok(auth)
+    }
+
+    fn owns_ticket(auth: &AuthStoreV1, ticket: &BrokerRequestV1) -> bool {
+        auth.auth_epoch == ticket.auth_epoch
+            && auth.logout_state == LogoutState::Active
+            && auth.confirmed_identity == ticket.source_identity
+            && auth.broker.as_ref().is_some_and(|m| {
+                m.next_attempt == ticket.attempt
+                    && m.confirmed_device_id == ticket.source_device_id
+                    && m.pending_request.as_ref() == Some(ticket)
+            })
     }
 
     pub async fn auth_state(&self) -> Result<BrokerAuthState, BrokerError> {
@@ -298,12 +302,14 @@ impl AuthBroker {
                 BrokerRequestKind::Login,
                 Uuid::new_v4().to_string(),
                 None,
+                controlled_unknown,
             )?;
             let mut request = request.clone();
             request.install_secret = auth.install_secret;
             (ticket, request)
         };
         let stop = self.stop.stop_local().await;
+        let local_not_issued = stop.is_err();
         let response = if let Err(error) = stop {
             Err(error)
         } else {
@@ -319,38 +325,53 @@ impl AuthBroker {
             Err(error) => {
                 let _state = self.state.lock().await;
                 let mut auth = self.load()?;
-                if auth
-                    .broker
-                    .as_ref()
-                    .and_then(|m| m.pending_request.as_ref())
-                    == Some(&ticket)
-                {
-                    auth.broker
-                        .as_mut()
-                        .ok_or(BrokerError::RecoveryRequired)?
-                        .authentication_outcome_unknown = true;
+                if Self::owns_ticket(&auth, &ticket) {
+                    let known_not_issued = local_not_issued
+                        || matches!(&error,
+                        BrokerError::Api(ClientApiError::Api { status, code, .. })
+                            if matches!((status.as_u16(), code.as_str()),
+                                (401, "invalid_credentials") | (403, "app_access_unavailable")
+                                | (429, "login_rate_limited") | (422, "invalid_request")));
+                    let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+                    if known_not_issued && !ticket.prior_login_outcome_unknown {
+                        meta.pending_request = None;
+                        meta.pending_login_account = None;
+                        meta.authentication_outcome_unknown = false;
+                        auth.logout_state = LogoutState::LoggedOut;
+                    } else {
+                        meta.authentication_outcome_unknown = true;
+                    }
                     self.store.save(&auth)?;
                 }
                 return Err(error);
             }
         };
-        let confirmed = response.device.confirmed_identity()?;
-        if RuntimeTarget::from_identity(&confirmed) != *target
+        let confirmed = response.device.confirmed_identity();
+        let invalid_response = confirmed.as_ref().is_err()
+            || confirmed
+                .as_ref()
+                .is_ok_and(|identity| RuntimeTarget::from_identity(identity) != *target)
             || response.token_type != "Bearer"
             || response.access_token.is_empty()
             || response.refresh_token.is_empty()
+            || response.device.id.is_empty()
             || response.access_expires_in == 0
-            || confirmed.session_generation
-                <= ticket
-                    .source_identity
-                    .as_ref()
-                    .and_then(|i| i.session_generation)
-        {
-            return Err(BrokerError::IdentityMismatch);
-        }
+            || (ticket.source_device_id.as_deref() == Some(response.device.id.as_str())
+                && confirmed.as_ref().is_ok_and(|identity| {
+                    identity.session_generation
+                        <= ticket
+                            .source_identity
+                            .as_ref()
+                            .and_then(|i| i.session_generation)
+                }));
         let _state = self.state.lock().await;
         let mut auth = self.load()?;
-        if auth.logout_state == LogoutState::Pending
+        let cancelled = auth.logout_state == LogoutState::Pending
+            && auth.confirmed_identity == ticket.source_identity
+            && auth
+                .broker
+                .as_ref()
+                .is_some_and(|m| m.confirmed_device_id == ticket.source_device_id)
             && auth.auth_epoch
                 == ticket
                     .auth_epoch
@@ -360,23 +381,47 @@ impl AuthBroker {
                 .broker
                 .as_ref()
                 .and_then(|m| m.cancelled_login.as_ref())
-                == Some(&ticket)
-        {
-            // This newly created family did not exist when logout was requested.
-            // Persist its proof before compensation; never install its access.
+                == Some(&ticket);
+        let owned = Self::owns_ticket(&auth, &ticket);
+        if cancelled || (owned && invalid_response) {
+            // A usable proof must survive even if the accompanying identity is
+            // rejected. It authorizes only this returned family, not newer auth.
+            if response.refresh_token.is_empty() || response.refresh_token.len() > 256 {
+                if owned {
+                    auth.broker
+                        .as_mut()
+                        .ok_or(BrokerError::RecoveryRequired)?
+                        .authentication_outcome_unknown = true;
+                    self.store.save(&auth)?;
+                }
+                return Err(BrokerError::IdentityMismatch);
+            }
+            if owned {
+                auth.auth_epoch = auth
+                    .auth_epoch
+                    .checked_add(1)
+                    .ok_or(BrokerError::RecoveryRequired)?;
+                auth.logout_state = LogoutState::Pending;
+            }
             let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
             meta.pending_logout = Some(PendingLogoutV1 {
                 operation_id: Uuid::new_v4().to_string(),
                 refresh_proof: response.refresh_token,
             });
             meta.cancelled_login = None;
+            meta.pending_request = None;
             meta.authentication_outcome_unknown = false;
             self.store.save(&auth)?;
             drop(_state);
             self.logout().await?;
-            return Err(BrokerError::Cancelled);
+            return Err(if cancelled {
+                BrokerError::Cancelled
+            } else {
+                BrokerError::IdentityMismatch
+            });
         }
         auth = self.fenced(&ticket)?;
+        let confirmed = confirmed?;
         auth.access_token = Some(response.access_token);
         auth.refresh_token = Some(response.refresh_token);
         auth.session_generation = confirmed.session_generation;
@@ -386,6 +431,7 @@ impl AuthBroker {
         meta.pending_request = None;
         meta.completed_resume = None;
         meta.pending_login_account = None;
+        meta.confirmed_device_id = Some(response.device.id);
         self.store.save(&auth)?;
         Self::snapshot(&auth)
     }
@@ -435,6 +481,7 @@ impl AuthBroker {
                 BrokerRequestKind::Refresh,
                 Uuid::new_v4().to_string(),
                 None,
+                false,
             )?;
             (ticket, refresh)
         };
@@ -508,6 +555,7 @@ impl AuthBroker {
                 BrokerRequestKind::Resume,
                 args.operation_id.clone(),
                 Some(stored),
+                false,
             )?;
             (ticket, refresh)
         };

@@ -87,20 +87,36 @@ struct Panel {
     resume_entered: Notify,
     resume_release: Notify,
     logout_requests: Mutex<Vec<Value>>,
+    login_reply: Mutex<Option<Value>>,
+    login_rejection: Mutex<Option<(u16, String)>>,
 }
 async fn login(
     State(panel): State<Arc<Panel>>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, axum::http::StatusCode> {
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     panel.login_requests.lock().unwrap().push(body);
     panel.login_entered.notify_one();
     if panel.hold_login.load(Ordering::SeqCst) {
         panel.login_release.notified().await;
     }
     if panel.fail_login.swap(false, Ordering::SeqCst) {
-        return Err(axum::http::StatusCode::BAD_GATEWAY);
+        return Err((axum::http::StatusCode::BAD_GATEWAY, Json(json!({}))));
     }
-    Ok(Json(response(8, "login-access")))
+    if let Some((status, code)) = panel.login_rejection.lock().unwrap().take() {
+        return Err((
+            axum::http::StatusCode::from_u16(status).unwrap(),
+            Json(json!({"request_id":"synthetic",
+            "code":code, "message":"rejected"})),
+        ));
+    }
+    Ok(Json(
+        panel
+            .login_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| response(8, "login-access")),
+    ))
 }
 async fn refresh(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
     assert_eq!(body["refresh_token"], "initial-refresh");
@@ -803,6 +819,265 @@ async fn never_authenticated_install_logout_is_local_and_does_not_block_first_lo
         )
         .await
         .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn controlled_account_change_accepts_new_device_generation_one() {
+    let state = Arc::new(Panel::default());
+    let mut reply_a = response(7, "account-a-access");
+    reply_a["device"]["id"] = json!("device-a");
+    *state.login_reply.lock().unwrap() = Some(reply_a);
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let mut previous = store.load().unwrap().unwrap();
+    previous.confirmed_identity = Some(identity(6));
+    previous.session_generation = Some(6);
+    store.save(&previous).unwrap();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+    broker.logout().await.unwrap();
+    let original = broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(7)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(original.identity().session_generation, Some(7));
+    broker.logout().await.unwrap();
+    let mut reply_b = response(1, "account-b-access");
+    reply_b["device"]["id"] = json!("device-b");
+    *state.login_reply.lock().unwrap() = Some(reply_b);
+    let mut request = login_request();
+    request.login = "account-b".into();
+    let next = broker
+        .login(&request, &RuntimeTarget::from_identity(&identity(1)))
+        .await
+        .unwrap();
+    assert_eq!(next.identity().session_generation, Some(1));
+    assert_ne!(next.family(), original.family());
+    assert_eq!(
+        store.load().unwrap().unwrap().install_secret,
+        "synthetic-install"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn rejected_cancelled_login_retains_received_proof_across_owner_restart_and_exact_retry() {
+    let state = Arc::new(Panel::default());
+    state.hold_login.store(true, Ordering::SeqCst);
+    let mut invalid = response(8, "must-never-issue");
+    invalid["device"]["runtime_slot"] = json!("stable");
+    *state.login_reply.lock().unwrap() = Some(invalid);
+    let (api, server) = panel(state.clone()).await;
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(ProtectedAuthStore::new(FileRecord(
+        root.path().join("record"),
+    )));
+    store.save(&auth_store().load().unwrap().unwrap()).unwrap();
+    let broker =
+        Arc::new(AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop::default())).unwrap());
+    broker.logout().await.unwrap();
+    let request = {
+        let broker = broker.clone();
+        tokio::spawn(async move {
+            broker
+                .login(
+                    &login_request(),
+                    &RuntimeTarget::from_identity(&identity(8)),
+                )
+                .await
+        })
+    };
+    state.login_entered.notified().await;
+    assert!(broker.logout().await.is_err());
+    state.lose_logout.store(true, Ordering::SeqCst);
+    state.login_release.notify_one();
+    assert!(request.await.unwrap().is_err());
+    let pending = store.load().unwrap().unwrap();
+    assert_eq!(pending.logout_state, LogoutState::Pending);
+    assert!(pending.access_token.is_none());
+    let proof = pending
+        .broker
+        .unwrap()
+        .pending_logout
+        .expect("received rejected proof must remain durable");
+    assert_eq!(proof.refresh_proof, "successor-refresh");
+    assert_eq!(state.logout_requests.lock().unwrap().len(), 2);
+    drop(broker);
+    let reopened = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+    assert!(reopened.access_token(None).await.is_err());
+    reopened.logout().await.unwrap();
+    {
+        let requests = state.logout_requests.lock().unwrap();
+        assert_eq!(requests[1], requests[2]);
+    }
+    assert_eq!(
+        store.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    state.hold_login.store(false, Ordering::SeqCst);
+    *state.login_reply.lock().unwrap() = None;
+    let next = reopened
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.access_token(None).await.unwrap(), next);
+    server.abort();
+}
+
+#[tokio::test]
+async fn pre_http_stop_failure_and_definitive_rejection_allow_corrected_username() {
+    for rejection in [
+        None,
+        Some((401, "invalid_credentials")),
+        Some((403, "app_access_unavailable")),
+        Some((429, "login_rate_limited")),
+        Some((422, "invalid_request")),
+    ] {
+        let local_failure = rejection.is_none();
+        let state = Arc::new(Panel::default());
+        *state.login_rejection.lock().unwrap() =
+            rejection.map(|(status, code)| (status, code.into()));
+        let (api, server) = panel(state.clone()).await;
+        let store = auth_store();
+        let mut initial = store.load().unwrap().unwrap();
+        initial.logout_state = LogoutState::LoggedOut;
+        initial.access_token = None;
+        initial.refresh_token = None;
+        store.save(&initial).unwrap();
+        let stop: Arc<dyn LocalAuthStop> = if local_failure {
+            Arc::new(FirstStopFails(AtomicUsize::new(0)))
+        } else {
+            Arc::new(Stop::default())
+        };
+        let broker = AuthBroker::new(api, store.clone(), stop).unwrap();
+        assert!(broker
+            .login(
+                &login_request(),
+                &RuntimeTarget::from_identity(&identity(8))
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            broker.auth_state().await.unwrap(),
+            BrokerAuthState::LoggedOut
+        );
+        assert!(store
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .pending_login_account
+            .is_none());
+        assert_eq!(
+            state.login_requests.lock().unwrap().len(),
+            usize::from(!local_failure)
+        );
+        let mut corrected = login_request();
+        corrected.login = "corrected-user".into();
+        broker
+            .login(&corrected, &RuntimeTarget::from_identity(&identity(8)))
+            .await
+            .unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn same_server_device_not_login_spelling_controls_generation_monotonicity() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+    broker.logout().await.unwrap();
+    broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8)),
+        )
+        .await
+        .unwrap();
+    broker.logout().await.unwrap();
+    *state.login_reply.lock().unwrap() = Some(response(7, "regressed-access"));
+    let mut spelling = login_request();
+    spelling.login = "SYNTHETIC-USER".into();
+    assert!(broker
+        .login(&spelling, &RuntimeTarget::from_identity(&identity(7)))
+        .await
+        .is_err());
+    assert!(store.load().unwrap().unwrap().access_token.is_none());
+    assert_eq!(state.logout_calls.load(Ordering::SeqCst), 3); // Includes rejected-family compensation.
+    server.abort();
+}
+
+#[tokio::test]
+async fn definitive_rejection_does_not_erase_earlier_unknown_login_outcome() {
+    let state = Arc::new(Panel::default());
+    state.fail_login.store(true, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let broker = AuthBroker::new(api, auth_store(), Arc::new(Stop::default())).unwrap();
+    broker.logout().await.unwrap();
+    assert!(broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8))
+        )
+        .await
+        .is_err());
+    *state.login_rejection.lock().unwrap() = Some((401, "invalid_credentials".into()));
+    assert!(broker
+        .login(
+            &login_request(),
+            &RuntimeTarget::from_identity(&identity(8))
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        broker.auth_state().await.unwrap(),
+        BrokerAuthState::AuthenticationOutcomeUnknown
+    );
+    let mut other = login_request();
+    other.login = "other-account".into();
+    assert!(broker
+        .login(&other, &RuntimeTarget::from_identity(&identity(8)))
+        .await
+        .is_err());
+    assert_eq!(state.login_requests.lock().unwrap().len(), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn definitive_rejection_after_logout_does_not_clear_cancelled_ticket_or_epoch() {
+    let state = Arc::new(Panel::default());
+    state.hold_login.store(true, Ordering::SeqCst);
+    *state.login_rejection.lock().unwrap() = Some((401, "invalid_credentials".into()));
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap());
+    broker.logout().await.unwrap();
+    let task = {
+        let broker = broker.clone();
+        tokio::spawn(async move {
+            broker
+                .login(
+                    &login_request(),
+                    &RuntimeTarget::from_identity(&identity(8)),
+                )
+                .await
+        })
+    };
+    state.login_entered.notified().await;
+    assert!(broker.logout().await.is_err());
+    let cancelled = store.load().unwrap().unwrap();
+    state.login_release.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(store.load().unwrap().unwrap(), cancelled);
     server.abort();
 }
 
