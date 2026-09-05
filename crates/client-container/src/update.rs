@@ -20,6 +20,7 @@ pub enum UpdateJournalPhase {
     Requested,
     LocalStopped,
     InstallerOpened,
+    CancelRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,15 +193,23 @@ impl UpdateBarrier {
     }
 
     async fn installer_failed_locked(&self) -> Result<(), UpdateBarrierError> {
-        let Some(journal) = self.snapshot()? else {
+        let Some(mut journal) = self.snapshot()? else {
             return Ok(());
         };
         if self.coordinator.installed_container_version() != journal.source_container {
             return Err(UpdateBarrierError::Invalid);
         }
-        self.coordinator
+        if journal.phase != UpdateJournalPhase::CancelRequested {
+            journal.phase = UpdateJournalPhase::CancelRequested;
+            self.replace(&journal)?;
+        }
+        let progress = self
+            .coordinator
             .cancel_update_stop(&journal.operation_id)
             .await?;
+        if matches!(progress, crate::SwitchProgress::Pending { .. }) {
+            return Err(UpdateBarrierError::Pending);
+        }
         self.coordinator
             .restore_update_selection(journal.previous_slot)?;
         self.remove()
@@ -220,11 +229,8 @@ impl UpdateBarrier {
         if installed_container_version == journal.source_container {
             return self.installer_failed_locked().await;
         }
-        if installed_container_version != journal.target_container {
-            return Err(UpdateBarrierError::Invalid);
-        }
         self.coordinator.recover_installed_update().await?;
-        self.remove()
+        Ok(())
     }
 
     fn replace(&self, journal: &UpdateJournalV1) -> Result<(), UpdateBarrierError> {
@@ -239,37 +245,12 @@ impl UpdateBarrier {
     }
 
     fn validate_switch_link(&self, journal: &UpdateJournalV1) -> Result<(), UpdateBarrierError> {
-        let Some(switch) = self.coordinator.snapshot().map_err(SwitchError::Journal)? else {
-            return Ok(());
-        };
-        if switch.phase() == SwitchPhase::Complete {
-            return Ok(());
-        }
-        if switch.operation_id() != journal.operation_id
-            || switch.source_identity() != Some(&journal.source_runtime)
-            || switch.target_identity()
-                != &nelomai_client_api::RuntimeTarget::from_identity(&journal.source_runtime)
-            || (matches!(
-                journal.phase,
-                UpdateJournalPhase::LocalStopped | UpdateJournalPhase::InstallerOpened
-            ) && switch.phase() != SwitchPhase::LocalStopped)
-        {
-            return Err(UpdateBarrierError::Invalid);
-        }
-        Ok(())
+        validate_switch_link(&self.coordinator, journal)
     }
 
     fn remove(&self) -> Result<(), UpdateBarrierError> {
         let _guard = self.owner.lock_transition_journal()?;
-        match std::fs::remove_file(&self.path) {
-            Ok(()) => {
-                #[cfg(unix)]
-                File::open(self.path.parent().ok_or(UpdateBarrierError::Invalid)?)?.sync_all()?;
-                Ok(())
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
+        remove_journal(&self.path)
     }
 }
 
@@ -284,6 +265,101 @@ pub(crate) fn update_barrier_pending(
             UpdateBarrierError::Io(error) => SwitchJournalError::Io(error),
             _ => SwitchJournalError::Invalid,
         })
+}
+
+pub(crate) enum UpdateStartRecovery {
+    None,
+    Blocked,
+    Cancel {
+        operation_id: String,
+        previous_slot: RuntimeSlot,
+    },
+    Installed {
+        operation_id: String,
+    },
+}
+
+pub(crate) fn update_start_recovery(
+    coordinator: &SwitchCoordinator,
+) -> Result<UpdateStartRecovery, SwitchJournalError> {
+    let owner = coordinator.owner_lock();
+    let path = owner.root().join("common/update-journal-v1.json");
+    let journal = {
+        let _guard = owner.lock_transition_journal()?;
+        load_journal(&path).map_err(update_to_switch_journal_error)?
+    };
+    let Some(journal) = journal else {
+        return Ok(UpdateStartRecovery::None);
+    };
+    validate_switch_link(coordinator, &journal).map_err(update_to_switch_journal_error)?;
+    if coordinator.installed_container_version() != journal.source_container {
+        return Ok(UpdateStartRecovery::Installed {
+            operation_id: journal.operation_id,
+        });
+    }
+    if journal.phase == UpdateJournalPhase::CancelRequested {
+        return Ok(UpdateStartRecovery::Cancel {
+            operation_id: journal.operation_id,
+            previous_slot: journal.previous_slot,
+        });
+    }
+    Ok(UpdateStartRecovery::Blocked)
+}
+
+pub(crate) fn finish_update_recovery(
+    owner: &ContainerOwnerLock,
+    operation_id: &str,
+) -> Result<(), SwitchJournalError> {
+    let _guard = owner.lock_transition_journal()?;
+    let path = owner.root().join("common/update-journal-v1.json");
+    let journal = load_journal(&path)
+        .map_err(update_to_switch_journal_error)?
+        .ok_or(SwitchJournalError::Invalid)?;
+    if journal.operation_id != operation_id {
+        return Err(SwitchJournalError::Invalid);
+    }
+    remove_journal(&path).map_err(update_to_switch_journal_error)
+}
+
+fn validate_switch_link(
+    coordinator: &SwitchCoordinator,
+    journal: &UpdateJournalV1,
+) -> Result<(), UpdateBarrierError> {
+    let Some(switch) = coordinator.snapshot().map_err(SwitchError::Journal)? else {
+        return Ok(());
+    };
+    let source_target = nelomai_client_api::RuntimeTarget::from_identity(&journal.source_runtime);
+    let stopped_or_later = matches!(
+        switch.phase(),
+        SwitchPhase::LocalStopped
+            | SwitchPhase::ServerReconciling
+            | SwitchPhase::AuthResuming
+            | SwitchPhase::Complete
+    );
+    if switch.operation_id() != journal.operation_id
+        || switch.source_identity() != Some(&journal.source_runtime)
+        || (switch.target_identity() != &source_target
+            && !coordinator.is_verified_manifest_target(switch.target_identity()))
+        || switch
+            .supersede_target()
+            .is_some_and(|target| !coordinator.is_verified_manifest_target(target))
+        || (matches!(
+            journal.phase,
+            UpdateJournalPhase::LocalStopped
+                | UpdateJournalPhase::InstallerOpened
+                | UpdateJournalPhase::CancelRequested
+        ) && !stopped_or_later)
+    {
+        return Err(UpdateBarrierError::Invalid);
+    }
+    Ok(())
+}
+
+fn update_to_switch_journal_error(error: UpdateBarrierError) -> SwitchJournalError {
+    match error {
+        UpdateBarrierError::Io(error) => SwitchJournalError::Io(error),
+        _ => SwitchJournalError::Invalid,
+    }
 }
 
 fn load_journal(path: &PathBuf) -> Result<Option<UpdateJournalV1>, UpdateBarrierError> {
@@ -317,6 +393,18 @@ fn validate_journal(journal: &UpdateJournalV1) -> Result<(), UpdateBarrierError>
         return Err(UpdateBarrierError::Invalid);
     }
     Ok(())
+}
+
+fn remove_journal(path: &PathBuf) -> Result<(), UpdateBarrierError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            File::open(path.parent().ok_or(UpdateBarrierError::Invalid)?)?.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn validate_version(version: &str) -> Result<(), UpdateBarrierError> {

@@ -151,6 +151,10 @@ impl SwitchJournalV1 {
     pub(crate) fn operation_id(&self) -> &str {
         &self.operation_id
     }
+
+    pub(crate) fn supersede_target(&self) -> Option<&RuntimeTarget> {
+        self.supersede_target.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +425,12 @@ impl SwitchCoordinator {
         self.owner.clone()
     }
 
+    pub(crate) fn is_verified_manifest_target(&self, target: &RuntimeTarget) -> bool {
+        self.manifest
+            .identity(target.runtime_slot, None)
+            .is_ok_and(|identity| RuntimeTarget::from_identity(&identity) == *target)
+    }
+
     pub(crate) async fn prepare_update_stop<F>(
         &self,
         expected_operation_id: Option<&str>,
@@ -618,15 +628,42 @@ impl SwitchCoordinator {
 
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
-        if crate::update_barrier_pending(&self.owner)? {
-            return Err(SwitchError::RecoveryRequired);
+        match crate::update_start_recovery(self)? {
+            crate::UpdateStartRecovery::None => self.before_tunnel_start_locked(false).await,
+            crate::UpdateStartRecovery::Blocked => Err(SwitchError::RecoveryRequired),
+            recovery => self.recover_update_for_start_locked(recovery).await,
         }
-        self.before_tunnel_start_locked(false).await
     }
 
     pub(crate) async fn recover_installed_update(&self) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
-        self.before_tunnel_start_locked(true).await
+        let recovery = crate::update_start_recovery(self)?;
+        if !matches!(recovery, crate::UpdateStartRecovery::Installed { .. }) {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        self.recover_update_for_start_locked(recovery).await
+    }
+
+    async fn recover_update_for_start_locked(
+        &self,
+        recovery: crate::UpdateStartRecovery,
+    ) -> Result<(), SwitchError> {
+        let (operation_id, previous_slot) = match recovery {
+            crate::UpdateStartRecovery::Cancel {
+                operation_id,
+                previous_slot,
+            } => (operation_id, Some(previous_slot)),
+            crate::UpdateStartRecovery::Installed { operation_id } => (operation_id, None),
+            crate::UpdateStartRecovery::None | crate::UpdateStartRecovery::Blocked => {
+                return Err(SwitchError::RecoveryRequired)
+            }
+        };
+        self.before_tunnel_start_locked(true).await?;
+        if let Some(previous_slot) = previous_slot {
+            self.restore_update_selection(previous_slot)?;
+        }
+        crate::finish_update_recovery(&self.owner, &operation_id)?;
+        Ok(())
     }
 
     async fn before_tunnel_start_locked(

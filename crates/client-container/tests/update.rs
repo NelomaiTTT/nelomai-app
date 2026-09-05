@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use ed25519_dalek::{Signer, SigningKey};
 use nelomai_client_container::{
     AuthBroker, BrokerError, LocalAuthStop, LocalStopReceiptV1, RuntimeCleanupHandoff,
@@ -535,24 +535,37 @@ struct Panel {
     reconcile: AtomicUsize,
     resume: AtomicUsize,
     supersede: AtomicUsize,
+    retry_reconcile: AtomicUsize,
+    fail_resume: AtomicUsize,
 }
 
 async fn reconcile(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
     panel.reconcile.fetch_add(1, Ordering::SeqCst);
+    if panel.retry_reconcile.swap(0, Ordering::SeqCst) > 0 {
+        return Json(json!({"state":"retry","operation_id":body["operation_id"],
+            "retired_lease_ids":[],"retired_session_ids":[],
+            "retired_operation_ids":[],"retry_after_seconds":1}));
+    }
     Json(json!({"state":"clean","operation_id":body["operation_id"],
         "retired_lease_ids":body["lease_ids"],"retired_session_ids":body["redundant_session_ids"],
         "retired_operation_ids":body["client_operation_ids"],"retry_after_seconds":null}))
 }
 
-async fn resume(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
+async fn resume(
+    State(panel): State<Arc<Panel>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
     panel.resume.fetch_add(1, Ordering::SeqCst);
-    Json(
+    if panel.fail_resume.swap(0, Ordering::SeqCst) > 0 {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(
         json!({"identity":{"container_version":body["target_identity"]["container_version"],
         "runtime_version":body["target_identity"]["runtime_version"],
         "runtime_contract_version":body["target_identity"]["runtime_contract_version"],
         "runtime_slot":body["target_identity"]["runtime_slot"],"session_generation":8},
         "access_token":"resumed-access","token_type":"Bearer","access_expires_in":900}),
-    )
+    ))
 }
 
 async fn supersede(State(panel): State<Arc<Panel>>) -> Json<Value> {
@@ -808,5 +821,202 @@ async fn new_container_first_launch_reconciles_to_verified_latest_before_clearin
     assert_eq!(panel.supersede.load(Ordering::SeqCst), 1);
     assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
     assert_eq!(new_control.completed.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn pending_installer_cancellation_reopens_and_tunnel_admission_retries_exact_work() {
+    let (panel, api, server) = panel().await;
+    panel.retry_reconcile.store(1, Ordering::SeqCst);
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let control = Arc::new(Control::default());
+    let coordinator = online_coordinator(
+        owner.clone(),
+        store.clone(),
+        control,
+        manifest("0.2.16", "0.2.16", false),
+        api.clone(),
+    );
+    let barrier = UpdateBarrier::open(coordinator).unwrap();
+    barrier.prepare("0.2.17").await.unwrap();
+    let operation = barrier
+        .snapshot()
+        .unwrap()
+        .unwrap()
+        .operation_id()
+        .to_owned();
+
+    assert!(matches!(
+        barrier.installer_failed().await,
+        Err(nelomai_client_container::UpdateBarrierError::Pending)
+    ));
+    assert!(barrier.snapshot().unwrap().is_some());
+    let persisted: Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("common/update-journal-v1.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted["phase"], "cancel_requested");
+    drop(barrier);
+
+    let reopened_coordinator = online_coordinator(
+        owner,
+        store,
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+        api,
+    );
+    let reopened = UpdateBarrier::open(reopened_coordinator.clone()).unwrap();
+    assert_eq!(
+        reopened.snapshot().unwrap().unwrap().operation_id(),
+        operation
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    reopened_coordinator.before_tunnel_start().await.unwrap();
+
+    assert!(reopened.snapshot().unwrap().is_none());
+    assert_eq!(
+        reopened_coordinator.snapshot().unwrap().unwrap().phase(),
+        SwitchPhase::Complete
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn changed_container_admission_retries_server_reconciliation_in_the_same_process() {
+    let (panel, api, server) = panel().await;
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let old = online_coordinator(
+        owner.clone(),
+        store.clone(),
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+        api.clone(),
+    );
+    let old_barrier = UpdateBarrier::open(old).unwrap();
+    old_barrier.prepare("0.2.17").await.unwrap();
+    old_barrier.installer_opened().await.unwrap();
+    drop(old_barrier);
+
+    write_selection(root.path(), "0.2.17", RuntimeSlot::Latest);
+    panel.retry_reconcile.store(1, Ordering::SeqCst);
+    let updated = online_coordinator(
+        owner,
+        store,
+        Arc::new(Control::default()),
+        manifest("0.2.17", "0.2.17", false),
+        api,
+    );
+    let barrier = UpdateBarrier::open(updated.clone()).unwrap();
+    assert!(barrier.recover("0.2.17").await.is_err());
+    assert_eq!(
+        updated.snapshot().unwrap().unwrap().phase(),
+        SwitchPhase::ServerReconciling
+    );
+    drop(barrier);
+
+    let reopened = UpdateBarrier::open(updated.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    updated.before_tunnel_start().await.unwrap();
+
+    assert!(reopened.snapshot().unwrap().is_none());
+    assert_eq!(panel.reconcile.load(Ordering::SeqCst), 2);
+    assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_auth_resume_reopens_with_original_update_provenance() {
+    let (panel, api, server) = panel().await;
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let old = online_coordinator(
+        owner.clone(),
+        store.clone(),
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+        api.clone(),
+    );
+    let old_barrier = UpdateBarrier::open(old).unwrap();
+    old_barrier.prepare("0.2.17").await.unwrap();
+    let operation = old_barrier
+        .snapshot()
+        .unwrap()
+        .unwrap()
+        .operation_id()
+        .to_owned();
+    old_barrier.installer_opened().await.unwrap();
+    drop(old_barrier);
+
+    write_selection(root.path(), "0.2.17", RuntimeSlot::Latest);
+    panel.fail_resume.store(1, Ordering::SeqCst);
+    let updated = online_coordinator(
+        owner,
+        store,
+        Arc::new(Control::default()),
+        manifest("0.2.17", "0.2.17", false),
+        api,
+    );
+    let barrier = UpdateBarrier::open(updated.clone()).unwrap();
+    assert!(barrier.recover("0.2.17").await.is_err());
+    assert_eq!(
+        updated.snapshot().unwrap().unwrap().phase(),
+        SwitchPhase::AuthResuming
+    );
+    drop(barrier);
+
+    let reopened = UpdateBarrier::open(updated).unwrap();
+    assert_eq!(
+        reopened.snapshot().unwrap().unwrap().operation_id(),
+        operation
+    );
+    reopened.recover("0.2.17").await.unwrap();
+    assert!(reopened.snapshot().unwrap().is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn verified_installed_container_newer_than_the_offer_recovers_to_its_latest_runtime() {
+    let (panel, api, server) = panel().await;
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let old = online_coordinator(
+        owner.clone(),
+        store.clone(),
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+        api.clone(),
+    );
+    let old_barrier = UpdateBarrier::open(old).unwrap();
+    old_barrier.prepare("0.2.17").await.unwrap();
+    old_barrier.installer_opened().await.unwrap();
+    drop(old_barrier);
+
+    write_selection(root.path(), "0.2.18", RuntimeSlot::Latest);
+    let updated = online_coordinator(
+        owner,
+        store,
+        Arc::new(Control::default()),
+        manifest("0.2.18", "0.2.18", false),
+        api,
+    );
+    let barrier = UpdateBarrier::open(updated.clone()).unwrap();
+
+    barrier.recover("0.2.18").await.unwrap();
+
+    assert!(barrier.snapshot().unwrap().is_none());
+    assert_eq!(updated.status().unwrap().selected_slot, RuntimeSlot::Latest);
+    assert_eq!(panel.supersede.load(Ordering::SeqCst), 1);
+    assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
     server.abort();
 }
