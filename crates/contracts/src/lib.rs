@@ -36,7 +36,18 @@ mod bounded_connection_items {
     }
 }
 
+mod runtime;
 mod split_tunnel;
+
+pub use runtime::{
+    verify_container_manifest, verify_runtime_artifact_manifest,
+    verify_runtime_release_set_manifest, ContainerManifestV1, RuntimeArtifactManifestV1,
+    RuntimeFileRole, RuntimeFileV1, RuntimeIdentity, RuntimeManifestError,
+    RuntimeReleaseArtifactV1, RuntimeReleaseSetManifestV1, RuntimeSlot, RuntimeSlotManifestV1,
+    VerifiedContainerManifest, VerifiedRuntimeArtifactManifest, VerifiedRuntimeReleaseSetManifest,
+    COMPILED_RUNTIME_CONTRACT_VERSION, CONTAINER_MANIFEST_SIGNATURE_DOMAIN,
+    RUNTIME_MANIFEST_SIGNATURE_DOMAIN, RUNTIME_RELEASE_SET_SIGNATURE_DOMAIN,
+};
 
 pub use split_tunnel::{
     SplitTunnelAddressRule, SplitTunnelAddressRuleKind, SplitTunnelAddressRuleScope,
