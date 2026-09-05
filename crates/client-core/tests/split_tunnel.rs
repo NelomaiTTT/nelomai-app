@@ -1068,6 +1068,64 @@ async fn settings_save_reports_apply_and_rollback_failures() {
 }
 
 #[tokio::test]
+async fn logout_fences_failed_policy_stop_without_restoring_connection() {
+    let fixture = Arc::new(coordinator_fixture(android_35_capabilities()));
+    fixture
+        .core
+        .synchronize_split_tunnel(1000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1010)
+        .await
+        .unwrap();
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 8;
+    changed.policy_hash = format!("sha256:{}", "f".repeat(64));
+    changed.selected_packages = vec!["com.example.chat".into()];
+    fixture.api.set_policy(changed);
+    fixture.tunnel.block_stop.store(true, Ordering::SeqCst);
+    let worker = fixture.clone();
+    let pending = tokio::spawn(async move {
+        worker
+            .core
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: SplitTunnelMode::ExcludeSelected,
+                    exclude_local_networks: true,
+                    selected_packages: vec![SplitTunnelSelectedPackage {
+                        package_id: "com.example.chat".into(),
+                        display_name: "Chat".into(),
+                    }],
+                },
+                1100,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture.tunnel.stops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.tunnel.block_stop.store(false, Ordering::SeqCst);
+    fixture.core.sign_out().await.unwrap();
+    let cleanup = fixture.secret_store.load().unwrap().unwrap();
+    fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    fixture.tunnel.stop_release.notify_one();
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert_eq!(fixture.core.state().await.phase, Phase::SignedOut);
+    assert!(fixture.core.state().await.connection.is_none());
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.secret_store.load().unwrap().unwrap(), cleanup);
+}
+
+#[tokio::test]
 async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
     let api = Arc::new(CoordinatorApi::new());
     let secret_store = Arc::new(TestSecretStore::new(StoredAuth {

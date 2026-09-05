@@ -409,6 +409,9 @@ struct MockApi {
     bootstrap_connection: Mutex<Option<Connection>>,
     bootstrap_binding_without_connection: AtomicBool,
     pin_calls: AtomicUsize,
+    hold_pin: AtomicBool,
+    pin_entered: Notify,
+    pin_release: Notify,
     unpin_calls: AtomicUsize,
     pin_fails: AtomicBool,
     reconcile_requests: Mutex<Vec<OperationReconcileRequest>>,
@@ -454,6 +457,9 @@ impl MockApi {
             bootstrap_connection: Mutex::new(None),
             bootstrap_binding_without_connection: AtomicBool::new(false),
             pin_calls: AtomicUsize::new(0),
+            hold_pin: AtomicBool::new(false),
+            pin_entered: Notify::new(),
+            pin_release: Notify::new(),
             unpin_calls: AtomicUsize::new(0),
             pin_fails: AtomicBool::new(false),
             reconcile_requests: Mutex::new(Vec::new()),
@@ -689,6 +695,10 @@ impl CoreApi for MockApi {
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         self.pin_calls.fetch_add(1, Ordering::SeqCst);
+        if self.hold_pin.load(Ordering::SeqCst) {
+            self.pin_entered.notify_one();
+            self.pin_release.notified().await;
+        }
         if self.pin_fails.load(Ordering::SeqCst) {
             return Err(CoreApiError::Rejected {
                 code: "connection_not_pinnable".to_string(),
@@ -4385,6 +4395,122 @@ async fn fixed_connection_uses_a_new_operation_after_stop() {
     let operation_ids = api.operation_ids.lock().unwrap();
     assert_eq!(operation_ids.len(), 2);
     assert_ne!(operation_ids[0], operation_ids[1]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logout_fences_delayed_pin_success_without_replacing_cleanup_snapshot() {
+    let api = Arc::new(MockApi::new(0));
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    ));
+    core.start(options(), 1_700_000_000).await.unwrap();
+    api.hold_pin.store(true, Ordering::SeqCst);
+    let worker = core.clone();
+    let pending = tokio::spawn(async move { worker.pin_stray().await });
+    api.pin_entered.notified().await;
+    core.sign_out().await.unwrap();
+    let cleanup = store.load().unwrap().unwrap();
+    api.pin_release.notify_one();
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    assert_eq!(core.state().await.phase, Phase::SignedOut);
+    assert!(core.state().await.connection.is_none());
+    assert_eq!(store.load().unwrap().unwrap(), cleanup);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logout_fences_offline_start_error_and_handshake_cleanup() {
+    exercise_offline_failure_after_logout(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logout_fences_offline_handshake_cleanup_success_and_failure() {
+    exercise_offline_failure_after_logout(true).await;
+}
+
+async fn exercise_offline_failure_after_logout(handshake: bool) {
+    for fail_cleanup in [false, true] {
+        let mut stored = auth();
+        stored.saved_connection = Some(StoredConnection {
+            lease_id: "synthetic-offline".into(),
+            pool_id: None,
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
+            probe_url: None,
+            kind: StoredConnectionKind::DynamicWarm,
+            configuration: if handshake {
+                awg3_configuration("synthetic")
+            } else {
+                "[Interface]\nPrivateKey = synthetic".into()
+            },
+            valid_until_unix: Some(2000),
+        });
+        let store = Arc::new(MemoryStore::new(stored));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        if handshake {
+            tunnel.metrics_supported.store(true, Ordering::SeqCst);
+            tunnel.block_metrics.store(true, Ordering::SeqCst);
+        } else {
+            tunnel.block_start.store(true, Ordering::SeqCst);
+            tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+            tunnel
+                .leave_running_on_start_failure
+                .store(true, Ordering::SeqCst);
+        }
+        let core = Arc::new(support::core(
+            Arc::new(MockApi::new(0)),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        ));
+        let worker = core.clone();
+        let pending = tokio::spawn(async move { worker.start_saved_stray_offline(1000).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while if handshake {
+                tunnel.blocked_metrics_calls.load(Ordering::SeqCst) == 0
+            } else {
+                tunnel.starts.load(Ordering::SeqCst) == 0
+            } {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        core.sign_out().await.unwrap();
+        let cleanup = store.load().unwrap().unwrap();
+        tunnel
+            .fail_next_stops
+            .store(usize::from(fail_cleanup), Ordering::SeqCst);
+        tunnel.start_release.notify_one();
+        tunnel.metrics_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            core.state().await.phase,
+            if fail_cleanup {
+                Phase::Error
+            } else {
+                Phase::SignedOut
+            },
+            "handshake={handshake}, cleanup failure={fail_cleanup}"
+        );
+        assert!(core.state().await.connection.is_none());
+        assert_eq!(store.load().unwrap().unwrap(), cleanup);
+        if !fail_cleanup {
+            assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

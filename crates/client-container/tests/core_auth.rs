@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{post, put},
     Json, Router,
 };
 use nelomai_client_api::{ClientApi, RuntimeTarget};
@@ -14,15 +14,18 @@ use nelomai_client_core::{
     CoreApi, CoreError, CoreLocalStop, NoopLogger, Phase, RuntimeAuthProvider,
 };
 use nelomai_client_storage::*;
-use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
+use nelomai_client_tunnel::{
+    TunnelCapabilities, TunnelController, TunnelError, TunnelPlatform, TunnelStartRequest,
+    TunnelStatus,
+};
 use nelomai_contracts::{
     ConnectionOperationRequest, EgressMode, Layer, Platform, RouteMode, RuntimeIdentity,
-    RuntimeSlot, TicConnectionMode,
+    RuntimeSlot, SplitTunnelMode, SplitTunnelPolicy, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde_json::{json, Value};
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -54,18 +57,36 @@ struct Tunnel {
     hold_status: AtomicBool,
     status_entered: Notify,
     status_release: Notify,
+    starts: AtomicUsize,
+    hold_start_at: AtomicUsize,
+    fail_start_at: AtomicUsize,
+    hold_next_stop: AtomicBool,
+    stop_entered: Notify,
+    stop_release: Notify,
 }
 #[async_trait]
 impl TunnelController for Tunnel {
     async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+        let call = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
         self.entered.notify_one();
-        if self.hold_start.load(Ordering::SeqCst) {
+        if self.hold_start.load(Ordering::SeqCst)
+            || self.hold_start_at.load(Ordering::SeqCst) == call
+        {
             self.release.notified().await;
         }
         self.running.store(true, Ordering::SeqCst);
+        if self.fail_start_at.load(Ordering::SeqCst) == call {
+            return Err(TunnelError::Backend(
+                "synthetic-start-failed-after-dispatch".into(),
+            ));
+        }
         Ok(())
     }
     async fn stop(&self) -> Result<(), TunnelError> {
+        if self.hold_next_stop.swap(false, Ordering::SeqCst) {
+            self.stop_entered.notify_one();
+            self.stop_release.notified().await;
+        }
         if self.fail_stop.load(Ordering::SeqCst) {
             return Err(TunnelError::Backend("synthetic-stop-failed".into()));
         }
@@ -83,6 +104,14 @@ impl TunnelController for Tunnel {
             self.status_release.notified().await;
         }
         Ok(captured)
+    }
+    async fn capabilities(&self) -> Result<TunnelCapabilities, TunnelError> {
+        Ok(TunnelCapabilities {
+            platform: TunnelPlatform::Windows,
+            android_api_level: None,
+            address_split_tunnel: true,
+            application_split_tunnel: false,
+        })
     }
 }
 #[derive(Default)]
@@ -289,5 +318,193 @@ async fn exercise_logout(fail_stop: bool) {
         .path()
         .join("runtime/stable/state/0.2.16/state-v1.json")
         .exists());
+    server.abort();
+}
+
+fn changed_policy() -> SplitTunnelPolicy {
+    SplitTunnelPolicy {
+        format_version: 1,
+        enabled: true,
+        revision: 8,
+        force_revision: 0,
+        address_revision: 0,
+        policy_hash: format!("sha256:{}", "b".repeat(64)),
+        mode: SplitTunnelMode::ExcludeSelected,
+        exclude_local_networks: true,
+        mandatory_excluded_packages: vec![],
+        suggested_name_fragments: vec![],
+        selected_packages: vec![],
+        excluded_ipv4_cidrs: vec!["203.0.113.0/24".into()],
+        address_rules: vec![],
+        generated_at: "2026-09-05T12:00:00Z".into(),
+    }
+}
+
+#[tokio::test]
+async fn actual_owner_logout_fences_split_stop() {
+    exercise_split_logout(0, false).await;
+}
+#[tokio::test]
+async fn actual_owner_logout_compensates_late_split_start() {
+    exercise_split_logout(2, false).await;
+}
+#[tokio::test]
+async fn actual_owner_logout_prevents_failed_forward_rollback() {
+    exercise_split_logout(2, true).await;
+}
+#[tokio::test]
+async fn actual_owner_logout_compensates_dispatched_split_rollback() {
+    exercise_split_logout(3, true).await;
+}
+
+async fn exercise_split_logout(held_start: usize, fail_forward: bool) {
+    let panel = Arc::new(Panel::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api =
+        Arc::new(ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap());
+    let router = Router::new()
+        .route("/api/client/v1/auth/logout-runtime", post(logout))
+        .route(
+            "/api/client/v1/split-tunnel/settings",
+            put(|| async { Json(changed_policy()) }),
+        )
+        .with_state(panel.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+    let identity = RuntimeIdentity {
+        slot: RuntimeSlot::Stable,
+        runtime_version: "0.2.16".into(),
+        container_version: "0.2.16".into(),
+        runtime_contract_version: 1,
+        session_generation: Some(7),
+    };
+    let mut legacy = StoredAuth::new_install();
+    legacy.install_secret = "synthetic-install".into();
+    legacy.access_token = Some("synthetic-access".into());
+    legacy.refresh_token = Some("synthetic-refresh".into());
+    legacy.saved_connection = Some(StoredConnection {
+        lease_id: "synthetic-lease".into(),
+        pool_id: None,
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probe_url: None,
+        kind: StoredConnectionKind::DynamicWarm,
+        configuration: "[Interface]\nPrivateKey = synthetic".into(),
+        valid_until_unix: Some(2000),
+    });
+    let auth = Arc::new(ProtectedAuthStore::new(Record::default()));
+    let mut auth_value = AuthStoreV1::from_legacy(&legacy);
+    auth_value.confirmed_identity = Some(identity.clone());
+    auth_value.session_generation = Some(7);
+    auth.save(&auth_value).unwrap();
+    let runtime = ProtectedRuntimeStore::new(Record::default(), paths);
+    let mut runtime_value =
+        RuntimeStateV1::import_legacy(&legacy, StoredSplitTunnelState::default(), runtime.paths());
+    runtime_value.cleanup_only = false;
+    runtime.save(&runtime_value).unwrap();
+    let owner = RuntimeRecordOwner::new(runtime);
+    let operational = Arc::new(owner.operational());
+    let tunnel = Arc::new(Tunnel::default());
+    let local = CoreLocalStop::new(tunnel.clone());
+    let broker =
+        Arc::new(AuthBroker::new(api.as_ref().clone(), auth.clone(), local.clone()).unwrap());
+    let port = Arc::new(
+        OwnerRuntimeAuth::new(
+            broker,
+            RuntimeTarget::from_identity(&identity),
+            RuntimeClientProfile {
+                platform: Platform::Macos,
+                platform_version: None,
+                architecture: "aarch64".into(),
+            },
+        )
+        .unwrap(),
+    );
+    let application = Arc::new(ClientApplication::with_split_tunnel_store(
+        api,
+        operational.clone(),
+        Arc::new(owner.split()),
+        port.clone(),
+        local,
+        Arc::new(NoopLogger),
+    ));
+    application.start_saved_stray_offline(1000).await.unwrap();
+    // Consume the notification from the initial start; all later waits are exact callbacks.
+    tunnel.entered.notified().await;
+    tunnel
+        .hold_next_stop
+        .store(held_start == 0, Ordering::SeqCst);
+    tunnel.hold_start_at.store(held_start, Ordering::SeqCst);
+    tunnel
+        .fail_start_at
+        .store(if fail_forward { 2 } else { 0 }, Ordering::SeqCst);
+    let worker = application.clone();
+    let pending = tokio::spawn(async move {
+        worker
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: SplitTunnelMode::ExcludeSelected,
+                    exclude_local_networks: true,
+                    selected_packages: vec![],
+                },
+                1100,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        if held_start == 0 {
+            tunnel.stop_entered.notified().await;
+        } else {
+            while tunnel.starts.load(Ordering::SeqCst) < held_start {
+                tunnel.entered.notified().await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), application.logout())
+        .await
+        .expect("owner logout must not queue behind policy callback")
+        .unwrap();
+    assert_eq!(
+        auth.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    assert!(port.access(None).await.is_err());
+    tunnel.stop_release.notify_one();
+    tunnel.release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(nelomai_client_application::ApplicationError::Core(
+                CoreError::StartCancelled
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        tunnel.starts.load(Ordering::SeqCst),
+        held_start.max(1),
+        "no new start may dispatch after logout"
+    );
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(
+        application.reconcile_external_tunnel_state().await.phase,
+        Phase::SignedOut
+    );
+    assert_eq!(
+        operational.load().unwrap().unwrap().saved_connection,
+        legacy.saved_connection
+    );
+    assert_eq!(panel.proofs.lock().unwrap().len(), 1);
     server.abort();
 }

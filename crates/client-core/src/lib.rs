@@ -3181,6 +3181,7 @@ where
     }
 
     pub async fn pin_stray(&self) -> Result<Connection, CoreError> {
+        let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
         let _guard = self.connection_gate.lock().await;
         let current_state = self.state.lock().await.clone();
         let current = current_state
@@ -3206,6 +3207,10 @@ where
         let response = self
             .retry_operation(&access_token, &request, ConnectionOperation::PinStray)
             .await?;
+        // Logout keeps the original lease/configuration as cleanup authority.
+        // A late pin acknowledgement must not replace that operational snapshot.
+        let mut state = self.state.lock().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         stored.pinned_connection = Some(StoredConnection {
             kind: StoredConnectionKind::Pinned,
             valid_until_unix: None,
@@ -3213,7 +3218,8 @@ where
         });
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         self.clear_offline_connection_quarantine(&response.connection.lease_id);
-        *self.state.lock().await = CoreState {
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        *state = CoreState {
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
         };
@@ -3406,7 +3412,11 @@ where
             })
             .await
         {
-            *self.state.lock().await = CoreState {
+            // Even an error may follow a partially dispatched platform start.
+            self.ensure_offline_start_current(cancel_epoch).await?;
+            let mut state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            *state = CoreState {
                 phase: Phase::Ready,
                 connection: None,
             };
@@ -3420,7 +3430,17 @@ where
             {
                 if let Err(stop_error) = self.tunnel.stop().await {
                     let stop_error = CoreError::from(stop_error);
-                    *self.state.lock().await = CoreState {
+                    let mut state = self.state.lock().await;
+                    if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                        // Cleanup failed, but logout still owns admission/presentation.
+                        // Durable runtime references remain available for a later stop.
+                        *state = CoreState {
+                            phase: Phase::Error,
+                            connection: None,
+                        };
+                        return Err(stop_error);
+                    }
+                    *state = CoreState {
                         phase: Phase::Stopping,
                         connection: Some(Connection {
                             lease_id: saved.lease_id.clone(),
@@ -3451,7 +3471,9 @@ where
                     });
                     return Err(stop_error);
                 }
-                *self.state.lock().await = CoreState {
+                let mut state = self.state.lock().await;
+                self.ensure_start_not_cancelled(cancel_epoch)?;
+                *state = CoreState {
                     phase: Phase::Ready,
                     connection: None,
                 };
@@ -3550,16 +3572,34 @@ where
         // A late platform start may have physically started after logout's stop.
         // The connection gate still excludes another start while we stop it.
         let result = self.tunnel.stop().await;
-        *self.state.lock().await = CoreState {
-            phase: if result.is_ok() {
-                Phase::SignedOut
-            } else {
-                Phase::Error
-            },
-            connection: None,
-        };
+        // Successful compensation must not overwrite an in-progress logout's
+        // Stopping/Error presentation or imply remote acknowledgement.
+        if result.is_err() {
+            *self.state.lock().await = CoreState {
+                phase: Phase::Error,
+                connection: None,
+            };
+        }
         result.map_err(CoreError::from)?;
         Err(CoreError::StartCancelled)
+    }
+
+    async fn publish_local_start_state(
+        &self,
+        epoch: StartCancellationEpoch,
+        phase: Phase,
+        connection: Connection,
+    ) -> Result<(), CoreError> {
+        let mut state = self.state.lock().await;
+        if self.ensure_start_not_cancelled(epoch).is_err() {
+            drop(state);
+            return self.ensure_offline_start_current(epoch).await;
+        }
+        *state = CoreState {
+            phase,
+            connection: Some(connection),
+        };
+        Ok(())
     }
 
     fn load_runtime(&self) -> Result<nelomai_client_storage::RuntimeStateV1, CoreError> {

@@ -1620,6 +1620,10 @@ where
         access_token: &mut AccessSnapshot,
         now_unix: i64,
     ) -> Result<ConnectedPolicyApplyOutcome, CoreError> {
+        let cancel_epoch = crate::StartCancellationEpoch(
+            self.start_cancel_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         let current = {
             let current_state = self.state.lock().await;
             (current_state.phase == Phase::Connected)
@@ -1701,6 +1705,7 @@ where
         let _connection_guard = self.connection_gate.lock().await;
         let connection_is_still_current = {
             let current_state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             current_state.phase == Phase::Connected
                 && current_state
                     .connection
@@ -1755,10 +1760,13 @@ where
                 )
                 | Err(_) => Phase::Connected,
             };
-            *self.state.lock().await = crate::CoreState {
+            let mut current_state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            *current_state = crate::CoreState {
                 phase,
                 connection: Some(connection),
             };
+            drop(current_state);
             self.set_split_tunnel_warning(
                 SplitTunnelWarningKind::Operation,
                 "split_tunnel_stop_failed",
@@ -1785,7 +1793,11 @@ where
                 .await;
             return Ok(ConnectedPolicyApplyOutcome::StopFailed);
         }
-        self.set_phase(Phase::Connecting).await;
+        {
+            let mut current_state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            current_state.phase = Phase::Connecting;
+        }
         let start_new = self
             .tunnel
             .start(nelomai_client_tunnel::TunnelStartRequest {
@@ -1797,6 +1809,9 @@ where
                 quick_connection: None,
             })
             .await;
+        // Both success and error can follow a physical start. Never dispatch
+        // rollback with a stale epoch; compensate an already dispatched start.
+        self.ensure_offline_start_current(cancel_epoch).await?;
         let (outcome, status, error_code) = if start_new.is_ok() {
             *self.split_tunnel_options.lock().await = new_options.clone();
             state.applied_physical_network_fingerprint = self
@@ -1808,16 +1823,15 @@ where
                 .await;
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
                 .await;
-            *self.state.lock().await = crate::CoreState {
-                phase: Phase::Connected,
-                connection: Some(connection),
-            };
+            self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
+                .await?;
             (
                 ConnectedPolicyApplyOutcome::Applied,
                 SplitTunnelApplyStatus::Applied,
                 None,
             )
         } else {
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             let rollback = self
                 .tunnel
                 .start(nelomai_client_tunnel::TunnelStartRequest {
@@ -1827,16 +1841,15 @@ where
                     quick_connection: None,
                 })
                 .await;
+            self.ensure_offline_start_current(cancel_epoch).await?;
             if rollback.is_ok() {
                 mark_policy_failure(state, policy, now_unix);
                 *self.split_tunnel_options.lock().await = previous_options.clone();
                 state.applied_physical_network_fingerprint = self
                     .initialize_physical_network_detector(&previous_options)
                     .await;
-                *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Connected,
-                    connection: Some(connection),
-                };
+                self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
+                    .await?;
                 self.set_split_tunnel_warning(
                     SplitTunnelWarningKind::Operation,
                     "split_tunnel_apply_failed",
@@ -1852,10 +1865,8 @@ where
                 *self.split_tunnel_options.lock().await = TunnelOptions::default();
                 self.physical_network_change.lock().await.reset();
                 state.applied_physical_network_fingerprint = None;
-                *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Stopping,
-                    connection: Some(connection),
-                };
+                self.publish_local_start_state(cancel_epoch, Phase::Stopping, connection)
+                    .await?;
                 self.set_split_tunnel_warning(
                     SplitTunnelWarningKind::Operation,
                     "split_tunnel_rollback_failed",
