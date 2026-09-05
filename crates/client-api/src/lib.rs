@@ -417,9 +417,6 @@ fn validate_runtime_switch_response(
     request: &RuntimeSwitchReconcileRequest,
     response: &RuntimeSwitchReconcileResponse,
 ) -> Result<(), ClientApiError> {
-    let requested_leases: HashSet<_> = request.lease_ids.iter().collect();
-    let requested_sessions: HashSet<_> = request.redundant_session_ids.iter().collect();
-    let requested_operations: HashSet<_> = request.client_operation_ids.iter().collect();
     if response.operation_id != request.operation_id
         || !valid_switch_ids(&response.retired_lease_ids)
         || !valid_switch_ids(&response.retired_session_ids)
@@ -427,18 +424,6 @@ fn validate_runtime_switch_response(
         || response
             .retry_after_seconds
             .is_some_and(|seconds| !(1..=30).contains(&seconds))
-        || response
-            .retired_lease_ids
-            .iter()
-            .any(|id| !requested_leases.contains(id))
-        || response
-            .retired_session_ids
-            .iter()
-            .any(|id| !requested_sessions.contains(id))
-        || response
-            .retired_operation_ids
-            .iter()
-            .any(|id| !requested_operations.contains(id))
     {
         return Err(ClientApiError::InvalidPayload {
             code: "invalid_runtime_switch_response",

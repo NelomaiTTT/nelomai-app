@@ -125,6 +125,7 @@ struct Panel {
     fail_refresh: AtomicUsize,
     reject_reconcile_access: AtomicUsize,
     fail_reconcile: AtomicUsize,
+    return_full_device_snapshot: AtomicUsize,
     reconcile_bodies: Mutex<Vec<Value>>,
     hold_resume: AtomicUsize,
     resume_entered: Notify,
@@ -190,6 +191,15 @@ async fn reconcile(
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"request_id":"r","code":"temporarily_unavailable","message":"offline"})),
+        ));
+    }
+    if state.return_full_device_snapshot.load(Ordering::SeqCst) == 1 {
+        return Ok(Json(
+            json!({"state":"clean","operation_id":body["operation_id"],
+            "retired_lease_ids":["server-lease"],
+            "retired_session_ids":["server-session"],
+            "retired_operation_ids":["server-operation"],
+            "retry_after_seconds":null}),
         ));
     }
     Ok(Json(
@@ -323,6 +333,32 @@ async fn exact_first_reconcile_401_updates_proof_once_and_lost_reply_replays_exa
             .len(),
         1
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn broker_persists_and_replays_the_exact_server_full_device_snapshot() {
+    let state = Arc::new(Panel::default());
+    state.return_full_device_snapshot.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = legacy_store();
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let mut request = reconcile_request(&source);
+    request.lease_ids.clear();
+    request.redundant_session_ids.clear();
+    request.client_operation_ids.clear();
+    let frozen = FrozenReconcileRequest::new(request, &source).unwrap();
+    let first = broker.reconcile_transition(frozen.clone()).await.unwrap();
+    assert_eq!(first.retired_lease_ids, ["server-lease"]);
+    assert_eq!(first.retired_session_ids, ["server-session"]);
+    assert_eq!(first.retired_operation_ids, ["server-operation"]);
+    drop(broker);
+
+    let reopened = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+    let replay = reopened.reconcile_transition(frozen).await.unwrap();
+    assert_eq!(replay, first);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
 

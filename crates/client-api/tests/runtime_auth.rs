@@ -398,25 +398,64 @@ async fn reconcile_retry_hint_is_nullable_and_supersede_uses_the_actual_refresh_
 }
 
 #[tokio::test]
-async fn reconcile_rejects_retirement_receipt_outside_the_frozen_snapshot() {
+async fn reconcile_accepts_the_server_full_device_snapshot_beyond_local_hints() {
     let (url, requests, handle) = server(json!({
         "state":"clean", "operation_id":"11111111-1111-4111-8111-111111111111",
-        "retired_lease_ids":["foreign-lease"], "retired_session_ids":[],
-        "retired_operation_ids":[], "retry_after_seconds":null
+        "retired_lease_ids":["server-lease"], "retired_session_ids":["server-session"],
+        "retired_operation_ids":["server-operation"], "retry_after_seconds":null
     }));
     let mut request = reconcile_request(None);
     request.expected_session_generation = None;
-    assert_eq!(
-        ClientApi::new(&url)
-            .unwrap()
-            .reconcile_runtime_switch("legacy-access", &request)
-            .await
-            .unwrap_err()
-            .stable_code(),
-        Some("invalid_runtime_switch_response")
-    );
+    request.lease_ids.clear();
+    request.redundant_session_ids.clear();
+    request.client_operation_ids.clear();
+    let response = ClientApi::new(&url)
+        .unwrap()
+        .reconcile_runtime_switch("legacy-access", &request)
+        .await
+        .unwrap();
+    assert_eq!(response.retired_lease_ids, ["server-lease"]);
+    assert_eq!(response.retired_session_ids, ["server-session"]);
+    assert_eq!(response.retired_operation_ids, ["server-operation"]);
     requests.recv_timeout(Duration::from_secs(5)).unwrap();
     handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_still_rejects_wrong_operation_invalid_ids_and_oversized_snapshots() {
+    let cases = [
+        json!({
+            "state":"clean", "operation_id":"22222222-2222-4222-8222-222222222222",
+            "retired_lease_ids":[], "retired_session_ids":[],
+            "retired_operation_ids":[], "retry_after_seconds":null
+        }),
+        json!({
+            "state":"clean", "operation_id":"11111111-1111-4111-8111-111111111111",
+            "retired_lease_ids":["duplicate","duplicate"], "retired_session_ids":[],
+            "retired_operation_ids":[], "retry_after_seconds":null
+        }),
+        json!({
+            "state":"clean", "operation_id":"11111111-1111-4111-8111-111111111111",
+            "retired_lease_ids":(0..1025).map(|index| format!("lease-{index}")).collect::<Vec<_>>(),
+            "retired_session_ids":[], "retired_operation_ids":[], "retry_after_seconds":null
+        }),
+    ];
+    for body in cases {
+        let (url, requests, handle) = server(body);
+        let mut request = reconcile_request(None);
+        request.expected_session_generation = None;
+        assert_eq!(
+            ClientApi::new(&url)
+                .unwrap()
+                .reconcile_runtime_switch("legacy-access", &request)
+                .await
+                .unwrap_err()
+                .stable_code(),
+            Some("invalid_runtime_switch_response")
+        );
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+    }
 }
 
 #[tokio::test]
