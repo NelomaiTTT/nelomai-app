@@ -40,6 +40,167 @@ impl LocalAuthStop for Stop {
         Ok(())
     }
 }
+
+#[derive(Default)]
+struct NativeStop {
+    stops: AtomicUsize,
+    hold_stop: AtomicBool,
+    handoff_entered: Notify,
+    handoffs: AtomicUsize,
+    handoff_release: Notify,
+    hold: AtomicBool,
+    fail: AtomicBool,
+}
+#[async_trait]
+impl LocalAuthStop for NativeStop {
+    async fn stop_local(&self) -> Result<(), BrokerError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+        if self.hold_stop.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+    async fn prepare_revocation(&self, _cancel_epoch: u64) -> Result<(), BrokerError> {
+        self.handoffs.fetch_add(1, Ordering::SeqCst);
+        self.handoff_entered.notify_one();
+        if self.hold.load(Ordering::SeqCst) {
+            self.handoff_release.notified().await;
+        }
+        if self.fail.swap(false, Ordering::SeqCst) {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn native_stop_wait_cannot_exceed_owner_budget_or_prevent_handoff_poll() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state).await;
+    let store = auth_store();
+    let native = Arc::new(NativeStop::default());
+    native.hold_stop.store(true, Ordering::SeqCst);
+    let broker = AuthBroker::new(api, store.clone(), native.clone()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(11), broker.logout())
+        .await
+        .expect("local native stop must share the bounded owner request budget");
+    assert!(matches!(result, Err(BrokerError::Timeout)));
+    assert_eq!(native.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(native.handoffs.load(Ordering::SeqCst), 1);
+    assert!(store.load().unwrap().unwrap().auth_epoch > 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_handoff_never_delays_logout_fence_or_stop_and_failure_retries_exact_proof() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let native = Arc::new(NativeStop::default());
+    native.hold.store(true, Ordering::SeqCst);
+    native.fail.store(true, Ordering::SeqCst);
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), native.clone()).unwrap());
+    let before_epoch = store.load().unwrap().unwrap().auth_epoch;
+    let owner = broker.clone();
+    let logout = tokio::spawn(async move { owner.logout().await });
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        native.handoff_entered.notified(),
+    )
+    .await
+    .expect("revocation must await native handoff");
+    let pending = store.load().unwrap().unwrap();
+    assert_eq!(pending.logout_state, LogoutState::Pending);
+    assert!(pending.auth_epoch > before_epoch);
+    assert_eq!(native.stops.load(Ordering::SeqCst), 1);
+    assert!(broker.access_token(None).await.is_err());
+    assert_eq!(state.logout_calls.load(Ordering::SeqCst), 0);
+    let proof = pending
+        .broker
+        .as_ref()
+        .unwrap()
+        .pending_logout
+        .clone()
+        .unwrap();
+    native.handoff_release.notify_one();
+    assert!(logout.await.unwrap().is_err());
+    assert_eq!(store.load().unwrap().unwrap(), pending);
+    native.hold.store(false, Ordering::SeqCst);
+    broker.logout().await.unwrap();
+    assert_eq!(
+        state.logout_requests.lock().unwrap()[0]["operation_id"],
+        proof.operation_id
+    );
+    assert_eq!(
+        state.logout_requests.lock().unwrap()[0]["refresh_token"],
+        proof.refresh_proof
+    );
+    assert_eq!(
+        store.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn push_cleanup_journal_survives_owner_restart_and_only_accepted_login_supersedes_it() {
+    let state = Arc::new(Panel::default());
+    state.lose_logout.store(true, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop::default())).unwrap();
+    assert!(broker.logout().await.is_err());
+    let epoch = store.load().unwrap().unwrap().auth_epoch;
+    broker.stage_push_cleanup(epoch).await.unwrap();
+    drop(broker);
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+    assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(epoch));
+    assert!(broker.push_cleanup_is_current(epoch).await.unwrap());
+    broker.logout().await.unwrap();
+    assert_eq!(
+        broker.pending_push_cleanup().await.unwrap(),
+        Some(epoch),
+        "HTTP ACK is not a push cleanup ACK"
+    );
+    assert!(broker.finish_push_cleanup(epoch + 1).await.is_err());
+    broker.logout().await.unwrap();
+    let repeated_epoch = store.load().unwrap().unwrap().auth_epoch;
+    assert!(repeated_epoch > epoch);
+    assert_eq!(
+        broker.pending_push_cleanup().await.unwrap(),
+        Some(repeated_epoch)
+    );
+    assert!(broker
+        .push_cleanup_is_current(repeated_epoch)
+        .await
+        .unwrap());
+    let request = LoginRequest {
+        login: "synthetic-user".into(),
+        password: "synthetic-password".into(),
+        install_secret: "ignored".into(),
+        device_name: "test".into(),
+        platform: nelomai_contracts::Platform::Macos,
+        platform_version: None,
+        architecture: "aarch64".into(),
+        app_version: "0.2.16".into(),
+    };
+    state.fail_login.store(true, Ordering::SeqCst);
+    assert!(broker
+        .login(&request, &RuntimeTarget::from_identity(&identity(8)))
+        .await
+        .is_err());
+    assert_eq!(
+        broker.pending_push_cleanup().await.unwrap(),
+        Some(repeated_epoch)
+    );
+    broker
+        .login(&request, &RuntimeTarget::from_identity(&identity(8)))
+        .await
+        .unwrap();
+    assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+    assert!(!broker.push_cleanup_is_current(epoch).await.unwrap());
+    server.abort();
+}
 fn identity(generation: u64) -> RuntimeIdentity {
     RuntimeIdentity {
         container_version: "0.2.16".into(),
@@ -58,6 +219,19 @@ fn auth_store() -> Arc<dyn AuthStore> {
     let mut value = AuthStoreV1::from_legacy(&legacy);
     value.session_generation = Some(7);
     value.confirmed_identity = Some(identity(7));
+    value.broker = Some(nelomai_client_storage::BrokerMetadataV1 {
+        family: "synthetic-family".into(),
+        next_attempt: 0,
+        pending_request: None,
+        completed_resume: None,
+        pending_logout: None,
+        pending_recovery: None,
+        cancelled_login: None,
+        authentication_outcome_unknown: false,
+        pending_login_account: None,
+        confirmed_device_id: Some("device".into()),
+        pending_push_cleanup_epoch: None,
+    });
     store.save(&value).unwrap();
     store
 }
@@ -142,6 +316,7 @@ struct Panel {
     release: Notify,
     held: AtomicBool,
     old_generation: AtomicBool,
+    foreign_refresh_device: AtomicBool,
     logout_calls: AtomicUsize,
     lose_logout: AtomicBool,
     resume_requests: Mutex<Vec<Value>>,
@@ -192,14 +367,18 @@ async fn refresh(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Js
     if panel.held.load(Ordering::SeqCst) {
         panel.release.notified().await;
     }
-    Json(response(
+    let mut reply = response(
         if panel.old_generation.load(Ordering::SeqCst) {
             6
         } else {
             7
         },
         "successor-access",
-    ))
+    );
+    if panel.foreign_refresh_device.load(Ordering::SeqCst) {
+        reply["device"]["id"] = json!("another-device");
+    }
+    Json(reply)
 }
 async fn logout(
     State(panel): State<Arc<Panel>>,
@@ -266,6 +445,30 @@ async fn concurrent_stale_access_requests_serialize_refresh_and_keep_identity() 
         store.load().unwrap().unwrap().refresh_token.as_deref(),
         Some("successor-refresh")
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn ordinary_refresh_rejects_foreign_device_with_same_runtime_identity() {
+    let state = Arc::new(Panel::default());
+    state.foreign_refresh_device.store(true, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+    let previous = broker.access_token(None).await.unwrap();
+    assert!(matches!(
+        broker.access_token(Some(&previous)).await,
+        Err(BrokerError::IdentityMismatch)
+    ));
+    let retained = store.load().unwrap().unwrap();
+    assert_eq!(retained.access_token.as_deref(), Some("initial-access"));
+    assert_eq!(retained.refresh_token.as_deref(), Some("initial-refresh"));
+    assert!(retained.broker.unwrap().pending_request.is_some());
+    assert!(matches!(
+        broker.access_token(None).await,
+        Err(BrokerError::RecoveryRequired)
+    ));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
 
@@ -441,6 +644,129 @@ async fn recovery_callback_cannot_import_another_identity_even_with_current_tick
         store.load().unwrap().unwrap().access_token.as_deref(),
         Some("initial-access")
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn recovery_callback_rejects_another_device_with_identical_runtime_identity() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+    let mut known = store.load().unwrap().unwrap();
+    known.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    store.save(&known).unwrap();
+    let ticket = broker.begin_background_recovery().await.unwrap();
+    let before = store.load().unwrap();
+    let mut foreign = response(7, "foreign-access");
+    foreign["device"]["id"] = json!("other-device");
+    assert!(matches!(
+        broker
+            .accept_background_recovery(&ticket, serde_json::from_value(foreign).unwrap())
+            .await,
+        Err(BrokerError::IdentityMismatch)
+    ));
+    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(
+        state.calls.load(Ordering::SeqCst),
+        0,
+        "no ordinary refresh validation probe"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn owner_native_recovery_checks_real_runtime_admission_and_ignores_stale_errors() {
+    use nelomai_client_container::{
+        NativeAuthFailure, OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile,
+    };
+    use nelomai_client_core::RuntimeWriterGates;
+    use nelomai_client_storage::{
+        ProtectedRuntimeStore, RuntimePaths, RuntimeRecordOwner, RuntimeStateStore, RuntimeStateV1,
+        StoredSplitTunnelState,
+    };
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ProtectedRuntimeStore::new(
+        Record::default(),
+        RuntimePaths::new(root.path(), RuntimeSlot::Latest, "0.2.16").unwrap(),
+    );
+    let mut empty = RuntimeStateV1::import_legacy(
+        &StoredAuth::new_install(),
+        StoredSplitTunnelState::default(),
+        runtime.paths(),
+    );
+    // Synthetic fresh, non-migrating runtime; no cleanup references exist.
+    empty.cleanup_only = false;
+    runtime.save(&empty).unwrap();
+    let record = RuntimeRecordOwner::new(runtime);
+    let port = OwnerRuntimeAuth::new(
+        broker.clone(),
+        RuntimeTarget::from_identity(&identity(7)),
+        RuntimeClientProfile {
+            platform: nelomai_contracts::Platform::Macos,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+        Arc::new(RuntimeCacheAdmission::new(record)),
+        Arc::new(RuntimeWriterGates::default()),
+    )
+    .unwrap();
+    let dispatches = AtomicUsize::new(0);
+    assert!(port
+        .recover_background(|_| async {
+            dispatches.fetch_add(1, Ordering::SeqCst);
+            Err(NativeAuthFailure::NotIssued)
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        dispatches.load(Ordering::SeqCst),
+        0,
+        "missing runtime scope is not recovery eligibility"
+    );
+    port.admit_empty_current().await.unwrap();
+    let dispatch_store = store.clone();
+    let recovered = port
+        .recover_background(|request| async move {
+            assert_eq!(request.install_secret, "synthetic-install");
+            assert_eq!(request.ticket.device_id.as_deref(), Some("device"));
+            assert_eq!(
+                dispatch_store
+                    .load()
+                    .unwrap()
+                    .unwrap()
+                    .broker
+                    .unwrap()
+                    .pending_recovery,
+                Some(request.ticket.clone())
+            );
+            Ok(serde_json::from_value(response(7, "native-access")).unwrap())
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered.access_token(), "native-access");
+    assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        port.recover_background(|_| async { Err(NativeAuthFailure::AccessUnavailable) })
+            .await,
+        Err(nelomai_client_core::CoreError::AccessExpired)
+    ));
+    assert!(port
+        .recover_background(|_| async {
+            broker.logout().await.unwrap();
+            Err(NativeAuthFailure::NotIssued)
+        })
+        .await
+        .is_err());
+    assert_eq!(
+        store.load().unwrap().unwrap().logout_state,
+        LogoutState::LoggedOut
+    );
+    assert!(store.load().unwrap().unwrap().access_token.is_none());
     server.abort();
 }
 

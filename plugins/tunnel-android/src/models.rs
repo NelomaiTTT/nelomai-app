@@ -254,6 +254,12 @@ pub struct BackgroundLogoutOwnershipResponse {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BackgroundOwnerLogoutRequest {
+    pub cancel_epoch: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BackgroundCredentialMutationRequest {
     pub expected_revision: i64,
 }
@@ -301,6 +307,8 @@ pub struct ConnectionIntentStatusResponse {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundUiProvisionRequest {
+    pub owner_operation: String,
+    pub mode: String,
     pub api_version: u16,
     pub expected_revision: i64,
     pub device_id: String,
@@ -316,13 +324,13 @@ pub struct BackgroundUiProvisionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundSessionRecoveryRequest {
     pub install_secret: String,
+    pub owner_operation: String,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundSessionRecoveryResponse {
-    pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
+    pub response_json: Option<String>,
     pub error_code: Option<String>,
 }
 
@@ -340,12 +348,8 @@ impl fmt::Debug for BackgroundSessionRecoveryResponse {
         formatter
             .debug_struct("BackgroundSessionRecoveryResponse")
             .field(
-                "access_token",
-                &self.access_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "refresh_token",
-                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+                "response_json",
+                &self.response_json.as_ref().map(|_| "<redacted>"),
             )
             .field("error_code", &self.error_code)
             .finish()
@@ -567,6 +571,8 @@ mod tests {
     #[test]
     fn ui_background_provision_redacts_both_authentication_secrets() {
         let request = BackgroundUiProvisionRequest {
+            owner_operation: "synthetic-owner-operation".into(),
+            mode: "legacy".into(),
             api_version: TUNNEL_API_VERSION,
             expected_revision: 4,
             device_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -590,12 +596,12 @@ mod tests {
     #[test]
     fn background_session_recovery_redacts_every_session_secret() {
         let request = BackgroundSessionRecoveryRequest {
+            owner_operation: "synthetic-owner-operation".into(),
             install_secret: "never-log-install-secret".to_string(),
         };
         let response: BackgroundSessionRecoveryResponse =
             serde_json::from_value(serde_json::json!({
-                "accessToken": "never-log-access",
-                "refreshToken": "never-log-refresh",
+                "responseJson": "{\"access_token\":\"never-log-access\",\"refresh_token\":\"never-log-refresh\",\"device\":{\"id\":\"server-device\",\"runtime_slot\":\"stable\",\"runtime_version\":\"0.2.15\",\"container_version\":\"0.2.16\",\"runtime_contract_version\":1,\"session_generation\":7},\"token_type\":\"Bearer\",\"access_expires_in\":900}",
                 "errorCode": null
             }))
             .unwrap();
@@ -608,6 +614,11 @@ mod tests {
         let debug = format!("{response:?}");
         assert!(!debug.contains("never-log-access"));
         assert!(!debug.contains("never-log-refresh"));
+        let wire: serde_json::Value =
+            serde_json::from_str(response.response_json.as_deref().unwrap()).unwrap();
+        assert_eq!(wire["device"]["id"], "server-device");
+        assert_eq!(wire["device"]["runtime_version"], "0.2.15");
+        assert_eq!(wire["access_expires_in"], 900);
     }
 
     #[test]
@@ -620,8 +631,7 @@ mod tests {
             response.error_code.as_deref(),
             Some("invalid_background_token")
         );
-        assert!(response.access_token.is_none());
-        assert!(response.refresh_token.is_none());
+        assert!(response.response_json.is_none());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 package ru.nelomai.tunnel
+import org.json.JSONObject
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -630,6 +631,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun handleBeginBackgroundLogout(intent: Intent) {
+        val credentialStore = AndroidBackgroundCredentialStores.open(applicationContext)
+        when (val fenced = credentialStore.fenceOwnerLogout(intent.getLongExtra(EXTRA_OWNER_CANCEL_EPOCH, -1))) {
+            is CredentialStoreResult.Failure -> { intent.resultReceiver().sendError(fenced.code); return }
+            is CredentialStoreResult.Success -> Unit
+        }
         when (val result = beginDispatchedLogout(connectionIntentDispatch) {
             logoutCoordinator.begin()
         }) {
@@ -791,6 +797,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
 
     private fun handleProvisionBackground(intent: Intent) {
         val receiver = intent.resultReceiver()
+        val ownerOperation = try {
+            NativeOwnerOperation.fromJson(JSONObject(requireNotNull(intent.getStringExtra(EXTRA_OWNER_OPERATION))))
+        } catch (_: Throwable) { receiver.sendError("background_owner_scope_mismatch"); return }
         val request = try {
             require(intent.getIntExtra(EXTRA_API_VERSION, 0) == TUNNEL_API_VERSION)
             val store = AndroidBackgroundCredentialStores.open(applicationContext)
@@ -816,6 +825,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         requireNotNull(intent.getStringExtra(EXTRA_CAPABILITY_EXPIRES_AT)),
                     ).epochSecond,
                 ),
+                ownerScope = ownerOperation.scope,
             )
         } catch (error: CredentialRotationFailure) {
             receiver.sendError(error.code)
@@ -830,14 +840,28 @@ class NelomaiVpnService : GoBackend.VpnService() {
         credentialExecutor.execute {
             var provisioned = false
             try {
+                val store = AndroidBackgroundCredentialStores.open(applicationContext)
+                val begun = store.beginOwnerOperation(request.expectedRevision, ownerOperation, false).credentialOrThrow()
+                require(ownerOperation.scope.deviceId == request.deviceId)
+                store.withOwnerOperation(ownerOperation) {
+                provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = begun.revision),
+                    requireNotNull(intent.getStringExtra(EXTRA_OWNER_PROVISION_MODE)), System.currentTimeMillis() / 1_000,
+                    provision = { scopedRequest ->
                 provisionBackgroundCredential(
-                    store = AndroidBackgroundCredentialStores.open(applicationContext),
-                    request = request,
+                    store = store,
+                    request = scopedRequest,
                     nowUnix = System.currentTimeMillis() / 1_000,
                     operationIds = { UUID.randomUUID().toString() to UUID.randomUUID().toString() },
                     prepare = BackgroundConnectionClient::prepareTokenWithBearer,
                     activate = BackgroundConnectionClient::activateToken,
                 )
+                    }, rotate = { revision ->
+                        try { rotateBackgroundCredential(revision) } catch (error: CredentialRotationFailure) {
+                            throw BackgroundConnectionException(error.code)
+                        }
+                    }, legacy = BackgroundConnectionClient::legacyTokenWithBearer)
+                store.read().credentialOrThrow()
+                }
                 provisioned = true
                 runCatching { AutomaticDiagnostics.credentialUpdated(applicationContext) }
                     .onFailure {
@@ -922,6 +946,10 @@ class NelomaiVpnService : GoBackend.VpnService() {
         credentialExecutor.execute {
             try {
                 val store = AndroidBackgroundCredentialStores.open(applicationContext)
+                val ownerOperation = NativeOwnerOperation.fromJson(JSONObject(requireNotNull(intent.getStringExtra(EXTRA_OWNER_OPERATION))))
+                val current = store.read().credentialOrThrow()
+                store.beginOwnerOperation(current.revision, ownerOperation, true).credentialOrThrow()
+                val recovered = store.withOwnerOperation(ownerOperation) {
                 val credential = backgroundCredentialForSessionRecovery(store) { envelope ->
                     provisionBackgroundCredential(
                         store = store,
@@ -934,6 +962,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                             installGeneration = requireNotNull(envelope.installGeneration),
                             capability = envelope.capability
                                 ?: BackgroundCapabilitySnapshot(0, false, 1),
+                            ownerScope = ownerOperation.scope,
                         ),
                         nowUnix = System.currentTimeMillis() / 1_000,
                         operationIds = { error("pending activation must not mint operation IDs") },
@@ -943,15 +972,17 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         activate = BackgroundConnectionClient::activateToken,
                     )
                 }
-                val recovered = BackgroundConnectionClient.recoverSession(
+                val result = BackgroundConnectionClient.recoverSession(
                     credential,
                     installSecret,
                 )
+                store.read().credentialOrThrow()
+                result
+                }
                 receiver?.send(
                     SERVICE_RESULT_OK,
                     Bundle().apply {
-                        putString(EXTRA_ACCESS_TOKEN, recovered.accessToken)
-                        putString(EXTRA_REFRESH_TOKEN, recovered.refreshToken)
+                        putString(EXTRA_AUTH_RESPONSE, recovered.responseJson)
                     },
                 )
             } catch (error: BackgroundConnectionException) {

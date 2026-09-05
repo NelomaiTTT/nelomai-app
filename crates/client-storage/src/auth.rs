@@ -53,6 +53,9 @@ pub struct BrokerMetadataV1 {
     /// Server device UUID, never derived from the spelling of a login name.
     #[serde(default)]
     pub confirmed_device_id: Option<String>,
+    /// Nonsecret local delivery cleanup, independent of server logout ACK.
+    #[serde(default)]
+    pub pending_push_cleanup_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +66,10 @@ pub struct RecoveryTicketV1 {
     pub attempt: u64,
     pub family: String,
     pub identity: RuntimeIdentity,
+    /// Old staged tickets remain readable for cleanup, never accepted without
+    /// an owner-confirmed device ID.
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +244,12 @@ impl AuthStoreV1 {
                 return Err(StorageError::RecoveryRequired(
                     "invalid pending login account",
                 ));
+            }
+            if meta
+                .pending_push_cleanup_epoch
+                .is_some_and(|epoch| epoch > self.auth_epoch)
+            {
+                return Err(StorageError::RecoveryRequired("invalid push cleanup epoch"));
             }
             let validate_request = |request: &BrokerRequestV1| -> Result<(), StorageError> {
                 if request.operation_id.is_empty()

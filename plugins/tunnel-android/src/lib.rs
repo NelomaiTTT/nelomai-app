@@ -178,7 +178,8 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         let response = self
             .app
             .tunnel_android()
-            .stop_tunnel()
+            .stop_tunnel_async()
+            .await
             .map_err(to_tunnel_error)?;
         require_state(response, "stopped")
     }

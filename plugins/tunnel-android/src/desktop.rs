@@ -122,6 +122,30 @@ impl<R: Runtime> TunnelAndroid<R> {
         })
     }
 
+    pub async fn prepare_owner_revocation(
+        &self,
+        _request: BackgroundOwnerLogoutRequest,
+    ) -> crate::Result<BackgroundLogoutOwnershipResponse> {
+        self.begin_background_logout()
+    }
+
+    pub async fn provision_background_async(
+        &self,
+        request: BackgroundUiProvisionRequest,
+    ) -> crate::Result<()> {
+        self.provision_background(request)
+    }
+
+    pub async fn background_credential_status_async(
+        &self,
+    ) -> crate::Result<BackgroundCredentialStatusResponse> {
+        self.background_credential_status()
+    }
+
+    pub async fn stop_tunnel_async(&self) -> crate::Result<TunnelOperationResponse> {
+        self.stop_tunnel()
+    }
+
     pub async fn recover_background_session(
         &self,
         _request: BackgroundSessionRecoveryRequest,

@@ -27,11 +27,35 @@ internal data class BackgroundStartResult(
 )
 
 internal data class BackgroundSessionRecoveryResult(
-    val accessToken: String,
-    val refreshToken: String,
+    val responseJson: String,
 ) {
     override fun toString(): String =
-        "BackgroundSessionRecoveryResult(accessToken=<redacted>, refreshToken=<redacted>)"
+        "BackgroundSessionRecoveryResult(response=<redacted>)"
+    companion object {
+        fun fromPayload(payload: JSONObject): BackgroundSessionRecoveryResult {
+            require(payload.getString("access_token").isNotBlank())
+            require(payload.getString("refresh_token").isNotBlank())
+            require(payload.getString("token_type") == "Bearer")
+            require(payload.getLong("access_expires_in") > 0 && payload.getLong("refresh_expires_in") > 0)
+            val device = payload.getJSONObject("device")
+            require(device.getString("id").isNotBlank())
+            require(device.getString("container_version").isNotBlank())
+            require(device.getString("runtime_version").isNotBlank())
+            require(device.getString("runtime_slot") in listOf("stable", "latest"))
+            require(device.getLong("runtime_contract_version") > 0 && device.getLong("session_generation") > 0)
+            return BackgroundSessionRecoveryResult(payload.toString())
+        }
+    }
+}
+
+internal fun backgroundAuthorizationHeaders(credential: BackgroundCredential, authorization: BackgroundAuthorization): Map<String, String> {
+    val headers = mutableMapOf("Authorization" to "${authorization.wireName} ${credential.token}")
+    if (authorization == BackgroundAuthorization.BEARER) {
+        val scope = credential.ownerScope ?: throw BackgroundConnectionException("background_owner_scope_mismatch")
+        if (scope.deviceId != credential.deviceId) throw BackgroundConnectionException("background_owner_scope_mismatch")
+        headers.putAll(scope.identityHeaders())
+    }
+    return headers
 }
 
 internal class BackgroundConnectionException(
@@ -250,6 +274,7 @@ internal data class BackgroundUiProvisionRequest(
     val installSecret: String,
     val installGeneration: Long,
     val capability: BackgroundCapabilitySnapshot,
+    val ownerScope: NativeOwnerScope? = null,
 ) {
     override fun toString(): String =
         "BackgroundUiProvisionRequest(expectedRevision=$expectedRevision, deviceId=$deviceId, panelBase=$panelBase, accessToken=<redacted>, installSecret=<redacted>, installGeneration=$installGeneration, capability=$capability)"
@@ -345,6 +370,7 @@ internal fun provisionBackgroundCredential(
             request.panelBase,
             request.accessToken,
             Long.MAX_VALUE,
+            request.ownerScope,
         ),
         installSecret = request.installSecret,
         nowUnix = nowUnix,
@@ -370,6 +396,48 @@ internal fun provisionBackgroundCredential(
         pendingToken.activationOperationId,
         activation.activeExpiresAtUnix,
     ).provisionEnvelopeOrThrow()
+}
+
+/** Actual owner service mode dispatcher; pending transactions always win. */
+internal fun provisionOwnedBackgroundCredential(
+    store: BackgroundCredentialStore,
+    request: BackgroundUiProvisionRequest,
+    mode: String,
+    nowUnix: Long,
+    provision: (BackgroundUiProvisionRequest) -> BackgroundCredentialEnvelope,
+    rotate: (Long) -> Unit,
+    legacy: (BackgroundCredential) -> BackgroundCredential,
+): BackgroundCredentialEnvelope {
+    var current = store.read().provisionEnvelopeOrThrow()
+    val scope = requireNotNull(current.ownerScope)
+    require(scope == request.ownerScope && scope.deviceId == request.deviceId)
+    var selected = if (current.pending != null || current.reservation != null) "two_phase" else mode
+    if (selected == "noop") return current
+    if (selected == "rotate") {
+        try {
+            rotate(current.revision)
+            return store.read().provisionEnvelopeOrThrow()
+        } catch (_: BackgroundConnectionException) { selected = "two_phase" }
+    }
+    if (selected == "two_phase") {
+        try {
+            current = store.read().provisionEnvelopeOrThrow()
+            return provision(request.copy(expectedRevision = current.revision))
+        } catch (error: BackgroundConnectionException) {
+            current = store.read().provisionEnvelopeOrThrow()
+            if (error.code != "background_credential_capability_unavailable" || current.pending != null ||
+                current.reservation != null || current.capability?.let { it.enabled &&
+                    it.expiresAtUnix > nowUnix } == true) throw error
+            selected = "legacy"
+        }
+    }
+    require(selected == "legacy")
+    current = store.read().provisionEnvelopeOrThrow()
+    if (current.pending != null || current.reservation != null) throw BackgroundConnectionException("background_credential_mutation_in_progress")
+    val credential = legacy(BackgroundCredential(request.deviceId, request.panelBase, request.accessToken, Long.MAX_VALUE, request.ownerScope))
+    require(credential.deviceId == request.deviceId && credential.panelBase == request.panelBase)
+    return store.configure(current.revision, BackgroundCredentialProvision(request.deviceId, request.panelBase,
+        credential.token, credential.expiresAtUnix, request.installSecret, request.installGeneration, request.capability)).provisionEnvelopeOrThrow()
 }
 
 internal data class PreparedBackgroundCredentialState(
@@ -731,7 +799,12 @@ internal class BackgroundOperationClient(
     }
 }
 
-private class UrlConnectionBackgroundApiTransport : BackgroundApiTransport {
+internal class UrlConnectionBackgroundApiTransport(
+    private val openConnection: (java.net.URL) -> HttpsURLConnection = { url ->
+        (url.openConnection() as? HttpsURLConnection)
+            ?: throw BackgroundConnectionException("background_transport_unavailable")
+    },
+) : BackgroundApiTransport {
     override fun execute(
         credential: BackgroundCredential,
         method: String,
@@ -741,17 +814,15 @@ private class UrlConnectionBackgroundApiTransport : BackgroundApiTransport {
     ): JSONObject {
         val base = URI(credential.panelBase)
         val url = base.resolve("/api/client/v1/$endpoint").toURL()
-        val connection = (url.openConnection() as? HttpsURLConnection)
-            ?: throw BackgroundConnectionException("background_transport_unavailable")
+        val connection = openConnection(url)
         return try {
             connection.requestMethod = method
             connection.instanceFollowRedirects = false
             connection.connectTimeout = BACKGROUND_CONNECT_TIMEOUT_MILLIS
             connection.readTimeout = BACKGROUND_READ_TIMEOUT_MILLIS
-            connection.setRequestProperty(
-                "Authorization",
-                "${authorization.wireName} ${credential.token}",
-            )
+            backgroundAuthorizationHeaders(credential, authorization).forEach { (name, value) ->
+                connection.setRequestProperty(name, value)
+            }
             connection.setRequestProperty("Accept", "application/json")
             if (payload != null) {
                 connection.doOutput = true
@@ -1024,10 +1095,15 @@ internal object BackgroundConnectionClient {
             "background/auth/recover",
             backgroundRecoveryPayload(installSecret),
         )
-        return BackgroundSessionRecoveryResult(
-            accessToken = payload.getString("access_token"),
-            refreshToken = payload.getString("refresh_token"),
-        )
+        return BackgroundSessionRecoveryResult.fromPayload(payload)
+    }
+
+    fun legacyTokenWithBearer(credential: BackgroundCredential): BackgroundCredential {
+        val payload = UrlConnectionBackgroundApiTransport().execute(credential, "POST", "background/token", null, BackgroundAuthorization.BEARER)
+        val token = payload.getString("token")
+        val expiresIn = payload.getLong("expires_in")
+        require(token.isNotBlank() && expiresIn > 0)
+        return credential.copy(token = token, expiresAtUnix = Math.addExact(System.currentTimeMillis() / 1_000, expiresIn), ownerScope = null)
     }
 
     fun capabilities(credential: BackgroundCredential): BackgroundCapabilitySnapshot =

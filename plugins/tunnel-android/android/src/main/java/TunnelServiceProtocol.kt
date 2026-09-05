@@ -42,6 +42,10 @@ internal const val EXTRA_CREDENTIAL_REVISION = "credential_revision"
 internal const val EXTRA_INSTALL_SECRET = "install_secret"
 internal const val EXTRA_ACCESS_TOKEN = "access_token"
 internal const val EXTRA_REFRESH_TOKEN = "refresh_token"
+internal const val EXTRA_AUTH_RESPONSE = "auth_response"
+internal const val EXTRA_OWNER_OPERATION = "owner_operation"
+internal const val EXTRA_OWNER_CANCEL_EPOCH = "owner_cancel_epoch"
+internal const val EXTRA_OWNER_PROVISION_MODE = "owner_provision_mode"
 internal const val EXTRA_CAPABILITY_REVISION = "capability_revision"
 internal const val EXTRA_CAPABILITY_ENABLED = "capability_enabled"
 internal const val EXTRA_CAPABILITY_EXPIRES_AT = "capability_expires_at"
@@ -408,6 +412,8 @@ internal object TunnelServiceClient {
             .putExtra(EXTRA_DEVICE_ID, args.deviceId)
             .putExtra(EXTRA_PANEL_BASE, args.panelBase)
             .putExtra(EXTRA_ACCESS_TOKEN, args.accessToken)
+            .putExtra(EXTRA_OWNER_OPERATION, args.ownerOperation)
+            .putExtra(EXTRA_OWNER_PROVISION_MODE, args.mode)
             .putExtra(EXTRA_INSTALL_SECRET, args.installSecret)
             .putExtra(EXTRA_CAPABILITY_REVISION, args.capabilityRevision)
             .putExtra(EXTRA_CAPABILITY_ENABLED, args.capabilityEnabled)
@@ -420,17 +426,18 @@ internal object TunnelServiceClient {
     fun recoverBackgroundSession(
         context: Context,
         installSecret: String,
-        onSuccess: (String, String) -> Unit,
+        ownerOperation: String,
+        onSuccess: (String) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
         Intent(context, NelomaiVpnService::class.java)
             .setAction(NelomaiVpnService.ACTION_RECOVER_BACKGROUND_SESSION)
-            .putExtra(EXTRA_INSTALL_SECRET, installSecret),
+            .putExtra(EXTRA_INSTALL_SECRET, installSecret)
+            .putExtra(EXTRA_OWNER_OPERATION, ownerOperation),
         { result ->
             onSuccess(
-                requireNotNull(result.getString(EXTRA_ACCESS_TOKEN)),
-                requireNotNull(result.getString(EXTRA_REFRESH_TOKEN)),
+                requireNotNull(result.getString(EXTRA_AUTH_RESPONSE)),
             )
         },
         onError,
@@ -451,12 +458,14 @@ internal object TunnelServiceClient {
 
     fun beginBackgroundLogout(
         context: Context,
+        cancelEpoch: Long,
         onSuccess: (BackgroundLogoutOwnership) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
         Intent(context, NelomaiVpnService::class.java)
-            .setAction(NelomaiVpnService.ACTION_BEGIN_BACKGROUND_LOGOUT),
+            .setAction(NelomaiVpnService.ACTION_BEGIN_BACKGROUND_LOGOUT)
+            .putExtra(EXTRA_OWNER_CANCEL_EPOCH, cancelEpoch),
         { result ->
             onSuccess(
                 BackgroundLogoutOwnership.fromWireName(

@@ -106,6 +106,25 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub async fn provision_background_async(
+        &self,
+        request: BackgroundUiProvisionRequest,
+    ) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin_async::<()>("provisionBackground", request)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn background_credential_status_async(
+        &self,
+    ) -> crate::Result<BackgroundCredentialStatusResponse> {
+        self.0
+            .run_mobile_plugin_async("backgroundCredentialStatus", EmptyRequest {})
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn background_credential_status(
         &self,
     ) -> crate::Result<BackgroundCredentialStatusResponse> {
@@ -174,6 +193,16 @@ impl<R: Runtime> TunnelAndroid<R> {
             .map_err(Into::into)
     }
 
+    pub async fn prepare_owner_revocation(
+        &self,
+        request: BackgroundOwnerLogoutRequest,
+    ) -> crate::Result<BackgroundLogoutOwnershipResponse> {
+        self.0
+            .run_mobile_plugin_async("beginBackgroundLogout", request)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn recover_background_session(
         &self,
         request: BackgroundSessionRecoveryRequest,
@@ -216,6 +245,18 @@ impl<R: Runtime> TunnelAndroid<R> {
                     api_version: TUNNEL_API_VERSION,
                 },
             )
+            .map_err(Into::into)
+    }
+
+    pub async fn stop_tunnel_async(&self) -> crate::Result<TunnelOperationResponse> {
+        self.0
+            .run_mobile_plugin_async(
+                "stopTunnel",
+                StopTunnelRequest {
+                    api_version: TUNNEL_API_VERSION,
+                },
+            )
+            .await
             .map_err(Into::into)
     }
 

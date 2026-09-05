@@ -76,6 +76,48 @@ impl<S: RuntimeStateStore> RuntimeAdmission for RuntimeCacheAdmission<S> {
     }
 }
 impl OwnerRuntimeAuth {
+    pub async fn recover_background<F, Fut>(&self, dispatch: F) -> Result<AccessSnapshot, CoreError>
+    where
+        F: FnOnce(crate::NativeAuthRequest) -> Fut,
+        Fut: std::future::Future<
+            Output = Result<nelomai_client_api::TokenResponse, crate::NativeAuthFailure>,
+        >,
+    {
+        self.broker
+            .native_auth(
+                |access| self.check_native_admission(access),
+                |request| async { dispatch(request).await.map(Some) },
+                true,
+            )
+            .await
+            .map_err(map_error)
+    }
+
+    pub async fn provision_background<F, Fut>(&self, dispatch: F) -> Result<(), CoreError>
+    where
+        F: FnOnce(crate::NativeAuthRequest) -> Fut,
+        Fut: std::future::Future<Output = Result<(), crate::NativeAuthFailure>>,
+    {
+        self.broker
+            .native_auth(
+                |access| self.check_native_admission(access),
+                |request| async { dispatch(request).await.map(|()| None) },
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(map_error)
+    }
+
+    fn check_native_admission(&self, access: &AccessSnapshot) -> Result<(), BrokerError> {
+        if RuntimeTarget::from_identity(access.identity()) != self.target {
+            return Err(BrokerError::Cancelled);
+        }
+        self.admission
+            .check(access)
+            .map_err(|_| BrokerError::RecoveryRequired)
+    }
+
     /// Does not enroll, refresh or erase migration credentials. The coordinator
     /// must complete cleanup before runtime operational admission is enabled.
     pub fn new(
@@ -132,6 +174,7 @@ fn map_error(error: BrokerError) -> CoreError {
         BrokerError::Api(error) => CoreError::from(nelomai_client_core::CoreApiError::from(error)),
         BrokerError::Storage(_) => CoreError::Storage,
         BrokerError::AuthenticationOutcomeUnknown => CoreError::AuthenticationOutcomeUnknown,
+        BrokerError::AccessUnavailable => CoreError::AccessExpired,
         BrokerError::RecoveryRequired => CoreError::AuthRecoveryRequired,
         BrokerError::Timeout => CoreError::Api(nelomai_client_core::CoreApiError::Retryable),
     }

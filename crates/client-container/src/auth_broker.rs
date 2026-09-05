@@ -17,6 +17,35 @@ use uuid::Uuid;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Only a trusted container/native adapter receives this request, never runtime IPC.
+pub struct NativeAuthRequest {
+    pub ticket: RecoveryTicketV1,
+    pub access: AccessSnapshot,
+    pub install_secret: String,
+    pub expires_at_unix_ms: u64,
+}
+impl std::fmt::Debug for NativeAuthRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeAuthRequest")
+            .field("ticket", &self.ticket)
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+impl NativeAuthRequest {
+    pub fn operation_json(&self) -> Result<String, BrokerError> {
+        serde_json::to_string(&serde_json::json!({"ticket": self.ticket, "expires_at_unix_ms": self.expires_at_unix_ms}))
+            .map_err(|_| BrokerError::RecoveryRequired)
+    }
+}
+#[derive(Debug)]
+pub enum NativeAuthFailure {
+    /// Exact native/server rejection before auth issuance; no native state is erased.
+    NotIssued,
+    AccessUnavailable,
+    OutcomeUnknown,
+}
+
 #[derive(thiserror::Error)]
 pub enum BrokerError {
     #[error("authentication operation cancelled")]
@@ -29,6 +58,8 @@ pub enum BrokerError {
     Timeout,
     #[error("authentication outcome unknown; explicit reauthentication required")]
     AuthenticationOutcomeUnknown,
+    #[error("application access unavailable")]
+    AccessUnavailable,
     #[error("protected storage failed")]
     Storage(#[from] StorageError),
     // Do not format server-controlled errors or request data into runtime logs.
@@ -67,6 +98,11 @@ pub(crate) struct LoginFence {
 #[async_trait]
 pub trait LocalAuthStop: Send + Sync {
     async fn stop_local(&self) -> Result<(), BrokerError>;
+    /// Owner-only native cleanup handoff, after durable cancellation and before
+    /// revocation HTTP. Must be genuinely asynchronous and preserve late fences.
+    async fn prepare_revocation(&self, _cancel_epoch: u64) -> Result<(), BrokerError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +163,7 @@ impl AuthBroker {
                 authentication_outcome_unknown: false,
                 pending_login_account: None,
                 confirmed_device_id: None,
+                pending_push_cleanup_epoch: None,
             });
             store.save(&auth)?;
         } else if let Some(meta) = &mut auth.broker {
@@ -513,6 +550,9 @@ impl AuthBroker {
         meta.completed_resume = None;
         meta.pending_login_account = None;
         meta.confirmed_device_id = Some(response.device.id);
+        // Only accepted login is proof that the prior delivery intent was
+        // superseded; failed/unknown password attempts retain the cleanup marker.
+        meta.pending_push_cleanup_epoch = None;
         self.store.save(&auth)?;
         Self::snapshot(&auth)
     }
@@ -573,6 +613,7 @@ impl AuthBroker {
         let mut auth = self.fenced(&ticket)?;
         let confirmed = response.device.confirmed_identity()?;
         if Some(&confirmed) != ticket.source_identity.as_ref()
+            || ticket.source_device_id.as_deref() != Some(response.device.id.as_str())
             || response.token_type != "Bearer"
             || response.access_token.is_empty()
             || response.refresh_token.is_empty()
@@ -682,6 +723,68 @@ impl AuthBroker {
         Self::snapshot(&auth)
     }
 
+    /// Host-only, after durable native cleanup handoff; never runtime IPC.
+    pub async fn stage_push_cleanup(&self, epoch: u64) -> Result<(), BrokerError> {
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+        if auth.auth_epoch != epoch
+            || (auth.logout_state != LogoutState::Pending
+                && !(auth.logout_state == LogoutState::LoggedOut
+                    && meta.pending_push_cleanup_epoch == Some(epoch)))
+        {
+            return Err(BrokerError::Cancelled);
+        }
+        meta.pending_push_cleanup_epoch = Some(epoch);
+        self.store.save(&auth)?;
+        Ok(())
+    }
+
+    pub async fn pending_push_cleanup(&self) -> Result<Option<u64>, BrokerError> {
+        let _state = self.state.lock().await;
+        Ok(self
+            .load()?
+            .broker
+            .ok_or(BrokerError::RecoveryRequired)?
+            .pending_push_cleanup_epoch)
+    }
+
+    pub async fn push_cleanup_is_current(&self, epoch: u64) -> Result<bool, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        Ok(auth.auth_epoch == epoch
+            && matches!(
+                auth.logout_state,
+                LogoutState::Pending | LogoutState::LoggedOut
+            )
+            && auth
+                .broker
+                .as_ref()
+                .and_then(|meta| meta.pending_push_cleanup_epoch)
+                == Some(epoch))
+    }
+
+    pub async fn finish_push_cleanup(&self, epoch: u64) -> Result<(), BrokerError> {
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+        if meta.pending_push_cleanup_epoch.is_none() {
+            return Ok(());
+        }
+        if auth.auth_epoch != epoch
+            || !matches!(
+                auth.logout_state,
+                LogoutState::Pending | LogoutState::LoggedOut
+            )
+            || meta.pending_push_cleanup_epoch != Some(epoch)
+        {
+            return Err(BrokerError::Cancelled);
+        }
+        meta.pending_push_cleanup_epoch = None;
+        self.store.save(&auth)?;
+        Ok(())
+    }
+
     pub async fn logout(&self) -> Result<(), BrokerError> {
         // Deliberately never acquire issuance: a hung refresh/resume cannot
         // delay the durable cancellation fence, local stop, or family revocation.
@@ -695,9 +798,27 @@ impl AuthBroker {
                     .auth_epoch
                     .checked_add(1)
                     .ok_or(BrokerError::RecoveryRequired)?;
+                let epoch = auth.auth_epoch;
+                let pending_push = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+                let retry_push = pending_push.pending_push_cleanup_epoch.is_some();
+                if retry_push {
+                    // Repeated cancellation supersedes queued login, not the
+                    // still-unfinished push cleanup of this logged-out owner.
+                    pending_push.pending_push_cleanup_epoch = Some(epoch);
+                }
                 self.store.save(&auth)?;
                 drop(_state);
-                return self.stop.stop_local().await;
+                if retry_push {
+                    let (stop, handoff) = tokio::join!(
+                        tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local()),
+                        tokio::time::timeout(REQUEST_TIMEOUT, self.stop.prepare_revocation(epoch))
+                    );
+                    handoff.map_err(|_| BrokerError::Timeout)??;
+                    return stop.map_err(|_| BrokerError::Timeout)?;
+                }
+                return tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local())
+                    .await
+                    .map_err(|_| BrokerError::Timeout)?;
             }
             if auth.logout_state == LogoutState::Active {
                 let never_authenticated = auth.confirmed_identity.is_none()
@@ -745,7 +866,12 @@ impl AuthBroker {
             )
         };
         let Some(proof) = proof else {
-            self.stop.stop_local().await?;
+            let (stop, handoff) = tokio::join!(
+                tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local()),
+                tokio::time::timeout(REQUEST_TIMEOUT, self.stop.prepare_revocation(epoch))
+            );
+            stop.map_err(|_| BrokerError::Timeout)??;
+            handoff.map_err(|_| BrokerError::Timeout)??;
             return Err(BrokerError::AuthenticationOutcomeUnknown);
         };
         let request = RuntimeLogoutRequest {
@@ -755,9 +881,18 @@ impl AuthBroker {
         // Initiate both immediately; physical stop failure must not suppress
         // revocation, and a slow remote server must not delay the stop attempt.
         let (stop, response) = tokio::join!(
-            self.stop.stop_local(),
-            tokio::time::timeout(REQUEST_TIMEOUT, self.api.logout_runtime(&request))
+            tokio::time::timeout(REQUEST_TIMEOUT, self.stop.stop_local()),
+            tokio::time::timeout(REQUEST_TIMEOUT, async {
+                self.stop.prepare_revocation(epoch).await?;
+                self.api
+                    .logout_runtime(&request)
+                    .await
+                    .map_err(BrokerError::from)
+            })
         );
+        let stop = stop
+            .map_err(|_| BrokerError::Timeout)
+            .and_then(|result| result);
         let response = response.map_err(|_| BrokerError::Timeout)??;
         if !matches!(
             response.code.as_str(),
@@ -767,6 +902,11 @@ impl AuthBroker {
         }
         let _state = self.state.lock().await;
         let mut auth = self.load()?;
+        if auth.auth_epoch == epoch && auth.logout_state == LogoutState::LoggedOut {
+            // Another caller completed this same pending revocation. Keep its
+            // durable result; this caller still reports its own stop outcome.
+            return stop;
+        }
         if auth.auth_epoch != epoch
             || auth.logout_state != LogoutState::Pending
             || auth.broker.as_ref().and_then(|m| m.pending_logout.as_ref()) != Some(&proof)
@@ -791,7 +931,11 @@ impl AuthBroker {
         let _issuance = self.issuance.lock().await;
         let _state = self.state.lock().await;
         let mut auth = self.load()?;
-        Self::active(&auth)?;
+        self.begin_native_locked(&mut auth)
+    }
+
+    fn begin_native_locked(&self, auth: &mut AuthStoreV1) -> Result<RecoveryTicketV1, BrokerError> {
+        Self::active(auth)?;
         let identity = auth
             .confirmed_identity
             .clone()
@@ -814,10 +958,100 @@ impl AuthBroker {
             attempt: meta.next_attempt,
             family: meta.family.clone(),
             identity,
+            device_id: Some(
+                meta.confirmed_device_id
+                    .clone()
+                    .ok_or(BrokerError::RecoveryRequired)?,
+            ),
         };
         meta.pending_recovery = Some(ticket.clone());
-        self.store.save(&auth)?;
+        self.store.save(auth)?;
         Ok(ticket)
+    }
+
+    /// One owner budget includes issuance wait and native dispatch. The native
+    /// request carries the same deadline so a late executor cannot persist writes.
+    pub(crate) async fn native_auth<C, F, Fut>(
+        &self,
+        check_admission: C,
+        dispatch: F,
+        recover: bool,
+    ) -> Result<AccessSnapshot, BrokerError>
+    where
+        C: FnOnce(&AccessSnapshot) -> Result<(), BrokerError>,
+        F: FnOnce(NativeAuthRequest) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<TokenResponse>, NativeAuthFailure>>,
+    {
+        let fence = self.capture_login_fence().await?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| BrokerError::RecoveryRequired)?
+            .as_millis()
+            .saturating_add(10_000);
+        tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let _issuance = self.issuance.lock().await;
+            let request = {
+                let _state = self.state.lock().await;
+                let mut auth = self.load()?;
+                if auth.auth_epoch != fence.epoch
+                    || auth.broker.as_ref().map(|m| m.family.as_str())
+                        != Some(fence.family.as_str())
+                {
+                    return Err(BrokerError::Cancelled);
+                }
+                let access = Self::snapshot(&auth)?;
+                check_admission(&access)?;
+                if !recover && Self::observed_state(&auth)? != BrokerAuthState::Active {
+                    return Err(BrokerError::RecoveryRequired);
+                }
+                let ticket = self.begin_native_locked(&mut auth)?;
+                NativeAuthRequest {
+                    ticket,
+                    access,
+                    install_secret: auth.install_secret,
+                    expires_at_unix_ms: u64::try_from(deadline)
+                        .map_err(|_| BrokerError::RecoveryRequired)?,
+                }
+            };
+            let ticket = request.ticket.clone();
+            let response = dispatch(request).await;
+            match response {
+                Ok(Some(response)) if recover => {
+                    self.accept_background_recovery(&ticket, response).await
+                }
+                other => {
+                    let _state = self.state.lock().await;
+                    let mut auth = self.load()?;
+                    Self::active(&auth)?;
+                    let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
+                    if meta.pending_recovery.as_ref() != Some(&ticket)
+                        || auth.auth_epoch != ticket.auth_epoch
+                        || meta.family != ticket.family
+                        || meta.next_attempt != ticket.attempt
+                    {
+                        return Err(BrokerError::Cancelled);
+                    }
+                    if !recover
+                        || matches!(
+                            other,
+                            Err(NativeAuthFailure::NotIssued | NativeAuthFailure::AccessUnavailable)
+                        )
+                    {
+                        meta.pending_recovery = None;
+                        self.store.save(&auth)?;
+                    }
+                    if matches!(other, Err(NativeAuthFailure::AccessUnavailable)) {
+                        Err(BrokerError::AccessUnavailable)
+                    } else if !recover && matches!(other, Ok(None)) {
+                        Self::snapshot(&auth)
+                    } else {
+                        Err(BrokerError::RecoveryRequired)
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| BrokerError::Timeout)?
     }
 
     /// Owner callback ingress, not runtime IPC. No network request is made with
@@ -836,10 +1070,13 @@ impl AuthBroker {
             || meta.family != ticket.family
             || auth.auth_epoch != ticket.auth_epoch
             || auth.confirmed_identity.as_ref() != Some(&ticket.identity)
+            || ticket.device_id.is_none()
+            || meta.confirmed_device_id != ticket.device_id
         {
             return Err(BrokerError::Cancelled);
         }
         if response.device.confirmed_identity()? != ticket.identity
+            || Some(response.device.id.as_str()) != ticket.device_id.as_deref()
             || response.token_type != "Bearer"
             || response.access_token.is_empty()
             || response.refresh_token.is_empty()

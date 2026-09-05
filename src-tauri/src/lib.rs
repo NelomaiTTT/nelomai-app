@@ -87,39 +87,113 @@ impl PushRegistrationScheduler {
         application: &NativeApplication,
     ) {
         let _guard = self.gate.lock().await;
+        #[cfg(target_os = "android")]
+        if replay_push_cleanup(app).await.is_err() {
+            return;
+        }
         register_android_push(app, application).await;
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(any(target_os = "android", test))]
+    async fn cleanup_push<F>(
+        &self,
+        broker: &AuthBroker,
+        epoch: u64,
+        disable: F,
+    ) -> Result<bool, nelomai_client_container::BrokerError>
+    where
+        F: std::future::Future<Output = Result<(), nelomai_client_container::BrokerError>>,
+    {
+        let _guard = self.gate.lock().await;
+        Self::cleanup_push_locked(broker, epoch, disable).await
+    }
+
+    /// Caller retains the push gate through native completion.
+    #[cfg(any(target_os = "android", test))]
+    async fn cleanup_push_locked<F>(
+        broker: &AuthBroker,
+        epoch: u64,
+        disable: F,
+    ) -> Result<bool, nelomai_client_container::BrokerError>
+    where
+        F: std::future::Future<Output = Result<(), nelomai_client_container::BrokerError>>,
+    {
+        if !broker.push_cleanup_is_current(epoch).await? {
+            return Ok(false);
+        }
+        // Completion owns the gate, even when the caller no longer waits. A
+        // newer prepare/confirm cannot overtake an in-flight native disable.
+        disable.await?;
+        broker.finish_push_cleanup(epoch).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn register_token(
+        &self,
+        app: &tauri::AppHandle,
+        application: &NativeApplication,
+        token: &str,
+    ) -> Result<(), ApplicationError> {
+        let _guard = self.gate.lock().await;
+        #[cfg(target_os = "android")]
+        {
+            replay_push_cleanup(app).await.map_err(|_| {
+                ApplicationError::Core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            })?;
+            let scope = application.current_access_token().await?;
+            application.register_push_token(token).await?;
+            check_push_scope(application, &scope).await?;
+            use tauri_plugin_push_android::PushAndroidExt;
+            app.push_android().confirm_async(token).await.map_err(|_| {
+                ApplicationError::Core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            })
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = app;
+            application.register_push_token(token).await
+        }
+    }
+
     pub(crate) async fn logout<F>(&self, owner_logout: F) -> Result<(), ApplicationError>
     where
         F: std::future::Future<Output = Result<(), ApplicationError>>,
     {
-        // Cancellation must not queue behind an old push HTTP request. Android
-        // native authority handoff uses its separate owner bridge.
+        // Never acquire the registration gate before owner cancellation.
         owner_logout.await
     }
+}
 
-    #[cfg(target_os = "android")]
-    pub(crate) async fn logout_remote(
-        &self,
-        application: &NativeApplication,
-    ) -> Result<(), ApplicationError> {
-        let _guard = self.gate.lock().await;
-        application.logout_remote().await
+#[cfg(target_os = "android")]
+struct AndroidOwnerStop {
+    app: tauri::AppHandle,
+    local: Arc<CoreLocalStop<platform::PlatformTunnelController>>,
+}
+#[cfg(target_os = "android")]
+#[async_trait::async_trait]
+impl nelomai_client_container::LocalAuthStop for AndroidOwnerStop {
+    async fn stop_local(&self) -> Result<(), nelomai_client_container::BrokerError> {
+        nelomai_client_container::LocalAuthStop::stop_local(self.local.as_ref()).await
     }
-
-    #[cfg(target_os = "android")]
-    pub(crate) async fn logout_local(
+    async fn prepare_revocation(
         &self,
-        app: &tauri::AppHandle,
-        application: &NativeApplication,
-    ) -> Result<(), ApplicationError> {
-        let _guard = self.gate.lock().await;
-        use tauri_plugin_push_android::PushAndroidExt;
-
-        let _ = app.push_android().disable();
-        application.logout_local().await
+        cancel_epoch: u64,
+    ) -> Result<(), nelomai_client_container::BrokerError> {
+        use tauri_plugin_tunnel_android::TunnelAndroidExt;
+        // This is a genuine asynchronous mobile callback, not a blocking wait
+        // wrapped in an async function. Native keeps cleanup proofs until ACK.
+        self.app
+            .tunnel_android()
+            .prepare_owner_revocation(tauri_plugin_tunnel_android::BackgroundOwnerLogoutRequest {
+                cancel_epoch,
+            })
+            .await
+            .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)?;
+        use tauri::Manager;
+        let broker = self.app.state::<Arc<AuthBroker>>().inner().clone();
+        broker.stage_push_cleanup(cancel_epoch).await?;
+        enqueue_push_cleanup(self.app.clone(), cancel_epoch);
+        Ok(())
     }
 }
 
@@ -201,10 +275,17 @@ pub fn run() {
             &app_data_directory.join("preferences.json"),
         )?);
         let local = CoreLocalStop::new(tunnel.clone());
+        #[cfg(target_os = "android")]
+        let owner_stop = Arc::new(AndroidOwnerStop {
+            app: app.handle().clone(),
+            local: local.clone(),
+        });
+        #[cfg(not(target_os = "android"))]
+        let owner_stop = local.clone();
         let broker = Arc::new(AuthBroker::new(
             api.clone(),
             Arc::new(storage.auth),
-            local.clone(),
+            owner_stop,
         )?);
         // Migration/full-writer ownership is consumed here; only the paired
         // field-merge views and narrow admission control survive into runtime.
@@ -1476,6 +1557,9 @@ fn start_push_registration_scheduler(
     scheduler: Arc<PushRegistrationScheduler>,
 ) {
     tauri::async_runtime::spawn(async move {
+        // Replay a durable logout push marker on process startup, before any
+        // new prepare. Periodic attempts also retain/retry it on native failure.
+        scheduler.synchronize(&app, &application).await;
         let mut interval = tokio::time::interval(PUSH_REGISTRATION_INTERVAL);
         interval.tick().await;
         loop {
@@ -1486,13 +1570,76 @@ fn start_push_registration_scheduler(
 }
 
 #[cfg(target_os = "android")]
+fn enqueue_push_cleanup(app: tauri::AppHandle, epoch: u64) {
+    use tauri::Manager;
+    use tauri_plugin_push_android::PushAndroidExt;
+    tauri::async_runtime::spawn(async move {
+        let broker = app.state::<Arc<AuthBroker>>().inner().clone();
+        let scheduler = app
+            .state::<Arc<PushRegistrationScheduler>>()
+            .inner()
+            .clone();
+        // No request timeout drops this completion owner or releases its gate.
+        // Failure deliberately leaves the protected marker for startup replay.
+        let _ = scheduler
+            .cleanup_push(&broker, epoch, async {
+                app.push_android()
+                    .disable_async()
+                    .await
+                    .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)
+            })
+            .await;
+    });
+}
+
+/// Called only while the push scheduler gate is held.
+#[cfg(target_os = "android")]
+async fn replay_push_cleanup(
+    app: &tauri::AppHandle,
+) -> Result<(), nelomai_client_container::BrokerError> {
+    use tauri::Manager;
+    use tauri_plugin_push_android::PushAndroidExt;
+    let broker = app.state::<Arc<AuthBroker>>().inner().clone();
+    if let Some(epoch) = broker.pending_push_cleanup().await? {
+        PushRegistrationScheduler::cleanup_push_locked(&broker, epoch, async {
+            app.push_android()
+                .disable_async()
+                .await
+                .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+async fn check_push_scope(
+    application: &NativeApplication,
+    scope: &nelomai_client_api::AccessSnapshot,
+) -> Result<(), ApplicationError> {
+    let current = application.current_access_token().await?;
+    if current.auth_epoch() != scope.auth_epoch()
+        || current.family() != scope.family()
+        || current.identity() != scope.identity()
+    {
+        return Err(ApplicationError::Core(
+            nelomai_client_core::CoreError::StartCancelled,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
 async fn register_android_push(app: &tauri::AppHandle, application: &NativeApplication) {
     use tauri_plugin_push_android::PushAndroidExt;
 
-    if application.current_access_token().await.is_err() {
+    let Ok(scope) = application.current_access_token().await else {
         return;
-    }
-    if let Ok(response) = app.push_android().prepare() {
+    };
+    if let Ok(response) = app.push_android().prepare_async().await {
+        if check_push_scope(application, &scope).await.is_err() {
+            return;
+        }
         if !response.permission_granted {
             let _ = application.unregister_push_token().await;
         } else if !response.token.trim().is_empty()
@@ -1500,8 +1647,9 @@ async fn register_android_push(app: &tauri::AppHandle, application: &NativeAppli
                 .register_push_token(&response.token)
                 .await
                 .is_ok()
+            && check_push_scope(application, &scope).await.is_ok()
         {
-            let _ = app.push_android().confirm(&response.token);
+            let _ = app.push_android().confirm_async(&response.token).await;
         }
     }
 }
@@ -1534,6 +1682,184 @@ fn connection_metrics_poll_required(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct PushAuthMemory(std::sync::Mutex<Option<nelomai_client_storage::AuthStoreV1>>);
+    impl nelomai_client_storage::AuthStore for PushAuthMemory {
+        fn load(
+            &self,
+        ) -> Result<Option<nelomai_client_storage::AuthStoreV1>, nelomai_client_storage::StorageError>
+        {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn save(
+            &self,
+            value: &nelomai_client_storage::AuthStoreV1,
+        ) -> Result<(), nelomai_client_storage::StorageError> {
+            *self.0.lock().unwrap() = Some(value.clone());
+            Ok(())
+        }
+    }
+    struct PushStop;
+    #[async_trait::async_trait]
+    impl nelomai_client_container::LocalAuthStop for PushStop {
+        async fn stop_local(&self) -> Result<(), nelomai_client_container::BrokerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_push_cleanup_skips_after_real_owner_login_and_holds_gate_until_completion() {
+        use nelomai_client_storage::{AuthStore, AuthStoreV1, LogoutState, StoredAuth};
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    assert!(header.len() < 16384);
+                }
+                let header = String::from_utf8(header).unwrap();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                stream.read_exact(&mut vec![0; length]).unwrap();
+                let body = if header.starts_with("POST /api/client/v1/auth/login ") {
+                    r#"{"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"synthetic-access","access_expires_in":900,"refresh_token":"synthetic-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"test","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"latest","session_generation":8}}"#
+                } else {
+                    r#"{"code":"already_inactive","cleanup_reconcile_operation_id":"synthetic"}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let store = Arc::new(PushAuthMemory::default());
+        let mut auth = AuthStoreV1::from_legacy(&StoredAuth::new_install());
+        auth.auth_epoch = 1;
+        auth.logout_state = LogoutState::Active;
+        auth.refresh_token = Some("synthetic-refresh".into());
+        store.save(&auth).unwrap();
+        let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(PushStop)).unwrap());
+        // Synthetic saved handoff state, then the actual owner completes HTTP logout.
+        let mut handoff = store.load().unwrap().unwrap();
+        handoff.logout_state = LogoutState::Pending;
+        handoff.broker.as_mut().unwrap().pending_logout =
+            Some(nelomai_client_storage::PendingLogoutV1 {
+                operation_id: "synthetic-logout".into(),
+                refresh_proof: "synthetic-refresh".into(),
+            });
+        store.save(&handoff).unwrap();
+        broker.stage_push_cleanup(1).await.unwrap();
+        let scheduler = Arc::new(PushRegistrationScheduler::new());
+        let busy = scheduler.gate.lock().await;
+        let disables = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let scheduler = scheduler.clone();
+            let broker = broker.clone();
+            let disables = disables.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .cleanup_push(&broker, 1, async {
+                        disables.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        broker.logout().await.unwrap();
+        broker
+            .login(
+                &nelomai_client_api::LoginRequest {
+                    login: "synthetic".into(),
+                    password: "synthetic".into(),
+                    install_secret: "ignored".into(),
+                    device_name: "test".into(),
+                    platform: nelomai_contracts::Platform::Macos,
+                    platform_version: None,
+                    architecture: "aarch64".into(),
+                    app_version: "0.2.16".into(),
+                },
+                &nelomai_client_api::RuntimeTarget {
+                    container_version: "0.2.16".into(),
+                    runtime_version: "0.2.16".into(),
+                    runtime_contract_version: 1,
+                    runtime_slot: nelomai_contracts::RuntimeSlot::Latest,
+                },
+            )
+            .await
+            .unwrap();
+        drop(busy);
+        assert!(!task.await.unwrap().unwrap());
+        assert_eq!(disables.load(Ordering::SeqCst), 0);
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+        server.join().unwrap();
+
+        let mut pending = store.load().unwrap().unwrap();
+        pending.logout_state = LogoutState::Pending;
+        let epoch = pending.auth_epoch;
+        store.save(&pending).unwrap();
+        broker.stage_push_cleanup(epoch).await.unwrap();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, completion) = tokio::sync::oneshot::channel();
+        let task = {
+            let scheduler = scheduler.clone();
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .cleanup_push(&broker, epoch, async {
+                        entered.send(()).unwrap();
+                        completion.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        seen.await.unwrap();
+        assert!(
+            scheduler.gate.try_lock().is_err(),
+            "new prepare cannot overtake a native disable still executing"
+        );
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(epoch));
+        release.send(()).unwrap();
+        assert!(task.await.unwrap().unwrap());
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+        broker.stage_push_cleanup(epoch).await.unwrap();
+        assert!(scheduler
+            .cleanup_push(&broker, epoch, async {
+                Err(nelomai_client_container::BrokerError::Timeout)
+            })
+            .await
+            .is_err());
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(epoch));
+        drop(broker);
+        drop(scheduler);
+        let reopened = AuthBroker::new(
+            ClientApi::new("http://127.0.0.1:1").unwrap(),
+            store,
+            Arc::new(PushStop),
+        )
+        .unwrap();
+        let restarted = PushRegistrationScheduler::new();
+        let gate = restarted.gate.lock().await;
+        let replay = reopened.pending_push_cleanup().await.unwrap().unwrap();
+        assert!(
+            PushRegistrationScheduler::cleanup_push_locked(&reopened, replay, async { Ok(()) })
+                .await
+                .unwrap()
+        );
+        assert_eq!(reopened.pending_push_cleanup().await.unwrap(), None);
+        drop(gate);
+    }
 
     #[cfg(not(target_os = "android"))]
     #[tokio::test]

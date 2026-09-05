@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_tunnel_android::TunnelAndroidExt;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 static ANDROID_BACKGROUND_PROVISION_GATE: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
@@ -718,23 +718,6 @@ const ANDROID_QUICK_RECONCILE_RETRY_SECONDS: i64 = 15;
 const STARTUP_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[cfg(any(target_os = "android", test))]
-fn should_attempt_android_background_recovery(
-    error: &ApplicationError,
-    background_configured: bool,
-) -> bool {
-    background_configured && matches!(error, ApplicationError::Core(CoreError::SignedOut))
-}
-
-#[cfg(any(target_os = "android", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AndroidBackgroundRecoveryFailure {
-    AccessExpired,
-    ClearAndFallbackRefresh,
-    FallbackRefresh,
-    Retryable,
-}
-
-#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AndroidBackgroundProvisionMode {
     Noop,
@@ -828,57 +811,6 @@ fn android_background_provision_mode(
     }
 }
 
-#[cfg(any(target_os = "android", test))]
-fn android_background_rotation_fallback() -> Option<AndroidBackgroundProvisionMode> {
-    Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase)
-}
-
-#[cfg(any(target_os = "android", test))]
-fn android_background_legacy_fallback_after_ui_failure(
-    failure_code: Option<&str>,
-    latest_status: &tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse,
-    now: i64,
-) -> bool {
-    if latest_status.mutation_pending {
-        return false;
-    }
-    let latest_capability_unavailable = !latest_status.capability_enabled
-        || latest_status
-            .capability_expires_at_unix
-            .is_none_or(|expires_at| expires_at <= now);
-    failure_code == Some("background_credential_capability_unavailable")
-        && latest_capability_unavailable
-}
-
-#[cfg(target_os = "android")]
-struct AndroidBackgroundProvisionFailure {
-    command_error: CommandError,
-    rejection_code: Option<String>,
-}
-
-#[cfg(any(target_os = "android", test))]
-fn classify_android_background_recovery_error(code: &str) -> AndroidBackgroundRecoveryFailure {
-    match code {
-        "invalid_background_token" | "invalid_background_recovery" => {
-            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh
-        }
-        "activation_not_applied" | "background_recovery_unsupported" => {
-            AndroidBackgroundRecoveryFailure::FallbackRefresh
-        }
-        "app_access_unavailable" => AndroidBackgroundRecoveryFailure::AccessExpired,
-        _ => AndroidBackgroundRecoveryFailure::Retryable,
-    }
-}
-
-#[cfg(any(target_os = "android", test))]
-async fn await_detached_on_cancellation<F, T>(future: F) -> Result<T, tokio::task::JoinError>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::spawn(future).await
-}
-
 async fn bootstrap_application_for_startup(
     app: &AppHandle,
     application: &NativeApplication,
@@ -891,98 +823,78 @@ async fn bootstrap_application_for_startup(
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
-        if !matches!(first_error, ApplicationError::Core(CoreError::SignedOut)) {
-            return Err(first_error.into());
-        }
-        let background_configured = app
-            .tunnel_android()
-            .background_credential_status()
-            .map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
-                    "Не удалось проверить сохранённую сессию. Повторите запуск приложения",
-                )
-            })?
-            .configured;
-        if !should_attempt_android_background_recovery(&first_error, background_configured) {
-            return application.bootstrap(now_unix).await.map_err(Into::into);
-        }
-
         diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
-        let install_secret = application.install_secret().map_err(CommandError::from)?;
-        let recovery_app = app.clone();
-        let recovered = await_detached_on_cancellation(async move {
-            recovery_app
+        // Eligibility comes from the owner and exact runtime admission, not the
+        // presentation error. No error callback clears native protected state.
+        let owner = app.state::<Arc<nelomai_client_container::OwnerRuntimeAuth>>();
+        let recovery = owner.recover_background(|request| async move {
+            use nelomai_client_container::NativeAuthFailure;
+            let operation = request
+                .operation_json()
+                .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
+            let result = app
                 .tunnel_android()
                 .recover_background_session(
                     tauri_plugin_tunnel_android::BackgroundSessionRecoveryRequest {
-                        install_secret,
+                        install_secret: request.install_secret,
+                        owner_operation: operation,
                     },
                 )
                 .await
-        })
+                .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
+            if let Some(code) = result.error_code.as_deref() {
+                return Err(match code {
+                    "invalid_background_token"
+                    | "invalid_background_recovery"
+                    | "activation_not_applied"
+                    | "background_recovery_unsupported"
+                    | "background_owner_scope_mismatch"
+                    | "background_credential_unavailable" => NativeAuthFailure::NotIssued,
+                    "app_access_unavailable" => NativeAuthFailure::AccessUnavailable,
+                    _ => NativeAuthFailure::OutcomeUnknown,
+                });
+            }
+            serde_json::from_str(
+                result
+                    .response_json
+                    .as_deref()
+                    .ok_or(NativeAuthFailure::OutcomeUnknown)?,
+            )
+            .map_err(|_| NativeAuthFailure::OutcomeUnknown)
+        });
+        // Only a known-not-issued recovery clears its own ticket. A genuinely
+        // lost refresh/recovery stays fenced, so this cannot retry its old proof.
+        route_android_startup_recovery(
+            first_error,
+            async { recovery.await.map(|_| ()) },
+            application.bootstrap(now_unix),
+        )
         .await
-        .map_err(|_| {
-            CommandError::new(
-                "session_recovery_failed",
-                "Не удалось завершить восстановление сессии. Повторите запуск приложения",
-            )
-        })?
-        .map_err(|_| {
-            CommandError::new(
-                "session_recovery_failed",
-                "Не удалось восстановить сессию. Проверьте сеть и повторите запуск приложения",
-            )
-        })?;
-        if let Some(code) = recovered.error_code.as_deref() {
-            return match classify_android_background_recovery_error(code) {
-                AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh => {
-                    app.tunnel_android().clear_background().map_err(|_| {
-                        CommandError::new(
-                            "background_storage_unavailable",
-                            "Не удалось очистить недействительную сессию. Повторите запуск приложения",
-                        )
-                    })?;
-                    application.bootstrap(now_unix).await.map_err(Into::into)
-                }
-                AndroidBackgroundRecoveryFailure::FallbackRefresh => {
-                    application.bootstrap(now_unix).await.map_err(Into::into)
-                }
-                AndroidBackgroundRecoveryFailure::AccessExpired => {
-                    Err(CommandError::from_core(CoreError::AccessExpired))
-                }
-                AndroidBackgroundRecoveryFailure::Retryable => Err(CommandError::new(
-                    code,
-                    "Не удалось восстановить сессию. Проверьте сеть и повторите запуск приложения",
-                )),
-            };
-        }
-        let access_token = recovered.access_token.as_deref().ok_or_else(|| {
-            CommandError::new(
-                "invalid_background_recovery_response",
-                "Панель вернула неполный ответ. Повторите запуск приложения",
-            )
-        })?;
-        let refresh_token = recovered.refresh_token.as_deref().ok_or_else(|| {
-            CommandError::new(
-                "invalid_background_recovery_response",
-                "Панель вернула неполный ответ. Повторите запуск приложения",
-            )
-        })?;
-        application
-            .replace_session_tokens(access_token, refresh_token)
-            .await
-            .map_err(CommandError::from)?;
-        diagnostics.record_named("startup.auth_recovery.completed", None, None, None);
-        application
-            .bootstrap_without_refresh(now_unix)
-            .await
-            .map_err(Into::into)
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = (app, diagnostics);
         application.bootstrap(now_unix).await.map_err(Into::into)
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_startup_recovery<T>(
+    first_error: ApplicationError,
+    recovery: impl std::future::Future<Output = Result<(), CoreError>>,
+    ordinary_bootstrap: impl std::future::Future<Output = Result<T, ApplicationError>>,
+) -> Result<T, CommandError> {
+    if !matches!(
+        first_error,
+        ApplicationError::Core(CoreError::SignedOut | CoreError::AuthRecoveryRequired)
+    ) {
+        return Err(first_error.into());
+    }
+    match recovery.await {
+        Ok(()) | Err(CoreError::AuthRecoveryRequired) => {
+            ordinary_bootstrap.await.map_err(Into::into)
+        }
+        Err(error) => Err(CommandError::from_core(error)),
     }
 }
 
@@ -1664,28 +1576,13 @@ where
 }
 
 #[cfg(any(target_os = "android", test))]
-async fn route_android_logout<B, L, LFut, R, RFut>(
-    begin_native_logout: B,
-    local_sign_out: L,
-    legacy_remote_logout: R,
-) -> Result<(), CommandError>
-where
-    B: FnOnce() -> Result<
-        tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse,
-        CommandError,
-    >,
-    L: FnOnce() -> LFut,
-    LFut: std::future::Future<Output = Result<(), CommandError>>,
-    R: FnOnce() -> RFut,
-    RFut: std::future::Future<Output = Result<(), CommandError>>,
-{
-    let ownership = begin_native_logout()?;
-    if ownership.ownership == tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned {
-        legacy_remote_logout().await?;
-    }
-    local_sign_out().await
+async fn route_android_logout<E>(
+    owner_logout: impl std::future::Future<Output = Result<(), E>>,
+) -> Result<(), E> {
+    // The broker owns stop/native-handoff/HTTP ordering. Neither the native
+    // ownership response nor a scheduler can replace its durable result.
+    owner_logout.await
 }
-
 #[cfg(any(target_os = "android", test))]
 fn android_start_acknowledgement_is_durable(
     acknowledged: &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse,
@@ -2452,147 +2349,57 @@ async fn provision_android_background(
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     {
-        let now = now_unix();
-        let mut status = app
-            .tunnel_android()
-            .background_credential_status()
-            .map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
-                    "Не удалось проверить фоновое подключение",
-                )
-            })?;
-        let desired_capability = android_background_capability_snapshot(capability, now);
-        let provision_with_ui_authentication =
-            |expected_revision: i64| -> Result<(), AndroidBackgroundProvisionFailure> {
-                let access_token = application.current_access_token().map_err(|error| {
-                    AndroidBackgroundProvisionFailure {
-                        command_error: CommandError::from(error),
-                        rejection_code: None,
-                    }
-                })?;
-                let install_secret = application.install_secret().map_err(|error| {
-                    AndroidBackgroundProvisionFailure {
-                        command_error: CommandError::from(error),
-                        rejection_code: None,
-                    }
-                })?;
-                let result = app.tunnel_android().provision_background(
-                    tauri_plugin_tunnel_android::BackgroundUiProvisionRequest {
-                        api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
-                        expected_revision,
-                        device_id: device_id.to_string(),
-                        panel_base: crate::PANEL_BASE.to_string(),
-                        access_token,
-                        install_secret,
-                        capability_revision: desired_capability.revision,
-                        capability_enabled: desired_capability.enabled,
-                        capability_expires_at: desired_capability.expires_at.clone(),
-                    },
-                );
-                result.map_err(|error| AndroidBackgroundProvisionFailure {
-                    rejection_code: error.rejection_code().map(str::to_owned),
-                    command_error: CommandError::new(
-                        "background_credential_provision_failed",
-                        "Не удалось безопасно подготовить фоновое подключение",
-                    ),
-                })
-            };
-        let legacy_status_after_ui_failure =
-            |failure: AndroidBackgroundProvisionFailure| -> Result<_, CommandError> {
-                let latest_status = app
+        let _ = application;
+        let desired = android_background_capability_snapshot(capability, now_unix());
+        let owner = app.state::<Arc<nelomai_client_container::OwnerRuntimeAuth>>();
+        owner
+            .provision_background(|request| async move {
+                use nelomai_client_container::NativeAuthFailure;
+                if request.ticket.device_id.as_deref() != Some(device_id) {
+                    return Err(NativeAuthFailure::NotIssued);
+                }
+                let operation = request
+                    .operation_json()
+                    .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
+                let status = app
                     .tunnel_android()
-                    .background_credential_status()
-                    .map_err(|_| {
-                        CommandError::new(
-                            "background_storage_unavailable",
-                            "Не удалось повторно проверить фоновое подключение",
-                        )
-                    })?;
-                if android_background_legacy_fallback_after_ui_failure(
-                    failure.rejection_code.as_deref(),
-                    &latest_status,
-                    now,
+                    .background_credential_status_async()
+                    .await
+                    .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
+                let mode = match android_background_provision_mode(
+                    &status,
+                    device_id,
+                    &desired,
+                    now_unix(),
                 ) {
-                    Ok(latest_status)
-                } else {
-                    Err(failure.command_error)
-                }
-            };
-        match android_background_provision_mode(&status, device_id, &desired_capability, now) {
-            AndroidBackgroundProvisionMode::Noop => return Ok(()),
-            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase => {
-                let failure = match provision_with_ui_authentication(status.credential_revision) {
-                    Ok(()) => return Ok(()),
-                    Err(failure) => failure,
+                    AndroidBackgroundProvisionMode::Noop => "noop",
+                    AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase => "two_phase",
+                    AndroidBackgroundProvisionMode::RefreshStoredCapability => "rotate",
+                    AndroidBackgroundProvisionMode::Legacy => "legacy",
                 };
-                status = legacy_status_after_ui_failure(failure)?;
-            }
-            AndroidBackgroundProvisionMode::RefreshStoredCapability => {
-                let refresh = app.tunnel_android().rotate_background(
-                    tauri_plugin_tunnel_android::BackgroundCredentialMutationRequest {
-                        expected_revision: status.credential_revision,
-                    },
-                );
-                if refresh.is_ok() {
-                    return Ok(());
-                }
-                if android_background_rotation_fallback().is_some() {
-                    let latest_revision = app
-                        .tunnel_android()
-                        .background_credential_status()
-                        .map_err(|_| {
-                            CommandError::new(
-                                "background_storage_unavailable",
-                                "Не удалось повторно проверить фоновое подключение",
-                            )
-                        })?
-                        .credential_revision;
-                    let failure = match provision_with_ui_authentication(latest_revision) {
-                        Ok(()) => return Ok(()),
-                        Err(failure) => failure,
-                    };
-                    status = legacy_status_after_ui_failure(failure)?;
-                } else {
-                    return Err(CommandError::new(
-                        "background_credential_rotation_failed",
-                        "Не удалось обновить фоновое подключение",
-                    ));
-                }
-            }
-            AndroidBackgroundProvisionMode::Legacy => {}
-        }
-        let token = application
-            .background_token_for_device(device_id, now)
-            .await
-            .map_err(CommandError::from)?
-            .ok_or_else(|| {
-                CommandError::new(
-                    "background_device_changed",
-                    "Учётная запись устройства изменилась",
-                )
-            })?;
-        let expires_at_unix = now.saturating_add(token.expires_in.min(i64::MAX as u64) as i64);
-        let install_secret = application.install_secret().map_err(CommandError::from)?;
-        app.tunnel_android()
-            .configure_background(tauri_plugin_tunnel_android::BackgroundCredentialRequest {
-                api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
-                expected_revision: status.credential_revision,
-                device_id: device_id.to_string(),
-                panel_base: crate::PANEL_BASE.to_string(),
-                token: token.token,
-                expires_at_unix,
-                install_secret,
-                capability_revision: desired_capability.revision,
-                capability_enabled: desired_capability.enabled,
-                capability_expires_at: desired_capability.expires_at,
+                // One owner-issued snapshot drives Bearer prepare; native code
+                // resumes any existing reservation/activation instead of minting anew.
+                app.tunnel_android()
+                    .provision_background_async(
+                        tauri_plugin_tunnel_android::BackgroundUiProvisionRequest {
+                            api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+                            expected_revision: status.credential_revision,
+                            device_id: device_id.into(),
+                            panel_base: crate::PANEL_BASE.into(),
+                            access_token: request.access.access_token().into(),
+                            install_secret: request.install_secret,
+                            owner_operation: operation,
+                            mode: mode.into(),
+                            capability_revision: desired.revision,
+                            capability_enabled: desired.enabled,
+                            capability_expires_at: desired.expires_at,
+                        },
+                    )
+                    .await
+                    .map_err(|_| NativeAuthFailure::OutcomeUnknown)
             })
-            .map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
-                    "Не удалось подготовить фоновое подключение",
-                )
-            })?;
+            .await
+            .map_err(CommandError::from_core)?;
     }
     #[cfg(not(target_os = "android"))]
     let _ = (app, application, device_id, capability);
@@ -3653,21 +3460,13 @@ pub async fn app_notifications_read_all(
 pub async fn app_register_push_token(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
     token: String,
 ) -> Result<(), CommandError> {
-    let result = application
-        .register_push_token(&token)
+    push_registration_scheduler
+        .register_token(&app, &application, &token)
         .await
-        .map_err(Into::into);
-    #[cfg(target_os = "android")]
-    if result.is_ok() {
-        use tauri_plugin_push_android::PushAndroidExt;
-
-        let _ = app.push_android().confirm(&token);
-    }
-    #[cfg(not(target_os = "android"))]
-    let _ = app;
-    result
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -3678,33 +3477,8 @@ pub async fn app_logout(
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
-    cancel_desktop_connection_intent(&app).await;
-    #[cfg(target_os = "android")]
-    let _background_provision_guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
-    #[cfg(target_os = "android")]
-    let logout_result = route_android_logout(
-        || {
-            app.tunnel_android().begin_background_logout().map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
-                    "Не удалось сохранить безопасное завершение фонового подключения",
-                )
-            })
-        },
-        || async {
-            push_registration_scheduler
-                .logout_local(&app, &application)
-                .await
-                .map_err(CommandError::from)
-        },
-        || async {
-            push_registration_scheduler
-                .logout_remote(&application)
-                .await
-                .map_err(CommandError::from)
-        },
-    )
-    .await;
+    let logout_result =
+        route_android_logout(push_registration_scheduler.logout(application.logout())).await;
     #[cfg(desktop)]
     let logout_result = route_desktop_logout(
         push_registration_scheduler.logout(application.logout()),
@@ -4049,6 +3823,39 @@ pub(crate) fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn android_startup_owner_rejection_never_falls_through_after_logout_or_access_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for rejection in [CoreError::StartCancelled, CoreError::AccessExpired] {
+            let fallbacks = AtomicUsize::new(0);
+            let result = route_android_startup_recovery(
+                ApplicationError::Core(CoreError::AuthRecoveryRequired),
+                async { Err(rejection) },
+                async {
+                    fallbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ApplicationError>(42)
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(fallbacks.load(Ordering::SeqCst), 0);
+        }
+        let entered = AtomicUsize::new(0);
+        let result = route_android_startup_recovery(
+            ApplicationError::Core(CoreError::Api(CoreApiError::Retryable)),
+            async {
+                entered.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            async {
+                entered.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ApplicationError>(42)
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+    }
     use super::*;
     use nelomai_contracts::{ApiVersion, LeaseStatus, PeerBinding};
 
@@ -4369,54 +4176,6 @@ mod tests {
     }
 
     #[test]
-    fn background_recovery_is_limited_to_a_configured_signed_out_android_session() {
-        assert!(should_attempt_android_background_recovery(
-            &ApplicationError::Core(CoreError::SignedOut),
-            true,
-        ));
-        assert!(!should_attempt_android_background_recovery(
-            &ApplicationError::Core(CoreError::SignedOut),
-            false,
-        ));
-        assert!(!should_attempt_android_background_recovery(
-            &ApplicationError::Core(CoreError::Api(CoreApiError::Retryable)),
-            true,
-        ));
-    }
-
-    #[test]
-    fn invalid_background_recovery_falls_back_but_missing_route_keeps_the_credential() {
-        assert_eq!(
-            classify_android_background_recovery_error("invalid_background_token"),
-            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("invalid_background_recovery"),
-            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("background_recovery_unsupported"),
-            AndroidBackgroundRecoveryFailure::FallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("activation_not_applied"),
-            AndroidBackgroundRecoveryFailure::FallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("background_transport_unavailable"),
-            AndroidBackgroundRecoveryFailure::Retryable,
-        );
-    }
-
-    #[test]
-    fn unavailable_application_access_is_terminal_instead_of_a_network_retry() {
-        assert_eq!(
-            classify_android_background_recovery_error("app_access_unavailable"),
-            AndroidBackgroundRecoveryFailure::AccessExpired,
-        );
-    }
-
-    #[test]
     fn enabled_recovery_with_an_expired_device_token_uses_ui_authenticated_provision() {
         let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
             configured: true,
@@ -4613,89 +4372,6 @@ mod tests {
         assert_eq!(snapshot.revision, 0);
         assert!(!snapshot.enabled);
         assert_eq!(snapshot.expires_at, ANDROID_DISABLED_CAPABILITY_EXPIRES_AT);
-    }
-
-    #[test]
-    fn failed_device_refresh_uses_ui_authentication_to_persist_disabled_recovery() {
-        assert_eq!(
-            android_background_rotation_fallback(),
-            Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase),
-        );
-    }
-
-    #[test]
-    fn legacy_fallback_requires_an_authoritative_capability_rejection() {
-        let mut status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
-            mutation_pending: true,
-            ..Default::default()
-        };
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-
-        status.mutation_pending = false;
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            None, &status, 100,
-        ));
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_transport_unavailable"),
-            &status,
-            100,
-        ));
-        assert!(android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-
-        status.capability_enabled = true;
-        status.capability_expires_at_unix = Some(500);
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-    }
-
-    #[test]
-    fn authoritative_newer_capability_downgrade_allows_legacy_fallback() {
-        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
-            mutation_pending: false,
-            capability_enabled: false,
-            capability_expires_at_unix: Some(500),
-            ..Default::default()
-        };
-
-        assert!(android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_transport_unavailable"),
-            &status,
-            100,
-        ));
-    }
-
-    #[tokio::test]
-    async fn outer_timeout_does_not_cancel_a_detached_mobile_operation() {
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        let operation = await_detached_on_cancellation(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let _ = completed_tx.send(());
-            42
-        });
-
-        assert!(tokio::time::timeout(Duration::from_millis(1), operation)
-            .await
-            .is_err());
-        tokio::time::timeout(Duration::from_secs(1), completed_rx)
-            .await
-            .unwrap()
-            .unwrap();
     }
 
     #[tokio::test]
@@ -5632,150 +5308,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn android_logout_durably_hands_off_before_local_sign_out_without_legacy_revoke() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let result = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_handoff");
-                Ok(
-                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
-                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::Native,
-                    },
-                )
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Ok(())
-            },
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &["native_handoff", "local_sign_out"]
-        );
-    }
-
-    #[tokio::test]
-    async fn android_logout_without_native_credential_revokes_legacy_before_local_sign_out() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let result = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_not_owned");
-                Ok(
-                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
-                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned,
-                    },
-                )
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Ok(())
-            },
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &["native_not_owned", "legacy_remote_revoke", "local_sign_out"]
-        );
-    }
-
-    #[tokio::test]
-    async fn android_legacy_revoke_failure_preserves_local_session_for_retry() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let error = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_not_owned");
-                Ok(
-                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
-                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned,
-                    },
-                )
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Err(CommandError::new(
-                    "logout_remote_failed",
-                    "remote logout failed",
+    async fn android_logout_bypasses_busy_native_provision_and_preserves_owner_failure() {
+        let _busy = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
+        let entered = std::sync::atomic::AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            route_android_logout(async {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(CommandError::new(
+                    "physical_stop_failed",
+                    "synthetic failure",
                 ))
-            },
+            }),
         )
         .await
-        .expect_err("failed remote revoke must abort local sign out");
-
-        assert_eq!(error.code(), "logout_remote_failed");
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &["native_not_owned", "legacy_remote_revoke"]
-        );
+        .expect("owner cancellation must not wait for native provision");
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(result.unwrap_err().code(), "physical_stop_failed");
     }
-
-    #[tokio::test]
-    async fn android_ambiguous_native_handoff_error_never_duplicates_with_legacy_revoke() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let error = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_handoff_lost");
-                Err(CommandError::new(
-                    "android_service_dispatch_unavailable",
-                    "lost response",
-                ))
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Ok(())
-            },
-        )
-        .await
-        .expect_err("ambiguous native response must fail closed");
-
-        assert_eq!(error.code(), "android_service_dispatch_unavailable");
-        assert_eq!(events.lock().unwrap().as_slice(), &["native_handoff_lost"]);
-    }
-
     fn android_begin_request() -> tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
         tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
             api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,

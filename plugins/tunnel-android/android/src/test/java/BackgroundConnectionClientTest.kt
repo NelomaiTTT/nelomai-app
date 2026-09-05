@@ -176,7 +176,7 @@ class BackgroundConnectionClientTest {
 
     @Test
     fun recoveredSessionDebugOutputRedactsBothTokens() {
-        val result = BackgroundSessionRecoveryResult("secret-access", "secret-refresh")
+        val result = BackgroundSessionRecoveryResult("{\"access_token\":\"secret-access\",\"refresh_token\":\"secret-refresh\"}")
 
         assertFalse(result.toString().contains("secret-access"))
         assertFalse(result.toString().contains("secret-refresh"))

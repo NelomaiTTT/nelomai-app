@@ -149,6 +149,8 @@ class BackgroundCredentialMutationArgs {
 
 @InvokeArg
 class BackgroundUiProvisionArgs {
+    lateinit var ownerOperation: String
+    lateinit var mode: String
     var apiVersion: Int = 0
     var expectedRevision: Long = -1
     lateinit var deviceId: String
@@ -163,7 +165,11 @@ class BackgroundUiProvisionArgs {
 @InvokeArg
 class BackgroundSessionRecoveryArgs {
     lateinit var installSecret: String
+    lateinit var ownerOperation: String
 }
+
+@InvokeArg
+class BackgroundOwnerLogoutArgs { var cancelEpoch: Long = -1 }
 
 @InvokeArg
 class ConnectionIntentTemplateArgs {
@@ -2942,8 +2948,12 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun beginBackgroundLogout(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BackgroundOwnerLogoutArgs::class.java) } catch (_: Throwable) {
+            invoke.reject("invalid_background_logout"); return
+        }
         TunnelServiceClient.beginBackgroundLogout(
             activity.applicationContext,
+            args.cancelEpoch,
             { ownership ->
                 activity.runOnUiThread {
                     invoke.resolve(JSObject().apply {
@@ -2966,11 +2976,11 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         TunnelServiceClient.recoverBackgroundSession(
             activity.applicationContext,
             args.installSecret,
-            { accessToken, refreshToken ->
+            args.ownerOperation,
+            { responseJson ->
                 activity.runOnUiThread {
                     val response = JSObject()
-                    response.put("accessToken", accessToken)
-                    response.put("refreshToken", refreshToken)
+                    response.put("responseJson", responseJson)
                     response.put("errorCode", null)
                     invoke.resolve(response)
                 }
@@ -2978,8 +2988,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             { code ->
                 activity.runOnUiThread {
                     val response = JSObject()
-                    response.put("accessToken", null)
-                    response.put("refreshToken", null)
+                    response.put("responseJson", null)
                     response.put("errorCode", code)
                     invoke.resolve(response)
                 }
