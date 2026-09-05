@@ -302,7 +302,7 @@ fn bootstrap_ack_tombstones_legacy_only_after_durable_server_enrollment() {
         "PRIVATE-TUNNEL-CONFIG",
     ] {
         assert!(!plain.contains(secret));
-        assert!(!format!("{:?}", value).contains(secret));
+        assert!(!format!("{value:?}").contains(secret));
     }
     assert!(String::from_utf8(raw.load_record().unwrap().unwrap())
         .unwrap()
