@@ -12,6 +12,10 @@ use nelomai_client_container::{
     RuntimeForceStop,
 };
 use nelomai_client_tunnel::TunnelController;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nelomai_unix_service::{Request, ServiceTransport};
+#[cfg(windows)]
+use nelomai_windows_service::{Request, ServiceTransport};
 use std::{
     collections::VecDeque,
     io,
@@ -65,6 +69,7 @@ pub fn installation_action(
 
 struct NativeStop {
     child: Mutex<Option<Child>>,
+    exit_owner: nelomai_client_container::desktop::RuntimeExitOwner,
     tunnel: Arc<NativeController>,
     operation: tokio::sync::Mutex<NativeOperationState>,
 }
@@ -125,13 +130,14 @@ impl LocalAuthStop for NativeStop {
 #[async_trait::async_trait]
 impl RuntimeForceStop for NativeStop {
     async fn force_stop(&self, _: &str) -> Result<(), BrokerError> {
-        nelomai_client_container::desktop::stop_runtime_before_helper(&self.child, async {
-            self.stop_local()
-                .await
-                .map_err(|_| io::Error::other("helper stop receipt unavailable"))
-        })
-        .await
-        .map_err(|_| BrokerError::RecoveryRequired)
+        self.exit_owner
+            .stop_for_transition(&self.child, async {
+                self.stop_local()
+                    .await
+                    .map_err(|_| io::Error::other("helper stop receipt unavailable"))
+            })
+            .await
+            .map_err(|_| BrokerError::RecoveryRequired)
     }
 }
 struct DesktopBackground;
@@ -312,6 +318,7 @@ pub fn run() {
             let tunnel = Arc::new(platform::windows::tunnel_controller());
             let stop = Arc::new(NativeStop {
                 child: Mutex::new(None),
+                exit_owner: Default::default(),
                 tunnel,
                 operation: tokio::sync::Mutex::new(NativeOperationState::default()),
             });
@@ -345,6 +352,7 @@ pub fn run() {
             )?);
             let mut child = tauri::async_runtime::block_on(host.launch_desktop(0))?;
             let native = child.take_native()?;
+            stop.exit_owner.runtime_launched();
             *stop
                 .child
                 .lock()
@@ -491,73 +499,41 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
             return;
         }
     }
-    // Native EOF is a process failure, never proof that the privileged engine
-    // stopped. Kill/reap and obtain the helper's independent stop response.
-    tauri::async_runtime::block_on(state.finish(app, false));
+    // Intentional termination leaves the active transition in control through
+    // helper acknowledgement and durable journal completion. Unsolicited EOF
+    // still needs ordered finish; neither kind of EOF is a helper stop receipt.
+    if state.stop.exit_owner.finish_on_native_eof() {
+        tauri::async_runtime::block_on(state.finish(app, false));
+    }
 }
 async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use nelomai_unix_service::{Request, ServiceTransport};
-        let request: Request = serde_json::from_slice(body)?;
-        if matches!(request, Request::Start { .. }) {
+    let request: Request = serde_json::from_slice(body)?;
+    if matches!(request, Request::Start { .. }) {
+        state
+            .host
+            .coordinator()
+            .before_tunnel_start()
+            .await
+            .map_err(|_| io::Error::other("common start rejected"))?;
+    }
+    let mut operation = state.stop.operation.lock().await;
+    if matches!(request, Request::Start { .. } | Request::RebindUdp { .. }) {
+        operation.begin_start(
             state
                 .host
-                .coordinator()
-                .before_tunnel_start()
-                .await
-                .map_err(|_| io::Error::other("common start rejected"))?;
-        }
-        let mut operation = state.stop.operation.lock().await;
-        if matches!(request, Request::Start { .. } | Request::RebindUdp { .. }) {
-            operation.begin_start(
-                state
-                    .host
-                    .native_start_blocked()
-                    .map_err(|_| io::Error::other("update state unavailable"))?
-                    || !runtime_is_alive(state),
-            )?;
-        }
-        let response = state
-            .stop
-            .tunnel
-            .transport()
-            .exchange(request)
-            .await
-            .map_err(|_| io::Error::other("engine unavailable"))?;
-        serde_json::to_vec(&response).map_err(Into::into)
+                .native_start_blocked()
+                .map_err(|_| io::Error::other("update state unavailable"))?
+                || !runtime_is_alive(state),
+        )?;
     }
-    #[cfg(windows)]
-    {
-        use nelomai_windows_service::{Request, ServiceTransport};
-        let request: Request = serde_json::from_slice(body)?;
-        if matches!(request, Request::Start { .. }) {
-            state
-                .host
-                .coordinator()
-                .before_tunnel_start()
-                .await
-                .map_err(|_| io::Error::other("common start rejected"))?;
-        }
-        let mut operation = state.stop.operation.lock().await;
-        if matches!(request, Request::Start { .. } | Request::RebindUdp { .. }) {
-            operation.begin_start(
-                state
-                    .host
-                    .native_start_blocked()
-                    .map_err(|_| io::Error::other("update state unavailable"))?
-                    || !runtime_is_alive(state),
-            )?;
-        }
-        let response = state
-            .stop
-            .tunnel
-            .transport()
-            .exchange(request)
-            .await
-            .map_err(|_| io::Error::other("engine unavailable"))?;
-        serde_json::to_vec(&response).map_err(Into::into)
-    }
+    let response = state
+        .stop
+        .tunnel
+        .transport()
+        .exchange(request)
+        .await
+        .map_err(|_| io::Error::other("engine unavailable"))?;
+    serde_json::to_vec(&response).map_err(Into::into)
 }
 fn runtime_is_alive(state: &CommonState) -> bool {
     state
@@ -598,6 +574,7 @@ pub(crate) async fn begin_installation<R: tauri::Runtime>(
     operation.replacement = Some((proof.clone(), false));
     Ok(proof)
 }
+#[cfg(not(windows))]
 pub(crate) async fn installation_succeeded<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     proof: nelomai_client_container::UpdateStopProof,
@@ -625,6 +602,48 @@ pub(crate) async fn installation_succeeded<R: tauri::Runtime>(
     }
     operation.replacement = Some((proof, true));
     Ok(())
+}
+#[cfg(windows)]
+pub(crate) async fn handoff_windows_installer<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    proof: nelomai_client_container::UpdateStopProof,
+    launch: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let state = app
+        .try_state::<Arc<CommonState>>()
+        .ok_or_else(|| io::Error::other("common owner unavailable"))?
+        .inner()
+        .clone();
+    // Keep the same native operation guard until the non-returning installer
+    // takes over. Queued Start/Rebind cannot invalidate this stop acknowledgement.
+    let operation = state.stop.operation.lock().await;
+    state
+        .stop
+        .exit_owner
+        .handoff_installer(
+            &state.stop.child,
+            async {
+                if !operation.observed_helper_stop
+                    || operation.replacement.as_ref() != Some(&(proof.clone(), false))
+                    || state
+                        .host
+                        .update_stop_proof(
+                            proof.target(),
+                            nelomai_client_container::UpdateJournalPhase::LocalStopped,
+                        )
+                        .map_err(|_| io::Error::other("pending update authority unavailable"))?
+                        != proof
+                {
+                    return Err(io::Error::other("pending update authority changed"));
+                }
+                // LocalStopped is already fsync'd by the existing barrier and linked to
+                // the exact operation/source/target/helper receipt. It remains pending:
+                // ShellExecute (whose result stock updater ignores) is not installation.
+                Ok(())
+            },
+            launch,
+        )
+        .await
 }
 async fn prepare_native(app: tauri::AppHandle) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use nelomai_client_api::AccessSnapshot;
+#[cfg(not(windows))]
+use nelomai_client_updater::InstalledUpdate;
 use nelomai_client_updater::{
-    DownloadProgress, InstallResult, InstalledUpdate, UpdateBackend, UpdateBackendError,
-    UpdateBarrierPhase, UpdateEndpointPolicy,
+    DownloadProgress, InstallResult, UpdateBackend, UpdateBackendError, UpdateBarrierPhase,
+    UpdateEndpointPolicy,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Runtime};
@@ -108,24 +110,39 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .await
             .map_err(|_| UpdateBackendError::new("update_stop_proof_unavailable"))?;
         #[cfg(windows)]
-        crate::desktop::set_tray_visible(&self.app, false);
-        #[cfg(target_os = "linux")]
-        let install = install_linux_common(bytes).await;
-        #[cfg(not(target_os = "linux"))]
-        let install = update
-            .install(bytes)
-            .map_err(|_| UpdateBackendError::new("update_install_failed"));
-        #[cfg(windows)]
-        if install.is_err() {
+        {
+            crate::desktop::set_tray_visible(&self.app, false);
+            let result = crate::container::handoff_windows_installer(&self.app, stop_proof, || {
+                update
+                    .install(bytes)
+                    .map_err(|_| std::io::Error::other("update install failed"))
+            })
+            .await;
+            // The dependency normally exits without returning. A return (even
+            // Ok) is not replacement evidence and must never enable restart.
             crate::desktop::set_tray_visible(&self.app, true);
+            Err(UpdateBackendError::new(if result.is_err() {
+                "update_install_failed"
+            } else {
+                "update_install_outcome_unknown"
+            }))
         }
-        install.map_err(|_| UpdateBackendError::new("update_install_failed"))?;
-        crate::container::installation_succeeded(&self.app, stop_proof)
-            .await
-            .map_err(|_| UpdateBackendError::new("update_stop_proof_changed"))?;
-        Ok(InstallResult::Installed(InstalledUpdate {
-            version: update.version,
-        }))
+        #[cfg(not(windows))]
+        {
+            #[cfg(target_os = "linux")]
+            let install = install_linux_common(bytes).await;
+            #[cfg(not(target_os = "linux"))]
+            let install = update
+                .install(bytes)
+                .map_err(|_| UpdateBackendError::new("update_install_failed"));
+            install.map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+            crate::container::installation_succeeded(&self.app, stop_proof)
+                .await
+                .map_err(|_| UpdateBackendError::new("update_stop_proof_changed"))?;
+            Ok(InstallResult::Installed(InstalledUpdate {
+                version: update.version,
+            }))
+        }
     }
 }
 

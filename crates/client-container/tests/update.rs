@@ -152,6 +152,16 @@ struct Control {
     graceful_entered: Notify,
     graceful_release: Notify,
     gates: Arc<RuntimeWriterGates>,
+    #[cfg(unix)]
+    forced_native: Mutex<Option<ForcedNative>>,
+}
+
+#[cfg(unix)]
+struct ForcedNative {
+    runtime: std::os::unix::net::UnixStream,
+    common: std::os::unix::net::UnixStream,
+    owner: Arc<nelomai_client_container::desktop::RuntimeExitOwner>,
+    helper_receipts: Arc<AtomicUsize>,
 }
 
 impl Control {
@@ -207,6 +217,28 @@ impl RuntimeSwitchControl for Control {
         self.forced.fetch_add(1, Ordering::SeqCst);
         if self.fail_force.swap(0, Ordering::SeqCst) == 1 {
             return Err(BrokerError::RecoveryRequired);
+        }
+        #[cfg(unix)]
+        {
+            let native = self.forced_native.lock().unwrap().take();
+            if let Some(mut native) = native {
+                let process = Mutex::new(None);
+                native
+                    .owner
+                    .stop_for_transition(&process, async {
+                        use std::io::Read;
+                        drop(native.runtime);
+                        assert_eq!(native.common.read(&mut [0; 1]).unwrap(), 0);
+                        assert!(
+                            !native.owner.finish_on_native_eof(),
+                            "forced timeout EOF must not exit the common operation"
+                        );
+                        native.helper_receipts.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|_| BrokerError::RecoveryRequired)?;
+            }
         }
         Ok(())
     }
@@ -287,6 +319,113 @@ async fn active_or_stopped_source_is_durably_local_stopped_before_installation()
         assert_eq!(control.handoffs.load(Ordering::SeqCst), 1);
         assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
         assert_eq!(control.forced.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+#[test]
+fn nonreturning_windows_handoff_retains_pending_authority_not_install_success() {
+    const ROOT: &str = "NELOMAI_TEST_HANDOFF_ROOT";
+    if let Some(path) = std::env::var_os(ROOT) {
+        let root = std::path::PathBuf::from(path);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            write_selection(&root, "0.2.16", RuntimeSlot::Latest);
+            let owner = Arc::new(ContainerOwnerLock::try_acquire(&root).unwrap());
+            let coordinator = offline_coordinator(
+                owner,
+                enrolled_store(RuntimeSlot::Latest),
+                Arc::new(Control::default()),
+                manifest("0.2.16", "0.2.16", false),
+            );
+            let barrier = UpdateBarrier::open(coordinator).unwrap();
+            barrier.prepare("0.2.17").await.unwrap();
+            let proof = barrier
+                .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+                .unwrap();
+            let exit_owner = nelomai_client_container::desktop::RuntimeExitOwner::default();
+            exit_owner
+                .handoff_installer(
+                    &Mutex::new(None),
+                    async {
+                        assert_eq!(
+                            barrier
+                                .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+                                .unwrap(),
+                            proof
+                        );
+                        Ok(())
+                    },
+                    || {
+                        // Characterize the installed updater's real contract: it ignores
+                        // ShellExecuteW's result and exits without unwinding/returning.
+                        // Exercise our boundary in a separate OS process, not a returning
+                        // mock that would incorrectly permit a success continuation.
+                        std::process::exit(73)
+                    },
+                )
+                .await
+                .unwrap();
+            std::fs::write(root.join("incorrect-success"), b"success").unwrap();
+        });
+        panic!("Windows install must not return success");
+    }
+    for installed in ["0.2.16", "0.2.17"] {
+        let root = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "nonreturning_windows_handoff_retains_pending_authority_not_install_success",
+            ])
+            .env(ROOT, root.path())
+            .status()
+            .unwrap();
+        assert_eq!(result.code(), Some(73));
+        assert!(!root.path().join("incorrect-success").exists());
+        let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+        let coordinator = offline_coordinator(
+            owner,
+            enrolled_store(RuntimeSlot::Latest),
+            Arc::new(Control::default()),
+            manifest("0.2.16", "0.2.16", false),
+        );
+        let barrier = UpdateBarrier::open(coordinator).unwrap();
+        let pending = barrier.snapshot().unwrap().unwrap();
+        assert_eq!(pending.phase(), UpdateJournalPhase::LocalStopped);
+        assert_eq!(pending.target_container(), "0.2.17");
+        assert!(barrier
+            .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+            .is_ok());
+        assert!(barrier
+            .stop_proof("0.2.17", UpdateJournalPhase::InstallerOpened)
+            .is_err());
+        drop(barrier);
+        // Reopen in this new OS process after the updater's abrupt exit. An ignored
+        // failed launch/unchanged installation cancels; a verified new version resumes.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (panel, api, server) = panel().await;
+            let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+            write_selection(root.path(), installed, RuntimeSlot::Latest);
+            let coordinator = online_coordinator(
+                owner,
+                enrolled_store(RuntimeSlot::Latest),
+                Arc::new(Control::default()),
+                manifest(installed, installed, false),
+                api,
+            );
+            let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+            barrier.recover(installed).await.unwrap();
+            assert!(barrier.snapshot().unwrap().is_none());
+            assert_eq!(
+                coordinator.snapshot().unwrap().unwrap().phase(),
+                SwitchPhase::Complete
+            );
+            assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                panel.supersede.load(Ordering::SeqCst),
+                usize::from(installed == "0.2.17")
+            );
+            server.abort();
+        });
     }
 }
 
@@ -410,6 +549,53 @@ async fn graceful_stop_timeout_is_forced_once_and_retry_reuses_the_same_journal(
         operation
     );
     assert_eq!(control.forced.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn forced_timeout_native_eof_preserves_common_until_durable_helper_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let control = Arc::new(Control::default());
+    control.stall_graceful.store(true, Ordering::SeqCst);
+    let (runtime, common) = std::os::unix::net::UnixStream::pair().unwrap();
+    let helper_receipts = Arc::new(AtomicUsize::new(0));
+    let exit_owner = Arc::new(nelomai_client_container::desktop::RuntimeExitOwner::default());
+    *control.forced_native.lock().unwrap() = Some(ForcedNative {
+        runtime,
+        common,
+        owner: exit_owner.clone(),
+        helper_receipts: helper_receipts.clone(),
+    });
+    let coordinator = offline_coordinator(
+        owner,
+        enrolled_store(RuntimeSlot::Latest),
+        control.clone(),
+        manifest("0.2.16", "0.2.16", false),
+    );
+    let barrier = Arc::new(UpdateBarrier::open(coordinator.clone()).unwrap());
+    let task = {
+        let barrier = barrier.clone();
+        tokio::spawn(async move { barrier.prepare("0.2.17").await })
+    };
+    control.graceful_entered.notified().await;
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    assert_eq!(task.await.unwrap().unwrap(), UpdatePrepare::LocalStopped);
+    assert_eq!(helper_receipts.load(Ordering::SeqCst), 1);
+    let switch = coordinator.snapshot().unwrap().unwrap();
+    let switch_json = serde_json::to_value(&switch).unwrap();
+    assert_eq!(switch_json["local_stop_receipt"]["forced"], true);
+    assert_eq!(switch.phase(), SwitchPhase::LocalStopped);
+    assert!(barrier
+        .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+        .is_ok());
+    assert!(!exit_owner.finish_on_native_eof());
+    barrier.installer_opened().await.unwrap();
+    assert_eq!(
+        barrier.snapshot().unwrap().unwrap().phase(),
+        UpdateJournalPhase::InstallerOpened
+    );
 }
 
 #[tokio::test(start_paused = true)]

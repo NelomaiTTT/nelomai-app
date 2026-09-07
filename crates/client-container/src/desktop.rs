@@ -60,6 +60,60 @@ pub async fn stop_runtime_before_helper(
     helper.await
 }
 
+/// EOF belongs either to unsolicited process failure or to the common operation
+/// deliberately terminating this child. Claim continuation before closing any
+/// endpoint; retain it even when helper acknowledgement needs a retry.
+#[derive(Default)]
+pub struct RuntimeExitOwner(std::sync::atomic::AtomicU8);
+impl RuntimeExitOwner {
+    /// Register a new child before starting its native reader. Ownership from a
+    /// previous intentional termination must not hide a new child's failure.
+    pub fn runtime_launched(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Release);
+    }
+    pub fn finish_on_native_eof(&self) -> bool {
+        self.0
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    pub async fn stop_for_transition(
+        &self,
+        process: &std::sync::Mutex<Option<VerifiedChild>>,
+        helper: impl std::future::Future<Output = io::Result<()>>,
+    ) -> io::Result<()> {
+        match self.0.compare_exchange(
+            0,
+            1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) | Err(1) => stop_runtime_before_helper(process, helper).await,
+            _ => Err(blocked()),
+        }
+    }
+    /// The stock Windows updater can exit the process without unwinding and
+    /// without reporting ShellExecute's result. Everything needed by recovery
+    /// must therefore be durable and the runtime reaped before entering it.
+    /// A returned Ok is not evidence of replacement either.
+    pub async fn handoff_installer(
+        &self,
+        process: &std::sync::Mutex<Option<VerifiedChild>>,
+        pending_authority: impl std::future::Future<Output = io::Result<()>>,
+        launch: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.stop_for_transition(process, pending_authority).await?;
+        launch()?;
+        Err(io::Error::other(
+            "installer returned without replacement evidence",
+        ))
+    }
+}
+
 pub struct VerifiedRuntime {
     root: PathBuf,
     executable: PathBuf,

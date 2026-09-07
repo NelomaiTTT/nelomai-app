@@ -176,6 +176,99 @@ fn latest_launch_requires_verified_manifest_and_reports_stable_unavailable() {
 }
 
 #[test]
+fn intentional_reap_keeps_common_alive_but_new_runtime_eof_is_unsolicited() {
+    use nelomai_client_container::desktop::RuntimeExitOwner;
+    use std::{io::Read, process::Command, sync::Mutex};
+    let f = Fixture::new();
+    let compiled = f.root.path().join("probe");
+    assert!(Command::new("rustc")
+        .args(["--edition=2021", "tests/fixtures/runtime_probe.rs", "-o"])
+        .arg(&compiled)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .unwrap()
+        .success());
+    f.replace_executable(&fs::read(compiled).unwrap());
+    let mut child = f.open(RuntimeSlot::Latest).unwrap().spawn().unwrap();
+    let mut native = child.native().try_clone().unwrap();
+    native.read_exact(&mut [0; 2]).unwrap();
+    let process = Mutex::new(Some(child));
+    let owner = RuntimeExitOwner::default();
+    tauri::async_runtime::block_on(owner.stop_for_transition(&process, async {
+        assert_eq!(native.read(&mut [0; 1]).unwrap(), 0);
+        assert!(
+            !owner.finish_on_native_eof(),
+            "intentional EOF must leave common alive through helper acknowledgement"
+        );
+        Err(std::io::Error::other("independent helper receipt missing"))
+    }))
+    .unwrap_err();
+    assert!(
+        !owner.finish_on_native_eof(),
+        "failed helper stop remains owned and retryable, not app exit"
+    );
+    owner.runtime_launched();
+    assert!(
+        owner.finish_on_native_eof(),
+        "new runtime unsolicited EOF must still finish common"
+    );
+    assert!(
+        tauri::async_runtime::block_on(owner.stop_for_transition(&process, async { Ok(()) }))
+            .is_err(),
+        "cannot steal an unsolicited failure already owned by finish"
+    );
+}
+
+#[test]
+fn installer_handoff_reaps_before_pending_check_and_never_infers_success() {
+    use nelomai_client_container::desktop::RuntimeExitOwner;
+    use std::{io::Read, process::Command, sync::Mutex};
+    let f = Fixture::new();
+    let compiled = f.root.path().join("probe");
+    assert!(Command::new("rustc")
+        .args(["--edition=2021", "tests/fixtures/runtime_probe.rs", "-o"])
+        .arg(&compiled)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .status()
+        .unwrap()
+        .success());
+    f.replace_executable(&fs::read(compiled).unwrap());
+    let mut child = f.open(RuntimeSlot::Latest).unwrap().spawn().unwrap();
+    let pid = child.id();
+    let mut native = child.native().try_clone().unwrap();
+    native.read_exact(&mut [0; 2]).unwrap();
+    let process = Mutex::new(Some(child));
+    let owner = RuntimeExitOwner::default();
+    let result = tauri::async_runtime::block_on(owner.handoff_installer(
+        &process,
+        async {
+            assert_ne!(
+                unsafe { libc::kill(pid as i32, 0) },
+                0,
+                "pending handoff validation must follow actual child reap"
+            );
+            assert_eq!(native.read(&mut [0; 1]).unwrap(), 0);
+            assert!(!owner.finish_on_native_eof());
+            Err(std::io::Error::other("pending authority missing or stale"))
+        },
+        || panic!("installer must not launch without pending stop authority"),
+    ));
+    assert!(result.is_err());
+    let launched = std::cell::Cell::new(false);
+    let result =
+        tauri::async_runtime::block_on(owner.handoff_installer(&process, async { Ok(()) }, || {
+            launched.set(true);
+            assert_ne!(unsafe { libc::kill(pid as i32, 0) }, 0);
+            Ok(())
+        }));
+    assert!(launched.get());
+    assert!(
+        result.is_err(),
+        "a returning installer launch is not successful replacement evidence"
+    );
+}
+
+#[test]
 fn signed_but_incompatible_contract_or_escaping_path_is_rejected() {
     for (field, value) in [
         ("contract_version", serde_json::json!(999)),
