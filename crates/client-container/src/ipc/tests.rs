@@ -2,7 +2,7 @@
 use super::*;
 use crate::{AuthBroker, RuntimeClientProfile};
 use nelomai_client_api::{ClientApi, RuntimeTarget};
-use nelomai_client_core::{CoreLocalStop, RuntimeAuthProvider};
+use nelomai_client_core::{CoreLocalStop, RuntimeAuthProvider, RuntimeStartPreflight};
 use nelomai_client_storage::*;
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{Platform, RuntimeSlot};
@@ -123,6 +123,226 @@ async fn revoked_peer_cannot_issue_queued_refresh() {
 #[tokio::test(start_paused = true)]
 async fn expired_peer_cannot_issue_queued_login() {
     queued_remote_issuance_is_cancelled(true, true).await;
+}
+
+#[tokio::test]
+async fn cleanup_snapshot_requires_live_child_writer_lease_over_private_channel() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let lease = fixture.parent.prepare(deadline).await.unwrap();
+    let requested_scope = fixture.record.cleanup_snapshot().unwrap().auth_scope;
+    let reply = fixture
+        .parent
+        .control(
+            ControlV1::CleanupSourceSnapshot {
+                lease: lease.clone(),
+                scope: requested_scope.clone(),
+            },
+            deadline,
+        )
+        .await
+        .unwrap();
+    let snapshot = match reply {
+        ControlAckV1::CleanupSnapshot { snapshot } => snapshot,
+        _ => panic!("expected actual runtime cleanup snapshot"),
+    };
+    assert_eq!(snapshot.slot, RuntimeSlot::Stable);
+    assert_eq!(snapshot.runtime_version, "0.2.16");
+    assert_eq!(
+        snapshot
+            .auth_scope
+            .as_ref()
+            .unwrap()
+            .identity
+            .session_generation,
+        Some(1)
+    );
+    assert!(snapshot.lease_ids.is_empty());
+    fixture.child.abort(&lease);
+    assert!(fixture
+        .parent
+        .control(
+            ControlV1::CleanupSourceSnapshot {
+                lease,
+                scope: requested_scope
+            },
+            deadline
+        )
+        .await
+        .is_err());
+    assert_eq!(fixture.record.cleanup_snapshot().unwrap(), snapshot);
+}
+
+#[tokio::test]
+async fn cleanup_cannot_bind_foreign_runtime_or_mutate_without_held_lease() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let snapshot = fixture.record.cleanup_snapshot().unwrap();
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let lease = fixture.parent.prepare(deadline).await.unwrap();
+    let mut scope = snapshot.auth_scope.clone().unwrap();
+    scope.identity.slot = RuntimeSlot::Latest;
+    let reply = fixture
+        .parent
+        .control(
+            ControlV1::CompleteCleanup {
+                lease: lease.clone(),
+                snapshot: snapshot.clone(),
+                scope,
+            },
+            deadline,
+        )
+        .await;
+    assert!(reply.is_err());
+    assert_eq!(fixture.record.cleanup_snapshot().unwrap(), snapshot);
+    fixture.child.abort(&lease);
+    let reply = fixture
+        .parent
+        .control(
+            ControlV1::CompleteCleanup {
+                lease,
+                snapshot: snapshot.clone(),
+                scope: snapshot.auth_scope.clone().unwrap(),
+            },
+            deadline,
+        )
+        .await;
+    assert!(reply.is_err());
+    assert_eq!(fixture.record.cleanup_snapshot().unwrap(), snapshot);
+}
+
+#[tokio::test]
+async fn remote_cleanup_rebinds_only_after_broker_generation_changes() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let frozen = fixture.record.cleanup_snapshot().unwrap();
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.session_generation = Some(2);
+    auth.confirmed_identity.as_mut().unwrap().session_generation = Some(2);
+    fixture.auth.save(&auth).unwrap();
+    let access = fixture.broker.access_token(None).await.unwrap();
+    fixture
+        .parent
+        .complete_runtime_cleanup(&fixture.broker, &frozen, &access)
+        .await
+        .unwrap();
+    let current = fixture.record.cleanup_snapshot().unwrap();
+    assert_eq!(
+        current.auth_scope.unwrap().identity.session_generation,
+        Some(2)
+    );
+    assert_eq!(
+        fixture
+            .client
+            .access(None)
+            .await
+            .unwrap()
+            .identity()
+            .session_generation,
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn remote_handoff_closes_admission_until_explicit_recovery() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&auth).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let source = fixture.broker.transition_source().await.unwrap();
+    let handoff = fixture
+        .parent
+        .runtime_cleanup_handoff(&source)
+        .await
+        .unwrap();
+    assert_eq!(handoff.snapshot().runtime_version, "0.2.16");
+    assert!(
+        nelomai_client_core::RuntimeStartPreflight::check_start_barrier(fixture.client.as_ref())
+            .is_err()
+    );
+    assert!(fixture.client.access(None).await.is_err());
+    drop(handoff);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    assert!(fixture.client.access(None).await.is_ok());
+    assert!(
+        nelomai_client_core::RuntimeStartPreflight::check_start_barrier(fixture.client.as_ref())
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn child_inventory_cleans_exact_retained_source_without_importing_its_state_into_target() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let target_scope = fixture
+        .record
+        .cleanup_snapshot()
+        .unwrap()
+        .auth_scope
+        .unwrap();
+    let mut source_scope = target_scope.clone();
+    source_scope.identity.runtime_version = "0.2.15".into();
+    let paths = RuntimePaths::new(fixture._root.path(), RuntimeSlot::Stable, "0.2.15").unwrap();
+    let store = ProtectedRuntimeStore::new(Record::default(), paths);
+    let mut old = RuntimeStateV1::import_legacy(
+        &StoredAuth::new_install(),
+        StoredSplitTunnelState::default(),
+        store.paths(),
+    );
+    old.auth_scope = Some(source_scope.clone());
+    store.save(&old).unwrap();
+    let source = RuntimeRecordOwner::new(store);
+    let inventory = Arc::new(RuntimeRecordInventory::new(
+        fixture.record.clone(),
+        vec![source.clone()],
+    ));
+    let child = ChildAdmission::new(
+        "retained-source".into(),
+        Arc::new(nelomai_client_core::RuntimeWriterGates::default()),
+        inventory,
+    );
+    let lease = child
+        .prepare(1, "retained-source", Instant::now() + REQUEST_BUDGET)
+        .await
+        .unwrap();
+    let frozen = child
+        .cleanup_snapshot_for(&lease, Some(&source_scope))
+        .unwrap();
+    assert_eq!(frozen.runtime_version, "0.2.15");
+    child
+        .complete_cleanup(&lease, &frozen, &target_scope)
+        .unwrap();
+    assert!(!source.cleanup_snapshot().unwrap().cleanup_only);
+    let target = fixture.record.cleanup_snapshot().unwrap();
+    assert_eq!(target.auth_scope, Some(target_scope));
+    assert_eq!(target.runtime_version, "0.2.16");
+    assert!(target.lease_ids.is_empty());
 }
 #[tokio::test(start_paused = true)]
 async fn expired_peer_cannot_issue_queued_refresh() {
@@ -374,6 +594,82 @@ async fn dropping_client_logout_waiter_does_not_abort_already_started_owner_revo
 
 #[derive(Clone, Default)]
 struct Record(Arc<Mutex<Option<Vec<u8>>>>);
+
+#[tokio::test]
+async fn completed_logout_clears_only_receipt_source_under_live_child_lease() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route("/api/client/v1/auth/logout-runtime", axum::routing::post(|| async {
+        axum::Json(serde_json::json!({"api_version":"1","request_id":"synthetic","code":"session_revoked_cleanup_accepted", "cleanup_reconcile_operation_id":"22222222-2222-4222-8222-222222222222"}))
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().confirmed_device_id =
+        Some("11111111-1111-4111-8111-111111111111".into());
+    fixture.auth.save(&auth).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    fixture.client.access(None).await.unwrap();
+    fixture.broker.logout().await.unwrap();
+    let receipt = fixture
+        .broker
+        .completed_runtime_logout()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fixture
+        .record
+        .cleanup_snapshot()
+        .unwrap()
+        .auth_scope
+        .is_some());
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let lease = fixture.parent.prepare(deadline).await.unwrap();
+    let mut foreign = receipt.clone();
+    foreign.source.identity.as_mut().unwrap().runtime_version = "0.2.17".into();
+    let before = fixture.record.cleanup_snapshot().unwrap();
+    assert!(matches!(
+        fixture
+            .parent
+            .control(
+                ControlV1::CompleteLogout {
+                    lease: lease.clone(),
+                    receipt: foreign
+                },
+                deadline
+            )
+            .await,
+        Err(_) | Ok(ControlAckV1::Error { .. })
+    ));
+    assert_eq!(fixture.record.cleanup_snapshot().unwrap(), before);
+    assert!(matches!(
+        fixture
+            .parent
+            .control(
+                ControlV1::CompleteLogout {
+                    lease: lease.clone(),
+                    receipt
+                },
+                deadline
+            )
+            .await
+            .unwrap(),
+        ControlAckV1::Done
+    ));
+    assert!(fixture
+        .record
+        .cleanup_snapshot()
+        .unwrap()
+        .auth_scope
+        .is_none());
+    assert!(fixture.client.check_start_barrier().is_err());
+    fixture.child.abort(&lease);
+    server.abort();
+}
 impl ProtectedRecordStore for Record {
     fn load_record(&self) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(self.0.lock().unwrap().clone())
@@ -487,7 +783,7 @@ impl Fixture {
         let child = Arc::new(ChildAdmission::new(
             "fixture-child".into(),
             stop.runtime_writer_gates(),
-            record.clone(),
+            Arc::new(RuntimeRecordInventory::new(record.clone(), vec![])),
         ));
         let (parent_socket, child_socket) = match pause {
             Some(pause) => pause.sockets(),

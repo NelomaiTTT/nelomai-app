@@ -12,6 +12,9 @@ use tokio::sync::{mpsc, Semaphore};
 /// callback credentials terminate here; runtime sees action/status/access only.
 #[async_trait]
 pub trait PrivateBackgroundDispatcher: Send + Sync {
+    async fn cleanup_push(&self) -> Result<(), BrokerError> {
+        Err(BrokerError::RecoveryRequired)
+    }
     /// Existing owner/native cleanup handoff, never a runtime-provided ticket.
     async fn prepare_revocation(&self, cancel_epoch: u64) -> Result<(), BrokerError>;
     async fn dispatch(
@@ -29,6 +32,12 @@ pub struct LaunchBinding {
     incarnation: String,
 }
 impl LaunchBinding {
+    pub(crate) fn from_common_host(target: RuntimeTarget, incarnation: String) -> Self {
+        Self {
+            target,
+            incarnation,
+        }
+    }
     #[cfg(test)]
     pub(super) fn fixture(target: RuntimeTarget, incarnation: &str) -> Self {
         Self {
@@ -46,6 +55,7 @@ pub struct RemoteOwner {
     incoming: Mutex<Option<mpsc::Receiver<(FrameV1, Instant)>>>,
     pub(super) logins: Mutex<HashMap<u64, (ScopeStamp, Option<BrokerRequestV1>)>>,
     background: Option<Arc<dyn PrivateBackgroundDispatcher>>,
+    commands: Option<Arc<dyn crate::host::PrivateOwnerCommands>>,
 }
 #[cfg(test)]
 pub(super) fn acknowledge_test_control(owner: &RemoteOwner, id: u64, ack: ControlAckV1) {
@@ -59,6 +69,29 @@ struct AdmissionLease<'a> {
     owner: &'a RemoteOwner,
     lease: PreparedLease,
     granted: bool,
+}
+
+struct RemoteCleanupLease {
+    outbox: Arc<Outbox>,
+    lease: PreparedLease,
+}
+impl Drop for RemoteCleanupLease {
+    fn drop(&mut self) {
+        let result = self.outbox.id().and_then(|id| {
+            self.outbox.enqueue(
+                FrameV1::new(
+                    id,
+                    MessageV1::Control(ControlV1::Abort {
+                        lease: self.lease.clone(),
+                    }),
+                ),
+                Instant::now() + REQUEST_BUDGET,
+            )
+        });
+        if result.is_err() {
+            self.outbox.close();
+        }
+    }
 }
 impl Drop for AdmissionLease<'_> {
     fn drop(&mut self) {
@@ -117,6 +150,9 @@ impl Drop for RemoteOwner {
 }
 
 impl RemoteOwner {
+    pub fn is_connected(&self) -> bool {
+        !self.outbox.is_closed()
+    }
     pub fn new<S>(
         stream: S,
         binding: LaunchBinding,
@@ -132,6 +168,18 @@ impl RemoteOwner {
         binding: LaunchBinding,
         profile: RuntimeClientProfile,
         background: Option<Arc<dyn PrivateBackgroundDispatcher>>,
+    ) -> Result<Arc<Self>, PrivateError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::new_with_owner(stream, binding, profile, background, None)
+    }
+    pub fn new_with_owner<S>(
+        stream: S,
+        binding: LaunchBinding,
+        profile: RuntimeClientProfile,
+        background: Option<Arc<dyn PrivateBackgroundDispatcher>>,
+        commands: Option<Arc<dyn crate::host::PrivateOwnerCommands>>,
     ) -> Result<Arc<Self>, PrivateError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -152,6 +200,7 @@ impl RemoteOwner {
             incoming: Mutex::new(Some(incoming)),
             logins: Mutex::new(HashMap::new()),
             background,
+            commands,
         }))
     }
     pub fn revoke_peer(&self) {
@@ -166,7 +215,7 @@ impl RemoteOwner {
         }
         Ok(())
     }
-    async fn control(
+    pub(super) async fn control(
         &self,
         control: ControlV1,
         deadline: Instant,
@@ -283,7 +332,7 @@ impl RemoteOwner {
             outbox: self.outbox.clone(),
         })
     }
-    async fn prepare(&self, deadline: Instant) -> Result<PreparedLease, PrivateError> {
+    pub(super) async fn prepare(&self, deadline: Instant) -> Result<PreparedLease, PrivateError> {
         match self
             .control(
                 ControlV1::Prepare {
@@ -322,6 +371,20 @@ impl RemoteOwner {
             ControlAckV1::Committed => {}
             _ => return Err(PrivateError::Protocol),
         }
+        self.grant_committed(broker, access, lease, reply_to, deadline)
+            .await
+    }
+
+    async fn grant_committed(
+        &self,
+        broker: &AuthBroker,
+        access: AccessSnapshot,
+        lease: PreparedLease,
+        reply_to: Option<u64>,
+        deadline: Instant,
+    ) -> Result<(), PrivateError> {
+        self.check_target(&access)?;
+        let scope = scope(&access);
         broker
             .with_current_access(&access, || {
                 // Only lock-free checks and bounded synchronous enqueue occur in
@@ -354,9 +417,89 @@ impl RemoteOwner {
             .await
             .map_err(broker_error)
     }
+
+    pub async fn runtime_cleanup_handoff(
+        &self,
+        source: &crate::TransitionSourceSnapshot,
+    ) -> Result<crate::RuntimeCleanupHandoff, PrivateError> {
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let lease = self.prepare(deadline).await?;
+        let held = RemoteCleanupLease {
+            outbox: self.outbox.clone(),
+            lease: lease.clone(),
+        };
+        let source_scope = source.identity().map(|identity| RuntimeAuthScope {
+            auth_epoch: source.auth_epoch(),
+            family: source.family().into(),
+            identity: identity.clone(),
+        });
+        let snapshot = match self
+            .control(
+                ControlV1::CleanupSourceSnapshot {
+                    lease,
+                    scope: source_scope,
+                },
+                deadline,
+            )
+            .await?
+        {
+            ControlAckV1::CleanupSnapshot { snapshot } => snapshot,
+            _ => return Err(PrivateError::Protocol),
+        };
+        if !source.matches_runtime_scope(snapshot.auth_scope.as_ref())
+            || source.identity().is_some_and(|identity| {
+                identity.slot != snapshot.slot
+                    || identity.runtime_version != snapshot.runtime_version
+            })
+        {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        Ok(crate::RuntimeCleanupHandoff::remote(snapshot, held))
+    }
+
+    pub async fn complete_runtime_cleanup(
+        &self,
+        broker: &AuthBroker,
+        snapshot: &nelomai_client_storage::RuntimeCleanupSnapshotV1,
+        access: &AccessSnapshot,
+    ) -> Result<(), PrivateError> {
+        self.check_target(access)?;
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let lease = self.prepare(deadline).await?;
+        let mut held = AdmissionLease {
+            owner: self,
+            lease: lease.clone(),
+            granted: false,
+        };
+        match self
+            .control(
+                ControlV1::CompleteCleanup {
+                    lease: lease.clone(),
+                    snapshot: snapshot.clone(),
+                    scope: scope(access),
+                },
+                deadline,
+            )
+            .await?
+        {
+            ControlAckV1::Committed => {}
+            _ => return Err(PrivateError::Protocol),
+        }
+        self.grant_committed(broker, access.clone(), lease, None, deadline)
+            .await?;
+        held.granted = true;
+        Ok(())
+    }
     /// Explicit startup/control admission. Read-only state/access never binds a
     /// missing runtime scope. The actual child record is the only full writer.
     pub async fn admit_empty_current(&self, broker: &AuthBroker) -> Result<(), PrivateError> {
+        self.admit_current_after(broker, || Ok(())).await
+    }
+    pub(crate) async fn admit_current_after(
+        &self,
+        broker: &AuthBroker,
+        finish: impl FnOnce() -> Result<(), PrivateError> + Send,
+    ) -> Result<(), PrivateError> {
         let deadline = Instant::now() + REQUEST_BUDGET;
         timeout_at(deadline, async {
             let lease = self.prepare(deadline).await?;
@@ -367,6 +510,12 @@ impl RemoteOwner {
             };
             let observation = broker.observe().await.map_err(broker_error)?;
             let access = observation.access.ok_or(PrivateError::RecoveryRequired)?;
+            broker
+                .with_current_access(&access, || {
+                    finish().map_err(|_| BrokerError::RecoveryRequired)
+                })
+                .await
+                .map_err(broker_error)?;
             self.commit_and_grant(broker, access, lease, None, deadline)
                 .await?;
             held.granted = true;
@@ -382,6 +531,52 @@ impl RemoteOwner {
             Err(PrivateError::Cancelled)
         }
     }
+    pub(crate) async fn recover_logout(
+        &self,
+        broker: &AuthBroker,
+        coordinator: &crate::SwitchCoordinator,
+    ) -> Result<(), PrivateError> {
+        let _execution = coordinator.lock_logout_cleanup().await;
+        let Some(receipt) = broker
+            .completed_runtime_logout()
+            .await
+            .map_err(broker_error)?
+        else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        let lease = self.prepare(deadline).await?;
+        let _held = AdmissionLease {
+            owner: self,
+            lease: lease.clone(),
+            granted: false,
+        };
+        broker
+            .stop_runtime_logout_cleanup(&receipt)
+            .await
+            .map_err(broker_error)?;
+        match self
+            .control(
+                ControlV1::CompleteLogout {
+                    lease,
+                    receipt: receipt.clone(),
+                },
+                deadline,
+            )
+            .await?
+        {
+            ControlAckV1::Done => {}
+            _ => return Err(PrivateError::RecoveryRequired),
+        }
+        coordinator
+            .retire_logout_journal(&receipt)
+            .await
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        broker
+            .finish_runtime_logout_cleanup(&receipt)
+            .await
+            .map_err(broker_error)
+    }
     pub(super) async fn request(
         &self,
         broker: &AuthBroker,
@@ -395,6 +590,15 @@ impl RemoteOwner {
             self.live(deadline)?;
         }
         let response = match request {
+            AuthRequestV1::Owner { request } => {
+                let commands = self
+                    .commands
+                    .as_ref()
+                    .ok_or(PrivateError::RecoveryRequired)?;
+                let response = commands.dispatch(&self.binding.target, request).await?;
+                self.live(deadline)?;
+                AuthResponseV1::Owner { response }
+            }
             AuthRequestV1::State => {
                 let (stamp, observation) = broker.observe_stamped().await.map_err(broker_error)?;
                 let state = match observation.state {
@@ -542,6 +746,14 @@ impl RemoteOwner {
                     .logout_pending_login_fenced(&stamp, pending.as_ref())
                     .await
                     .map_err(broker_error)?;
+                if let Some(commands) = &self.commands {
+                    commands
+                        .dispatch(
+                            &self.binding.target,
+                            crate::host::HostRequestV1::RuntimeReady,
+                        )
+                        .await?;
+                }
                 AuthResponseV1::Done
             }
             AuthRequestV1::BackgroundCredential { stamp, action } => {
@@ -688,6 +900,21 @@ impl Drop for PrivateRuntimeAuthClient {
     }
 }
 impl PrivateRuntimeAuthClient {
+    pub async fn owner_request(
+        &self,
+        request: crate::host::HostRequestV1,
+    ) -> Result<crate::host::HostResponseV1, PrivateError> {
+        match self
+            .request(
+                AuthRequestV1::Owner { request },
+                Instant::now() + REQUEST_BUDGET,
+            )
+            .await?
+        {
+            AuthResponseV1::Owner { response } => Ok(response),
+            _ => Err(PrivateError::Protocol),
+        }
+    }
     pub async fn background(
         &self,
         action: BackgroundAction,
@@ -801,6 +1028,19 @@ impl PrivateRuntimeAuthClient {
                             ControlV1::CheckScope { scope } => {
                                 client_child.check(&scope).map(|()| ControlAckV1::Done)
                             }
+                            ControlV1::CleanupSourceSnapshot { lease, scope } => client_child
+                                .cleanup_snapshot_for(&lease, scope.as_ref())
+                                .map(|snapshot| ControlAckV1::CleanupSnapshot { snapshot }),
+                            ControlV1::CompleteCleanup {
+                                lease,
+                                snapshot,
+                                scope,
+                            } => client_child
+                                .complete_cleanup(&lease, &snapshot, &scope)
+                                .map(|()| ControlAckV1::Committed),
+                            ControlV1::CompleteLogout { lease, receipt } => client_child
+                                .complete_logout(&lease, &receipt)
+                                .map(|()| ControlAckV1::Done),
                             ControlV1::Stop => {
                                 if controls.len() >= MAX_PENDING {
                                     break;
@@ -912,6 +1152,33 @@ impl PrivateRuntimeAuthClient {
         Ok(self.stamp.lock().map_err(|_| PrivateError::Closed)?.clone())
     }
 }
+#[async_trait]
+impl nelomai_client_core::RuntimeStartPreflight for PrivateRuntimeAuthClient {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        match self
+            .owner_request(crate::host::HostRequestV1::BeforeTunnelStart)
+            .await
+            .map_err(core_error)?
+        {
+            crate::host::HostResponseV1::Done => Ok(()),
+            _ => Err(core_error(PrivateError::Protocol)),
+        }
+    }
+    fn check_start_barrier(&self) -> Result<(), CoreError> {
+        // Called under the core writer gate: no IPC or recovery is permitted.
+        let stamp = self
+            .stamp
+            .lock()
+            .map_err(|_| CoreError::AuthRecoveryRequired)?;
+        let scope = stamp
+            .as_ref()
+            .ok_or(CoreError::AuthRecoveryRequired)?
+            .runtime_scope()
+            .map_err(|_| CoreError::AuthRecoveryRequired)?;
+        self.child.check(&scope).map_err(core_error)
+    }
+}
+
 #[async_trait]
 impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
     async fn state(&self) -> Result<RuntimeAuthState, CoreError> {

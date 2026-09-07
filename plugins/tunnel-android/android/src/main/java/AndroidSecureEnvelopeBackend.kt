@@ -22,12 +22,15 @@ private const val GCM_TAG_BITS = 128
 
 internal class AndroidSecureEnvelopeBackend(
     context: Context,
-    private val preferenceName: String = RECOVERY_PREFERENCES,
+    preferenceName: String = RECOVERY_PREFERENCES,
     private val recordName: String = RECOVERY_RECORD,
-    private val keyAlias: String = RECOVERY_KEY_ALIAS,
+    keyAlias: String = RECOVERY_KEY_ALIAS,
+    scoped: Boolean = true,
 ) : EncryptedRecordBackend {
+    private val preferenceName = if (scoped) AndroidRuntimeNamespace.record(preferenceName) else preferenceName
+    private val keyAlias = if (scoped) AndroidRuntimeNamespace.record(keyAlias) else keyAlias
     private val preferences = context.applicationContext.getSharedPreferences(
-        preferenceName,
+        this.preferenceName,
         Context.MODE_PRIVATE,
     )
     private val gate = Any()

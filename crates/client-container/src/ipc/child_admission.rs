@@ -7,14 +7,176 @@ use tokio::time::{timeout_at, Instant};
 /// Implemented by the sole record owner in the child. No parent record writer
 /// and no access token are needed to validate/bind nonsecret provenance.
 pub trait ScopeAdmission: Send + Sync {
+    fn complete_logout(
+        &self,
+        _: &nelomai_client_storage::CompletedRuntimeLogoutV1,
+        _: &RuntimeWriterQuiescence,
+    ) -> Result<(), PrivateError> {
+        Err(PrivateError::RecoveryRequired)
+    }
     fn check_scope(&self, scope: &RuntimeAuthScope) -> Result<(), PrivateError>;
     fn bind_empty_scope(
         &self,
         scope: &RuntimeAuthScope,
         writers: &RuntimeWriterQuiescence,
     ) -> Result<(), PrivateError>;
+    fn cleanup_snapshot(
+        &self,
+    ) -> Result<nelomai_client_storage::RuntimeCleanupSnapshotV1, PrivateError> {
+        Err(PrivateError::RecoveryRequired)
+    }
+    fn cleanup_snapshot_for(
+        &self,
+        scope: Option<&RuntimeAuthScope>,
+    ) -> Result<nelomai_client_storage::RuntimeCleanupSnapshotV1, PrivateError> {
+        let snapshot = self.cleanup_snapshot()?;
+        if snapshot.auth_scope.as_ref() != scope {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        Ok(snapshot)
+    }
+    fn complete_cleanup(
+        &self,
+        _snapshot: &nelomai_client_storage::RuntimeCleanupSnapshotV1,
+        _scope: &RuntimeAuthScope,
+        _writers: &RuntimeWriterQuiescence,
+    ) -> Result<(), PrivateError> {
+        Err(PrivateError::RecoveryRequired)
+    }
+}
+
+/// Runtime-local owners for selected state and explicitly inherited cleanup
+/// namespaces. Old operational state is never copied into selected state.
+pub struct RuntimeRecordInventory<S> {
+    target: Arc<RuntimeRecordOwner<S>>,
+    retained: Vec<Arc<RuntimeRecordOwner<S>>>,
+}
+impl<S: RuntimeStateStore> RuntimeRecordInventory<S> {
+    pub fn new(
+        target: Arc<RuntimeRecordOwner<S>>,
+        retained: Vec<Arc<RuntimeRecordOwner<S>>>,
+    ) -> Self {
+        Self { target, retained }
+    }
+}
+impl<S: RuntimeStateStore> ScopeAdmission for RuntimeRecordInventory<S> {
+    fn complete_logout(
+        &self,
+        receipt: &nelomai_client_storage::CompletedRuntimeLogoutV1,
+        writers: &RuntimeWriterQuiescence,
+    ) -> Result<(), PrivateError> {
+        use crate::RuntimeAdmission;
+        // Only the exact receipt source is eligible, never all old namespaces.
+        let mut matches = Vec::new();
+        for owner in self.retained.iter().chain([&self.target]) {
+            let snapshot = owner
+                .cleanup_snapshot()
+                .map_err(|_| PrivateError::RecoveryRequired)?;
+            if receipt.source.identity.as_ref().map_or_else(
+                || Arc::ptr_eq(owner, &self.target),
+                |identity| {
+                    identity.slot == snapshot.slot
+                        && identity.runtime_version == snapshot.runtime_version
+                },
+            ) {
+                matches.push(owner);
+            }
+        }
+        if matches.len() != 1 {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        crate::RuntimeCacheAdmission::new(matches[0].clone())
+            .complete_logout(receipt, writers)
+            .map_err(|_| PrivateError::RecoveryRequired)
+    }
+    fn check_scope(&self, scope: &RuntimeAuthScope) -> Result<(), PrivateError> {
+        ScopeAdmission::check_scope(self.target.as_ref(), scope)
+    }
+    fn bind_empty_scope(
+        &self,
+        scope: &RuntimeAuthScope,
+        writers: &RuntimeWriterQuiescence,
+    ) -> Result<(), PrivateError> {
+        ScopeAdmission::bind_empty_scope(self.target.as_ref(), scope, writers)
+    }
+    fn cleanup_snapshot(
+        &self,
+    ) -> Result<nelomai_client_storage::RuntimeCleanupSnapshotV1, PrivateError> {
+        ScopeAdmission::cleanup_snapshot(self.target.as_ref())
+    }
+    fn cleanup_snapshot_for(
+        &self,
+        scope: Option<&RuntimeAuthScope>,
+    ) -> Result<nelomai_client_storage::RuntimeCleanupSnapshotV1, PrivateError> {
+        let mut matches = self
+            .retained
+            .iter()
+            .chain([&self.target])
+            .filter_map(|owner| {
+                let snapshot = owner.cleanup_snapshot().ok()?;
+                (snapshot.auth_scope.as_ref() == scope).then_some(snapshot)
+            });
+        let snapshot = matches.next().ok_or(PrivateError::RecoveryRequired)?;
+        if matches.next().is_some() {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        Ok(snapshot)
+    }
+    fn complete_cleanup(
+        &self,
+        snapshot: &nelomai_client_storage::RuntimeCleanupSnapshotV1,
+        scope: &RuntimeAuthScope,
+        writers: &RuntimeWriterQuiescence,
+    ) -> Result<(), PrivateError> {
+        let target = self
+            .target
+            .cleanup_snapshot()
+            .map_err(|_| PrivateError::RecoveryRequired)?;
+        if target.slot != scope.identity.slot
+            || target.runtime_version != scope.identity.runtime_version
+        {
+            return Err(PrivateError::Protocol);
+        }
+        let mut matching = self.retained.iter().chain([&self.target]).filter(|owner| {
+            owner
+                .cleanup_snapshot()
+                .is_ok_and(|current| current == *snapshot)
+        });
+        let source = matching.next().ok_or(PrivateError::RecoveryRequired)?;
+        if matching.next().is_some() {
+            return Err(PrivateError::RecoveryRequired);
+        }
+        if Arc::ptr_eq(source, &self.target) {
+            return ScopeAdmission::complete_cleanup(source.as_ref(), snapshot, scope, writers);
+        }
+        // Validate/enroll selected empty state before clearing the exact source.
+        // Admission remains closed if either durable operation fails.
+        self.bind_empty_scope(scope, writers)?;
+        source
+            .complete_cleanup(snapshot)
+            .map_err(|_| PrivateError::RecoveryRequired)
+    }
 }
 impl<S: RuntimeStateStore> ScopeAdmission for RuntimeRecordOwner<S> {
+    fn cleanup_snapshot(
+        &self,
+    ) -> Result<nelomai_client_storage::RuntimeCleanupSnapshotV1, PrivateError> {
+        RuntimeRecordOwner::cleanup_snapshot(self).map_err(|_| PrivateError::RecoveryRequired)
+    }
+    fn complete_cleanup(
+        &self,
+        snapshot: &nelomai_client_storage::RuntimeCleanupSnapshotV1,
+        scope: &RuntimeAuthScope,
+        _: &RuntimeWriterQuiescence,
+    ) -> Result<(), PrivateError> {
+        if snapshot.slot != scope.identity.slot
+            || snapshot.runtime_version != scope.identity.runtime_version
+        {
+            return Err(PrivateError::Protocol);
+        }
+        self.complete_cleanup_and_bind(snapshot, scope)
+            .map_err(|_| PrivateError::RecoveryRequired)
+    }
     fn check_scope(&self, scope: &RuntimeAuthScope) -> Result<(), PrivateError> {
         RuntimeRecordOwner::check_scope(self, scope).map_err(|_| PrivateError::RecoveryRequired)
     }
@@ -82,6 +244,18 @@ pub struct ChildAdmission {
     cancelled: tokio::sync::Notify,
 }
 impl ChildAdmission {
+    pub(super) fn complete_logout(
+        &self,
+        lease: &PreparedLease,
+        receipt: &nelomai_client_storage::CompletedRuntimeLogoutV1,
+    ) -> Result<(), PrivateError> {
+        let mut state = self.state.lock().map_err(|_| PrivateError::Closed)?;
+        let held = state.held(lease)?;
+        if held.committed.is_some() {
+            return Err(PrivateError::Cancelled);
+        }
+        self.record.complete_logout(receipt, &held.writers)
+    }
     pub fn new(
         incarnation: String,
         writers: Arc<RuntimeWriterGates>,
@@ -155,6 +329,32 @@ impl ChildAdmission {
             return Err(PrivateError::Cancelled);
         }
         self.record.bind_empty_scope(scope, &held.writers)?;
+        held.committed = Some(scope.clone());
+        Ok(())
+    }
+    pub fn cleanup_snapshot_for(
+        &self,
+        lease: &PreparedLease,
+        scope: Option<&RuntimeAuthScope>,
+    ) -> Result<nelomai_client_storage::RuntimeCleanupSnapshotV1, PrivateError> {
+        let mut state = self.state.lock().map_err(|_| PrivateError::Closed)?;
+        state.held(lease)?;
+        self.record.cleanup_snapshot_for(scope)
+    }
+    pub fn complete_cleanup(
+        &self,
+        lease: &PreparedLease,
+        snapshot: &nelomai_client_storage::RuntimeCleanupSnapshotV1,
+        scope: &RuntimeAuthScope,
+    ) -> Result<(), PrivateError> {
+        scope.validate().map_err(|_| PrivateError::Protocol)?;
+        let mut state = self.state.lock().map_err(|_| PrivateError::Closed)?;
+        let held = state.held(lease)?;
+        if held.committed.is_some() {
+            return Err(PrivateError::Cancelled);
+        }
+        self.record
+            .complete_cleanup(snapshot, scope, &held.writers)?;
         held.committed = Some(scope.clone());
         Ok(())
     }

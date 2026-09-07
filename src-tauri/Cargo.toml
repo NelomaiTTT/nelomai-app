@@ -1,6 +1,6 @@
 [package]
 name = "nelomai-app"
-version = "0.1.7"
+version = "0.2.16"
 description = "Native Nelomai client"
 authors = ["Nelomai"]
 edition = "2021"
@@ -42,6 +42,7 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util"] }

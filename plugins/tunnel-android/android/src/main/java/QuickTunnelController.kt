@@ -253,7 +253,7 @@ object QuickTunnelController {
     }
 
     private fun preferences(context: Context) =
-        context.applicationContext.getSharedPreferences(STATE_PREFERENCES, Context.MODE_PRIVATE)
+        context.applicationContext.getSharedPreferences(AndroidRuntimeNamespace.record(STATE_PREFERENCES), Context.MODE_PRIVATE)
 
     @Synchronized
     private fun migrateLegacyDesiredActive(context: Context): Boolean {

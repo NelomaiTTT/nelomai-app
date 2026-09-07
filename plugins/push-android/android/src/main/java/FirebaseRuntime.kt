@@ -3,6 +3,7 @@ package ru.nelomai.push
 import android.content.Context
 import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
+import ru.nelomai.runtime.v1.RuntimePushGate
 
 internal object FirebaseRuntime {
     private const val PREFERENCES = "nelomai_push"
@@ -28,11 +29,13 @@ internal object FirebaseRuntime {
         return FirebaseApp.initializeApp(context.applicationContext, options)
     }
 
-    fun deliveryEnabled(context: Context): Boolean =
-        preferences(context).getBoolean(DELIVERY_ENABLED, false)
+    private fun gate(context: Context) = RuntimePushGate(context.filesDir)
+    fun epoch(context: Context): Long = gate(context).epoch()
+    fun deliveryEnabled(context: Context): Boolean = gate(context).enabled()
 
-    fun setDeliveryEnabled(context: Context, enabled: Boolean) {
-        preferences(context).edit().putBoolean(DELIVERY_ENABLED, enabled).apply()
+    fun setDeliveryEnabled(context: Context, enabled: Boolean, epoch: Long? = null): Boolean {
+        if (enabled) return epoch != null && gate(context).enable(epoch)
+        gate(context).disable(); return true
     }
 
     fun permissionRequested(context: Context): Boolean =
@@ -43,20 +46,17 @@ internal object FirebaseRuntime {
     }
 
     fun pendingToken(context: Context): String? =
-        preferences(context).getString(PENDING_TOKEN, null)?.takeIf { it.isNotBlank() }
+        gate(context).pendingToken()
 
     fun savePendingToken(context: Context, token: String) {
         if (token.isBlank()) return
-        preferences(context).edit().putString(PENDING_TOKEN, token).apply()
+        gate(context).saveToken(token)
     }
 
-    fun confirmToken(context: Context, token: String) {
-        if (pendingToken(context) == token) {
-            preferences(context).edit().remove(PENDING_TOKEN).apply()
-        }
-    }
+    fun confirmToken(context: Context, token: String, epoch: Long): Boolean = gate(context).confirm(epoch, token)
 
     fun disable(context: Context) {
+        gate(context).revoke(0)
         preferences(context).edit()
             .putBoolean(DELIVERY_ENABLED, false)
             .remove(PENDING_TOKEN)

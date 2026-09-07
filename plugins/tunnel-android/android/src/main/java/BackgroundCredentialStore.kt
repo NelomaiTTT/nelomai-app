@@ -1187,12 +1187,8 @@ internal object AndroidBackgroundCredentialStores {
                 keyAlias = BACKGROUND_KEY_ALIAS,
             ),
         )
-        val current = store.read()
-        if (current is CredentialStoreResult.Success && current.value.revision == 0L) {
-            AndroidLegacyBackgroundCredentialReader(context).read()?.let { legacy ->
-                store.importLegacy(legacy)
-            }
-        }
+        // Legacy import is owned by the locked common migration before any
+        // engine loads; a runtime must never fall back to another namespace.
         return store
     }
 

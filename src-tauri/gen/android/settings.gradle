@@ -1,5 +1,9 @@
 include ':app'
 include ':amneziawg-tunnel'
 project(':amneziawg-tunnel').projectDir = file('../../../plugins/amneziawg-android-tunnel')
+include ':runtime-android-common'
+project(':runtime-android-common').projectDir = file('../../../plugins/runtime-android-common/android')
+include ':stable-runtime-android'
+project(':stable-runtime-android').projectDir = file('../../../plugins/stable-runtime-android')
 
 apply from: 'tauri.settings.gradle'

@@ -180,7 +180,8 @@ internal data class LegacyBackgroundStartServiceBoundary(
     val status: () -> ConnectionIntentServiceStatus?,
 )
 
-class NelomaiVpnService : GoBackend.VpnService() {
+class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVpnHostV1) :
+    GoBackend.VpnService(runtimeHost.service) {
     private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
     private val restoreHandler = Handler(Looper.getMainLooper())
     private val credentialExecutor = Executors.newSingleThreadExecutor { task ->
@@ -209,8 +210,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private var unreadableRecoveryRetryAttempt = 0
 
     override fun getBuilder(): VpnService.Builder =
-        object : VpnService.Builder() {
-            override fun establish(): ParcelFileDescriptor? {
+        runtimeHost.builder { builder ->
+            with(builder) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     val (excludedRoutes, forcedTunnelRoutes) =
                         AndroidSplitTunnel.currentVpnRoutes()
@@ -219,7 +220,6 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     // a panel or local exclusion contains the resolver's parent prefix.
                     forcedTunnelRoutes.forEach(::addRoute)
                 }
-                return super.establish()
             }
         }
 
@@ -345,7 +345,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             intent == null && hasPendingBackgroundLogout() -> scheduleLogoutAttempt()
             intent == null -> {
                 TunnelLog.info("service.idle_restart_stopped")
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf(startId)
                 return START_NOT_STICKY
             }
@@ -1769,7 +1769,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         runCatching {
             ContextCompat.startForegroundService(
                 applicationContext,
-                Intent(applicationContext, NelomaiVpnService::class.java)
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(applicationContext)
                     .setAction(ACTION_ENSURE_RUNNING),
             )
         }.onFailure { error ->
@@ -1966,7 +1966,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 )
             },
             stop = {
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
             },
         )
@@ -2186,7 +2186,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             }
             ContextCompat.startForegroundService(
                 context,
-                Intent(context, NelomaiVpnService::class.java).setAction(ACTION_ENSURE_RUNNING),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_ENSURE_RUNNING),
             )
             return serviceReady
         }
@@ -2194,13 +2194,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
         fun requestToggle(context: Context) {
             ContextCompat.startForegroundService(
                 context,
-                Intent(context, NelomaiVpnService::class.java).setAction(ACTION_QUICK_TOGGLE),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_QUICK_TOGGLE),
             )
         }
 
         fun stopForegroundService() {
             activeService?.run {
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
@@ -2251,7 +2251,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun promoteToForeground() {
         createNotificationChannel()
         ServiceCompat.startForeground(
-            this,
+            systemServiceHost,
             NOTIFICATION_ID,
             connectionNotification(),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {

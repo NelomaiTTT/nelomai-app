@@ -90,7 +90,10 @@ fn artifact(version: &str, slot: RuntimeSlot) -> RuntimeSlotManifestV1 {
             files: vec![RuntimeFileV1 {
                 path: "bin/nelomai-runtime".to_owned(),
                 size_bytes: 17,
-                sha256: "a".repeat(64),
+                sha256: {
+                    use sha2::Digest;
+                    format!("{:x}", sha2::Sha256::digest(b"synthetic-runtime"))
+                },
                 role: RuntimeFileRole::Executable,
             }],
         },
@@ -98,6 +101,16 @@ fn artifact(version: &str, slot: RuntimeSlot) -> RuntimeSlotManifestV1 {
 }
 
 fn install_manifest(resources: &std::path::Path, version: &str, stable: bool) -> [u8; 32] {
+    install_manifest_platform(resources, version, stable, "linux", "x86_64")
+}
+
+fn install_manifest_platform(
+    resources: &std::path::Path,
+    version: &str,
+    stable: bool,
+    platform: &str,
+    architecture: &str,
+) -> [u8; 32] {
     std::fs::create_dir_all(resources).unwrap();
     let mut slots = vec![artifact(version, RuntimeSlot::Latest)];
     let (stable_release_set_sha256, stable_platform_manifest_sha256) = if stable {
@@ -106,6 +119,21 @@ fn install_manifest(resources: &std::path::Path, version: &str, stable: bool) ->
     } else {
         (None, None)
     };
+    for slot in &mut slots {
+        slot.manifest.platform = platform.into();
+        slot.manifest.architecture = architecture.into();
+        let name = match slot.slot {
+            RuntimeSlot::Latest => "latest",
+            RuntimeSlot::Stable => "stable",
+        };
+        let directory = resources
+            .join("engines")
+            .join(name)
+            .join(&slot.manifest.runtime_version)
+            .join("bin");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("nelomai-runtime"), b"synthetic-runtime").unwrap();
+    }
     let manifest = ContainerManifestV1 {
         format_version: 1,
         container_version: version.to_owned(),
@@ -131,6 +159,255 @@ fn install_manifest(resources: &std::path::Path, version: &str, stable: bool) ->
 
 fn selection_path(root: &std::path::Path) -> std::path::PathBuf {
     root.join("common/runtime-selection-v1.json")
+}
+
+#[test]
+fn common_host_rejects_bad_manifest_before_constructing_secret_backend() {
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest(resources.path(), "0.2.16", false);
+    std::fs::write(resources.path().join("container-manifest-v1.sig"), [0; 64]).unwrap();
+    let result = nelomai_client_container::host::prepare_host(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "linux",
+        "x86_64",
+        || -> Records { panic!("unverified startup reached protected backend") },
+    );
+    assert!(result.is_err());
+    assert!(!selection_path(data.path()).exists());
+}
+
+#[test]
+fn common_host_rejects_second_owner_before_constructing_secret_backend() {
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest(resources.path(), "0.2.16", false);
+    let _owner = ContainerOwnerLock::try_acquire(data.path()).unwrap();
+    let result = nelomai_client_container::host::prepare_host(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "linux",
+        "x86_64",
+        || -> Records { panic!("secondary startup reached protected backend") },
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn common_host_keeps_exclusive_owner_and_preserves_install_identity_on_reopen() {
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest(resources.path(), "0.2.16", false);
+    let records = Records::default();
+    let host = nelomai_client_container::host::prepare_host(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "linux",
+        "x86_64",
+        || records.clone(),
+    )
+    .unwrap();
+    assert_eq!(host.selection.target().runtime_version, "0.2.16");
+    assert_eq!(host.selection.target().runtime_slot, RuntimeSlot::Latest);
+    assert!(host
+        .selection
+        .target()
+        .identity(None)
+        .unwrap()
+        .session_generation
+        .is_none());
+    assert!(ContainerOwnerLock::try_acquire(data.path()).is_err());
+    let first = records
+        .values
+        .lock()
+        .unwrap()
+        .get("auth-v1")
+        .unwrap()
+        .clone();
+    drop(host);
+    let _reopened = nelomai_client_container::host::prepare_host(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "linux",
+        "x86_64",
+        || records.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        records.values.lock().unwrap().get("auth-v1").unwrap(),
+        &first
+    );
+}
+
+#[cfg(unix)]
+struct NoNativeWork;
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl nelomai_client_container::LocalAuthStop for NoNativeWork {
+    async fn stop_local(&self) -> Result<(), nelomai_client_container::BrokerError> {
+        Ok(())
+    }
+}
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl nelomai_client_container::ipc::PrivateBackgroundDispatcher for NoNativeWork {
+    async fn prepare_revocation(
+        &self,
+        _: u64,
+    ) -> Result<(), nelomai_client_container::BrokerError> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: nelomai_client_container::NativeAuthRequest,
+        _: nelomai_client_container::ipc::BackgroundAction,
+    ) -> Result<
+        Option<nelomai_client_api::TokenResponse>,
+        nelomai_client_container::NativeAuthFailure,
+    > {
+        panic!("logged-out startup must not issue native credentials")
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_owner_is_ready_without_loading_product_runtime_and_rejects_foreign_uid() {
+    use nelomai_client_container::host::{CommonHost, HostNativePorts, RuntimeAttachRequest};
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest_platform(resources.path(), "0.2.16", false, "android", "aarch64");
+    let host = CommonHost::open(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "android",
+        "aarch64",
+        Records::default,
+        nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap(),
+        nelomai_client_container::RuntimeClientProfile {
+            platform: nelomai_contracts::Platform::Android,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+        HostNativePorts {
+            stop: Arc::new(NoNativeWork),
+            force: Arc::new(nelomai_client_container::UnavailableRuntimeForceStop),
+            background: Arc::new(NoNativeWork),
+            updater: None,
+            storage: None,
+        },
+    )
+    .unwrap();
+    let view = host.selection().await.unwrap();
+    assert_eq!(view.target.runtime_slot, RuntimeSlot::Latest);
+    assert_eq!(view.target.container_version, "0.2.16");
+    assert_eq!(view.session_generation, None);
+    assert_eq!(view.pending_slot, None);
+    assert!(ContainerOwnerLock::try_acquire(data.path()).is_err());
+    let (stream, _peer) = tokio::io::duplex(1024);
+    let request = RuntimeAttachRequest {
+        target: view.target,
+        session_generation: None,
+        incarnation: view.incarnation,
+    };
+    let uid = unsafe { libc::geteuid() };
+    assert!(host
+        .attach_android(stream, 999, uid + 1, uid, &request)
+        .await
+        .is_err());
+    assert_eq!(
+        host.broker().observe().await.unwrap().state,
+        nelomai_client_container::BrokerAuthState::RecoveryRequired
+    );
+    let (stream, mut accepted_peer) = tokio::io::duplex(1024);
+    assert!(host
+        .attach_android(stream, 999, uid, uid, &request)
+        .await
+        .is_ok());
+    use nelomai_client_container::ipc::*;
+    let deadline = tokio::time::Instant::now() + REQUEST_BUDGET;
+    write_frame(
+        &mut accepted_peer,
+        FrameV1::new(
+            1,
+            MessageV1::Request(AuthRequestV1::Owner {
+                request: nelomai_client_container::host::HostRequestV1::RuntimeStatus,
+            }),
+        ),
+        deadline,
+    )
+    .await
+    .unwrap();
+    let response = read_frame(&mut accepted_peer, deadline).await.unwrap();
+    assert_eq!(response.id, 1);
+    match response.message {
+        MessageV1::Response(AuthResponseV1::Owner {
+            response: nelomai_client_container::host::HostResponseV1::RuntimeStatus { status },
+        }) => {
+            assert_eq!(status.selected_slot, RuntimeSlot::Latest);
+            assert_eq!(status.pending_slot, None);
+            assert!(!status.stable_available);
+        }
+        _ => panic!("private common owner status was not delivered"),
+    }
+    write_frame(
+        &mut accepted_peer,
+        FrameV1::new(
+            2,
+            MessageV1::Request(AuthRequestV1::Owner {
+                request: nelomai_client_container::host::HostRequestV1::UpdateSetAutomatic {
+                    enabled: false,
+                },
+            }),
+        ),
+        deadline,
+    )
+    .await
+    .unwrap();
+    match read_frame(&mut accepted_peer, deadline)
+        .await
+        .unwrap()
+        .message
+    {
+        MessageV1::Response(AuthResponseV1::Owner {
+            response: nelomai_client_container::host::HostResponseV1::UpdateStatus { status },
+        }) => {
+            assert!(!status.automatic);
+            assert!(!status.supported);
+            assert_eq!(status.phase, "idle");
+        }
+        _ => panic!("common updater preference was not applied"),
+    }
+    assert!(data.path().join("updates/preferences.json").is_file());
+    write_frame(
+        &mut accepted_peer,
+        FrameV1::new(
+            3,
+            MessageV1::Request(AuthRequestV1::Owner {
+                request: nelomai_client_container::host::HostRequestV1::RuntimeReady,
+            }),
+        ),
+        deadline,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame(&mut accepted_peer, deadline)
+            .await
+            .unwrap()
+            .message,
+        MessageV1::Response(AuthResponseV1::Owner {
+            response: nelomai_client_container::host::HostResponseV1::Done
+        })
+    ));
+    // Fresh/unauthenticated startup is permitted to display login, but must not
+    // fabricate an access generation or grant the child start admission.
+    assert_eq!(host.selection().await.unwrap().session_generation, None);
 }
 
 #[test]
@@ -161,6 +438,103 @@ fn first_start_persists_latest_only_after_real_storage_startup_succeeds() {
     assert_eq!(persisted["selected_slot"], "latest");
     assert!(persisted["pending_slot"].is_null());
     assert!(!app_data.path().join("runtime-selection-v1.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_admits_real_private_child_and_preserves_generation_without_access() {
+    use nelomai_client_container::{host::*, ipc::*};
+    use nelomai_client_core::{RuntimeAuthProvider, RuntimeStartPreflight, RuntimeWriterGates};
+    use nelomai_client_storage::*;
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest_platform(resources.path(), "0.2.16", false, "android", "aarch64");
+    let records = Records::default();
+    let host = CommonHost::open(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "android",
+        "aarch64",
+        || records.clone(),
+        nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap(),
+        nelomai_client_container::RuntimeClientProfile {
+            platform: nelomai_contracts::Platform::Android,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+        HostNativePorts {
+            stop: Arc::new(NoNativeWork),
+            force: Arc::new(nelomai_client_container::UnavailableRuntimeForceStop),
+            background: Arc::new(NoNativeWork),
+            updater: None,
+            storage: None,
+        },
+    )
+    .unwrap();
+    let initial = host.selection().await.unwrap();
+    let auth = ProtectedAuthStore::new(records.record("auth-v1"));
+    let mut state = auth.load().unwrap().unwrap();
+    state.refresh_token = Some("synthetic-refresh".into());
+    state.confirmed_identity = Some(initial.target.identity(Some(7)).unwrap());
+    state.session_generation = Some(7);
+    auth.save(&state).unwrap();
+    assert_eq!(
+        host.selection().await.unwrap().session_generation,
+        Some(7),
+        "missing access must not erase confirmed generation"
+    );
+    state.access_token = Some("synthetic-access".into());
+    auth.save(&state).unwrap();
+    let view = host.selection().await.unwrap();
+    let paths = view.runtime_paths().unwrap();
+    let selected = paths
+        .iter()
+        .find(|path| {
+            path.slot() == view.target.runtime_slot
+                && path.runtime_version() == view.target.runtime_version
+        })
+        .unwrap();
+    let record = RuntimeRecordOwner::new(ProtectedRuntimeStore::new(
+        records.record(selected.namespace()),
+        selected.clone(),
+    ));
+    let child = Arc::new(ChildAdmission::new(
+        view.incarnation.clone(),
+        Arc::new(RuntimeWriterGates::default()),
+        Arc::new(RuntimeRecordInventory::new(record.clone(), vec![])),
+    ));
+    let (parent, child_socket) = private_socketpair().unwrap();
+    let request = RuntimeAttachRequest {
+        target: view.target,
+        session_generation: view.session_generation,
+        incarnation: view.incarnation,
+    };
+    let uid = unsafe { libc::geteuid() };
+    host.attach_android(parent, std::process::id(), uid, uid, &request)
+        .await
+        .unwrap();
+    let client = PrivateRuntimeAuthClient::new(child_socket, child, Arc::new(NoNativeWork));
+    assert!(client.access(None).await.is_err());
+    assert!(client.check_start_barrier().is_err());
+    assert!(matches!(
+        client
+            .owner_request(HostRequestV1::RuntimeReady)
+            .await
+            .unwrap(),
+        HostResponseV1::Done
+    ));
+    assert_eq!(
+        client
+            .access(None)
+            .await
+            .unwrap()
+            .identity()
+            .session_generation,
+        Some(7)
+    );
+    assert!(client.check_start_barrier().is_ok());
+    assert!(record.cleanup_snapshot().unwrap().auth_scope.is_some());
 }
 
 #[test]

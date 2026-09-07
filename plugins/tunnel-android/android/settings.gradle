@@ -28,6 +28,8 @@ dependencyResolutionManagement {
 }
 
 include ':tauri-android'
+include ':runtime-android-common'
+project(':runtime-android-common').projectDir = new File(rootDir, '../../runtime-android-common/android')
 include ':amneziawg-tunnel'
 project(':amneziawg-tunnel').projectDir = new File(rootDir, '../../amneziawg-android-tunnel')
 def tauriAndroidProjectDir = System.getenv('TAURI_ANDROID_PROJECT_DIR')

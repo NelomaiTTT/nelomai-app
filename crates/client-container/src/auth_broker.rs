@@ -104,6 +104,11 @@ pub struct ScopeStamp {
     identity: Option<nelomai_contracts::RuntimeIdentity>,
 }
 impl ScopeStamp {
+    pub(crate) fn session_generation(&self) -> Option<u64> {
+        self.identity
+            .as_ref()
+            .and_then(|identity| identity.session_generation)
+    }
     pub(crate) fn runtime_scope(
         &self,
     ) -> Result<nelomai_client_storage::RuntimeAuthScope, BrokerError> {

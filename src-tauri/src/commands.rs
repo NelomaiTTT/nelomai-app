@@ -1,5 +1,6 @@
 use crate::connection_metrics::{ConnectionMetricsResponse, ConnectionMetricsTracker};
 use crate::diagnostics::AppDiagnostics;
+use crate::runtime_control::RuntimeControls;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{
     preferences::{AppPreferenceStore, DnsProvider},
@@ -7,7 +8,7 @@ use crate::{
 };
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
-use nelomai_client_container::{RuntimeSwitchStatusV1, SwitchCoordinator};
+use nelomai_client_container::RuntimeSwitchStatusV1;
 use nelomai_client_core::{
     split_tunnel_active, ConnectOptions, CoreApiError, CoreError, CoreState, Phase,
     SplitTunnelContext,
@@ -821,6 +822,12 @@ async fn bootstrap_application_for_startup(
 ) -> Result<Bootstrap, CommandError> {
     #[cfg(target_os = "android")]
     {
+        app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+            .owner_request(nelomai_client_container::host::HostRequestV1::RuntimeReady)
+            .await
+            .map_err(|_| {
+                CommandError::from_core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            })?;
         let first_error = match application.bootstrap_without_refresh(now_unix).await {
             Ok(response) => return Ok(response),
             Err(error) => error,
@@ -828,47 +835,18 @@ async fn bootstrap_application_for_startup(
         diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
         // Eligibility comes from the owner and exact runtime admission, not the
         // presentation error. No error callback clears native protected state.
-        let owner = app.state::<Arc<nelomai_client_container::OwnerRuntimeAuth>>();
-        let recovery = owner.recover_background(|request| async move {
-            use nelomai_client_container::NativeAuthFailure;
-            let operation = request
-                .operation_json()
-                .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
-            let result = app
-                .tunnel_android()
-                .recover_background_session(
-                    tauri_plugin_tunnel_android::BackgroundSessionRecoveryRequest {
-                        install_secret: request.install_secret,
-                        owner_operation: operation,
-                    },
-                )
-                .await
-                .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
-            if let Some(code) = result.error_code.as_deref() {
-                return Err(match code {
-                    "invalid_background_token"
-                    | "invalid_background_recovery"
-                    | "activation_not_applied"
-                    | "background_recovery_unsupported"
-                    | "background_owner_scope_mismatch"
-                    | "background_credential_unavailable" => NativeAuthFailure::NotIssued,
-                    "app_access_unavailable" => NativeAuthFailure::AccessUnavailable,
-                    _ => NativeAuthFailure::OutcomeUnknown,
-                });
-            }
-            serde_json::from_str(
-                result
-                    .response_json
-                    .as_deref()
-                    .ok_or(NativeAuthFailure::OutcomeUnknown)?,
-            )
-            .map_err(|_| NativeAuthFailure::OutcomeUnknown)
-        });
+        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+        let recovery = owner.background(nelomai_client_container::ipc::BackgroundAction::Recover);
         // Only a known-not-issued recovery clears its own ticket. A genuinely
         // lost refresh/recovery stays fenced, so this cannot retry its old proof.
         route_android_startup_recovery(
             first_error,
-            async { recovery.await.map(|_| ()) },
+            async {
+                recovery
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| nelomai_client_core::CoreError::AuthRecoveryRequired)
+            },
             application.bootstrap(now_unix),
         )
         .await
@@ -2205,6 +2183,13 @@ pub async fn app_login(
         )
         .await
         .map_err(CommandError::from)?;
+    #[cfg(target_os = "android")]
+    app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+        .owner_request(nelomai_client_container::host::HostRequestV1::RuntimeReady)
+        .await
+        .map_err(|_| {
+            CommandError::from_core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+        })?;
     #[cfg(desktop)]
     diagnostics.set_automatic_device(&response.device.id);
     #[cfg(not(target_os = "android"))]
@@ -2351,57 +2336,15 @@ async fn provision_android_background(
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     {
-        let _ = application;
-        let desired = android_background_capability_snapshot(capability, now_unix());
-        let owner = app.state::<Arc<nelomai_client_container::OwnerRuntimeAuth>>();
-        owner
-            .provision_background(|request| async move {
-                use nelomai_client_container::NativeAuthFailure;
-                if request.ticket.device_id.as_deref() != Some(device_id) {
-                    return Err(NativeAuthFailure::NotIssued);
-                }
-                let operation = request
-                    .operation_json()
-                    .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
-                let status = app
-                    .tunnel_android()
-                    .background_credential_status_async()
-                    .await
-                    .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
-                let mode = match android_background_provision_mode(
-                    &status,
-                    device_id,
-                    &desired,
-                    now_unix(),
-                ) {
-                    AndroidBackgroundProvisionMode::Noop => "noop",
-                    AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase => "two_phase",
-                    AndroidBackgroundProvisionMode::RefreshStoredCapability => "rotate",
-                    AndroidBackgroundProvisionMode::Legacy => "legacy",
-                };
-                // One owner-issued snapshot drives Bearer prepare; native code
-                // resumes any existing reservation/activation instead of minting anew.
-                app.tunnel_android()
-                    .provision_background_async(
-                        tauri_plugin_tunnel_android::BackgroundUiProvisionRequest {
-                            api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
-                            expected_revision: status.credential_revision,
-                            device_id: device_id.into(),
-                            panel_base: crate::PANEL_BASE.into(),
-                            access_token: request.access.access_token().into(),
-                            install_secret: request.install_secret,
-                            owner_operation: operation,
-                            mode: mode.into(),
-                            capability_revision: desired.revision,
-                            capability_enabled: desired.enabled,
-                            capability_expires_at: desired.expires_at,
-                        },
-                    )
-                    .await
-                    .map_err(|_| NativeAuthFailure::OutcomeUnknown)
-            })
+        // The common owner obtains device/capability from its own admitted
+        // bootstrap, never from UI-provided install-secret or refresh material.
+        let _ = (application, device_id, capability);
+        app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+            .background(nelomai_client_container::ipc::BackgroundAction::Provision)
             .await
-            .map_err(CommandError::from_core)?;
+            .map_err(|_| {
+                CommandError::from_core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            })?;
     }
     #[cfg(not(target_os = "android"))]
     let _ = (app, application, device_id, capability);
@@ -3168,10 +3111,17 @@ fn stable_diagnostics_connection_lease(
 }
 
 #[tauri::command]
-pub fn app_update_status(
+pub async fn app_update_status(
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    updater.status().map_err(update_command_error)
+    #[cfg(not(target_os = "android"))]
+    {
+        updater.status().map_err(update_command_error)
+    }
+    #[cfg(target_os = "android")]
+    {
+        updater.status().await.map_err(update_command_error)
+    }
 }
 
 #[tauri::command]
@@ -3179,33 +3129,52 @@ pub async fn app_update_refresh(
     application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    let Some(_refresh_guard) = updater.try_begin_refresh() else {
-        return updater.status().map_err(update_command_error);
-    };
-    let update = application
-        .refresh_update_state()
-        .await
-        .map_err(CommandError::from)?;
-    updater.observe(&update).map_err(update_command_error)?;
-    if updater.automatic_enabled().map_err(update_command_error)? {
-        schedule_automatic_update(application.inner().clone(), updater.inner().clone());
+    #[cfg(target_os = "android")]
+    {
+        let _ = application;
+        updater.refresh().await.map_err(update_command_error)
     }
-    updater.status().map_err(update_command_error)
+    #[cfg(not(target_os = "android"))]
+    {
+        let Some(_refresh_guard) = updater.try_begin_refresh() else {
+            return updater.status().map_err(update_command_error);
+        };
+        let update = application
+            .refresh_update_state()
+            .await
+            .map_err(CommandError::from)?;
+        updater.observe(&update).map_err(update_command_error)?;
+        if updater.automatic_enabled().map_err(update_command_error)? {
+            schedule_automatic_update(application.inner().clone(), updater.inner().clone());
+        }
+        updater.status().map_err(update_command_error)
+    }
 }
 
 #[tauri::command]
-pub fn app_update_set_automatic(
+pub async fn app_update_set_automatic(
     application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
     enabled: bool,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    let response = updater
-        .set_automatic(enabled)
-        .map_err(update_command_error)?;
-    if enabled {
-        schedule_automatic_update(application.inner().clone(), updater.inner().clone());
+    #[cfg(target_os = "android")]
+    {
+        let _ = application;
+        updater
+            .set_automatic(enabled)
+            .await
+            .map_err(update_command_error)
     }
-    Ok(response)
+    #[cfg(not(target_os = "android"))]
+    {
+        let response = updater
+            .set_automatic(enabled)
+            .map_err(update_command_error)?;
+        if enabled {
+            schedule_automatic_update(application.inner().clone(), updater.inner().clone());
+        }
+        Ok(response)
+    }
 }
 
 #[tauri::command]
@@ -3213,21 +3182,29 @@ pub async fn app_update_install(
     application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    let bootstrap = application
-        .bootstrap(now_unix())
-        .await
-        .map_err(CommandError::from)?;
-    updater
-        .observe(&bootstrap.update)
-        .map_err(update_command_error)?;
-    let access_token = application
-        .current_access_token()
-        .await
-        .map_err(CommandError::from)?;
-    updater
-        .install_now(&access_token)
-        .await
-        .map_err(update_command_error)
+    #[cfg(target_os = "android")]
+    {
+        let _ = application;
+        updater.install().await.map_err(update_command_error)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let bootstrap = application
+            .bootstrap(now_unix())
+            .await
+            .map_err(CommandError::from)?;
+        updater
+            .observe(&bootstrap.update)
+            .map_err(update_command_error)?;
+        let access_token = application
+            .current_access_token()
+            .await
+            .map_err(CommandError::from)?;
+        updater
+            .install_now(&access_token)
+            .await
+            .map_err(update_command_error)
+    }
 }
 
 #[tauri::command]
@@ -3254,33 +3231,42 @@ fn runtime_switch_error() -> CommandError {
 }
 
 #[tauri::command]
-pub fn app_runtime_switch_status(
-    coordinator: State<'_, Arc<SwitchCoordinator>>,
+pub async fn app_runtime_switch_status(
+    coordinator: State<'_, Arc<RuntimeControls>>,
 ) -> Result<RuntimeSwitchStatusV1, CommandError> {
-    coordinator.status().map_err(|_| runtime_switch_error())
+    coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())
 }
 
 #[tauri::command]
 pub async fn app_runtime_switch_request(
-    coordinator: State<'_, Arc<SwitchCoordinator>>,
+    coordinator: State<'_, Arc<RuntimeControls>>,
     slot: RuntimeSlot,
 ) -> Result<RuntimeSwitchStatusV1, CommandError> {
     coordinator
         .request(slot)
         .await
         .map_err(|_| runtime_switch_error())?;
-    coordinator.status().map_err(|_| runtime_switch_error())
+    coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())
 }
 
 #[tauri::command]
 pub async fn app_runtime_switch_cancel(
-    coordinator: State<'_, Arc<SwitchCoordinator>>,
+    coordinator: State<'_, Arc<RuntimeControls>>,
 ) -> Result<RuntimeSwitchStatusV1, CommandError> {
     coordinator
         .cancel_pending()
         .await
         .map_err(|_| runtime_switch_error())?;
-    coordinator.status().map_err(|_| runtime_switch_error())
+    coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())
 }
 
 #[derive(Clone, Serialize)]
@@ -3589,11 +3575,22 @@ fn observe_and_schedule_update(
     updater: Arc<NativeUpdater>,
     bootstrap: &Bootstrap,
 ) {
-    if updater.observe(&bootstrap.update).is_ok() {
-        schedule_automatic_update(application, updater);
+    #[cfg(target_os = "android")]
+    {
+        let _ = (application, bootstrap);
+        tauri::async_runtime::spawn(async move {
+            let _ = updater.refresh().await;
+        });
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if updater.observe(&bootstrap.update).is_ok() {
+            schedule_automatic_update(application, updater);
+        }
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn schedule_automatic_update(application: Arc<NativeApplication>, updater: Arc<NativeUpdater>) {
     tauri::async_runtime::spawn(async move {
         let Ok(access_token) = application.current_access_token().await else {

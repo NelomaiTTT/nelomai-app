@@ -8,6 +8,17 @@
         android:label="@string/app_name"
         android:theme="@style/Theme.nelomai_app"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
+        <service android:name=".RuntimeAuthBrokerService" android:exported="false" />
+        <activity android:name=".RuntimeApkInstallerActivity" android:exported="false" />
+        <service android:name=".RuntimeVpnDispatcherService" android:exported="false"
+            android:foregroundServiceType="systemExempted" android:permission="android.permission.BIND_VPN_SERVICE"
+            android:process=":vpn" android:stopWithTask="false">
+            <intent-filter><action android:name="android.net.VpnService" /></intent-filter>
+        </service>
+        <activity android:name=".RuntimeBootstrapActivity" android:exported="false" android:process=":runtime" />
+        <activity android:name=".LatestRuntimeActivity" android:exported="false" android:process=":runtime"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode" />
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:launchMode="singleTask"

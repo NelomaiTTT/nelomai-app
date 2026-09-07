@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{timeout_at, Duration, Instant};
 mod child_admission;
-pub use child_admission::{ChildAdmission, ScopeAdmission};
+pub use child_admission::{ChildAdmission, RuntimeRecordInventory, ScopeAdmission};
 mod remote;
 mod transport;
 pub use remote::{
@@ -48,6 +48,9 @@ pub enum PrivateError {
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum AuthRequestV1 {
     State,
+    Owner {
+        request: crate::host::HostRequestV1,
+    },
     Login {
         stamp: Option<ScopeStamp>,
         request: RuntimeLogin,
@@ -77,6 +80,9 @@ pub enum BackgroundAction {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum AuthResponseV1 {
+    Owner {
+        response: crate::host::HostResponseV1,
+    },
     State {
         stamp: ScopeStamp,
         state: RuntimeAuthState,
@@ -127,14 +133,34 @@ pub enum ControlV1 {
     CheckScope {
         scope: RuntimeAuthScope,
     },
+    CleanupSourceSnapshot {
+        lease: PreparedLease,
+        scope: Option<RuntimeAuthScope>,
+    },
+    CompleteCleanup {
+        lease: PreparedLease,
+        snapshot: nelomai_client_storage::RuntimeCleanupSnapshotV1,
+        scope: RuntimeAuthScope,
+    },
+    CompleteLogout {
+        lease: PreparedLease,
+        receipt: nelomai_client_storage::CompletedRuntimeLogoutV1,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ControlAckV1 {
-    Prepared { lease: PreparedLease },
+    Prepared {
+        lease: PreparedLease,
+    },
+    CleanupSnapshot {
+        snapshot: nelomai_client_storage::RuntimeCleanupSnapshotV1,
+    },
     Committed,
     Done,
-    Error { error: PrivateError },
+    Error {
+        error: PrivateError,
+    },
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(

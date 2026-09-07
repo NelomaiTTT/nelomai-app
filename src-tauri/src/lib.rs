@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+mod android_runtime;
 #[cfg(desktop)]
 mod automatic_diagnostics;
 mod commands;
@@ -9,24 +11,36 @@ mod desktop;
 mod diagnostics;
 #[cfg(desktop)]
 mod network_incidents;
+#[cfg(target_os = "android")]
+mod owner_runtime;
 mod platform;
 mod preferences;
 mod resource_usage;
+mod runtime_control;
+#[cfg(not(target_os = "android"))]
+mod updates;
+#[cfg(target_os = "android")]
+#[path = "updates_remote.rs"]
 mod updates;
 
 use nelomai_client_api::ClientApi;
 use nelomai_client_application::{ApplicationError, ClientApplication};
+#[cfg(any(not(target_os = "android"), test))]
+use nelomai_client_container::AuthBroker;
+#[cfg(not(target_os = "android"))]
 use nelomai_client_container::{
-    AuthBroker, InstalledRuntimeSelection, OwnerRuntimeAuth, RuntimeCacheAdmission,
-    RuntimeClientProfile, RuntimeRecordSwitchControl, SelectionRecovery, SwitchCoordinator,
-    UnavailableRuntimeForceStop,
+    OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile, RuntimeRecordSwitchControl,
+    SelectionRecovery, SwitchCoordinator, UnavailableRuntimeForceStop,
 };
 use nelomai_client_core::CoreLocalStop;
+#[cfg(not(target_os = "android"))]
 use nelomai_client_storage::{
-    acknowledge_migration_bootstrap, ContainerOwnerLock, FileMigrationJournal,
-    FileSplitTunnelStore, LegacyMigrationSource, MigrationOutcome, ProtectedAuthStore,
-    ProtectedRecordFactory, ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner,
-    RuntimeStateStore, SystemRecordFactory, SystemSecretStore,
+    acknowledge_migration_bootstrap, FileMigrationJournal, FileSplitTunnelStore,
+    LegacyMigrationSource, MigrationOutcome, ProtectedAuthStore, ProtectedRecordFactory,
+    RuntimeStateStore, SystemRecordFactory,
+};
+use nelomai_client_storage::{
+    ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner, SystemSecretStore,
 };
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -97,7 +111,7 @@ impl PushRegistrationScheduler {
         register_android_push(app, application).await;
     }
 
-    #[cfg(any(target_os = "android", test))]
+    #[cfg(test)]
     async fn cleanup_push<F>(
         &self,
         broker: &AuthBroker,
@@ -112,7 +126,7 @@ impl PushRegistrationScheduler {
     }
 
     /// Caller retains the push gate through native completion.
-    #[cfg(any(target_os = "android", test))]
+    #[cfg(test)]
     async fn cleanup_push_locked<F>(
         broker: &AuthBroker,
         epoch: u64,
@@ -167,39 +181,6 @@ impl PushRegistrationScheduler {
     }
 }
 
-#[cfg(target_os = "android")]
-struct AndroidOwnerStop {
-    app: tauri::AppHandle,
-    local: Arc<CoreLocalStop<platform::PlatformTunnelController>>,
-}
-#[cfg(target_os = "android")]
-#[async_trait::async_trait]
-impl nelomai_client_container::LocalAuthStop for AndroidOwnerStop {
-    async fn stop_local(&self) -> Result<(), nelomai_client_container::BrokerError> {
-        nelomai_client_container::LocalAuthStop::stop_local(self.local.as_ref()).await
-    }
-    async fn prepare_revocation(
-        &self,
-        cancel_epoch: u64,
-    ) -> Result<(), nelomai_client_container::BrokerError> {
-        use tauri_plugin_tunnel_android::TunnelAndroidExt;
-        // This is a genuine asynchronous mobile callback, not a blocking wait
-        // wrapped in an async function. Native keeps cleanup proofs until ACK.
-        self.app
-            .tunnel_android()
-            .prepare_owner_revocation(tauri_plugin_tunnel_android::BackgroundOwnerLogoutRequest {
-                cancel_epoch,
-            })
-            .await
-            .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)?;
-        use tauri::Manager;
-        let broker = self.app.state::<Arc<AuthBroker>>().inner().clone();
-        broker.stage_push_cleanup(cancel_epoch).await?;
-        enqueue_push_cleanup(self.app.clone(), cancel_epoch);
-        Ok(())
-    }
-}
-
 fn current_unix_time() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -231,208 +212,214 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build());
 
     let builder = builder.setup(|app| {
-        use tauri::Manager;
-
-        let app_data_directory = app.path().app_data_dir()?;
-        // Before any secret read/init on every desktop platform (and Android
-        // host process). The Windows plugin above is only an activation UX.
-        let owner_lock = Arc::new(ContainerOwnerLock::try_acquire(&app_data_directory)?);
-        use base64::Engine;
-        let public_key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
-            .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
-            .transpose()
-            .map_err(|_| {
-                std::io::Error::other("runtime_startup_blocked: invalid pinned manifest key")
-            })?;
-        let selection = InstalledRuntimeSelection::prepare(
-            &app.path().resource_dir()?.join("runtime"),
-            owner_lock.as_ref(),
-            public_key.as_deref(),
-            std::env::consts::OS,
-            std::env::consts::ARCH,
-        )?;
-        #[cfg(target_os = "linux")]
-        let fallback = Some(app_data_directory.join("credentials"));
-        #[cfg(not(target_os = "linux"))]
-        let fallback = None;
-
-        let records = SystemRecordFactory::new("primary", fallback.clone());
-        let (selection, storage) =
-            selection.prepare_runtime_storage(owner_lock.as_ref(), &records)?;
-
-        let api = ClientApi::new(PANEL_BASE)
-            .and_then(|api| api.with_app_version(&selection.target().container_version))
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let resource_baseline = resource_usage::ResourceSnapshot::capture(app.handle());
-        let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
-            app.path().app_data_dir()?.join("diagnostics"),
-            resource_baseline,
-        )?);
-        diagnostics.record_named("startup.rust.setup_ready", None, None, None);
-        let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
-        let preferences = Arc::new(preferences::AppPreferenceStore::open_runtime(
-            &nelomai_client_storage::RuntimeStateStore::paths(&storage.runtime).preferences,
-            &app_data_directory.join("preferences.json"),
-        )?);
-        let local = CoreLocalStop::new(tunnel.clone());
         #[cfg(target_os = "android")]
-        let owner_stop = Arc::new(AndroidOwnerStop {
-            app: app.handle().clone(),
-            local: local.clone(),
-        });
-        #[cfg(not(target_os = "android"))]
-        let owner_stop = local.clone();
-        let broker = Arc::new(AuthBroker::new(
-            api.clone(),
-            Arc::new(storage.auth),
-            owner_stop,
-        )?);
-        let migration = storage.migration;
-        let target_paths = storage.runtime.paths().clone();
-        let requires_transition = matches!(
-            selection.recovery(),
-            Some(SelectionRecovery::ContainerVersionChanged)
-        ) || storage
-            .runtime
-            .load()?
-            .is_some_and(|state| state.cleanup_only);
-        let retained_record_owners: Vec<_> = storage
-            .retained
-            .into_iter()
-            .map(RuntimeRecordOwner::new)
-            .collect();
-        let record_owner = RuntimeRecordOwner::new(storage.runtime);
-        let port = OwnerRuntimeAuth::new(
-            broker.clone(),
-            selection.target().clone(),
-            RuntimeClientProfile {
-                platform: commands::current_platform(),
-                platform_version: None,
-                architecture: std::env::consts::ARCH.into(),
-            },
-            Arc::new(RuntimeCacheAdmission::new(record_owner.clone())),
-            local.runtime_writer_gates(),
-        )?;
-        let switch_control = Arc::new(RuntimeRecordSwitchControl::new(
-            record_owner.clone(),
-            retained_record_owners,
-            local.clone(),
-            Arc::new(UnavailableRuntimeForceStop),
-        ));
-        let mut switch_coordinator =
-            SwitchCoordinator::open(owner_lock.clone(), selection.manifest().clone())?
-                .attach(broker.clone(), switch_control);
-        if requires_transition {
-            switch_coordinator =
-                switch_coordinator.require_initial_transition(selection.state().selected_slot);
+        {
+            owner_runtime::setup_android(app)
         }
-        let switch_coordinator = Arc::new(switch_coordinator);
-        let port = Arc::new(port.with_switch_coordinator(switch_coordinator.clone()));
-        let application = Arc::new(ClientApplication::with_split_tunnel_store_and_preflight(
-            Arc::new(api),
-            Arc::new(record_owner.operational()),
-            Arc::new(record_owner.split()),
-            port.clone(),
-            local,
-            diagnostics.clone(),
-            switch_coordinator.clone(),
-        ));
-        let dns_servers = preferences.get().dns_provider.servers();
-        application.set_dns_servers(dns_servers.clone());
-        let app_handle = app.handle().clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = app_handle
-                .tunnel_android()
-                .update_quick_dns_async(tauri_plugin_tunnel_android::DnsServersRequest {
-                    dns_servers: dns_servers.iter().map(ToString::to_string).collect(),
-                })
-                .await;
-        });
-        let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
-        let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
-        let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
         #[cfg(not(target_os = "android"))]
-        let connection_intent = Arc::new(connection_intent::DesktopConnectionIntent::new(
-            app.handle().clone(),
-            application.clone(),
-            diagnostics.clone(),
-        ));
-        app.manage(diagnostics.clone());
-        app.manage(application.clone());
-        app.manage(owner_lock);
-        app.manage(broker);
-        app.manage(port.clone());
-        app.manage(switch_coordinator.clone());
-        app.manage(tunnel.clone());
-        app.manage(split_tunnel_scheduler.clone());
-        app.manage(push_registration_scheduler.clone());
-        app.manage(preferences);
-        app.manage(connection_metrics.clone());
-        #[cfg(not(target_os = "android"))]
-        app.manage(connection_intent.clone());
-        let updater = Arc::new(updates::NativeUpdater::from_build(
-            app.handle(),
-            switch_coordinator.clone(),
-            selection.state().container_version.clone(),
-        )?);
-        app.manage(updater.clone());
-        #[cfg(desktop)]
-        desktop::setup_tray(app)?;
-        start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
-        #[cfg(not(target_os = "android"))]
-        start_physical_network_scheduler(application.clone(), connection_intent.clone());
-        #[cfg(target_os = "android")]
-        start_physical_network_scheduler(application.clone());
-        start_pending_stop_scheduler(application.clone());
-        #[cfg(not(target_os = "android"))]
-        connection_intent.spawn();
-        start_connection_metrics_scheduler(
-            app.handle().clone(),
-            application.clone(),
-            tunnel.clone(),
-            connection_metrics,
-            diagnostics.clone(),
-        );
-        #[cfg(desktop)]
-        start_automatic_diagnostics_scheduler(
-            app.handle().clone(),
-            application.clone(),
-            tunnel.clone(),
-            diagnostics,
-        );
-        start_push_registration_scheduler(
-            app.handle().clone(),
-            application,
-            push_registration_scheduler,
-        );
-        let recovery = switch_coordinator;
-        let logout_recovery = port.clone();
-        let update_recovery = updater;
-        tauri::async_runtime::spawn(async move {
-            let _ = logout_recovery.recover_logout_cleanup().await;
-            if update_recovery.recover_installed_container().await.is_ok()
-                && recovery.before_tunnel_start().await.is_ok()
-                && matches!(migration, Some(MigrationOutcome::AwaitingBootstrap))
-            {
-                let records = SystemRecordFactory::new("primary", fallback);
-                let auth = ProtectedAuthStore::new(records.record("auth-v1"));
-                let runtime = ProtectedRuntimeStore::new(
-                    records.record(target_paths.namespace()),
-                    target_paths,
-                );
-                let split = FileSplitTunnelStore::new(&app_data_directory);
-                let journal = FileMigrationJournal::new(
-                    app_data_directory.join("common/auth-migration-v1.json"),
-                );
-                let _ = acknowledge_migration_bootstrap(
-                    &LegacyMigrationSource::new(records.legacy(), &split),
-                    &auth,
-                    &runtime,
-                    &journal,
-                );
+        {
+            use tauri::Manager;
+
+            let app_data_directory = app.path().app_data_dir()?;
+            // Before any secret read/init on every desktop platform (and Android
+            // host process). The Windows plugin above is only an activation UX.
+            use base64::Engine;
+            let public_key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
+                .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
+                .transpose()
+                .map_err(|_| {
+                    std::io::Error::other("runtime_startup_blocked: invalid pinned manifest key")
+                })?;
+            #[cfg(target_os = "linux")]
+            let fallback = Some(app_data_directory.join("credentials"));
+            #[cfg(not(target_os = "linux"))]
+            let fallback = None;
+
+            let nelomai_client_container::host::PreparedHost {
+                owner: owner_lock,
+                selection,
+                storage,
+                ..
+            } = nelomai_client_container::host::prepare_host(
+                &app_data_directory,
+                &app.path().resource_dir()?.join("runtime"),
+                public_key.as_deref(),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                || SystemRecordFactory::new("primary", fallback.clone()),
+            )?;
+
+            let api = ClientApi::new(PANEL_BASE)
+                .and_then(|api| api.with_app_version(&selection.target().container_version))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let resource_baseline = resource_usage::ResourceSnapshot::capture(app.handle());
+            let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
+                app.path().app_data_dir()?.join("diagnostics"),
+                resource_baseline,
+            )?);
+            diagnostics.record_named("startup.rust.setup_ready", None, None, None);
+            let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
+            let preferences = Arc::new(preferences::AppPreferenceStore::open_runtime(
+                &nelomai_client_storage::RuntimeStateStore::paths(&storage.runtime).preferences,
+                &app_data_directory.join("preferences.json"),
+            )?);
+            let local = CoreLocalStop::new(tunnel.clone());
+            let owner_stop = local.clone();
+            let broker = Arc::new(AuthBroker::new(
+                api.clone(),
+                Arc::new(storage.auth),
+                owner_stop,
+            )?);
+            let migration = storage.migration;
+            let target_paths = storage.runtime.paths().clone();
+            let requires_transition = matches!(
+                selection.recovery(),
+                Some(SelectionRecovery::ContainerVersionChanged)
+            ) || storage
+                .runtime
+                .load()?
+                .is_some_and(|state| state.cleanup_only);
+            let retained_record_owners: Vec<_> = storage
+                .retained
+                .into_iter()
+                .map(RuntimeRecordOwner::new)
+                .collect();
+            let record_owner = RuntimeRecordOwner::new(storage.runtime);
+            let port = OwnerRuntimeAuth::new(
+                broker.clone(),
+                selection.target().clone(),
+                RuntimeClientProfile {
+                    platform: commands::current_platform(),
+                    platform_version: None,
+                    architecture: std::env::consts::ARCH.into(),
+                },
+                Arc::new(RuntimeCacheAdmission::new(record_owner.clone())),
+                local.runtime_writer_gates(),
+            )?;
+            let switch_control = Arc::new(RuntimeRecordSwitchControl::new(
+                record_owner.clone(),
+                retained_record_owners,
+                local.clone(),
+                Arc::new(UnavailableRuntimeForceStop),
+            ));
+            let mut switch_coordinator =
+                SwitchCoordinator::open(owner_lock.clone(), selection.manifest().clone())?
+                    .attach(broker.clone(), switch_control);
+            if requires_transition {
+                switch_coordinator =
+                    switch_coordinator.require_initial_transition(selection.state().selected_slot);
             }
-        });
-        Ok(())
+            let switch_coordinator = Arc::new(switch_coordinator);
+            let port = Arc::new(port.with_switch_coordinator(switch_coordinator.clone()));
+            let application = Arc::new(ClientApplication::with_split_tunnel_store_and_preflight(
+                Arc::new(api),
+                Arc::new(record_owner.operational()),
+                Arc::new(record_owner.split()),
+                port.clone(),
+                local,
+                diagnostics.clone(),
+                switch_coordinator.clone(),
+            ));
+            let dns_servers = preferences.get().dns_provider.servers();
+            application.set_dns_servers(dns_servers.clone());
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = app_handle
+                    .tunnel_android()
+                    .update_quick_dns_async(tauri_plugin_tunnel_android::DnsServersRequest {
+                        dns_servers: dns_servers.iter().map(ToString::to_string).collect(),
+                    })
+                    .await;
+            });
+            let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
+            let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
+            let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
+            #[cfg(not(target_os = "android"))]
+            let connection_intent = Arc::new(connection_intent::DesktopConnectionIntent::new(
+                app.handle().clone(),
+                application.clone(),
+                diagnostics.clone(),
+            ));
+            app.manage(diagnostics.clone());
+            app.manage(application.clone());
+            app.manage(owner_lock);
+            app.manage(broker);
+            app.manage(port.clone());
+            app.manage(switch_coordinator.clone());
+            app.manage(Arc::new(runtime_control::RuntimeControls::new(
+                switch_coordinator.clone(),
+            )));
+            app.manage(tunnel.clone());
+            app.manage(split_tunnel_scheduler.clone());
+            app.manage(push_registration_scheduler.clone());
+            app.manage(preferences);
+            app.manage(connection_metrics.clone());
+            #[cfg(not(target_os = "android"))]
+            app.manage(connection_intent.clone());
+            let updater = Arc::new(updates::NativeUpdater::from_build(
+                app.handle(),
+                switch_coordinator.clone(),
+                selection.state().container_version.clone(),
+            )?);
+            app.manage(updater.clone());
+            #[cfg(desktop)]
+            desktop::setup_tray(app)?;
+            start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
+            #[cfg(not(target_os = "android"))]
+            start_physical_network_scheduler(application.clone(), connection_intent.clone());
+            #[cfg(target_os = "android")]
+            start_physical_network_scheduler(application.clone());
+            start_pending_stop_scheduler(application.clone());
+            #[cfg(not(target_os = "android"))]
+            connection_intent.spawn();
+            start_connection_metrics_scheduler(
+                app.handle().clone(),
+                application.clone(),
+                tunnel.clone(),
+                connection_metrics,
+                diagnostics.clone(),
+            );
+            #[cfg(desktop)]
+            start_automatic_diagnostics_scheduler(
+                app.handle().clone(),
+                application.clone(),
+                tunnel.clone(),
+                diagnostics,
+            );
+            start_push_registration_scheduler(
+                app.handle().clone(),
+                application,
+                push_registration_scheduler,
+            );
+            let recovery = switch_coordinator;
+            let logout_recovery = port.clone();
+            let update_recovery = updater;
+            tauri::async_runtime::spawn(async move {
+                let _ = logout_recovery.recover_logout_cleanup().await;
+                if update_recovery.recover_installed_container().await.is_ok()
+                    && recovery.before_tunnel_start().await.is_ok()
+                    && matches!(migration, Some(MigrationOutcome::AwaitingBootstrap))
+                {
+                    let records = SystemRecordFactory::new("primary", fallback);
+                    let auth = ProtectedAuthStore::new(records.record("auth-v1"));
+                    let runtime = ProtectedRuntimeStore::new(
+                        records.record(target_paths.namespace()),
+                        target_paths,
+                    );
+                    let split = FileSplitTunnelStore::new(&app_data_directory);
+                    let journal = FileMigrationJournal::new(
+                        app_data_directory.join("common/auth-migration-v1.json"),
+                    );
+                    let _ = acknowledge_migration_bootstrap(
+                        &LegacyMigrationSource::new(records.legacy(), &split),
+                        &auth,
+                        &runtime,
+                        &journal,
+                    );
+                }
+            });
+            Ok(())
+        }
     });
 
     let app = builder
@@ -1630,47 +1617,17 @@ fn start_push_registration_scheduler(
     });
 }
 
-#[cfg(target_os = "android")]
-fn enqueue_push_cleanup(app: tauri::AppHandle, epoch: u64) {
-    use tauri::Manager;
-    use tauri_plugin_push_android::PushAndroidExt;
-    tauri::async_runtime::spawn(async move {
-        let broker = app.state::<Arc<AuthBroker>>().inner().clone();
-        let scheduler = app
-            .state::<Arc<PushRegistrationScheduler>>()
-            .inner()
-            .clone();
-        // No request timeout drops this completion owner or releases its gate.
-        // Failure deliberately leaves the protected marker for startup replay.
-        let _ = scheduler
-            .cleanup_push(&broker, epoch, async {
-                app.push_android()
-                    .disable_async()
-                    .await
-                    .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)
-            })
-            .await;
-    });
-}
-
 /// Called only while the push scheduler gate is held.
 #[cfg(target_os = "android")]
 async fn replay_push_cleanup(
     app: &tauri::AppHandle,
 ) -> Result<(), nelomai_client_container::BrokerError> {
     use tauri::Manager;
-    use tauri_plugin_push_android::PushAndroidExt;
-    let broker = app.state::<Arc<AuthBroker>>().inner().clone();
-    if let Some(epoch) = broker.pending_push_cleanup().await? {
-        PushRegistrationScheduler::cleanup_push_locked(&broker, epoch, async {
-            app.push_android()
-                .disable_async()
-                .await
-                .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)
-        })
-        .await?;
-    }
-    Ok(())
+    app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+        .owner_request(nelomai_client_container::host::HostRequestV1::PushCleanup)
+        .await
+        .map(|_| ())
+        .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)
 }
 
 #[cfg(target_os = "android")]

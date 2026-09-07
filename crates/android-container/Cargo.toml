@@ -1,0 +1,24 @@
+[package]
+name = "nelomai-android-container"
+version = "0.2.16"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "nelomai_android_container"
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+jni = "0.21"
+libc = "0.2"
+ndk-context = "0.1"
+nelomai-client-container = { path = "../client-container" }
+nelomai-client-storage = { path = "../client-storage" }
+nelomai-client-api = { path = "../client-api" }
+nelomai-client-updater = { path = "../client-updater" }
+nelomai-contracts = { path = "../contracts" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }

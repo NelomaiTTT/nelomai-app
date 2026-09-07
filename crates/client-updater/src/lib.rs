@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+mod android;
+pub use android::{AndroidApkInstaller, AndroidUpdateBackend};
 use nelomai_client_api::AccessSnapshot;
 use nelomai_contracts::UpdateState;
 use semver::Version;

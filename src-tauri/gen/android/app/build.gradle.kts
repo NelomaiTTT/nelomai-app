@@ -13,6 +13,17 @@ val tauriProperties = Properties().apply {
         propFile.inputStream().use { load(it) }
     }
 }
+val runtimeInputs = providers.gradleProperty("nelomaiRuntimeInputs").orNull?.let { file(it) }
+val verifyRuntimeBuildInputs by tasks.registering {
+    doLast {
+        val inputs = requireNotNull(runtimeInputs) { "Stage signed runtime APK inputs and pass -PnelomaiRuntimeInputs=<apk inputs directory>" }
+        for (name in listOf("assets/runtime/container-manifest-v1.json", "assets/runtime/container-manifest-v1.sig",
+            "jniLibs/arm64-v8a/libnelomai_android_container.so", "jniLibs/arm64-v8a/libnelomai_app_lib.so", "jniLibs/arm64-v8a/libwg-go.so")) {
+            check(inputs.resolve(name).isFile) { "Missing compiled runtime input: $name" }
+        }
+    }
+}
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach { dependsOn(verifyRuntimeBuildInputs) }
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties().apply {
     if (keystorePropertiesFile.exists()) {
@@ -45,7 +56,8 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
-        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        val sourceVersion = (groovy.json.JsonSlurper().parse(rootDir.resolve("../../../src-tauri/tauri.conf.json")) as Map<*, *>)["version"] as String
+        versionName = tauriProperties.getProperty("tauri.android.versionName", sourceVersion)
     }
     signingConfigs {
         if (releaseSigningConfigured) {
@@ -92,6 +104,13 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    // The host checks the exact read-only installed ELF bytes before allowing
+    // System.loadLibrary; keep a concrete nativeLibraryDir on every API level.
+    packaging.jniLibs.useLegacyPackaging = true
+    runtimeInputs?.let { inputs -> sourceSets.getByName("main") {
+        assets.srcDir(inputs.resolve("assets"))
+        jniLibs.srcDir(inputs.resolve("jniLibs"))
+    } }
 }
 
 rust {
@@ -99,6 +118,7 @@ rust {
 }
 
 dependencies {
+    implementation(project(":runtime-android-common"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")

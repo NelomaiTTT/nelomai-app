@@ -1694,16 +1694,16 @@ internal object AutomaticDiagnostics {
     }
 
     private fun pendingDirectory(context: Context): File =
-        File(context.applicationInfo.dataDir, "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$PENDING_DIRECTORY")
+        File(AndroidRuntimeNamespace.directory(context), "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$PENDING_DIRECTORY")
 
     private fun sentDirectory(context: Context): File =
-        File(context.applicationInfo.dataDir, "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$SENT_DIRECTORY")
+        File(AndroidRuntimeNamespace.directory(context), "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$SENT_DIRECTORY")
 
     private fun startFailureDirectory(context: Context): File =
-        File(context.applicationInfo.dataDir, "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$START_FAILURE_DIRECTORY")
+        File(AndroidRuntimeNamespace.directory(context), "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$START_FAILURE_DIRECTORY")
 
     private fun memoryTimelineFile(context: Context): File =
-        File(context.applicationInfo.dataDir, "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$MEMORY_TIMELINE_FILE")
+        File(AndroidRuntimeNamespace.directory(context), "$AUTOMATIC_DIAGNOSTICS_DIRECTORY/$MEMORY_TIMELINE_FILE")
 
     private fun readMemoryTimelineSamples(context: Context): List<JSONObject> {
         val file = memoryTimelineFile(context)
@@ -1909,7 +1909,7 @@ internal object AutomaticDiagnostics {
     }
 
     private fun preferences(context: Context) = context.getSharedPreferences(
-        AUTOMATIC_DIAGNOSTICS_PREFERENCES,
+        AndroidRuntimeNamespace.record(AUTOMATIC_DIAGNOSTICS_PREFERENCES),
         Context.MODE_PRIVATE,
     )
 
@@ -2743,7 +2743,7 @@ private fun intervalLog(
     startedAt: Long,
     endedAt: Long,
 ): String {
-    val diagnostics = File(context.applicationInfo.dataDir, "diagnostics")
+    val diagnostics = File(AndroidRuntimeNamespace.directory(context), "diagnostics")
     val previous = readTail(File(diagnostics, "$stem.previous.jsonl"), maximum / 2)
     val current = readTail(File(diagnostics, "$stem.jsonl"), maximum)
     return automaticDiagnosticsFilterIntervalLog(

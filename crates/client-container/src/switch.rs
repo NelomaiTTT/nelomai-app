@@ -163,7 +163,7 @@ pub enum SwitchProgress {
     Pending { retry_after_seconds: u32 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSwitchStatusV1 {
     pub selected_slot: nelomai_contracts::RuntimeSlot,
@@ -174,14 +174,21 @@ pub struct RuntimeSwitchStatusV1 {
 
 pub struct RuntimeCleanupHandoff {
     snapshot: RuntimeCleanupSnapshotV1,
-    _quiescence: RuntimeWriterQuiescence,
+    _quiescence: Box<dyn Send>,
 }
 
 impl RuntimeCleanupHandoff {
     pub fn new(snapshot: RuntimeCleanupSnapshotV1, quiescence: RuntimeWriterQuiescence) -> Self {
         Self {
             snapshot,
-            _quiescence: quiescence,
+            _quiescence: Box::new(quiescence),
+        }
+    }
+
+    pub(crate) fn remote(snapshot: RuntimeCleanupSnapshotV1, lease: impl Send + 'static) -> Self {
+        Self {
+            snapshot,
+            _quiescence: Box::new(lease),
         }
     }
 
