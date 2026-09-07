@@ -3,6 +3,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+from packaging.version import InvalidVersion, Version
 
 from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, PREFIX, SCRIPTS, module
 import scripts.tests.test_runtime_release_set as release_set_fixture
@@ -58,8 +59,15 @@ class AcceptanceContainerTest(ArtifactFixture):
         verified = module("verify-runtime-artifact").authenticated("container",
             resources / "container-manifest-v1.json", resources / "container-manifest-v1.sig",
             self.public, "linux", "x86_64")
+        # The panel consumes PEP 440 versions; Rust-authenticated semver alone
+        # admitted a synthetic identity that could never enroll with that panel.
+        try:
+            synthetic = Version(verified["slots"][0]["manifest"]["runtime_version"])
+        except InvalidVersion as error:
+            self.fail(f"signed synthetic runtime is rejected by the panel version parser: {error}")
+        self.assertGreater(synthetic, Version("0.2.16"))
         self.assertEqual([(slot["slot"], slot["manifest"]["runtime_version"]) for slot in verified["slots"]],
-                         [("latest", "0.2.17-acceptance"), ("stable", "0.2.16")])
+                         [("latest", "0.2.17"), ("stable", "0.2.16")])
         self.assertEqual(verified["stable_release_set_sha256"], self.root_digest)
         raw = self.candidate / (PREFIX + ".manifest.json")
         self.assertEqual(verified["stable_platform_manifest_sha256"], hashlib.sha256(raw.read_bytes()).hexdigest())

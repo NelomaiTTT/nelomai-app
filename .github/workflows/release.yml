@@ -82,6 +82,7 @@ jobs:
         with:
           platform: "linux"
           target: "x86_64-unknown-linux-gnu"
+          android-fixtures: "true"
       -
         name: "Exact source before generated inputs"
         run: |

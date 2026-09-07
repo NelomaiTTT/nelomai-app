@@ -23,7 +23,7 @@ class ApkManifestTest(unittest.TestCase):
     def test_acceptance_slot_gate_requires_both_exact_approved_digests(self):
         check = module('check-container-apk')
         self.assertTrue(callable(getattr(check, 'verify_slots', None)), 'root-bound acceptance slot gate is missing')
-        value = {'slots': [{'slot':'latest', 'manifest':{'runtime_version':'0.2.17-acceptance'}},
+        value = {'slots': [{'slot':'latest', 'manifest':{'runtime_version':'0.2.17'}},
                            {'slot':'stable', 'manifest':{'runtime_version':'0.2.16'}}],
                  'stable_release_set_sha256':'a'*64, 'stable_platform_manifest_sha256':'b'*64}
         check.verify_slots(value, acceptance=True, root_digest='a'*64, stable_digest='b'*64)

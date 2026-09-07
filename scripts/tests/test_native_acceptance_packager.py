@@ -14,7 +14,7 @@ import zipfile
 from unittest.mock import patch
 
 from scripts.tests.test_runtime_artifact import ArtifactFixture, ROOT, SOURCE, module
-from scripts.tests.test_android_runtime_collisions import NDK
+from scripts.tests.test_android_runtime_collisions import native_tools
 import scripts.tests.test_runtime_release_set as release_set_fixture
 
 
@@ -67,11 +67,11 @@ class NativeAcceptancePackagerTest(ArtifactFixture):
         self.assertTrue(package.is_file())
         self.assertGreater(package.stat().st_size, 1024 * 1024)
 
-    @unittest.skipUnless(NDK.is_dir(), "cached Android NDK required")
     def test_actual_android_apk_links_exact_final_stable_aar_and_native_bytes(self):
+        ndk, _ = native_tools()
         stable = ROOT / "target/task8-stable-c4521ec/payload"
         self.assertTrue(stable.is_dir(), "retained local native test payload is unavailable")
-        candidates, digest = self.candidates("android", "aarch64", stable, NDK / "llvm-readelf")
+        candidates, digest = self.candidates("android", "aarch64", stable, ndk / "llvm-readelf")
         latest = self.root / "latest"
         shutil.copytree(ROOT / "target/task8-latest-c4521ec/payload", latest / "payload")
         original = json.loads((ROOT / "target/task8-latest-c4521ec/runtime-manifest-v1.json").read_bytes())
@@ -88,18 +88,16 @@ class NativeAcceptancePackagerTest(ArtifactFixture):
         staged = self.root / "staged"
         signed, digest = self.final_signed(candidates, latest)
         builder.stage_signed(signed, digest, staged, self.public, "android", "aarch64", SOURCE,
-                             "acceptance", NDK / "llvm-readelf")
+                             "acceptance", ndk / "llvm-readelf")
         environment = {**os.environ, "NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64": base64.b64encode(self.public.read_bytes()).decode(),
-            "CC_aarch64_linux_android": str(NDK / "aarch64-linux-android24-clang"),
-            "AR_aarch64_linux_android": str(NDK / "llvm-ar"),
-            "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER": str(NDK / "aarch64-linux-android24-clang"),
-            "JAVA_HOME": "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
-            "ANDROID_HOME": "/opt/homebrew/share/android-commandlinetools"}
+            "CC_aarch64_linux_android": str(ndk / "aarch64-linux-android24-clang"),
+            "AR_aarch64_linux_android": str(ndk / "llvm-ar"),
+            "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER": str(ndk / "aarch64-linux-android24-clang")}
         subprocess.run(["cargo", "rustc", "--locked", "--offline", "-p", "nelomai-android-container",
             "--target", "aarch64-linux-android", "--", "-C", "link-arg=-Wl,-soname,libnelomai_android_container.so"],
             cwd=ROOT, env=environment, check=True)
         with patch.dict(os.environ, environment):
-            package = builder.package_android(staged, self.root / "packaged", self.public, NDK / "llvm-readelf",
+            package = builder.package_android(staged, self.root / "packaged", self.public, ndk / "llvm-readelf",
                 __import__('pathlib').Path(environment["ANDROID_HOME"]) / "cmdline-tools/latest/bin/apkanalyzer",
                 ROOT / "target/aarch64-linux-android/debug/libnelomai_android_container.so")
         self.assertTrue(package.is_file())

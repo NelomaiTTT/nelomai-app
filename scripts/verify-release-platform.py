@@ -5,7 +5,6 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
-import subprocess
 import tarfile
 import tempfile
 import zipfile
@@ -84,12 +83,12 @@ def main():
                         raise ValueError("final macOS app layout mismatch")
                     builder.run("/usr/bin/codesign", "--verify", "--strict", apps[0])
                 elif args.platform == "windows":
-                    builder.run("7z", "x", "-y", "-o" + str(extracted), package, stdout=subprocess.DEVNULL)
+                    builder.run("7z", "x", "-y", "-o" + str(extracted), package, capture=True)
                 else:
                     executable = work / (kind + ".AppImage")
                     shutil.copyfile(package, executable)
                     executable.chmod(0o755)
-                    builder.run(executable, "--appimage-extract", cwd=extracted, stdout=subprocess.DEVNULL)
+                    builder.run(executable, "--appimage-extract", cwd=extracted, capture=True)
                 container.verify_packaged_tree(extracted, staged, args.public_key, args.platform, args.architecture)
             results[kind] = verifier.digest(package)
         if args.linux_execution:

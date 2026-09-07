@@ -81,7 +81,7 @@ def verify_slots(manifest, acceptance=False, root_digest=None, stable_digest=Non
             or manifest.get('stable_release_set_sha256') != root_digest
             or manifest.get('stable_platform_manifest_sha256') != stable_digest
             or [(slot['slot'], slot['manifest']['runtime_version']) for slot in slots]
-               != [('latest', '0.2.17-acceptance'), ('stable', '0.2.16')]):
+               != [('latest', '0.2.17'), ('stable', '0.2.16')]):
         raise ValueError('acceptance APK does not bind exact approved stable/root identities')
 
 

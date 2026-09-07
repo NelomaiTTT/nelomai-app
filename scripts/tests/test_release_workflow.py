@@ -7,6 +7,21 @@ from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_discovery_host_provisions_mandatory_compiled_android_fixtures(self):
+        steps = self.workflow()["jobs"]["verify"]["steps"]
+        host = next(step for step in steps if step.get("uses") == "./.github/actions/release-native-host")
+        self.assertEqual(str(host["with"].get("android-fixtures")).lower(), "true",
+                         "discovery executes mandatory Android fixtures without its toolchain")
+        action = yaml.safe_load((ROOT / ".github/actions/release-native-host/action.yml").read_text())
+        setup = action["runs"]["steps"]
+        for prefix in ("actions/setup-java@", "android-actions/setup-android@"):
+            step = next(step for step in setup if step.get("uses", "").startswith(prefix))
+            self.assertIn("inputs.android-fixtures == 'true'", step["if"])
+        ndk = next(step for step in setup if "sdkmanager " in step.get("run", ""))
+        self.assertIn("inputs.android-fixtures == 'true'", ndk["if"])
+        self.assertIn("ndk;28.2.13676358", ndk["run"])
+        self.assertIn("ANDROID_NDK_HOME=", ndk["run"])
+
     def workflow(self):
         return yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
 

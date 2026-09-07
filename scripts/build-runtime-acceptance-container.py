@@ -24,7 +24,7 @@ spec = importlib.util.spec_from_file_location("release_set", ROOT / "scripts/bui
 release_set = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release_set)
 verifier = release_set.verifier
-SYNTHETIC_LATEST = "0.2.17-acceptance"
+SYNTHETIC_LATEST = "0.2.17"
 
 
 def stage_signed(signed, root_digest, output, public_key, platform, architecture, source, kind, readelf=None):

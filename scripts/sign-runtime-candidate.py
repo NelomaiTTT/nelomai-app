@@ -70,7 +70,7 @@ def sign(drafts, output, source, signing_key, public_key):
             for kind in ("shipping", "acceptance"):
                 latest = documents[platform, "latest"]
                 if kind == "acceptance":
-                    latest = {**latest, "runtime_version": "0.2.17-acceptance"}
+                    latest = {**latest, "runtime_version": "0.2.17"}
                 container = dict(format_version=1, container_version="0.2.16",
                     release_set_id=kind + "-" + source, minimum_runtime_contract=1, maximum_runtime_contract=1,
                     slots=[dict(slot="latest", manifest=latest)])

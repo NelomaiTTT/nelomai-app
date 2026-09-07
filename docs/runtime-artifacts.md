@@ -5,6 +5,11 @@ two-slot packages are test inputs, not public installers. Packaging, native
 re-extraction, limited Linux execution and full candidate acceptance are
 different gates; none implies the others.
 
+The synthetic latest identity is plain `0.2.17`, distinct from immutable stable
+`0.2.16` and accepted by both Rust semver and the panel's PEP 440 parser/current
+contract bounds. It changes only the separate acceptance container/Android
+build identity, not the normal shipping version or final stable payload bytes.
+
 ## Source and final bytes
 
 Dispatch `release.yml` with a full lowercase 40-character `source_sha`. Every
@@ -153,6 +158,14 @@ not replace this provenance. Expired/missing bytes or changed digests require a
 new build and acceptance; rebuilding under an old approval is forbidden.
 
 ## Actual command boundaries
+
+The Ubuntu verifier provisions JDK 17 and NDK `28.2.13676358` before mandatory
+compiled Java/ELF fixture discovery (`android-fixtures: true` on the native host
+action). Local fixture runs must likewise supply `JAVA_HOME` and
+`ANDROID_NDK_HOME` (or `NDK_HOME`); tools resolve the actual Linux/Darwin host
+subdirectory. Missing or nonexecutable tools fail the tests, never skip their
+compiled-byte coverage. `ANDROID_HOME` also identifies the SDK for opt-in actual
+APK packaging tests. These tests do not establish device acceptance.
 
 The workflow supplies explicit paths/pins and runs these existing CLI consumers:
 

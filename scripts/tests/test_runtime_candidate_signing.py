@@ -51,7 +51,7 @@ class RuntimeCandidateSigningTest(ArtifactFixture):
                 self.assertEqual([slot["slot"] for slot in container["slots"]], expected)
                 if kind == "acceptance":
                     self.assertEqual(container["stable_release_set_sha256"], digest)
-                    self.assertEqual(container["slots"][0]["manifest"]["runtime_version"], "0.2.17-acceptance")
+                    self.assertEqual(container["slots"][0]["manifest"]["runtime_version"], "0.2.17")
             self.assertFalse(any("acceptance" in path.name for path in (output / "release").iterdir()))
         self.assertEqual(before, {str(path.relative_to(drafts)): path.read_bytes() for path in drafts.rglob("*") if path.is_file()})
         with self.assertRaisesRegex(ValueError, "immutable"):
