@@ -109,6 +109,9 @@ android {
     // The host checks the exact read-only installed ELF bytes before allowing
     // System.loadLibrary; keep a concrete nativeLibraryDir on every API level.
     packaging.jniLibs.useLegacyPackaging = true
+    // Svelte's signed WebView payload contains _app; AAPT's default <dir>_*
+    // exclusion would silently remove indexed files and block host admission.
+    androidResources.ignoreAssetsPattern = "!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~"
     runtimeInputs?.let { inputs -> sourceSets.getByName("main") {
         assets.srcDir(inputs.resolve("assets"))
         jniLibs.srcDir(inputs.resolve("jniLibs"))
