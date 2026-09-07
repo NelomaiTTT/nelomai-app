@@ -4,6 +4,7 @@
   import ChangelogPanel from "$lib/ChangelogPanel.svelte";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
+  import RuntimeSelector from "$lib/RuntimeSelector.svelte";
   import { CHANGELOG } from "$lib/changelog";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
   import {
@@ -33,6 +34,7 @@
     hasSecondaryStop,
     primaryAction,
     recoveryCopy,
+    runtimeStartBlocked,
     visibleConnectionIntentStatus,
     requiresServerProbes,
     viewForAppState,
@@ -50,6 +52,7 @@
     type PeerOption,
     type Phase,
     type RouteMode,
+    type RuntimeStatus,
     type TicConnectionMode,
     type UpdateStatus,
   } from "$lib/app-model";
@@ -107,6 +110,8 @@
   let updateStatus = $state<UpdateStatus | null>(null);
   const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
   let updateBusy = $state(false);
+  let runtimeStatus = $state<RuntimeStatus | null>(null);
+  let runtimeSelectionBusy = $state(false);
   let updateTimer: number | null = null;
   let stateTimer: number | null = null;
   let startupTimer: number | null = null;
@@ -196,6 +201,7 @@
         void restore();
         void loadAppPreferences();
         void refreshWindowsDefender();
+        void refreshRuntimeStatus();
       }, 0);
     });
     void listen<NativeConnectionChangedEvent>("native-connection-changed", (event) => {
@@ -253,6 +259,7 @@
         void nativeClient.wakeConnectionIntent();
         void synchronizeRuntimeState();
         void refreshProbes();
+        void refreshRuntimeStatus();
         if (bootstrap) {
           void refreshNotifications(false, true);
           void refreshUpdateOffer();
@@ -372,6 +379,38 @@
       void refreshProbes();
     } catch (reason) {
       error = commandMessage(reason, "preferences");
+    }
+  }
+
+  async function refreshRuntimeStatus() {
+    const status = await nativeClient.runtimeStatus().catch(() => null);
+    if (status) runtimeStatus = status;
+  }
+
+  async function selectRuntime(useStable: boolean) {
+    if (runtimeSelectionBusy) return;
+    runtimeSelectionBusy = true;
+    error = null;
+    try {
+      runtimeStatus = await nativeClient.runtimeSelect(useStable);
+    } catch (reason) {
+      error = commandMessage(reason, "runtime");
+      await refreshRuntimeStatus();
+    } finally {
+      runtimeSelectionBusy = false;
+    }
+  }
+
+  async function restartRuntime() {
+    if (runtimeSelectionBusy) return;
+    runtimeSelectionBusy = true;
+    error = null;
+    try {
+      await nativeClient.restartRuntime();
+    } catch (reason) {
+      error = commandMessage(reason, "runtime");
+      runtimeSelectionBusy = false;
+      await refreshRuntimeStatus();
     }
   }
 
@@ -560,6 +599,14 @@
   }
 
   async function toggleConnection(forceStop = false) {
+    if (
+      !forceStop &&
+      connectionAction !== "stop" &&
+      runtimeStartBlocked(runtimeStatus)
+    ) {
+      error = "Перезапустите Nelomai, чтобы завершить переключение runtime.";
+      return;
+    }
     if (!forceStop && connectionAction === "start" && splitTunnelBlocksStart) {
       showOverlay("split_tunnel");
       return;
@@ -1357,7 +1404,8 @@
               connectionAction === "stop" || connectionActionState.startBusy,
             ) ||
               (connectionAction === "start" &&
-                (!splitTunnelLoaded || splitTunnelBlocksStart))}
+                (!splitTunnelLoaded || splitTunnelBlocksStart)) ||
+              (connectionAction !== "stop" && runtimeStartBlocked(runtimeStatus))}
           >
             <span>
               {connectionAction === "stop"
@@ -1582,6 +1630,14 @@
                 onchange={setAutomaticUpdates}
               />
             </label>
+          {/if}
+          {#if runtimeStatus}
+            <RuntimeSelector
+              status={runtimeStatus}
+              busy={busy || runtimeSelectionBusy}
+              onselect={selectRuntime}
+              onrestart={restartRuntime}
+            />
           {/if}
           {#if appPreferences?.closeToTraySupported}
             <label class="update-preference">

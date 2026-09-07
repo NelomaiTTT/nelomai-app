@@ -16,6 +16,9 @@
             <intent-filter><action android:name="android.net.VpnService" /></intent-filter>
         </service>
         <activity android:name=".RuntimeBootstrapActivity" android:exported="false" android:process=":runtime" />
+        <activity android:name=".RuntimeRestartActivity" android:exported="false"
+            android:excludeFromRecents="true" android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.runtime_restart" />
         <activity android:name=".LatestRuntimeActivity" android:exported="false" android:process=":runtime"
             android:launchMode="singleTask"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode" />

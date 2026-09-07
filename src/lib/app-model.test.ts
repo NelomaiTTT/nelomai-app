@@ -10,12 +10,16 @@ import {
   primaryAction,
   recoveryCopy,
   requiresServerProbes,
+  runtimeRestartRequired,
+  runtimeSelectorVisible,
+  runtimeStartBlocked,
   visibleConnectionIntentStatus,
   viewForPhase,
   viewForAppState,
   type Bootstrap,
   type BootstrapDefaults,
   type Connection,
+  type RuntimeStatus,
 } from "./app-model";
 
 const defaults: BootstrapDefaults = {
@@ -231,5 +235,71 @@ describe("connection intent recovery", () => {
       }),
     ).toBe("connection");
     expect(hasSecondaryStop({ connectionIntentStatus: "blocked_terminal" })).toBe(true);
+  });
+});
+
+const runtimeStatus = (overrides: Partial<RuntimeStatus> = {}): RuntimeStatus => ({
+  containerVersion: "0.2.16",
+  selectedSlot: "latest",
+  activeSlot: "latest",
+  pendingSlot: null,
+  latestVersion: "0.2.16",
+  stableVersion: null,
+  runtimeContractVersion: 1,
+  manifestVerified: true,
+  stableAvailable: false,
+  switchId: null,
+  phase: null,
+  engineRole: "primary",
+  ...overrides,
+});
+
+describe("runtime selector view", () => {
+  it("hides the selector when stable is absent or equal to latest", () => {
+    expect(runtimeSelectorVisible(runtimeStatus())).toBe(false);
+    expect(
+      runtimeSelectorVisible(
+        runtimeStatus({
+          stableAvailable: true,
+          stableVersion: "0.2.16",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("shows only a distinct verified stable runtime", () => {
+    expect(
+      runtimeSelectorVisible(
+        runtimeStatus({
+          stableAvailable: true,
+          stableVersion: "0.2.15",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      runtimeSelectorVisible(
+        runtimeStatus({
+          manifestVerified: false,
+          stableAvailable: true,
+          stableVersion: "0.2.15",
+        }),
+      ),
+    ).toBe(false);
+  });
+
+  it("blocks start for pending work and until the selected runtime is relaunched", () => {
+    expect(runtimeStartBlocked(runtimeStatus({ pendingSlot: "stable" }))).toBe(true);
+    expect(
+      runtimeStartBlocked(
+        runtimeStatus({
+          selectedSlot: "stable",
+          activeSlot: "latest",
+          stableAvailable: true,
+          stableVersion: "0.2.15",
+          phase: "complete",
+        }),
+      ),
+    ).toBe(true);
+    expect(runtimeRestartRequired(runtimeStatus())).toBe(false);
   });
 });

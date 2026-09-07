@@ -300,6 +300,7 @@ async fn common_owner_is_ready_without_loading_product_runtime_and_rejects_forei
             background: Arc::new(NoNativeWork),
             updater: None,
             storage: None,
+            relaunch: None,
         },
     )
     .unwrap();
@@ -469,6 +470,7 @@ async fn common_host_admits_real_private_child_and_preserves_generation_without_
             background: Arc::new(NoNativeWork),
             updater: None,
             storage: None,
+            relaunch: None,
         },
     )
     .unwrap();

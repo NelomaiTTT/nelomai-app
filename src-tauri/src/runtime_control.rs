@@ -25,6 +25,9 @@ impl RuntimeControls {
             .await
             .map(|_| ())
     }
+    pub async fn prepare_restart(&self) -> Result<RuntimeSwitchStatusV1, ()> {
+        self.request_owner(HostRequestV1::RuntimeRestart).await
+    }
     async fn request_owner(&self, request: HostRequestV1) -> Result<RuntimeSwitchStatusV1, ()> {
         match self.0.owner_request(request).await.map_err(|_| ())? {
             HostResponseV1::RuntimeStatus { status } => Ok(status),

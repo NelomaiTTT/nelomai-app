@@ -1,5 +1,5 @@
 use crate::connection_metrics::{ConnectionMetricsResponse, ConnectionMetricsTracker};
-use crate::diagnostics::AppDiagnostics;
+use crate::diagnostics::{AppDiagnostics, RuntimeActionSource};
 use crate::runtime_control::RuntimeControls;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{
@@ -3158,7 +3158,9 @@ pub async fn app_update_restart(
         let _ = application;
         crate::runtime::native()
             .map_err(|_| update_command_error("common runtime unavailable".into()))?
-            .control(crate::runtime::NativeControl::Exit { restart: true })
+            .control(crate::runtime::NativeControl::Exit {
+                reason: crate::runtime::NativeExitReason::Update,
+            })
             .await
             .map_err(|_| update_command_error("common restart failed".into()))?;
         app.exit(0);
@@ -3177,6 +3179,84 @@ fn runtime_switch_error() -> CommandError {
         "runtime_switch_recovery_required",
         "Переключение runtime требует безопасного восстановления",
     )
+}
+
+fn runtime_slot_for_selection(use_stable: bool) -> RuntimeSlot {
+    if use_stable {
+        RuntimeSlot::Stable
+    } else {
+        RuntimeSlot::Latest
+    }
+}
+
+#[tauri::command]
+pub async fn runtime_status(
+    coordinator: State<'_, Arc<RuntimeControls>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    let status = coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::UiStatus);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn runtime_select(
+    coordinator: State<'_, Arc<RuntimeControls>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+    use_stable: bool,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    let current = coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    let desired = runtime_slot_for_selection(use_stable);
+    if desired == current.active_slot && current.restart_required() {
+        coordinator
+            .cancel_pending()
+            .await
+            .map_err(|_| runtime_switch_error())?;
+    } else if desired != current.selected_slot || current.pending_slot.is_some() {
+        coordinator
+            .request(desired)
+            .await
+            .map_err(|_| runtime_switch_error())?;
+    }
+    let status = coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::UiSelect);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn runtime_restart(
+    app: AppHandle,
+    coordinator: State<'_, Arc<RuntimeControls>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<(), CommandError> {
+    let status = coordinator
+        .prepare_restart()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::UiRestart);
+    #[cfg(desktop)]
+    crate::runtime::native()
+        .map_err(|_| runtime_switch_error())?
+        .control(crate::runtime::NativeControl::Exit {
+            reason: crate::runtime::NativeExitReason::RuntimeSwitch,
+        })
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    // Android's common-owner handoff kills the admitted :runtime PID before
+    // releasing the fresh bootstrap gate, so a successful reply is normally
+    // unreachable. This is only a post-proof fallback for an unusually late
+    // Binder/socket delivery.
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3789,6 +3869,12 @@ pub(crate) fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_selection_boolean_maps_only_to_the_verified_slot_enum() {
+        assert_eq!(runtime_slot_for_selection(false), RuntimeSlot::Latest);
+        assert_eq!(runtime_slot_for_selection(true), RuntimeSlot::Stable);
+    }
+
     #[tokio::test]
     async fn android_startup_owner_rejection_never_falls_through_after_logout_or_access_expiry() {
         use std::sync::atomic::{AtomicUsize, Ordering};

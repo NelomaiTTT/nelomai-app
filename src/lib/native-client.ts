@@ -17,6 +17,7 @@ import type {
   StartCommandResponse,
   TicConnectionMode,
   UpdateStatus,
+  RuntimeStatus,
 } from "./app-model";
 import type {
   InstalledApplication,
@@ -191,6 +192,10 @@ export function createNativeClient(
       invoke("app_update_install") as Promise<UpdateStatus>,
     restartForUpdate: () =>
       invoke("app_update_restart") as Promise<void>,
+    runtimeStatus: () => invoke("runtime_status") as Promise<RuntimeStatus>,
+    runtimeSelect: (useStable: boolean) =>
+      invoke("runtime_select", { useStable }) as Promise<RuntimeStatus>,
+    restartRuntime: () => invoke("runtime_restart") as Promise<void>,
     splitTunnelState: () =>
       invoke("app_split_tunnel_state") as Promise<SplitTunnelState>,
     splitTunnelInstalledApplications: () =>
@@ -241,6 +246,7 @@ export type UserErrorContext =
   | "diagnostics"
   | "notifications"
   | "update"
+  | "runtime"
   | "split_tunnel";
 
 export interface UserErrorOptions {
@@ -438,6 +444,8 @@ export function commandMessage(
       return original?.startsWith("Разрешите ") || original?.includes("вручную")
         ? original
         : "Не удалось установить обновление. Проверьте интернет и нажмите «Обновить» ещё раз.";
+    case "runtime_switch_recovery_required":
+      return "Не удалось безопасно переключить runtime. Перезапустите Nelomai и повторите попытку.";
     default:
       return original ?? "Не удалось выполнить действие. Повторите попытку.";
   }

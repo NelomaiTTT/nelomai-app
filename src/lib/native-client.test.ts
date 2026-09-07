@@ -384,6 +384,35 @@ describe("native client", () => {
     expect(invoke).toHaveBeenNthCalledWith(5, "app_update_restart");
   });
 
+  it("uses the typed common-owner runtime commands without storing a frontend selection", async () => {
+    const status = {
+      containerVersion: "0.2.16",
+      selectedSlot: "latest",
+      activeSlot: "latest",
+      pendingSlot: null,
+      latestVersion: "0.2.16",
+      stableVersion: null,
+      runtimeContractVersion: 1,
+      manifestVerified: true,
+      stableAvailable: false,
+      switchId: null,
+      phase: null,
+      engineRole: "primary",
+    } as const;
+    const invoke = vi.fn().mockResolvedValue(status);
+    const client = createNativeClient(invoke);
+
+    await client.runtimeStatus();
+    await client.runtimeSelect(true);
+    await client.restartRuntime();
+
+    expect(invoke).toHaveBeenNthCalledWith(1, "runtime_status");
+    expect(invoke).toHaveBeenNthCalledWith(2, "runtime_select", {
+      useStable: true,
+    });
+    expect(invoke).toHaveBeenNthCalledWith(3, "runtime_restart");
+  });
+
   it("routes every split-tunnel mutation through native commands", async () => {
     const invoke = vi.fn().mockResolvedValue({});
     const client = createNativeClient(invoke);

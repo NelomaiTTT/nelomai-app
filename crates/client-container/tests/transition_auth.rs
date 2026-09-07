@@ -9,9 +9,10 @@ use nelomai_client_api::{
     AccessSnapshot, LoginRequest, RuntimeSwitchReconcileRequest, RuntimeSwitchState, RuntimeTarget,
 };
 use nelomai_client_container::{
-    AuthBroker, BrokerError, FrozenReconcileRequest, LocalAuthStop, LocalStopReceiptV1,
-    ResumeArguments, RuntimeCleanupHandoff, RuntimeRecordSwitchControl, RuntimeSwitchControl,
-    SlotSelectionV1, SwitchCoordinator, SwitchPhase, SwitchProgress, UnavailableRuntimeForceStop,
+    AuthBroker, BrokerError, CleanupEngineRoleV1, FrozenReconcileRequest, LocalAuthStop,
+    LocalStopReceiptV1, ResumeArguments, RuntimeCleanupHandoff, RuntimeRecordSwitchControl,
+    RuntimeSwitchControl, SlotSelectionV1, SwitchCoordinator, SwitchPhase, SwitchProgress,
+    UnavailableRuntimeForceStop,
 };
 use nelomai_client_core::{CoreLocalStop, RuntimeWriterGates};
 use nelomai_client_storage::{
@@ -289,6 +290,7 @@ struct SwitchControl {
     hold_completion: AtomicUsize,
     completion_entered: Notify,
     completion_release: Notify,
+    reject_completion: AtomicUsize,
 }
 #[async_trait]
 impl RuntimeSwitchControl for SwitchControl {
@@ -355,6 +357,9 @@ impl RuntimeSwitchControl for SwitchControl {
         _receipt: &LocalStopReceiptV1,
         _access: &nelomai_client_api::AccessSnapshot,
     ) -> Result<(), BrokerError> {
+        if self.reject_completion.load(Ordering::SeqCst) == 1 {
+            return Err(BrokerError::RecoveryRequired);
+        }
         if self.hold_completion.load(Ordering::SeqCst) == 1 {
             self.completion_entered.notify_one();
             self.completion_release.notified().await;
@@ -1664,25 +1669,123 @@ async fn satisfied_initial_admission_does_not_override_a_later_explicit_slot_swi
     let root = tempfile::tempdir().unwrap();
     let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
     write_test_selection(root.path(), "0.2.16");
-    let coordinator = SwitchCoordinator::open(
-        owner,
-        manifest_with_optional_stable("0.2.16", "0.2.16", true),
-    )
-    .unwrap()
-    .attach(broker, Arc::new(SwitchControl::default()))
-    .require_initial_transition(RuntimeSlot::Latest);
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let active =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let coordinator = SwitchCoordinator::open(owner, manifest)
+        .unwrap()
+        .attach(broker, Arc::new(SwitchControl::default()))
+        .require_initial_transition(RuntimeSlot::Latest);
+    coordinator.before_tunnel_start().await.unwrap();
+    state.return_retry.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        coordinator.request(RuntimeSlot::Stable).await.unwrap(),
+        SwitchProgress::Pending { .. }
+    ));
+    let status = coordinator.status_for(&active).unwrap();
+    assert_eq!(status.container_version, "0.2.16");
+    assert_eq!(status.active_slot, RuntimeSlot::Latest);
+    assert_eq!(status.selected_slot, RuntimeSlot::Latest);
+    assert_eq!(status.pending_slot, Some(RuntimeSlot::Stable));
+    assert_eq!(status.latest_version, "0.2.16");
+    assert_eq!(status.stable_version.as_deref(), Some("0.2.15"));
+    assert_eq!(status.runtime_contract_version, 1);
+    assert!(status.manifest_verified);
+    assert!(status.stable_available);
+    assert!(status.switch_id.is_some());
+    assert_eq!(status.phase, Some(SwitchPhase::ServerReconciling));
+    assert_eq!(status.engine_role, CleanupEngineRoleV1::Primary);
+    assert!(status.restart_required());
+    assert!(coordinator.before_tunnel_start_for(&active).await.is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert_eq!(
+        coordinator.cancel_pending_for(&active).await.unwrap(),
+        SwitchProgress::Ready,
+    );
+    let cancelled = coordinator.status_for(&active).unwrap();
+    assert_eq!(cancelled.selected_slot, RuntimeSlot::Latest);
+    assert_eq!(cancelled.pending_slot, None);
+    assert!(!cancelled.restart_required());
+    coordinator.before_tunnel_start_for(&active).await.unwrap();
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn completed_switch_returns_to_active_slot_through_a_fresh_reverse_authority() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, legacy_store(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let active =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let coordinator = SwitchCoordinator::open(owner, manifest)
+        .unwrap()
+        .attach(broker, Arc::new(SwitchControl::default()))
+        .require_initial_transition(RuntimeSlot::Latest);
     coordinator.before_tunnel_start().await.unwrap();
     assert_eq!(
         coordinator.request(RuntimeSlot::Stable).await.unwrap(),
-        SwitchProgress::Ready
+        SwitchProgress::Ready,
     );
-    coordinator.before_tunnel_start().await.unwrap();
+    let applied = coordinator.status_for(&active).unwrap();
+    let applied_operation = applied.switch_id.clone().unwrap();
+    assert_eq!(applied.phase, Some(SwitchPhase::Complete));
+    assert_eq!(applied.selected_slot, RuntimeSlot::Stable);
+    assert!(applied.restart_required());
+
     assert_eq!(
-        coordinator.status().unwrap().selected_slot,
-        RuntimeSlot::Stable
+        coordinator.cancel_pending_for(&active).await.unwrap(),
+        SwitchProgress::Ready,
     );
-    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 2);
+    let reversed = coordinator.status_for(&active).unwrap();
+    assert_eq!(reversed.phase, Some(SwitchPhase::Complete));
+    assert_eq!(reversed.selected_slot, RuntimeSlot::Latest);
+    assert_ne!(
+        reversed.switch_id.as_deref(),
+        Some(applied_operation.as_str())
+    );
+    assert!(!reversed.restart_required());
+    coordinator.before_tunnel_start_for(&active).await.unwrap();
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn restart_can_recover_an_auth_resuming_switch_after_local_stop_is_durable() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state).await;
+    let broker = Arc::new(AuthBroker::new(api, legacy_store(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let active =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let coordinator = SwitchCoordinator::open(owner, manifest)
+        .unwrap()
+        .attach(broker, control.clone())
+        .require_initial_transition(RuntimeSlot::Latest);
+    coordinator.before_tunnel_start().await.unwrap();
+    control.reject_completion.store(1, Ordering::SeqCst);
+
+    assert!(coordinator.request(RuntimeSlot::Stable).await.is_err());
+    assert_eq!(
+        coordinator.status_for(&active).unwrap().phase,
+        Some(SwitchPhase::AuthResuming),
+    );
+    let restart = coordinator.prepare_runtime_restart(&active).await.unwrap();
+    assert_eq!(restart.selected_slot, RuntimeSlot::Stable);
+    assert_eq!(restart.pending_slot, None);
+    assert_eq!(restart.phase, Some(SwitchPhase::AuthResuming));
+    assert!(restart.local_stop_confirmed());
+    assert_eq!(control.stops.load(Ordering::SeqCst), 2);
     server.abort();
 }
 
@@ -1778,7 +1881,10 @@ async fn offline_start_rechecks_switch_barrier_after_preflight_and_lifecycle_gap
     );
     let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
     write_test_selection(root.path(), "0.2.16");
-    let coordinator = Arc::new(SwitchCoordinator::open(owner, manifest()).unwrap().attach(
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let active =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let coordinator = Arc::new(SwitchCoordinator::open(owner, manifest).unwrap().attach(
         broker,
         Arc::new(RuntimeRecordSwitchControl::new(
             record.clone(),
@@ -1809,13 +1915,19 @@ async fn offline_start_rechecks_switch_barrier_after_preflight_and_lifecycle_gap
         _ = preflight.passed.notified() => {}
     }
     assert!(matches!(
-        coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+        coordinator.request(RuntimeSlot::Stable).await.unwrap(),
         SwitchProgress::Pending { .. }
     ));
     assert_eq!(
         coordinator.status().unwrap().phase,
         Some(SwitchPhase::ServerReconciling)
     );
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+    let restart = coordinator.prepare_runtime_restart(&active).await.unwrap();
+    assert_eq!(restart.active_slot, RuntimeSlot::Latest);
+    assert_eq!(restart.selected_slot, RuntimeSlot::Stable);
+    assert_eq!(restart.pending_slot, None);
+    assert_eq!(restart.phase, Some(SwitchPhase::ServerReconciling));
     assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
     preflight.release.notify_one();
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), start)

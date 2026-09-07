@@ -281,6 +281,41 @@ struct ConnectionIntentLogRecord {
     delay_seconds: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeActionSource {
+    UiStatus,
+    UiSelect,
+    UiRestart,
+}
+
+impl RuntimeActionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::UiStatus => "ui_status",
+            Self::UiSelect => "ui_select",
+            Self::UiRestart => "ui_restart",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RuntimeStatusLogRecord<'a> {
+    timestamp_unix: i64,
+    kind: &'static str,
+    container_version: &'a str,
+    selected_slot: nelomai_contracts::RuntimeSlot,
+    active_slot: nelomai_contracts::RuntimeSlot,
+    pending_slot: Option<nelomai_contracts::RuntimeSlot>,
+    latest_version: &'a str,
+    stable_version: Option<&'a str>,
+    runtime_contract_version: u32,
+    manifest_verification: &'static str,
+    switch_id: Option<&'a str>,
+    switch_phase: Option<nelomai_client_container::SwitchPhase>,
+    action_source: &'static str,
+    engine_role: nelomai_client_container::CleanupEngineRoleV1,
+}
+
 impl AppDiagnostics {
     pub fn new(directory: PathBuf, resource_baseline: ResourceSnapshot) -> io::Result<Self> {
         fs::create_dir_all(&directory)?;
@@ -355,6 +390,33 @@ impl AppDiagnostics {
             reason_class,
             attempt,
             delay_seconds,
+        });
+    }
+
+    pub(crate) fn record_runtime_status(
+        &self,
+        status: &nelomai_client_container::RuntimeSwitchStatusV1,
+        source: RuntimeActionSource,
+    ) {
+        self.append_serialized(&RuntimeStatusLogRecord {
+            timestamp_unix: now_unix(),
+            kind: "runtime.status",
+            container_version: &status.container_version,
+            selected_slot: status.selected_slot,
+            active_slot: status.active_slot,
+            pending_slot: status.pending_slot,
+            latest_version: &status.latest_version,
+            stable_version: status.stable_version.as_deref(),
+            runtime_contract_version: status.runtime_contract_version,
+            manifest_verification: if status.manifest_verified {
+                "verified"
+            } else {
+                "rejected"
+            },
+            switch_id: status.switch_id.as_deref(),
+            switch_phase: status.phase,
+            action_source: source.as_str(),
+            engine_role: status.engine_role,
         });
     }
 
@@ -1155,6 +1217,69 @@ fn safe_connection_intent_log(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_diagnostics_are_allowlisted_and_exclude_secret_or_tunnel_configuration() {
+        use nelomai_client_container::{CleanupEngineRoleV1, RuntimeSwitchStatusV1, SwitchPhase};
+        use nelomai_contracts::RuntimeSlot;
+
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().to_path_buf(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let status = RuntimeSwitchStatusV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Stable,
+            active_slot: RuntimeSlot::Latest,
+            pending_slot: Some(RuntimeSlot::Stable),
+            latest_version: "0.2.16".into(),
+            stable_version: Some("0.2.15".into()),
+            runtime_contract_version: 1,
+            manifest_verified: true,
+            stable_available: true,
+            switch_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            phase: Some(SwitchPhase::ServerReconciling),
+            engine_role: CleanupEngineRoleV1::Primary,
+        };
+
+        diagnostics.record_runtime_status(&status, RuntimeActionSource::UiSelect);
+
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
+        let record = report
+            .application_log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "runtime.status")
+            .unwrap();
+        assert_eq!(record["container_version"], "0.2.16");
+        assert_eq!(record["active_slot"], "latest");
+        assert_eq!(record["pending_slot"], "stable");
+        assert_eq!(record["latest_version"], "0.2.16");
+        assert_eq!(record["stable_version"], "0.2.15");
+        assert_eq!(record["runtime_contract_version"], 1);
+        assert_eq!(record["manifest_verification"], "verified");
+        assert_eq!(record["switch_id"], "11111111-1111-4111-8111-111111111111");
+        assert_eq!(record["switch_phase"], "server_reconciling");
+        assert_eq!(record["action_source"], "ui_select");
+        assert_eq!(record["engine_role"], "primary");
+        let encoded = serde_json::to_string(&record).unwrap();
+        for forbidden in [
+            "install_secret",
+            "access_token",
+            "refresh_token",
+            "password",
+            "private_key",
+            "configuration",
+            "tunnel_config",
+            "wireguard_config",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
 
     #[test]
     fn connection_intent_diagnostics_reports_and_notifies_once_per_episode() {

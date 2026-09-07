@@ -170,10 +170,38 @@ pub enum SwitchProgress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSwitchStatusV1 {
+    pub container_version: String,
     pub selected_slot: nelomai_contracts::RuntimeSlot,
+    pub active_slot: nelomai_contracts::RuntimeSlot,
     pub pending_slot: Option<nelomai_contracts::RuntimeSlot>,
+    pub latest_version: String,
+    pub stable_version: Option<String>,
+    pub runtime_contract_version: u32,
+    pub manifest_verified: bool,
     pub stable_available: bool,
+    pub switch_id: Option<String>,
     pub phase: Option<SwitchPhase>,
+    pub engine_role: CleanupEngineRoleV1,
+}
+
+impl RuntimeSwitchStatusV1 {
+    pub fn restart_required(&self) -> bool {
+        self.pending_slot
+            .is_some_and(|pending| pending != self.active_slot)
+            || self.selected_slot != self.active_slot
+    }
+
+    pub fn local_stop_confirmed(&self) -> bool {
+        matches!(
+            self.phase,
+            Some(
+                SwitchPhase::LocalStopped
+                    | SwitchPhase::ServerReconciling
+                    | SwitchPhase::AuthResuming
+                    | SwitchPhase::Complete
+            )
+        )
+    }
 }
 
 pub struct RuntimeCleanupHandoff {
@@ -331,14 +359,42 @@ impl SwitchCoordinator {
     pub fn status(&self) -> Result<RuntimeSwitchStatusV1, SwitchError> {
         let selection =
             current_selection(&self.owner, &self.manifest).map_err(SwitchJournalError::Io)?;
-        Ok(RuntimeSwitchStatusV1 {
-            selected_slot: selection.selected_slot,
-            pending_slot: selection.pending_slot,
-            stable_available: self
+        let active = RuntimeTarget::from_identity(
+            &self
                 .manifest
-                .selected(nelomai_contracts::RuntimeSlot::Stable)
-                .is_some(),
-            phase: self.snapshot()?.map(|journal| journal.phase),
+                .identity(selection.selected_slot, None)
+                .map_err(|_| SwitchError::RecoveryRequired)?,
+        );
+        self.status_for(&active)
+    }
+
+    /// Projects the persisted selection against the runtime that the common
+    /// owner actually admitted for this process incarnation.
+    pub fn status_for(&self, active: &RuntimeTarget) -> Result<RuntimeSwitchStatusV1, SwitchError> {
+        if !self.is_verified_manifest_target(active) {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        let selection =
+            current_selection(&self.owner, &self.manifest).map_err(SwitchJournalError::Io)?;
+        let latest = self.manifest.latest();
+        let stable = self.manifest.stable();
+        let journal = self.snapshot()?;
+        Ok(RuntimeSwitchStatusV1 {
+            container_version: self.manifest.manifest().container_version.clone(),
+            selected_slot: selection.selected_slot,
+            active_slot: active.runtime_slot,
+            pending_slot: selection.pending_slot,
+            latest_version: latest.runtime_version.clone(),
+            stable_version: stable.map(|runtime| runtime.runtime_version.clone()),
+            runtime_contract_version: active.runtime_contract_version,
+            manifest_verified: true,
+            stable_available: stable.is_some(),
+            switch_id: journal.as_ref().map(|journal| journal.operation_id.clone()),
+            phase: journal.as_ref().map(|journal| journal.phase),
+            engine_role: journal
+                .as_ref()
+                .map(|journal| journal.cleanup_envelope.engine_role)
+                .unwrap_or(CleanupEngineRoleV1::Primary),
         })
     }
 
@@ -646,11 +702,70 @@ impl SwitchCoordinator {
 
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
+        self.before_tunnel_start_locked_for(None).await
+    }
+
+    pub async fn before_tunnel_start_for(&self, active: &RuntimeTarget) -> Result<(), SwitchError> {
+        let _execution = self.execution.lock().await;
+        self.before_tunnel_start_locked_for(Some(active)).await
+    }
+
+    async fn before_tunnel_start_locked_for(
+        &self,
+        active: Option<&RuntimeTarget>,
+    ) -> Result<(), SwitchError> {
+        if active.is_some_and(|target| {
+            self.status_for(target)
+                .map(|status| status.restart_required())
+                .unwrap_or(true)
+        }) {
+            return Err(SwitchError::RecoveryRequired);
+        }
         match crate::update_start_recovery(self)? {
             crate::UpdateStartRecovery::None => self.before_tunnel_start_locked(false).await,
             crate::UpdateStartRecovery::Blocked => Err(SwitchError::RecoveryRequired),
             recovery => self.recover_update_for_start_locked(recovery).await,
         }
+    }
+
+    /// Prepares a full runtime-process relaunch without weakening update
+    /// replacement gates. Recovery may remain server-pending, but local stop
+    /// and its durable handoff must already be complete before relaunch.
+    pub async fn prepare_runtime_restart(
+        &self,
+        active: &RuntimeTarget,
+    ) -> Result<RuntimeSwitchStatusV1, SwitchError> {
+        let _execution = self.execution.lock().await;
+        if crate::update_barrier_pending(&self.owner)? {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        let status = self.status_for(active)?;
+        if !status.restart_required() {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        if status
+            .phase
+            .is_some_and(|phase| phase != SwitchPhase::Complete)
+        {
+            let (broker, control) = self.components()?;
+            let recovered = self.recover_locked(broker, control).await;
+            if recovered.is_err() {
+                let status = self.status_for(active)?;
+                if !status.restart_required() || !status.local_stop_confirmed() {
+                    return Err(SwitchError::RecoveryRequired);
+                }
+            }
+        }
+        let mut status = self.status_for(active)?;
+        if !status.restart_required() || !status.local_stop_confirmed() {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        if let Some(pending) = status.pending_slot {
+            finish_selection(&self.owner, &self.manifest, pending)
+                .map_err(SwitchJournalError::Io)?;
+            status = self.status_for(active)?;
+        }
+        Ok(status)
     }
 
     pub(crate) async fn recover_installed_update(&self) -> Result<(), SwitchError> {
@@ -779,6 +894,41 @@ impl SwitchCoordinator {
         }
         let (broker, control) = self.components()?;
         self.update(|journal| journal.cancel_requested = true)?;
+        self.recover_locked(broker, control).await
+    }
+
+    pub async fn cancel_pending_for(
+        &self,
+        active: &RuntimeTarget,
+    ) -> Result<SwitchProgress, SwitchError> {
+        let _execution = self.execution.lock().await;
+        if crate::update_barrier_pending(&self.owner)? || !self.is_verified_manifest_target(active)
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        let journal = self.snapshot()?.ok_or(SwitchError::RecoveryRequired)?;
+        if journal
+            .source_identity
+            .as_ref()
+            .map(RuntimeTarget::from_identity)
+            .as_ref()
+            != Some(active)
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        if journal.phase == SwitchPhase::Complete {
+            if journal.decision != Some(SwitchDecision::Apply)
+                || journal.target_identity.runtime_slot == active.runtime_slot
+            {
+                return Err(SwitchError::RecoveryRequired);
+            }
+            // A completed Apply is immutable. Returning to the still-active
+            // runtime is a fresh reverse transition with its own authority,
+            // never a replay of the completed operation as Cancel.
+            return self.request_locked(active.runtime_slot, false).await;
+        }
+        self.update(|journal| journal.cancel_requested = true)?;
+        let (broker, control) = self.components()?;
         self.recover_locked(broker, control).await
     }
 

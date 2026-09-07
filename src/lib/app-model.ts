@@ -28,6 +28,76 @@ export type EgressMode = "ipv4" | "prefer_ipv6";
 export type Platform = "android" | "windows" | "macos" | "linux";
 export type ConnectionIntentStatus = "none" | "recovering" | "blocked_terminal";
 export type PrimaryConnectionAction = "start" | "stop" | "retry";
+export type RuntimeSlot = "latest" | "stable";
+export type RuntimeSwitchPhase =
+  | "requested"
+  | "cleanup_handed_off"
+  | "runtime_stopping"
+  | "local_stopped"
+  | "server_reconciling"
+  | "auth_resuming"
+  | "complete";
+
+export interface RuntimeStatus {
+  containerVersion: string;
+  selectedSlot: RuntimeSlot;
+  activeSlot: RuntimeSlot;
+  pendingSlot: RuntimeSlot | null;
+  latestVersion: string;
+  stableVersion: string | null;
+  runtimeContractVersion: number;
+  manifestVerified: boolean;
+  stableAvailable: boolean;
+  switchId: string | null;
+  phase: RuntimeSwitchPhase | null;
+  engineRole: "primary" | "redundant";
+}
+
+export function runtimeSelectorVisible(status: RuntimeStatus): boolean {
+  return (
+    status.manifestVerified &&
+    status.stableAvailable &&
+    status.stableVersion !== null &&
+    status.stableVersion !== status.latestVersion
+  );
+}
+
+export function runtimeRestartRequired(status: RuntimeStatus): boolean {
+  return (
+    (status.pendingSlot !== null && status.pendingSlot !== status.activeSlot) ||
+    status.selectedSlot !== status.activeSlot
+  );
+}
+
+export function runtimeStartBlocked(status: RuntimeStatus | null): boolean {
+  if (status === null) return false;
+  return (
+    runtimeRestartRequired(status) ||
+    (status.phase !== null && status.phase !== "complete")
+  );
+}
+
+export function createRuntimeSelectorActions(
+  select: (useStable: boolean) => Promise<void>,
+  restart: () => Promise<void>,
+) {
+  let inFlight: Promise<void> | null = null;
+  return {
+    select(useStable: boolean): Promise<void> {
+      if (inFlight) return inFlight;
+      const request = Promise.resolve(select(useStable));
+      const tracked = request.finally(() => {
+        if (inFlight === tracked) inFlight = null;
+      });
+      inFlight = tracked;
+      return tracked;
+    },
+    later(): void {},
+    restartNow(): Promise<void> {
+      return restart();
+    },
+  };
+}
 
 export interface Access {
   state: "active" | "expired";

@@ -36,6 +36,13 @@ pub(crate) enum RuntimeAction {
     Toggle,
     Quit,
 }
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeExitReason {
+    Shutdown,
+    Update,
+    RuntimeSwitch,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeControl {
@@ -44,7 +51,7 @@ pub(crate) enum NativeControl {
         presentation: TraySnapshot,
     },
     Exit {
-        restart: bool,
+        reason: NativeExitReason,
     },
     #[cfg(windows)]
     DefenderStatus {
@@ -139,6 +146,18 @@ pub(crate) fn native() -> io::Result<Arc<NativeClient>> {
 #[cfg(all(test, unix))]
 mod native_tests {
     use super::*;
+    #[test]
+    fn runtime_restart_is_an_explicit_full_common_exit_reason() {
+        let encoded = serde_json::to_value(NativeControl::Exit {
+            reason: NativeExitReason::RuntimeSwitch,
+        })
+        .unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({"command":"exit","reason":"runtime_switch"}),
+        );
+    }
+
     #[test]
     fn malformed_reply_permanently_closes_native_channel() {
         let (client, mut peer) = NativeStream::pair().unwrap();

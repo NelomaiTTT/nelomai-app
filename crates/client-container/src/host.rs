@@ -63,6 +63,17 @@ pub struct HostNativePorts {
     pub background: Arc<dyn PrivateBackgroundDispatcher>,
     pub updater: Option<Arc<dyn nelomai_client_updater::UpdateBackend>>,
     pub storage: Option<Arc<dyn NativeRuntimeStorage>>,
+    pub relaunch: Option<Arc<dyn NativeRuntimeRelaunch>>,
+}
+
+#[async_trait::async_trait]
+pub trait NativeRuntimeRelaunch: Send + Sync {
+    async fn relaunch_runtime(&self, runtime_pid: u32) -> Result<(), BrokerError>;
+    async fn release_owner_reload(
+        &self,
+        runtime_pid: u32,
+        success: bool,
+    ) -> Result<(), BrokerError>;
 }
 
 pub trait NativeRuntimeStorage: Send + Sync {
@@ -187,6 +198,7 @@ pub enum HostRequestV1 {
     RuntimeStatus,
     RuntimeSelect { slot: RuntimeSlot },
     RuntimeCancel,
+    RuntimeRestart,
     BeforeTunnelStart,
     UpdateStatus,
     UpdateRefresh,
@@ -219,6 +231,7 @@ struct HostCommands {
     bridge: std::sync::Weak<HostBridge>,
     ready_gate: Arc<tokio::sync::Mutex<()>>,
     migration: Option<Arc<dyn MigrationCompletion>>,
+    runtime_pid: Option<u32>,
 }
 #[async_trait::async_trait]
 impl PrivateOwnerCommands for HostCommands {
@@ -299,21 +312,58 @@ impl PrivateOwnerCommands for HostCommands {
             }
             HostRequestV1::RuntimeStatus => {}
             HostRequestV1::RuntimeSelect { slot } => {
-                self.coordinator
-                    .request(slot)
-                    .await
-                    .map_err(|_| PrivateError::RecoveryRequired)?;
+                if self.coordinator.request(slot).await.is_err() {
+                    let status = self
+                        .coordinator
+                        .status_for(target)
+                        .map_err(|_| PrivateError::RecoveryRequired)?;
+                    if !status.restart_required() || !status.local_stop_confirmed() {
+                        return Err(PrivateError::RecoveryRequired);
+                    }
+                }
             }
             HostRequestV1::RuntimeCancel => {
                 self.coordinator
-                    .cancel_pending()
+                    .cancel_pending_for(target)
                     .await
                     .map_err(|_| PrivateError::RecoveryRequired)?;
+            }
+            HostRequestV1::RuntimeRestart => {
+                let status = self
+                    .coordinator
+                    .prepare_runtime_restart(target)
+                    .await
+                    .map_err(|_| PrivateError::RecoveryRequired)?;
+                if let Some(runtime_pid) = self.runtime_pid {
+                    let bridge = self.bridge.upgrade().ok_or(PrivateError::Closed)?;
+                    let relaunch = bridge
+                        .native
+                        .relaunch
+                        .as_ref()
+                        .ok_or(PrivateError::RecoveryRequired)?
+                        .clone();
+                    let peer = bridge.peer().map_err(|_| PrivateError::Closed)?;
+                    relaunch
+                        .relaunch_runtime(runtime_pid)
+                        .await
+                        .map_err(|_| PrivateError::RecoveryRequired)?;
+                    tokio::spawn(async move {
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                        while peer.is_connected() && tokio::time::Instant::now() < deadline {
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
+                        let _ = relaunch
+                            .release_owner_reload(runtime_pid, !peer.is_connected())
+                            .await;
+                    });
+                }
+                return Ok(HostResponseV1::RuntimeStatus { status });
             }
             HostRequestV1::BeforeTunnelStart => {
                 self.updater.recover().await?;
                 self.coordinator
-                    .before_tunnel_start()
+                    .before_tunnel_start_for(target)
                     .await
                     .map_err(|_| PrivateError::RecoveryRequired)?;
                 return Ok(HostResponseV1::Done);
@@ -322,7 +372,7 @@ impl PrivateOwnerCommands for HostCommands {
         Ok(HostResponseV1::RuntimeStatus {
             status: self
                 .coordinator
-                .status()
+                .status_for(target)
                 .map_err(|_| PrivateError::RecoveryRequired)?,
         })
     }
@@ -645,6 +695,38 @@ impl CommonHost {
             .native_start_blocked()
             .map_err(|_| HostError::RecoveryRequired)
     }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn before_native_tunnel_start(&self) -> Result<(), HostError> {
+        self.coordinator
+            .before_tunnel_start_for(self.installed.target())
+            .await
+            .map_err(|_| HostError::RecoveryRequired)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn prepare_runtime_restart(&self) -> Result<crate::RuntimeSwitchStatusV1, HostError> {
+        self.coordinator
+            .prepare_runtime_restart(self.installed.target())
+            .await
+            .map_err(|_| HostError::RecoveryRequired)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn runtime_restart_ready(&self) -> Result<bool, HostError> {
+        if self
+            .updater
+            .native_start_blocked()
+            .map_err(|_| HostError::RecoveryRequired)?
+        {
+            return Ok(false);
+        }
+        let status = self
+            .coordinator
+            .status_for(self.installed.target())
+            .map_err(|_| HostError::RecoveryRequired)?;
+        Ok(status.restart_required() && status.local_stop_confirmed())
+    }
     /// Only this verified launch path creates desktop auth admission. A PID or
     /// manifest claimed by a connecting client is never accepted as authority.
     #[cfg(not(target_os = "android"))]
@@ -738,6 +820,7 @@ impl CommonHost {
                 bridge: Arc::downgrade(&self.bridge),
                 ready_gate: self.ready_gate.clone(),
                 migration: self.migration.clone(),
+                runtime_pid: None,
             })),
         )
         .map_err(|_| HostError::RecoveryRequired)?;
@@ -823,6 +906,7 @@ impl CommonHost {
                 bridge: Arc::downgrade(&self.bridge),
                 ready_gate: self.ready_gate.clone(),
                 migration: self.migration.clone(),
+                runtime_pid: Some(caller_pid),
             })),
         )
         .map_err(|_| HostError::RecoveryRequired)?;

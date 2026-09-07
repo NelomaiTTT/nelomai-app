@@ -47,6 +47,7 @@ class RuntimeAuthBrokerService : Service() {
     override fun onCreate() {
         super.onCreate()
         host = runCatching { RuntimeNativeHost.nativeOpen(applicationContext, filesDir.absolutePath, RuntimeContainerAssets.prepare(this).absolutePath, RuntimeNativeCallbacks(this)) }.getOrDefault(0L)
+        RuntimeOwnerReloadGate.ownerReady(host != 0L)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -55,8 +56,9 @@ class RuntimeAuthBrokerService : Service() {
         if (intent != null && intent.component?.packageName == packageName && intent.component?.className == javaClass.name && intent.action == null) binder else null
 
     override fun onDestroy() {
-        if (host != 0L) RuntimeNativeHost.nativeClose(host)
+        val ownerClosed = host != 0L && RuntimeNativeHost.nativeClose(host)
         host = 0
+        RuntimeOwnerReloadGate.ownerStopped(ownerClosed)
         super.onDestroy()
     }
 

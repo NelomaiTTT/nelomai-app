@@ -2,7 +2,7 @@
 //! journals, tray and privileged dispatch; it never constructs product core/UI.
 use crate::{
     desktop, platform,
-    runtime::{NativeControl, NativeReply, RuntimeAction, TraySnapshot},
+    runtime::{NativeControl, NativeExitReason, NativeReply, RuntimeAction, TraySnapshot},
     PANEL_BASE,
 };
 use nelomai_client_container::{
@@ -348,6 +348,7 @@ pub fn run() {
                     background: Arc::new(DesktopBackground),
                     updater,
                     storage: None,
+                    relaunch: None,
                 },
             )?);
             let mut child = tauri::async_runtime::block_on(host.launch_desktop(0))?;
@@ -443,22 +444,31 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                                 .collect();
                             NativeReply::Actions { actions }
                         }
-                        NativeControl::Exit { restart } => {
-                            if restart
-                                && state
-                                    .host
-                                    .updater_status()
-                                    .map_err(|_| io::Error::other("updater unavailable"))?
-                                    .phase
-                                    != "ready_to_restart"
-                            {
-                                return Err(io::Error::other("update not ready"));
+                        NativeControl::Exit { reason } => {
+                            match reason {
+                                NativeExitReason::Shutdown => {}
+                                NativeExitReason::Update => {
+                                    if state
+                                        .host
+                                        .updater_status()
+                                        .map_err(|_| io::Error::other("updater unavailable"))?
+                                        .phase
+                                        != "ready_to_restart"
+                                    {
+                                        return Err(io::Error::other("update not ready"));
+                                    }
+                                    tauri::async_runtime::block_on(state.stop.operation.lock())
+                                        .restart_proof(&state.host)?;
+                                }
+                                NativeExitReason::RuntimeSwitch => {
+                                    if !state.host.runtime_restart_ready().map_err(|_| {
+                                        io::Error::other("runtime switch unavailable")
+                                    })? {
+                                        return Err(io::Error::other("runtime switch not ready"));
+                                    }
+                                }
                             }
-                            if restart {
-                                tauri::async_runtime::block_on(state.stop.operation.lock())
-                                    .restart_proof(&state.host)?;
-                            }
-                            exit = Some(restart);
+                            exit = Some(!matches!(reason, NativeExitReason::Shutdown));
                             NativeReply::Done
                         }
                         #[cfg(windows)]
@@ -511,8 +521,7 @@ async fn engine_exchange(state: &CommonState, body: &[u8]) -> io::Result<Vec<u8>
     if matches!(request, Request::Start { .. }) {
         state
             .host
-            .coordinator()
-            .before_tunnel_start()
+            .before_native_tunnel_start()
             .await
             .map_err(|_| io::Error::other("common start rejected"))?;
     }

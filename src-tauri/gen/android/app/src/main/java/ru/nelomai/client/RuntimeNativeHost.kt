@@ -9,7 +9,7 @@ object RuntimeNativeHost {
     external fun nativeSelection(host: Long): String
     /** Takes ownership of fd on success and failure; all identity fields are checked in Rust. */
     external fun nativeAttach(host: Long, fd: Int, peerPid: Int, peerUid: Int, request: String): String
-    external fun nativeClose(host: Long)
+    external fun nativeClose(host: Long): Boolean
 }
 
 object RuntimeContainerAssets {

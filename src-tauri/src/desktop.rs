@@ -334,7 +334,9 @@ pub fn quit_application(app: AppHandle) {
             // validates the successful-install stop proof before using it.
             if let Ok(owner) = crate::runtime::native() {
                 if owner
-                    .control(crate::runtime::NativeControl::Exit { restart: false })
+                    .control(crate::runtime::NativeControl::Exit {
+                        reason: crate::runtime::NativeExitReason::Shutdown,
+                    })
                     .await
                     .is_ok()
                 {
@@ -355,7 +357,9 @@ pub fn quit_application(app: AppHandle) {
                 .await;
                 if let Ok(owner) = crate::runtime::native() {
                     let _ = owner
-                        .control(crate::runtime::NativeControl::Exit { restart: false })
+                        .control(crate::runtime::NativeControl::Exit {
+                            reason: crate::runtime::NativeExitReason::Shutdown,
+                        })
                         .await;
                 }
                 app.exit(0);

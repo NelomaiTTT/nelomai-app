@@ -1,7 +1,7 @@
 use base64::Engine;
 use jni::{
     objects::{GlobalRef, JObject, JString, JValue},
-    sys::{jint, jlong, jstring},
+    sys::{jboolean, jint, jlong, jstring},
     JNIEnv, JavaVM,
 };
 use nelomai_client_api::ClientApi;
@@ -63,6 +63,8 @@ enum Call {
     Storage(String, String, bool, bool),
     StorageAck,
     PushCleanup,
+    Relaunch(u32),
+    ReleaseOwnerReload(u32, bool),
 }
 impl Callbacks {
     fn call(&self, call: Call) -> Result<Option<String>, ()> {
@@ -125,6 +127,27 @@ impl Callbacks {
                     "stopVpn",
                     "(Z)Z",
                     &[JValue::Bool(force.into())],
+                )
+                .and_then(|v| v.z())
+                .map(|ok| ok.then_some(None)),
+            Call::Relaunch(runtime_pid) => env
+                .call_method(
+                    self.object.as_obj(),
+                    "relaunchRuntime",
+                    "(I)Z",
+                    &[JValue::Int(runtime_pid.try_into().map_err(|_| ())?)],
+                )
+                .and_then(|v| v.z())
+                .map(|ok| ok.then_some(None)),
+            Call::ReleaseOwnerReload(runtime_pid, success) => env
+                .call_method(
+                    self.object.as_obj(),
+                    "releaseRuntimeOwnerReload",
+                    "(IZ)Z",
+                    &[
+                        JValue::Int(runtime_pid.try_into().map_err(|_| ())?),
+                        JValue::Bool(success.into()),
+                    ],
                 )
                 .and_then(|v| v.z())
                 .map(|ok| ok.then_some(None)),
@@ -219,6 +242,21 @@ impl LocalAuthStop for Native {
 impl RuntimeForceStop for Native {
     async fn force_stop(&self, _: &str) -> Result<(), BrokerError> {
         self.call(Call::Stop(true)).await.map(|_| ())
+    }
+}
+#[async_trait::async_trait]
+impl nelomai_client_container::host::NativeRuntimeRelaunch for Native {
+    async fn relaunch_runtime(&self, runtime_pid: u32) -> Result<(), BrokerError> {
+        self.call(Call::Relaunch(runtime_pid)).await.map(|_| ())
+    }
+    async fn release_owner_reload(
+        &self,
+        runtime_pid: u32,
+        success: bool,
+    ) -> Result<(), BrokerError> {
+        self.call(Call::ReleaseOwnerReload(runtime_pid, success))
+            .await
+            .map(|_| ())
     }
 }
 #[async_trait::async_trait]
@@ -364,7 +402,8 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeOpen(
                     force: native.clone(),
                     background: native.clone(),
                     updater: Some(updater),
-                    storage: Some(native),
+                    storage: Some(native.clone()),
+                    relaunch: Some(native),
                 },
             )
             .map_err(|_| ())
@@ -462,8 +501,23 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeClose(
     _: JNIEnv,
     _: JObject,
     id: jlong,
-) {
-    if let Ok(mut registry) = hosts().lock() {
-        registry.remove(&id);
-    }
+) -> jboolean {
+    let removed = hosts()
+        .lock()
+        .ok()
+        .and_then(|mut registry| registry.remove(&id));
+    let Some(host) = removed else {
+        return 0;
+    };
+    // Runtime shutdown must never run on one of that runtime's own workers.
+    // A bounded lifecycle ACK prevents a fresh owner from racing an old lock.
+    let (closed, acknowledgement) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        drop(host);
+        let _ = closed.send(());
+    });
+    acknowledgement
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .is_ok()
+        .into()
 }
