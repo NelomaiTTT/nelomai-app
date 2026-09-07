@@ -14,12 +14,23 @@ val tauriProperties = Properties().apply {
     }
 }
 val runtimeInputs = providers.gradleProperty("nelomaiRuntimeInputs").orNull?.let { file(it) }
+val acceptancePackage = providers.gradleProperty("nelomaiAcceptance").orNull == "true"
+val stableRuntimeAar = providers.gradleProperty("nelomaiStableRuntimeAar").orNull?.let { file(it) }
+check(acceptancePackage || stableRuntimeAar == null) { "Stable AAR linking is restricted to the separate acceptance package" }
+if (acceptancePackage) {
+    check(stableRuntimeAar?.isFile == true) { "Acceptance packaging requires the exact final stable runtime AAR" }
+}
 val verifyRuntimeBuildInputs by tasks.registering {
     doLast {
         val inputs = requireNotNull(runtimeInputs) { "Stage signed runtime APK inputs and pass -PnelomaiRuntimeInputs=<apk inputs directory>" }
         for (name in listOf("assets/runtime/container-manifest-v1.json", "assets/runtime/container-manifest-v1.sig",
             "jniLibs/arm64-v8a/libnelomai_android_container.so", "jniLibs/arm64-v8a/libnelomai_app_lib.so", "jniLibs/arm64-v8a/libwg-go.so")) {
             check(inputs.resolve(name).isFile) { "Missing compiled runtime input: $name" }
+        }
+        if (acceptancePackage) {
+            for (name in listOf("libnelomai_runtime_stable.so", "libstable_runtime_wg_go.so")) {
+                check(inputs.resolve("jniLibs/arm64-v8a/$name").isFile) { "Missing exact stable native input: $name" }
+            }
         }
     }
 }
@@ -59,7 +70,8 @@ android {
         val sourceVersion = (groovy.json.JsonSlurper().parse(rootDir.resolve("../../../src-tauri/tauri.conf.json")) as Map<*, *>)["version"] as String
         versionName = tauriProperties.getProperty("tauri.android.versionName", sourceVersion)
         buildConfigField("String", "RUNTIME_SLOT", "\"latest\"")
-        buildConfigField("String", "RUNTIME_VERSION", "\"$sourceVersion\"")
+        val runtimeVersion = if (acceptancePackage) "0.2.17-acceptance" else sourceVersion
+        buildConfigField("String", "RUNTIME_VERSION", "\"$runtimeVersion\"")
     }
     signingConfigs {
         if (releaseSigningConfigured) {
@@ -123,6 +135,10 @@ rust {
 }
 
 dependencies {
+    if (acceptancePackage) {
+        // Link final candidate classes/resources; never rebuild the stable AAR.
+        implementation(files(stableRuntimeAar!!))
+    }
     implementation(project(":runtime-android-common"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
     implementation("androidx.webkit:webkit:1.14.0")

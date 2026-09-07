@@ -78,61 +78,26 @@ def run() -> None:
     ).read_text(encoding="utf-8")
     if f'"git-{AMNEZIAWG_GO_REVISION[:7]}"' not in tunnel_plugin:
         raise RuntimeError("Android diagnostics use another AmneziaWG Go revision")
+    # Authorization is checked as a parsed job graph, not old inline build
+    # command tokens that no longer describe the native phase consumers.
+    subprocess.run([sys.executable, "-m", "unittest", "scripts.tests.test_release_workflow"],
+                   cwd=ROOT, check=True)
+    consumers = "\n".join((ROOT / name).read_text(encoding="utf-8") for name in (
+        "scripts/build-release-platform.py", "scripts/package-release-platform.py",
+        "scripts/finalize-release-candidate.py", "scripts/verify-release-platform.py",
+        ".github/actions/release-native-host/action.yml"))
     for token in (
-        "verify:",
-        "needs: verify",
-        "needs: [verify, build, build-android]",
-        "npm test",
-        "cargo clippy --workspace --all-targets -- -D warnings",
-        "cargo test --workspace",
-        "TAURI_SIGNING_PRIVATE_KEY",
-        "NELOMAI_UPDATER_PUBLIC_KEY",
-        'test -n "$NELOMAI_UPDATER_PUBLIC_KEY"',
-        "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64",
-        "prepare-runtime.ps1",
-        "prepare-runtime.sh",
-        "nelomai-windows-service",
-        "nelomai-unix-service",
-        '--bundles "${{ matrix.package_kind }}"',
-        'target/${{ matrix.rust_target }}/release/bundle',
-        "ubuntu-22.04",
-        "windows-2022",
-        "macos-14",
-        "build-android:",
-        "aarch64-linux-android",
-        "ndk;28.2.13676358",
-        "ANDROID_KEYSTORE_BASE64",
-        "ANDROID_KEYSTORE_PASSWORD",
-        "ANDROID_KEY_PASSWORD",
-        "ANDROID_KEY_ALIAS",
-        "NELOMAI_FIREBASE_APPLICATION_ID",
-        "NELOMAI_FIREBASE_API_KEY",
-        "NELOMAI_FIREBASE_PROJECT_ID",
-        "android build --ci --apk --target aarch64",
-        "CARGO_PROFILE_RELEASE_STRIP",
-        "app/build/outputs/apk/universal/release/app-universal-release.apk",
-        "apksigner",
-        ".debug_",
-        ".symtab",
-        "collect-android-release-artifact.py",
-        "amneziawg-android-source.tar.gz",
-        "vendor/amneziawg-android",
-        "vendor/amneziawg-go",
-        "go.work",
-        "patches/amneziawg-android-network-telemetry.patch",
-        "patches/amneziawg-android-memory-diagnostics.patch",
-        "patches/amneziawg-go-network-recovery.patch",
-        "patches/amneziawg-go-android-memory.patch",
-        "scripts/android/apply-amneziawg-overrides.sh",
-        "go list -m -f '{{.Dir}}' github.com/amnezia-vpn/amneziawg-go/v3",
-        "--exclude='*/.cxx'",
-        'source_archive_name="$(basename "$source_archive")"',
-        "Signer #1 certificate SHA-256 digest",
-        "path: release-android/",
-        "gh release create",
+        "prepare-runtime.ps1", "prepare-runtime.sh", "nelomai-windows-service", "nelomai-unix-service",
+        "ndk;28.2.13676358", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_PASSWORD", "ANDROID_KEY_ALIAS",
+        "NELOMAI_FIREBASE_APPLICATION_ID", "NELOMAI_FIREBASE_API_KEY", "NELOMAI_FIREBASE_PROJECT_ID",
+        "CARGO_PROFILE_RELEASE_STRIP", "apksigner", ".debug_", ".symtab",
+        "collect-android-release-artifact.py", "amneziawg-android-source.tar.gz",
+        "Signer #1 certificate SHA-256 digest", "defender-exclusions.ps1",
+        "awgGetNetworkTelemetry", "awgCloseUdp", "awgRebindUdp", "awgSendKeepalives",
+        "awgStartHandshakeProbe", "awgHandshakeProbeStatus", "awgHandshakeProbeTimeoutMillis",
     ):
-        if token not in workflow:
-            raise RuntimeError(f"release workflow misses {token}")
+        if token not in consumers:
+            raise RuntimeError(f"native release consumers miss required gate: {token}")
     for forbidden in ("macos-15-intel", "x86_64-apple-darwin"):
         if forbidden in workflow:
             raise RuntimeError(f"release workflow still contains {forbidden}")
@@ -258,15 +223,14 @@ def run() -> None:
     windows_resources = windows_bundle.get("resources", {})
     for resource in (
         "nelomai-windows-service.exe",
-        "tunnel.dll",
-        "wireguard.dll",
-        "amneziawg-tunnel.dll",
-        "wintun.dll",
-        "licenses/AMNEZIAWG-GO-LICENSE.txt",
-        "licenses/WINTUN-LICENSE.txt",
+        "runtime/",
     ):
         if resource not in windows_resources.values():
             raise RuntimeError(f"Windows bundle misses {resource}")
+    # DLLs/licenses now live inside the authenticated latest slot, not as
+    # competing top-level resources. The real packager tests retain their
+    # completeness and the native verifier runs after installer extraction.
+    subprocess.run([sys.executable, "-m", "unittest", "scripts.tests.test_runtime_artifact"], cwd=ROOT, check=True)
     nsis = windows_bundle.get("windows", {}).get("nsis", {})
     if nsis.get("installMode") != "perMachine":
         raise RuntimeError("Windows tunnel service requires a per-machine installer")
@@ -368,11 +332,10 @@ def run() -> None:
         )
     ).get("bundle", {}).get("resources", {})
     for resource in (
-        "nelomai-unix-service",
-        "wireguard-go",
-        "amneziawg-go",
-        "licenses/AMNEZIAWG-GO-LICENSE.txt",
+        "runtime/",
+        "dispatcher/1/nelomai-unix-service",
         "install-macos.sh",
+        "install-common-macos.sh",
     ):
         if resource not in macos_resources.values():
             raise RuntimeError(f"macOS bundle misses {resource}")
@@ -383,11 +346,10 @@ def run() -> None:
         )
     ).get("bundle", {}).get("resources", {})
     for resource in (
-        "nelomai-unix-service",
-        "amneziawg-go",
-        "licenses/AMNEZIAWG-GO-LICENSE.txt",
+        "runtime/",
+        "dispatcher/1/nelomai-unix-service",
         "install-linux.sh",
-        "resolvconf-linux.sh",
+        "install-common-linux.sh",
     ):
         if resource not in linux_resources.values():
             raise RuntimeError(f"Linux bundle misses {resource}")
@@ -396,12 +358,12 @@ def run() -> None:
     ).read_text(encoding="utf-8")
     if "CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW" not in linux_installer:
         raise RuntimeError("Linux helper cannot assign its socket to the app user")
-    for token in (
-        "resolvconf-linux.sh",
-        "Environment=PATH=$INSTALL_DIR:",
-    ):
+    for token in ("Environment=PATH=$INSTALL_DIR:", "install-layout", "--dispatcher"):
         if token not in linux_installer:
             raise RuntimeError(f"Linux helper DNS integration misses {token}")
+    unix_prepare = (ROOT / "scripts/unix/prepare-runtime.sh").read_text(encoding="utf-8")
+    if 'resolvconf-linux.sh" "$OUTPUT/resolvconf"' not in unix_prepare:
+        raise RuntimeError("Linux signed runtime slot omits the actual DNS helper")
 
     private_key = Ed25519PrivateKey.generate()
     seed = private_key.private_bytes_raw()

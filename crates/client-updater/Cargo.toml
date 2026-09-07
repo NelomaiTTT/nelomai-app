@@ -20,4 +20,6 @@ tokio = { version = "1", features = ["sync", "fs", "io-util"] }
 url = "2"
 
 [dev-dependencies]
+base64 = "0.22"
+minisign-verify = "=0.2.5"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

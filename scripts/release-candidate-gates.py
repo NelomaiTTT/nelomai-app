@@ -8,17 +8,36 @@ Failed/rejected attempts or ambiguous review history require a new workflow
 run and fresh approvals; GitHub's rerun action cannot reuse these approvals.
 """
 import argparse
+import base64
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import stat
+import tempfile
+import zipfile
 
 BASE = "632cc4b40872c559a75e5d7104b72bae17ac91c3"
 SIGNING_ENVIRONMENT = "release-candidate-signing"
+FINALIZATION_ENVIRONMENT = "release-candidate-finalization"
 ACCEPTANCE_ENVIRONMENT = "release-candidate-acceptance"
 PUBLICATION_ENVIRONMENT = "release-publication"
+CANDIDATE_ENVIRONMENTS = (SIGNING_ENVIRONMENT, FINALIZATION_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT)
+ENVIRONMENTS = (*CANDIDATE_ENVIRONMENTS, PUBLICATION_ENVIRONMENT)
+PACKAGE_NAMES = {
+    "linux": "nelomai-0.2.16-linux-x86_64.AppImage", "windows": "nelomai-0.2.16-windows-x86_64.exe",
+    "macos": "nelomai-0.2.16-macos-aarch64.app.tar.gz", "android": "nelomai-0.2.16-android-aarch64.apk"}
+PUBLISH_ASSETS = frozenset(PACKAGE_NAMES.values()) | {
+    "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
+    "nelomai-0.2.16-amneziawg-android-source.tar.gz", "nelomai-0.2.16-amneziawg-android-source.tar.gz.sha256",
+    "nelomai-runtime-0.2.16-release-set.manifest.json", "nelomai-runtime-0.2.16-release-set.manifest.sig",
+    *(f"nelomai-runtime-0.2.16-{platform}-{architecture}{suffix}"
+      for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64"))
+      for suffix in (".zip", ".manifest.json", ".manifest.sig"))}
 
 
 def mode_policy(mode="build_only"):
@@ -28,7 +47,7 @@ def mode_policy(mode="build_only"):
                 "operations": ["build", "test_sign", "verify", "upload_candidate"]}
     if mode == "sign_candidate":
         return {"contents": "read", "trust": "release",
-                "environments": [SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT],
+                "environments": list(CANDIDATE_ENVIRONMENTS),
                 "operations": ["build", "release_sign", "verify", "upload_candidate", "accept"]}
     if mode == "publish_approved_candidate":
         return {"contents": "write", "trust": "release", "environments": [PUBLICATION_ENVIRONMENT],
@@ -110,10 +129,10 @@ def require_publishable_inventory(inventory, run_id, source, environment_ids, ru
             or inventory.get("source_sha") != source or str(inventory.get("run_id")) != str(run_id)
             or not environment_ids or inventory.get("environment_ids") != environment_ids):
         raise ValueError("test-key, build-only or foreign candidate is permanently nonpublishable")
-    packages = {
-        "nelomai-0.2.16-linux-x86_64.AppImage", "nelomai-0.2.16-windows-x86_64.exe",
-        "nelomai-0.2.16-macos-aarch64.app.tar.gz", "nelomai-0.2.16-android-aarch64.apk"}
+    packages = set(PACKAGE_NAMES.values())
     assets = inventory.get("assets", {})
+    if isinstance(assets, dict) and not set(assets) <= PUBLISH_ASSETS:
+        raise ValueError("nonpublishable or acceptance-only asset in candidate inventory")
     if not isinstance(assets, dict) or any(not re.fullmatch(r"[0-9a-f]{64}", str(assets.get(name, ""))) for name in packages):
         raise ValueError("approved digests for all four exact installer/package names required")
 
@@ -124,7 +143,7 @@ def github_get(endpoint):
 
 
 def check_environment(repository, name):
-    if name not in (SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT, PUBLICATION_ENVIRONMENT):
+    if name not in ENVIRONMENTS:
         raise ValueError("unknown release environment")
     environment = github_get(f"repos/{repository}/environments/{name}")
     require_protected_environment(environment)
@@ -133,7 +152,7 @@ def check_environment(repository, name):
     return environment["id"]
 
 
-def check_approvals(repository, run_id, required=(SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT), *, run_attempt=1):
+def check_approvals(repository, run_id, required=CANDIDATE_ENVIRONMENTS, *, run_attempt=1):
     run_endpoint = f"repos/{repository}/actions/runs/{run_id}"
     require_first_attempt(github_get(run_endpoint), run_id, run_attempt)
     identities = {name: check_environment(repository, name) for name in required}
@@ -205,6 +224,53 @@ def verify_inventory(directory, inventory, expected_digest):
     return document
 
 
+def verify_retained_artifact(metadata, archive, directory, artifact_id, run_id, source, repository_id):
+    """Bind local bytes to GET /actions/artifacts/{id}, not an uploaded receipt.
+
+    GitHub's documented artifact digest hashes the uploaded ZIP. Require that
+    digest and its original-run/repository identity before reading its contents.
+    Missing/expired retention is never recoverable by rebuilding under old approval.
+    """
+    full_source(source)
+    run = metadata.get("workflow_run", {})
+    if (str(metadata.get("id")) != str(artifact_id) or not re.fullmatch(r"[1-9][0-9]*", str(artifact_id))
+            or metadata.get("name") != "candidate-0.2.16" or metadata.get("expired") is not False
+            or str(run.get("id")) != str(run_id) or run.get("head_sha") != source
+            or type(repository_id) is not int or repository_id <= 0
+            or run.get("repository_id") != repository_id or run.get("head_repository_id") != repository_id):
+        raise ValueError("retained artifact provenance mismatch")
+    try:
+        expires = datetime.fromisoformat(metadata["expires_at"].replace("Z", "+00:00"))
+        if expires.tzinfo is None or expires <= datetime.now(timezone.utc):
+            raise ValueError("expired retained artifact; new candidate and acceptance required")
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("retained artifact expiry is unavailable") from error
+    if (metadata.get("digest") != "sha256:" + file_hash(archive)
+            or type(metadata.get("size_in_bytes")) is not int
+            or metadata["size_in_bytes"] != archive.stat().st_size):
+        raise ValueError("retained ZIP digest or size mismatch")
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("retained extraction directory is invalid")
+    with zipfile.ZipFile(archive) as bundle:
+        entries = bundle.infolist()
+        names = [entry.filename for entry in entries]
+        if (not 0 < len(entries) <= 128 or len(set(names)) != len(names)
+                or {path.name for path in directory.iterdir()} != set(names)
+                or sum(entry.file_size for entry in entries) > 20 * 1024**3):
+            raise ValueError("retained file inventory differs")
+        for entry in entries:
+            name = entry.filename
+            mode = entry.external_attr >> 16
+            if (Path(name).name != name or "\\" in name or name.startswith(".") or entry.is_dir()
+                    or entry.flag_bits & 1 or stat.S_IFMT(mode) not in (0, stat.S_IFREG)
+                    or not 0 < entry.file_size <= 4 * 1024**3):
+                raise ValueError("retained ZIP contains an invalid asset")
+            with bundle.open(entry) as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            if file_hash(directory / name) != digest:
+                raise ValueError("local asset differs from retained ZIP")
+
+
 def verify_runtime_release(directory, version, source, root_sha256, public_key):
     spec = importlib.util.spec_from_file_location("runtime_release_set", Path(__file__).with_name("build-runtime-release-set.py"))
     aggregate = importlib.util.module_from_spec(spec)
@@ -217,6 +283,47 @@ def verify_runtime_release(directory, version, source, root_sha256, public_key):
     actual = aggregate.collect(directory, version, source, public_key)
     if sorted(root["artifacts"], key=lambda item: item["platform"]) != sorted(actual, key=lambda item: item["platform"]):
         raise ValueError("retained artifacts differ from approved release-set digests")
+
+
+def verify_updater_release(directory, runtime_public_key, updater_public_key, android_signer_sha256):
+    """Existing release JSON/Ed25519 envelope plus Tauri's own minisign verifier.
+
+    The two public keys are intentionally different formats and authorities.
+    This reads the existing producer wire format; it cannot authorize a run.
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    manifest = directory / "nelomai-release-manifest.json"
+    signature = directory / "nelomai-release-manifest.sig"
+    for path in (manifest, signature, runtime_public_key, updater_public_key):
+        file_hash(path)
+    if manifest.stat().st_size > 1024 * 1024 or signature.stat().st_size > 1024:
+        raise ValueError("release envelope size limit")
+    body = manifest.read_bytes()
+    Ed25519PublicKey.from_public_bytes(runtime_public_key.read_bytes()).verify(
+        base64.b64decode(signature.read_bytes().strip(), validate=True), body)
+    document = json.loads(body)
+    artifacts = document.get("artifacts", [])
+    if (document.get("schema_version") != 1 or document.get("version") != "0.2.16" or len(artifacts) != 4
+            or {item.get("platform") for item in artifacts} != set(PACKAGE_NAMES)):
+        raise ValueError("signed release index must identify all four ordinary packages")
+    executable = os.environ.get("NELOMAI_UPDATER_SIGNATURE_VERIFIER", str(Path(__file__).resolve().parents[1]
+        / "target/debug/examples" / ("verify-updater-signature.exe" if os.name == "nt" else "verify-updater-signature")))
+    with tempfile.TemporaryDirectory(prefix="updater-final-verification-") as temporary:
+        for artifact in artifacts:
+            platform = artifact["platform"]
+            if artifact.get("asset_name") != PACKAGE_NAMES[platform]:
+                raise ValueError("signed release contains a nonpublishable package")
+            package = directory / artifact["asset_name"]
+            if file_hash(package) != artifact.get("sha256") or package.stat().st_size != artifact.get("size_bytes"):
+                raise ValueError("final installer digest or size differs from signed release index")
+            if platform == "android":
+                if not re.fullmatch(r"[0-9a-f]{64}", android_signer_sha256) or artifact.get("signature") != android_signer_sha256:
+                    raise ValueError("signed APK certificate differs from explicit release certificate pin")
+            else:
+                signature_file = Path(temporary) / (platform + ".sig")
+                signature_file.write_text(artifact["signature"])
+                subprocess.run([executable, str(package), str(signature_file), str(updater_public_key)],
+                               check=True, capture_output=True)
 
 
 def main():
@@ -236,7 +343,7 @@ def main():
     approval_parser.add_argument("--repository", required=True)
     approval_parser.add_argument("--run-id", required=True)
     approval_parser.add_argument("--run-attempt", type=int, required=True)
-    approval_parser.add_argument("--name", choices=(SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT, PUBLICATION_ENVIRONMENT), required=True)
+    approval_parser.add_argument("--name", choices=ENVIRONMENTS, required=True)
     tag_parser = commands.add_parser("tag")
     tag_parser.add_argument("--repository", required=True)
     tag_parser.add_argument("--version", required=True)
@@ -246,6 +353,10 @@ def main():
         candidate.add_argument("--" + name, required=True)
     candidate.add_argument("--directory", type=Path, required=True)
     candidate.add_argument("--public-key", type=Path, required=True)
+    candidate.add_argument("--updater-public-key", type=Path, required=True)
+    candidate.add_argument("--android-signer-sha256", required=True)
+    candidate.add_argument("--artifact-id", required=True)
+    candidate.add_argument("--artifact-archive", type=Path, required=True)
     candidate.add_argument("--run-attempt", type=int, required=True)
     args = parser.parse_args()
     if args.command == "mode":
@@ -264,14 +375,20 @@ def main():
     elif args.command == "tag":
         check_remote_tag(args.repository, args.version, args.source_sha)
     else:
-        for name in (SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT, PUBLICATION_ENVIRONMENT):
+        for name in ENVIRONMENTS:
             check_environment(args.repository, name)
-        require_candidate_run(github_get(f"repos/{args.repository}/actions/runs/{args.run_id}"),
-                              args.run_id, args.source_sha, args.repository, args.run_attempt)
+        run = github_get(f"repos/{args.repository}/actions/runs/{args.run_id}")
+        require_candidate_run(run, args.run_id, args.source_sha, args.repository, args.run_attempt)
+        artifact_endpoint = f"repos/{args.repository}/actions/artifacts/{args.artifact_id}"
+        verify_retained_artifact(github_get(artifact_endpoint), args.artifact_archive, args.directory,
+                                 args.artifact_id, args.run_id, args.source_sha, run["repository"]["id"])
         environment_ids = check_approvals(args.repository, args.run_id, run_attempt=args.run_attempt)
         inventory = verify_inventory(args.directory, args.directory / "candidate-inventory.json", args.inventory_sha256)
         require_publishable_inventory(inventory, args.run_id, args.source_sha, environment_ids, args.run_attempt)
         verify_runtime_release(args.directory, "0.2.16", args.source_sha, args.release_set_sha256, args.public_key)
+        verify_updater_release(args.directory, args.public_key, args.updater_public_key, args.android_signer_sha256)
+        verify_retained_artifact(github_get(artifact_endpoint), args.artifact_archive, args.directory,
+                                 args.artifact_id, args.run_id, args.source_sha, run["repository"]["id"])
         require_candidate_run(github_get(f"repos/{args.repository}/actions/runs/{args.run_id}"),
                               args.run_id, args.source_sha, args.repository, args.run_attempt)
     print("OK: release authorization checks passed")

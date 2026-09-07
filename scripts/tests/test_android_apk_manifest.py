@@ -5,6 +5,34 @@ from scripts.tests.test_android_runtime_collisions import module
 
 
 class ApkManifestTest(unittest.TestCase):
+    def test_acceptance_requires_stable_dex_but_shipping_still_rejects_it(self):
+        check = module('check-container-apk')
+        self.assertTrue(callable(getattr(check, 'verify_classes', None)), 'explicit acceptance-only DEX gate is missing')
+        latest = {'ru.nelomai.client.MainActivity', 'ru.nelomai.client.RuntimeAuthBrokerService',
+            'ru.nelomai.client.RuntimeVpnDispatcherService', 'ru.nelomai.client.LatestRuntimeActivity',
+            'ru.nelomai.tunnel.LatestRuntimeVpnEngineV1'}
+        stable = {'ru.nelomai.runtime.stable.LatestRuntimeActivity', 'ru.nelomai.runtime.stable.RuntimeEntrypoint',
+            'ru.nelomai.runtime.stable.tunnel.LatestRuntimeVpnEngineV1'}
+        check.verify_classes(latest)
+        check.verify_classes(latest | stable, acceptance=True)
+        with self.assertRaisesRegex(ValueError, 'latest-only'):
+            check.verify_classes(latest | stable)
+        with self.assertRaisesRegex(ValueError, 'stable'):
+            check.verify_classes(latest, acceptance=True)
+
+    def test_acceptance_slot_gate_requires_both_exact_approved_digests(self):
+        check = module('check-container-apk')
+        self.assertTrue(callable(getattr(check, 'verify_slots', None)), 'root-bound acceptance slot gate is missing')
+        value = {'slots': [{'slot':'latest', 'manifest':{'runtime_version':'0.2.17-acceptance'}},
+                           {'slot':'stable', 'manifest':{'runtime_version':'0.2.16'}}],
+                 'stable_release_set_sha256':'a'*64, 'stable_platform_manifest_sha256':'b'*64}
+        check.verify_slots(value, acceptance=True, root_digest='a'*64, stable_digest='b'*64)
+        for root, stable in [('c'*64, 'b'*64), ('a'*64, 'c'*64), (None, None)]:
+            with self.assertRaises(ValueError):
+                check.verify_slots(value, acceptance=True, root_digest=root, stable_digest=stable)
+        with self.assertRaisesRegex(ValueError, 'latest'):
+            check.verify_slots(value)
+
     def test_tampered_container_signature_is_not_packaging_success(self):
         check = module('check-container-apk')
         key = Ed25519PrivateKey.generate()

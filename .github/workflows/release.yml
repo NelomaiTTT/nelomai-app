@@ -1,338 +1,838 @@
-name: release
-
+name: "release"
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Версия без префикса v"
+      mode:
+        description: "build_only не публикуется; кандидат и публикация требуют отдельных одобрений"
+        type: "choice"
+        options:
+          - "build_only"
+          - "sign_candidate"
+          - "publish_approved_candidate"
+        default: "build_only"
         required: true
-        type: string
+      source_sha:
+        description: "Полный immutable maintenance SHA; dispatch ref должен совпадать"
+        type: "string"
+        required: true
+      version:
+        description: "Проверяемая версия; исходники не переписываются"
+        type: "string"
+        default: "0.2.16"
+        required: true
+      candidate_run_id:
+        description: "Успешный исходный sign_candidate run, только attempt 1"
+        type: "string"
+      candidate_artifact_id:
+        description: "Retained candidate-0.2.16 artifact ID исходного run"
+        type: "string"
+      release_set_sha256:
+        description: "Одобренный SHA-256 финального runtime release-set root"
+        type: "string"
+      inventory_sha256:
+        description: "Одобренный SHA-256 финального shipping inventory"
+        type: "string"
       release_notes:
         description: "Описание релиза"
-        required: false
-        type: string
+        type: "string"
       critical:
         description: "Критическое обновление"
-        required: false
+        type: "boolean"
         default: false
-        type: boolean
       minimum_supported:
         description: "Минимально поддерживаемая версия"
-        required: false
+        type: "boolean"
         default: false
-        type: boolean
       panel_notification_ready:
         description: "Подтверждаю, что панель с producer уведомлений уже развёрнута"
+        type: "boolean"
         required: true
         default: false
-        type: boolean
-
 permissions:
-  contents: write
-
+  contents: "read"
+  actions: "read"
+defaults:
+  run:
+    shell: "bash"
 env:
-  RELEASE_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
-
+  SOURCE_SHA: "${{ inputs.source_sha }}"
+  RELEASE_MODE: "${{ inputs.mode }}"
+  RELEASE_VERSION: "${{ inputs.version }}"
+  GH_TOKEN: "${{ github.token }}"
+  NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: "${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}"
+  NELOMAI_UPDATER_PUBLIC_KEY: "${{ vars.NELOMAI_UPDATER_PUBLIC_KEY }}"
+  NELOMAI_FIREBASE_APPLICATION_ID: "${{ vars.NELOMAI_FIREBASE_APPLICATION_ID }}"
+  NELOMAI_FIREBASE_API_KEY: "${{ vars.NELOMAI_FIREBASE_API_KEY }}"
+  NELOMAI_FIREBASE_PROJECT_ID: "${{ vars.NELOMAI_FIREBASE_PROJECT_ID }}"
+  ANDROID_SIGNER_SHA256: "${{ vars.ANDROID_SIGNER_SHA256 }}"
 jobs:
   verify:
-    name: Обязательные проверки
-    runs-on: ubuntu-22.04
+    if: "inputs.mode != 'publish_approved_candidate'"
+    runs-on: "ubuntu-22.04"
     steps:
-      - name: Проверить готовность панели к уведомлению
-        if: github.event_name == 'workflow_dispatch' && inputs.panel_notification_ready != true
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
+        with:
+          platform: "linux"
+          target: "x86_64-unknown-linux-gnu"
+      -
+        name: "Exact source before generated inputs"
         run: |
-          echo "Сначала разверните и проверьте panel notification producer" >&2
-          exit 1
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.88.0
-          components: rustfmt, clippy
-      - name: Установить зависимости Linux
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        name: "Configured protection, not environment labels"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - run: npm ci
-      - run: npm test
-      - run: python -m pip install "cryptography>=45,<46"
-      - run: python contracts/python/validate_fixtures.py
-      - run: python scripts/release-workflow-check.py
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-
-  build:
-    needs: verify
-    name: ${{ matrix.platform }}-${{ matrix.architecture }}
+          test -n "$NELOMAI_UPDATER_PUBLIC_KEY"
+          for name in release-candidate-signing release-candidate-finalization release-candidate-acceptance release-publication; do
+            python scripts/release-candidate-gates.py environment --repository "$GITHUB_REPOSITORY" --name "$name"
+          done
+        if: "inputs.mode == 'sign_candidate'"
+      -
+        name: "Pinned AmneziaWG source"
+        run: |
+          test "$(git -C vendor/amneziawg-go rev-parse HEAD)" = 08d68cdae27762c3e07f36bbb12d2bad32f81926
+          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && go env GOWORK)" = "$GITHUB_WORKSPACE/go.work"
+          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && go list -m -f '{{.Dir}}' github.com/amnezia-vpn/amneziawg-go/v3)" = "$GITHUB_WORKSPACE/vendor/amneziawg-go"
+      -
+        run: "npm test"
+      -
+        run: "python contracts/python/validate_fixtures.py"
+      -
+        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
+      -
+        run: "cargo build --locked -p nelomai-client-updater --example verify-updater-signature"
+      -
+        run: "python scripts/release-workflow-check.py"
+      -
+        run: "cargo fmt --all --check"
+      -
+        run: "cargo clippy --workspace --all-targets -- -D warnings"
+      -
+        run: "cargo test --workspace --locked"
+      -
+        run: "python -m unittest discover -s scripts/tests"
+  native_drafts:
+    needs: "verify"
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: linux
-            architecture: x86_64
-            package_kind: appimage
-            runner: ubuntu-22.04
-            rust_target: x86_64-unknown-linux-gnu
-          - platform: windows
-            architecture: x86_64
-            package_kind: nsis
-            runner: windows-2022
-            rust_target: x86_64-pc-windows-msvc
-          - platform: macos
-            architecture: aarch64
-            package_kind: app
-            runner: macos-14
-            rust_target: aarch64-apple-darwin
-    runs-on: ${{ matrix.runner }}
+          -
+            platform: "linux"
+            architecture: "x86_64"
+            runner: "ubuntu-22.04"
+            rust_target: "x86_64-unknown-linux-gnu"
+          -
+            platform: "windows"
+            architecture: "x86_64"
+            runner: "windows-2022"
+            rust_target: "x86_64-pc-windows-msvc"
+          -
+            platform: "macos"
+            architecture: "aarch64"
+            runner: "macos-14"
+            rust_target: "aarch64-apple-darwin"
+          -
+            platform: "android"
+            architecture: "aarch64"
+            runner: "ubuntu-22.04"
+            rust_target: "aarch64-linux-android"
+    runs-on: "${{ matrix.runner }}"
+    env:
+      PLATFORM: "${{ matrix.platform }}"
+      ARCHITECTURE: "${{ matrix.architecture }}"
     steps:
-      - uses: actions/checkout@v4
+      -
+        uses: "actions/checkout@v4"
         with:
-          submodules: recursive
-      - uses: actions/setup-node@v4
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
         with:
-          node-version-file: .nvmrc
-          cache: npm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.88.0
-          targets: ${{ matrix.rust_target }}
-      - uses: actions/setup-go@v5
-        if: matrix.platform == 'linux' || matrix.platform == 'macos'
-        with:
-          go-version: '1.25.0'
-      - name: Установить зависимости Linux
-        if: matrix.platform == 'linux'
+          platform: "${{ matrix.platform }}"
+          target: "${{ matrix.rust_target }}"
+      -
+        name: "Exact source before generated inputs"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - run: npm ci
-      - name: Установить версию релиза
-        shell: bash
-        run: python scripts/set-release-version.py "${RELEASE_VERSION#v}"
-      - name: Подготовить системную часть Windows
-        if: matrix.platform == 'windows'
-        shell: pwsh
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
+      -
+        name: "Native final payloads; ephemeral draft signatures only"
         run: |
-          cargo build --release --target "${{ matrix.rust_target }}" -p nelomai-windows-service
-          ./scripts/windows/prepare-runtime.ps1
-      - name: Подготовить системную часть Unix
-        if: matrix.platform == 'linux' || matrix.platform == 'macos'
-        shell: bash
-        run: |
-          cargo build --release --target "${{ matrix.rust_target }}" -p nelomai-unix-service
-          scripts/unix/prepare-runtime.sh "${{ matrix.platform }}" "${{ matrix.rust_target }}"
-      - name: Собрать подписанный пакет
-        shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          NELOMAI_UPDATER_PUBLIC_KEY: ${{ secrets.NELOMAI_UPDATER_PUBLIC_KEY }}
-        run: |
-          test -n "$NELOMAI_UPDATER_PUBLIC_KEY"
-          npm run tauri build -- \
-            --target "${{ matrix.rust_target }}" \
-            --config "src-tauri/bundle.${{ matrix.platform }}.conf.json" \
-            --bundles "${{ matrix.package_kind }}"
-      - name: Собрать артефакт релиза
-        shell: bash
-        run: |
-          python scripts/collect-release-artifact.py \
-            --search-root "target/${{ matrix.rust_target }}/release/bundle" \
-            --output-dir release-output \
-            --version "${RELEASE_VERSION#v}" \
-            --platform "${{ matrix.platform }}" \
-            --architecture "${{ matrix.architecture }}" \
-            --package-kind "${{ matrix.package_kind }}"
-      - uses: actions/upload-artifact@v4
+          extra=()
+          if [ "$PLATFORM" = android ]; then extra+=(--ndk "$NDK_HOME"); fi
+          if [ "$PLATFORM" = android ]; then extra+=(--go-archive "$NELOMAI_GO_ARCHIVE"); fi
+          python scripts/build-release-platform.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --platform "$PLATFORM" --architecture "$ARCHITECTURE" --public-key "$RUNNER_TEMP/runtime-public.raw" \
+            --output "$RUNNER_TEMP/draft/$PLATFORM" --work "$RUNNER_TEMP/native-work" "${extra[@]}"
+      -
+        uses: "actions/upload-artifact@v4"
         with:
-          name: release-${{ matrix.platform }}-${{ matrix.architecture }}
-          path: release-output/
-          if-no-files-found: error
-          retention-days: 3
-
-  build-android:
-    needs: verify
-    name: android-aarch64
-    runs-on: ubuntu-22.04
+          name: "draft-${{ matrix.platform }}"
+          path: "${{ runner.temp }}/draft/"
+          if-no-files-found: "error"
+          retention-days: 14
+  sign_test:
+    needs: "native_drafts"
+    if: "inputs.mode == 'build_only'"
+    runs-on: "ubuntu-22.04"
+    outputs:
+      root_sha256: "${{ steps.sign.outputs.root_sha256 }}"
     steps:
-      - uses: actions/checkout@v4
+      -
+        uses: "actions/checkout@v4"
         with:
-          submodules: recursive
-      - uses: actions/setup-node@v4
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
         with:
-          node-version-file: .nvmrc
-          cache: npm
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.0"
-      - uses: android-actions/setup-android@v3
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.88.0
-          targets: aarch64-linux-android
-      - uses: gradle/actions/setup-gradle@v4
-      - name: Проверить локальный Go backend AmneziaWG
+          platform: "linux"
+          target: "x86_64-unknown-linux-gnu"
+      -
+        name: "Exact source before generated inputs"
         run: |
-          test "$(git -C vendor/amneziawg-go rev-parse HEAD)" = \
-            08d68cdae27762c3e07f36bbb12d2bad32f81926
-          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && go env GOWORK)" = \
-            "$GITHUB_WORKSPACE/go.work"
-          test "$(cd vendor/amneziawg-android/tunnel/tools/libwg-go && \
-            go list -m -f '{{.Dir}}' github.com/amnezia-vpn/amneziawg-go/v3)" = \
-            "$GITHUB_WORKSPACE/vendor/amneziawg-go"
-      - name: Установить Android SDK и NDK
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "draft-*"
+          merge-multiple: true
+          path: "drafts"
+      -
+        name: "Phase-local trust"
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase signing --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
+      -
+        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
+      -
+        name: "Final runtime/root/container documents via build-runtime-release-set.py"
         run: |
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
-          echo "NDK_HOME=${ANDROID_SDK_ROOT}/ndk/28.2.13676358" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/28.2.13676358" >> "$GITHUB_ENV"
-      - run: npm ci
-      - name: Установить версию релиза
-        run: python scripts/set-release-version.py "${RELEASE_VERSION#v}"
-      - name: Восстановить ключ подписи Android
+          root_sha=$(python scripts/sign-runtime-candidate.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --drafts drafts --output signed --signing-key "$RUNNER_TEMP/runtime-private.raw" --public-key "$RUNNER_TEMP/runtime-public.raw")
+          echo "root_sha256=$root_sha" >> "$GITHUB_OUTPUT"
+        id: "sign"
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "signed-runtime"
+          path: "signed/"
+          if-no-files-found: "error"
+          retention-days: 14
+  sign_candidate:
+    needs: "native_drafts"
+    if: "inputs.mode == 'sign_candidate'"
+    environment: "release-candidate-signing"
+    runs-on: "ubuntu-22.04"
+    outputs:
+      root_sha256: "${{ steps.sign.outputs.root_sha256 }}"
+    steps:
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
+        with:
+          platform: "linux"
+          target: "x86_64-unknown-linux-gnu"
+      -
+        name: "Exact source before generated inputs"
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "draft-*"
+          merge-multiple: true
+          path: "drafts"
+      -
+        name: "Phase-local trust"
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase signing --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
         env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: "${{ secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 }}"
+      -
+        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
+      -
+        name: "Final runtime/root/container documents via build-runtime-release-set.py"
         run: |
-          test -n "$ANDROID_KEYSTORE_BASE64"
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/nelomai-android.jks"
-          chmod 600 "$RUNNER_TEMP/nelomai-android.jks"
-          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/nelomai-android.jks" >> "$GITHUB_ENV"
-      - name: Собрать подписанный APK
-        env:
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          NELOMAI_FIREBASE_APPLICATION_ID: ${{ secrets.NELOMAI_FIREBASE_APPLICATION_ID }}
-          NELOMAI_FIREBASE_API_KEY: ${{ secrets.NELOMAI_FIREBASE_API_KEY }}
-          NELOMAI_FIREBASE_PROJECT_ID: ${{ secrets.NELOMAI_FIREBASE_PROJECT_ID }}
-          CARGO_PROFILE_RELEASE_STRIP: symbols
-        run: |
-          test -n "$NELOMAI_FIREBASE_APPLICATION_ID"
-          test -n "$NELOMAI_FIREBASE_API_KEY"
-          test -n "$NELOMAI_FIREBASE_PROJECT_ID"
-          npm run tauri -- android build --ci --apk --target aarch64
-      - name: Проверить подпись и подготовить APK
-        run: |
-          apk="src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
-          test -f "$apk"
-          apksigner="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
-          "$apksigner" verify --verbose "$apk"
-          native_directory="$RUNNER_TEMP/android-release-native"
-          mkdir -p "$native_directory"
-          mapfile -t native_entries < <(
-            unzip -Z1 "$apk" | grep -E '^lib/arm64-v8a/[^/]+\.so$'
-          )
-          test "${#native_entries[@]}" -gt 0
-          for native_entry in "${native_entries[@]}"; do
-            extracted_library="$native_directory/$(basename "$native_entry")"
-            unzip -p "$apk" "$native_entry" > "$extracted_library"
-            if readelf -S --wide "$extracted_library" | grep -Eq '\.debug_|\.symtab'; then
-              echo "Android release library keeps debug or static symbols: $native_entry" >&2
-              exit 1
-            fi
-          done
-          native_library="$RUNNER_TEMP/libwg-go-release.so"
-          unzip -p "$apk" lib/arm64-v8a/libwg-go.so > "$native_library"
-          native_symbols="$RUNNER_TEMP/libwg-go-release.symbols"
-          readelf --dyn-syms --wide "$native_library" > "$native_symbols"
-          for symbol in \
-            Java_org_amnezia_awg_GoBackend_awgGetNetworkTelemetry \
-            Java_org_amnezia_awg_GoBackend_awgCloseUdp \
-            Java_org_amnezia_awg_GoBackend_awgRebindUdp \
-            Java_org_amnezia_awg_GoBackend_awgSendKeepalives \
-            Java_org_amnezia_awg_GoBackend_awgStartHandshakeProbe \
-            Java_org_amnezia_awg_GoBackend_awgHandshakeProbeStatus \
-            Java_org_amnezia_awg_GoBackend_awgHandshakeProbeTimeoutMillis; do
-            grep -Fq " $symbol" "$native_symbols"
-          done
-          signer_sha256="$("$apksigner" verify --print-certs "$apk" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1)"
-          test -n "$signer_sha256"
-          python scripts/collect-android-release-artifact.py \
-            --apk "$apk" \
-            --output-dir release-android \
-            --version "${RELEASE_VERSION#v}" \
-            --signer-sha256 "$signer_sha256"
-          source_archive="release-android/nelomai-${RELEASE_VERSION#v}-amneziawg-android-source.tar.gz"
-          tar --exclude='.git' \
-            --exclude='*/build' --exclude='*/build/*' \
-            --exclude='*/.cxx' --exclude='*/.cxx/*' \
-            -czf "$source_archive" \
-            vendor/amneziawg-android \
-            vendor/amneziawg-go \
-            go.work \
-            patches/amneziawg-android-network-telemetry.patch \
-            patches/amneziawg-android-memory-diagnostics.patch \
-            patches/amneziawg-go-network-recovery.patch \
-            patches/amneziawg-go-android-memory.patch \
-            plugins/amneziawg-android-tunnel \
-            plugins/tunnel-android/android/build.gradle.kts \
-            plugins/tunnel-android/android/src \
-            scripts/android/apply-amneziawg-overrides.sh
-          source_archive_name="$(basename "$source_archive")"
-          (
-            cd release-android
-            sha256sum "$source_archive_name" > "${source_archive_name}.sha256"
-          )
-      - uses: actions/upload-artifact@v4
+          root_sha=$(python scripts/sign-runtime-candidate.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --drafts drafts --output signed --signing-key "$RUNNER_TEMP/runtime-private.raw" --public-key "$RUNNER_TEMP/runtime-public.raw")
+          echo "root_sha256=$root_sha" >> "$GITHUB_OUTPUT"
+        id: "sign"
+      -
+        uses: "actions/upload-artifact@v4"
         with:
-          name: release-android-aarch64
-          path: release-android/
-          if-no-files-found: error
-          retention-days: 3
-
+          name: "signed-runtime"
+          path: "signed/"
+          if-no-files-found: "error"
+          retention-days: 14
+  native_packages:
+    needs:
+      - "native_drafts"
+      - "sign_test"
+      - "sign_candidate"
+    if: "always() && needs.native_drafts.result == 'success' && (needs.sign_test.result == 'success' || needs.sign_candidate.result == 'success')"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          -
+            platform: "linux"
+            architecture: "x86_64"
+            runner: "ubuntu-22.04"
+            rust_target: "x86_64-unknown-linux-gnu"
+          -
+            platform: "windows"
+            architecture: "x86_64"
+            runner: "windows-2022"
+            rust_target: "x86_64-pc-windows-msvc"
+          -
+            platform: "macos"
+            architecture: "aarch64"
+            runner: "macos-14"
+            rust_target: "aarch64-apple-darwin"
+          -
+            platform: "android"
+            architecture: "aarch64"
+            runner: "ubuntu-22.04"
+            rust_target: "aarch64-linux-android"
+    runs-on: "${{ matrix.runner }}"
+    env:
+      ROOT_SHA256: "${{ needs.sign_candidate.outputs.root_sha256 || needs.sign_test.outputs.root_sha256 }}"
+      PLATFORM: "${{ matrix.platform }}"
+      ARCHITECTURE: "${{ matrix.architecture }}"
+    steps:
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
+        with:
+          platform: "${{ matrix.platform }}"
+          target: "${{ matrix.rust_target }}"
+      -
+        name: "Exact source before generated inputs"
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "signed-runtime"
+          path: "signed"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "draft-${{ matrix.platform }}"
+          path: "draft"
+      -
+        name: "Keyless native packaging and exact re-extraction"
+        run: |
+          extra=()
+          if [ "$PLATFORM" = android ]; then extra+=(--ndk "$NDK_HOME"); fi
+          python scripts/package-release-platform.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --release-set-sha256 "$ROOT_SHA256" --platform "$PLATFORM" --architecture "$ARCHITECTURE" \
+            --signed signed --draft "draft/$PLATFORM" --public-key "$RUNNER_TEMP/runtime-public.raw" \
+            --output "packages/$PLATFORM" "${extra[@]}"
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "packages-${{ matrix.platform }}"
+          path: |
+            packages/${{ matrix.platform }}/shipping/
+            packages/${{ matrix.platform }}/acceptance/
+            packages/${{ matrix.platform }}/package-digests.json
+          if-no-files-found: "error"
+          retention-days: 14
+  finalize_test:
+    needs:
+      - "native_packages"
+      - "sign_test"
+      - "sign_candidate"
+    if: "always() && inputs.mode == 'build_only' && needs.native_packages.result == 'success'"
+    runs-on: "ubuntu-22.04"
+    env:
+      ROOT_SHA256: "${{ needs.sign_candidate.outputs.root_sha256 || needs.sign_test.outputs.root_sha256 }}"
+      RELEASE_NOTES: "${{ inputs.release_notes }}"
+      RELEASE_CRITICAL: "${{ inputs.critical }}"
+      RELEASE_MINIMUM_SUPPORTED: "${{ inputs.minimum_supported }}"
+    outputs:
+      inventory_sha256: "${{ steps.final.outputs.inventory_sha256 }}"
+      acceptance_inventory_sha256: "${{ steps.final.outputs.acceptance_inventory_sha256 }}"
+    steps:
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
+        with:
+          platform: "android"
+          target: "aarch64-linux-android"
+      -
+        name: "Exact source before generated inputs"
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "signed-runtime"
+          path: "signed"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "packages-*"
+          path: "package-downloads"
+      -
+        name: "Keep platform and purpose separation"
+        run: |
+          mkdir packages
+          for platform in linux windows macos android; do mv "package-downloads/packages-$platform" "packages/$platform"; done
+      -
+        name: "Phase-local trust"
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase finalization --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
+      -
+        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
+      -
+        run: "cargo build --locked -p nelomai-client-updater --example verify-updater-signature"
+      -
+        name: "Final installer/updater signatures; separate acceptance outputs"
+        run: |
+          python scripts/finalize-release-candidate.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --release-set-sha256 "$ROOT_SHA256" --packages packages --signed signed --output finalized \
+            --public-key "$RUNNER_TEMP/runtime-public.raw" --private-key "$RUNNER_TEMP/runtime-private.raw" \
+            --work "$RUNNER_TEMP/finalization" --sdk "$ANDROID_HOME" > final-result.json
+          python -c 'import json,os; d=json.load(open("final-result.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("inventory_sha256="+d["inventory_sha256"]+"\nacceptance_inventory_sha256="+d["acceptance_inventory_sha256"]+"\n")'
+        id: "final"
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "candidate-0.2.16"
+          path: "finalized/candidate/"
+          if-no-files-found: "error"
+          retention-days: 14
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "acceptance-only-0.2.16"
+          path: "finalized/acceptance/"
+          if-no-files-found: "error"
+          retention-days: 14
+  finalize_candidate:
+    needs:
+      - "native_packages"
+      - "sign_test"
+      - "sign_candidate"
+    if: "always() && inputs.mode == 'sign_candidate' && needs.native_packages.result == 'success'"
+    environment: "release-candidate-finalization"
+    runs-on: "ubuntu-22.04"
+    env:
+      ROOT_SHA256: "${{ needs.sign_candidate.outputs.root_sha256 || needs.sign_test.outputs.root_sha256 }}"
+      RELEASE_NOTES: "${{ inputs.release_notes }}"
+      RELEASE_CRITICAL: "${{ inputs.critical }}"
+      RELEASE_MINIMUM_SUPPORTED: "${{ inputs.minimum_supported }}"
+    outputs:
+      inventory_sha256: "${{ steps.final.outputs.inventory_sha256 }}"
+      acceptance_inventory_sha256: "${{ steps.final.outputs.acceptance_inventory_sha256 }}"
+    steps:
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
+        with:
+          platform: "android"
+          target: "aarch64-linux-android"
+      -
+        name: "Exact source before generated inputs"
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "signed-runtime"
+          path: "signed"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "packages-*"
+          path: "package-downloads"
+      -
+        name: "Keep platform and purpose separation"
+        run: |
+          mkdir packages
+          for platform in linux windows macos android; do mv "package-downloads/packages-$platform" "packages/$platform"; done
+      -
+        name: "Phase-local trust"
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase finalization --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
+        env:
+          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: "${{ secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 }}"
+      -
+        name: "Phase-local Android keystore"
+        run: "python -c 'import base64,os,pathlib; p=pathlib.Path(os.environ[\"RUNNER_TEMP\"])/\"android-finalization.jks\"; p.write_bytes(base64.b64decode(os.environ[\"ANDROID_KEYSTORE_BASE64\"],validate=True)); p.chmod(0o600)'"
+        env:
+          ANDROID_KEYSTORE_BASE64: "${{ secrets.ANDROID_KEYSTORE_BASE64 }}"
+      -
+        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
+      -
+        run: "cargo build --locked -p nelomai-client-updater --example verify-updater-signature"
+      -
+        name: "Final installer/updater signatures; separate acceptance outputs"
+        run: |
+          python scripts/finalize-release-candidate.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --release-set-sha256 "$ROOT_SHA256" --packages packages --signed signed --output finalized \
+            --public-key "$RUNNER_TEMP/runtime-public.raw" --private-key "$RUNNER_TEMP/runtime-private.raw" \
+            --work "$RUNNER_TEMP/finalization" --sdk "$ANDROID_HOME" > final-result.json
+          python -c 'import json,os; d=json.load(open("final-result.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("inventory_sha256="+d["inventory_sha256"]+"\nacceptance_inventory_sha256="+d["acceptance_inventory_sha256"]+"\n")'
+        id: "final"
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
+          ANDROID_KEY_ALIAS: "${{ secrets.ANDROID_KEY_ALIAS }}"
+          ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+          ANDROID_KEY_PASSWORD: "${{ secrets.ANDROID_KEY_PASSWORD }}"
+          ANDROID_KEYSTORE_PATH: "${{ runner.temp }}/android-finalization.jks"
+          ANDROID_SIGNER_SHA256: "${{ vars.ANDROID_SIGNER_SHA256 }}"
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "candidate-0.2.16"
+          path: "finalized/candidate/"
+          if-no-files-found: "error"
+          retention-days: 14
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "acceptance-only-0.2.16"
+          path: "finalized/acceptance/"
+          if-no-files-found: "error"
+          retention-days: 14
+  native_recheck:
+    needs:
+      - "sign_test"
+      - "sign_candidate"
+      - "finalize_test"
+      - "finalize_candidate"
+    if: "always() && (needs.finalize_test.result == 'success' || needs.finalize_candidate.result == 'success')"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          -
+            platform: "linux"
+            architecture: "x86_64"
+            runner: "ubuntu-22.04"
+            rust_target: "x86_64-unknown-linux-gnu"
+          -
+            platform: "windows"
+            architecture: "x86_64"
+            runner: "windows-2022"
+            rust_target: "x86_64-pc-windows-msvc"
+          -
+            platform: "macos"
+            architecture: "aarch64"
+            runner: "macos-14"
+            rust_target: "aarch64-apple-darwin"
+          -
+            platform: "android"
+            architecture: "aarch64"
+            runner: "ubuntu-22.04"
+            rust_target: "aarch64-linux-android"
+    runs-on: "${{ matrix.runner }}"
+    env:
+      ROOT_SHA256: "${{ needs.sign_candidate.outputs.root_sha256 || needs.sign_test.outputs.root_sha256 }}"
+      INVENTORY_SHA256: "${{ needs.finalize_candidate.outputs.inventory_sha256 || needs.finalize_test.outputs.inventory_sha256 }}"
+      ACCEPTANCE_INVENTORY_SHA256: "${{ needs.finalize_candidate.outputs.acceptance_inventory_sha256 || needs.finalize_test.outputs.acceptance_inventory_sha256 }}"
+      PLATFORM: "${{ matrix.platform }}"
+      ARCHITECTURE: "${{ matrix.architecture }}"
+    steps:
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
+        with:
+          platform: "${{ matrix.platform }}"
+          target: "${{ matrix.rust_target }}"
+      -
+        name: "Exact source before generated inputs"
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "signed-runtime"
+          path: "signed"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "candidate-0.2.16"
+          path: "candidate"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "acceptance-only-0.2.16"
+          path: "acceptance"
+      -
+        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
+      -
+        name: "Build the real CommonHost/private-channel supplemental adapter"
+        run: "cargo build --locked -p nelomai-client-container --example linux-runtime-acceptance"
+        if: "matrix.platform == 'linux'"
+      -
+        name: "Post-final native checks, JNI and separate ordinary Linux startup"
+        run: |
+          extra=()
+          if [ "$PLATFORM" = android ]; then extra+=(--ndk "$NDK_HOME"); fi
+          if [ "$PLATFORM" = linux ]; then extra+=(--linux-execution); fi
+          python scripts/verify-release-platform.py --source-sha "$SOURCE_SHA" --release-set-sha256 "$ROOT_SHA256" \
+            --inventory-sha256 "$INVENTORY_SHA256" --acceptance-inventory-sha256 "$ACCEPTANCE_INVENTORY_SHA256" \
+            --platform "$PLATFORM" --architecture "$ARCHITECTURE" --signed signed --candidate candidate --acceptance acceptance \
+            --public-key "$RUNNER_TEMP/runtime-public.raw" --output "evidence/$PLATFORM.json" "${extra[@]}"
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "native-evidence-${{ matrix.platform }}"
+          path: "evidence/"
+          if-no-files-found: "error"
+          retention-days: 14
+  candidate_acceptance:
+    needs:
+      - "native_recheck"
+      - "sign_candidate"
+      - "finalize_candidate"
+    if: "inputs.mode == 'sign_candidate'"
+    environment: "release-candidate-acceptance"
+    runs-on: "ubuntu-22.04"
+    env:
+      ROOT_SHA256: "${{ needs.sign_candidate.outputs.root_sha256 }}"
+      INVENTORY_SHA256: "${{ needs.finalize_candidate.outputs.inventory_sha256 }}"
+    steps:
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "actions/setup-python@v5"
+        with:
+          python-version: "3.12"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "candidate-0.2.16"
+          path: "candidate"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "acceptance-only-0.2.16"
+          path: "acceptance"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          pattern: "native-evidence-*"
+          path: "native-evidence"
+      -
+        name: "Approval is necessary, never acceptance evidence"
+        run: "python scripts/release-candidate-gates.py approval --repository \"$GITHUB_REPOSITORY\" --run-id \"$GITHUB_RUN_ID\" --run-attempt \"$GITHUB_RUN_ATTEMPT\" --name release-candidate-acceptance"
+      -
+        name: "Mandatory Task12 producer: UNRUN/nonzero until implemented and executed"
+        run: |
+          python scripts/require-candidate-acceptance.py --source-sha "$SOURCE_SHA" --release-set-sha256 "$ROOT_SHA256" \
+            --inventory-sha256 "$INVENTORY_SHA256" --candidate-directory candidate
+  verify_promotion:
+    if: "inputs.mode == 'publish_approved_candidate'"
+    runs-on: "ubuntu-22.04"
+    env:
+      CANDIDATE_RUN: "${{ inputs.candidate_run_id }}"
+      CANDIDATE_ARTIFACT: "${{ inputs.candidate_artifact_id }}"
+      ROOT_SHA256: "${{ inputs.release_set_sha256 }}"
+      INVENTORY_SHA256: "${{ inputs.inventory_sha256 }}"
+    outputs:
+      verifier_sha256: "${{ steps.verifier.outputs.sha256 }}"
+      updater_verifier_sha256: "${{ steps.verifier.outputs.updater_sha256 }}"
+    steps:
+      -
+        uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "./.github/actions/release-native-host"
+        with:
+          platform: "linux"
+          target: "x86_64-unknown-linux-gnu"
+      -
+        name: "Exact source before generated inputs"
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
+      -
+        run: "python -c 'import os,pathlib; p=pathlib.Path(os.environ[\"RUNNER_TEMP\"])/\"updater-public.b64\"; p.write_text(os.environ[\"NELOMAI_UPDATER_PUBLIC_KEY\"])'"
+      -
+        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
+      -
+        run: "cargo build --locked -p nelomai-client-updater --example verify-updater-signature"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "candidate-0.2.16"
+          path: "candidate"
+          run-id: "${{ inputs.candidate_run_id }}"
+          github-token: "${{ github.token }}"
+      -
+        name: "Read-only original-run retained-byte/provenance/trust verification"
+        run: |
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT/zip" > retained.zip
+          python scripts/release-candidate-gates.py candidate --repository "$GITHUB_REPOSITORY" --run-id "$CANDIDATE_RUN" --run-attempt 1 \
+            --source-sha "$SOURCE_SHA" --directory candidate --public-key "$RUNNER_TEMP/runtime-public.raw" \
+            --updater-public-key "$RUNNER_TEMP/updater-public.b64" --android-signer-sha256 "$ANDROID_SIGNER_SHA256" \
+            --artifact-id "$CANDIDATE_ARTIFACT" --artifact-archive retained.zip --release-set-sha256 "$ROOT_SHA256" --inventory-sha256 "$INVENTORY_SHA256"
+      -
+        run: |
+          echo "sha256=$(sha256sum target/debug/verify-runtime-manifest | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "updater_sha256=$(sha256sum target/debug/examples/verify-updater-signature | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        id: "verifier"
+      -
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "trusted-promotion-verifier"
+          path: |
+            target/debug/verify-runtime-manifest
+            target/debug/examples/verify-updater-signature
+          if-no-files-found: "error"
+          retention-days: 1
   publish:
-    needs: [verify, build, build-android]
-    runs-on: ubuntu-latest
+    needs: "verify_promotion"
+    if: "inputs.mode == 'publish_approved_candidate'"
+    environment: "release-publication"
+    permissions:
+      contents: "write"
+      actions: "read"
+    runs-on: "ubuntu-22.04"
+    env:
+      CANDIDATE_RUN: "${{ inputs.candidate_run_id }}"
+      CANDIDATE_ARTIFACT: "${{ inputs.candidate_artifact_id }}"
+      ROOT_SHA256: "${{ inputs.release_set_sha256 }}"
+      INVENTORY_SHA256: "${{ inputs.inventory_sha256 }}"
+      VERIFIER_SHA256: "${{ needs.verify_promotion.outputs.verifier_sha256 }}"
+      RELEASE_NOTES: "${{ inputs.release_notes }}"
+      UPDATER_VERIFIER_SHA256: "${{ needs.verify_promotion.outputs.updater_verifier_sha256 }}"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      -
+        uses: "actions/checkout@v4"
         with:
-          python-version: "3.11"
-      - run: python -m pip install "cryptography>=45,<46"
-      - uses: actions/download-artifact@v4
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          submodules: "recursive"
+          persist-credentials: false
+      -
+        uses: "actions/setup-python@v5"
         with:
-          pattern: release-*
-          path: release-input
-      - name: Сформировать и подписать манифест
-        env:
-          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: ${{ secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 }}
-          RELEASE_NOTES: ${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || '' }}
-          RELEASE_CRITICAL: ${{ github.event_name == 'workflow_dispatch' && inputs.critical || 'false' }}
-          RELEASE_MINIMUM_SUPPORTED: ${{ github.event_name == 'workflow_dispatch' && inputs.minimum_supported || 'false' }}
-          MINIMUM_PANEL_API_VERSION: "1"
-          MINIMUM_AGENT_CONTRACT_VERSION: "1"
+          python-version: "3.12"
+      -
+        run: "python -m pip install 'cryptography>=45,<46'"
+      -
+        name: "Exact source before generated inputs"
         run: |
-          python scripts/build-release-manifest.py \
-            --input-dir release-input \
-            --output-dir release-publish \
-            --version "${RELEASE_VERSION#v}"
-          find release-input -type f \
-            \( -name 'nelomai-*-amneziawg-android-source.tar.gz' \
-            -o -name 'nelomai-*-amneziawg-android-source.tar.gz.sha256' \) \
-            -exec cp {} release-publish/ \;
-          test "$(find release-publish -maxdepth 1 -name 'nelomai-*-amneziawg-android-source.tar.gz' | wc -l)" -eq 1
-      - name: Опубликовать стабильный GitHub-релиз
-        env:
-          GH_TOKEN: ${{ github.token }}
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$RELEASE_VERSION" = 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+      -
+        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
+      -
+        run: "python -c 'import os,pathlib; p=pathlib.Path(os.environ[\"RUNNER_TEMP\"])/\"updater-public.b64\"; p.write_text(os.environ[\"NELOMAI_UPDATER_PUBLIC_KEY\"])'"
+      -
+        name: "Проверить готовность панели к уведомлению"
         run: |
-          tag="v${RELEASE_VERSION#v}"
-          gh release create "$tag" release-publish/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Nelomai ${RELEASE_VERSION#v}" \
-            --notes "${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || format('Nelomai {0}', github.ref_name) }}"
+          echo "Сначала разверните и проверьте panel notification producer" >&2
+          exit 1
+        if: "inputs.panel_notification_ready != true"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "trusted-promotion-verifier"
+          path: "trusted-verifier"
+      -
+        uses: "actions/download-artifact@v4"
+        with:
+          name: "candidate-0.2.16"
+          path: "candidate"
+          run-id: "${{ inputs.candidate_run_id }}"
+          github-token: "${{ github.token }}"
+      -
+        name: "Immediately recheck exact bytes and create once; never rebuild/re-sign/retag"
+        run: |
+          echo "$VERIFIER_SHA256  trusted-verifier/verify-runtime-manifest" | sha256sum --check --strict
+          echo "$UPDATER_VERIFIER_SHA256  trusted-verifier/examples/verify-updater-signature" | sha256sum --check --strict
+          chmod 755 trusted-verifier/verify-runtime-manifest trusted-verifier/examples/verify-updater-signature
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT/zip" > retained.zip
+          python scripts/release-candidate-gates.py candidate --repository "$GITHUB_REPOSITORY" --run-id "$CANDIDATE_RUN" --run-attempt 1 \
+            --source-sha "$SOURCE_SHA" --directory candidate --public-key "$RUNNER_TEMP/runtime-public.raw" \
+            --updater-public-key "$RUNNER_TEMP/updater-public.b64" --android-signer-sha256 "$ANDROID_SIGNER_SHA256" \
+            --artifact-id "$CANDIDATE_ARTIFACT" --artifact-archive retained.zip --release-set-sha256 "$ROOT_SHA256" --inventory-sha256 "$INVENTORY_SHA256"
+          python scripts/release-candidate-gates.py approval --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --name release-publication
+          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.2.16 --source-sha "$SOURCE_SHA"
+          mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
+          test "${#assets[@]}" -eq 22
+          gh release create v0.2.16 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.2.16" --notes "$RELEASE_NOTES"
+        env:
+          NELOMAI_RUNTIME_CONTRACT_VERIFIER: "${{ github.workspace }}/trusted-verifier/verify-runtime-manifest"
+          NELOMAI_UPDATER_SIGNATURE_VERIFIER: "${{ github.workspace }}/trusted-verifier/examples/verify-updater-signature"

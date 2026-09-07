@@ -8,8 +8,19 @@ import argparse
 import io
 import os
 from pathlib import Path
+import platform
 import subprocess
 import tarfile
+
+
+def ndk_compiler(ndk, system=None):
+    tag = {'Linux': 'linux-x86_64', 'Darwin': 'darwin-x86_64'}.get(system or platform.system())
+    if tag is None:
+        raise ValueError('unsupported Android tunnel build host')
+    compiler = ndk / 'toolchains/llvm/prebuilt' / tag / 'bin/aarch64-linux-android24-clang'
+    if not compiler.is_file() or not os.access(compiler, os.X_OK):
+        raise ValueError('Android NDK host compiler is missing or not executable')
+    return compiler
 
 
 def vendor(root, name, output, patches):
@@ -23,6 +34,7 @@ def vendor(root, name, output, patches):
 
 def build(root, output, ndk, go_archive, slot):
     if output.exists(): raise ValueError('native build output already exists')
+    compiler = ndk_compiler(ndk)
     output.mkdir(parents=True)
     source = output / 'source'
     android = source / 'amneziawg-android'
@@ -41,7 +53,7 @@ def build(root, output, ndk, go_archive, slot):
     module.write_text(module.read_text() + '\nreplace github.com/amnezia-vpn/amneziawg-go/v3 => ../../../../amneziawg-go\n')
     environment = os.environ.copy()
     environment.update({'GOOS':'android', 'GOARCH':'arm64', 'CGO_ENABLED':'1', 'GOTOOLCHAIN':'local', 'GOWORK':'off',
-        'GOROOT':str(go_root), 'CC':str(ndk / 'toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android24-clang'),
+        'GOROOT':str(go_root), 'CC':str(compiler),
         'CGO_CFLAGS':'-O2', 'CGO_LDFLAGS':'-Wl,-z,max-page-size=16384 -Wl,-soname,' + name})
     destination = output / 'jni/arm64-v8a'
     destination.mkdir(parents=True)

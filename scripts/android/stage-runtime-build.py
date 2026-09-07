@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import zipfile
@@ -30,13 +31,17 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--slot', choices=('latest', 'stable'), required=True)
     parser.add_argument('--source-commit', required=True)
-    parser.add_argument('--local-test-container', action='store_true')
+    signing = parser.add_mutually_exclusive_group()
+    signing.add_argument('--local-test-container', action='store_true')
+    signing.add_argument('--container-signing-key', type=Path, help='Explicit raw key for normal latest-only APK inputs; no key discovery')
     parser.add_argument('--host', type=Path)
     args = parser.parse_args()
+    if not re.fullmatch(r'[0-9a-f]{40}', args.source_commit): raise ValueError('full lowercase source commit is required')
+    if args.local_test_container or args.container_signing_key:
+        if args.slot != 'latest' or args.host is None: raise ValueError('signed APK inputs require latest and common host')
     if args.output.exists(): raise ValueError('immutable staging directory already exists')
     root = args.root.resolve(); output = args.output.resolve()
     version = json.loads((root / 'src-tauri/tauri.conf.json').read_text())['version']
-    if len(args.source_commit) != 40: raise ValueError('full source commit is required')
     payload = output / 'payload'; payload.mkdir(parents=True)
     library = 'libnelomai_runtime_stable.so' if args.slot == 'stable' else 'libnelomai_app_lib.so'
     tunnel = 'libstable_runtime_wg_go.so' if args.slot == 'stable' else 'libwg-go.so'
@@ -68,6 +73,9 @@ def main():
     index = []
     for path in sorted(payload.rglob('*')):
         if not path.is_file(): continue
+        # Android's signed payload roles are data/shared libraries, not host
+        # executables. Normalize before hashing/archiving, never after signing.
+        path.chmod(0o644)
         name = path.relative_to(payload).as_posix(); data = path.read_bytes()
         index.append({'path':name, 'size_bytes':len(data), 'sha256':hashlib.sha256(data).hexdigest(),
             'role':'license' if name.startswith('licenses/') else 'shared_library' if name.endswith('.so') else 'resource'})
@@ -76,13 +84,17 @@ def main():
     with zipfile.ZipFile(output / 'collision-input.zip', 'w', compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(payload.rglob('*')):
             if path.is_file(): archive.write(path, path.relative_to(payload))
-    if args.local_test_container:
-        if args.slot != 'latest' or args.host is None: raise ValueError('local test APK requires latest and common host')
-        key = Ed25519PrivateKey.generate()
-        (output / 'LOCAL-TEST-KEY-NOT-FOR-RELEASE').write_bytes(key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
+    if args.local_test_container or args.container_signing_key:
+        if args.container_signing_key:
+            if args.container_signing_key.is_symlink() or args.container_signing_key.resolve().is_relative_to(output):
+                raise ValueError('container signing key must be a regular file outside output')
+            key = Ed25519PrivateKey.from_private_bytes(args.container_signing_key.read_bytes())
+        else:
+            key = Ed25519PrivateKey.generate()
+            (output / 'LOCAL-TEST-KEY-NOT-FOR-RELEASE').write_bytes(key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption()))
         public = base64.b64encode(key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
-        (output / 'test-public-key.b64').write_text(public)
-        container = {'format_version':1,'container_version':version,'release_set_id':'local-task8-' + args.source_commit,
+        (output / ('test-public-key.b64' if args.local_test_container else 'container-public-key.b64')).write_text(public)
+        container = {'format_version':1,'container_version':version,'release_set_id':'android-latest-' + args.source_commit,
             'minimum_runtime_contract':1,'maximum_runtime_contract':1,'slots':[{'slot':'latest','manifest':manifest}]}
         value = json.dumps(container, sort_keys=True, separators=(',', ':')).encode()
         resources = output / 'apk/assets/runtime'; resources.mkdir(parents=True)
@@ -91,7 +103,7 @@ def main():
         (resources / 'container-manifest-v1.sig').write_bytes(key.sign(b'nelomai-container-manifest-v1\0' + value))
         for path in (payload / 'jni/arm64-v8a').iterdir(): copy(path, output / 'apk/jniLibs/arm64-v8a' / path.name)
         subprocess.run([str(strip), '--strip-debug', '-o', str(output / 'apk/jniLibs/arm64-v8a/libnelomai_android_container.so'), str(args.host)], check=True)
-        print('Local verification trust key: ' + str(output / 'test-public-key.b64'))
+        if args.local_test_container: print('Local verification trust key: ' + str(output / 'test-public-key.b64'))
     print(str(output))
 
 

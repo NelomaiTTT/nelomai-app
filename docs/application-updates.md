@@ -99,9 +99,20 @@ and claims about functionality that is not yet present in the release branch.
   `NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64`; configure the matching public key
   on the panel as `CLIENT_RELEASE_MANIFEST_PUBLIC_KEY_B64`.
 - The `release` GitHub Actions workflow is started only through guarded manual
-  dispatch. It builds Linux x86_64, Windows x86_64, and macOS aarch64 updater
-  artifacts, plus a signed Android aarch64 APK. Intel macOS builds are not
-  published. It publishes only after every build job succeeds.
+  dispatch with an exact maintenance `source_sha`. Default `build_only` uses
+  TEST trust and cannot publish. `sign_candidate` builds Linux x86_64, Windows
+  x86_64, macOS aarch64 and Android aarch64 through two distinct protected signing
+  phases: final runtime/root/container signatures before keyless native
+  packaging, then final installer/updater/APK signatures. Intel macOS is not a
+  release target. Full real-candidate acceptance remains a separate mandatory
+  gate, currently blocked on Task12 rather than inferred from build success.
+- `publish_approved_candidate` promotes only original retained final bytes from
+  a successful first-attempt candidate run, under separate publication approval.
+  It rechecks original-run/artifact provenance, current environment identities,
+  all hashes, the Ed25519 release/root envelopes and Tauri updater signatures
+  against their separate pinned public keys. It never rebuilds, re-signs,
+  overwrites assets or moves a tag. Synthetic acceptance installers are stored
+  separately and excluded from the explicit ordinary shipping allowlist.
 - The workflow publishes a deterministic JSON manifest, its detached Ed25519
   signature, and Tauri-signed packages. Draft and prerelease GitHub releases
   are not consumed by the panel.
@@ -113,6 +124,14 @@ and claims about functionality that is not yet present in the release branch.
 - Exercise a signed update on Windows, macOS, Linux, and a physical Android
   device. Android must show its system confirmation UI; silent installation is
   neither requested nor supported.
+
+The full artifact commands, four required protected environments, retention
+expiry behavior, first-attempt-only approval policy, actual preliminary checks
+and known stable dispatcher/engine implementation gap are documented in
+[`runtime-artifacts.md`](runtime-artifacts.md). Required environment protections
+were absent at this work's read-only preflight; this task did not configure them.
+An environment label, caller JSON or a build-only artifact is not release
+authorization.
 
 ## Panel-first release order
 
@@ -126,12 +145,20 @@ For every application release:
 1. Deploy the compatible panel change through the guarded panel updater.
 2. Verify panel health and release-sync readiness without running production
    preflight against the working database.
-3. Start the manual `release` workflow with
+3. Build/sign and fully accept the exact candidate in its separately approved
+   run. Missing authoritative Task12/physical acceptance keeps publication closed.
+4. Start the manual `release` workflow in `publish_approved_candidate` mode with
+   the original run/artifact IDs and approved root/inventory hashes, and
    `panel_notification_ready=true`. The acknowledgement confirms that the
    notification producer is already deployed; it is not a remote capability
    probe.
-4. Let the guarded workflow create the version tag and GitHub release.
-5. Wait for normal panel release sync and verify the notification audit event.
+5. Let the independently approved publication job recheck and create the exact
+   version tag/GitHub release at `source_sha`.
+6. Wait for normal panel release sync and verify the notification audit event.
+
+The panel acknowledgement is required only at publication, not for useful
+nonpublishing `build_only` checks. Nothing here authorizes a panel deployment or
+production probe as part of local build verification.
 
 A pushed `v*` tag no longer starts release publication. This closes the path
 that could publish an application before the panel notification producer was

@@ -91,13 +91,35 @@ class RuntimeReleaseSetTest(ArtifactFixture):
 
 
 class ReleaseAuthorizationTest(ArtifactFixture):
+    def test_finalization_requires_its_own_unique_current_environment_approval(self):
+        gates = module("release-candidate-gates")
+        final = "release-candidate-finalization"
+        identities = {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12, final: 13}
+        approval = {"state": "approved", "environments": [
+            {"name": name, "id": identity} for name, identity in identities.items()]}
+        with self.approval_api(gates, reviews=[approval], environment_ids=identities):
+            self.assertEqual(gates.check_approvals("example/repo", "42"), identities)
+        for final_reviews in ([], [{"state": "approved", "environments": [{"name": final, "id": 9}]}],
+                              [{"state": "approved", "environments": [{"name": final, "id": 13}]},
+                               {"state": "rejected", "environments": [{"name": final, "id": 13}]}]):
+            reviews = [{"state": "approved", "environments": approval["environments"][:2]}] + final_reviews
+            with self.approval_api(gates, reviews=reviews, environment_ids=identities):
+                with self.assertRaises(ValueError):
+                    gates.check_approvals("example/repo", "42")
+
     def approval_api(self, gates, reviews=None, run_attempt=1, environment_ids=None):
-        identities = environment_ids or {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12}
+        identities = environment_ids or {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12,
+                                         gates.FINALIZATION_ENVIRONMENT: 13}
         run = dict(id=42, run_attempt=run_attempt, event="workflow_dispatch", head_sha=SOURCE,
                    path=".github/workflows/release.yml", repository={"full_name": "example/repo"})
         if reviews is None:
             reviews = [{"state": "approved", "environments": [
                 {"name": name, "id": identity} for name, identity in identities.items()]}]
+        elif environment_ids is None:
+            # Keep earlier acceptance/signing negative cases independent of the
+            # additional finalization obligation instead of failing on its absence.
+            reviews = reviews + [{"state": "approved", "environments": [
+                {"name": gates.FINALIZATION_ENVIRONMENT, "id": 13}]}]
         responses = {"repos/example/repo/actions/runs/42": run,
                      "repos/example/repo/actions/runs/42/approvals": reviews}
         for name, identity in identities.items():
@@ -148,9 +170,13 @@ class ReleaseAuthorizationTest(ArtifactFixture):
             "nelomai-0.2.16-macos-aarch64.app.tar.gz", "nelomai-0.2.16-android-aarch64.apk")}
         inventory = {"trust": "release", "mode": "sign_candidate", "source_sha": SOURCE,
                      "run_id": "42", "run_attempt": 1, "assets": assets,
-                     "environment_ids": {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12}}
+                     "environment_ids": {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12,
+                                         gates.FINALIZATION_ENVIRONMENT: 13}}
         identities = inventory["environment_ids"]
         gates.require_publishable_inventory(inventory, "42", SOURCE, identities)
+        with self.assertRaisesRegex(ValueError, "publishable"):
+            gates.require_publishable_inventory({**inventory, "assets": {**assets,
+                "nelomai-acceptance-0.2.16-linux-x86_64.AppImage": "e" * 64}}, "42", SOURCE, identities)
         for changes in ({"run_attempt": 2}, {"run_attempt": None}, {"run_attempt": True},
                         {"environment_ids": {gates.SIGNING_ENVIRONMENT: 10, gates.ACCEPTANCE_ENVIRONMENT: 12}}):
             with self.assertRaises(ValueError):

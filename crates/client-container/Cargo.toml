@@ -32,3 +32,6 @@ ed25519-dalek = "2.2"
 nelomai-client-application = { path = "../client-application" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nelomai-unix-service = { path = "../unix-service" }

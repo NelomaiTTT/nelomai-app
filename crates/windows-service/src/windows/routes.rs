@@ -661,11 +661,12 @@ mod tests {
 
     #[test]
     fn on_link_default_route_is_a_valid_physical_egress() {
-        let mut route = MIB_IPFORWARD_ROW2::default();
-        route.InterfaceIndex = 21;
-        route.Metric = 7;
-        route.DestinationPrefix.PrefixLength = 0;
-        route.NextHop = sockaddr(Ipv4Addr::UNSPECIFIED);
+        let route = MIB_IPFORWARD_ROW2 {
+            InterfaceIndex: 21,
+            Metric: 7,
+            NextHop: sockaddr(Ipv4Addr::UNSPECIFIED),
+            ..Default::default()
+        };
 
         let (_, _, egress) =
             egress_candidate(&route, 13, Some(Ipv4Addr::new(100, 64, 12, 34))).unwrap();
