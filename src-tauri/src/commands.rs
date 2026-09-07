@@ -2533,7 +2533,7 @@ pub async fn app_windows_defender_status(
 ) -> Result<WindowsDefenderStatusResponse, CommandError> {
     #[cfg(windows)]
     {
-        let status = crate::platform::windows::refresh_defender_status()
+        let status = crate::platform::defender_status(true)
             .await
             .map_err(CommandError::from_tunnel)?;
         record_defender_status(&diagnostics, "windows.defender.checked", &status);
@@ -2560,7 +2560,7 @@ pub async fn app_windows_defender_repair(
 ) -> Result<WindowsDefenderStatusResponse, CommandError> {
     #[cfg(windows)]
     {
-        let status = match crate::platform::windows::repair_defender_exclusion().await {
+        let status = match crate::platform::repair_defender_exclusion().await {
             Ok(status) => status,
             Err(error) => {
                 let error = CommandError::from_tunnel(error);
@@ -2674,7 +2674,7 @@ fn defender_state_name(state: nelomai_windows_service::DefenderExclusionState) -
 pub(crate) async fn ensure_defender_ready_for_awg(
     diagnostics: &AppDiagnostics,
 ) -> Result<(), ApplicationError> {
-    let defender = crate::platform::windows::defender_status()
+    let defender = crate::platform::defender_status(false)
         .await
         .map_err(CoreError::from)?;
     record_defender_status(diagnostics, "windows.defender.before_awg_start", &defender);
@@ -3114,113 +3114,62 @@ fn stable_diagnostics_connection_lease(
 pub async fn app_update_status(
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    #[cfg(not(target_os = "android"))]
-    {
-        updater.status().map_err(update_command_error)
-    }
-    #[cfg(target_os = "android")]
-    {
-        updater.status().await.map_err(update_command_error)
-    }
+    updater.status().await.map_err(update_command_error)
 }
-
 #[tauri::command]
 pub async fn app_update_refresh(
-    application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    #[cfg(target_os = "android")]
-    {
-        let _ = application;
-        updater.refresh().await.map_err(update_command_error)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let Some(_refresh_guard) = updater.try_begin_refresh() else {
-            return updater.status().map_err(update_command_error);
-        };
-        let update = application
-            .refresh_update_state()
-            .await
-            .map_err(CommandError::from)?;
-        updater.observe(&update).map_err(update_command_error)?;
-        if updater.automatic_enabled().map_err(update_command_error)? {
-            schedule_automatic_update(application.inner().clone(), updater.inner().clone());
-        }
-        updater.status().map_err(update_command_error)
-    }
+    updater.refresh().await.map_err(update_command_error)
 }
-
 #[tauri::command]
 pub async fn app_update_set_automatic(
-    application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
     enabled: bool,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    #[cfg(target_os = "android")]
-    {
-        let _ = application;
-        updater
-            .set_automatic(enabled)
-            .await
-            .map_err(update_command_error)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let response = updater
-            .set_automatic(enabled)
-            .map_err(update_command_error)?;
-        if enabled {
-            schedule_automatic_update(application.inner().clone(), updater.inner().clone());
-        }
-        Ok(response)
-    }
+    updater
+        .set_automatic(enabled)
+        .await
+        .map_err(update_command_error)
 }
-
 #[tauri::command]
 pub async fn app_update_install(
-    application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    #[cfg(target_os = "android")]
-    {
-        let _ = application;
-        updater.install().await.map_err(update_command_error)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        let bootstrap = application
-            .bootstrap(now_unix())
-            .await
-            .map_err(CommandError::from)?;
-        updater
-            .observe(&bootstrap.update)
-            .map_err(update_command_error)?;
-        let access_token = application
-            .current_access_token()
-            .await
-            .map_err(CommandError::from)?;
-        updater
-            .install_now(&access_token)
-            .await
-            .map_err(update_command_error)
-    }
+    updater.install().await.map_err(update_command_error)
 }
-
 #[tauri::command]
 pub async fn app_update_restart(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<(), CommandError> {
-    if !updater.ready_to_restart() {
+    if updater.status().await.map_err(update_command_error)?.phase != "ready_to_restart" {
         return Err(CommandError::new(
             "update_not_ready",
             "Обновление ещё не готово к перезапуску",
         ));
     }
-    stop_for_shutdown(&app, &application).await?;
-    app.restart();
+    #[cfg(desktop)]
+    {
+        // Common's verified update barrier already stopped this runtime and the
+        // helper before replacing its executable. Re-contacting the old broker
+        // hash after replacement cannot provide a new stop acknowledgement.
+        let _ = application;
+        crate::runtime::native()
+            .map_err(|_| update_command_error("common runtime unavailable".into()))?
+            .control(crate::runtime::NativeControl::Exit { restart: true })
+            .await
+            .map_err(|_| update_command_error("common restart failed".into()))?;
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(desktop))]
+    {
+        stop_for_shutdown(&app, &application).await?;
+        let _ = app;
+        Err(update_command_error("common restart unavailable".into()))
+    }
 }
 
 fn runtime_switch_error() -> CommandError {
@@ -3575,28 +3524,9 @@ fn observe_and_schedule_update(
     updater: Arc<NativeUpdater>,
     bootstrap: &Bootstrap,
 ) {
-    #[cfg(target_os = "android")]
-    {
-        let _ = (application, bootstrap);
-        tauri::async_runtime::spawn(async move {
-            let _ = updater.refresh().await;
-        });
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        if updater.observe(&bootstrap.update).is_ok() {
-            schedule_automatic_update(application, updater);
-        }
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn schedule_automatic_update(application: Arc<NativeApplication>, updater: Arc<NativeUpdater>) {
+    let _ = (application, bootstrap);
     tauri::async_runtime::spawn(async move {
-        let Ok(access_token) = application.current_access_token().await else {
-            return;
-        };
-        let _ = updater.install_automatically(&access_token).await;
+        let _ = updater.refresh().await;
     });
 }
 

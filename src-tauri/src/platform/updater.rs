@@ -104,16 +104,73 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .await
             .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
 
+        let stop_proof = crate::container::begin_installation(&self.app, expected_version)
+            .await
+            .map_err(|_| UpdateBackendError::new("update_stop_proof_unavailable"))?;
         #[cfg(windows)]
         crate::desktop::set_tray_visible(&self.app, false);
-        let install = update.install(bytes);
+        #[cfg(target_os = "linux")]
+        let install = install_linux_common(bytes).await;
+        #[cfg(not(target_os = "linux"))]
+        let install = update
+            .install(bytes)
+            .map_err(|_| UpdateBackendError::new("update_install_failed"));
         #[cfg(windows)]
         if install.is_err() {
             crate::desktop::set_tray_visible(&self.app, true);
         }
         install.map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+        crate::container::installation_succeeded(&self.app, stop_proof)
+            .await
+            .map_err(|_| UpdateBackendError::new("update_stop_proof_changed"))?;
         Ok(InstallResult::Installed(InstalledUpdate {
             version: update.version,
         }))
     }
+}
+
+/// `Update::download` has already verified the updater signature. The root
+/// installer copies and hashes these exact bytes before extracting/activating
+/// the complete AppImage; auth and stop barriers stay in the common updater.
+#[cfg(target_os = "linux")]
+async fn install_linux_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+    let installer = Path::new("/usr/local/libexec/nelomai/common/install-common-linux.sh");
+    for path in installer.ancestors() {
+        nelomai_contracts::dispatcher::trusted(path, 0)
+            .map_err(|_| UpdateBackendError::new("common_installer_untrusted"))?;
+    }
+    let staging = tempfile::Builder::new()
+        .prefix("nelomai-verified-update-")
+        .tempdir()
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    let image = staging.path().join("Nelomai.AppImage");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&image)
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    drop(file);
+    let sha = nelomai_contracts::dispatcher::digest(&bytes);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _staging = staging;
+        let status = super::unix::installer_status(
+            std::process::Command::new("/usr/bin/pkexec")
+                .arg("/bin/sh")
+                .arg(installer)
+                .arg(image)
+                .arg(sha),
+        )
+        .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+        if !status.success() {
+            return Err(UpdateBackendError::new("update_install_failed"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| UpdateBackendError::new("update_install_failed"))?
 }

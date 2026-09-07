@@ -2834,6 +2834,7 @@ version = "0.2.16"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "ed25519-dalek",
  "jni 0.21.1",
  "libc",
  "nelomai-client-api",

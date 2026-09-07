@@ -23,9 +23,6 @@ impl NativeUpdater {
     pub async fn install(&self) -> Result<UpdateStatusResponse, String> {
         self.request(HostRequestV1::UpdateInstall).await
     }
-    pub fn ready_to_restart(&self) -> bool {
-        false
-    }
     async fn request(&self, request: HostRequestV1) -> Result<UpdateStatusResponse, String> {
         match self
             .0

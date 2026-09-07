@@ -66,6 +66,22 @@ pub enum UpdatePrepare {
     LocalStopped,
 }
 
+/// An in-memory copy of the existing validated journals' independent stop proof.
+/// It cannot be constructed by runtime IPC or used without revalidating the
+/// active operation after the installer reports success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateStopProof {
+    operation_id: String,
+    source: nelomai_contracts::RuntimeIdentity,
+    target: String,
+    receipt: crate::LocalStopReceiptV1,
+}
+impl UpdateStopProof {
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpdateBarrierError {
     #[error("update journal I/O failed")]
@@ -103,6 +119,45 @@ impl UpdateBarrier {
     pub fn snapshot(&self) -> Result<Option<UpdateJournalV1>, UpdateBarrierError> {
         let _guard = self.owner.lock_transition_journal()?;
         load_journal(&self.path)
+    }
+
+    pub fn stop_proof(
+        &self,
+        target: &str,
+        phase: UpdateJournalPhase,
+    ) -> Result<UpdateStopProof, UpdateBarrierError> {
+        if !matches!(
+            phase,
+            UpdateJournalPhase::LocalStopped | UpdateJournalPhase::InstallerOpened
+        ) {
+            return Err(UpdateBarrierError::Invalid);
+        }
+        let journal = self.snapshot()?.ok_or(UpdateBarrierError::Invalid)?;
+        self.validate_switch_link(&journal)?;
+        let switch = self
+            .coordinator
+            .snapshot()
+            .map_err(SwitchError::Journal)?
+            .ok_or(UpdateBarrierError::Invalid)?;
+        if journal.phase != phase
+            || journal.target_container != target
+            || journal.source_container != self.coordinator.installed_container_version()
+            || switch.phase() != SwitchPhase::LocalStopped
+            || switch.operation_id() != journal.operation_id
+            || switch.source_identity() != Some(&journal.source_runtime)
+        {
+            return Err(UpdateBarrierError::Invalid);
+        }
+        let receipt = switch
+            .local_stop_receipt()
+            .ok_or(UpdateBarrierError::Invalid)?
+            .clone();
+        Ok(UpdateStopProof {
+            operation_id: journal.operation_id,
+            source: journal.source_runtime,
+            target: journal.target_container,
+            receipt,
+        })
     }
 
     pub async fn prepare(&self, target_version: &str) -> Result<UpdatePrepare, UpdateBarrierError> {

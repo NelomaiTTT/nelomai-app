@@ -7,7 +7,33 @@ Var NelomaiLegacyDesktopShortcutPath
 Var NelomaiDefenderExclusionPath
 
 !define NelomaiRegistryKey "SOFTWARE\Nelomai\Client"
-!define NelomaiDefenderExclusionValue "ManagedDefenderExclusionPath"
+!define NelomaiDefenderScript "${__FILEDIR__}\..\..\crates\windows-service\install\defender-exclusions.ps1"
+
+; One exact-path ownership implementation is shared with privileged runtime
+; copying and repair. Embed it in both installer and uninstaller, never load
+; a mutable script from the application installation directory.
+!macro NelomaiManagedDefender ACTION
+  InitPluginsDir
+  File "/oname=$PLUGINSDIR\nelomai-defender-exclusions.ps1" "${NelomaiDefenderScript}"
+  System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_INSTALL_DIR", t "$INSTDIR") i.r0'
+  StrCpy $2 $0
+  System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_PRIVILEGED_DIR", t "$PROGRAMFILES64\Nelomai\privileged") i.r0'
+  IntOp $2 $2 & $0
+  System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_ACTION", t "${ACTION}") i.r0'
+  IntOp $2 $2 & $0
+  System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_EXCLUSION_PATH", t "$NelomaiDefenderExclusionPath") i.r0'
+  IntOp $2 $2 & $0
+  ${If} $2 = 0
+    DetailPrint "Unable to prepare managed Defender exclusion environment"
+  ${Else}
+    nsExec::ExecToStack /TIMEOUT=30000 '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\nelomai-defender-exclusions.ps1"'
+    Pop $0
+    Pop $1
+    ${If} $0 <> 0
+      DetailPrint "Unable to complete managed Defender exclusion ${ACTION}: $1"
+    ${EndIf}
+  ${EndIf}
+!macroend
 
 !macro NSIS_HOOK_PREINSTALL
   StrCpy $NelomaiLegacyStartShortcut 0
@@ -97,23 +123,8 @@ Var NelomaiDefenderExclusionPath
   ; Exclude only the AWG runtime DLL, not the application directory. This hook
   ; runs before NSIS extracts files, so real-time protection cannot quarantine
   ; the DLL between extraction and service installation.
-  StrCpy $NelomaiDefenderExclusionPath "$INSTDIR\amneziawg-tunnel.dll"
-  System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_EXCLUSION_PATH", t "$NelomaiDefenderExclusionPath") i.r0'
-  ${If} $0 = 0
-    DetailPrint "Unable to prepare the Defender exclusion environment"
-  ${Else}
-    nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "$ErrorActionPreference=[Management.Automation.ActionPreference]::Stop; $path=$env:NELOMAI_DEFENDER_EXCLUSION_PATH; $existing=@((Get-MpPreference -ErrorAction Stop).ExclusionPath); if($existing -contains $path){exit 10}; Add-MpPreference -ExclusionPath $path -ErrorAction Stop"'
-    Pop $0
-    Pop $1
-    ${If} $0 = 0
-      WriteRegStr HKLM "${NelomaiRegistryKey}" "${NelomaiDefenderExclusionValue}" "$NelomaiDefenderExclusionPath"
-      DetailPrint "Added a Microsoft Defender exclusion for the AmneziaWG runtime"
-    ${ElseIf} $0 = 10
-      DetailPrint "The Microsoft Defender exclusion for the AmneziaWG runtime already exists"
-    ${Else}
-      DetailPrint "Unable to add the Microsoft Defender exclusion: $1"
-    ${EndIf}
-  ${EndIf}
+  StrCpy $NelomaiDefenderExclusionPath "$INSTDIR\runtime\engines\latest\0.2.16\amneziawg-tunnel.dll"
+  !insertmacro NelomaiManagedDefender "add"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -171,23 +182,6 @@ Var NelomaiDefenderExclusionPath
   ; Keep the exclusion while an updater replaces the installed files. During a
   ; full uninstall, remove only the exact path that this installer registered.
   ${If} $UpdateMode <> 1
-    ReadRegStr $NelomaiDefenderExclusionPath HKLM "${NelomaiRegistryKey}" "${NelomaiDefenderExclusionValue}"
-    StrCmp $NelomaiDefenderExclusionPath "$INSTDIR\amneziawg-tunnel.dll" 0 nelomai_defender_uninstall_done
-    System::Call 'Kernel32::SetEnvironmentVariable(t "NELOMAI_DEFENDER_EXCLUSION_PATH", t "$NelomaiDefenderExclusionPath") i.r0'
-    ${If} $0 = 0
-      DetailPrint "Unable to prepare removal of the Defender exclusion"
-    ${Else}
-      nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -Command "$ErrorActionPreference=[Management.Automation.ActionPreference]::Stop; $path=$env:NELOMAI_DEFENDER_EXCLUSION_PATH; $existing=@((Get-MpPreference -ErrorAction Stop).ExclusionPath); if($existing -contains $path){Remove-MpPreference -ExclusionPath $path -ErrorAction Stop}"'
-      Pop $0
-      Pop $1
-      ${If} $0 = 0
-        DeleteRegValue HKLM "${NelomaiRegistryKey}" "${NelomaiDefenderExclusionValue}"
-        DeleteRegKey /ifempty HKLM "${NelomaiRegistryKey}"
-        DetailPrint "Removed the Microsoft Defender exclusion for the AmneziaWG runtime"
-      ${Else}
-        DetailPrint "Unable to remove the Microsoft Defender exclusion: $1"
-      ${EndIf}
-    ${EndIf}
+    !insertmacro NelomaiManagedDefender "cleanup"
   ${EndIf}
-  nelomai_defender_uninstall_done:
 !macroend

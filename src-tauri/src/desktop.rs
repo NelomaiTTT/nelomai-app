@@ -120,7 +120,17 @@ fn start_tray_refresh(app: AppHandle) {
     });
 }
 
-async fn refresh_tray(app: &AppHandle) {
+fn tray_disconnect_action(
+    phase: Phase,
+    intent: nelomai_client_core::ConnectionIntentStatus,
+) -> bool {
+    matches!(
+        phase,
+        Phase::Connected | Phase::Connecting | Phase::Stopping
+    ) || intent != nelomai_client_core::ConnectionIntentStatus::None
+}
+
+pub(crate) async fn runtime_presentation(app: &AppHandle) -> crate::runtime::TraySnapshot {
     let application = app.state::<Arc<NativeApplication>>().inner().clone();
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>().inner().clone();
     let state = application.state().await;
@@ -128,9 +138,7 @@ async fn refresh_tray(app: &AppHandle) {
         .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
         .snapshot()
         .await;
-    let disconnect_action = state.phase == Phase::Connected
-        || matches!(state.phase, Phase::Connecting | Phase::Stopping)
-        || intent.status != nelomai_client_core::ConnectionIntentStatus::None;
+    let disconnect_action = tray_disconnect_action(state.phase, intent.status);
     let presentation = if state.phase == Phase::Connected {
         metrics.mark_observed().await;
         let traffic_text = match state.connection.as_ref() {
@@ -161,6 +169,23 @@ async fn refresh_tray(app: &AppHandle) {
             toggle_text: "Включить VPN",
             traffic_text: "Трафик сессии: нет подключения".to_string(),
         }
+    };
+
+    crate::runtime::TraySnapshot {
+        disconnect: presentation.toggle_text == "Отключить VPN",
+        traffic: presentation.traffic_text,
+    }
+}
+
+async fn refresh_tray(app: &AppHandle) {
+    let snapshot = crate::container::tray_snapshot(app).unwrap_or_default();
+    let presentation = TrayPresentation {
+        toggle_text: if snapshot.disconnect {
+            "Отключить VPN"
+        } else {
+            "Включить VPN"
+        },
+        traffic_text: snapshot.traffic,
     };
 
     let tray = app.state::<Arc<TrayMenuState>>().inner().clone();
@@ -198,6 +223,9 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 pub fn show_window(app: &AppHandle) {
+    if crate::container::queue_action(app, crate::runtime::RuntimeAction::Show) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         DOCK_VISIBILITY_GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -215,6 +243,14 @@ pub fn hide_window(window: &tauri::Window) {
     let _ = window.hide();
     #[cfg(target_os = "macos")]
     hide_dock_when_window_stays_hidden(window.app_handle().clone());
+}
+
+pub(crate) fn close_runtime_window(close_to_tray: bool, hide: impl FnOnce(), quit: impl FnOnce()) {
+    if close_to_tray {
+        hide();
+    } else {
+        quit();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -245,7 +281,10 @@ pub fn set_tray_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
     }
 }
 
-fn toggle_connection(app: AppHandle) {
+pub(crate) fn toggle_connection(app: AppHandle) {
+    if crate::container::queue_action(&app, crate::runtime::RuntimeAction::Toggle) {
+        return;
+    }
     if TOGGLE_RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -278,10 +317,32 @@ fn toggle_connection(app: AppHandle) {
 }
 
 pub fn quit_application(app: AppHandle) {
+    if crate::container::queue_action(&app, crate::runtime::RuntimeAction::Quit) {
+        return;
+    }
     if EXIT_RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
     tauri::async_runtime::spawn(async move {
+        let installed = app
+            .state::<Arc<crate::updates::NativeUpdater>>()
+            .status()
+            .await
+            .is_ok_and(|status| status.phase == "ready_to_restart");
+        if installed {
+            // This status only chooses the route. Common independently
+            // validates the successful-install stop proof before using it.
+            if let Ok(owner) = crate::runtime::native() {
+                if owner
+                    .control(crate::runtime::NativeControl::Exit { restart: false })
+                    .await
+                    .is_ok()
+                {
+                    app.exit(0);
+                    return;
+                }
+            }
+        }
         let application = app.state::<Arc<NativeApplication>>().inner().clone();
         let result = commands::stop_for_shutdown(&app, application.as_ref()).await;
         match result {
@@ -292,6 +353,11 @@ pub fn quit_application(app: AppHandle) {
                     crate::upload_automatic_diagnostics_once(&application, &diagnostics),
                 )
                 .await;
+                if let Ok(owner) = crate::runtime::native() {
+                    let _ = owner
+                        .control(crate::runtime::NativeControl::Exit { restart: false })
+                        .await;
+                }
                 app.exit(0);
             }
             Err(error) => {
@@ -312,6 +378,46 @@ pub fn quit_application(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::format_bytes;
+
+    #[test]
+    fn recovery_keeps_tray_disconnect_action() {
+        use nelomai_client_core::{ConnectionIntentStatus as Intent, Phase};
+        assert!(super::tray_disconnect_action(
+            Phase::Error,
+            Intent::Recovering
+        ));
+        assert!(super::tray_disconnect_action(
+            Phase::Error,
+            Intent::BlockedTerminal
+        ));
+        assert!(super::tray_disconnect_action(
+            Phase::Connecting,
+            Intent::None
+        ));
+        assert!(super::tray_disconnect_action(
+            Phase::Connected,
+            Intent::None
+        ));
+        assert!(!super::tray_disconnect_action(Phase::Ready, Intent::None));
+    }
+
+    #[test]
+    fn closing_to_tray_never_requests_common_process_exit() {
+        let events = std::cell::RefCell::new(Vec::new());
+        super::close_runtime_window(
+            true,
+            || events.borrow_mut().push("hide"),
+            || events.borrow_mut().push("common-exit"),
+        );
+        assert_eq!(*events.borrow(), ["hide"]);
+        events.borrow_mut().clear();
+        super::close_runtime_window(
+            false,
+            || events.borrow_mut().push("hide"),
+            || events.borrow_mut().push("common-exit"),
+        );
+        assert_eq!(*events.borrow(), ["common-exit"]);
+    }
 
     #[test]
     fn formats_session_traffic_for_the_tray() {

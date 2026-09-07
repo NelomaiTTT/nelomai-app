@@ -64,10 +64,10 @@ pub async fn repair_defender_exclusion() -> Result<DefenderStatus, TunnelError> 
     defender_status_cached(true).await
 }
 
-pub async fn diagnostic_helper_log() -> Option<String> {
-    let controller = tunnel_controller();
-    let diagnostics = controller.diagnostics().await.ok();
-    let status = controller.defender_status().await.ok();
+pub fn format_diagnostic_helper_log(
+    diagnostics: Option<String>,
+    status: Option<DefenderStatus>,
+) -> Option<String> {
     if diagnostics.is_none() && status.is_none() {
         return None;
     }

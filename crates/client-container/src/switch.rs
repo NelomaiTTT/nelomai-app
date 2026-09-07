@@ -152,6 +152,10 @@ impl SwitchJournalV1 {
         &self.operation_id
     }
 
+    pub(crate) fn local_stop_receipt(&self) -> Option<&LocalStopReceiptV1> {
+        self.local_stop_receipt.as_ref()
+    }
+
     pub(crate) fn supersede_target(&self) -> Option<&RuntimeTarget> {
         self.supersede_target.as_ref()
     }

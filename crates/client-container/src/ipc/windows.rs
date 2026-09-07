@@ -63,11 +63,11 @@ fn duplicate(handle: HANDLE, inherit: bool) -> io::Result<OwnedHandle> {
     }
     Ok(unsafe { OwnedHandle::from_raw_handle(result) })
 }
-fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
+fn pipe(inherit: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
     let security = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: 1,
+        bInheritHandle: inherit.into(),
     };
     let (mut read, mut write) = (std::ptr::null_mut(), std::ptr::null_mut());
     if unsafe { CreatePipe(&mut read, &mut write, &security, 0) } == 0 {
@@ -120,18 +120,29 @@ pub struct InheritedChildPipes {
     stderr: OwnedHandle,
 }
 pub fn private_pipe_pair() -> io::Result<(PrivatePipeIo, InheritedChildPipes)> {
-    let (child_read, parent_write) = pipe()?;
-    let (parent_read, child_write) = pipe()?;
+    pair(true)
+}
+/// Production launch keeps every handle non-inheritable in the common process.
+/// Only duplicates in a suspended donor process are made inheritable.
+pub fn noninheritable_pipe_pair() -> io::Result<(PrivatePipeIo, InheritedChildPipes)> {
+    pair(false)
+}
+fn pair(inherit: bool) -> io::Result<(PrivatePipeIo, InheritedChildPipes)> {
+    let (child_read, parent_write) = pipe(inherit)?;
+    let (parent_read, child_write) = pipe(inherit)?;
     no_inherit(&parent_read)?;
     no_inherit(&parent_write)?;
     let child = InheritedChildPipes {
         read: child_read,
         write: child_write,
-        stderr: null_file(true)?,
+        stderr: null_file(inherit)?,
     };
     Ok((PrivatePipeIo::new(parent_read, parent_write)?, child))
 }
 impl InheritedChildPipes {
+    pub fn handles(&self) -> [&OwnedHandle; 3] {
+        [&self.read, &self.write, &self.stderr]
+    }
     /// Local loopback/embedded consumer, including platform tests. A launched
     /// process must instead capture its inherited standard handles immediately.
     pub fn into_local_io(self) -> io::Result<PrivatePipeIo> {
@@ -292,7 +303,7 @@ pub unsafe fn capture_inherited_stdio() -> io::Result<PrivatePipeIo> {
 fn explicit_standard_owners(standard: [isize; 3], crt: [isize; 3]) -> io::Result<Vec<isize>> {
     let valid: Vec<_> = crt
         .into_iter()
-        .filter(|handle| !matches!(*handle, 0 | -1 | -2))
+        .filter(|handle| !matches!(*handle, -2..=0))
         .collect();
     if valid
         .iter()
@@ -305,23 +316,6 @@ fn explicit_standard_owners(standard: [isize; 3], crt: [isize; 3]) -> io::Result
         .into_iter()
         .filter(|handle| !valid.contains(handle))
         .collect())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn crt_dup2_owns_its_original_close_and_explicit_close_never_repeats_it() {
-        assert_eq!(
-            explicit_standard_owners([11, 12, 13], [11, 12, 13]).unwrap(),
-            Vec::<isize>::new()
-        );
-        assert_eq!(
-            explicit_standard_owners([11, 12, 13], [11, -1, -2]).unwrap(),
-            vec![12, 13]
-        );
-        assert!(explicit_standard_owners([11, 12, 13], [11, 11, 13]).is_err());
-    }
 }
 
 struct WriteCommand {
@@ -338,7 +332,7 @@ pub struct PrivatePipeIo {
     workers: Vec<JoinHandle<()>>,
 }
 impl PrivatePipeIo {
-    fn new(read: OwnedHandle, write: OwnedHandle) -> io::Result<Self> {
+    pub(crate) fn new(read: OwnedHandle, write: OwnedHandle) -> io::Result<Self> {
         let (read_sender, reads) = mpsc::channel(1);
         let (writes, mut write_receiver) = mpsc::channel::<WriteCommand>(1);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -498,5 +492,22 @@ impl Drop for PrivatePipeIo {
             // Join is the completion ACK: no abandoned blocking worker.
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn crt_dup2_owns_its_original_close_and_explicit_close_never_repeats_it() {
+        assert_eq!(
+            explicit_standard_owners([11, 12, 13], [11, 12, 13]).unwrap(),
+            Vec::<isize>::new()
+        );
+        assert_eq!(
+            explicit_standard_owners([11, 12, 13], [11, -1, -2]).unwrap(),
+            vec![12, 13]
+        );
+        assert!(explicit_standard_owners([11, 12, 13], [11, 11, 13]).is_err());
     }
 }

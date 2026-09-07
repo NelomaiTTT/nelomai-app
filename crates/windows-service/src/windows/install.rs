@@ -6,6 +6,7 @@ use crate::{
     AMNEZIAWG_TUNNEL_SERVICE_NAME, MANAGER_SERVICE_NAME, TUNNEL_SERVICE_NAME,
 };
 use nelomai_client_tunnel::TunnelTransport;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -41,6 +42,53 @@ pub struct InstallOptions {
     pub installed_client_path: PathBuf,
 }
 
+/// Copy hooks receive only already signature/hash-verified source entries.
+/// Prepare exact staging/final DLL exceptions before the first file write;
+/// regular signed-copy validation and activation remain unchanged.
+struct DefenderInstallIo<'a> {
+    root: &'a Path,
+    broker: &'a Path,
+    stages: RefCell<Vec<PathBuf>>,
+    finals: RefCell<Vec<PathBuf>>,
+    published: Cell<bool>,
+}
+impl nelomai_contracts::dispatcher::InstallIo for DefenderInstallIo<'_> {
+    fn copy(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        if let Some((stage, final_path)) =
+            super::defender_layout::copy_exclusion_paths(self.root, destination)?
+        {
+            self.stages.borrow_mut().push(stage.clone());
+            self.finals.borrow_mut().push(final_path.clone());
+            for path in [&stage, &final_path] {
+                if super::defender::managed_exclusion(self.broker, path, "add").is_err() {
+                    // Defender may be disabled/not installed (another AV).
+                    // No signature/hash checks are skipped on this path.
+                    record_service_message("installer", "defender_exclusion_prepare_failed");
+                }
+            }
+        }
+        nelomai_contracts::dispatcher::RealInstallIo.copy(source, destination)
+    }
+    fn publish(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        nelomai_contracts::dispatcher::RealInstallIo.publish(source, destination)
+    }
+}
+impl Drop for DefenderInstallIo<'_> {
+    fn drop(&mut self) {
+        let paths = self.stages.get_mut().iter().chain(
+            self.finals
+                .get_mut()
+                .iter()
+                .filter(|_| !self.published.get()),
+        );
+        for path in paths {
+            if super::defender::managed_exclusion(self.broker, path, "remove").is_err() {
+                record_service_message("installer", "defender_exclusion_cleanup_pending");
+            }
+        }
+    }
+}
+
 pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
     let executable =
         env::current_exe().map_err(|error| platform_error("resolve service executable", error))?;
@@ -65,14 +113,24 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(platform_error("read previous dispatcher pointer", error)),
         };
+    let operations = DefenderInstallIo {
+        root: &install_root,
+        broker: &installed_client_path,
+        stages: RefCell::new(Vec::new()),
+        finals: RefCell::new(Vec::new()),
+        published: Cell::new(false),
+    };
     let layout = installation
         .install(
             &source,
             &installed_client_path,
             &options.owner_sid,
-            &nelomai_contracts::dispatcher::RealInstallIo,
+            &operations,
         )
         .map_err(|_| ServiceError::UnauthorizedClient)?;
+    // Published generations stay recoverable on service activation rollback;
+    // their exact owned exceptions are retained until full uninstall.
+    operations.published.set(true);
     let activation = (|| {
         pipe_security_descriptor(&options.owner_sid)?;
         let root = state_directory()?;

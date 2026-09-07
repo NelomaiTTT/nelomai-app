@@ -624,6 +624,132 @@ impl CommonHost {
     pub fn coordinator(&self) -> &Arc<SwitchCoordinator> {
         &self.coordinator
     }
+    pub fn updater_status(&self) -> Result<HostUpdateStatusV1, HostError> {
+        self.updater
+            .status()
+            .map_err(|_| HostError::RecoveryRequired)
+    }
+    #[cfg(not(target_os = "android"))]
+    pub fn update_stop_proof(
+        &self,
+        target: &str,
+        phase: crate::UpdateJournalPhase,
+    ) -> Result<crate::UpdateStopProof, HostError> {
+        self.updater
+            .stop_proof(target, phase)
+            .map_err(|_| HostError::RecoveryRequired)
+    }
+    #[cfg(not(target_os = "android"))]
+    pub fn native_start_blocked(&self) -> Result<bool, HostError> {
+        self.updater
+            .native_start_blocked()
+            .map_err(|_| HostError::RecoveryRequired)
+    }
+    /// Only this verified launch path creates desktop auth admission. A PID or
+    /// manifest claimed by a connecting client is never accepted as authority.
+    #[cfg(not(target_os = "android"))]
+    pub async fn launch_desktop(
+        &self,
+        payload_owner: u32,
+    ) -> Result<crate::desktop::VerifiedChild, HostError> {
+        let _gate = self.attach_gate.lock().await;
+        let selected = self.selection().await?;
+        if self
+            .bridge
+            .peer
+            .lock()
+            .map_err(|_| HostError::RecoveryRequired)?
+            .as_ref()
+            .is_some_and(|peer| peer.owner.is_connected())
+        {
+            return Err(HostError::RecoveryRequired);
+        }
+        let runtime = crate::desktop::VerifiedRuntime::from_verified(
+            &self.resources,
+            self.installed.manifest().clone(),
+            selected.target.runtime_slot,
+            payload_owner,
+        )
+        .map_err(|_| HostError::RecoveryRequired)?;
+        let mut child = tokio::task::spawn_blocking(move || runtime.spawn())
+            .await
+            .map_err(|_| HostError::RecoveryRequired)?
+            .map_err(|_| HostError::RecoveryRequired)?;
+        child
+            .verify_alive()
+            .map_err(|_| HostError::RecoveryRequired)?;
+        if child.target != selected.target {
+            return Err(HostError::RecoveryRequired);
+        }
+        let stream = child.take_auth().map_err(|_| HostError::RecoveryRequired)?;
+        let bytes = serde_json::to_vec(&selected).map_err(|_| HostError::RecoveryRequired)?;
+        if bytes.len() > 65536 {
+            return Err(HostError::RecoveryRequired);
+        }
+        #[cfg(unix)]
+        {
+            stream
+                .set_nonblocking(true)
+                .map_err(|_| HostError::RecoveryRequired)?;
+        }
+        #[cfg(unix)]
+        let mut stream =
+            tokio::net::UnixStream::from_std(stream).map_err(|_| HostError::RecoveryRequired)?;
+        #[cfg(windows)]
+        let mut stream = stream;
+        {
+            use tokio::io::AsyncWriteExt;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                stream.write_u32_le(bytes.len() as u32).await?;
+                stream.write_all(&bytes).await
+            })
+            .await
+            .map_err(|_| HostError::RecoveryRequired)?
+            .map_err(|_| HostError::RecoveryRequired)?;
+        }
+        self.attach_verified(stream, &selected)?;
+        Ok(child)
+    }
+    #[cfg(not(target_os = "android"))]
+    fn attach_verified<S>(&self, stream: S, selected: &RuntimeBootstrapV1) -> Result<(), HostError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut current = self
+            .bridge
+            .peer
+            .lock()
+            .map_err(|_| HostError::RecoveryRequired)?;
+        if current
+            .as_ref()
+            .is_some_and(|peer| peer.owner.is_connected())
+        {
+            return Err(HostError::RecoveryRequired);
+        }
+        let peer = RemoteOwner::new_with_owner(
+            stream,
+            LaunchBinding::from_common_host(selected.target.clone(), selected.incarnation.clone()),
+            self.profile.clone(),
+            Some(self.bridge.native.background.clone()),
+            Some(Arc::new(HostCommands {
+                target: selected.target.clone(),
+                coordinator: self.coordinator.clone(),
+                updater: self.updater.clone(),
+                bridge: Arc::downgrade(&self.bridge),
+                ready_gate: self.ready_gate.clone(),
+                migration: self.migration.clone(),
+            })),
+        )
+        .map_err(|_| HostError::RecoveryRequired)?;
+        let service = peer
+            .serve(self.broker.clone())
+            .map_err(|_| HostError::RecoveryRequired)?;
+        *current = Some(HostPeer {
+            owner: peer,
+            _service: service,
+        });
+        Ok(())
+    }
     pub async fn selection(&self) -> Result<RuntimeBootstrapV1, HostError> {
         let (stamp, _) = self.broker.observe_stamped().await?;
         let generation = stamp.session_generation();

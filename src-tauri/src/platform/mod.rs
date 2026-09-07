@@ -11,9 +11,11 @@ pub mod windows;
 pub type PlatformTunnelController =
     tauri_plugin_tunnel_android::AndroidTunnelController<tauri::Wry>;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use unix::PlatformTunnelController;
+pub(crate) type PlatformTunnelController =
+    nelomai_unix_service::UnixTunnelController<crate::runtime::RemoteTransport>;
 #[cfg(windows)]
-pub use windows::PlatformTunnelController;
+pub(crate) type PlatformTunnelController =
+    nelomai_windows_service::WindowsTunnelController<crate::runtime::RemoteTransport>;
 
 #[cfg(target_os = "android")]
 pub fn tunnel_controller(app: tauri::AppHandle<tauri::Wry>) -> PlatformTunnelController {
@@ -22,13 +24,14 @@ pub fn tunnel_controller(app: tauri::AppHandle<tauri::Wry>) -> PlatformTunnelCon
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn tunnel_controller(_app: tauri::AppHandle<tauri::Wry>) -> PlatformTunnelController {
-    unix::tunnel_controller()
+    nelomai_unix_service::UnixTunnelController::new(crate::runtime::RemoteTransport)
 }
 
 #[cfg(windows)]
 pub async fn diagnostic_helper_log(tunnel: &PlatformTunnelController) -> Option<String> {
-    let _ = tunnel;
-    windows::diagnostic_helper_log().await
+    let log = tunnel.diagnostics().await.ok();
+    let defender = defender_status(false).await.ok();
+    windows::format_diagnostic_helper_log(log, defender)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -38,7 +41,7 @@ pub async fn diagnostic_helper_log(tunnel: &PlatformTunnelController) -> Option<
 
 #[cfg(windows)]
 pub fn tunnel_controller(_app: tauri::AppHandle<tauri::Wry>) -> PlatformTunnelController {
-    windows::tunnel_controller()
+    nelomai_windows_service::WindowsTunnelController::new(crate::runtime::RemoteTransport)
 }
 
 #[cfg(target_os = "android")]
@@ -80,28 +83,85 @@ pub async fn prepare_tunnel(
 pub async fn prepare_tunnel(
     app: tauri::AppHandle<tauri::Wry>,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    unix::prepare_tunnel(app).await
+    let _ = app;
+    crate::runtime::native()
+        .map_err(|_| {
+            nelomai_client_tunnel::TunnelError::Backend("common runtime unavailable".into())
+        })?
+        .control(crate::runtime::NativeControl::Prepare)
+        .await
+        .map(|_| ())
+        .map_err(|_| {
+            nelomai_client_tunnel::TunnelError::Backend("common preparation failed".into())
+        })
 }
 
 #[cfg(windows)]
 pub async fn prepare_tunnel(
     _app: tauri::AppHandle<tauri::Wry>,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    windows::prepare_tunnel().await
+    private_prepare().await
 }
 
 #[cfg(windows)]
 pub async fn prepare_tunnel_for_stop(
     _app: tauri::AppHandle<tauri::Wry>,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    windows::prepare_tunnel().await
+    private_prepare().await
+}
+
+#[cfg(windows)]
+async fn private_prepare() -> Result<(), nelomai_client_tunnel::TunnelError> {
+    crate::runtime::native()
+        .map_err(|_| {
+            nelomai_client_tunnel::TunnelError::Backend("common runtime unavailable".into())
+        })?
+        .control(crate::runtime::NativeControl::Prepare)
+        .await
+        .map(|_| ())
+        .map_err(|_| {
+            nelomai_client_tunnel::TunnelError::Backend("common preparation failed".into())
+        })
+}
+#[cfg(windows)]
+pub async fn defender_status(
+    refresh: bool,
+) -> Result<nelomai_windows_service::DefenderStatus, nelomai_client_tunnel::TunnelError> {
+    match crate::runtime::native()
+        .map_err(|_| {
+            nelomai_client_tunnel::TunnelError::Backend("common runtime unavailable".into())
+        })?
+        .control(crate::runtime::NativeControl::DefenderStatus { refresh })
+        .await
+    {
+        Ok(crate::runtime::NativeReply::Defender { status }) => Ok(status),
+        _ => Err(nelomai_client_tunnel::TunnelError::Backend(
+            "common defender status unavailable".into(),
+        )),
+    }
+}
+#[cfg(windows)]
+pub async fn repair_defender_exclusion(
+) -> Result<nelomai_windows_service::DefenderStatus, nelomai_client_tunnel::TunnelError> {
+    match crate::runtime::native()
+        .map_err(|_| {
+            nelomai_client_tunnel::TunnelError::Backend("common runtime unavailable".into())
+        })?
+        .control(crate::runtime::NativeControl::DefenderRepair)
+        .await
+    {
+        Ok(crate::runtime::NativeReply::Defender { status }) => Ok(status),
+        _ => Err(nelomai_client_tunnel::TunnelError::Backend(
+            "common defender repair failed".into(),
+        )),
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn prepare_tunnel_for_stop(
     app: tauri::AppHandle<tauri::Wry>,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    unix::prepare_tunnel(app).await
+    prepare_tunnel(app).await
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]

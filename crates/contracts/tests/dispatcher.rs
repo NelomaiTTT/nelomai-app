@@ -91,6 +91,50 @@ struct FailingIo {
     copy: bool,
 }
 
+#[test]
+fn invalid_source_bytes_are_rejected_before_effectful_platform_copy_hooks() {
+    struct Observe(std::cell::Cell<usize>);
+    impl InstallIo for Observe {
+        fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.0.set(self.0.get() + 1);
+            RealInstallIo.copy(from, to)
+        }
+        fn publish(&self, from: &Path, to: &Path) -> io::Result<()> {
+            RealInstallIo.publish(from, to)
+        }
+    }
+    let (source, key) = fixture();
+    fs::write(
+        source
+            .path()
+            .join("engines/latest/0.2.16/nelomai-unix-service"),
+        b"tampered",
+    )
+    .unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let installer = Installation::for_owner(
+        target.path(),
+        key.verifying_key().to_bytes(),
+        "macos",
+        "aarch64",
+        current_owner(),
+    );
+    let calls = Observe(std::cell::Cell::new(0));
+    assert!(installer
+        .install(
+            source.path(),
+            &std::env::current_exe().unwrap(),
+            "501",
+            &calls
+        )
+        .is_err());
+    assert_eq!(
+        calls.0.get(),
+        0,
+        "invalid payload must not trigger exclusion/copy side effects"
+    );
+}
+
 struct FailedDurability;
 impl InstallIo for FailedDurability {
     fn copy(&self, from: &Path, to: &Path) -> io::Result<()> {

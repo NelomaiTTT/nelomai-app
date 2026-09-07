@@ -82,6 +82,23 @@ pub(crate) struct HostUpdater {
     refresh_gate: tokio::sync::Mutex<()>,
 }
 impl HostUpdater {
+    #[cfg(not(target_os = "android"))]
+    pub fn stop_proof(
+        &self,
+        target: &str,
+        phase: crate::UpdateJournalPhase,
+    ) -> Result<crate::UpdateStopProof, PrivateError> {
+        self.barrier
+            .stop_proof(target, phase)
+            .map_err(|_| PrivateError::RecoveryRequired)
+    }
+    #[cfg(not(target_os = "android"))]
+    pub fn native_start_blocked(&self) -> Result<bool, PrivateError> {
+        self.barrier
+            .snapshot()
+            .map(|journal| journal.is_some())
+            .map_err(|_| PrivateError::RecoveryRequired)
+    }
     pub fn new(
         root: &Path,
         api: ClientApi,

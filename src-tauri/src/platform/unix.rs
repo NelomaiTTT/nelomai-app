@@ -59,7 +59,7 @@ async fn helper_is_current(expected: &EngineIdentity) -> bool {
 }
 
 fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    let helper = required_resource(resources, "nelomai-unix-service")?;
+    let helper = required_resource(resources, "dispatcher/1/nelomai-unix-service")?;
     let layout = resources.join("runtime");
     let broker = std::fs::canonicalize(
         std::env::current_exe().map_err(|_| tunnel_error("common_broker_unavailable"))?,
@@ -68,7 +68,7 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
     // AppImage's per-launch FUSE path is not the installed common broker.
     // Task 9's launcher must hand off here before auth initialization.
     #[cfg(target_os = "linux")]
-    if broker != Path::new("/usr/local/libexec/nelomai/common/nelomai") {
+    if broker != Path::new("/usr/local/libexec/nelomai/common/AppDir/usr/bin/nelomai-app") {
         return Err(tunnel_error("installed_common_broker_required"));
     }
     nelomai_contracts::dispatcher::trusted(&broker, 0)
@@ -118,7 +118,7 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
     }
 }
 
-fn installer_status(
+pub(crate) fn installer_status(
     command: &mut Command,
 ) -> Result<ExitStatus, nelomai_client_tunnel::TunnelError> {
     installer_status_with_timeout(command, HELPER_INSTALL_TIMEOUT)

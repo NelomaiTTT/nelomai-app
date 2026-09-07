@@ -572,6 +572,9 @@ impl Installation {
             return Err(blocked());
         }
         let (manifest, hash) = self.verified_manifest(source)?;
+        // Platform copy hooks may prepare narrowly scoped OS resources. Never
+        // run them for payload bytes that already fail their signed index.
+        self.verify_files(source, &manifest)?;
         let generation = format!(
             "{}-{:x}",
             hash,

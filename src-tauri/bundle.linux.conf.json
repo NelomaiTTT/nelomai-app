@@ -1,12 +1,10 @@
 {
   "bundle": {
     "resources": {
-      "platform-runtime/nelomai-unix-service": "nelomai-unix-service",
-      "platform-runtime/amneziawg-go": "amneziawg-go",
-      "platform-runtime/AMNEZIAWG-GO-LICENSE.txt": "licenses/AMNEZIAWG-GO-LICENSE.txt",
-      "platform-runtime/linux-runtime.json": "licenses/linux-runtime.json",
+      "platform-runtime/desktop-bundle/runtime/": "runtime/",
+      "platform-runtime/desktop-bundle/dispatcher/1/nelomai-unix-service": "dispatcher/1/nelomai-unix-service",
       "../crates/unix-service/install/install-linux.sh": "install-linux.sh",
-      "../crates/unix-service/install/resolvconf-linux.sh": "resolvconf-linux.sh"
+      "../crates/unix-service/install/install-common-linux.sh": "install-common-linux.sh"
     }
   }
 }

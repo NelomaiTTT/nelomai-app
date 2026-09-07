@@ -1,5 +1,6 @@
 mod backend;
 mod defender;
+mod defender_layout;
 mod elevation;
 mod install;
 mod ipc;

@@ -23,7 +23,7 @@ const AWG_DLL_NAME: &str = "amneziawg-tunnel.dll";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 const REPAIR_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFENDER_ACTIVE_SCRIPT: &str = "$ErrorActionPreference=[Management.Automation.ActionPreference]::Stop; $status=Get-MpComputerStatus -ErrorAction Stop; if($status.AntivirusEnabled -and $status.RealTimeProtectionEnabled -and $status.AMRunningMode -ne 'Passive Mode'){exit 0}; exit 20";
-const ADD_EXCLUSION_SCRIPT: &str = r"$ErrorActionPreference=[Management.Automation.ActionPreference]::Stop; $path=$env:NELOMAI_DEFENDER_EXCLUSION_PATH; if([string]::IsNullOrWhiteSpace($path)){exit 30}; $existing=@((Get-MpPreference -ErrorAction Stop).ExclusionPath); if($existing -notcontains $path){Add-MpPreference -ExclusionPath $path -ErrorAction Stop}; New-Item -Path 'HKLM:\SOFTWARE\Nelomai\Client' -Force -ErrorAction Stop | Out-Null; New-ItemProperty -Path 'HKLM:\SOFTWARE\Nelomai\Client' -Name 'ManagedDefenderExclusionPath' -PropertyType String -Value $path -Force -ErrorAction Stop | Out-Null";
+const EXCLUSION_SCRIPT: &str = include_str!("../../install/defender-exclusions.ps1");
 
 pub(crate) fn exclusion_status() -> DefenderStatus {
     let (antivirus_products, antivirus_detail_code) = antivirus_products();
@@ -143,6 +143,19 @@ pub fn configure_exclusion(client_executable: &Path) -> Result<(), ServiceError>
         return Err(ServiceError::UnauthorizedClient);
     }
     let dll_path = layout.engine_path().with_file_name(AWG_DLL_NAME);
+    managed_exclusion(&client_executable, &dll_path, "add")
+}
+
+/// Called only for exact verified install-layout destinations or a loaded
+/// selected engine; the shared script validates roots/ownership again.
+pub(crate) fn managed_exclusion(
+    client_executable: &Path,
+    dll_path: &Path,
+    action: &str,
+) -> Result<(), ServiceError> {
+    if !matches!(action, "add" | "remove") {
+        return Err(ServiceError::InvalidRequest);
+    }
     let powershell = powershell_path()
         .ok_or_else(|| ServiceError::Backend("defender_repair_tool_unavailable".to_string()))?;
     let mut command = Command::new(powershell);
@@ -152,9 +165,18 @@ pub fn configure_exclusion(client_executable: &Path) -> Result<(), ServiceError>
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            ADD_EXCLUSION_SCRIPT,
+            EXCLUSION_SCRIPT,
         ])
-        .env("NELOMAI_DEFENDER_EXCLUSION_PATH", &dll_path);
+        .env("NELOMAI_DEFENDER_EXCLUSION_PATH", dll_path)
+        .env("NELOMAI_DEFENDER_ACTION", action)
+        .env(
+            "NELOMAI_DEFENDER_INSTALL_DIR",
+            client_executable.parent().ok_or(ServiceError::UnsafePath)?,
+        )
+        .env(
+            "NELOMAI_DEFENDER_PRIVILEGED_DIR",
+            super::install::installation_directory()?,
+        );
     match run_hidden(&mut command, REPAIR_TIMEOUT) {
         CommandResult::Exit(0) => Ok(()),
         CommandResult::Exit(_) => Err(ServiceError::Backend(

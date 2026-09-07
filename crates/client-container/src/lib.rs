@@ -1,6 +1,8 @@
 //! Container-owned authentication. Runtime integration is a separate boundary.
 mod auth_broker;
 mod cleanup;
+#[cfg(not(target_os = "android"))]
+pub mod desktop;
 pub mod host;
 mod host_updater;
 mod installed_runtime;

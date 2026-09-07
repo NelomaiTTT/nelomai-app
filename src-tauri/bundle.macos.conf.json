@@ -1,14 +1,12 @@
 {
   "bundle": {
     "resources": {
-      "platform-runtime/nelomai-unix-service": "nelomai-unix-service",
-      "platform-runtime/wireguard-go": "wireguard-go",
-      "platform-runtime/amneziawg-go": "amneziawg-go",
-      "platform-runtime/WIREGUARD-GO-LICENSE.txt": "licenses/WIREGUARD-GO-LICENSE.txt",
-      "platform-runtime/AMNEZIAWG-GO-LICENSE.txt": "licenses/AMNEZIAWG-GO-LICENSE.txt",
-      "platform-runtime/macos-runtime.json": "licenses/macos-runtime.json",
+      "platform-runtime/desktop-bundle/runtime/": "runtime/",
+      "platform-runtime/desktop-bundle/dispatcher/1/nelomai-unix-service": "dispatcher/1/nelomai-unix-service",
       "../crates/unix-service/install/install-macos.sh": "install-macos.sh",
-      "../crates/unix-service/install/install-macos.applescript": "install-macos.applescript"
+      "../crates/unix-service/install/install-macos.applescript": "install-macos.applescript",
+      "../crates/unix-service/install/install-common-macos.sh": "install-common-macos.sh",
+      "../crates/unix-service/install/install-common-macos.applescript": "install-common-macos.applescript"
     }
   }
 }

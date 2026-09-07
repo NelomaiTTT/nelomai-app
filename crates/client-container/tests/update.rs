@@ -482,6 +482,56 @@ async fn installer_opened_is_pending_replacement_not_installed_version_proof() {
 }
 
 #[tokio::test]
+async fn replacement_restart_reuses_only_matching_verified_stop_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let coordinator = offline_coordinator(
+        owner,
+        enrolled_store(RuntimeSlot::Latest),
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+    );
+    let barrier = UpdateBarrier::open(coordinator).unwrap();
+    assert!(barrier
+        .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+        .is_err());
+    barrier.prepare("0.2.17").await.unwrap();
+    let proof = barrier
+        .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+        .unwrap();
+    assert!(barrier
+        .stop_proof("0.2.18", UpdateJournalPhase::LocalStopped)
+        .is_err());
+    let executable = root.path().join("common-broker");
+    std::fs::write(&executable, b"old common").unwrap();
+    let old_hash = nelomai_contracts::dispatcher::file_digest(&executable).unwrap();
+    std::fs::write(&executable, b"replacement common").unwrap();
+    assert_ne!(
+        old_hash,
+        nelomai_contracts::dispatcher::file_digest(&executable).unwrap(),
+        "old dispatcher binding no longer authorizes this path"
+    );
+    assert!(barrier
+        .stop_proof("0.2.17", UpdateJournalPhase::InstallerOpened)
+        .is_err());
+    barrier.installer_opened().await.unwrap();
+    assert_eq!(
+        proof,
+        barrier
+            .stop_proof("0.2.17", UpdateJournalPhase::InstallerOpened)
+            .unwrap()
+    );
+    let journal = root.path().join("common/runtime-switch-v1.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+    value["local_stop_receipt"] = Value::Null;
+    std::fs::write(journal, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(barrier
+        .stop_proof("0.2.17", UpdateJournalPhase::InstallerOpened)
+        .is_err());
+}
+
+#[tokio::test]
 async fn update_journal_keeps_start_blocked_if_the_switch_journal_is_retired_mid_install() {
     let root = tempfile::tempdir().unwrap();
     write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);

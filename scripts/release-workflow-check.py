@@ -308,13 +308,11 @@ def run() -> None:
         raise RuntimeError("Windows legacy migration must precede service replacement")
     for token in (
         "amneziawg-tunnel.dll",
-        "$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe",
-        "Add-MpPreference -ExclusionPath",
-        "NelomaiDefenderExclusionValue",
+        '!insertmacro NelomaiManagedDefender "add"',
     ):
         if token not in preinstall_hook:
             raise RuntimeError(f"Windows Defender setup misses {token}")
-    if preinstall_hook.index("Add-MpPreference -ExclusionPath") < preinstall_hook.index(
+    if preinstall_hook.index('!insertmacro NelomaiManagedDefender "add"') < preinstall_hook.index(
         "Stopping the previous Nelomai tunnel service"
     ):
         raise RuntimeError("Windows Defender exclusion must be the final pre-install mutation")
@@ -325,8 +323,7 @@ def run() -> None:
     )[1].split("!macroend", 1)[0]
     for token in (
         "$UpdateMode <> 1",
-        "NelomaiDefenderExclusionValue",
-        "Remove-MpPreference -ExclusionPath",
+        '!insertmacro NelomaiManagedDefender "cleanup"',
     ):
         if token not in preuninstall_hook:
             raise RuntimeError(f"Windows Defender cleanup misses {token}")
@@ -337,12 +334,19 @@ def run() -> None:
         "Get-MpComputerStatus",
         "MpCmdRun.exe",
         "-CheckExclusion",
-        "Add-MpPreference -ExclusionPath",
-        "ManagedDefenderExclusionPath",
+        'include_str!("../../install/defender-exclusions.ps1")',
         "CREATE_NO_WINDOW",
     ):
         if token not in defender_runtime:
             raise RuntimeError(f"Windows Defender runtime check misses {token}")
+    defender_script = (ROOT / "crates/windows-service/install/defender-exclusions.ps1").read_text(encoding="utf-8")
+    for token in ("Add-MpPreference -ExclusionPath", "Remove-MpPreference -ExclusionPath", "ManagedDefenderExclusionPath", "Get-OwnershipName", "Test-ManagedPath"):
+        if token not in defender_script:
+            raise RuntimeError(f"Windows Defender shared ownership script misses {token}")
+    defender_hook = windows_hooks.split("!macro NelomaiManagedDefender ACTION", 1)[1].split("!macroend", 1)[0]
+    for token in ("${NelomaiDefenderScript}", "$SYSDIR\\WindowsPowerShell\\v1.0\\powershell.exe", "NELOMAI_DEFENDER_INSTALL_DIR", "NELOMAI_DEFENDER_PRIVILEGED_DIR", "NELOMAI_DEFENDER_ACTION", "NELOMAI_DEFENDER_EXCLUSION_PATH"):
+        if token not in defender_hook:
+            raise RuntimeError(f"Windows Defender hook misses {token}")
     windows_commands = (ROOT / "src-tauri" / "src" / "commands.rs").read_text(
         encoding="utf-8"
     )
