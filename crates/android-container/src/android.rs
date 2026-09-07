@@ -1,3 +1,4 @@
+use crate::owner_lifecycle::{OwnerEntry, OwnerLease};
 use base64::Engine;
 use jni::{
     objects::{GlobalRef, JObject, JString, JValue},
@@ -26,15 +27,21 @@ struct Host {
     owner: CommonHost,
     runtime: tokio::runtime::Runtime,
 }
-static HOSTS: OnceLock<Mutex<HashMap<i64, Arc<Host>>>> = OnceLock::new();
+static HOSTS: OnceLock<Mutex<HashMap<i64, Arc<OwnerEntry<Host>>>>> = OnceLock::new();
 static NEXT_HOST: AtomicI64 = AtomicI64::new(1);
 static CONTEXT: OnceLock<GlobalRef> = OnceLock::new();
 
-fn hosts() -> &'static Mutex<HashMap<i64, Arc<Host>>> {
+fn hosts() -> &'static Mutex<HashMap<i64, Arc<OwnerEntry<Host>>>> {
     HOSTS.get_or_init(Mutex::default)
 }
-fn host(id: i64) -> Result<Arc<Host>, ()> {
-    hosts().lock().map_err(|_| ())?.get(&id).cloned().ok_or(())
+fn host(id: i64) -> Result<OwnerLease<Host>, ()> {
+    let entry = hosts()
+        .lock()
+        .map_err(|_| ())?
+        .get(&id)
+        .cloned()
+        .ok_or(())?;
+    entry.acquire()
 }
 fn string(env: &mut JNIEnv, value: JString) -> Result<String, ()> {
     let value: String = env.get_string(&value).map_err(|_| ())?.into();
@@ -415,7 +422,7 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeOpen(
         hosts()
             .lock()
             .map_err(|_| ())?
-            .insert(id, Arc::new(Host { owner, runtime }));
+            .insert(id, Arc::new(OwnerEntry::new(Host { owner, runtime })));
         Ok(id)
     })();
     match result {
@@ -509,15 +516,7 @@ pub extern "system" fn Java_ru_nelomai_client_RuntimeNativeHost_nativeClose(
     let Some(host) = removed else {
         return 0;
     };
-    // Runtime shutdown must never run on one of that runtime's own workers.
-    // A bounded lifecycle ACK prevents a fresh owner from racing an old lock.
-    let (closed, acknowledgement) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        drop(host);
-        let _ = closed.send(());
-    });
-    acknowledgement
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .is_ok()
-        .into()
+    // Closing fences calls that already obtained the registry entry, waits for
+    // every active lease, and ACKs only after CommonHost/runtime destruction.
+    host.close(std::time::Duration::from_secs(2)).into()
 }

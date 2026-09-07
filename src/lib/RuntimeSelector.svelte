@@ -39,6 +39,12 @@
     actions.later();
     restartDismissed = true;
   }
+
+  function versionFor(slot: "latest" | "stable"): string {
+    return slot === "stable"
+      ? (status.stableVersion ?? status.latestVersion)
+      : status.latestVersion;
+  }
 </script>
 
 {#if runtimeSelectorVisible(status)}
@@ -46,11 +52,19 @@
     <div>
       <p>Runtime</p>
       <strong>Контракт {status.runtimeContractVersion}</strong>
+      <small>Стабильная версия: {status.stableVersion}</small>
+      <small>Активная версия: {versionFor(status.activeSlot)}</small>
+      {#if runtimeRestartRequired(status)}
+        <small
+          >Ожидает перезапуска: {versionFor(
+            status.pendingSlot ?? status.selectedSlot,
+          )}</small
+        >
+      {/if}
     </div>
     <label class="stable-toggle">
       <span>
         <strong>Использовать стабильную версию</strong>
-        <small>{status.latestVersion} → {status.stableVersion}</small>
       </span>
       <input
         type="checkbox"
@@ -64,7 +78,7 @@
   {#if runtimeRestartRequired(status) && !restartDismissed}
     <section class="runtime-restart" aria-live="polite">
       <div>
-        <strong>Runtime будет изменён после перезапуска</strong>
+        <strong>Версия изменится после полного перезапуска приложения</strong>
         <span>Новое подключение недоступно до безопасного перезапуска.</span>
       </div>
       <div class="runtime-actions">
@@ -109,6 +123,10 @@
     font-size: 12px;
   }
 
+  .runtime-selector small {
+    color: #9ca5ad;
+  }
+
   .stable-toggle {
     display: grid;
     grid-template-columns: 1fr auto;
@@ -119,10 +137,6 @@
   .stable-toggle > span {
     display: grid;
     gap: 4px;
-  }
-
-  .stable-toggle small {
-    color: #9ca5ad;
   }
 
   .stable-toggle input {

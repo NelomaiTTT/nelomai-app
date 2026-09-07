@@ -149,6 +149,16 @@ impl Drop for RemoteOwner {
     }
 }
 
+fn owns_completion(request: &AuthRequestV1) -> bool {
+    matches!(
+        request,
+        AuthRequestV1::Logout { .. }
+            | AuthRequestV1::Owner {
+                request: crate::host::HostRequestV1::RuntimeRestart
+            }
+    )
+}
+
 impl RemoteOwner {
     pub fn is_connected(&self) -> bool {
         !self.outbox.is_closed()
@@ -269,14 +279,15 @@ impl RemoteOwner {
         tokio::spawn(async move {
             let slots = Arc::new(Semaphore::new(MAX_PENDING));
             let mut operations = tokio::task::JoinSet::new();
-            // Logout already accepted by this pump owns its bounded completion;
-            // peer EOF or dropping a client waiter cannot abort durable cleanup.
-            let mut logouts = tokio::task::JoinSet::new();
+            // Logout and runtime restart already accepted by this pump own their
+            // bounded completion; peer EOF cannot abort common-owned cleanup or
+            // the owner reload release caused by intentionally stopping runtime.
+            let mut continuations = tokio::task::JoinSet::new();
             loop {
                 let (frame, deadline) = tokio::select! { biased;
                     _ = closed(&mut cancel) => break,
                     Some(_) = operations.join_next(), if !operations.is_empty() => continue,
-                    Some(_) = logouts.join_next(), if !logouts.is_empty() => continue,
+                    Some(_) = continuations.join_next(), if !continuations.is_empty() => continue,
                     frame = incoming.recv() => match frame { Some(frame) => frame, None => break },
                 };
                 if Instant::now() >= deadline {
@@ -292,7 +303,7 @@ impl RemoteOwner {
                         let Ok(permit) = slots.clone().try_acquire_owned() else {
                             break;
                         };
-                        let is_logout = matches!(request, AuthRequestV1::Logout { .. });
+                        let owns_completion = owns_completion(&request);
                         let owner = owner.clone();
                         let broker = broker.clone();
                         let task = async move {
@@ -313,8 +324,8 @@ impl RemoteOwner {
                                 );
                             }
                         };
-                        if is_logout {
-                            logouts.spawn(task);
+                        if owns_completion {
+                            continuations.spawn(task);
                         } else {
                             operations.spawn(task);
                         }
@@ -326,7 +337,7 @@ impl RemoteOwner {
             owner.acks.clear();
             operations.abort_all();
             while operations.join_next().await.is_some() {}
-            while logouts.join_next().await.is_some() {}
+            while continuations.join_next().await.is_some() {}
         });
         Ok(OwnerService {
             outbox: self.outbox.clone(),
@@ -584,9 +595,9 @@ impl RemoteOwner {
         request: AuthRequestV1,
         deadline: Instant,
     ) -> Result<(), PrivateError> {
-        // Logout accepted before EOF may continue cleanup. Other requests never
-        // issue after their peer is closed.
-        if !matches!(request, AuthRequestV1::Logout { .. }) {
+        // Accepted cleanup/restart continuations may outlive EOF. Other requests
+        // never issue after their peer is closed.
+        if !owns_completion(&request) {
             self.live(deadline)?;
         }
         let response = match request {

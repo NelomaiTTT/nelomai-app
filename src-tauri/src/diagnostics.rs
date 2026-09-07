@@ -283,17 +283,17 @@ struct ConnectionIntentLogRecord {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeActionSource {
-    UiStatus,
-    UiSelect,
-    UiRestart,
+    Status,
+    Selection,
+    Restart,
 }
 
 impl RuntimeActionSource {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::UiStatus => "ui_status",
-            Self::UiSelect => "ui_select",
-            Self::UiRestart => "ui_restart",
+            Self::Status => "ui_status",
+            Self::Selection => "ui_select",
+            Self::Restart => "ui_restart",
         }
     }
 }
@@ -1219,6 +1219,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_action_sources_keep_the_diagnostic_wire_strings() {
+        assert_eq!(RuntimeActionSource::Status.as_str(), "ui_status");
+        assert_eq!(RuntimeActionSource::Selection.as_str(), "ui_select");
+        assert_eq!(RuntimeActionSource::Restart.as_str(), "ui_restart");
+    }
+
+    #[test]
     fn runtime_diagnostics_are_allowlisted_and_exclude_secret_or_tunnel_configuration() {
         use nelomai_client_container::{CleanupEngineRoleV1, RuntimeSwitchStatusV1, SwitchPhase};
         use nelomai_contracts::RuntimeSlot;
@@ -1244,7 +1251,7 @@ mod tests {
             engine_role: CleanupEngineRoleV1::Primary,
         };
 
-        diagnostics.record_runtime_status(&status, RuntimeActionSource::UiSelect);
+        diagnostics.record_runtime_status(&status, RuntimeActionSource::Selection);
 
         let report = diagnostics
             .build_report(ResourceSnapshot::capture_for_test())

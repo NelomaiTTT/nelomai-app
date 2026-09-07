@@ -51,8 +51,51 @@ describe("RuntimeSelector", () => {
     });
 
     expect(body).toContain("Использовать стабильную версию");
-    expect(body).toContain("0.2.16 → 0.2.15");
+    expect(body).toContain("Стабильная версия: 0.2.15");
     expect(body).toContain("Контракт 1");
+  });
+
+  it("labels stable, active, and pending versions when switching stable to latest", () => {
+    const { body } = render(RuntimeSelector, {
+      props: {
+        status: status({
+          selectedSlot: "latest",
+          activeSlot: "stable",
+          pendingSlot: "latest",
+          phase: "server_reconciling",
+        }),
+        busy: false,
+        onselect: async () => {},
+        onrestart: async () => {},
+      },
+    });
+
+    expect(body).toContain("Стабильная версия: 0.2.15");
+    expect(body).toContain("Активная версия: 0.2.15");
+    expect(body).toContain("Ожидает перезапуска: 0.2.16");
+  });
+
+  it("shows the completed Apply target when switching latest to stable", () => {
+    const { body } = render(RuntimeSelector, {
+      props: {
+        status: status({
+          selectedSlot: "stable",
+          activeSlot: "latest",
+          pendingSlot: null,
+          phase: "complete",
+        }),
+        busy: false,
+        onselect: async () => {},
+        onrestart: async () => {},
+      },
+    });
+
+    expect(body).toContain("Стабильная версия: 0.2.15");
+    expect(body).toContain("Активная версия: 0.2.16");
+    expect(body).toContain("Ожидает перезапуска: 0.2.15");
+    expect(body).toContain(
+      "Версия изменится после полного перезапуска приложения",
+    );
   });
 
   it("deduplicates a pending selection request", async () => {

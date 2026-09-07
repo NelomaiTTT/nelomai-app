@@ -2,3 +2,5 @@
 #[cfg(target_os = "android")]
 mod android;
 pub mod native_reply;
+#[cfg(any(target_os = "android", test))]
+mod owner_lifecycle;

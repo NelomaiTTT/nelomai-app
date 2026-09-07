@@ -3198,7 +3198,7 @@ pub async fn runtime_status(
         .status()
         .await
         .map_err(|_| runtime_switch_error())?;
-    diagnostics.record_runtime_status(&status, RuntimeActionSource::UiStatus);
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::Status);
     Ok(status)
 }
 
@@ -3228,7 +3228,7 @@ pub async fn runtime_select(
         .status()
         .await
         .map_err(|_| runtime_switch_error())?;
-    diagnostics.record_runtime_status(&status, RuntimeActionSource::UiSelect);
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::Selection);
     Ok(status)
 }
 
@@ -3242,7 +3242,7 @@ pub async fn runtime_restart(
         .prepare_restart()
         .await
         .map_err(|_| runtime_switch_error())?;
-    diagnostics.record_runtime_status(&status, RuntimeActionSource::UiRestart);
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::Restart);
     #[cfg(desktop)]
     crate::runtime::native()
         .map_err(|_| runtime_switch_error())?

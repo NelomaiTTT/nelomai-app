@@ -592,6 +592,95 @@ async fn dropping_client_logout_waiter_does_not_abort_already_started_owner_revo
     server.abort();
 }
 
+struct HeldRuntimeRestart {
+    entered: tokio::sync::Notify,
+    stop_checks_complete: tokio::sync::Notify,
+    stage: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::host::PrivateOwnerCommands for HeldRuntimeRestart {
+    async fn dispatch(
+        &self,
+        _: &RuntimeTarget,
+        request: crate::host::HostRequestV1,
+    ) -> Result<crate::host::HostResponseV1, PrivateError> {
+        assert!(matches!(
+            request,
+            crate::host::HostRequestV1::RuntimeRestart
+        ));
+        self.stage.store(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.stop_checks_complete.notified().await;
+        self.stage.store(2, Ordering::SeqCst);
+        Ok(crate::host::HostResponseV1::Done)
+    }
+}
+
+#[tokio::test]
+async fn accepted_runtime_restart_survives_peer_eof_until_owner_release() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+    let commands = Arc::new(HeldRuntimeRestart {
+        entered: tokio::sync::Notify::new(),
+        stop_checks_complete: tokio::sync::Notify::new(),
+        stage: AtomicUsize::new(0),
+    });
+    let (owner_socket, mut runtime_socket) = private_socketpair().unwrap();
+    let owner = RemoteOwner::new_with_owner(
+        owner_socket,
+        LaunchBinding::fixture(
+            RuntimeTarget {
+                container_version: "0.2.16".into(),
+                runtime_version: "0.2.16".into(),
+                runtime_contract_version: 1,
+                runtime_slot: RuntimeSlot::Stable,
+            },
+            "restart-eof",
+        ),
+        RuntimeClientProfile {
+            platform: Platform::Android,
+            platform_version: None,
+            architecture: "aarch64".into(),
+        },
+        None,
+        Some(commands.clone()),
+    )
+    .unwrap();
+    let _service = owner.serve(fixture.broker.clone()).unwrap();
+    write_frame(
+        &mut runtime_socket,
+        FrameV1::new(
+            42,
+            MessageV1::Request(AuthRequestV1::Owner {
+                request: crate::host::HostRequestV1::RuntimeRestart,
+            }),
+        ),
+        Instant::now() + REQUEST_BUDGET,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), commands.entered.notified())
+        .await
+        .expect("restart must enter common owner dispatch");
+    drop(runtime_socket);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while owner.is_connected() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime EOF must reach owner pump");
+    assert_eq!(commands.stage.load(Ordering::SeqCst), 1);
+    commands.stop_checks_complete.notify_one();
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while commands.stage.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("accepted restart must release owner after stop checks despite peer EOF");
+}
+
 #[derive(Clone, Default)]
 struct Record(Arc<Mutex<Option<Vec<u8>>>>);
 
