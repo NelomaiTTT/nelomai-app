@@ -3,6 +3,9 @@
 
 All GitHub calls are GET. Only the separate publication job may create a
 release, after this module has rechecked pinned source and retained bytes.
+Only first attempts with unique reviews for current environment IDs qualify.
+Failed/rejected attempts or ambiguous review history require a new workflow
+run and fresh approvals; GitHub's rerun action cannot reuse these approvals.
 """
 import argparse
 import hashlib
@@ -82,19 +85,30 @@ def require_protected_environment(environment):
         raise ValueError("environment requires configured reviewers and no self-review")
 
 
-def require_candidate_run(run, run_id, source, repository):
+def require_first_attempt(run, run_id, run_attempt=1):
+    # Review history has no documented deployment-attempt association. Never
+    # reuse that history for a rerun or infer freshness from record ordering.
+    if (type(run_attempt) is not int or run_attempt != 1
+            or type(run.get("run_attempt")) is not int or run["run_attempt"] != run_attempt
+            or not re.fullmatch(r"[1-9][0-9]*", str(run_id)) or str(run.get("id")) != str(run_id)):
+        raise ValueError("approval requires the first attempt of a new workflow run")
+
+
+def require_candidate_run(run, run_id, source, repository, run_attempt=1):
+    require_first_attempt(run, run_id, run_attempt)
     full_source(source)
-    if (not re.fullmatch(r"[1-9][0-9]*", str(run_id)) or str(run.get("id")) != str(run_id)
-            or run.get("status") != "completed" or run.get("conclusion") != "success"
+    if (run.get("status") != "completed" or run.get("conclusion") != "success"
             or run.get("event") != "workflow_dispatch" or run.get("head_sha") != source
             or run.get("path") != ".github/workflows/release.yml"
             or run.get("repository", {}).get("full_name") != repository):
         raise ValueError("approved candidate run provenance mismatch")
 
 
-def require_publishable_inventory(inventory, run_id, source):
+def require_publishable_inventory(inventory, run_id, source, environment_ids, run_attempt=1):
+    require_first_attempt({"id": inventory.get("run_id"), "run_attempt": inventory.get("run_attempt")}, run_id, run_attempt)
     if (inventory.get("trust") != "release" or inventory.get("mode") != "sign_candidate"
-            or inventory.get("source_sha") != source or str(inventory.get("run_id")) != str(run_id)):
+            or inventory.get("source_sha") != source or str(inventory.get("run_id")) != str(run_id)
+            or not environment_ids or inventory.get("environment_ids") != environment_ids):
         raise ValueError("test-key, build-only or foreign candidate is permanently nonpublishable")
     packages = {
         "nelomai-0.2.16-linux-x86_64.AppImage", "nelomai-0.2.16-windows-x86_64.exe",
@@ -112,16 +126,38 @@ def github_get(endpoint):
 def check_environment(repository, name):
     if name not in (SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT, PUBLICATION_ENVIRONMENT):
         raise ValueError("unknown release environment")
-    require_protected_environment(github_get(f"repos/{repository}/environments/{name}"))
+    environment = github_get(f"repos/{repository}/environments/{name}")
+    require_protected_environment(environment)
+    if environment.get("name") != name or type(environment.get("id")) is not int or environment["id"] <= 0:
+        raise ValueError("current environment identity is unavailable")
+    return environment["id"]
 
 
-def check_approvals(repository, run_id, required=(SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT)):
+def check_approvals(repository, run_id, required=(SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT), *, run_attempt=1):
+    run_endpoint = f"repos/{repository}/actions/runs/{run_id}"
+    require_first_attempt(github_get(run_endpoint), run_id, run_attempt)
+    identities = {name: check_environment(repository, name) for name in required}
     approvals = github_get(f"repos/{repository}/actions/runs/{run_id}/approvals")
-    # GitHub's review history records the protected deployments for this run.
-    approved = {environment["name"] for review in approvals if review.get("state") == "approved"
-                for environment in review.get("environments", [])}
-    if not set(required) <= approved:
+    if not identities or not isinstance(approvals, list):
+        raise ValueError("approval association is unavailable")
+    approved = set()
+    for review in approvals:
+        for environment in review.get("environments", []):
+            name, identity = environment.get("name"), environment.get("id")
+            if name not in identities and identity not in identities.values():
+                continue
+            if (review.get("state") != "approved" or name not in identities
+                    or type(identity) is not int or identity != identities[name] or name in approved):
+                raise ValueError("conflicting, stale or ambiguous approval history; start a new run")
+            approved.add(name)
+    if set(identities) != approved:
         raise ValueError("candidate lacks actual required environment approvals")
+    # Do not accept a rerun or environment replacement that happened while the
+    # read-only checks were in progress.
+    require_first_attempt(github_get(run_endpoint), run_id, run_attempt)
+    if identities != {name: check_environment(repository, name) for name in required}:
+        raise ValueError("environment identity changed during approval verification")
+    return identities
 
 
 def check_remote_tag(repository, version, source):
@@ -199,6 +235,7 @@ def main():
     approval_parser = commands.add_parser("approval")
     approval_parser.add_argument("--repository", required=True)
     approval_parser.add_argument("--run-id", required=True)
+    approval_parser.add_argument("--run-attempt", type=int, required=True)
     approval_parser.add_argument("--name", choices=(SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT, PUBLICATION_ENVIRONMENT), required=True)
     tag_parser = commands.add_parser("tag")
     tag_parser.add_argument("--repository", required=True)
@@ -209,6 +246,7 @@ def main():
         candidate.add_argument("--" + name, required=True)
     candidate.add_argument("--directory", type=Path, required=True)
     candidate.add_argument("--public-key", type=Path, required=True)
+    candidate.add_argument("--run-attempt", type=int, required=True)
     args = parser.parse_args()
     if args.command == "mode":
         require_operation(args.mode, args.operation)
@@ -222,19 +260,20 @@ def main():
     elif args.command == "environment":
         check_environment(args.repository, args.name)
     elif args.command == "approval":
-        check_environment(args.repository, args.name)
-        check_approvals(args.repository, args.run_id, (args.name,))
+        check_approvals(args.repository, args.run_id, (args.name,), run_attempt=args.run_attempt)
     elif args.command == "tag":
         check_remote_tag(args.repository, args.version, args.source_sha)
     else:
         for name in (SIGNING_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT, PUBLICATION_ENVIRONMENT):
             check_environment(args.repository, name)
         require_candidate_run(github_get(f"repos/{args.repository}/actions/runs/{args.run_id}"),
-                              args.run_id, args.source_sha, args.repository)
-        check_approvals(args.repository, args.run_id)
+                              args.run_id, args.source_sha, args.repository, args.run_attempt)
+        environment_ids = check_approvals(args.repository, args.run_id, run_attempt=args.run_attempt)
         inventory = verify_inventory(args.directory, args.directory / "candidate-inventory.json", args.inventory_sha256)
-        require_publishable_inventory(inventory, args.run_id, args.source_sha)
+        require_publishable_inventory(inventory, args.run_id, args.source_sha, environment_ids, args.run_attempt)
         verify_runtime_release(args.directory, "0.2.16", args.source_sha, args.release_set_sha256, args.public_key)
+        require_candidate_run(github_get(f"repos/{args.repository}/actions/runs/{args.run_id}"),
+                              args.run_id, args.source_sha, args.repository, args.run_attempt)
     print("OK: release authorization checks passed")
 
 

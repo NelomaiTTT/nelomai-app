@@ -2,6 +2,8 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 import zipfile
 
@@ -27,6 +29,27 @@ class ArtifactTest(unittest.TestCase):
         (self.payload / 'index.html').write_text('runtime UI')
         with self.assertRaisesRegex(ValueError, 'license'):
             self.builder.package(self.payload, self.output, '0.2.16', 'a' * 40, self.key_path)
+        self.assertFalse(self.output.exists())
+
+    def test_shared_validation_rejects_incomplete_payload_before_native_tools(self):
+        self.assertTrue(callable(getattr(self.builder, 'validate_payload', None)),
+                        'shared Android payload validator is missing')
+        self.licenses()
+        before = {path.relative_to(self.payload): path.read_bytes() for path in self.payload.rglob('*') if path.is_file()}
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            self.builder.validate_payload(self.payload, self.root / 'absent-readelf')
+        self.assertEqual(before, {path.relative_to(self.payload): path.read_bytes() for path in self.payload.rglob('*') if path.is_file()})
+        self.assertFalse(self.output.exists())
+
+    def test_cli_rejects_incomplete_payload_before_native_tools_and_signing(self):
+        self.licenses()
+        result = subprocess.run([sys.executable, str(Path(self.builder.__file__)),
+            '--payload', str(self.payload), '--output', str(self.output), '--version', '0.2.16',
+            '--source-commit', 'a' * 40, '--signing-key', str(self.key_path),
+            '--readelf', str(self.root / 'absent-readelf')], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('compiled runtime payload is incomplete', result.stderr)
+        self.assertNotIn('FileNotFoundError', result.stderr)
         self.assertFalse(self.output.exists())
 
     def test_symlink_cannot_include_external_file(self):

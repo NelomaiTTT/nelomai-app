@@ -96,27 +96,7 @@ def inspect(payload, manifest, readelf=None):
         if readelf is None:
             raise ValueError("Android re-extraction requires LLVM readelf")
         packager = load_script("android/build-runtime-artifact.py")
-        files = packager.payload_files(payload)
-        required = {"licenses/" + name for name in packager.REQUIRED_LICENSES} | {
-            "runtime/runtime.aar", "webview/index.html",
-            "jni/arm64-v8a/libnelomai_runtime_stable.so", "jni/arm64-v8a/libstable_runtime_wg_go.so"}
-        if not required <= {name for name, _ in files}:
-            raise ValueError("compiled Android runtime payload is incomplete")
-        packager.verify_runtime_abi(payload / "jni/arm64-v8a/libnelomai_runtime_stable.so", readelf)
-        checker = packager.collision_module()
-        for name, path in files:
-            if name.endswith(".aar"):
-                inventory = checker.inspect_archive(path.read_bytes(), readelf=readelf)
-                if not inventory["classes"] or any(not name.startswith("ru.nelomai.runtime.stable.") for name in inventory["classes"]):
-                    raise ValueError("unrelocated Android runtime class")
-                if any(not name.split("/", 1)[1].startswith("stable_runtime_") for name in inventory["resources"]):
-                    raise ValueError("unrelocated Android runtime resource")
-            elif name.endswith(".so"):
-                import io
-                data = io.BytesIO()
-                with zipfile.ZipFile(data, "w") as archive:
-                    archive.writestr(name, path.read_bytes())
-                checker.inspect_archive(data.getvalue(), readelf=readelf)
+        packager.validate_payload(payload, readelf)
 
 
 def verify(archive, manifest_path, signature, public_key, version, source, platform, architecture,

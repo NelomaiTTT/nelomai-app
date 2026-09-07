@@ -91,27 +91,82 @@ class RuntimeReleaseSetTest(ArtifactFixture):
 
 
 class ReleaseAuthorizationTest(ArtifactFixture):
+    def approval_api(self, gates, reviews=None, run_attempt=1, environment_ids=None):
+        identities = environment_ids or {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12}
+        run = dict(id=42, run_attempt=run_attempt, event="workflow_dispatch", head_sha=SOURCE,
+                   path=".github/workflows/release.yml", repository={"full_name": "example/repo"})
+        if reviews is None:
+            reviews = [{"state": "approved", "environments": [
+                {"name": name, "id": identity} for name, identity in identities.items()]}]
+        responses = {"repos/example/repo/actions/runs/42": run,
+                     "repos/example/repo/actions/runs/42/approvals": reviews}
+        for name, identity in identities.items():
+            responses["repos/example/repo/environments/" + name] = {"id": identity, "name": name,
+                "protection_rules": [{"type": "required_reviewers", "prevent_self_review": True,
+                    "reviewers": [{"type": "User", "reviewer": {"id": 7}}]}]}
+        return patch.object(gates, "github_get", side_effect=lambda endpoint: responses[endpoint])
+
+    def test_approval_then_rejection_is_never_current_authorization_in_either_order(self):
+        gates = module("release-candidate-gates")
+        approval = {"state": "approved", "environments": [
+            {"name": gates.SIGNING_ENVIRONMENT, "id": 11}, {"name": gates.ACCEPTANCE_ENVIRONMENT, "id": 12}]}
+        rejection = {"state": "rejected", "environments": [{"name": gates.ACCEPTANCE_ENVIRONMENT, "id": 12}]}
+        for reviews in ([approval, rejection], [rejection, approval]):
+            with self.approval_api(gates, reviews=reviews):
+                with self.assertRaises(ValueError):
+                    gates.check_approvals("example/repo", "42")
+
+    def test_approval_for_recreated_environment_or_without_id_is_rejected(self):
+        gates = module("release-candidate-gates")
+        for acceptance in ({"name": gates.ACCEPTANCE_ENVIRONMENT, "id": 10},
+                           {"name": gates.ACCEPTANCE_ENVIRONMENT}):
+            reviews = [{"state": "approved", "environments": [
+                {"name": gates.SIGNING_ENVIRONMENT, "id": 11}, acceptance]}]
+            with self.approval_api(gates, reviews=reviews):
+                with self.assertRaises(ValueError):
+                    gates.check_approvals("example/repo", "42")
+
+    def test_repeated_approval_records_are_ambiguous_and_require_new_run(self):
+        gates = module("release-candidate-gates")
+        approval = {"state": "approved", "environments": [
+            {"name": gates.SIGNING_ENVIRONMENT, "id": 11}, {"name": gates.ACCEPTANCE_ENVIRONMENT, "id": 12}]}
+        with self.approval_api(gates, reviews=[approval, approval]):
+            with self.assertRaises(ValueError):
+                gates.check_approvals("example/repo", "42")
+
+    def test_rerun_cannot_reuse_first_attempt_approval_or_inventory(self):
+        gates = module("release-candidate-gates")
+        for attempt in (2, None, True):
+            with self.approval_api(gates, run_attempt=attempt):
+                with self.assertRaises(ValueError):
+                    gates.check_approvals("example/repo", "42")
+
     def test_publishable_inventory_requires_every_exact_installer_digest(self):
         gates = module("release-candidate-gates")
         assets = {name: "d" * 64 for name in (
             "nelomai-0.2.16-linux-x86_64.AppImage", "nelomai-0.2.16-windows-x86_64.exe",
             "nelomai-0.2.16-macos-aarch64.app.tar.gz", "nelomai-0.2.16-android-aarch64.apk")}
         inventory = {"trust": "release", "mode": "sign_candidate", "source_sha": SOURCE,
-                     "run_id": "42", "assets": assets}
-        gates.require_publishable_inventory(inventory, "42", SOURCE)
+                     "run_id": "42", "run_attempt": 1, "assets": assets,
+                     "environment_ids": {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12}}
+        identities = inventory["environment_ids"]
+        gates.require_publishable_inventory(inventory, "42", SOURCE, identities)
+        for changes in ({"run_attempt": 2}, {"run_attempt": None}, {"run_attempt": True},
+                        {"environment_ids": {gates.SIGNING_ENVIRONMENT: 10, gates.ACCEPTANCE_ENVIRONMENT: 12}}):
+            with self.assertRaises(ValueError):
+                gates.require_publishable_inventory({**inventory, **changes}, "42", SOURCE, identities)
         for name in assets:
             with self.assertRaises(ValueError, msg=name):
-                gates.require_publishable_inventory({**inventory, "assets": {key: value for key, value in assets.items() if key != name}}, "42", SOURCE)
+                gates.require_publishable_inventory({**inventory, "assets": {key: value for key, value in assets.items() if key != name}}, "42", SOURCE, identities)
 
     def test_protection_rule_alone_does_not_substitute_actual_run_approval(self):
         gates = module("release-candidate-gates")
-        for reviews in ([], [{"state": "rejected", "environments": [{"name": gates.SIGNING_ENVIRONMENT}]}],
-                        [{"state": "approved", "environments": [{"name": gates.SIGNING_ENVIRONMENT}]}]):
-            with patch.object(gates, "github_get", return_value=reviews):
+        for reviews in ([], [{"state": "rejected", "environments": [{"name": gates.SIGNING_ENVIRONMENT, "id": 11}]}],
+                        [{"state": "approved", "environments": [{"name": gates.SIGNING_ENVIRONMENT, "id": 11}]}]):
+            with self.approval_api(gates, reviews=reviews):
                 with self.assertRaises(ValueError):
                     gates.check_approvals("example/repo", "42")
-        with patch.object(gates, "github_get", return_value=[{"state": "approved", "environments": [
-                {"name": gates.SIGNING_ENVIRONMENT}, {"name": gates.ACCEPTANCE_ENVIRONMENT}]}]):
+        with self.approval_api(gates):
             gates.check_approvals("example/repo", "42")
     def test_default_build_only_and_signing_modes_reject_every_publication_write(self):
         gates = module("release-candidate-gates")
@@ -235,15 +290,16 @@ class ReleaseAuthorizationTest(ArtifactFixture):
 
     def test_test_trust_failed_run_or_wrong_source_cannot_be_promoted(self):
         gates = module("release-candidate-gates")
-        run = dict(id=42, status="completed", conclusion="success", event="workflow_dispatch",
+        run = dict(id=42, run_attempt=1, status="completed", conclusion="success", event="workflow_dispatch",
                    head_sha=SOURCE, path=".github/workflows/release.yml", repository={"full_name": "example/repo"})
         gates.require_candidate_run(run, "42", SOURCE, "example/repo")
-        for changes in ({"conclusion": "failure"}, {"head_sha": "b" * 40}, {"event": "pull_request"},
+        for changes in ({"run_attempt": 2}, {"run_attempt": None}, {"run_attempt": True},
+                        {"conclusion": "failure"}, {"head_sha": "b" * 40}, {"event": "pull_request"},
                         {"repository": {"full_name": "foreign/repo"}}, {"path": ".github/workflows/other.yml"}):
             with self.assertRaises(ValueError):
                 gates.require_candidate_run({**run, **changes}, "42", SOURCE, "example/repo")
         with self.assertRaises(ValueError):
-            gates.require_publishable_inventory({"trust": "test", "source_sha": SOURCE, "run_id": "42"}, "42", SOURCE)
+            gates.require_publishable_inventory({"trust": "test", "source_sha": SOURCE, "run_id": "42", "run_attempt": 1}, "42", SOURCE, {})
 
 
 if __name__ == "__main__":

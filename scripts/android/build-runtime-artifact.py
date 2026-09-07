@@ -72,20 +72,47 @@ def payload_files(payload):
     return result
 
 
+def validate_payload_files(payload):
+    """Read-only structural preflight shared by packaging and native validation."""
+    files = payload_files(payload)
+    names = {name for name, _ in files}
+    missing = {'licenses/' + name for name in REQUIRED_LICENSES} - names
+    if missing:
+        raise ValueError('compiled runtime payload is incomplete: required runtime license files are missing: ' + ', '.join(sorted(missing)))
+    if not {'runtime/runtime.aar', 'webview/index.html',
+            'jni/arm64-v8a/libnelomai_runtime_stable.so',
+            'jni/arm64-v8a/libstable_runtime_wg_go.so'} <= names:
+        raise ValueError('compiled runtime payload is incomplete')
+    return files
+
+
+def validate_payload(payload, readelf):
+    """Inspect existing bytes without modifying/signing the payload or making output."""
+    files = validate_payload_files(payload)
+    verify_runtime_abi(payload / 'jni/arm64-v8a/libnelomai_runtime_stable.so', readelf)
+    check = collision_module()
+    for name, path in files:
+        if name.endswith('.aar'):
+            inventory = check.inspect_archive(path.read_bytes(), readelf=readelf)
+            if not inventory['classes'] or any(not item.startswith('ru.nelomai.runtime.stable.') for item in inventory['classes']):
+                raise ValueError('stable artifact contains non-relocated runtime classes')
+            if any(not item.split('/', 1)[1].startswith('stable_runtime_') for item in inventory['resources']):
+                raise ValueError('stable artifact contains non-prefixed resources')
+        elif name.endswith('.so'):
+            import io
+            data = io.BytesIO()
+            with zipfile.ZipFile(data, 'w') as archive:
+                archive.writestr(name, path.read_bytes())
+            check.inspect_archive(data.getvalue(), readelf=readelf)
+    return files
+
+
 def package(payload, output, version, source_commit, signing_key):
     if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?', version):
         raise ValueError('invalid runtime version')
     if not re.fullmatch(r'[0-9a-f]{40}', source_commit):
         raise ValueError('invalid runtime source commit')
-    files = payload_files(payload)
-    names = {name for name, _ in files}
-    missing = {'licenses/' + name for name in REQUIRED_LICENSES} - names
-    if missing:
-        raise ValueError('required runtime license files are missing: ' + ', '.join(sorted(missing)))
-    if not {'runtime/runtime.aar', 'webview/index.html',
-            'jni/arm64-v8a/libnelomai_runtime_stable.so',
-            'jni/arm64-v8a/libstable_runtime_wg_go.so'} <= names:
-        raise ValueError('compiled runtime payload is incomplete')
+    files = validate_payload_files(payload)
     if output.exists():
         raise ValueError('runtime output already exists; immutable artifact cannot be overwritten')
     key = Ed25519PrivateKey.from_private_bytes(signing_key.read_bytes())
@@ -121,23 +148,7 @@ def main():
     parser.add_argument('--signing-key', type=Path, required=True)
     parser.add_argument('--readelf', type=Path, required=True)
     args = parser.parse_args()
-    verify_runtime_abi(args.payload / 'jni/arm64-v8a/libnelomai_runtime_stable.so', args.readelf)
-    # Actual CLI gate: fail closed on malformed AAR/ELF before signing.
-    check = collision_module()
-    for name, path in payload_files(args.payload):
-        if name.endswith(('.aar', '.so')):
-            if name.endswith('.aar'):
-                inventory = check.inspect_archive(path.read_bytes(), readelf=args.readelf)
-                if not inventory['classes'] or any(not item.startswith('ru.nelomai.runtime.stable.') for item in inventory['classes']):
-                    raise ValueError('stable artifact contains non-relocated runtime classes')
-                if any(not item.split('/', 1)[1].startswith('stable_runtime_') for item in inventory['resources']):
-                    raise ValueError('stable artifact contains non-prefixed resources')
-            else:
-                import io
-                data = io.BytesIO()
-                with zipfile.ZipFile(data, 'w') as archive:
-                    archive.writestr(name, path.read_bytes())
-                check.inspect_archive(data.getvalue(), readelf=args.readelf)
+    validate_payload(args.payload, args.readelf)
     package(args.payload, args.output, args.version, args.source_commit, args.signing_key)
 
 
