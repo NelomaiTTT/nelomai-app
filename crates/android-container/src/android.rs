@@ -281,16 +281,11 @@ impl PrivateBackgroundDispatcher for Native {
         let payload = serde_json::json!({"owner_operation":operation, "install_secret":request.install_secret,
             "access_token":request.access.access_token(), "device_id":request.ticket.device_id,
             "identity":request.access.identity(), "expires_at_unix_ms":request.expires_at_unix_ms,"capability":capability}).to_string();
-        let value = self
-            .call(Call::Background(action.into(), payload))
-            .await
-            .map_err(|_| NativeAuthFailure::OutcomeUnknown)?;
-        match value {
-            Some(value) => {
-                serde_json::from_str(&value).map_err(|_| NativeAuthFailure::OutcomeUnknown)
-            }
-            None => Ok(None),
-        }
+        crate::native_reply::decode_background_reply(
+            self.call(Call::Background(action.into(), payload))
+                .await
+                .map_err(|_| ()),
+        )
     }
 }
 

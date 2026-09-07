@@ -52,7 +52,8 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         await { bridge().prepareRevocation(context, cancelEpoch, it) }
         return true
     }
-    fun background(action: String, request: String): String = await { bridge().background(context, action, request, it) }
+    fun background(action: String, request: String): String =
+        ru.nelomai.runtime.v1.RuntimeNativeBackgroundReplyV1.await { bridge().background(context, action, request, it) }
 
     fun stopVpn(force: Boolean): Boolean {
         val manager = context.getSystemService(ActivityManager::class.java)

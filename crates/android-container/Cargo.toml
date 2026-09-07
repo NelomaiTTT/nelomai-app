@@ -9,16 +9,28 @@ publish = false
 name = "nelomai_android_container"
 crate-type = ["cdylib", "rlib"]
 
+[dependencies]
+nelomai-client-container = { path = "../client-container" }
+nelomai-client-api = { path = "../client-api" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+async-trait = "0.1"
+axum = "0.8"
+nelomai-client-core = { path = "../client-core" }
+nelomai-client-storage = { path = "../client-storage" }
+nelomai-contracts = { path = "../contracts" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 async-trait = "0.1"
 base64 = "0.22"
 jni = "0.21"
 libc = "0.2"
 ndk-context = "0.1"
-nelomai-client-container = { path = "../client-container" }
 nelomai-client-storage = { path = "../client-storage" }
-nelomai-client-api = { path = "../client-api" }
 nelomai-client-updater = { path = "../client-updater" }
 nelomai-contracts = { path = "../contracts" }
-serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }

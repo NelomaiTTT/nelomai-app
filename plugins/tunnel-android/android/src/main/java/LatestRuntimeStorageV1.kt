@@ -7,29 +7,86 @@ import javax.crypto.spec.GCMParameterSpec
 import org.json.JSONObject
 import ru.nelomai.runtime.v1.RuntimeNativeStorageV1
 
+/** Storage I/O boundary shared by startup and common-ACK retirement. */
+internal interface NativeRuntimeStorageAccess {
+    fun source(name: String, record: String): EncryptedRecordBackend
+    fun destination(name: String, record: String): EncryptedRecordBackend
+    fun receipt(name: String): EncryptedRecordBackend
+    fun hasLegacy(name: String): Boolean
+    fun retireLegacy(name: String)
+    fun migrateQuickState()
+    fun validateQuickStateDestination()
+}
+
 /** The common locked host invokes this before admitting any runtime. */
 class LatestRuntimeStorageV1 : RuntimeNativeStorageV1 {
     override fun prepare(context: Context, slot: String, version: String, legacyMigration: Boolean, migrationComplete: Boolean) {
+        prepare(AndroidNativeRuntimeStorageAccess(context), slot, version, legacyMigration, migrationComplete)
+    }
+    internal fun prepare(storage: NativeRuntimeStorageAccess, slot: String, version: String, legacyMigration: Boolean, migrationComplete: Boolean) {
         check(slot == AndroidRuntimeNamespace.slot && version == AndroidRuntimeNamespace.version)
         if (slot != "latest" || version != "0.2.16") { check(!legacyMigration); return }
-        if (migrationComplete) { acknowledge(context); return }
+        if (migrationComplete) { acknowledge(storage); return }
         if (!legacyMigration) {
-            check(legacyNames.none { context.getSharedPreferences(it, Context.MODE_PRIVATE).all.isNotEmpty() }) { "orphan_native_legacy_state" }
+            check(legacyNames.none(storage::hasLegacy)) { "orphan_native_legacy_state" }
             return
         }
         for ((name, record) in records) {
-            val source = when (name) {
-                "nelomai-quick-tunnel-plan" -> legacyPair(context, name)
-                "nelomai-background-credential" -> backgroundSource(context, name, record)
-                else -> AndroidSecureEnvelopeBackend(context, name, record, name, scoped = false)
-            }
-            NativeRuntimeMigration.reseal(source,
-                AndroidSecureEnvelopeBackend(context, name, record, name), receipt(context, name))
+            NativeRuntimeMigration.reseal(storage.source(name, record), storage.destination(name, record), storage.receipt(name))
         }
+        storage.migrateQuickState()
+    }
+
+    override fun acknowledge(context: Context) = acknowledge(AndroidNativeRuntimeStorageAccess(context))
+
+    internal fun acknowledge(storage: NativeRuntimeStorageAccess) {
+        check(AndroidRuntimeNamespace.slot == "latest" && AndroidRuntimeNamespace.version == "0.2.16")
+        // The common ACK can survive a crash before native source retirement.
+        // Validate every remaining destination before deleting any source.
+        // Once a source is gone, later opens do not depend on its old receipt.
+        val remaining = legacyNames.filter(storage::hasLegacy)
+        for (name in remaining) {
+            val record = records.firstOrNull { it.first == name }?.second
+            if (record != null) {
+                NativeRuntimeMigration.validateDestination(storage.destination(name, record), storage.receipt(name))
+            } else {
+                val proof = checkNotNull(storage.receipt(name).read()) { "native_migration_receipt_missing" }
+                try { check(JSONObject(proof.toString(Charsets.UTF_8)).getInt("format") == 1) }
+                finally { proof.fill(0) }
+                storage.validateQuickStateDestination()
+            }
+        }
+        remaining.forEach(storage::retireLegacy)
+    }
+
+    companion object {
+        private val records = listOf("nelomai-connection-recovery" to "encrypted-envelope",
+            "nelomai-background-credential" to "encrypted-envelope-v3", "nelomai-quick-tunnel-plan" to "encrypted-envelope-v1")
+        private val legacyNames = records.map { it.first } + "nelomai-quick-tunnel-state"
+    }
+}
+
+private class AndroidNativeRuntimeStorageAccess(private val context: Context) : NativeRuntimeStorageAccess {
+    override fun source(name: String, record: String): EncryptedRecordBackend = when (name) {
+        "nelomai-quick-tunnel-plan" -> legacyPair(context, name)
+        "nelomai-background-credential" -> backgroundSource(context, name, record)
+        else -> AndroidSecureEnvelopeBackend(context, name, record, name, scoped = false)
+    }
+    override fun destination(name: String, record: String): EncryptedRecordBackend = AndroidSecureEnvelopeBackend(context, name, record, name)
+    override fun hasLegacy(name: String): Boolean = context.getSharedPreferences(name, Context.MODE_PRIVATE).all.isNotEmpty()
+    override fun retireLegacy(name: String) {
+        check(context.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit())
+    }
+    override fun validateQuickStateDestination() {
+        check(context.getSharedPreferences(AndroidRuntimeNamespace.record("nelomai-quick-tunnel-state"), Context.MODE_PRIVATE).all.isNotEmpty()) {
+            "native_migration_destination_missing"
+        }
+    }
+    override fun migrateQuickState() {
         // The quick state projection is non-secret, but its revision and retry
         // markers must move together instead of aliasing the legacy preferences.
         val stateName = "nelomai-quick-tunnel-state"
-        val stateReceipt = receipt(context, stateName)
+        val stateReceipt = receipt(stateName)
         if (stateReceipt.read() == null) {
             val source = context.getSharedPreferences(stateName, Context.MODE_PRIVATE)
             val target = context.getSharedPreferences(AndroidRuntimeNamespace.record(stateName), Context.MODE_PRIVATE)
@@ -46,19 +103,7 @@ class LatestRuntimeStorageV1 : RuntimeNativeStorageV1 {
         }
     }
 
-    override fun acknowledge(context: Context) {
-        // This is reachable only after common Rust bootstrap ACK. It is safe to
-        // replay if the process died between retiring two individual sources.
-        check(AndroidRuntimeNamespace.slot == "latest" && AndroidRuntimeNamespace.version == "0.2.16")
-        for (name in legacyNames) {
-            val proof = receipt(context, name).read()
-            check(proof != null) { "native_migration_receipt_missing" }
-            proof.fill(0)
-            check(context.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit())
-        }
-    }
-
-    private fun receipt(context: Context, name: String) = AndroidSecureEnvelopeBackend(context,
+    override fun receipt(name: String) = AndroidSecureEnvelopeBackend(context,
         preferenceName = "native-migration-receipt-$name", recordName = "receipt-v1", keyAlias = "native-migration-receipt-$name")
 
     private fun backgroundSource(context: Context, name: String, record: String): EncryptedRecordBackend = object : EncryptedRecordBackend {
@@ -94,10 +139,5 @@ class LatestRuntimeStorageV1 : RuntimeNativeStorageV1 {
                 doFinal(bytes)
             } } finally { bytes.fill(0); nonce.fill(0) }
         }
-    }
-    companion object {
-        private val records = listOf("nelomai-connection-recovery" to "encrypted-envelope",
-            "nelomai-background-credential" to "encrypted-envelope-v3", "nelomai-quick-tunnel-plan" to "encrypted-envelope-v1")
-        private val legacyNames = records.map { it.first } + "nelomai-quick-tunnel-state"
     }
 }

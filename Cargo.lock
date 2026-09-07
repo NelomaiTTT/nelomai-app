@@ -2811,16 +2811,20 @@ name = "nelomai-android-container"
 version = "0.2.16"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "jni 0.21.1",
  "libc",
  "ndk-context",
  "nelomai-client-api",
  "nelomai-client-container",
+ "nelomai-client-core",
  "nelomai-client-storage",
  "nelomai-client-updater",
  "nelomai-contracts",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
