@@ -17,6 +17,13 @@ Use the locked Cargo graph and existing SDK/NDK/JDK17/Go caches. Do not edit
 vendor or Cargo registry inputs. The source generators create disposable build
 trees. A future container must consume a published stable artifact unchanged.
 
+The packaging, staging and signature-check scripts require Python 3 with
+`cryptography` installed. Use an existing isolated interpreter with that
+dependency (for this local verification:
+`/Users/altzxd/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3`),
+not the macOS system Python. The source-generation scripts need only the
+standard library.
+
 1. `python3 scripts/android/generate-build-inputs.py --root "$TASK_ROOT"`
 2. In `src-tauri/gen/android`, run
    `./gradlew :app:testArm64DebugUnitTest :tauri-plugin-tunnel-android:testDebugUnitTest :stable-runtime-android:assembleDebug --offline`.

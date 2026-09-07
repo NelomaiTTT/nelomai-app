@@ -2784,7 +2784,7 @@ private fun applicationLog(context: Context, startedAt: Long, endedAt: Long): St
         endedAt,
     )
     val startup = readTail(
-        File(context.applicationInfo.dataDir, "diagnostics/android-startup.jsonl"),
+        File(AndroidRuntimeNamespace.directory(context), "diagnostics/android-startup.jsonl"),
         MAX_STARTUP_LOG_BYTES,
     ).let { automaticDiagnosticsFilterIntervalLog(it, Long.MIN_VALUE, Long.MAX_VALUE) }
     return automaticDiagnosticsCombineApplicationLogs(

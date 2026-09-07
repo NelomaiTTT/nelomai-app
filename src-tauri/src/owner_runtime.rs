@@ -46,7 +46,11 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     })?;
     let api = ClientApi::new(PANEL_BASE)?.with_app_version(&bootstrap.target.container_version)?;
     let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
-        bootstrap.data_root.join("diagnostics"),
+        selected
+            .operational_state
+            .parent()
+            .ok_or_else(|| std::io::Error::other("runtime diagnostics directory unavailable"))?
+            .join("diagnostics"),
         resource_usage::ResourceSnapshot::capture(app.handle()),
     )?);
     diagnostics.record_named("startup.rust.private_runtime_ready", None, None, None);

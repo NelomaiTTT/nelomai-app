@@ -9,9 +9,11 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 
+internal fun startupDiagnosticsDirectory(filesDir: File, slot: String, version: String): File =
+  File(filesDir, "runtime/$slot/state/$version/diagnostics")
+
 internal object StartupDiagnostics {
   private const val MAX_LOG_BYTES = 64 * 1024L
-  private const val DIRECTORY = "diagnostics"
   private const val FILE_NAME = "android-startup.jsonl"
   private const val FRONTEND_READY_MARKER = "android-frontend-ready"
   private const val EXIT_PREFERENCES = "nelomai-startup-exit-diagnostics"
@@ -22,17 +24,20 @@ internal object StartupDiagnostics {
   private val processStartedAtUnixMillis = System.currentTimeMillis()
   @Volatile private var launchStartedAtUnixMillis = System.currentTimeMillis()
 
+  private fun directory(context: Context): File =
+    startupDiagnosticsDirectory(context.filesDir, BuildConfig.RUNTIME_SLOT, BuildConfig.RUNTIME_VERSION)
+
   fun beginLaunch(context: Context) {
     launchStartedAtUnixMillis = System.currentTimeMillis()
     recordPreviousProcessExits(context)
     runCatching {
-      File(context.applicationInfo.dataDir, "$DIRECTORY/$FRONTEND_READY_MARKER").delete()
+      File(directory(context), FRONTEND_READY_MARKER).delete()
     }
     record(context, "startup.android.activity_create_begin")
   }
 
   fun frontendReady(context: Context): Boolean {
-    val marker = File(context.applicationInfo.dataDir, "$DIRECTORY/$FRONTEND_READY_MARKER")
+    val marker = File(directory(context), FRONTEND_READY_MARKER)
     return marker.isFile && marker.lastModified() >= launchStartedAtUnixMillis
   }
 
@@ -40,7 +45,7 @@ internal object StartupDiagnostics {
 
   private fun record(context: Context, kind: String, details: Map<String, Any?>) {
     runCatching {
-      val directory = File(context.applicationInfo.dataDir, DIRECTORY)
+      val directory = directory(context)
       if (!directory.exists() && !directory.mkdirs()) return
       val file = File(directory, FILE_NAME)
       val record = JSONObject()
@@ -68,7 +73,10 @@ internal object StartupDiagnostics {
   private fun recordPreviousProcessExits(context: Context) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
     runCatching {
-      val preferences = context.getSharedPreferences(EXIT_PREFERENCES, Context.MODE_PRIVATE)
+      val preferences = context.getSharedPreferences(
+        "runtime.${BuildConfig.RUNTIME_SLOT}.state.${BuildConfig.RUNTIME_VERSION}.$EXIT_PREFERENCES",
+        Context.MODE_PRIVATE,
+      )
       val lastRecordedTimestamp = preferences.getLong(LAST_EXIT_TIMESTAMP, 0)
       val activityManager = context.getSystemService(ActivityManager::class.java)
       val exits = activityManager

@@ -58,6 +58,8 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         val sourceVersion = (groovy.json.JsonSlurper().parse(rootDir.resolve("../../../src-tauri/tauri.conf.json")) as Map<*, *>)["version"] as String
         versionName = tauriProperties.getProperty("tauri.android.versionName", sourceVersion)
+        buildConfigField("String", "RUNTIME_SLOT", "\"latest\"")
+        buildConfigField("String", "RUNTIME_VERSION", "\"$sourceVersion\"")
     }
     signingConfigs {
         if (releaseSigningConfigured) {
