@@ -671,6 +671,10 @@ impl CommonHost {
     pub fn broker(&self) -> &Arc<AuthBroker> {
         &self.broker
     }
+    /// The admitted target of this common incarnation, never pending preference.
+    pub fn native_target(&self) -> &RuntimeTarget {
+        self.installed.target()
+    }
     pub fn coordinator(&self) -> &Arc<SwitchCoordinator> {
         &self.coordinator
     }

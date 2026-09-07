@@ -12,8 +12,10 @@ const HELPER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub type PlatformTunnelController = UnixTunnelController<UnixSocketTransport>;
 
-pub fn tunnel_controller() -> PlatformTunnelController {
-    UnixTunnelController::new(UnixSocketTransport::new(DEFAULT_SOCKET_PATH))
+pub fn common_tunnel_controller(
+    binding: nelomai_contracts::dispatcher::CommonEngineBinding,
+) -> PlatformTunnelController {
+    UnixTunnelController::new(UnixSocketTransport::new(DEFAULT_SOCKET_PATH).for_common(binding))
 }
 
 pub async fn prepare_tunnel(
@@ -51,7 +53,10 @@ async fn helper_is_current(expected: &EngineIdentity) -> bool {
         .is_ok_and(|response| {
             response.ok
                 && response.contract_version == 1
-                && response.identity.as_ref() == Some(&expected)
+                && response.identity.as_ref().is_some_and(|actual| {
+                    actual.manifest_sha256 == expected.manifest_sha256
+                        && actual.container_version == expected.container_version
+                })
         })
     })
     .await

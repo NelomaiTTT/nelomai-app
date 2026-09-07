@@ -370,7 +370,7 @@ fn dispatcher_status_and_version_do_not_launch_or_modify_engine_state() {
             contract_version: 1,
         },
     ] {
-        let response = dispatcher.handle(command, &mut |_| {
+        let response = dispatcher.handle(command, &mut |_, _| {
             Err(io::Error::other("no platform mutation permitted"))
         });
         assert!(response.ok);
@@ -392,6 +392,12 @@ while True:
     size=sys.stdin.buffer.read(4)
     if not size: break
     value=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
+    if value.get('command')=='primitive':
+        data=json.dumps({'engine_primitive':'rebind_service'}).encode()
+        sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
+        size=sys.stdin.buffer.read(4)
+        ack=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
+        value['probe']=ack.get('primitive_ok')
     if value.get('command')=='crash': os._exit(1)
     if value.get('command')=='hang':
         signal.alarm(10)
@@ -454,7 +460,7 @@ fn real_child_relay_preserves_private_operations_and_shared_mutation_exclusion()
         .unwrap();
     let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
     let identity = dispatcher.layout.identity.clone();
-    let mut primitive = |_| Err(io::Error::other("no SCM on Unix"));
+    let mut primitive = |_, _: &Path| Err(io::Error::other("no SCM on Unix"));
     assert!(
         dispatcher
             .handle(
@@ -522,87 +528,114 @@ fn dispatcher_death_fixture_entry() {
         current_owner(),
     );
     let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
+    let identity = if std::env::var_os("NELOMAI_TEST_STABLE").is_some() {
+        dispatcher
+            .installation
+            .load_slot(nelomai_contracts::RuntimeSlot::Stable)
+            .unwrap()
+            .identity
+    } else {
+        dispatcher.layout.identity.clone()
+    };
     assert!(
         dispatcher
             .handle(
                 DispatcherRequest::Start {
                     contract_version: 1,
-                    identity: dispatcher.layout.identity.clone()
+                    identity
                 },
-                &mut |_| Ok(())
+                &mut |_, _| Ok(())
             )
             .ok
     );
     let _ = dispatcher.relay(
         &encode_frame(&json!({"command":"hang"})).unwrap(),
-        &mut |_| Ok(()),
+        &mut |_, _| Ok(()),
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn dispatcher_death_terminates_hung_owned_tree_and_recovers_persisted_state() {
-    let (source, key) = process_fixture();
-    let target = tempfile::tempdir().unwrap();
-    let installation = Installation::for_owner(
-        target.path(),
-        key.verifying_key().to_bytes(),
-        "macos",
-        "aarch64",
-        current_owner(),
-    );
-    installation
-        .install(
-            source.path(),
-            &std::env::current_exe().unwrap(),
-            "501",
-            &RealInstallIo,
-        )
-        .unwrap();
-    let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "dispatcher_death_fixture_entry"])
-        .env("NELOMAI_TEST_OWNED_DISPATCHER_ROOT", target.path())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !target.path().join("persisted-tunnel").exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "fixture never entered its hung operation"
+    for stable in [false, true] {
+        let (source, key) = if stable {
+            two_slot_process_fixture()
+        } else {
+            process_fixture()
+        };
+        let target = tempfile::tempdir().unwrap();
+        let installation = Installation::for_owner(
+            target.path(),
+            key.verifying_key().to_bytes(),
+            "macos",
+            "aarch64",
+            current_owner(),
         );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(MutationGuard::at(&target.path().join("engine-owner.lock")).is_err());
-    owner.kill().unwrap(); // exact owned dispatcher handle, no PID-file adoption
-    owner.wait().unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if let Ok(lease) = MutationGuard::at(&target.path().join("engine-owner.lock")) {
-            drop(lease);
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "hung owned engine tree survived dispatcher death with lifetime lease"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(target.path().join(ACTIVE_ENGINE_NAME).exists());
-    let mut restarted = ProcessDispatcher::new(installation).unwrap();
-    assert!(
-        restarted
-            .handle(
-                DispatcherRequest::Stop {
-                    contract_version: 1,
-                    identity: restarted.layout.identity.clone()
-                },
-                &mut |_| Ok(())
+        installation
+            .install(
+                source.path(),
+                &std::env::current_exe().unwrap(),
+                "501",
+                &RealInstallIo,
             )
-            .ok
-    );
-    assert!(!target.path().join("persisted-tunnel").exists());
-    assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
+            .unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        if stable {
+            command.env("NELOMAI_TEST_STABLE", "1");
+        }
+        let mut owner = command
+            .args(["--exact", "dispatcher_death_fixture_entry"])
+            .env("NELOMAI_TEST_OWNED_DISPATCHER_ROOT", target.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !target.path().join("persisted-tunnel").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture never entered its hung operation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(MutationGuard::at(&target.path().join("engine-owner.lock")).is_err());
+        owner.kill().unwrap(); // exact owned dispatcher handle, no PID-file adoption
+        owner.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(lease) = MutationGuard::at(&target.path().join("engine-owner.lock")) {
+                drop(lease);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hung owned engine tree survived dispatcher death with lifetime lease"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(target.path().join(ACTIVE_ENGINE_NAME).exists());
+        let mut restarted = ProcessDispatcher::new(installation).unwrap();
+        assert_eq!(
+            restarted.layout.identity.slot,
+            if stable {
+                nelomai_contracts::RuntimeSlot::Stable
+            } else {
+                nelomai_contracts::RuntimeSlot::Latest
+            }
+        );
+        assert!(
+            restarted
+                .handle(
+                    DispatcherRequest::Stop {
+                        contract_version: 1,
+                        identity: restarted.layout.identity.clone()
+                    },
+                    &mut |_, _| Ok(())
+                )
+                .ok
+        );
+        assert!(!target.path().join("persisted-tunnel").exists());
+        assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
+    }
 }
 
 #[cfg(unix)]
@@ -627,7 +660,7 @@ fn crashed_engine_status_is_not_running_and_cleanup_keeps_recovery_marker_until_
         .unwrap();
     let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
     let identity = dispatcher.layout.identity.clone();
-    let mut primitive = |_| Err(io::Error::other("no SCM"));
+    let mut primitive = |_, _: &Path| Err(io::Error::other("no SCM"));
     assert!(
         dispatcher
             .handle(
@@ -696,7 +729,7 @@ fn cleanup_removes_only_stopped_verified_previous_generations() {
             contract_version: 1,
             identity: current.identity.clone(),
         },
-        &mut |_| Err(io::Error::other("must not launch anything")),
+        &mut |_, _| Err(io::Error::other("must not launch anything")),
     );
     assert!(response.ok);
     assert!(!previous.directory.exists());
@@ -716,4 +749,207 @@ fn current_owner() -> u32 {
     {
         0
     }
+}
+
+#[cfg(unix)]
+fn two_slot_process_fixture() -> (TempDir, SigningKey) {
+    let (source, key) = process_fixture();
+    let latest = source.path().join("engines/latest");
+    let stable = source.path().join("engines/stable/0.2.16");
+    fs::create_dir_all(&stable).unwrap();
+    fs::copy(
+        latest.join("0.2.16/nelomai-unix-service"),
+        stable.join("nelomai-unix-service"),
+    )
+    .unwrap();
+    fs::rename(latest.join("0.2.16"), latest.join("0.2.17")).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(source.path().join(MANIFEST_NAME)).unwrap()).unwrap();
+    let mut stable = manifest["slots"][0].clone();
+    stable["slot"] = json!("stable");
+    manifest["slots"][0]["manifest"]["runtime_version"] = json!("0.2.17");
+    manifest["slots"].as_array_mut().unwrap().push(stable);
+    manifest["stable_release_set_sha256"] = json!("b".repeat(64));
+    manifest["stable_platform_manifest_sha256"] = json!("c".repeat(64));
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let mut message = CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
+    message.extend(&bytes);
+    fs::write(source.path().join(MANIFEST_NAME), bytes).unwrap();
+    fs::write(
+        source.path().join(SIGNATURE_NAME),
+        key.sign(&message).to_bytes(),
+    )
+    .unwrap();
+    (source, key)
+}
+
+#[cfg(unix)]
+#[test]
+fn signed_stable_engine_can_start_only_after_previous_owner_stops() {
+    let (source, key) = two_slot_process_fixture();
+    let target = tempfile::tempdir().unwrap();
+    let installation = Installation::for_owner(
+        target.path(),
+        key.verifying_key().to_bytes(),
+        "macos",
+        "aarch64",
+        current_owner(),
+    );
+    installation
+        .install(
+            source.path(),
+            &std::env::current_exe().unwrap(),
+            "501",
+            &RealInstallIo,
+        )
+        .unwrap();
+    let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
+    let latest = dispatcher.layout.identity.clone();
+    let mut stable = latest.clone();
+    stable.slot = nelomai_contracts::RuntimeSlot::Stable;
+    stable.runtime_version = "0.2.16".into();
+    let mut primitive = |_, _: &Path| Err(blocked());
+    let start = |identity| DispatcherRequest::Start {
+        contract_version: 1,
+        identity,
+    };
+    let stop = |identity| DispatcherRequest::Stop {
+        contract_version: 1,
+        identity,
+    };
+    assert!(
+        dispatcher.handle(stop(stable.clone()), &mut primitive).ok,
+        "bound stable cleanup before first Start must acknowledge fully idle installation"
+    );
+    assert!(dispatcher.handle(start(latest.clone()), &mut primitive).ok);
+    assert!(!dispatcher.handle(start(stable.clone()), &mut primitive).ok);
+    assert!(dispatcher.handle(stop(latest.clone()), &mut primitive).ok);
+    assert!(
+        dispatcher.handle(start(stable.clone()), &mut primitive).ok,
+        "authenticated stable slot must launch after latest stop"
+    );
+    assert_eq!(dispatcher.layout.identity, stable);
+    assert!(dispatcher
+        .layout
+        .engine_path()
+        .ends_with("engines/stable/0.2.16/nelomai-unix-service"));
+    assert!(
+        !dispatcher.handle(stop(latest.clone()), &mut primitive).ok,
+        "stale source stop cannot stop stable"
+    );
+    assert!(
+        !dispatcher
+            .handle(
+                DispatcherRequest::Cleanup {
+                    contract_version: 1,
+                    identity: latest.clone()
+                },
+                &mut primitive
+            )
+            .ok
+    );
+    let stable_engine = dispatcher.layout.engine_path();
+    let response = dispatcher
+        .relay(
+            &encode_frame(&json!({"command":"primitive"})).unwrap(),
+            &mut |_, path| {
+                assert_eq!(
+                    path, stable_engine,
+                    "SCM callback must receive selected stable path, never old latest path"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    let response: serde_json::Value =
+        serde_json::from_slice(frame_body(&response, MAX_ENGINE_FRAME).unwrap()).unwrap();
+    assert_eq!(response["preserved"], true);
+    assert!(dispatcher.handle(stop(stable), &mut primitive).ok);
+    assert!(dispatcher.handle(start(latest.clone()), &mut primitive).ok);
+    assert!(dispatcher.handle(stop(latest), &mut primitive).ok);
+}
+
+#[cfg(unix)]
+#[test]
+fn engine_self_validation_resolves_signed_slot_and_rejects_other_executables() {
+    let (source, key) = two_slot_process_fixture();
+    let target = tempfile::tempdir().unwrap();
+    let installation = Installation::for_owner(
+        target.path(),
+        key.verifying_key().to_bytes(),
+        "macos",
+        "aarch64",
+        current_owner(),
+    );
+    let layout = installation
+        .install(
+            source.path(),
+            &std::env::current_exe().unwrap(),
+            "501",
+            &RealInstallIo,
+        )
+        .unwrap();
+    let stable = layout
+        .directory
+        .join("engines/stable/0.2.16/nelomai-unix-service");
+    let resolved = installation
+        .load_engine(&fs::canonicalize(&stable).unwrap())
+        .unwrap();
+    assert_eq!(
+        resolved.identity.slot,
+        nelomai_contracts::RuntimeSlot::Stable
+    );
+    assert_eq!(resolved.identity.runtime_version, "0.2.16");
+    assert!(installation
+        .load_engine(&std::env::current_exe().unwrap())
+        .is_err());
+    assert!(installation.load_engine(&layout.dispatcher_path()).is_err());
+    let alias = target.path().join("engine-alias");
+    std::os::unix::fs::symlink(&stable, &alias).unwrap();
+    assert!(installation.load_engine(&alias).is_err());
+    fs::set_permissions(&stable, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    fs::write(&stable, b"tampered").unwrap();
+    assert!(installation.load_engine(&stable).is_err());
+}
+
+#[test]
+fn common_binding_blocks_start_before_binding_and_serializes_pre_auth_cleanup() {
+    let binding = CommonEngineBinding::default();
+    let retained = binding.clone();
+    let identity = EngineIdentity {
+        slot: nelomai_contracts::RuntimeSlot::Stable,
+        runtime_version: "0.2.16".into(),
+        runtime_contract_version: 1,
+        container_version: "0.2.16".into(),
+        manifest_sha256: "a".repeat(64),
+    };
+    assert!(binding.with_identity(false, |_| Ok(())).is_err());
+    retained
+        .with_identity(true, |current| {
+            assert!(current.is_none());
+            assert!(
+                binding.bind(identity.clone()).is_err(),
+                "binding must not overtake in-flight cleanup"
+            );
+            Ok(())
+        })
+        .unwrap();
+    binding.bind(identity.clone()).unwrap();
+    retained
+        .with_identity(false, |current| {
+            assert_eq!(current, Some(&identity));
+            Ok(())
+        })
+        .unwrap();
+    let mut pending = identity.clone();
+    pending.slot = nelomai_contracts::RuntimeSlot::Latest;
+    pending.runtime_version = "0.2.17".into();
+    assert!(retained.bind(pending).is_err());
+    assert!(binding.bind(identity.clone()).is_err());
+    retained
+        .with_identity(true, |current| {
+            assert_eq!(current, Some(&identity));
+            Ok(())
+        })
+        .unwrap();
 }

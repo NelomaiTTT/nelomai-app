@@ -659,6 +659,80 @@ impl AuthBroker {
         Ok(())
     }
 
+    // Called only under issuance after a durable, unambiguous access rejection.
+    // The cleanup operation and its source never change; only current proofs
+    // rotate. A persisted pending Refresh ticket cannot be retried after loss.
+    async fn refresh_bound_transition_locked(&self, operation_id: &str) -> Result<(), BrokerError> {
+        let (ticket, refresh) = {
+            let _state = self.state.lock().await;
+            let mut auth = self.load()?;
+            let authority = auth
+                .broker
+                .as_ref()
+                .and_then(|meta| {
+                    meta.transition_authorities
+                        .iter()
+                        .find(|entry| entry.reconcile_operation_id == operation_id)
+                })
+                .ok_or(BrokerError::RecoveryRequired)?;
+            if authority.source_identity.is_none()
+                || authority.dispatch_state != TransitionDispatchStateV1::InvalidAccessRejected
+            {
+                return Err(BrokerError::RecoveryRequired);
+            }
+            Self::match_current_transition_source(&auth, authority)?;
+            Self::ensure_transition_issuance_allowed(&auth, Some(operation_id))?;
+            let refresh = authority.resume_refresh_proof.clone();
+            let ticket = self.begin(
+                &mut auth,
+                BrokerRequestKind::Refresh,
+                Uuid::new_v4().to_string(),
+                None,
+                false,
+            )?;
+            (ticket, refresh)
+        };
+        self.recheck_ticket(&ticket).await?;
+        let response = self.api.refresh(refresh).await?;
+        let _state = self.state.lock().await;
+        let mut auth = self.fenced(&ticket)?;
+        let confirmed = response.device.confirmed_identity()?;
+        if Some(&confirmed) != ticket.source_identity.as_ref()
+            || ticket.source_device_id.as_deref() != Some(response.device.id.as_str())
+            || response.token_type != "Bearer"
+            || response.access_token.is_empty()
+            || response.refresh_token.is_empty()
+            || response.access_expires_in == 0
+            || response.refresh_expires_in == 0
+        {
+            return Err(BrokerError::IdentityMismatch);
+        }
+        let position = auth
+            .broker
+            .as_ref()
+            .and_then(|meta| {
+                meta.transition_authorities
+                    .iter()
+                    .position(|entry| entry.reconcile_operation_id == operation_id)
+            })
+            .ok_or(BrokerError::RecoveryRequired)?;
+        let authority = &auth.broker.as_ref().unwrap().transition_authorities[position];
+        Self::match_current_transition_scope(&auth, authority)?;
+        if authority.dispatch_state != TransitionDispatchStateV1::InvalidAccessRejected {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        auth.access_token = Some(response.access_token.clone());
+        auth.refresh_token = Some(response.refresh_token.clone());
+        let meta = auth.broker.as_mut().unwrap();
+        meta.pending_request = None;
+        let authority = &mut meta.transition_authorities[position];
+        authority.cleanup_access_proof = response.access_token;
+        authority.resume_refresh_proof = response.refresh_token;
+        authority.dispatch_state = TransitionDispatchStateV1::DispatchIntent;
+        self.save_transition_write(&auth)?;
+        Ok(())
+    }
+
     pub async fn reconcile_transition(
         &self,
         frozen: FrozenReconcileRequest,
@@ -778,7 +852,8 @@ impl AuthBroker {
                         .as_ref()
                         .ok_or(BrokerError::RecoveryRequired)?
                         .transition_authorities[position];
-                    if authority.source_identity.is_some() || authority.legacy_refresh_completed {
+                    let bound = authority.source_identity.is_some();
+                    if !bound && authority.legacy_refresh_completed {
                         return Err(BrokerError::RecoveryRequired);
                     }
                     Self::match_current_transition_scope(&auth, authority)?;
@@ -792,8 +867,13 @@ impl AuthBroker {
                         return Err(BrokerError::RecoveryRequired);
                     }
                     drop(_state);
-                    self.legacy_refresh_locked(Some(&frozen.request.operation_id))
-                        .await?;
+                    if bound {
+                        self.refresh_bound_transition_locked(&frozen.request.operation_id)
+                            .await?;
+                    } else {
+                        self.legacy_refresh_locked(Some(&frozen.request.operation_id))
+                            .await?;
+                    }
                     let _state = self.state.lock().await;
                     let auth = self.load()?;
                     let position = auth
@@ -819,7 +899,7 @@ impl AuthBroker {
                         .as_ref()
                         .ok_or(BrokerError::RecoveryRequired)?
                         .transition_authorities[position];
-                    if !entry.legacy_refresh_completed
+                    if (!bound && !entry.legacy_refresh_completed)
                         || entry.dispatch_state != TransitionDispatchStateV1::DispatchIntent
                     {
                         return Err(BrokerError::RecoveryRequired);
@@ -841,9 +921,10 @@ impl AuthBroker {
                         .as_mut()
                         .ok_or(BrokerError::RecoveryRequired)?
                         .transition_authorities[position];
-                    let may_refresh = recheck_current
-                        && authority.source_identity.is_none()
-                        && !authority.legacy_refresh_completed;
+                    let may_refresh = (recheck_current
+                        || state == TransitionDispatchStateV1::ResponseKnown)
+                        && (authority.source_identity.is_some()
+                            || !authority.legacy_refresh_completed);
                     if authority
                         .reconcile_receipt
                         .as_ref()
@@ -930,7 +1011,9 @@ impl AuthBroker {
                             })
                         })
                         .ok_or(BrokerError::RecoveryRequired)?;
-                    entry.dispatch_state = TransitionDispatchStateV1::InvalidAccessRejected;
+                    // An uncertain dispatch stays uncertain even after its
+                    // old proof expires. A later 401 cannot prove no commit.
+                    entry.dispatch_state = TransitionDispatchStateV1::OutcomeUnknown;
                     self.save_transition_write(&auth)?;
                     return Err(BrokerError::RecoveryRequired);
                 }

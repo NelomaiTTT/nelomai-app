@@ -197,13 +197,25 @@ Linux layout. Docker execution disables external networking, uses a fresh
 unprivileged application user, and never invokes a host installer or product
 panel. The source-fixed `PANEL_BASE` and TLS trust remain unchanged.
 
-The real production dispatcher is latest-only. More importantly, the immutable
-0.2.16 Unix and Windows engines also load Latest and require their own executable
-to equal the latest engine path. A future dispatcher alone cannot make these
-stable engine bytes work. This is a **known missing implementation requiring a
-prepublication Task12 fix**, not a hardware-only UNRUN or future-only deferral.
-The supplemental adapter does not claim stable→production dispatcher/engine
-acceptance. Any resulting new candidate bytes require fresh signing and tests.
+Task12 fixes signed slot selection before immutable publication: engine startup
+resolves its kernel executable against authenticated slot bytes, the dispatcher
+selects an exact signed identity only while idle, and CommonHost binds all native
+transport clones once to its installed target. Pending preference cannot retarget
+a running incarnation; stale Stop/private commands remain fenced. Installation
+readiness checks the authenticated container layout separately from active slot.
+Source tests execute Stable through the actual Unix socket and dispatcher, with
+an external native-effects child. Shipping remains latest-only. New candidate
+bytes still require fresh signing and exact-candidate tests.
+
+`scripts/run-real-panel-acceptance.py` is the local real-broker/panel/PostgreSQL
+fault producer. It requires an explicitly isolated migrated database and a
+recorded panel archive on loopback. It runs real HTTP, protected-file persistence,
+actual process exits and independent DB observations. Only external native/agent
+effects are adapted; actual cleanup jobs and leases are completed by the existing
+panel recovery worker. The macOS phase fault hook is a disposable rename
+interposer, not a product hook or journal rewrite. Results record tested source
+diff/driver hashes; the supplied panel SHA is an archive provenance claim, not
+argument-based verification. This is not a packaged-candidate approval issuer.
 
 The mandatory full producer interface is:
 

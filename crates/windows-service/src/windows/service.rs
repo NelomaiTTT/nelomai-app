@@ -189,13 +189,12 @@ fn manager_service_loop() -> Result<(), ServiceError> {
     record_service_message("manager lifecycle", "SCM stop requested");
     if let Ok(mut dispatcher) = owner.lock() {
         let identity = dispatcher.layout.identity.clone();
-        let engine = dispatcher.layout.engine_path();
         let response = dispatcher.handle(
             d::DispatcherRequest::Stop {
                 contract_version: 1,
                 identity,
             },
-            &mut |action| super::install::engine_primitive(action, &engine),
+            &mut |action, engine| super::install::engine_primitive(action, engine),
         );
         if !response.ok {
             record_service_message("dispatcher stop", "cleanup remains pending");
@@ -220,14 +219,13 @@ fn serve_owned_frame(
     };
     let output = (|| {
         let mut dispatcher = owner.try_lock().map_err(|_| d::blocked())?;
-        let engine = dispatcher.layout.engine_path();
         if private {
-            dispatcher.relay(frame, &mut |action| {
-                super::install::engine_primitive(action, &engine)
+            dispatcher.relay(frame, &mut |action, engine| {
+                super::install::engine_primitive(action, engine)
             })
         } else {
-            let response = dispatcher.handle(d::decode_request(frame)?, &mut |action| {
-                super::install::engine_primitive(action, &engine)
+            let response = dispatcher.handle(d::decode_request(frame)?, &mut |action, engine| {
+                super::install::engine_primitive(action, engine)
             });
             d::encode_frame(&response)
         }
@@ -243,14 +241,11 @@ pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
     let installation =
         d::Installation::production(root).map_err(|_| ServiceError::UnauthorizedClient)?;
     let layout = installation
-        .load()
+        .load_engine(
+            &std::fs::canonicalize(std::env::current_exe().map_err(|_| ServiceError::UnsafePath)?)
+                .map_err(|_| ServiceError::UnsafePath)?,
+        )
         .map_err(|_| ServiceError::UnauthorizedClient)?;
-    if std::fs::canonicalize(std::env::current_exe().map_err(|_| ServiceError::UnsafePath)?)
-        .map_err(|_| ServiceError::UnsafePath)?
-        != std::fs::canonicalize(layout.engine_path()).map_err(|_| ServiceError::UnsafePath)?
-    {
-        return Err(ServiceError::UnauthorizedClient);
-    }
     let _lease = d::MutationGuard::at(&root.join("engine-owner.lock"))
         .map_err(|_| ServiceError::UnauthorizedClient)?;
     let mut handler = TunnelRequestHandler::new(

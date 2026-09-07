@@ -10,6 +10,15 @@ fn owned_dispatcher() -> (
     tempfile::TempDir,
     std::sync::Arc<std::sync::Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
 ) {
+    owned_dispatcher_with_slots(false)
+}
+
+fn owned_dispatcher_with_slots(
+    two_slots: bool,
+) -> (
+    tempfile::TempDir,
+    std::sync::Arc<std::sync::Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+) {
     use ed25519_dalek::{Signer, SigningKey};
     use nelomai_contracts::dispatcher as d;
     use serde_json::json;
@@ -20,19 +29,41 @@ fn owned_dispatcher() -> (
         .join("engines/latest/0.2.16/nelomai-unix-service");
     fs::create_dir_all(engine.parent().unwrap()).unwrap();
     let engine_bytes = br#"#!/usr/bin/python3
-import json,struct,sys,fcntl
+import json,struct,sys,fcntl,os
 lease=open(sys.argv[2]+'/engine-owner.lock','a')
 fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
 while True:
     size=sys.stdin.buffer.read(4)
     if not size: break
     value=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
-    reply={'engine_ready':True} if value.get('dispatcher_control')=='ready' else {'engine_stopped':True}
+    if value.get('dispatcher_control')=='ready': reply={'engine_ready':True}
+    elif value.get('dispatcher_control')=='stop': reply={'engine_stopped':True}
+    else: reply={'protocolVersion':5,'ok':True,'state':'running','serviceVersion':os.path.basename(os.path.dirname(sys.argv[0]))}
     data=json.dumps(reply).encode()
     sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
 "#;
     fs::write(engine, engine_bytes).unwrap();
     let manifest = serde_json::to_vec(&json!({"format_version":1,"container_version":"0.2.16","release_set_id":"owned-test","minimum_runtime_contract":1,"maximum_runtime_contract":1,"slots":[{"slot":"latest","manifest":{"format_version":1,"runtime_version":"0.2.16","source_commit":"0123456789abcdef0123456789abcdef01234567","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"contract_version":1,"files":[{"path":"nelomai-unix-service","role":"executable","size_bytes":engine_bytes.len(),"sha256":d::digest(engine_bytes)}]}}]})).unwrap();
+    let manifest = if two_slots {
+        let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+        let mut stable = value["slots"][0].clone();
+        stable["slot"] = json!("stable");
+        value["slots"][0]["manifest"]["runtime_version"] = json!("0.2.17");
+        value["slots"].as_array_mut().unwrap().push(stable);
+        value["stable_release_set_sha256"] = json!("b".repeat(64));
+        value["stable_platform_manifest_sha256"] = json!("c".repeat(64));
+        fs::rename(
+            source.path().join("engines/latest/0.2.16"),
+            source.path().join("engines/latest/0.2.17"),
+        )
+        .unwrap();
+        let stable = source.path().join("engines/stable/0.2.16");
+        fs::create_dir_all(&stable).unwrap();
+        fs::write(stable.join("nelomai-unix-service"), engine_bytes).unwrap();
+        serde_json::to_vec(&value).unwrap()
+    } else {
+        manifest
+    };
     let key = SigningKey::from_bytes(&[82; 32]);
     let mut signed = nelomai_contracts::CONTAINER_MANIFEST_SIGNATURE_DOMAIN.to_vec();
     signed.extend(&manifest);
@@ -120,7 +151,7 @@ async fn production_transport_stop_then_passive_poll_preserves_quiescence() {
                         contract_version: 1,
                         identity
                     },
-                    &mut |_| Ok(())
+                    &mut |_, _| Ok(())
                 )
                 .running
         );
@@ -157,7 +188,7 @@ async fn production_transport_stop_then_passive_poll_preserves_quiescence() {
                 d::DispatcherRequest::Status {
                     contract_version: 1
                 },
-                &mut |_| Ok(())
+                &mut |_, _| Ok(())
             )
             .running
     );
@@ -186,6 +217,69 @@ fn real_engine_channel_keeps_diagnostics_rebind_and_eof_cleanup() {
         ServiceTunnelState::Stopped,
         "EOF must clean up the tunnel"
     );
+}
+
+#[tokio::test]
+async fn common_bound_transport_launches_signed_stable_through_real_dispatcher_socket() {
+    use nelomai_contracts::{dispatcher as d, RuntimeSlot};
+    use nelomai_unix_service::{Request, ServiceTransport};
+    let (root, owner) = owned_dispatcher_with_slots(true);
+    let stable = owner
+        .lock()
+        .unwrap()
+        .installation
+        .load_slot(RuntimeSlot::Stable)
+        .unwrap()
+        .identity;
+    let lifecycle_path = root.path().join("lifecycle.sock");
+    let private_path = root.path().join("private.sock");
+    let lifecycle = bind_listener(&lifecycle_path, unsafe { libc::geteuid() }).unwrap();
+    let private = bind_listener(&private_path, unsafe { libc::geteuid() }).unwrap();
+    let lifecycle_owner = owner.clone();
+    let lifecycle_thread = std::thread::spawn(move || {
+        // Pre-bind stop(2), bound start(2), bound private version(1), stop(2).
+        for _ in 0..7 {
+            nelomai_unix_service::serve_dispatcher_one(&lifecycle, &lifecycle_owner, false)
+                .unwrap();
+        }
+    });
+    let private_owner = owner.clone();
+    let private_thread = std::thread::spawn(move || {
+        for _ in 0..2 {
+            nelomai_unix_service::serve_dispatcher_one(&private, &private_owner, true).unwrap();
+        }
+    });
+    let binding = d::CommonEngineBinding::default();
+    let transport = UnixSocketTransport::with_dispatcher(private_path, lifecycle_path)
+        .for_common(binding.clone());
+    let retained = transport.clone();
+    assert!(retained
+        .exchange(Request::start("synthetic".into()))
+        .await
+        .is_err());
+    transport.exchange(Request::stop()).await.unwrap();
+    binding.bind(stable.clone()).unwrap();
+    assert!(
+        retained
+            .exchange(Request::start("synthetic".into()))
+            .await
+            .unwrap()
+            .ok
+    );
+    assert_eq!(owner.lock().unwrap().layout.identity, stable);
+    assert_eq!(
+        retained
+            .exchange(Request::version())
+            .await
+            .unwrap()
+            .service_version
+            .as_deref(),
+        Some("0.2.16")
+    );
+    transport.exchange(Request::stop()).await.unwrap();
+    lifecycle_thread.join().unwrap();
+    private_thread.join().unwrap();
+    assert!(!root.path().join(d::ACTIVE_ENGINE_NAME).exists());
 }
 
 #[test]

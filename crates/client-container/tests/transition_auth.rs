@@ -430,6 +430,10 @@ struct Panel {
     reject_bootstrap_access: AtomicUsize,
     fail_bootstrap: AtomicUsize,
     fail_refresh: AtomicUsize,
+    bound_refresh: AtomicUsize,
+    hold_refresh: AtomicUsize,
+    refresh_entered: Notify,
+    refresh_release: Notify,
     reject_reconcile_access: AtomicUsize,
     fail_reconcile: AtomicUsize,
     return_full_device_snapshot: AtomicUsize,
@@ -473,6 +477,10 @@ async fn refresh(
     Json(_): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     state.refresh_calls.fetch_add(1, Ordering::SeqCst);
+    if state.hold_refresh.load(Ordering::SeqCst) == 1 {
+        state.refresh_entered.notify_one();
+        state.refresh_release.notified().await;
+    }
     if state.fail_refresh.load(Ordering::SeqCst) == 1 {
         return Err(StatusCode::BAD_GATEWAY);
     }
@@ -481,7 +489,7 @@ async fn refresh(
         "access_token":"refreshed-access","access_expires_in":900,
         "refresh_token":"refreshed-refresh","refresh_expires_in":3600,
         "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
-        "device":legacy_device()}),
+        "device":if state.bound_refresh.load(Ordering::SeqCst) == 1 { json!({"id":"device-a","name":"bound","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"latest","session_generation":7}) } else { legacy_device() }}),
     ))
 }
 async fn reconcile(
@@ -903,6 +911,187 @@ async fn clean_supersede_is_protected_replay_and_exposes_only_the_successor_auth
         .unwrap()
         .pending_runtime_supersede
         .is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn bound_known_expiry_refreshes_same_source_without_changing_frozen_reconcile() {
+    for accepted in [false, true] {
+        let state = Arc::new(Panel::default());
+        state.bound_refresh.store(1, Ordering::SeqCst);
+        let (api, server) = panel(state.clone()).await;
+        let store = enrolled_store();
+        let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap();
+        let source = broker.transition_source().await.unwrap();
+        let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+        if accepted {
+            state.return_retry.store(1, Ordering::SeqCst);
+            assert_eq!(
+                broker
+                    .reconcile_transition(frozen.clone())
+                    .await
+                    .unwrap()
+                    .state,
+                RuntimeSwitchState::Retry
+            );
+            state.return_retry.store(0, Ordering::SeqCst);
+        }
+        state.reject_reconcile_access.store(1, Ordering::SeqCst);
+        assert_eq!(
+            broker
+                .reconcile_transition(frozen.clone())
+                .await
+                .unwrap()
+                .state,
+            RuntimeSwitchState::Clean
+        );
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        let auth = store.load().unwrap().unwrap();
+        assert_eq!(auth.session_generation, Some(7));
+        assert_eq!(auth.access_token.as_deref(), Some("refreshed-access"));
+        let authorities = auth.broker.unwrap().transition_authorities;
+        assert_eq!(authorities.len(), 1);
+        assert_eq!(
+            authorities[0].request_fingerprint,
+            frozen.request_fingerprint()
+        );
+        assert_eq!(authorities[0].resume_refresh_proof, "refreshed-refresh");
+        assert!(state
+            .reconcile_bodies
+            .lock()
+            .unwrap()
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]));
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn bound_persisted_known_rejection_can_refresh_but_uncertain_dispatch_never_can() {
+    for dispatch in [
+        TransitionDispatchStateV1::InvalidAccessRejected,
+        TransitionDispatchStateV1::DispatchIntent,
+        TransitionDispatchStateV1::OutcomeUnknown,
+    ] {
+        let state = Arc::new(Panel::default());
+        state.bound_refresh.store(1, Ordering::SeqCst);
+        let (api, server) = panel(state.clone()).await;
+        let store = enrolled_store();
+        let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+        let source = broker.transition_source().await.unwrap();
+        let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+        insert_reconcile_authority(&store, &frozen, dispatch);
+        drop(broker);
+        if dispatch == TransitionDispatchStateV1::InvalidAccessRejected {
+            let broker = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
+            assert_eq!(
+                broker.reconcile_transition(frozen).await.unwrap().state,
+                RuntimeSwitchState::Clean
+            );
+            assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+        } else {
+            for _ in 0..2 {
+                state.reject_reconcile_access.store(1, Ordering::SeqCst);
+                let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+                assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
+                assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    store
+                        .load()
+                        .unwrap()
+                        .unwrap()
+                        .broker
+                        .unwrap()
+                        .transition_authorities[0]
+                        .dispatch_state,
+                    TransitionDispatchStateV1::OutcomeUnknown
+                );
+            }
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn lost_bound_refresh_response_keeps_pending_ticket_and_never_rotates_again() {
+    let state = Arc::new(Panel::default());
+    state.bound_refresh.store(1, Ordering::SeqCst);
+    state.reject_reconcile_access.store(1, Ordering::SeqCst);
+    state.fail_refresh.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
+    drop(broker);
+    let before = store.load().unwrap().unwrap();
+    assert_eq!(
+        before
+            .broker
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .as_ref()
+            .unwrap()
+            .kind,
+        BrokerRequestKind::Refresh
+    );
+    state.fail_refresh.store(0, Ordering::SeqCst);
+    let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap();
+    assert!(broker.reconcile_transition(frozen).await.is_err());
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(before, store.load().unwrap().unwrap());
+    server.abort();
+}
+
+#[tokio::test]
+async fn logout_fences_late_bound_transition_refresh_and_new_family_replay() {
+    let state = Arc::new(Panel::default());
+    state.bound_refresh.store(1, Ordering::SeqCst);
+    state.hold_refresh.store(1, Ordering::SeqCst);
+    state.reject_reconcile_access.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap());
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    let pending = {
+        let broker = broker.clone();
+        let frozen = frozen.clone();
+        tokio::spawn(async move { broker.reconcile_transition(frozen).await })
+    };
+    state.refresh_entered.notified().await;
+    broker.logout().await.unwrap();
+    let logged_out = store.load().unwrap().unwrap();
+    state.refresh_release.notify_one();
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(BrokerError::Cancelled)
+    ));
+    assert_eq!(store.load().unwrap().unwrap(), logged_out);
+    assert!(broker.access_token(None).await.is_err());
+    broker
+        .login(
+            &LoginRequest {
+                login: "b".into(),
+                password: "synthetic-password".into(),
+                install_secret: "ignored".into(),
+                device_name: "B".into(),
+                platform: Platform::Macos,
+                platform_version: None,
+                architecture: "aarch64".into(),
+                app_version: "0.2.16".into(),
+            },
+            &target(),
+        )
+        .await
+        .unwrap();
+    let new_family = store.load().unwrap().unwrap();
+    assert!(broker.reconcile_transition(frozen).await.is_err());
+    assert_eq!(store.load().unwrap().unwrap(), new_family);
+    assert_eq!(new_family.access_token.as_deref(), Some("login-b-access"));
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
 

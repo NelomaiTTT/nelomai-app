@@ -9,6 +9,7 @@ pub use nelomai_contracts::dispatcher;
 /// injected transports. Only explicit Start may create an engine lifetime.
 pub fn exchange_selected(
     request: Request,
+    expected: Option<&dispatcher::EngineIdentity>,
     mut lifecycle: impl FnMut(
         &dispatcher::DispatcherRequest,
     ) -> Result<dispatcher::DispatcherResponse, ServiceError>,
@@ -20,16 +21,28 @@ pub fn exchange_selected(
     let ready = lifecycle(&dispatcher::DispatcherRequest::Version {
         contract_version: 1,
     })?;
-    let identity = ready
+    let reported = ready
         .identity
         .filter(|_| ready.ok && ready.contract_version == 1)
         .ok_or(ServiceError::UnauthorizedClient)?;
+    if expected.is_some_and(|expected| {
+        expected.manifest_sha256 != reported.manifest_sha256
+            || expected.container_version != reported.container_version
+            || ready.running && expected != &reported
+    }) {
+        return Err(ServiceError::UnauthorizedClient);
+    }
+    let identity = expected.unwrap_or(&reported).clone();
     if matches!(request, Request::Stop { .. }) {
         let stopped = lifecycle(&dispatcher::DispatcherRequest::Stop {
             contract_version: 1,
-            identity,
+            identity: identity.clone(),
         })?;
-        return if stopped.ok {
+        return if stopped.ok
+            && !stopped.running
+            && stopped.contract_version == 1
+            && stopped.identity.as_ref() == Some(&identity)
+        {
             Ok(Response::success(Some(ServiceTunnelState::Stopped)))
         } else {
             Err(ServiceError::Backend("dispatcher_stop_failed".into()))
@@ -50,9 +63,13 @@ pub fn exchange_selected(
     } else {
         let started = lifecycle(&dispatcher::DispatcherRequest::Start {
             contract_version: 1,
-            identity,
+            identity: identity.clone(),
         })?;
-        if !started.ok {
+        if !started.ok
+            || !started.running
+            || started.contract_version != 1
+            || started.identity.as_ref() != Some(&identity)
+        {
             return Err(ServiceError::Backend("dispatcher_start_failed".into()));
         }
     }
@@ -62,6 +79,46 @@ pub fn exchange_selected(
 #[cfg(test)]
 mod selected_transport_tests {
     use super::*;
+    #[test]
+    fn bound_stable_request_never_adopts_latest_from_dispatcher_version() {
+        let stable = dispatcher::EngineIdentity {
+            slot: nelomai_contracts::RuntimeSlot::Stable,
+            runtime_version: "0.2.16".into(),
+            runtime_contract_version: 1,
+            container_version: "0.2.16".into(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let mut latest = stable.clone();
+        latest.slot = nelomai_contracts::RuntimeSlot::Latest;
+        latest.runtime_version = "0.2.17".into();
+        for running in [false, true] {
+            let lifecycle = |request: &dispatcher::DispatcherRequest| match request {
+                dispatcher::DispatcherRequest::Version { .. } => Ok(
+                    dispatcher::DispatcherResponse::success(latest.clone(), running),
+                ),
+                dispatcher::DispatcherRequest::Start { identity, .. }
+                    if identity == &stable && !running =>
+                {
+                    Ok(dispatcher::DispatcherResponse::success(
+                        stable.clone(),
+                        true,
+                    ))
+                }
+                _ => Ok(dispatcher::DispatcherResponse::failure()),
+            };
+            let result = exchange_selected(
+                Request::start("fixture".into()),
+                Some(&stable),
+                lifecycle,
+                |_| Ok(Response::success(Some(ServiceTunnelState::Running))),
+            );
+            assert_eq!(
+                result.is_ok(),
+                !running,
+                "bound Stable must select itself only when Latest is stopped"
+            );
+        }
+    }
     #[test]
     fn stop_then_passive_polls_do_not_reopen_the_engine() {
         let identity = dispatcher::EngineIdentity {
@@ -89,25 +146,25 @@ mod selected_transport_tests {
             ))
         };
         assert_eq!(
-            exchange_selected(Request::stop(), &mut lifecycle, private)
+            exchange_selected(Request::stop(), None, &mut lifecycle, private)
                 .unwrap()
                 .state,
             Some(ServiceTunnelState::Stopped)
         );
         assert_eq!(
-            exchange_selected(Request::status(), &mut lifecycle, private)
+            exchange_selected(Request::status(), None, &mut lifecycle, private)
                 .unwrap()
                 .state,
             Some(ServiceTunnelState::Stopped)
         );
         assert_eq!(
-            exchange_selected(Request::version(), &mut lifecycle, private)
+            exchange_selected(Request::version(), None, &mut lifecycle, private)
                 .unwrap()
                 .service_version
                 .as_deref(),
             Some("0.2.16")
         );
-        assert!(exchange_selected(Request::diagnostics(), &mut lifecycle, private).is_err());
+        assert!(exchange_selected(Request::diagnostics(), None, &mut lifecycle, private).is_err());
         assert!(!running);
     }
 }

@@ -312,10 +312,15 @@ pub fn run() {
                 .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
                 .transpose()?
                 .ok_or_else(|| io::Error::other("pinned runtime manifest key unavailable"))?;
+            let native_binding = nelomai_contracts::dispatcher::CommonEngineBinding::default();
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let tunnel = Arc::new(platform::unix::tunnel_controller());
+            let tunnel = Arc::new(platform::unix::common_tunnel_controller(
+                native_binding.clone(),
+            ));
             #[cfg(windows)]
-            let tunnel = Arc::new(platform::windows::tunnel_controller());
+            let tunnel = Arc::new(platform::windows::common_tunnel_controller(
+                native_binding.clone(),
+            ));
             let stop = Arc::new(NativeStop {
                 child: Mutex::new(None),
                 exit_owner: Default::default(),
@@ -351,6 +356,17 @@ pub fn run() {
                     relaunch: None,
                 },
             )?);
+            let target = host.native_target();
+            let engine =
+                nelomai_contracts::dispatcher::Installation::production(Path::new("/unused"))?
+                    .manifest_identity_for(&resources.join("runtime"), target.runtime_slot)?;
+            if engine.runtime_version != target.runtime_version
+                || engine.runtime_contract_version != target.runtime_contract_version
+                || engine.container_version != target.container_version
+            {
+                return Err(io::Error::other("common native identity mismatch").into());
+            }
+            native_binding.bind(engine)?;
             let mut child = tauri::async_runtime::block_on(host.launch_desktop(0))?;
             let native = child.take_native()?;
             stop.exit_owner.runtime_launched();
@@ -475,9 +491,10 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                         NativeControl::DefenderStatus { refresh } => {
                             let status = tauri::async_runtime::block_on(async {
                                 if refresh {
-                                    platform::windows::refresh_defender_status().await
+                                    platform::windows::refresh_defender_status(&state.stop.tunnel)
+                                        .await
                                 } else {
-                                    platform::windows::defender_status().await
+                                    platform::windows::defender_status(&state.stop.tunnel).await
                                 }
                             })
                             .map_err(|_| io::Error::other("defender status unavailable"))?;
@@ -486,7 +503,7 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                         #[cfg(windows)]
                         NativeControl::DefenderRepair => {
                             let status = tauri::async_runtime::block_on(
-                                platform::windows::repair_defender_exclusion(),
+                                platform::windows::repair_defender_exclusion(&state.stop.tunnel),
                             )
                             .map_err(|_| io::Error::other("defender repair failed"))?;
                             NativeReply::Defender { status }

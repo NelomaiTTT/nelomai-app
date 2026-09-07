@@ -96,10 +96,7 @@ fn run_dispatcher(root: &Path) -> std::io::Result<()> {
 }
 fn run_engine(root: &Path) -> std::io::Result<()> {
     let installation = Installation::production(root)?;
-    let layout = installation.load()?;
-    if std::fs::canonicalize(std::env::current_exe()?)? != layout.engine_path() {
-        return Err(nelomai_contracts::dispatcher::blocked());
-    }
+    let layout = installation.load_engine(&std::fs::canonicalize(std::env::current_exe()?)?)?;
     let _lease = MutationGuard::at(&root.join("engine-owner.lock"))?;
     let directory: PathBuf = layout
         .engine_path()

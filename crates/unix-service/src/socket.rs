@@ -53,6 +53,7 @@ impl RequestWatchdog {
 pub struct UnixSocketTransport {
     path: PathBuf,
     dispatcher_path: Option<PathBuf>,
+    common: Option<nelomai_contracts::dispatcher::CommonEngineBinding>,
 }
 
 pub fn prepare_runtime_directory(path: &Path) -> io::Result<()> {
@@ -84,6 +85,7 @@ impl UnixSocketTransport {
         Self {
             path,
             dispatcher_path,
+            common: None,
         }
     }
 
@@ -91,7 +93,16 @@ impl UnixSocketTransport {
         Self {
             path: path.into(),
             dispatcher_path: Some(dispatcher_path.into()),
+            common: None,
         }
+    }
+
+    pub fn for_common(
+        mut self,
+        binding: nelomai_contracts::dispatcher::CommonEngineBinding,
+    ) -> Self {
+        self.common = Some(binding);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -99,6 +110,25 @@ impl UnixSocketTransport {
     }
 
     fn exchange_blocking(&self, request: Request) -> Result<Response, ServiceError> {
+        if let Some(binding) = &self.common {
+            return binding
+                .with_identity(
+                    matches!(
+                        request,
+                        Request::Stop { .. } | Request::Status { .. } | Request::Version { .. }
+                    ),
+                    |expected| Ok(self.exchange_bound(request, expected)),
+                )
+                .map_err(|_| ServiceError::UnauthorizedClient)?;
+        }
+        self.exchange_bound(request, None)
+    }
+
+    fn exchange_bound(
+        &self,
+        request: Request,
+        expected: Option<&nelomai_contracts::dispatcher::EngineIdentity>,
+    ) -> Result<Response, ServiceError> {
         if request.protocol_version() != crate::PROTOCOL_VERSION {
             return Err(ServiceError::UnsupportedProtocol);
         }
@@ -109,16 +139,28 @@ impl UnixSocketTransport {
             let version = dispatcher_exchange(&d::DispatcherRequest::Version {
                 contract_version: 1,
             })?;
-            let identity = version
+            let reported = version
                 .identity
                 .filter(|_| version.ok && version.contract_version == 1)
                 .ok_or(ServiceError::UnauthorizedClient)?;
+            if expected.is_some_and(|expected| {
+                expected.manifest_sha256 != reported.manifest_sha256
+                    || expected.container_version != reported.container_version
+                    || version.running && expected != &reported
+            }) {
+                return Err(ServiceError::UnauthorizedClient);
+            }
+            let identity = expected.unwrap_or(&reported).clone();
             if matches!(request, Request::Stop { .. }) {
                 let stopped = dispatcher_exchange(&d::DispatcherRequest::Stop {
                     contract_version: 1,
-                    identity,
+                    identity: identity.clone(),
                 })?;
-                return if stopped.ok {
+                return if stopped.ok
+                    && !stopped.running
+                    && stopped.contract_version == 1
+                    && stopped.identity.as_ref() == Some(&identity)
+                {
                     Ok(Response::success(Some(crate::ServiceTunnelState::Stopped)))
                 } else {
                     Err(ServiceError::Backend("dispatcher_stop_failed".into()))
@@ -141,9 +183,13 @@ impl UnixSocketTransport {
             } else {
                 let started = dispatcher_exchange(&d::DispatcherRequest::Start {
                     contract_version: 1,
-                    identity,
+                    identity: identity.clone(),
                 })?;
-                if !started.ok {
+                if !started.ok
+                    || !started.running
+                    || started.contract_version != 1
+                    || started.identity.as_ref() != Some(&identity)
+                {
                     return Err(ServiceError::Backend("dispatcher_start_failed".into()));
                 }
             }
@@ -386,11 +432,11 @@ pub fn serve_dispatcher_one(
         .map_err(transport_error)?;
         let output = if private {
             dispatcher
-                .relay(&frame, &mut |_| Err(d::blocked()))
+                .relay(&frame, &mut |_, _| Err(d::blocked()))
                 .map_err(transport_error)?
         } else {
             let response = d::decode_request(&frame)
-                .map(|request| dispatcher.handle(request, &mut |_| Err(d::blocked())))
+                .map(|request| dispatcher.handle(request, &mut |_, _| Err(d::blocked())))
                 .unwrap_or_else(|_| d::DispatcherResponse::failure());
             d::encode_frame(&response).map_err(transport_error)?
         };
@@ -414,7 +460,7 @@ pub fn recover_dispatcher(
             contract_version: 1,
             identity: owner.layout.identity.clone(),
         },
-        &mut |_| Err(d::blocked()),
+        &mut |_, _| Err(d::blocked()),
     );
     watchdog.complete();
     if response.ok {

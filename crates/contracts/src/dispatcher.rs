@@ -46,6 +46,33 @@ pub struct EngineIdentity {
     pub manifest_sha256: String,
 }
 
+/// One common-process incarnation owns one immutable native target. The read
+/// lease spans a complete transport exchange, so binding cannot overtake an
+/// earlier pre-auth cleanup callback retained by another cloned transport.
+#[derive(Clone, Default)]
+pub struct CommonEngineBinding(std::sync::Arc<std::sync::RwLock<Option<EngineIdentity>>>);
+impl CommonEngineBinding {
+    pub fn bind(&self, identity: EngineIdentity) -> io::Result<()> {
+        let mut current = self.0.try_write().map_err(|_| blocked())?;
+        if current.is_some() {
+            return Err(blocked());
+        }
+        *current = Some(identity);
+        Ok(())
+    }
+    pub fn with_identity<T>(
+        &self,
+        allow_unbound: bool,
+        exchange: impl FnOnce(Option<&EngineIdentity>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let current = self.0.read().map_err(|_| blocked())?;
+        if current.is_none() && !allow_unbound {
+            return Err(blocked());
+        }
+        exchange(current.as_ref())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DispatcherRequest {
@@ -444,11 +471,19 @@ impl Installation {
         }
     }
     pub fn manifest_identity(&self, directory: &Path) -> io::Result<EngineIdentity> {
+        self.manifest_identity_for(directory, RuntimeSlot::Latest)
+    }
+    pub fn manifest_identity_for(
+        &self,
+        directory: &Path,
+        slot: RuntimeSlot,
+    ) -> io::Result<EngineIdentity> {
         let (verified, manifest_sha256) = self.verified_manifest(directory)?;
+        let selected = verified.selected(slot).ok_or_else(blocked)?;
         Ok(EngineIdentity {
-            slot: RuntimeSlot::Latest,
-            runtime_version: verified.latest().runtime_version.clone(),
-            runtime_contract_version: verified.latest().contract_version,
+            slot,
+            runtime_version: selected.runtime_version.clone(),
+            runtime_contract_version: selected.contract_version,
             container_version: verified.manifest().container_version.clone(),
             manifest_sha256,
         })
@@ -469,6 +504,15 @@ impl Installation {
         directory: &Path,
         verified: &VerifiedContainerManifest,
     ) -> io::Result<PathBuf> {
+        self.verify_slot_files(directory, verified, RuntimeSlot::Latest)
+    }
+    fn verify_slot_files(
+        &self,
+        directory: &Path,
+        verified: &VerifiedContainerManifest,
+        selected: RuntimeSlot,
+    ) -> io::Result<PathBuf> {
+        verified.selected(selected).ok_or_else(blocked)?;
         let mut selected_engine = None;
         for slot in &verified.manifest().slots {
             let name = match slot.slot {
@@ -492,7 +536,7 @@ impl Installation {
                 {
                     return Err(blocked());
                 }
-                if slot.slot == RuntimeSlot::Latest
+                if slot.slot == selected
                     && entry.path == self.engine_name()
                     && entry.role == RuntimeFileRole::Executable
                 {
@@ -503,6 +547,22 @@ impl Installation {
         selected_engine.ok_or_else(blocked)
     }
     pub fn load(&self) -> io::Result<VerifiedLayout> {
+        self.load_slot(RuntimeSlot::Latest)
+    }
+    /// Resolve only a kernel-reported executable against signed protected paths.
+    /// This path is never obtained from a lifecycle request or command argument.
+    pub fn load_engine(&self, kernel_executable: &Path) -> io::Result<VerifiedLayout> {
+        let latest = self.load()?;
+        if kernel_executable == fs::canonicalize(latest.engine_path())? {
+            return Ok(latest);
+        }
+        let stable = self.load_slot(RuntimeSlot::Stable)?;
+        if kernel_executable != fs::canonicalize(stable.engine_path())? {
+            return Err(blocked());
+        }
+        Ok(stable)
+    }
+    pub fn load_slot(&self, slot: RuntimeSlot) -> io::Result<VerifiedLayout> {
         self.trusted_ancestors(&self.root)?;
         trusted(&self.root, self.owner)?;
         trusted(&self.root.join(POINTER_NAME), self.owner)?;
@@ -518,7 +578,7 @@ impl Installation {
             trusted(&directory.join(name), self.owner)?;
         }
         let (verified, hash) = self.verified_manifest(&directory)?;
-        let engine = self.verify_files(&directory, &verified)?;
+        let engine = self.verify_slot_files(&directory, &verified, slot)?;
         let broker: BrokerPolicy =
             serde_json::from_slice(&read_bounded(&directory.join(POLICY_NAME), 8192)?)
                 .map_err(|_| blocked())?;
@@ -530,15 +590,15 @@ impl Installation {
         if file_digest(&broker.executable)? != broker.sha256 {
             return Err(blocked());
         }
-        let latest = verified.latest();
+        let selected = verified.selected(slot).ok_or_else(blocked)?;
         Ok(VerifiedLayout {
             directory,
             engine,
             broker,
             identity: EngineIdentity {
-                slot: RuntimeSlot::Latest,
-                runtime_version: latest.runtime_version.clone(),
-                runtime_contract_version: latest.contract_version,
+                slot,
+                runtime_version: selected.runtime_version.clone(),
+                runtime_contract_version: selected.contract_version,
                 container_version: verified.manifest().container_version.clone(),
                 manifest_sha256: hash,
             },
@@ -910,7 +970,18 @@ pub struct ProcessDispatcher {
 }
 impl ProcessDispatcher {
     pub fn new(installation: Installation) -> io::Result<Self> {
-        let layout = installation.load()?;
+        let layout = if installation.root.join(ACTIVE_ENGINE_NAME).exists() {
+            let marker = installation.root.join(ACTIVE_ENGINE_NAME);
+            trusted(&marker, installation.owner)?;
+            let identity: EngineIdentity =
+                serde_json::from_slice(&read_bounded(&marker, MAX_DISPATCHER_FRAME)?)
+                    .map_err(|_| blocked())?;
+            let layout = installation.load_slot(identity.slot)?;
+            layout.authorize(&identity)?;
+            layout
+        } else {
+            installation.load()?
+        };
         Ok(Self {
             installation,
             layout,
@@ -923,7 +994,7 @@ impl ProcessDispatcher {
     pub fn handle(
         &mut self,
         request: DispatcherRequest,
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> DispatcherResponse {
         match self.handle_inner(request, primitive) {
             Ok(()) => {
@@ -940,18 +1011,28 @@ impl ProcessDispatcher {
     fn handle_inner(
         &mut self,
         request: DispatcherRequest,
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
         if request.contract() != 1 {
             return Err(blocked());
-        }
-        if let Some(identity) = request.identity() {
-            self.layout.authorize(identity)?;
         }
         if !request.is_mutation() {
             return Ok(());
         }
         let _guard = MutationGuard::acquire(&self.installation.root)?;
+        if let Some(identity) = request.identity() {
+            if identity != &self.layout.identity {
+                if self.child.is_some()
+                    || self.channel_failed
+                    || self.installation.root.join(ACTIVE_ENGINE_NAME).exists()
+                {
+                    return Err(blocked());
+                }
+                let selected = self.installation.load_slot(identity.slot)?;
+                selected.authorize(identity)?;
+                self.layout = selected;
+            }
+        }
         match request {
             DispatcherRequest::Start { .. } => self.start(primitive),
             DispatcherRequest::Stop { .. } => self.stop(primitive),
@@ -964,7 +1045,7 @@ impl ProcessDispatcher {
     }
     fn start(
         &mut self,
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
         if self.channel_failed {
             return Err(blocked());
@@ -983,9 +1064,9 @@ impl ProcessDispatcher {
     }
     fn spawn(
         &mut self,
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
-        let verified = self.installation.load()?;
+        let verified = self.installation.load_slot(self.layout.identity.slot)?;
         verified.authorize(&self.layout.identity)?;
         let marker = self.installation.root.join(ACTIVE_ENGINE_NAME);
         if !marker.exists() {
@@ -1052,7 +1133,7 @@ impl ProcessDispatcher {
     }
     fn stop(
         &mut self,
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
         let marker = self.installation.root.join(ACTIVE_ENGINE_NAME);
         if self.channel_failed {
@@ -1126,7 +1207,7 @@ impl ProcessDispatcher {
     pub fn relay(
         &mut self,
         frame: &[u8],
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<Vec<u8>> {
         frame_body(frame, MAX_ENGINE_FRAME)?;
         let _guard = MutationGuard::acquire(&self.installation.root)?;
@@ -1138,7 +1219,7 @@ impl ProcessDispatcher {
     fn exchange(
         &mut self,
         frame: &[u8],
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<Vec<u8>> {
         let result = self.exchange_inner(frame, primitive);
         if result.is_err() {
@@ -1149,7 +1230,7 @@ impl ProcessDispatcher {
     fn exchange_inner(
         &mut self,
         frame: &[u8],
-        primitive: &mut impl FnMut(EnginePrimitive) -> io::Result<()>,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<Vec<u8>> {
         let child = self.child.as_mut().ok_or_else(blocked)?;
         let input = child.stdin.as_mut().ok_or_else(blocked)?;
@@ -1161,7 +1242,7 @@ impl ProcessDispatcher {
             if let Ok(control) =
                 serde_json::from_slice::<PrimitiveRequest>(frame_body(&response, MAX_ENGINE_FRAME)?)
             {
-                let result = primitive(control.engine_primitive);
+                let result = primitive(control.engine_primitive, &self.layout.engine_path());
                 input.write_all(&encode_frame(
                     &serde_json::json!({"primitive_ok":result.is_ok()}),
                 )?)?;

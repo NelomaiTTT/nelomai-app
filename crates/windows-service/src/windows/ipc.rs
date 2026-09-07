@@ -40,11 +40,20 @@ const PIPE_RECREATE_GRACE: std::time::Duration = std::time::Duration::from_milli
 const PIPE_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub const DISPATCHER_PIPE_NAME: &str = r"\\.\pipe\NelomaiDispatcherV1";
-pub struct NamedPipeTransport;
+pub struct NamedPipeTransport {
+    common: Option<nelomai_contracts::dispatcher::CommonEngineBinding>,
+}
 
 impl NamedPipeTransport {
     pub fn new() -> Self {
-        Self
+        Self { common: None }
+    }
+    pub fn for_common(
+        mut self,
+        binding: nelomai_contracts::dispatcher::CommonEngineBinding,
+    ) -> Self {
+        self.common = Some(binding);
+        self
     }
 }
 
@@ -57,9 +66,33 @@ impl Default for NamedPipeTransport {
 #[async_trait]
 impl ServiceTransport for NamedPipeTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
+        let common = self.common.clone();
         tokio::time::timeout(
             PIPE_EXCHANGE_TIMEOUT,
-            tokio::task::spawn_blocking(move || exchange_blocking(request)),
+            tokio::task::spawn_blocking(move || {
+                if let Some(binding) = common {
+                    binding
+                        .with_identity(
+                            matches!(
+                                request,
+                                Request::Stop { .. }
+                                    | Request::Status { .. }
+                                    | Request::Version { .. }
+                            ),
+                            |expected| {
+                                Ok(crate::exchange_selected(
+                                    request,
+                                    expected,
+                                    dispatcher_exchange,
+                                    exchange_private,
+                                ))
+                            },
+                        )
+                        .map_err(|_| ServiceError::UnauthorizedClient)?
+                } else {
+                    exchange_blocking(request)
+                }
+            }),
         )
         .await
         .map_err(|_| ServiceError::Backend("service_timeout".to_string()))?
@@ -184,7 +217,7 @@ pub(crate) fn wake_server() {
 }
 
 fn exchange_blocking(request: Request) -> Result<Response, ServiceError> {
-    crate::exchange_selected(request, dispatcher_exchange, exchange_private)
+    crate::exchange_selected(request, None, dispatcher_exchange, exchange_private)
 }
 
 fn exchange_private(request: Request) -> Result<Response, ServiceError> {

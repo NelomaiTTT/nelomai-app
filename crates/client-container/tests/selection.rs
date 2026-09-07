@@ -449,7 +449,7 @@ async fn common_host_admits_real_private_child_and_preserves_generation_without_
     use nelomai_client_storage::*;
     let data = tempfile::tempdir().unwrap();
     let resources = tempfile::tempdir().unwrap();
-    let key = install_manifest_platform(resources.path(), "0.2.16", false, "android", "aarch64");
+    let key = install_manifest_platform(resources.path(), "0.2.16", true, "android", "aarch64");
     let records = Records::default();
     let host = CommonHost::open(
         data.path(),
@@ -480,6 +480,7 @@ async fn common_host_admits_real_private_child_and_preserves_generation_without_
     state.refresh_token = Some("synthetic-refresh".into());
     state.confirmed_identity = Some(initial.target.identity(Some(7)).unwrap());
     state.session_generation = Some(7);
+    state.broker.as_mut().unwrap().confirmed_device_id = Some("device-a".into());
     auth.save(&state).unwrap();
     assert_eq!(
         host.selection().await.unwrap().session_generation,
@@ -537,6 +538,22 @@ async fn common_host_admits_real_private_child_and_preserves_generation_without_
     );
     assert!(client.check_start_barrier().is_ok());
     assert!(record.cleanup_snapshot().unwrap().auth_scope.is_some());
+    let installed = host.native_target().clone();
+    assert!(matches!(
+        host.coordinator()
+            .request(RuntimeSlot::Stable)
+            .await
+            .unwrap(),
+        nelomai_client_container::SwitchProgress::Pending { .. }
+    ));
+    let pending = host.selection().await.unwrap();
+    assert_eq!(pending.pending_slot, Some(RuntimeSlot::Stable));
+    assert_eq!(pending.target, installed);
+    assert_eq!(
+        host.native_target(),
+        &installed,
+        "pending preference retargeted the live common incarnation"
+    );
 }
 
 #[test]

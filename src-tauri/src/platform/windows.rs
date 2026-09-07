@@ -14,8 +14,10 @@ static DEFENDER_STATUS_CACHE: tokio::sync::Mutex<Option<DefenderStatus>> =
 
 pub type PlatformTunnelController = WindowsTunnelController<NamedPipeTransport>;
 
-pub fn tunnel_controller() -> PlatformTunnelController {
-    WindowsTunnelController::new(NamedPipeTransport::new())
+pub fn common_tunnel_controller(
+    binding: nelomai_contracts::dispatcher::CommonEngineBinding,
+) -> PlatformTunnelController {
+    WindowsTunnelController::new(NamedPipeTransport::new().for_common(binding))
 }
 
 pub async fn prepare_tunnel() -> Result<(), TunnelError> {
@@ -43,15 +45,21 @@ pub async fn prepare_tunnel() -> Result<(), TunnelError> {
     Err(tunnel_error("service_unavailable"))
 }
 
-pub async fn defender_status() -> Result<DefenderStatus, TunnelError> {
-    defender_status_cached(false).await
+pub async fn defender_status(
+    tunnel: &PlatformTunnelController,
+) -> Result<DefenderStatus, TunnelError> {
+    defender_status_cached(tunnel, false).await
 }
 
-pub async fn refresh_defender_status() -> Result<DefenderStatus, TunnelError> {
-    defender_status_cached(true).await
+pub async fn refresh_defender_status(
+    tunnel: &PlatformTunnelController,
+) -> Result<DefenderStatus, TunnelError> {
+    defender_status_cached(tunnel, true).await
 }
 
-pub async fn repair_defender_exclusion() -> Result<DefenderStatus, TunnelError> {
+pub async fn repair_defender_exclusion(
+    tunnel: &PlatformTunnelController,
+) -> Result<DefenderStatus, TunnelError> {
     let client_executable =
         std::env::current_exe().map_err(|_| tunnel_error("helper_resources_unavailable"))?;
     let service_executable = bundled_service_path(&client_executable);
@@ -61,7 +69,7 @@ pub async fn repair_defender_exclusion() -> Result<DefenderStatus, TunnelError> 
     .await
     .map_err(|_| tunnel_error("defender_exclusion_repair_failed"))?
     .map_err(defender_repair_error)?;
-    defender_status_cached(true).await
+    defender_status_cached(tunnel, true).await
 }
 
 pub fn format_diagnostic_helper_log(
@@ -131,7 +139,10 @@ async fn verify_service_version() -> Result<(), TunnelError> {
             .map_err(|_| tunnel_error("service_unavailable"))?;
         if response.ok
             && response.contract_version == 1
-            && response.identity.as_ref() == Some(&expected)
+            && response.identity.as_ref().is_some_and(|actual| {
+                actual.manifest_sha256 == expected.manifest_sha256
+                    && actual.container_version == expected.container_version
+            })
         {
             Ok(())
         } else {
@@ -199,14 +210,17 @@ fn optional_bool_name(value: Option<bool>) -> &'static str {
     }
 }
 
-async fn defender_status_cached(force: bool) -> Result<DefenderStatus, TunnelError> {
+async fn defender_status_cached(
+    tunnel: &PlatformTunnelController,
+    force: bool,
+) -> Result<DefenderStatus, TunnelError> {
     let mut cached = DEFENDER_STATUS_CACHE.lock().await;
     if !force {
         if let Some(status) = cached.as_ref() {
             return Ok(status.clone());
         }
     }
-    let status = tunnel_controller()
+    let status = tunnel
         .defender_status()
         .await
         .unwrap_or_else(|_| local_defender_status());
