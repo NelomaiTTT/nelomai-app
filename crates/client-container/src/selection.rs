@@ -103,8 +103,9 @@ impl InstalledRuntimeSelection {
     ) -> io::Result<PreparedInstalledRuntimeSelection> {
         let manifest =
             verify_installed_manifest(resources, pinned_raw_key, platform, architecture)?;
+        let _guard = owner.lock_transition_journal()?;
         let path = owner.root().join("common/runtime-selection-v1.json");
-        let (state, recovery, persist_after_storage, missing_selection) =
+        let (mut state, recovery, mut persist_after_storage, missing_selection) =
             match read_optional_bounded(&path, MAX_SELECTION_BYTES)? {
                 Some(bytes) => {
                     let (state, recovery) = recover_bytes(&manifest, &bytes);
@@ -112,6 +113,19 @@ impl InstalledRuntimeSelection {
                 }
                 None => (latest_selection(&manifest), None, true, true),
             };
+        if recovery.is_none() && !missing_selection {
+            if let Some(desired) = crate::switch::desired_slot_from_journal(
+                &owner.root().join("common/runtime-switch-v1.json"),
+                &manifest,
+            )? {
+                // Only new owner startup adopts the intent. Existing host and
+                // native binding retain their immutable incarnation target.
+                persist_after_storage |=
+                    state.selected_slot != desired || state.pending_slot.is_some();
+                state.selected_slot = desired;
+                state.pending_slot = None;
+            }
+        }
         Ok(PreparedInstalledRuntimeSelection {
             root: owner.root().to_owned(),
             path,
@@ -177,16 +191,6 @@ impl PreparedInstalledRuntimeSelection {
     }
 }
 
-pub(crate) fn set_pending_selection(
-    owner: &ContainerOwnerLock,
-    manifest: &VerifiedContainerManifest,
-    pending: RuntimeSlot,
-) -> io::Result<()> {
-    update_selection(owner, manifest, |state| {
-        state.pending_slot = (state.selected_slot != pending).then_some(pending);
-    })
-}
-
 pub(crate) fn finish_selection(
     owner: &ContainerOwnerLock,
     manifest: &VerifiedContainerManifest,
@@ -206,7 +210,7 @@ pub(crate) fn current_selection(
     let path = owner.root().join("common/runtime-selection-v1.json");
     let bytes = read_bounded(&path, MAX_SELECTION_BYTES)?;
     let stored: StoredSlotSelectionV1 = serde_json::from_slice(&bytes).map_err(|_| blocked())?;
-    let state = SlotSelectionV1 {
+    let mut state = SlotSelectionV1 {
         container_version: stored.container_version,
         selected_slot: stored.selected_slot,
         pending_slot: stored.pending_slot,
@@ -219,6 +223,12 @@ pub(crate) fn current_selection(
             .is_some_and(|slot| manifest.selected(slot).is_none())
     {
         return Err(blocked());
+    }
+    if let Some(desired) = crate::switch::desired_slot_from_journal(
+        &owner.root().join("common/runtime-switch-v1.json"),
+        manifest,
+    )? {
+        state.pending_slot = (state.selected_slot != desired).then_some(desired);
     }
     Ok(state)
 }

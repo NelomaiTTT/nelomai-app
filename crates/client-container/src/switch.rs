@@ -1,9 +1,9 @@
 //! Durable nonsecret switch ownership. Network/auth/stop execution is added by
 //! later checkpoints; this foundation only creates and reloads Requested work.
 use crate::{
-    atomic_nonsecret_write, current_selection, digest_json, finish_selection,
-    set_pending_selection, valid_fingerprint, AuthBroker, BrokerError, CleanupEngineRoleV1,
-    CleanupEnvelopeV1, FrozenReconcileRequest, ResumeArguments,
+    atomic_nonsecret_write, current_selection, digest_json, finish_selection, valid_fingerprint,
+    AuthBroker, BrokerError, CleanupEngineRoleV1, CleanupEnvelopeV1, FrozenReconcileRequest,
+    ResumeArguments,
 };
 use async_trait::async_trait;
 use nelomai_client_api::{
@@ -277,6 +277,7 @@ pub struct SwitchCoordinator {
     owner: Arc<ContainerOwnerLock>,
     path: PathBuf,
     manifest: VerifiedContainerManifest,
+    installed_target: Option<RuntimeTarget>,
     broker: Option<Arc<AuthBroker>>,
     control: Option<Arc<dyn RuntimeSwitchControl>>,
     required_initial_target: Option<nelomai_contracts::RuntimeSlot>,
@@ -291,10 +292,19 @@ impl SwitchCoordinator {
         owner: Arc<ContainerOwnerLock>,
         manifest: VerifiedContainerManifest,
     ) -> Result<Self, SwitchJournalError> {
+        // Selection adoption happens in verified startup, never from a live
+        // pending preference. Retain that incarnation's target immutably.
+        let installed_target = current_selection(&owner, &manifest).ok().and_then(|state| {
+            manifest
+                .identity(state.selected_slot, None)
+                .ok()
+                .map(|identity| RuntimeTarget::from_identity(&identity))
+        });
         let coordinator = Self {
             path: owner.root().join("common/runtime-switch-v1.json"),
             owner,
             manifest,
+            installed_target,
             broker: None,
             control: None,
             required_initial_target: None,
@@ -472,8 +482,6 @@ impl SwitchCoordinator {
         );
         journal.runtime_snapshot = Some(runtime_snapshot);
         self.begin_requested(journal)?;
-        set_pending_selection(&self.owner, &self.manifest, target_slot)
-            .map_err(SwitchJournalError::Io)?;
         self.stop_handoff(control, handoff).await?;
         self.recover_locked(broker, control).await
     }
@@ -1144,6 +1152,27 @@ impl SwitchCoordinator {
                     })?;
                 }
                 SwitchPhase::AuthResuming => {
+                    if journal.cancel_requested
+                        && journal.decision == Some(SwitchDecision::Apply)
+                        && journal.active_reconcile_operation_id.is_none()
+                        && broker
+                            .transition_resume_is_undispatched(
+                                journal
+                                    .active_reconcile_operation_id
+                                    .as_deref()
+                                    .unwrap_or(&journal.operation_id),
+                            )
+                            .await?
+                    {
+                        // Prepared intent may be cancelled; a protected ticket
+                        // (even outcome unknown) must instead replay unchanged.
+                        self.update(|journal| {
+                            journal.decision = Some(SwitchDecision::Cancel);
+                            journal.resume_operation_id = Some(Uuid::new_v4().to_string());
+                            journal.retry = None;
+                        })?;
+                        continue;
+                    }
                     if let Some(retry) = &journal.retry {
                         if unix_time_ms() < retry.retry_not_before_unix_ms {
                             return Ok(SwitchProgress::Pending {
@@ -1176,25 +1205,28 @@ impl SwitchCoordinator {
                         ),
                     };
                     let resumed = broker
-                        .resume_transition(ResumeArguments {
-                            operation_id: journal
-                                .resume_operation_id
-                                .clone()
-                                .ok_or(SwitchError::RecoveryRequired)?,
-                            reconcile_operation_id: journal
-                                .active_reconcile_operation_id
-                                .clone()
-                                .unwrap_or_else(|| journal.operation_id.clone()),
-                            decision: match decision {
-                                SwitchDecision::Apply => "apply",
-                                SwitchDecision::Cancel => "cancel",
-                            }
-                            .into(),
-                            target,
-                            expected_session_generation: journal
-                                .active_session_generation
-                                .or(journal.expected_session_generation),
-                        })
+                        .resume_transition_for_installed_target(
+                            ResumeArguments {
+                                operation_id: journal
+                                    .resume_operation_id
+                                    .clone()
+                                    .ok_or(SwitchError::RecoveryRequired)?,
+                                reconcile_operation_id: journal
+                                    .active_reconcile_operation_id
+                                    .clone()
+                                    .unwrap_or_else(|| journal.operation_id.clone()),
+                                decision: match decision {
+                                    SwitchDecision::Apply => "apply",
+                                    SwitchDecision::Cancel => "cancel",
+                                }
+                                .into(),
+                                target,
+                                expected_session_generation: journal
+                                    .active_session_generation
+                                    .or(journal.expected_session_generation),
+                            },
+                            self.installed_target.as_ref(),
+                        )
                         .await?;
                     if decision == SwitchDecision::Apply {
                         let selection = current_selection(&self.owner, &self.manifest)
@@ -1453,6 +1485,38 @@ fn retry_delay(attempt: u32) -> u32 {
         .checked_shl(attempt.saturating_sub(1).min(5))
         .unwrap_or(30)
         .min(30)
+}
+
+/// The journal rename is the sole switch-intent commit. Preference consumers
+/// project this validated intent; a second selection-file write is not required
+/// to remember Requested. Terminal/foreign-container journals cannot retarget it.
+pub(crate) fn desired_slot_from_journal(
+    path: &PathBuf,
+    manifest: &VerifiedContainerManifest,
+) -> io::Result<Option<nelomai_contracts::RuntimeSlot>> {
+    let Some(journal) = load_journal(path).map_err(|_| crate::installed_runtime::blocked())? else {
+        return Ok(None);
+    };
+    if journal.phase == SwitchPhase::Complete
+        || journal.target_identity.container_version != manifest.manifest().container_version
+    {
+        return Ok(None);
+    }
+    let target = if journal.cancel_requested {
+        journal
+            .source_identity
+            .as_ref()
+            .map(RuntimeTarget::from_identity)
+    } else {
+        Some(journal.target_identity)
+    };
+    Ok(target
+        .filter(|target| {
+            manifest
+                .identity(target.runtime_slot, None)
+                .is_ok_and(|identity| RuntimeTarget::from_identity(&identity) == *target)
+        })
+        .map(|target| target.runtime_slot))
 }
 
 fn load_journal(path: &PathBuf) -> Result<Option<SwitchJournalV1>, SwitchJournalError> {

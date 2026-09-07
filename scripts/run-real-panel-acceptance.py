@@ -89,7 +89,13 @@ def main():
         run([*fixture, "seed", login], env=env)
         run([binary, "login", args.panel_url, work, login])
         fault_env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(interposer), NELOMAI_TEST_EXIT_PHASE=phase)
-        run([binary, "switch", args.panel_url, work, login], env=fault_env, expected=91)
+        if phase == "complete":
+            prepared = json.loads(run([binary, "switch", args.panel_url, work, login]))
+            assert prepared["phase"] == "auth_resuming" and prepared["barrier"]
+            assert observe(login)["device_generations"] == [1]
+            run([binary, "recover", args.panel_url, work, login], env=fault_env, expected=91)
+        else:
+            run([binary, "switch", args.panel_url, work, login], env=fault_env, expected=91)
         journal_path = work / "common/runtime-switch-v1.json"
         before = json.loads(journal_path.read_text())
         assert before["phase"] == phase, "requested fault hook did not reach its phase"
@@ -108,7 +114,7 @@ def main():
         result = json.loads(run([binary, "recover", args.panel_url, work, login]))
         assert result["phase"] == "complete" and not result["barrier"]
         assert result["operation_id"] == before["operation_id"]
-        expected_slot = args.source_slot if phase == "requested" else target_slot
+        expected_slot = target_slot
         assert result["target"]["runtime_slot"] == expected_slot
         assert result["confirmed_identity"]["slot"] == expected_slot
         assert result["confirmed_identity"]["session_generation"] == 2
@@ -117,12 +123,7 @@ def main():
         assert observed["device_generations"] == [2] and not observed["leases"] and not observed["jobs"]
         applied = [row for row in observed["transitions"] if row["state"] == "applied"]
         assert len(applied) == 1 and applied[0]["source_generation"] == 1 and applied[0]["result_generation"] == 2 and not applied[0]["barrier"]
-        if phase == "requested":
-            superseded = [row for row in observed["transitions"] if row["operation_id"] == before["operation_id"]]
-            assert len(superseded) == 1 and superseded[0]["state"] == "superseded"
-            assert applied[0]["operation_id"] == result["active_operation_id"]
-        else:
-            assert len(observed["transitions"]) == 1 and applied[0]["operation_id"] == before["operation_id"]
+        assert len(observed["transitions"]) == 1 and applied[0]["operation_id"] == before["operation_id"]
         records.append({"phase":phase,"before":observed_before,"after":observed,"final_slot":expected_slot,"child_exit":91,"authenticated_bootstrap":True})
         print(f"PASS real panel/process phase {phase}: {expected_slot}, generation 2", flush=True)
     login, work = prepare("delayed")
@@ -164,7 +165,7 @@ def main():
         assert {row["family"] for row in after["session_identities"]} == {before["session_identities"][0]["family"]}
         assert [row for row in after["session_identities"] if row["id"] == before["session_identities"][0]["id"]][0]["revoked"]
         expiries.append({"delayed_cleanup":delayed_cleanup,"before":before,"after":after})
-        print(f"PASS real expired access with valid refresh (delayed={delayed_cleanup}): same family/device/session",flush=True)
+        print(f"PASS real expired access with valid refresh (delayed={delayed_cleanup}): same family/device; rotated session",flush=True)
     for endpoint in ["reconcile","resume"]:
         login, work = prepare("drop_"+endpoint)
         marker = args.work / (endpoint+"-dropped.json")

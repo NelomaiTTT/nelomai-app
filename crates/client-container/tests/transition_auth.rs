@@ -1914,13 +1914,25 @@ async fn completed_switch_returns_to_active_slot_through_a_fresh_reverse_authori
         RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
     let coordinator = SwitchCoordinator::open(owner, manifest)
         .unwrap()
-        .attach(broker, Arc::new(SwitchControl::default()))
+        .attach(broker.clone(), Arc::new(SwitchControl::default()))
         .require_initial_transition(RuntimeSlot::Latest);
     coordinator.before_tunnel_start().await.unwrap();
-    assert_eq!(
-        coordinator.request(RuntimeSlot::Stable).await.unwrap(),
-        SwitchProgress::Ready,
-    );
+    assert!(coordinator.request(RuntimeSlot::Stable).await.is_err());
+    // Compatibility with an Apply already issued by the previous client: this
+    // explicit broker call seeds real protected completion evidence. The live
+    // coordinator itself must never issue this new cross-slot Apply.
+    let prepared = serde_json::to_value(coordinator.snapshot().unwrap().unwrap()).unwrap();
+    broker
+        .resume_transition(ResumeArguments {
+            operation_id: prepared["resume_operation_id"].as_str().unwrap().into(),
+            reconcile_operation_id: prepared["operation_id"].as_str().unwrap().into(),
+            decision: "apply".into(),
+            target: serde_json::from_value(prepared["target_identity"].clone()).unwrap(),
+            expected_session_generation: prepared["expected_session_generation"].as_u64(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(coordinator.recover().await.unwrap(), SwitchProgress::Ready);
     let applied = coordinator.status_for(&active).unwrap();
     let applied_operation = applied.switch_id.clone().unwrap();
     assert_eq!(applied.phase, Some(SwitchPhase::Complete));
@@ -1942,6 +1954,70 @@ async fn completed_switch_returns_to_active_slot_through_a_fresh_reverse_authori
     coordinator.before_tunnel_start_for(&active).await.unwrap();
     assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 3);
     assert_eq!(state.resume_calls.load(Ordering::SeqCst), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn cancel_replays_dispatched_apply_before_fresh_reverse_without_rewriting_ticket() {
+    let state = Arc::new(Panel::default());
+    let (api, server) = panel(state.clone()).await;
+    let broker = Arc::new(AuthBroker::new(api, legacy_store(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    write_test_selection(root.path(), "0.2.16");
+    let manifest = manifest_with_optional_stable("0.2.16", "0.2.16", true);
+    let active =
+        RuntimeTarget::from_identity(&manifest.identity(RuntimeSlot::Latest, None).unwrap());
+    let coordinator = SwitchCoordinator::open(owner, manifest)
+        .unwrap()
+        .attach(broker.clone(), Arc::new(SwitchControl::default()))
+        .require_initial_transition(RuntimeSlot::Latest);
+    coordinator.before_tunnel_start().await.unwrap();
+    assert!(coordinator.request(RuntimeSlot::Stable).await.is_err());
+    let prepared = serde_json::to_value(coordinator.snapshot().unwrap().unwrap()).unwrap();
+    let args = ResumeArguments {
+        operation_id: prepared["resume_operation_id"].as_str().unwrap().into(),
+        reconcile_operation_id: prepared["operation_id"].as_str().unwrap().into(),
+        decision: "apply".into(),
+        target: serde_json::from_value(prepared["target_identity"].clone()).unwrap(),
+        expected_session_generation: prepared["expected_session_generation"].as_u64(),
+    };
+    // Explicit previous-client dispatch: abort only after real HTTP entered,
+    // leaving the actual broker's durable unknown ticket, not a journal UUID.
+    state.hold_resume.store(1, Ordering::SeqCst);
+    let task = {
+        let broker = broker.clone();
+        tokio::spawn(async move { broker.resume_transition(args).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.resume_calls.load(Ordering::SeqCst) != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("previous-client request reached real HTTP");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    state.hold_resume.store(0, Ordering::SeqCst);
+    state.resume_release.notify_one();
+    assert_eq!(
+        coordinator.cancel_pending_for(&active).await.unwrap(),
+        SwitchProgress::Ready
+    );
+    let status = coordinator.status_for(&active).unwrap();
+    assert_eq!(status.selected_slot, RuntimeSlot::Latest);
+    assert!(!status.restart_required());
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        broker
+            .access_token(None)
+            .await
+            .unwrap()
+            .identity()
+            .session_generation,
+        Some(3)
+    );
     server.abort();
 }
 

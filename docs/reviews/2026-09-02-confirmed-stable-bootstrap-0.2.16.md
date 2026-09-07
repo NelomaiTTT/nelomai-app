@@ -103,3 +103,40 @@ macOS rename-interposer завершает настоящий broker после 
 passes. Дорогие clean-source build_only, полные workspace/Android проверки и
 финальная приёмка выполняются после разрешения вопросов исходников. Никаких
 push, CI, deploy, release, реальных ключей, установки продукта или production DB.
+
+## Task12 fix1: отдельный checkpoint после scoped review
+
+Исторические наблюдения выше сохранены; два пункта исходников исправлены в
+ограниченной волне от `d7b06c1754ad8270c7c4e87dfe5f7e40fa426658`, ожидают rereview.
+Единственный durable Requested journal теперь является авторитетным pending
+intent; preference — восстанавливаемая проекция, которую новый verified startup
+принимает без live-retarget текущего CommonHost. Terminal и чужой container
+journal не переопределяют новую selection.
+
+Новый Resume ticket разрешён лишь для неизменного verified installed target
+координатора; проверка под существующим issuance lock. Уже сохранённый exact
+ticket/evidence replay не блокируется. Prepared UUID не означает dispatch.
+Отмена до dispatch использует Cancel; неизвестный Apply сначала повторяется
+без изменения, затем выполняется отдельный reverse/supersede.
+
+Настоящий CommonHost/private-child тест выявил ещё существовавший отказ первого
+cross-slot admission: новый namespace корректно создаётся cleanup_only, а обычный
+bind не должен его снимать. Теперь только control cleanup после единственного
+exact retained-source match завершает пустой selected namespace и привязывает
+новый scope. Проверены отказ для foreign scope/nonempty/changed source и retry
+после реального отказа записи старого source; ordinary bind не ослаблен.
+
+Focused GREEN: selection16 + switch10 + transition_auth41 + runtime_state8 =75.
+Новый CommonHost до restart сохраняет generation7/Apply0, новый Stable host
+достигает generation8/Apply1, повторный Ready не выдаёт второй Apply. Реальные
+panel/PG smoke в `/tmp/nelomai-task12-fix1-smoke.wEMcuQ`: Requested exit91 теперь
+сохраняет запрошенную Stable и original operation без supersede; clean switch
+остаётся AuthResuming/server generation1 до нового процесса; Complete exit91
+в новом процессе и ещё один replay сохраняют единственный generation2/session.
+Оба восстановленных access проверены настоящим bootstrap.
+
+Producer остаётся instrumented native-effect adapter, не packaged/private-peer
+доказательством. Full matrix не перезапускалась в fix1; controlled reauth,
+delayed cross-product, clean-source full gates и физическая/candidate приёмка
+остаются OPEN/UNRUN. Проверка exact candidate по-прежнему nonzero. Полный fix1
+отчёт и точный freeze SHA находятся в рабочем `task-12-fix1-report.md` у root.

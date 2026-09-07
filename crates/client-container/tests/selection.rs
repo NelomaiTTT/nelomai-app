@@ -16,6 +16,7 @@ use std::{
 #[derive(Clone, Default)]
 struct Records {
     values: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    fail_once: Arc<Mutex<Option<String>>>,
     legacy: Legacy,
 }
 
@@ -48,6 +49,13 @@ impl ProtectedRecordStore for Record {
     }
 
     fn save_record(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        let mut fail = self.records.fail_once.lock().unwrap();
+        if fail.as_deref() == Some(&self.key) {
+            *fail = None;
+            return Err(StorageError::RecoveryRequired(
+                "synthetic one-shot record save failure",
+            ));
+        }
         self.records
             .values
             .lock()
@@ -194,6 +202,81 @@ fn common_host_rejects_second_owner_before_constructing_secret_backend() {
         || -> Records { panic!("secondary startup reached protected backend") },
     );
     assert!(result.is_err());
+}
+
+#[test]
+fn durable_requested_intent_recovers_pending_and_next_startup_target_without_second_write() {
+    use nelomai_client_container::{
+        CleanupEngineRoleV1, CleanupEnvelopeV1, SwitchCoordinator, SwitchJournalV1,
+    };
+    let data = tempfile::tempdir().unwrap();
+    let resources = tempfile::tempdir().unwrap();
+    let key = install_manifest(resources.path(), "0.2.16", true);
+    let records = Records::default();
+    let host = nelomai_client_container::host::prepare_host(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "linux",
+        "x86_64",
+        || records.clone(),
+    )
+    .unwrap();
+    let coordinator =
+        SwitchCoordinator::open(host.owner.clone(), host.selection.manifest().clone()).unwrap();
+    let target = nelomai_client_api::RuntimeTarget::from_identity(
+        &host
+            .selection
+            .manifest()
+            .identity(RuntimeSlot::Stable, None)
+            .unwrap(),
+    );
+    let journal = SwitchJournalV1::requested(
+        "11111111-1111-4111-8111-111111111111".into(),
+        "b".repeat(64),
+        None,
+        Some("device-a".into()),
+        "c".repeat(64),
+        target.clone(),
+        None,
+        CleanupEnvelopeV1 {
+            cleanup_contract_version: 1,
+            lease_ids: vec![],
+            redundant_session_ids: vec![],
+            operations: vec![],
+            engine_role: CleanupEngineRoleV1::Primary,
+            background_reference: None,
+        },
+    );
+    coordinator.begin_requested(journal.clone()).unwrap();
+    // The only committed write is the Requested journal: simulate death before
+    // any projection write, without modifying the committed journal afterward.
+    assert_eq!(
+        coordinator
+            .status_for(host.selection.target())
+            .unwrap()
+            .pending_slot,
+        Some(RuntimeSlot::Stable)
+    );
+    assert_eq!(host.selection.target().runtime_slot, RuntimeSlot::Latest);
+    drop(coordinator);
+    drop(host);
+    let reopened = nelomai_client_container::host::prepare_host(
+        data.path(),
+        resources.path(),
+        Some(&key),
+        "linux",
+        "x86_64",
+        || records.clone(),
+    )
+    .unwrap();
+    assert_eq!(reopened.selection.target(), &target);
+    let coordinator = SwitchCoordinator::open(
+        reopened.owner.clone(),
+        reopened.selection.manifest().clone(),
+    )
+    .unwrap();
+    assert_eq!(coordinator.snapshot().unwrap(), Some(journal));
 }
 
 #[test]
@@ -444,13 +527,71 @@ fn first_start_persists_latest_only_after_real_storage_startup_succeeds() {
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_admits_real_private_child_and_preserves_generation_without_access() {
+    common_host_restart_case(false, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_cancels_prepared_apply_before_restart_without_resurrecting_stable() {
+    common_host_restart_case(true, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_retries_selected_binding_when_exact_old_source_clear_failed() {
+    common_host_restart_case(false, true, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_rejects_changed_source_before_binding_selected_empty_runtime() {
+    common_host_restart_case(false, false, true).await;
+}
+
+#[cfg(unix)]
+async fn common_host_restart_case(
+    cancel_before_restart: bool,
+    fail_source_clear: bool,
+    change_source: bool,
+) {
+    use axum::{routing::post, Json, Router};
     use nelomai_client_container::{host::*, ipc::*};
     use nelomai_client_core::{RuntimeAuthProvider, RuntimeStartPreflight, RuntimeWriterGates};
     use nelomai_client_storage::*;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let data = tempfile::tempdir().unwrap();
     let resources = tempfile::tempdir().unwrap();
     let key = install_manifest_platform(resources.path(), "0.2.16", true, "android", "aarch64");
     let records = Records::default();
+    let resume_calls = Arc::new(AtomicUsize::new(0));
+    let counted = resume_calls.clone();
+    let router = Router::new()
+        .route(
+            "/api/client/v1/connections/runtime-switch/reconcile",
+            post(|Json(body): Json<Value>| async move {
+                Json(json!({"state":"clean", "operation_id":body["operation_id"],
+                "retired_lease_ids":[], "retired_session_ids":[], "retired_operation_ids":[],
+                "retry_after_seconds":null}))
+            }),
+        )
+        .route(
+            "/api/client/v1/auth/runtime/resume",
+            post(move |Json(body): Json<Value>| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let mut identity = body["target_identity"].clone();
+                    identity["session_generation"] =
+                        json!(body["expected_session_generation"].as_u64().unwrap() + 1);
+                    Json(json!({"identity":identity, "access_token":"resumed-access",
+                    "token_type":"Bearer", "access_expires_in":900}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let host = CommonHost::open(
         data.path(),
         resources.path(),
@@ -458,7 +599,7 @@ async fn common_host_admits_real_private_child_and_preserves_generation_without_
         "android",
         "aarch64",
         || records.clone(),
-        nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap(),
+        nelomai_client_api::ClientApi::new(&api_url).unwrap(),
         nelomai_client_container::RuntimeClientProfile {
             platform: nelomai_contracts::Platform::Android,
             platform_version: None,
@@ -539,13 +680,18 @@ async fn common_host_admits_real_private_child_and_preserves_generation_without_
     assert!(client.check_start_barrier().is_ok());
     assert!(record.cleanup_snapshot().unwrap().auth_scope.is_some());
     let installed = host.native_target().clone();
-    assert!(matches!(
-        host.coordinator()
-            .request(RuntimeSlot::Stable)
-            .await
-            .unwrap(),
-        nelomai_client_container::SwitchProgress::Pending { .. }
-    ));
+    let _reply = client
+        .owner_request(HostRequestV1::RuntimeSelect {
+            slot: RuntimeSlot::Stable,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resume_calls.load(Ordering::SeqCst),
+        0,
+        "old host issued Apply before full restart"
+    );
+    assert_eq!(auth.load().unwrap().unwrap().session_generation, Some(7));
     let pending = host.selection().await.unwrap();
     assert_eq!(pending.pending_slot, Some(RuntimeSlot::Stable));
     assert_eq!(pending.target, installed);
@@ -554,6 +700,178 @@ async fn common_host_admits_real_private_child_and_preserves_generation_without_
         &installed,
         "pending preference retargeted the live common incarnation"
     );
+    assert!(auth
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .pending_request
+        .is_none());
+    if cancel_before_restart {
+        client
+            .owner_request(HostRequestV1::RuntimeCancel)
+            .await
+            .unwrap();
+        assert_eq!(resume_calls.load(Ordering::SeqCst), 1);
+        let current = auth.load().unwrap().unwrap();
+        assert_eq!(
+            current.confirmed_identity.unwrap().slot,
+            RuntimeSlot::Latest
+        );
+        assert_eq!(current.session_generation, Some(8));
+        assert!(!host
+            .coordinator()
+            .status_for(host.native_target())
+            .unwrap()
+            .restart_required());
+    }
+    let expected_slot = if cancel_before_restart {
+        RuntimeSlot::Latest
+    } else {
+        RuntimeSlot::Stable
+    };
+    let old_incarnation = pending.incarnation;
+    drop(client);
+    drop(host);
+    // Closing the private channel releases its task's retained owner handle.
+    let host = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Ok(host) = CommonHost::open(
+                data.path(),
+                resources.path(),
+                Some(&key),
+                "android",
+                "aarch64",
+                || records.clone(),
+                nelomai_client_api::ClientApi::new(&api_url).unwrap(),
+                nelomai_client_container::RuntimeClientProfile {
+                    platform: nelomai_contracts::Platform::Android,
+                    platform_version: None,
+                    architecture: "aarch64".into(),
+                },
+                HostNativePorts {
+                    stop: Arc::new(NoNativeWork),
+                    force: Arc::new(nelomai_client_container::UnavailableRuntimeForceStop),
+                    background: Arc::new(NoNativeWork),
+                    updater: None,
+                    storage: None,
+                    relaunch: None,
+                },
+            ) {
+                break host;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("previous common owner released after private channel exit");
+    let view = host.selection().await.unwrap();
+    assert_ne!(view.incarnation, old_incarnation);
+    assert_eq!(view.target.runtime_slot, expected_slot);
+    assert_eq!(
+        resume_calls.load(Ordering::SeqCst),
+        usize::from(cancel_before_restart)
+    );
+    let paths = view.runtime_paths().unwrap();
+    let selected_index = paths
+        .iter()
+        .position(|path| path.slot() == expected_slot)
+        .unwrap();
+    let source_namespace = paths
+        .iter()
+        .find(|path| path.slot() == RuntimeSlot::Latest)
+        .unwrap()
+        .namespace()
+        .to_owned();
+    let mut owners: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            RuntimeRecordOwner::new(ProtectedRuntimeStore::new(
+                records.record(path.namespace()),
+                path,
+            ))
+        })
+        .collect();
+    let selected = owners.remove(selected_index);
+    let selected_record = selected.clone();
+    if change_source {
+        let mut state = record.operational().load().unwrap().unwrap();
+        state.pending_compensation_stop = Some(StoredPendingCompensationStop {
+            operation_id: "changed-after-handoff".into(),
+            lease_id: "synthetic-changed-lease".into(),
+            accept_warm: false,
+            failure_code: None,
+        });
+        record.operational().save(&state).unwrap();
+    }
+    let child = Arc::new(ChildAdmission::new(
+        view.incarnation.clone(),
+        Arc::new(RuntimeWriterGates::default()),
+        Arc::new(RuntimeRecordInventory::new(selected, owners)),
+    ));
+    let (parent, child_socket) = private_socketpair().unwrap();
+    host.attach_android(
+        parent,
+        std::process::id(),
+        uid,
+        uid,
+        &RuntimeAttachRequest {
+            target: view.target,
+            session_generation: view.session_generation,
+            incarnation: view.incarnation,
+        },
+    )
+    .await
+    .unwrap();
+    let client = PrivateRuntimeAuthClient::new(child_socket, child, Arc::new(NoNativeWork));
+    if change_source {
+        assert!(client
+            .owner_request(HostRequestV1::RuntimeReady)
+            .await
+            .is_err());
+        assert!(client.check_start_barrier().is_err());
+        let selected = selected_record.cleanup_snapshot().unwrap();
+        assert!(selected.cleanup_only && selected.auth_scope.is_none());
+        assert_eq!(
+            record.cleanup_snapshot().unwrap().lease_ids,
+            ["synthetic-changed-lease"]
+        );
+        server.abort();
+        return;
+    }
+    if fail_source_clear {
+        *records.fail_once.lock().unwrap() = Some(source_namespace);
+        assert!(client
+            .owner_request(HostRequestV1::RuntimeReady)
+            .await
+            .is_err());
+        assert!(
+            records.fail_once.lock().unwrap().is_none(),
+            "fault reached actual old source save"
+        );
+        assert_eq!(resume_calls.load(Ordering::SeqCst), 1);
+        assert!(client.check_start_barrier().is_err());
+    }
+    for _ in 0..2 {
+        let ready = client.owner_request(HostRequestV1::RuntimeReady).await;
+        assert!(
+            matches!(ready, Ok(HostResponseV1::Done)),
+            "ready={ready:?}, calls={}, generation={:?}, status={:?}",
+            resume_calls.load(Ordering::SeqCst),
+            auth.load().unwrap().unwrap().session_generation,
+            host.coordinator().status_for(host.native_target())
+        );
+        let access = client.access(None).await.unwrap();
+        assert_eq!(access.identity().slot, expected_slot);
+        assert_eq!(access.identity().session_generation, Some(8));
+        assert_eq!(
+            resume_calls.load(Ordering::SeqCst),
+            1,
+            "new incarnation must apply exactly once"
+        );
+    }
+    server.abort();
 }
 
 #[test]

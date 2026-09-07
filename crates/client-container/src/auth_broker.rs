@@ -1942,13 +1942,14 @@ impl AuthBroker {
     /// Cleanup coordinator supplies an accepted clean reconcile operation.
     /// Server independently verifies that authority; this method cannot bypass it.
     pub async fn resume(&self, args: ResumeArguments) -> Result<AccessSnapshot, BrokerError> {
-        self.resume_inner(args, None).await
+        self.resume_inner(args, None, true).await
     }
 
     async fn resume_inner(
         &self,
         args: ResumeArguments,
         transition_operation_id: Option<&str>,
+        allow_new: bool,
     ) -> Result<AccessSnapshot, BrokerError> {
         let stored = args.stored()?;
         let _issuance = self.issuance.lock().await;
@@ -1984,6 +1985,10 @@ impl AuthBroker {
                 {
                     return Err(BrokerError::Cancelled);
                 }
+            } else if !allow_new {
+                // A journal UUID is preparation, not evidence of dispatch.
+                // Only the exact protected ticket may replay across incarnations.
+                return Err(BrokerError::RecoveryRequired);
             }
             let refresh = auth
                 .refresh_token
@@ -2067,6 +2072,43 @@ impl AuthBroker {
         &self,
         args: ResumeArguments,
     ) -> Result<TransitionResumeReceipt, BrokerError> {
+        self.resume_transition_inner(args, true).await
+    }
+
+    pub(crate) async fn resume_transition_for_installed_target(
+        &self,
+        args: ResumeArguments,
+        installed: Option<&RuntimeTarget>,
+    ) -> Result<TransitionResumeReceipt, BrokerError> {
+        let allow_new = installed == Some(&args.target);
+        self.resume_transition_inner(args, allow_new).await
+    }
+
+    pub(crate) async fn transition_resume_is_undispatched(
+        &self,
+        operation: &str,
+    ) -> Result<bool, BrokerError> {
+        let _issuance = self.issuance.lock().await;
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        Self::active(&auth)?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        let authority = meta
+            .transition_authorities
+            .iter()
+            .find(|authority| authority.reconcile_operation_id == operation)
+            .ok_or(BrokerError::RecoveryRequired)?;
+        Ok(meta.pending_request.is_none()
+            && meta.pending_recovery.is_none()
+            && authority.resume_ticket.is_none()
+            && authority.resume_evidence.is_none())
+    }
+
+    async fn resume_transition_inner(
+        &self,
+        args: ResumeArguments,
+        allow_new: bool,
+    ) -> Result<TransitionResumeReceipt, BrokerError> {
         tokio::time::timeout(REQUEST_TIMEOUT, async {
             let historical = {
                 let _state = self.state.lock().await;
@@ -2139,7 +2181,7 @@ impl AuthBroker {
             }
             let reconcile_operation_id = args.reconcile_operation_id.clone();
             let access = self
-                .resume_inner(args, Some(&reconcile_operation_id))
+                .resume_inner(args, Some(&reconcile_operation_id), allow_new)
                 .await?;
             Ok(TransitionResumeReceipt {
                 identity: access.identity().clone(),

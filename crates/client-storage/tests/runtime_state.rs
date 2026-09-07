@@ -24,6 +24,42 @@ impl ProtectedRecordStore for Raw {
 }
 
 #[test]
+fn selected_empty_cleanup_binding_retries_exact_scope_but_rejects_payload_and_foreign_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+    let backend = ProtectedRuntimeStore::new(Raw::default(), paths.clone());
+    backend.save(&RuntimeStateV1::empty(&paths, true)).unwrap();
+    let owner = RuntimeRecordOwner::new(backend);
+    let scope = RuntimeAuthScope {
+        auth_epoch: 1,
+        family: "synthetic-family".into(),
+        identity: nelomai_contracts::RuntimeIdentity {
+            slot: RuntimeSlot::Stable,
+            runtime_version: "0.2.16".into(),
+            container_version: "0.2.16".into(),
+            runtime_contract_version: 1,
+            session_generation: Some(2),
+        },
+    };
+    assert!(owner.bind_empty_scope(&scope).is_err());
+    owner.complete_empty_cleanup_and_bind(&scope).unwrap();
+    owner.complete_empty_cleanup_and_bind(&scope).unwrap();
+    let foreign = RuntimeAuthScope {
+        family: "other-family".into(),
+        ..scope.clone()
+    };
+    assert!(owner.complete_empty_cleanup_and_bind(&foreign).is_err());
+    let mut state = owner.operational().load().unwrap().unwrap();
+    state.compatibility = Some(StoredCompatibility {
+        update_required: false,
+        observed_at_unix: 5,
+    });
+    owner.operational().save(&state).unwrap();
+    assert!(owner.complete_empty_cleanup_and_bind(&scope).is_err());
+    assert_eq!(owner.operational().load().unwrap().unwrap(), state);
+}
+
+#[test]
 fn runtime_cache_scope_cannot_be_relabelled_or_inherited_by_a_new_login() {
     let root = tempfile::tempdir().unwrap();
     let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();

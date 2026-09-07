@@ -401,6 +401,41 @@ impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
     }
     /// Owner/control only: caller holds actual runtime-writer quiescence (or
     /// has not handed the record to any runtime yet). Never called by access reads.
+    /// Completes the selected empty namespace's startup barrier only after the
+    /// caller validates an exact source cleanup receipt. Ordinary admission
+    /// must continue to use `bind_empty_scope`, which cannot clear this barrier.
+    pub fn complete_empty_cleanup_and_bind(
+        &self,
+        scope: &RuntimeAuthScope,
+    ) -> Result<(), StorageError> {
+        scope.validate()?;
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let mut current = self.load_required()?;
+        if !current.operationally_empty() {
+            return Err(StorageError::RecoveryRequired(
+                "selected runtime is not empty",
+            ));
+        }
+        if !current.cleanup_only && current.auth_scope.as_ref() == Some(scope) {
+            return Ok(());
+        }
+        if current.auth_scope.is_some()
+            || current.slot != scope.identity.slot
+            || current.runtime_version != scope.identity.runtime_version
+        {
+            return Err(StorageError::RecoveryRequired(
+                "selected runtime is not empty",
+            ));
+        }
+        current.complete_legacy_cleanup();
+        current.auth_scope = Some(scope.clone());
+        self.backend.save(&current)
+    }
+
+    /// Owner/control only; ordinary admission never clears cleanup-only state.
     pub fn bind_empty_scope(&self, scope: &RuntimeAuthScope) -> Result<(), StorageError> {
         scope.validate()?;
         let _guard = self

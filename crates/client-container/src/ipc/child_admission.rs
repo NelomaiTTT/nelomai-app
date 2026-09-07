@@ -151,7 +151,9 @@ impl<S: RuntimeStateStore> ScopeAdmission for RuntimeRecordInventory<S> {
         }
         // Validate/enroll selected empty state before clearing the exact source.
         // Admission remains closed if either durable operation fails.
-        self.bind_empty_scope(scope, writers)?;
+        self.target
+            .complete_empty_cleanup_and_bind(scope)
+            .map_err(|_| PrivateError::RecoveryRequired)?;
         source
             .complete_cleanup(snapshot)
             .map_err(|_| PrivateError::RecoveryRequired)

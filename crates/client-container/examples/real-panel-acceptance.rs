@@ -478,15 +478,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 file.write_all(&serde_json::to_vec(&json!({"schema_version":1,"container_version":"0.2.16","selected_slot":source_slot,"pending_slot":null}))?)?;
                 file.sync_all()?;
             }
-            let coordinator = SwitchCoordinator::open(owner, test_manifest())?
+            let mut coordinator = SwitchCoordinator::open(owner.clone(), test_manifest())?
                 .attach(broker.clone(), native.clone());
+            if arguments[1] == "recover" {
+                // This is a new process with no running source child. Resolve
+                // the durable restart selection through the owner API before
+                // constructing its selected coordinator. Native admission here
+                // remains an instrumented effect, not the production peer.
+                let active = target(source_slot);
+                if coordinator.status_for(&active)?.restart_required() {
+                    coordinator.prepare_runtime_restart(&active).await?;
+                    drop(coordinator);
+                    coordinator = SwitchCoordinator::open(owner, test_manifest())?
+                        .attach(broker.clone(), native.clone());
+                }
+            }
             let result = if arguments[1] == "switch" {
                 native.start()?;
                 coordinator.request(target_slot).await
             } else {
                 coordinator.recover().await
             };
-            let result = result?;
+            let result = match result {
+                Ok(result) => result,
+                Err(error)
+                    if arguments[1] == "switch"
+                        && coordinator
+                            .status_for(&target(source_slot))?
+                            .restart_required()
+                        && coordinator
+                            .status_for(&target(source_slot))?
+                            .local_stop_confirmed()
+                        && coordinator.snapshot()?.is_some_and(|journal| {
+                            journal.phase() == nelomai_client_container::SwitchPhase::AuthResuming
+                        }) =>
+                {
+                    let _ = error;
+                    nelomai_client_container::SwitchProgress::Pending {
+                        retry_after_seconds: 1,
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            };
             let journal = coordinator.snapshot()?.ok_or("switch journal missing")?;
             let saved = serde_json::to_value(&journal)?;
             let access = if journal.phase() == nelomai_client_container::SwitchPhase::Complete {
