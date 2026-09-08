@@ -11,6 +11,8 @@ pub mod container;
 #[cfg(desktop)]
 mod desktop;
 mod diagnostics;
+#[cfg(any(target_os = "macos", test))]
+mod macos_power;
 #[cfg(desktop)]
 mod network_incidents;
 #[cfg(target_os = "android")]
@@ -498,6 +500,7 @@ fn automatic_upload_error_code(error: &ApplicationError) -> String {
 
     match error {
         ApplicationError::Storage => "storage_unavailable".to_string(),
+        ApplicationError::RecoveryDeferred => "recovery_power_deferred".to_string(),
         ApplicationError::Clock => "clock_unavailable".to_string(),
         ApplicationError::Api(error) => api_code(error),
         ApplicationError::Core(error) => match error {
@@ -553,8 +556,23 @@ fn start_physical_network_scheduler(
         interval.tick().await;
         loop {
             interval.tick().await;
+            #[cfg(target_os = "macos")]
+            if macos_power::defer_reason().is_some() {
+                continue;
+            }
             if matches!(
-                application.poll_physical_network(current_unix_time()).await,
+                application
+                    .poll_physical_network_guarded(current_unix_time(), || {
+                        #[cfg(target_os = "macos")]
+                        {
+                            macos_power::defer_reason().is_none()
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            true
+                        }
+                    })
+                    .await,
                 Ok(nelomai_client_core::PhysicalNetworkPollOutcome::Reconnected)
             ) {
                 connection_intent.wake_for_network_change().await;
@@ -597,6 +615,8 @@ fn start_connection_metrics_scheduler(
         let mut stall_recovery_limiter = connection_metrics::StallRecoveryLimiter::default();
         #[cfg(target_os = "macos")]
         let mut macos_stall_recovery = MacosStallRecoveryEpisode::default();
+        #[cfg(target_os = "macos")]
+        let mut last_power_defer = None;
         #[cfg(windows)]
         let mut windows_service_recovery = WindowsServiceRecoveryEpisode::default();
         loop {
@@ -618,6 +638,24 @@ fn start_connection_metrics_scheduler(
                 continue;
             };
             let observed = tracker.is_observed().await;
+            #[cfg(target_os = "macos")]
+            {
+                let reason = macos_power::defer_reason();
+                if reason != last_power_defer {
+                    diagnostics.record_named(
+                        "tunnel.recovery.power_gate",
+                        Some(&context.session_id),
+                        None,
+                        Some(reason.unwrap_or("recovery_resumed")),
+                    );
+                    last_power_defer = reason;
+                }
+                if reason.is_some() {
+                    last_incident_sample = None;
+                    last_diagnostics_sample = None;
+                    continue;
+                }
+            }
             let endpoint_route_guard =
                 cfg!(windows) && context.layer == nelomai_contracts::Layer::Stray;
             let incident_sampling = cfg!(desktop);
@@ -1162,6 +1200,10 @@ async fn diagnose_and_recover_macos_stall(
 ) -> MacosStallRecoveryResult {
     use nelomai_client_core::{StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome};
 
+    if macos_power::defer_reason().is_some() {
+        return MacosStallRecoveryResult::Retry;
+    }
+
     let tunnel_probe_url = format!("{PANEL_BASE}/health");
     let tunnel_probe = application.probe_fresh_connection_latency_ms(&tunnel_probe_url);
     let direct_probe = async {
@@ -1176,6 +1218,9 @@ async fn diagnose_and_recover_macos_stall(
         }
     };
     let (tunnel_latency, direct_succeeded) = tokio::join!(tunnel_probe, direct_probe);
+    if macos_power::defer_reason().is_some() {
+        return MacosStallRecoveryResult::Retry;
+    }
     let classification = classify_desktop_stall_probe(tunnel_latency.is_some(), direct_succeeded);
     let classification_code = match classification {
         DesktopStallClassification::TunnelPathFailed => "tunnel_path_failed_direct_ok",
@@ -1213,6 +1258,9 @@ async fn diagnose_and_recover_macos_stall(
             .inner()
             .clone();
         if runtime.handle_stall(&context.session_id).await {
+            if macos_power::defer_reason().is_some() {
+                return MacosStallRecoveryResult::Retry;
+            }
             return MacosStallRecoveryResult::Complete;
         }
     }
@@ -1231,6 +1279,10 @@ async fn diagnose_and_recover_macos_stall(
         );
     }
 
+    if macos_power::defer_reason().is_some() {
+        limiter.cancel_attempt(&context.session_id, attempt_unix);
+        return MacosStallRecoveryResult::Retry;
+    }
     let rebind = application
         .recover_stalled_data_plane(&context.session_id, StalledDataPlaneRecovery::RebindUdp)
         .await;
@@ -1297,6 +1349,10 @@ async fn diagnose_and_recover_macos_stall(
     }
 
     for restart_attempt in 1..=2 {
+        if macos_power::defer_reason().is_some() {
+            limiter.cancel_attempt(&context.session_id, attempt_unix);
+            return MacosStallRecoveryResult::Retry;
+        }
         if restart_attempt > 1 {
             attempt_unix = current_unix_time();
             if !limiter.begin_attempt(&context.session_id, attempt_unix) {

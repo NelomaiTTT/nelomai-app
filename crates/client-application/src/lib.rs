@@ -342,6 +342,8 @@ impl ApplicationApi for ClientApi {
 
 #[derive(Debug, Error)]
 pub enum ApplicationError {
+    #[error("автоматическое восстановление отложено до пробуждения")]
+    RecoveryDeferred,
     #[error("защищённое хранилище недоступно")]
     Storage,
     #[error("не удалось определить текущее время")]
@@ -578,6 +580,17 @@ where
     ) -> Result<PhysicalNetworkPollOutcome, ApplicationError> {
         self.core
             .poll_physical_network(now_unix)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn poll_physical_network_guarded(
+        &self,
+        now_unix: i64,
+        allowed: impl Fn() -> bool + Send,
+    ) -> Result<PhysicalNetworkPollOutcome, ApplicationError> {
+        self.core
+            .poll_physical_network_guarded(now_unix, allowed)
             .await
             .map_err(Into::into)
     }
@@ -936,8 +949,19 @@ where
     #[cfg(not(target_os = "android"))]
     pub async fn connection_intent_attempt(
         &self,
+        options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        self.connection_intent_attempt_guarded(options, now_unix, || true)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn connection_intent_attempt_guarded(
+        &self,
         mut options: ConnectOptions,
         now_unix: i64,
+        allowed: impl Fn() -> bool + Send + Sync,
     ) -> Result<Connection, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
@@ -960,12 +984,16 @@ where
                     .unwrap_or_default(),
             }
         };
-        let result = self
-            .core
-            .connection_intent_attempt_with_cancellation_epoch(options, now_unix, cancel_epoch)
-            .await;
+        let result = if allowed() {
+            self.core
+                .connection_intent_attempt_with_cancellation_epoch(options, now_unix, cancel_epoch)
+                .await
+                .map_err(Into::into)
+        } else {
+            Err(ApplicationError::RecoveryDeferred)
+        };
         self.core.finish_start_attempt();
-        result.map_err(Into::into)
+        result
     }
 
     #[cfg(not(target_os = "android"))]
@@ -980,8 +1008,19 @@ where
     #[cfg(not(target_os = "android"))]
     pub async fn replace_stalled_connection(
         &self,
+        options: ConnectOptions,
+        now_unix: i64,
+    ) -> Result<Connection, ApplicationError> {
+        self.replace_stalled_connection_guarded(options, now_unix, || true)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn replace_stalled_connection_guarded(
+        &self,
         mut options: ConnectOptions,
         now_unix: i64,
+        allowed: impl Fn() -> bool + Send + Sync,
     ) -> Result<Connection, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
@@ -994,10 +1033,17 @@ where
             {
                 Vec::new()
             } else {
-                self.refresh_probes(options.layer, options.egress_mode, now_unix)
-                    .await?
-                    .probes
+                let probes = self
+                    .refresh_probes(options.layer, options.egress_mode, now_unix)
+                    .await;
+                if !allowed() {
+                    return Err(ApplicationError::RecoveryDeferred);
+                }
+                probes?.probes
             };
+            if !allowed() {
+                return Err(ApplicationError::RecoveryDeferred);
+            }
             self.core
                 .replace_stalled_connection_with_cancellation_epoch(options, now_unix, cancel_epoch)
                 .await

@@ -935,6 +935,10 @@ impl From<ApplicationError> for CommandError {
             ApplicationError::Clock => {
                 Self::new("clock_unavailable", "Не удалось определить текущее время")
             }
+            ApplicationError::RecoveryDeferred => Self::new(
+                "recovery_power_deferred",
+                "Восстановление продолжится после пробуждения",
+            ),
             ApplicationError::Api(error) => Self::from_api(error),
             ApplicationError::Core(error) => Self::from_core(error),
         }

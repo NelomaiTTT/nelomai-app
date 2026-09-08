@@ -302,7 +302,7 @@ impl DesktopConnectionIntent {
         };
         self.diagnostics
             .record_connection_intent(ConnectionIntentDiagnosticEvent::Started);
-        self.run_attempt(generation).await
+        self.run_attempt(generation, false).await
     }
 
     pub(crate) async fn cancel(&self) -> bool {
@@ -382,6 +382,10 @@ impl DesktopConnectionIntent {
             return true;
         }
 
+        #[cfg(target_os = "macos")]
+        if crate::macos_power::defer_reason().is_some() {
+            return true;
+        }
         let generation = {
             let mut state = self.state.lock().await;
             if state
@@ -412,7 +416,7 @@ impl DesktopConnectionIntent {
         };
         self.diagnostics
             .record_connection_intent(ConnectionIntentDiagnosticEvent::LeaseReplacementStarted);
-        let _ = self.run_attempt(generation).await;
+        let _ = self.run_attempt(generation, true).await;
         true
     }
 
@@ -422,6 +426,9 @@ impl DesktopConnectionIntent {
         generation: IntentGeneration,
         lease_id: &str,
     ) -> Option<Connection> {
+        if crate::macos_power::defer_reason().is_some() {
+            return None;
+        }
         let rebind = self
             .application
             .recover_stalled_data_plane(lease_id, StalledDataPlaneRecovery::RebindUdp)
@@ -444,6 +451,9 @@ impl DesktopConnectionIntent {
             }
         }
 
+        if crate::macos_power::defer_reason().is_some() {
+            return None;
+        }
         let local_restart = self
             .application
             .recover_stalled_data_plane(lease_id, StalledDataPlaneRecovery::RestartLocalTunnel)
@@ -526,7 +536,17 @@ impl DesktopConnectionIntent {
                 .then(|| state.coordinator.generation())
             };
             if let Some(generation) = generation {
-                let _ = self.run_attempt(generation).await;
+                #[cfg(target_os = "macos")]
+                if crate::macos_power::defer_reason().is_some() {
+                    // Keep the same pending intent without spending its retry budget.
+                    // Manual start/stop do not enter this scheduler-only gate.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                        _ = self.wake.notified() => {},
+                    }
+                    continue;
+                }
+                let _ = self.run_attempt(generation, true).await;
             }
         }
     }
@@ -534,6 +554,7 @@ impl DesktopConnectionIntent {
     async fn run_attempt(
         &self,
         generation: IntentGeneration,
+        automatic: bool,
     ) -> Result<StartCommandResponse, CommandError> {
         let (
             mut options,
@@ -622,6 +643,7 @@ impl DesktopConnectionIntent {
                     state.initial_preflight = None;
                 }
                 InitialDesktopPreflightAction::RunLegacy => {
+                    self.wait_for_recovery_power(generation, automatic).await?;
                     let skip_probe_refresh = initial_preflight
                         .quick_toggle_skip_probe_refresh
                         .unwrap_or(false);
@@ -672,17 +694,37 @@ impl DesktopConnectionIntent {
             }
         }
         if repair_before_attempt {
+            self.wait_for_recovery_power(generation, automatic).await?;
             let _ = crate::platform::prepare_tunnel(self.app.clone()).await;
         }
+        self.wait_for_recovery_power(generation, automatic).await?;
+        let recovery_allowed = || {
+            #[cfg(target_os = "macos")]
+            {
+                !automatic || crate::macos_power::defer_reason().is_none()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                true
+            }
+        };
         let result = match attempt_kind {
             AttemptKind::Start => {
                 self.application
-                    .connection_intent_attempt(options, crate::current_unix_time())
+                    .connection_intent_attempt_guarded(
+                        options,
+                        crate::current_unix_time(),
+                        recovery_allowed,
+                    )
                     .await
             }
             AttemptKind::StallReplacement => {
                 self.application
-                    .replace_stalled_connection(options, crate::current_unix_time())
+                    .replace_stalled_connection_guarded(
+                        options,
+                        crate::current_unix_time(),
+                        recovery_allowed,
+                    )
                     .await
             }
         };
@@ -706,6 +748,34 @@ impl DesktopConnectionIntent {
             Ok(connection) => self.complete_success(generation, connection).await,
             Err(error) => self.complete_error(generation, error).await,
         }
+    }
+
+    async fn wait_for_recovery_power(
+        &self,
+        generation: IntentGeneration,
+        _automatic: bool,
+    ) -> Result<(), CommandError> {
+        #[cfg(target_os = "macos")]
+        while _automatic && crate::macos_power::defer_reason().is_some() {
+            {
+                let mut state = self.state.lock().await;
+                if !attempt_is_current_after_async_boundary(&mut state.coordinator, generation) {
+                    return Err(CommandError::new(
+                        "connection_intent_cancelled",
+                        "Подключение отменено",
+                    ));
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let mut state = self.state.lock().await;
+        if !attempt_is_current_after_async_boundary(&mut state.coordinator, generation) {
+            return Err(CommandError::new(
+                "connection_intent_cancelled",
+                "Подключение отменено",
+            ));
+        }
+        Ok(())
     }
 
     async fn refresh_recovery_capability(&self) -> Result<(), ApplicationError> {
@@ -911,6 +981,24 @@ impl DesktopConnectionIntent {
         generation: IntentGeneration,
         error: ApplicationError,
     ) -> Result<StartCommandResponse, CommandError> {
+        if matches!(error, ApplicationError::RecoveryDeferred) {
+            let mut state = self.state.lock().await;
+            if state.coordinator.accept_result(generation) != RecoveryDecision::Accept {
+                state.coordinator.complete_compensation(generation);
+                return Err(CommandError::new(
+                    "connection_intent_cancelled",
+                    "Подключение отменено",
+                ));
+            }
+            let next = crate::current_unix_time().saturating_add(1);
+            state.next_retry_at_unix = Some(next);
+            // This is a power pause, not a failed attempt: retain the intent and
+            // its retry budget. The scheduler gates it until full wake + grace.
+            drop(state);
+            self.emit_change(None);
+            self.wake.notify_one();
+            return Ok(StartCommandResponse::recovering(Some(next)));
+        }
         let code = stable_error_code(&error);
         let retry_after_seconds = error_retry_after_seconds(&error);
         let command_error = CommandError::from(error);
@@ -1284,6 +1372,7 @@ fn stable_error_code(error: &ApplicationError) -> String {
 
     match error {
         ApplicationError::Storage => "storage_unavailable".to_string(),
+        ApplicationError::RecoveryDeferred => "recovery_power_deferred".to_string(),
         ApplicationError::Clock => "clock_unavailable".to_string(),
         ApplicationError::Api(error) => api_code(error),
         ApplicationError::Core(error) => match error {

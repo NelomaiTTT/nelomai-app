@@ -1847,7 +1847,7 @@ async fn confirmed_desktop_network_change_restarts_only_the_local_tunnel() {
         .unwrap();
     fixture
         .tunnel
-        .set_fingerprints(["network-a", "network-b", "network-b"]);
+        .set_fingerprints(["network-a", "network-b", "network-b", "network-b"]);
     fixture
         .core
         .start(
@@ -1873,11 +1873,32 @@ async fn confirmed_desktop_network_change_restarts_only_the_local_tunnel() {
         Some("network-a")
     );
 
+    fixture
+        .tunnel
+        .fail_next_fingerprint
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .core
+            .poll_physical_network_guarded(1_099, || false)
+            .await
+            .unwrap(),
+        PhysicalNetworkPollOutcome::RetryDeferred
+    );
     assert_eq!(
         fixture.core.poll_physical_network(1_100).await.unwrap(),
         PhysicalNetworkPollOutcome::ChangePending
     );
     assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .core
+            .poll_physical_network_guarded(1_129, || false)
+            .await
+            .unwrap(),
+        PhysicalNetworkPollOutcome::RetryDeferred
+    );
     assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
     assert_eq!(
         fixture.core.poll_physical_network(1_130).await.unwrap(),
@@ -2412,6 +2433,7 @@ struct CoordinatorTunnel {
     status: Mutex<TunnelStatus>,
     fingerprints: Mutex<VecDeque<String>>,
     fingerprint_calls: AtomicUsize,
+    fail_next_fingerprint: AtomicBool,
     block_fingerprint: AtomicBool,
     fingerprint_release: Notify,
     capability_calls: AtomicUsize,
@@ -2480,6 +2502,11 @@ impl TunnelController for CoordinatorTunnel {
 
     async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
         self.fingerprint_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_next_fingerprint.swap(false, Ordering::SeqCst) {
+            return Err(TunnelError::Backend(
+                "physical_egress_unavailable".to_string(),
+            ));
+        }
         if self.block_fingerprint.load(Ordering::SeqCst) {
             self.fingerprint_release.notified().await;
         }

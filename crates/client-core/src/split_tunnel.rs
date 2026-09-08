@@ -741,6 +741,14 @@ where
         &self,
         now_unix: i64,
     ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
+        self.poll_physical_network_guarded(now_unix, || true).await
+    }
+
+    pub async fn poll_physical_network_guarded(
+        &self,
+        now_unix: i64,
+        allowed: impl Fn() -> bool + Send,
+    ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
         let Ok(_split_guard) = self.split_tunnel_gate.try_lock() else {
             return Ok(PhysicalNetworkPollOutcome::Busy);
         };
@@ -764,7 +772,11 @@ where
             self.physical_network_change.lock().await.reset();
             return Ok(PhysicalNetworkPollOutcome::Skipped);
         }
-        let fingerprint = match self.tunnel.physical_network_fingerprint().await {
+        let fingerprint_result = self.tunnel.physical_network_fingerprint().await;
+        if !allowed() {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        }
+        let fingerprint = match fingerprint_result {
             Ok(Some(fingerprint)) => fingerprint,
             Ok(None) => {
                 self.physical_network_change.lock().await.reset();
@@ -838,6 +850,9 @@ where
             }
             return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
         };
+        if !allowed() {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        }
         if let Err(error) = self.tunnel.stop().await {
             let tunnel_stopped = self
                 .tunnel

@@ -157,6 +157,44 @@ async fn probe_cache_is_separate_for_ipv4_and_ipv6_pools() {
     );
 }
 
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn automatic_attempts_defer_when_power_changes_during_probes() {
+    for (replacement, probes_fail) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (application, api) = application();
+        api.all_probes_fail.store(probes_fail, Ordering::SeqCst);
+        let options = ConnectOptions {
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
+            probes: Vec::new(),
+            allow_alternate: true,
+        };
+        // Initially allowed; the actual probe phase crosses into a deferred state.
+        let allowed = || api.probe_calls.load(Ordering::SeqCst) == 0;
+        assert!(allowed());
+        let result = if replacement {
+            application
+                .replace_stalled_connection_guarded(options.clone(), 1_800_000_000, allowed)
+                .await
+        } else {
+            application
+                .connection_intent_attempt_guarded(options.clone(), 1_800_000_000, allowed)
+                .await
+        };
+        assert!(
+            matches!(result, Err(ApplicationError::RecoveryDeferred)),
+            "{result:?}"
+        );
+        assert!(api.start_request.lock().unwrap().is_none());
+        // Manual starts keep their existing path, even while the automatic guard denies.
+        api.all_probes_fail.store(false, Ordering::SeqCst);
+        assert!(application.start(options, 1_800_000_001).await.is_ok());
+        assert!(api.start_request.lock().unwrap().is_some());
+    }
+}
+
 #[derive(Default)]
 struct MemoryStore(Mutex<Option<StoredAuth>>);
 
