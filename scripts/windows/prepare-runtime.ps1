@@ -42,6 +42,11 @@ git init $source
 git -C $source remote add origin https://github.com/WireGuard/wireguard-windows.git
 git -C $source fetch --depth 1 origin $WireGuardWindowsCommit
 git -C $source checkout --detach FETCH_HEAD
+$downloadPatch = Join-Path $root "patches/wireguard-windows-toolchain-download.patch"
+git -C $source apply --check --unidiff-zero $downloadPatch
+if ($LASTEXITCODE -ne 0) { throw "Pinned WireGuard download patch no longer applies" }
+git -C $source apply --unidiff-zero $downloadPatch
+if ($LASTEXITCODE -ne 0) { throw "Failed to apply pinned WireGuard download patch" }
 $wireGuardBuild = Join-Path $source "embeddable-dll-service/build.bat"
 $WireGuardBuildMaximumAttempts = 3
 for ($wireGuardBuildAttempt = 1; $wireGuardBuildAttempt -le $WireGuardBuildMaximumAttempts; $wireGuardBuildAttempt++) {

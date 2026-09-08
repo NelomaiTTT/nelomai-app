@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 # The same immutable source archive and digest as the pinned upstream build.bat.
-$url = "https://git.zx2c4.com/wireguard-tools/snapshot/wireguard-tools-06a99cce2c9998f53eb30d2f258a9e5ff286445b.zip"
-$expected = "b7a73e027cee3127f3cccba8ad3a08ea61ccd42d3ea5c28c548a8e0ec9e10cf6"
+$url = "https://codeload.github.com/WireGuard/wireguard-tools/zip/06a99cce2c9998f53eb30d2f258a9e5ff286445b"
+$expected = "209db11b588eb4dc55a05ee70ceea44690ddad44e945d8299e95465a5dec4d7d"
 $gitRoot = Split-Path (Split-Path (Get-Command git.exe).Source -Parent) -Parent
 $clients = @{
     system = Join-Path ([Environment]::SystemDirectory) "curl.exe"
