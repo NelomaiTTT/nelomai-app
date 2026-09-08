@@ -5,6 +5,24 @@ from scripts.tests.test_android_runtime_collisions import module
 
 
 class ApkManifestTest(unittest.TestCase):
+    def test_apk_version_code_must_follow_release_version(self):
+        check = module('check-container-apk')
+        for version, code in [('0.2.15', '2015'), ('0.2.16', '2016'), ('0.3.0', '3000'), ('1.0.0', '1000000')]:
+            xml = f'<manifest xmlns:android="http://schemas.android.com/apk/res/android" android:versionName="{version}" android:versionCode="{code}"/>'
+            check.verify_version(xml, version)
+            with self.assertRaises(ValueError):
+                check.verify_version(xml.replace(f'Code="{code}"', 'Code="1"'), version)
+            with self.assertRaises(ValueError):
+                check.verify_version(xml.replace(f'Name="{version}"', 'Name="0.0.1"'), version)
+        with self.assertRaises(ValueError):
+            check.verify_version('<manifest/>', '0.2.16')
+
+    def test_unrepresentable_apk_release_versions_are_rejected(self):
+        check = module('check-container-apk')
+        for version in ['0.0.0', '0.2.1000', '0.1000.0', '2100.0.1', '0.2.16-beta', '0.2', None]:
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                check.verify_version('<manifest/>', version)
+
     def test_acceptance_requires_stable_dex_but_shipping_still_rejects_it(self):
         check = module('check-container-apk')
         self.assertTrue(callable(getattr(check, 'verify_classes', None)), 'explicit acceptance-only DEX gate is missing')

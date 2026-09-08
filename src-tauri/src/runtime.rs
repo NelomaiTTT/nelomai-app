@@ -362,15 +362,9 @@ fn setup_desktop(
     app.manage(metrics.clone());
     app.manage(intent.clone());
     let handle = app.handle().clone();
-    tauri::async_runtime::spawn(async move {
-        if port
-            .owner_request(nelomai_client_container::host::HostRequestV1::RuntimeReady)
-            .await
-            .is_err()
-        {
-            diagnostics.record_named("startup.runtime_recovery_required", None, None, None);
-            return;
-        }
+    let startup_diagnostics = diagnostics.clone();
+    let startup = Arc::new(runtime_startup::RuntimeStartup::new(move || {
+        diagnostics.record_named("startup.runtime_ready", None, None, None);
         start_split_tunnel_scheduler(application.clone(), split);
         start_physical_network_scheduler(application.clone(), intent.clone());
         start_pending_stop_scheduler(application.clone());
@@ -389,6 +383,12 @@ fn setup_desktop(
             diagnostics,
         );
         start_push_registration_scheduler(handle.clone(), application, push);
+    }));
+    app.manage(startup.clone());
+    tauri::async_runtime::spawn(async move {
+        let _ = startup
+            .recover(|| async { runtime_startup::request_ready(&port, &startup_diagnostics).await })
+            .await;
     });
     // Tray/lifecycle remain available even when record admission needs recovery.
     let handle = app.handle().clone();

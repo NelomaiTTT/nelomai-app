@@ -66,9 +66,18 @@ android {
         applicationId = "ru.nelomai.client"
         minSdk = 24
         targetSdk = 36
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         val sourceVersion = (groovy.json.JsonSlurper().parse(rootDir.resolve("../../../src-tauri/tauri.conf.json")) as Map<*, *>)["version"] as String
-        versionName = tauriProperties.getProperty("tauri.android.versionName", sourceVersion)
+        check(sourceVersion.matches(Regex("[0-9]+\\.[0-9]+\\.[0-9]+"))) { "Android release version must be major.minor.patch" }
+        val (major, minor, patch) = sourceVersion.split('.').map { it.toLong() }
+        check(major <= 2100 && minor <= 999 && patch <= 999) { "Android release version exceeds versionCode range" }
+        val sourceCode = major * 1_000_000 + minor * 1_000 + patch
+        check(sourceCode in 1..2_100_000_000L) { "Android versionCode is out of range" }
+        check(tauriProperties.getProperty("tauri.android.versionCode", sourceCode.toString()).toLong() == sourceCode &&
+            tauriProperties.getProperty("tauri.android.versionName", sourceVersion) == sourceVersion) {
+            "Stale tauri.properties: Android version must match tauri.conf.json"
+        }
+        versionCode = sourceCode.toInt()
+        versionName = sourceVersion
         buildConfigField("String", "RUNTIME_SLOT", "\"latest\"")
         val runtimeVersion = if (acceptancePackage) "0.2.17" else sourceVersion
         buildConfigField("String", "RUNTIME_VERSION", "\"$runtimeVersion\"")

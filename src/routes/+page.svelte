@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { StartupRetry } from "$lib/startup-retry";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import ChangelogPanel from "$lib/ChangelogPanel.svelte";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
@@ -118,6 +119,8 @@
   let startupTimer: number | null = null;
   let startupKickoffTimer: number | null = null;
   let startupSlow = $state(false);
+  let startupPending = $state(false);
+  const startupRetry = new StartupRetry();
   let runtimeStateBusy = false;
   let splitTunnelState = $state<SplitTunnelState | null>(null);
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
@@ -283,6 +286,7 @@
     window.addEventListener("popstate", handleHistoryChange);
     return () => {
       disposed = true;
+      startupRetry.dispose();
       window.clearInterval(timer);
       window.clearInterval(notificationTimer);
       if (stateTimer !== null) window.clearInterval(stateTimer);
@@ -465,6 +469,8 @@
   }
 
   async function restore() {
+    startupRetry.cancel();
+    startupPending = false;
     busy = true;
     localStopPendingCleanup = false;
     error = null;
@@ -480,6 +486,8 @@
       await applyBootstrap(response);
     } catch (reason) {
       const code = commandCode(reason);
+      startupPending = code === "runtime_startup_pending";
+      startupRetry.schedule(code, retryPendingStartup);
       if (code === "signed_out") {
         phase = "signed_out";
         view = "sign_in";
@@ -502,6 +510,8 @@
   }
 
   async function applyBootstrap(response: Bootstrap) {
+    startupRetry.cancel();
+    startupPending = false;
     localStopPendingCleanup = false;
     bootstrap = response;
     pinnedStray = response.pinned_stray;
@@ -848,10 +858,12 @@
 
   async function logout() {
     if (busy) return;
+    startupRetry.cancel();
     busy = true;
     error = null;
     try {
       await nativeClient.logout();
+      startupPending = false;
       localStopPendingCleanup = false;
       bootstrap = null;
       connection = null;
@@ -879,6 +891,16 @@
       error = commandMessage(reason, "logout");
     } finally {
       busy = false;
+      if (startupPending) startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+    }
+  }
+
+  function retryPendingStartup() {
+    if (!startupPending || view !== "unavailable") return;
+    if (busy) {
+      startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+    } else {
+      void restore();
     }
   }
 
@@ -1156,7 +1178,7 @@
     <div class="header-actions">
       <span class="status" data-phase={phase}>
         <span aria-hidden="true"></span>
-        {localStopPendingCleanup ? "Туннель выключен" : phaseLabels[phase]}
+        {startupPending ? "Подготовка приложения" : localStopPendingCleanup ? "Туннель выключен" : phaseLabels[phase]}
       </span>
       {#if bootstrap}
         <button class="quiet-button" type="button" onclick={openChangelog}>
@@ -1761,7 +1783,7 @@
     {:else}
       <div class="panel message-panel">
         <p class="eyebrow">Подключение к панели</p>
-        <h1>Сейчас сервис недоступен</h1>
+        <h1>{startupPending ? "Завершаем подготовку приложения" : "Сейчас сервис недоступен"}</h1>
         {#if error}<p class="error-message">{error}</p>{/if}
         <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
           {busy ? "Проверяем…" : "Повторить"}

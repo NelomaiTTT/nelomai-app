@@ -25,6 +25,19 @@ def verify_signature(value, signature, public_key):
     if canonical != value: raise ValueError('APK container signature binds noncanonical JSON')
 
 
+def verify_version(xml, version):
+    if not isinstance(version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+        raise ValueError('APK release version must be major.minor.patch')
+    major, minor, patch = map(int, version.split('.'))
+    code = major * 1_000_000 + minor * 1_000 + patch
+    if minor > 999 or patch > 999 or not 0 < code <= 2_100_000_000:
+        raise ValueError('APK release version exceeds Android versionCode range')
+    manifest = ET.fromstring(xml)
+    if (manifest.get(ANDROID + 'versionName') != version
+            or manifest.get(ANDROID + 'versionCode') != str(code)):
+        raise ValueError(f'APK version must be {version} / versionCode {code}')
+
+
 def verify_manifest(xml, acceptance=False):
     manifest = ET.fromstring(xml)
     package = manifest.get('package')
@@ -117,8 +130,7 @@ def main():
         if len(public) != 32: public = base64.b64decode(public.strip(), validate=True)
         verify_signature(value, apk.read('assets/runtime/container-manifest-v1.sig'), public)
         manifest = json.loads(value)
-        if manifest['container_version'] != ET.fromstring(xml).get(ANDROID + 'versionName'):
-            raise ValueError('APK version differs from signed container version')
+        verify_version(xml, manifest['container_version'])
         verify_slots(manifest, args.acceptance, args.release_set_sha256, args.stable_manifest_sha256)
         for slot in manifest['slots']:
             prefix = 'assets/runtime/engines/' + slot['slot'] + '/' + slot['manifest']['runtime_version'] + '/'

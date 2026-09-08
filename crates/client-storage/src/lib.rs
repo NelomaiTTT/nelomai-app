@@ -21,6 +21,8 @@ mod startup;
 pub use startup::*;
 mod runtime_state;
 mod split_tunnel;
+#[cfg(any(windows, test))]
+mod windows_records;
 
 pub use auth::*;
 pub use migration::*;
@@ -236,7 +238,25 @@ impl SystemSecretStore {
         Ok(serde_json::to_vec(auth)?)
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(windows)]
+    fn load_native(&self) -> Result<Option<Vec<u8>>, NativeStoreError> {
+        windows_records::load(&windows_records::WindowsEntries, &self.account)
+            .map_err(NativeStoreError::Fatal)
+    }
+
+    #[cfg(windows)]
+    fn save_native(&self, bytes: &[u8]) -> Result<(), NativeStoreError> {
+        windows_records::save(&windows_records::WindowsEntries, &self.account, bytes)
+            .map_err(NativeStoreError::Fatal)
+    }
+
+    #[cfg(windows)]
+    fn delete_native(&self) -> Result<(), NativeStoreError> {
+        windows_records::delete(&windows_records::WindowsEntries, &self.account)
+            .map_err(NativeStoreError::Fatal)
+    }
+
+    #[cfg(not(any(windows, target_os = "android")))]
     fn load_native(&self) -> Result<Option<Vec<u8>>, NativeStoreError> {
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;
@@ -247,14 +267,14 @@ impl SystemSecretStore {
         }
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(windows, target_os = "android")))]
     fn save_native(&self, bytes: &[u8]) -> Result<(), NativeStoreError> {
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;
         entry.set_secret(bytes).map_err(NativeStoreError::from)
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(windows, target_os = "android")))]
     fn delete_native(&self) -> Result<(), NativeStoreError> {
         let entry =
             keyring::Entry::new(SERVICE_NAME, &self.account).map_err(NativeStoreError::from)?;

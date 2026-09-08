@@ -111,6 +111,9 @@ try {
     executablePath,
     headless: true,
   });
+  for (const scenario of ["runtime-pending-auto", "runtime-pending-manual", "runtime-pending-logout-failed", "runtime-pending-logout"]) {
+    await capture(scenario, { width: 1280, height: 800 }, scenario);
+  }
   await capture("sign-in", { width: 390, height: 844 }, "signed_out");
   await capture(
     "bootstrap-error",
@@ -138,13 +141,19 @@ async function capture(name, viewport, scenario) {
     hasTouch: viewport.width < 600,
   });
   const page = await context.newPage();
+  page.setDefaultTimeout(30000);
   await page.addInitScript(
     ({ fixture, peerFixture, currentScenario, desktop }) => {
+      let connection = null;
       window.__TAURI_CALLS__ = [];
       window.__TAURI_INTERNALS__ = {
         invoke: async (command, args) => {
           window.__TAURI_CALLS__.push({ command, args });
           if (command === "app_bootstrap") {
+            if (currentScenario.startsWith("runtime-pending") &&
+                window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length === 1) {
+              throw { code: "runtime_startup_pending", message: "Подготовка подключения; повторим автоматически" };
+            }
             if (currentScenario === "signed_out") {
               throw {
                 code: "signed_out",
@@ -194,8 +203,8 @@ async function capture(name, viewport, scenario) {
           }
           if (command === "app_state") {
             return {
-              phase: "ready",
-              connection: null,
+              phase: connection ? "connected" : "ready",
+              connection,
               connectionIntentStatus: "none",
               nextRetryAtUnix: null,
               warning: null,
@@ -203,9 +212,7 @@ async function capture(name, viewport, scenario) {
             };
           }
           if (command === "app_start") {
-            return {
-              status: "connected",
-              connection: {
+            connection = {
                 lease_id: "preview-lease",
                 layer: "stray",
                 tic_connection_mode: "dynamic",
@@ -214,15 +221,58 @@ async function capture(name, viewport, scenario) {
                 status: "connected",
                 pinned: false,
                 stopped_at: null,
-              },
+            };
+            return {
+              status: "connected",
+              connection,
               nextRetryAtUnix: null,
             };
+          }
+          if (command === "app_logout" && currentScenario === "runtime-pending-logout-failed") {
+            await new Promise((resolve) => setTimeout(resolve, 6000));
+            throw { code: "temporarily_unavailable", message: "Отложенный отказ выхода" };
           }
           if (command === "app_preferences") {
             return {
               closeToTraySupported: desktop,
               closeToTray: true,
               dnsProvider: "auto",
+            };
+          }
+          if (command === "runtime_status") {
+            return {
+              containerVersion: "0.2.16",
+              selectedSlot: "latest",
+              activeSlot: "latest",
+              pendingSlot: null,
+              latestVersion: "0.2.16",
+              stableVersion: null,
+              runtimeContractVersion: 1,
+              manifestVerified: true,
+              stableAvailable: false,
+              switchId: null,
+              phase: null,
+              engineRole: "primary",
+            };
+          }
+          if (command === "app_split_tunnel_installed_applications") return [];
+          if (command === "app_split_tunnel_state") {
+            return {
+              available: true,
+              enabled: false,
+              mode: "exclude_selected",
+              excludeLocalNetworks: false,
+              mandatoryExcludedPackages: [],
+              suggestedNameFragments: [],
+              selectedPackages: [],
+              addressRules: [],
+              warning: null,
+              capabilities: {
+                platform: desktop ? "macos" : "android",
+                androidApiLevel: desktop ? null : 35,
+                addressSplitTunnel: true,
+                applicationSplitTunnel: !desktop,
+              },
             };
           }
           if (command === "app_peer_options") {
@@ -270,6 +320,31 @@ async function capture(name, viewport, scenario) {
 
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.waitForTimeout(100);
+  if (scenario.startsWith("runtime-pending")) {
+    await page.getByRole("heading", { name: "Завершаем подготовку приложения" }).waitFor();
+    if (scenario.includes("logout")) {
+      await page.getByRole("button", { name: "Выйти", exact: true }).click();
+    } else if (scenario.endsWith("manual")) {
+      await page.getByRole("button", { name: "Повторить", exact: true }).click();
+    }
+    if (scenario === "runtime-pending-logout") {
+      await page.getByRole("heading", { name: "Вход в Nelomai" }).waitFor();
+      if (await page.getByText("Подготовка приложения", { exact: true }).isVisible()) {
+        throw new Error("successful logout retained pending startup status");
+      }
+      await page.waitForTimeout(5500);
+    } else {
+      await page.getByRole("button", { name: /Старт/ }).waitFor({ timeout: 16000 });
+      if (scenario.endsWith("manual")) await page.waitForTimeout(5500);
+    }
+    const calls = await page.evaluate(() => window.__TAURI_CALLS__.filter((call) => call.command === "app_bootstrap").length);
+    if (calls !== (scenario === "runtime-pending-logout" ? 1 : 2)) {
+      throw new Error(`${scenario} lost or duplicated bootstrap: ${calls}`);
+    }
+    await page.screenshot({ path: `/tmp/nelomai-${name}.png`, fullPage: true });
+    await context.close();
+    return;
+  }
   if (scenario !== "signed_out" && scenario !== "server-unavailable") {
     await page.waitForFunction(
       () =>
