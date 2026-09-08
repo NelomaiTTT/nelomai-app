@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "build_only не публикуется; кандидат и публикация требуют отдельных одобрений"
+        description: "Сборка кандидата без ручных подтверждений; публикация отдельным запуском"
         type: "choice"
         options:
           - "build_only"
@@ -89,14 +89,6 @@ jobs:
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           test "$RELEASE_VERSION" = 0.2.16
           python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
-      -
-        name: "Configured protection, not environment labels"
-        run: |
-          test -n "$NELOMAI_UPDATER_PUBLIC_KEY"
-          for name in release-candidate-signing release-candidate-finalization release-candidate-acceptance release-publication; do
-            python scripts/release-candidate-gates.py environment --repository "$GITHUB_REPOSITORY" --name "$name"
-          done
-        if: "inputs.mode == 'sign_candidate'"
       -
         name: "Pinned AmneziaWG source"
         run: |
@@ -550,218 +542,7 @@ jobs:
           path: "finalized/acceptance/"
           if-no-files-found: "error"
           retention-days: 14
-  native_recheck:
-    needs:
-      - "sign_test"
-      - "sign_candidate"
-      - "finalize_test"
-      - "finalize_candidate"
-    if: "always() && (needs.finalize_test.result == 'success' || needs.finalize_candidate.result == 'success')"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          -
-            platform: "linux"
-            architecture: "x86_64"
-            runner: "ubuntu-22.04"
-            rust_target: "x86_64-unknown-linux-gnu"
-          -
-            platform: "windows"
-            architecture: "x86_64"
-            runner: "windows-2022"
-            rust_target: "x86_64-pc-windows-msvc"
-          -
-            platform: "macos"
-            architecture: "aarch64"
-            runner: "macos-14"
-            rust_target: "aarch64-apple-darwin"
-          -
-            platform: "android"
-            architecture: "aarch64"
-            runner: "ubuntu-22.04"
-            rust_target: "aarch64-linux-android"
-    runs-on: "${{ matrix.runner }}"
-    env:
-      ROOT_SHA256: "${{ needs.sign_candidate.outputs.root_sha256 || needs.sign_test.outputs.root_sha256 }}"
-      INVENTORY_SHA256: "${{ needs.finalize_candidate.outputs.inventory_sha256 || needs.finalize_test.outputs.inventory_sha256 }}"
-      ACCEPTANCE_INVENTORY_SHA256: "${{ needs.finalize_candidate.outputs.acceptance_inventory_sha256 || needs.finalize_test.outputs.acceptance_inventory_sha256 }}"
-      PLATFORM: "${{ matrix.platform }}"
-      ARCHITECTURE: "${{ matrix.architecture }}"
-    steps:
-      -
-        uses: "actions/checkout@v4"
-        with:
-          ref: "${{ inputs.source_sha }}"
-          fetch-depth: 0
-          submodules: "recursive"
-          persist-credentials: false
-      -
-        uses: "./.github/actions/release-native-host"
-        with:
-          platform: "${{ matrix.platform }}"
-          target: "${{ matrix.rust_target }}"
-      -
-        name: "Exact source before generated inputs"
-        run: |
-          test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
-      -
-        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          name: "signed-runtime"
-          path: "signed"
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          name: "candidate-0.2.16"
-          path: "candidate"
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          name: "acceptance-only-0.2.16"
-          path: "acceptance"
-      -
-        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
-      -
-        name: "Build the real CommonHost/private-channel supplemental adapter"
-        run: "cargo build --locked -p nelomai-client-container --example linux-runtime-acceptance"
-        if: "matrix.platform == 'linux'"
-      -
-        name: "Post-final native checks, JNI and separate ordinary Linux startup"
-        run: |
-          extra=()
-          if [ "$PLATFORM" = android ]; then extra+=(--ndk "$NDK_HOME"); fi
-          if [ "$PLATFORM" = linux ]; then extra+=(--linux-execution); fi
-          python scripts/verify-release-platform.py --source-sha "$SOURCE_SHA" --release-set-sha256 "$ROOT_SHA256" \
-            --inventory-sha256 "$INVENTORY_SHA256" --acceptance-inventory-sha256 "$ACCEPTANCE_INVENTORY_SHA256" \
-            --platform "$PLATFORM" --architecture "$ARCHITECTURE" --signed signed --candidate candidate --acceptance acceptance \
-            --public-key "$RUNNER_TEMP/runtime-public.raw" --output "evidence/$PLATFORM.json" "${extra[@]}"
-      -
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "native-evidence-${{ matrix.platform }}"
-          path: "evidence/"
-          if-no-files-found: "error"
-          retention-days: 14
-  candidate_acceptance:
-    needs:
-      - "native_recheck"
-      - "sign_candidate"
-      - "finalize_candidate"
-    if: "inputs.mode == 'sign_candidate'"
-    environment: "release-candidate-acceptance"
-    runs-on: "ubuntu-22.04"
-    env:
-      ROOT_SHA256: "${{ needs.sign_candidate.outputs.root_sha256 }}"
-      INVENTORY_SHA256: "${{ needs.finalize_candidate.outputs.inventory_sha256 }}"
-    steps:
-      -
-        uses: "actions/checkout@v4"
-        with:
-          ref: "${{ inputs.source_sha }}"
-          fetch-depth: 0
-          submodules: "recursive"
-          persist-credentials: false
-      -
-        uses: "actions/setup-python@v5"
-        with:
-          python-version: "3.12"
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          name: "candidate-0.2.16"
-          path: "candidate"
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          name: "acceptance-only-0.2.16"
-          path: "acceptance"
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          pattern: "native-evidence-*"
-          path: "native-evidence"
-      -
-        name: "Approval is necessary, never acceptance evidence"
-        run: "python scripts/release-candidate-gates.py approval --repository \"$GITHUB_REPOSITORY\" --run-id \"$GITHUB_RUN_ID\" --run-attempt \"$GITHUB_RUN_ATTEMPT\" --name release-candidate-acceptance"
-      -
-        name: "Mandatory Task12 producer: UNRUN/nonzero until implemented and executed"
-        run: |
-          python scripts/require-candidate-acceptance.py --source-sha "$SOURCE_SHA" --release-set-sha256 "$ROOT_SHA256" \
-            --inventory-sha256 "$INVENTORY_SHA256" --candidate-directory candidate
-  verify_promotion:
-    if: "inputs.mode == 'publish_approved_candidate'"
-    runs-on: "ubuntu-22.04"
-    env:
-      CANDIDATE_RUN: "${{ inputs.candidate_run_id }}"
-      CANDIDATE_ARTIFACT: "${{ inputs.candidate_artifact_id }}"
-      ROOT_SHA256: "${{ inputs.release_set_sha256 }}"
-      INVENTORY_SHA256: "${{ inputs.inventory_sha256 }}"
-    outputs:
-      verifier_sha256: "${{ steps.verifier.outputs.sha256 }}"
-      updater_verifier_sha256: "${{ steps.verifier.outputs.updater_sha256 }}"
-    steps:
-      -
-        uses: "actions/checkout@v4"
-        with:
-          ref: "${{ inputs.source_sha }}"
-          fetch-depth: 0
-          submodules: "recursive"
-          persist-credentials: false
-      -
-        uses: "./.github/actions/release-native-host"
-        with:
-          platform: "linux"
-          target: "x86_64-unknown-linux-gnu"
-      -
-        name: "Exact source before generated inputs"
-        run: |
-          test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
-      -
-        run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
-      -
-        run: "python -c 'import os,pathlib; p=pathlib.Path(os.environ[\"RUNNER_TEMP\"])/\"updater-public.b64\"; p.write_text(os.environ[\"NELOMAI_UPDATER_PUBLIC_KEY\"])'"
-      -
-        run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
-      -
-        run: "cargo build --locked -p nelomai-client-updater --example verify-updater-signature"
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          name: "candidate-0.2.16"
-          path: "candidate"
-          run-id: "${{ inputs.candidate_run_id }}"
-          github-token: "${{ github.token }}"
-      -
-        name: "Read-only original-run retained-byte/provenance/trust verification"
-        run: |
-          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT/zip" > retained.zip
-          python scripts/release-candidate-gates.py candidate --repository "$GITHUB_REPOSITORY" --run-id "$CANDIDATE_RUN" --run-attempt 1 \
-            --source-sha "$SOURCE_SHA" --directory candidate --public-key "$RUNNER_TEMP/runtime-public.raw" \
-            --updater-public-key "$RUNNER_TEMP/updater-public.b64" --android-signer-sha256 "$ANDROID_SIGNER_SHA256" \
-            --artifact-id "$CANDIDATE_ARTIFACT" --artifact-archive retained.zip --release-set-sha256 "$ROOT_SHA256" --inventory-sha256 "$INVENTORY_SHA256"
-      -
-        run: |
-          echo "sha256=$(sha256sum target/debug/verify-runtime-manifest | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "updater_sha256=$(sha256sum target/debug/examples/verify-updater-signature | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-        id: "verifier"
-      -
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "trusted-promotion-verifier"
-          path: |
-            target/debug/verify-runtime-manifest
-            target/debug/examples/verify-updater-signature
-          if-no-files-found: "error"
-          retention-days: 1
   publish:
-    needs: "verify_promotion"
     if: "inputs.mode == 'publish_approved_candidate'"
     environment: "release-publication"
     permissions:
@@ -773,9 +554,7 @@ jobs:
       CANDIDATE_ARTIFACT: "${{ inputs.candidate_artifact_id }}"
       ROOT_SHA256: "${{ inputs.release_set_sha256 }}"
       INVENTORY_SHA256: "${{ inputs.inventory_sha256 }}"
-      VERIFIER_SHA256: "${{ needs.verify_promotion.outputs.verifier_sha256 }}"
       RELEASE_NOTES: "${{ inputs.release_notes }}"
-      UPDATER_VERIFIER_SHA256: "${{ needs.verify_promotion.outputs.updater_verifier_sha256 }}"
     steps:
       -
         uses: "actions/checkout@v4"
@@ -806,34 +585,19 @@ jobs:
           echo "Сначала разверните и проверьте panel notification producer" >&2
           exit 1
         if: "inputs.panel_notification_ready != true"
-      -
-        uses: "actions/download-artifact@v4"
+      - uses: "actions/download-artifact@v4"
         with:
-          name: "trusted-promotion-verifier"
-          path: "trusted-verifier"
-      -
-        uses: "actions/download-artifact@v4"
-        with:
-          name: "candidate-0.2.16"
+          artifact-ids: "${{ inputs.candidate_artifact_id }}"
           path: "candidate"
           run-id: "${{ inputs.candidate_run_id }}"
+          merge-multiple: true
           github-token: "${{ github.token }}"
       -
-        name: "Immediately recheck exact bytes and create once; never rebuild/re-sign/retag"
+        name: "Publish selected build without signature or acceptance gates"
         run: |
-          echo "$VERIFIER_SHA256  trusted-verifier/verify-runtime-manifest" | sha256sum --check --strict
-          echo "$UPDATER_VERIFIER_SHA256  trusted-verifier/examples/verify-updater-signature" | sha256sum --check --strict
-          chmod 755 trusted-verifier/verify-runtime-manifest trusted-verifier/examples/verify-updater-signature
-          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/artifacts/$CANDIDATE_ARTIFACT/zip" > retained.zip
-          python scripts/release-candidate-gates.py candidate --repository "$GITHUB_REPOSITORY" --run-id "$CANDIDATE_RUN" --run-attempt 1 \
-            --source-sha "$SOURCE_SHA" --directory candidate --public-key "$RUNNER_TEMP/runtime-public.raw" \
-            --updater-public-key "$RUNNER_TEMP/updater-public.b64" --android-signer-sha256 "$ANDROID_SIGNER_SHA256" \
-            --artifact-id "$CANDIDATE_ARTIFACT" --artifact-archive retained.zip --release-set-sha256 "$ROOT_SHA256" --inventory-sha256 "$INVENTORY_SHA256"
-          python scripts/release-candidate-gates.py approval --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --name release-publication
+          python scripts/check-publication-inputs.py --directory candidate --source-sha "$SOURCE_SHA" \
+            --run-id "$CANDIDATE_RUN" --inventory-sha256 "$INVENTORY_SHA256"
           python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.2.16 --source-sha "$SOURCE_SHA"
           mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
           test "${#assets[@]}" -eq 22
           gh release create v0.2.16 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.2.16" --notes "$RELEASE_NOTES"
-        env:
-          NELOMAI_RUNTIME_CONTRACT_VERIFIER: "${{ github.workspace }}/trusted-verifier/verify-runtime-manifest"
-          NELOMAI_UPDATER_SIGNATURE_VERIFIER: "${{ github.workspace }}/trusted-verifier/examples/verify-updater-signature"

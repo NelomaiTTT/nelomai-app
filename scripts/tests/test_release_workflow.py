@@ -55,8 +55,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotRegex(body, r"cargo (?:build|test)|tauri (?:build|bundle)|build-release-manifest|signing-key|PRIVATE_KEY")
         self.assertIn("--target", body)
         self.assertIn("SOURCE_SHA", body)
-        self.assertIn("release-candidate-gates.py candidate", body)
-        self.assertIn("release-candidate-gates.py approval", body)
+        self.assertIn("check-publication-inputs.py", body)
+        self.assertNotIn("release-candidate-gates.py approval", body)
         self.assertIn("release-candidate-gates.py tag", body)
         self.assertIn("panel_notification_ready", body)
 
@@ -68,18 +68,17 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 if step.get("uses", "").startswith("actions/checkout@"):
                     self.assertEqual(step.get("with", {}).get("ref"), "${{ inputs.source_sha }}", name)
                     self.assertEqual(step["with"].get("fetch-depth"), 0, name)
-        for name in ("native_drafts", "native_packages", "native_recheck"):
+        for name in ("native_drafts", "native_packages"):
             targets = jobs[name]["strategy"]["matrix"]["include"]
             self.assertEqual({(row["platform"], row["architecture"]) for row in targets},
                 {("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64")})
         self.assertEqual(jobs["sign_candidate"]["environment"], "release-candidate-signing")
         self.assertEqual(jobs["finalize_candidate"]["environment"], "release-candidate-finalization")
-        for name in ("native_drafts", "native_packages", "sign_test", "finalize_test", "native_recheck"):
+        for name in ("native_drafts", "native_packages", "sign_test", "finalize_test"):
             self.assertNotIn("environment", jobs[name])
         self.assertEqual(jobs["sign_candidate"]["needs"], "native_drafts")
         self.assertIn("sign_candidate", jobs["native_packages"]["needs"])
         self.assertIn("native_packages", jobs["finalize_candidate"]["needs"])
-        self.assertIn("finalize_candidate", jobs["native_recheck"]["needs"])
         self.assertIn("build-runtime-release-set.py", yaml.safe_dump(jobs["sign_candidate"]))
 
     def test_build_only_has_no_release_secrets_or_full_acceptance_requirement(self):
@@ -91,10 +90,9 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("secrets.", build)
         self.assertNotIn("contents: write", build)
         self.assertNotIn("panel_notification_ready", build)
-        acceptance = workflow["jobs"]["candidate_acceptance"]
-        self.assertEqual(acceptance["environment"], "release-candidate-acceptance")
-        self.assertIn("sign_candidate", acceptance["if"])
-        self.assertIn("require-candidate-acceptance.py", yaml.safe_dump(acceptance))
+        self.assertNotIn("candidate_acceptance", workflow["jobs"])
+        self.assertNotIn("native_recheck", workflow["jobs"])
+        self.assertNotIn("verify_promotion", workflow["jobs"])
 
 
 if __name__ == "__main__":

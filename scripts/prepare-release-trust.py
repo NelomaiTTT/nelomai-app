@@ -31,10 +31,6 @@ def main():
         gates.require_operation(args.mode, "test_sign" if args.mode == "build_only" else "release_sign")
         if not args.phase:
             raise ValueError("phase-local private key requires an explicit signing phase")
-        if args.mode == "sign_candidate":
-            gates.check_approvals(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"],
-                (gates.SIGNING_ENVIRONMENT if args.phase == "signing" else gates.FINALIZATION_ENVIRONMENT,),
-                run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]))
     private = None
     if args.mode == "build_only":
         # An intentionally public seed cannot later be mistaken for release

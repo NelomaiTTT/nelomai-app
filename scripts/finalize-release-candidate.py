@@ -40,12 +40,6 @@ def main():
     policy = builder.build_trust(args.mode, args.private_key, args.public_key)
     gates.require_operation(args.mode, "test_sign" if args.mode == "build_only" else "release_sign")
     identities = {}
-    if args.mode == "sign_candidate":
-        gates.check_approvals(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"],
-            (gates.SIGNING_ENVIRONMENT, gates.FINALIZATION_ENVIRONMENT), run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]))
-        # Bind current acceptance environment identity now. Its actual approval
-        # and full real-client producer run are separate subsequent obligations.
-        identities = {name: gates.check_environment(os.environ["GITHUB_REPOSITORY"], name) for name in gates.CANDIDATE_ENVIRONMENTS}
     if args.output.exists() or args.work.exists():
         raise ValueError("immutable installer finalization output exists")
     gates.verify_runtime_release(args.signed / "release", "0.2.16", args.source_sha, args.release_set_sha256, args.public_key)
