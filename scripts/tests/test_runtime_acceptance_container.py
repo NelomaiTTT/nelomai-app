@@ -3,6 +3,8 @@ import hashlib
 import json
 import shutil
 import subprocess
+from pathlib import Path
+from unittest.mock import patch
 from packaging.version import InvalidVersion, Version
 
 from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, PREFIX, SCRIPTS, module
@@ -10,6 +12,68 @@ import scripts.tests.test_runtime_release_set as release_set_fixture
 
 
 class AcceptanceContainerTest(ArtifactFixture):
+    def test_linux_final_pack_uses_output_plugin_and_rechecks_exact_bytes(self):
+        self.stage()
+        builder = module("build-runtime-acceptance-container")
+        root, output = self.root / "repo", self.root / "package"
+        (root / "src-tauri").mkdir(parents=True)
+        (root / "src-tauri/bundle.linux.conf.json").write_text(json.dumps({"bundle": {"resources": {}}}))
+        calls = []
+        real_run = subprocess.run
+        def native_tool(command, **kwargs):
+            if command[1] not in ("build", "--appimage-extract", "--appimage-extract-and-run"):
+                return real_run(command, **kwargs)
+            calls.append(command)
+            if command[1] == "build":
+                self.assertEqual(kwargs["env"]["XDG_CACHE_HOME"], str(output / "tools-cache"))
+                bundle = output / "target/x86_64-unknown-linux-gnu/release/bundle/appimage/test.AppImage"
+                bundle.parent.mkdir(parents=True)
+                bundle.write_bytes(b"intermediate")
+                plugin = output / "tools-cache/tauri/linuxdeploy-plugin-appimage.AppImage"
+                plugin.parent.mkdir(parents=True)
+                plugin.write_bytes(b"same output plugin")
+            elif command[1] == "--appimage-extract":
+                destination = kwargs["cwd"] / "squashfs-root"
+                if Path(command[0]).name == "test.AppImage":
+                    shutil.copytree(self.root / "staged", destination / "usr/lib/nelomai-app")
+                    (destination / "usr/lib/nelomai-app/runtime/engines/latest/0.2.17/nelomai-runtime").write_bytes(b"patched")
+                else:
+                    shutil.copytree(output / "linuxdeploy-extracted/squashfs-root", destination)
+            else:
+                self.assertEqual(command[1:3], ["--appimage-extract-and-run", "--appdir"])
+                builder.verify_packaged_tree(Path(command[3]), self.root / "staged", self.public, "linux", "x86_64")
+                Path(kwargs["env"]["OUTPUT"]).write_bytes(b"final AppImage")
+            return subprocess.CompletedProcess(command, 0)
+        with patch.object(builder.subprocess, "run", side_effect=native_tool):
+            package = builder.package_desktop(self.root / "staged", output, self.public, "linux", "x86_64", root=root)
+        self.assertTrue(package.is_file())
+        self.assertEqual(len(calls), 4)
+
+    def test_linux_repack_restores_only_signed_payload_and_preserves_dependencies(self):
+        self.stage()
+        builder = module("build-runtime-acceptance-container")
+        extracted = self.root / "extracted/AppDir/usr/lib/nelomai-app"
+        shutil.copytree(self.root / "staged", extracted)
+        dependency = extracted.parent / "libexample.so"
+        dependency.write_bytes(b"bundled dependency")
+        for relative in ("runtime/engines/stable/0.2.16/nelomai-runtime",
+                         "dispatcher/1/nelomai-unix-service"):
+            path = extracted / relative
+            path.write_bytes(b"linuxdeploy rewritten ELF")
+            path.chmod(0o644)
+        builder.restore_linux_signed_payload(self.root / "extracted", self.root / "staged", self.public, "x86_64")
+        builder.verify_packaged_tree(self.root / "extracted", self.root / "staged", self.public, "linux", "x86_64")
+        self.assertEqual(dependency.read_bytes(), b"bundled dependency")
+        unexpected = extracted / "runtime/unindexed"
+        unexpected.write_bytes(b"extra")
+        with self.assertRaisesRegex(ValueError, "file set"):
+            builder.restore_linux_signed_payload(self.root / "extracted", self.root / "staged", self.public, "x86_64")
+        unexpected.unlink()
+        signature = extracted / "runtime/container-manifest-v1.sig"
+        signature.write_bytes(b"tampered")
+        with self.assertRaisesRegex(ValueError, "signed metadata"):
+            builder.restore_linux_signed_payload(self.root / "extracted", self.root / "staged", self.public, "x86_64")
+
     def test_keyless_native_stage_consumes_final_signatures_and_exact_zip_bytes(self):
         self.stage()
         builder = module("build-runtime-acceptance-container")

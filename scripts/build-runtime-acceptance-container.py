@@ -196,6 +196,34 @@ def verify_packaged_tree(extracted, staged, public_key, platform, architecture):
     return runtime
 
 
+def restore_linux_signed_payload(extracted, staged, public_key, architecture):
+    """Undo linuxdeploy ELF rewriting before the final, keyless filesystem pack.
+
+    Keep dependency deployment, but never admit its rewritten signed runtime.
+    Unknown paths, links and changed signed metadata remain hard failures.
+    """
+    manifests = list(extracted.rglob("container-manifest-v1.json"))
+    if len(manifests) != 1:
+        raise ValueError("packaged container manifest is missing or ambiguous")
+    runtime, expected = manifests[0].parent, staged / "runtime"
+    paths = list(runtime.rglob("*"))
+    names = {p.relative_to(runtime).as_posix() for p in paths if not p.is_dir()}
+    expected_names = {p.relative_to(expected).as_posix() for p in expected.rglob("*") if not p.is_dir()}
+    if names != expected_names or any(p.is_symlink() for p in paths):
+        raise ValueError("packaged runtime file set differs from staged signed inputs")
+    for name in ("container-manifest-v1.json", "container-manifest-v1.sig"):
+        if (runtime / name).read_bytes() != (expected / name).read_bytes():
+            raise ValueError("packaged signed metadata changed")
+    dispatcher = runtime.parent / "dispatcher/1/nelomai-unix-service"
+    if (not dispatcher.is_file() or any(p.is_symlink() for p in
+            (dispatcher, dispatcher.parent, dispatcher.parent.parent))):
+        raise ValueError("packaged dispatcher is missing or linked")
+    for name in sorted(expected_names):
+        shutil.copy2(expected / name, runtime / name)
+    shutil.copy2(staged / "dispatcher/1/nelomai-unix-service", dispatcher)
+    verify_packaged_tree(extracted, staged, public_key, "linux", architecture)
+
+
 def package_desktop(staged, output, public_key, platform, architecture, *, root=ROOT, environment=None):
     """Invoke the actual Tauri native bundler, then inspect its extracted bytes.
 
@@ -223,6 +251,9 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
     environment = (environment or os.environ).copy()
     # Build-only/test trust and release trust must use separate output/cache roots.
     environment["CARGO_TARGET_DIR"] = str(output / "target")
+    if platform == "linux":
+        # Keep the exact output plugin used by Tauri in a known private cache.
+        environment["XDG_CACHE_HOME"] = str(output / "tools-cache")
     cli = root / "node_modules/.bin" / ("tauri.cmd" if os.name == "nt" else "tauri")
     subprocess.run([str(cli), "build", "--ci", "--no-sign", "--target", target,
         "--features", "custom-protocol", "--bundles", bundle, "--config", str(config_path), "--", "--locked"],
@@ -245,7 +276,18 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
         subprocess.run(["/usr/bin/codesign", "--verify", "--strict", str(extracted / matches[0].name)], check=True)
     elif platform == "linux":
         package = output / (name + ".AppImage")
-        shutil.copy2(matches[0], package)
+        intermediate = output / "linuxdeploy-extracted"
+        intermediate.mkdir()
+        subprocess.run([str(matches[0]), "--appimage-extract"], cwd=intermediate, check=True, stdout=subprocess.DEVNULL)
+        restore_linux_signed_payload(intermediate, staged, public_key, architecture)
+        plugin = output / "tools-cache/tauri/linuxdeploy-plugin-appimage.AppImage"
+        if not plugin.is_file():
+            raise ValueError("Tauri AppImage output plugin is unavailable for immutable payload packing")
+        # Invoke only the output plugin: running linuxdeploy again would patch
+        # RPATHs again. The installed launcher supplies the trusted library path.
+        subprocess.run([str(plugin), "--appimage-extract-and-run", "--appdir", str(intermediate / "squashfs-root")],
+            env={**environment, "APPIMAGE_EXTRACT_AND_RUN": "1", "ARCH": architecture,
+                 "OUTPUT": str(package), "VERSION": "0.2.16"}, cwd=output, check=True)
         subprocess.run([str(package), "--appimage-extract"], cwd=extracted, check=True, stdout=subprocess.DEVNULL)
     else:
         package = output / (name + ".exe")
