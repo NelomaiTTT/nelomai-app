@@ -23,7 +23,15 @@ APP = Path("/usr/local/libexec/nelomai/common/AppDir")
 
 
 def run(*command, **kwargs):
-    return subprocess.run(list(map(str, command)), check=True, **kwargs)
+    try:
+        return subprocess.run(list(map(str, command)), check=True, **kwargs)
+    except subprocess.CalledProcessError as error:
+        # Captured disposable-container output must not hide the actual failure.
+        for output in (error.stdout, error.stderr):
+            if output:
+                print(output.decode("utf-8", errors="replace") if isinstance(output, bytes) else output,
+                      file=sys.stderr)
+        raise
 
 
 def digest(path):
