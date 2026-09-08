@@ -2,11 +2,29 @@ import subprocess
 import sys
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 from scripts.tests.test_runtime_artifact import ArtifactFixture, SCRIPTS, module
 
 
 class ReleasePlatformTest(ArtifactFixture):
+    def test_android_fetches_locked_graph_before_offline_input_generation(self):
+        builder = module("build-release-platform")
+        events = []
+        class InputsReached(Exception):
+            pass
+        def generate(name, *args, **kwargs):
+            self.assertEqual(name, "android/generate-build-inputs.py")
+            self.assertIn(("cargo", "fetch", "--locked"), events)
+            raise InputsReached()
+        args = SimpleNamespace(ndk=self.root, go_archive=self.root / "go.zip")
+        with patch.object(builder.verifier, "load_script", return_value=SimpleNamespace(
+                ndk_compiler=lambda _: self.root / "clang")), \
+             patch.object(builder, "run", side_effect=lambda *args, **kwargs: events.append(args)), \
+             patch.object(builder, "script", side_effect=generate):
+            with self.assertRaises(InputsReached):
+                builder.android(args, self.root, {})
+
     def test_final_recheck_reaches_linux_and_windows_extractors(self):
         consumer = module("verify-release-platform")
         # Native tool substitutes only unpack a marker; the consumer, subprocess

@@ -47,6 +47,7 @@ def main():
             raise ValueError("Android native wrapper requires NDK")
         compiler = verifier.load_script("android/build-tunnel-runtime.py").ndk_compiler(args.ndk)
         readelf = compiler.with_name("llvm-readelf")
+        builder.run("cargo", "fetch", "--locked", env=environment)
         builder.script("android/generate-build-inputs.py", "--root", builder.ROOT, env=environment)
         if args.mode == "sign_candidate" and not all(environment.get(name) for name in (
             "NELOMAI_FIREBASE_APPLICATION_ID", "NELOMAI_FIREBASE_API_KEY", "NELOMAI_FIREBASE_PROJECT_ID")):

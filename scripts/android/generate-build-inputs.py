@@ -11,7 +11,7 @@ import subprocess
 
 
 def generate(root):
-    graph = json.loads(subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'], cwd=root, check=True, capture_output=True, text=True).stdout)
+    graph = json.loads(subprocess.run(['cargo', 'metadata', '--locked', '--offline', '--format-version', '1'], cwd=root, check=True, stdout=subprocess.PIPE, text=True).stdout)
     packages = {package['name']: Path(package['manifest_path']).parent for package in graph['packages']}
     android = root / 'src-tauri/gen/android'
     projects = {'tauri-android': packages['tauri'] / 'mobile/android'}

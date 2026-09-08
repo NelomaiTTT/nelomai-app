@@ -109,6 +109,9 @@ def android(args, work, environment):
     environment = {**environment, "CC_aarch64_linux_android": str(compiler),
         "AR_aarch64_linux_android": str(compiler.with_name("llvm-ar")),
         "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER": str(compiler), "CARGO_PROFILE_RELEASE_STRIP": "symbols"}
+    # Metadata resolves the entire locked graph, including non-host targets.
+    # Building only the contracts verifier does not populate that cold cache.
+    run("cargo", "fetch", "--locked", env=environment)
     script("android/generate-build-inputs.py", "--root", ROOT, env=environment)
     gradle = ROOT / "src-tauri/gen/android/gradlew"
     android_root = gradle.parent
