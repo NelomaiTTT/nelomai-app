@@ -69,6 +69,14 @@ while True:
     )
     .unwrap();
     let uid = unsafe { libc::geteuid() };
+    let test_executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+    let started = std::time::Instant::now();
+    d::file_digest(&test_executable).unwrap();
+    eprintln!(
+        "dispatcher fixture client: {} bytes, hash {:?}",
+        fs::metadata(&test_executable).unwrap().len(),
+        started.elapsed()
+    );
     let installation = d::Installation::for_owner(
         target.path(),
         key.verifying_key().to_bytes(),

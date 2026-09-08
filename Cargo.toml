@@ -22,3 +22,9 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.88"
+
+# IPC tests authenticate the actual test executable by hashing it. Linux DWARF
+# sections are not runtime code and can otherwise dominate the bounded exchange.
+# Keep checks/assertions enabled; do not alter shipping release profiles.
+[profile.test]
+debug = 0

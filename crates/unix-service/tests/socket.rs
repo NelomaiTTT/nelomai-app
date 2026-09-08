@@ -241,7 +241,7 @@ fn same_uid_foreign_executable_is_rejected_before_decode() {
     // A distinct real executable with the same UID, just like the runtime child.
     // Invalid JSON is intentional: authorization must happen before decoding it.
     let result = std::process::Command::new("/usr/bin/python3")
-        .args(["-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b'\\x01\\x00\\x00\\x00{');\ntry: s.recv(1024)\nexcept ConnectionResetError: pass\ns.close()"])
+        .args(["-c", "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]);\ntry:\n s.sendall(b'\\x01\\x00\\x00\\x00{')\n s.recv(1024)\nexcept (BrokenPipeError, ConnectionResetError): pass\nfinally: s.close()"])
         .arg(socket_path)
         .status()
         .unwrap();
