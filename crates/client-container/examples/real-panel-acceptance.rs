@@ -1,16 +1,25 @@
 //! Local instrumented acceptance driver. Real broker, HTTP and protected file
 //! persistence; no keychain, production endpoint or release approval.
 use async_trait::async_trait;
-use nelomai_client_api::{ClientApi, LoginRequest, RuntimeSwitchReconcileRequest, RuntimeTarget};
+use nelomai_client_api::{
+    ClientApi, ClientApiError, LoginRequest, RuntimeLogin, RuntimeSwitchReconcileRequest,
+    RuntimeTarget,
+};
 use nelomai_client_container::{
     AuthBroker, BrokerError, FrozenReconcileRequest, LocalAuthStop, LocalStopReceiptV1,
-    ResumeArguments, RuntimeCleanupHandoff, RuntimeSwitchControl, SwitchCoordinator,
+    OwnerRuntimeAuth, ResumeArguments, RuntimeAdmission, RuntimeCleanupHandoff,
+    RuntimeClientProfile, RuntimeSwitchControl, SwitchCoordinator,
+};
+use nelomai_client_core::{
+    CoreError, RuntimeAuthProvider, RuntimeWriterGates, RuntimeWriterQuiescence,
 };
 use nelomai_client_storage::{
     AuthStore, AuthStoreV1, ContainerOwnerLock, ProtectedAuthStore, ProtectedRecordStore,
     RuntimeAuthScope, RuntimeCleanupSnapshotV1, StorageError, StoredAuth,
 };
-use nelomai_contracts::{Platform, RuntimeSlot};
+use nelomai_contracts::{
+    ConnectionStartRequest, EgressMode, Layer, Platform, RouteMode, RuntimeSlot, TicConnectionMode,
+};
 use serde_json::json;
 use std::{
     fs,
@@ -47,14 +56,14 @@ impl ProtectedRecordStore for FileRecord {
 struct NativeEffects {
     root: PathBuf,
     child: Mutex<Option<Child>>,
-    writers: nelomai_client_core::RuntimeWriterGates,
+    writers: Arc<RuntimeWriterGates>,
 }
 impl NativeEffects {
     fn new(root: PathBuf) -> Self {
         Self {
             root,
             child: Mutex::new(None),
-            writers: Default::default(),
+            writers: Arc::new(RuntimeWriterGates::default()),
         }
     }
     fn start(&self) -> std::io::Result<()> {
@@ -74,6 +83,62 @@ impl NativeEffects {
         }
         *self.child.lock().unwrap() = Some(child);
         Ok(())
+    }
+}
+
+struct FileAdmission(PathBuf);
+impl RuntimeAdmission for FileAdmission {
+    fn check(&self, access: &nelomai_client_api::AccessSnapshot) -> Result<(), CoreError> {
+        let expected = access
+            .identity()
+            .session_generation
+            .ok_or(CoreError::AuthRecoveryRequired)?
+            .to_string();
+        if fs::read_to_string(self.0.join("authenticated-generation"))
+            .is_ok_and(|value| value == expected)
+        {
+            Ok(())
+        } else {
+            Err(CoreError::AuthRecoveryRequired)
+        }
+    }
+
+    fn bind_empty(
+        &self,
+        access: &nelomai_client_api::AccessSnapshot,
+        _: &RuntimeWriterQuiescence,
+    ) -> Result<(), CoreError> {
+        fs::write(
+            self.0.join("authenticated-generation"),
+            access
+                .identity()
+                .session_generation
+                .ok_or(CoreError::AuthRecoveryRequired)?
+                .to_string(),
+        )
+        .map_err(|_| CoreError::Storage)
+    }
+
+    fn complete_logout(
+        &self,
+        receipt: &nelomai_client_storage::CompletedRuntimeLogoutV1,
+        _: &RuntimeWriterQuiescence,
+    ) -> Result<(), CoreError> {
+        if receipt.operation_id.is_empty()
+            || !matches!(
+                receipt.code.as_str(),
+                "already_inactive" | "session_revoked_cleanup_accepted"
+            )
+        {
+            return Err(CoreError::AuthRecoveryRequired);
+        }
+        match fs::remove_file(self.0.join("authenticated-generation")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(CoreError::Storage),
+        }
+        fs::write(self.0.join("logout-cleanup-complete"), b"complete")
+            .map_err(|_| CoreError::Storage)
     }
 }
 #[async_trait]
@@ -177,6 +242,23 @@ fn target(slot: RuntimeSlot) -> RuntimeTarget {
     }
 }
 
+fn connection_start_request() -> ConnectionStartRequest {
+    ConnectionStartRequest {
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probes: Vec::new(),
+        allow_alternate: false,
+        require_measured_selection: false,
+        recovery_contract_version: None,
+        redundancy_contract_version: None,
+        reserve_enabled: None,
+        request_fingerprint: None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments: Vec<_> = std::env::args().collect();
@@ -224,6 +306,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         native.clone(),
     )?);
     match arguments[1].as_str() {
+        "controlled-logout" => {
+            broker.logout().await?;
+            let receipt = broker
+                .completed_runtime_logout()
+                .await?
+                .ok_or("missing durable runtime logout cleanup receipt")?;
+            assert!(root.join("native-stopped").exists());
+            println!(
+                "{}",
+                json!({
+                    "case":"controlled-logout",
+                    "logged_out":true,
+                    "local_stop_complete":true,
+                    "cleanup_receipt_pending":true,
+                    "operation_id":receipt.operation_id,
+                    "cleanup_reconcile_operation_id":receipt.cleanup_reconcile_operation_id,
+                    "code":receipt.code
+                })
+            );
+        }
+        "controlled-login" => {
+            let owner = Arc::new(ContainerOwnerLock::try_acquire(&root)?);
+            let coordinator = Arc::new(
+                SwitchCoordinator::open(owner, test_manifest())?
+                    .attach(broker.clone(), native.clone()),
+            );
+            let port = OwnerRuntimeAuth::new(
+                broker.clone(),
+                target(source_slot),
+                RuntimeClientProfile {
+                    platform: Platform::Linux,
+                    platform_version: None,
+                    architecture: "x86_64".into(),
+                },
+                Arc::new(FileAdmission(root.clone())),
+                native.writers.clone(),
+            )?
+            .with_switch_coordinator(coordinator.clone());
+            let access = port
+                .login(RuntimeLogin {
+                    login: arguments[4].clone(),
+                    password: "synthetic-task12-password".into(),
+                    device_name: "Task12 controlled reauthentication".into(),
+                })
+                .await?;
+            ClientApi::new(url)?
+                .with_access_snapshot(&access)?
+                .bootstrap(access.access_token())
+                .await?;
+            assert!(coordinator.snapshot()?.is_none());
+            assert!(broker.completed_runtime_logout().await?.is_none());
+            println!(
+                "{}",
+                json!({
+                    "case":"controlled-login",
+                    "usable_access":true,
+                    "local_switch_journal_retired":coordinator.snapshot()?.is_none(),
+                    "generation":access.identity().session_generation,
+                    "slot":access.identity().slot,
+                    "cleanup_receipt_consumed":true
+                })
+            );
+        }
+        "assert-start-blocked" => {
+            let access = broker.access_token(None).await?;
+            let error = ClientApi::new(url)?
+                .with_access_snapshot(&access)?
+                .start_connection(access.access_token(), &connection_start_request())
+                .await
+                .expect_err("server admitted a connection before cleanup ACK");
+            let (status, code) = match &error {
+                ClientApiError::Api { status, code, .. } => (status.as_u16(), code.as_str()),
+                _ => return Err(error.into()),
+            };
+            assert_eq!((status, code), (409, "runtime_switch_pending"));
+            assert!(!root.join("admitted-generation").exists());
+            let _lease =
+                nelomai_contracts::dispatcher::MutationGuard::at(&root.join("native-effect.lock"))?;
+            println!(
+                "{}",
+                json!({"case":"assert-start-blocked","status":status,"code":code,"no_native_start":true})
+            );
+        }
+        "assert-start-unblocked" => {
+            let access = broker.access_token(None).await?;
+            let api = ClientApi::new(url)?.with_access_snapshot(&access)?;
+            let error = api
+                .start_connection(access.access_token(), &connection_start_request())
+                .await
+                .expect_err("isolated fixture unexpectedly allocated a connection");
+            let (status, code) = match &error {
+                ClientApiError::Api { status, code, .. } => (status.as_u16(), code.as_str()),
+                _ => return Err(error.into()),
+            };
+            assert_eq!((status, code), (409, "peer_binding_required"));
+            api.bootstrap(access.access_token()).await?;
+            assert!(!root.join("admitted-generation").exists());
+            let _lease =
+                nelomai_contracts::dispatcher::MutationGuard::at(&root.join("native-effect.lock"))?;
+            println!(
+                "{}",
+                json!({"case":"assert-start-unblocked","status":status,"code":code,"runtime_switch_barrier_absent":true,"bootstrap_usable":true,"no_native_start":true,"generation":access.identity().session_generation})
+            );
+        }
         "assert-reauth-required" => {
             assert_eq!(
                 broker.observe_stamped().await?.1.state,

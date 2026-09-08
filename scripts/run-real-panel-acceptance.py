@@ -37,7 +37,7 @@ def main():
     parser.add_argument("--panel-url", required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--source-slot", choices=["latest","stable"], default="latest")
-    parser.add_argument("--case-filter", choices=["expiry-clean","lost-reconcile","lost-resume"], help="Run only this scoped regression using the already-built driver; never full matrix coverage")
+    parser.add_argument("--case-filter", choices=["expiry-clean","lost-reconcile","lost-resume","controlled-reauth","phases-delayed","faults-delayed"], help="Run only this scoped regression using the already-built driver; never full matrix coverage")
     args = parser.parse_args()
     os.environ["NELOMAI_TEST_SOURCE_SLOT"] = args.source_slot
     target_slot = "stable" if args.source_slot == "latest" else "latest"
@@ -55,7 +55,7 @@ def main():
     elif not binary.is_file():
         raise SystemExit("scoped regression requires an already-built driver")
     interposer = args.work / "phase-exit.dylib"
-    if args.case_filter is None:
+    if args.case_filter in (None, "controlled-reauth", "phases-delayed"):
         run(["/usr/bin/cc", "-dynamiclib", "-Wall", "-Wextra", "-Werror", ROOT / "scripts/tests/runtime_phase_exit.c", "-o", interposer])
     records = []
     fixture = [sys.executable, ROOT / "scripts/tests/real_panel_fixture.py"]
@@ -87,23 +87,59 @@ def main():
         assert transitions[0]["operation_id"] == result["operation_id"]
         assert transitions[0]["source_generation"] == 1 and transitions[0]["result_generation"] == 2
         return observed
-    for index, phase in enumerate(PHASES if args.case_filter is None else []):
+    phase_cases = [(phase, delayed_cleanup) for delayed_cleanup in [False, True] for phase in PHASES]
+    if args.case_filter == "phases-delayed":
+        phase_cases = [(phase, True) for phase in PHASES]
+    for index, (phase, delayed_cleanup) in enumerate(phase_cases if args.case_filter in (None, "phases-delayed") else []):
         login = f"task12_phase_{args.work.name}_{index}"
-        work = args.work / phase
+        work = args.work / (phase+("_delayed" if delayed_cleanup else "_clean"))
         fixture = [sys.executable, ROOT / "scripts/tests/real_panel_fixture.py"]
         run([*fixture, "seed", login], env=env)
         run([binary, "login", args.panel_url, work, login])
+        if delayed_cleanup:
+            run([*fixture, "lease", login], env=env)
         fault_env = dict(os.environ, DYLD_INSERT_LIBRARIES=str(interposer), NELOMAI_TEST_EXIT_PHASE=phase)
-        if phase == "complete":
+        pending_before_ack = None
+        after_denied_ack = None
+        after_ack = None
+        if not delayed_cleanup and phase == "complete":
             prepared = json.loads(run([binary, "switch", args.panel_url, work, login]))
             assert prepared["phase"] == "auth_resuming" and prepared["barrier"]
             assert observe(login)["device_generations"] == [1]
             run([binary, "recover", args.panel_url, work, login], env=fault_env, expected=91)
-        else:
+        elif not delayed_cleanup or phase in PHASES[:5]:
             run([binary, "switch", args.panel_url, work, login], env=fault_env, expected=91)
         journal_path = work / "common/runtime-switch-v1.json"
-        before = json.loads(journal_path.read_text())
-        assert before["phase"] == phase, "requested fault hook did not reach its phase"
+        if delayed_cleanup:
+            if phase in PHASES[:5]:
+                before = json.loads(journal_path.read_text())
+                assert before["phase"] == phase, "requested fault hook did not reach its phase"
+                pending = json.loads(run([binary, "recover", args.panel_url, work, login]))
+            else:
+                pending = json.loads(run([binary, "switch", args.panel_url, work, login]))
+            assert pending["phase"] == "server_reconciling" and pending["barrier"] and "Pending" in pending["progress"]
+            pending_before_ack = observe(login)
+            assert pending_before_ack["device_generations"] == [1]
+            assert pending_before_ack["transitions"][0]["state"] == "cleaning" and pending_before_ack["transitions"][0]["barrier"]
+            assert [lease["status"] for lease in pending_before_ack["leases"]] == ["connected"]
+            assert [job["status"] for job in pending_before_ack["jobs"]] == ["pending"]
+            run([*fixture, "agent-fail", login], env=env)
+            after_denied_ack = observe(login)
+            assert after_denied_ack["transitions"][0]["barrier"]
+            assert [lease["status"] for lease in after_denied_ack["leases"]] == ["connected"]
+            assert [job["status"] for job in after_denied_ack["jobs"]] == ["pending"]
+            run([*fixture, "agent-ack", login], env=env)
+            after_ack = observe(login)
+            assert after_ack["transitions"][0]["state"] == "clean" and after_ack["transitions"][0]["barrier"]
+            assert [lease["status"] for lease in after_ack["leases"]] == ["released"]
+            assert [job["status"] for job in after_ack["jobs"]] == ["completed"]
+            if phase in PHASES[5:]:
+                run([binary, "recover", args.panel_url, work, login], env=fault_env, expected=91)
+                before = json.loads(journal_path.read_text())
+                assert before["phase"] == phase, "requested fault hook did not reach its phase"
+        else:
+            before = json.loads(journal_path.read_text())
+            assert before["phase"] == phase, "requested fault hook did not reach its phase"
         # A real process exit must release its external child before restart.
         deadline = time.monotonic()+5
         with (work / "native-effect.lock").open("a") as lock:
@@ -125,12 +161,17 @@ def main():
         assert result["confirmed_identity"]["session_generation"] == 2
         observed = json.loads(run([*fixture, "view", login], env=env))
         assert observed["devices"] == 1 and observed["sessions"] == observed["active_sessions"] == 1
-        assert observed["device_generations"] == [2] and not observed["leases"] and not observed["jobs"]
+        assert observed["device_generations"] == [2]
+        if delayed_cleanup:
+            assert [lease["status"] for lease in observed["leases"]] == ["released"]
+            assert [job["status"] for job in observed["jobs"]] == ["completed"]
+        else:
+            assert not observed["leases"] and not observed["jobs"]
         applied = [row for row in observed["transitions"] if row["state"] == "applied"]
         assert len(applied) == 1 and applied[0]["source_generation"] == 1 and applied[0]["result_generation"] == 2 and not applied[0]["barrier"]
         assert len(observed["transitions"]) == 1 and applied[0]["operation_id"] == before["operation_id"]
-        records.append({"phase":phase,"before":observed_before,"after":observed,"final_slot":expected_slot,"child_exit":91,"authenticated_bootstrap":True})
-        print(f"PASS real panel/process phase {phase}: {expected_slot}, generation 2", flush=True)
+        records.append({"phase":phase,"delayed_cleanup":delayed_cleanup,"journal_at_exit":before,"pending_before_ack":pending_before_ack,"after_denied_ack":after_denied_ack,"after_ack":after_ack,"before_recovery":observed_before,"after":observed,"final_slot":expected_slot,"child_exit":91,"authenticated_bootstrap":True})
+        print(f"PASS real panel/process phase {phase} (delayed={delayed_cleanup}): {expected_slot}, generation 2", flush=True)
     delayed = None
     if args.case_filter is None:
         login, work = prepare("delayed")
@@ -183,10 +224,15 @@ def main():
         expiries.append({"delayed_cleanup":delayed_cleanup,"before":before,"pre_restart":pre_restart,"after":after})
         print(f"PASS real expired access with valid refresh (delayed={delayed_cleanup}): same family/device; rotated session",flush=True)
     for endpoint in ["reconcile","resume"]:
-        if args.case_filter is not None and args.case_filter != "lost-"+endpoint:
+      for delayed_cleanup in [False,True]:
+        if args.case_filter is not None and args.case_filter != "lost-"+endpoint and not (args.case_filter == "faults-delayed" and delayed_cleanup):
             continue
-        login, work = prepare("drop_"+endpoint)
-        marker = args.work / (endpoint+"-dropped.json")
+        if args.case_filter in ("lost-reconcile", "lost-resume") and delayed_cleanup:
+            continue
+        login, work = prepare("drop_"+endpoint+("_delayed" if delayed_cleanup else "_clean"))
+        if delayed_cleanup:
+            run([*fixture,"lease",login],env=env)
+        marker = args.work / (endpoint+("-delayed" if delayed_cleanup else "-clean")+"-dropped.json")
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1",0))
             port = reservation.getsockname()[1]
@@ -204,7 +250,29 @@ def main():
             pending = json.loads(run([binary,"switch",url,work,login]))
             assert pending["barrier"]
             pre_restart = None
-            if endpoint == "resume":
+            pending_before_ack = None
+            after_denied_ack = None
+            after_ack = None
+            if delayed_cleanup:
+                assert pending["phase"] == "server_reconciling" and "Pending" in pending["progress"]
+                assert marker.exists() == (endpoint == "reconcile")
+                pending_before_ack = observe(login)
+                assert pending_before_ack["device_generations"] == [1]
+                assert pending_before_ack["transitions"][0]["state"] == "cleaning" and pending_before_ack["transitions"][0]["barrier"]
+                assert [lease["status"] for lease in pending_before_ack["leases"]] == ["connected"]
+                assert [job["status"] for job in pending_before_ack["jobs"]] == ["pending"]
+                run([*fixture,"agent-fail",login],env=env)
+                after_denied_ack = observe(login)
+                assert after_denied_ack["transitions"][0]["barrier"]
+                assert [lease["status"] for lease in after_denied_ack["leases"]] == ["connected"]
+                run([*fixture,"agent-ack",login],env=env)
+                after_ack = observe(login)
+                assert after_ack["transitions"][0]["state"] == "clean" and after_ack["transitions"][0]["barrier"]
+                assert [lease["status"] for lease in after_ack["leases"]] == ["released"]
+                if endpoint == "resume":
+                    pre_restart = after_ack
+                    run([binary,"recover",url,work,login],expected=1)
+            elif endpoint == "resume":
                 assert pending["phase"] == "auth_resuming" and "Pending" in pending["progress"]
                 assert not marker.exists(), "old process must not dispatch resume"
                 pre_restart = observe(login)
@@ -218,8 +286,12 @@ def main():
             assert before["device_generations"] == ([2] if endpoint == "resume" else [1])
             result = drive(work,login,url)
             after = assert_applied(login,result)
+            if delayed_cleanup:
+                assert [lease["status"] for lease in after["leases"]] == ["released"]
+                assert [job["status"] for job in after["jobs"]] == ["completed"]
             assert before["device_ids"] == after["device_ids"]
             assert before["session_identities"] == after["session_identities"]
+            assert before["transitions"][0]["operation_id"] == pending["operation_id"] == after["transitions"][0]["operation_id"]
             if endpoint == "resume":
                 assert before["device_ids"] == pre_restart["device_ids"]
                 assert before["session_identities"] == pre_restart["session_identities"]
@@ -227,15 +299,15 @@ def main():
                 assert before["transitions"][0]["operation_id"] == pending["operation_id"]
                 assert before["transitions"][0]["resume_operation_id"] is not None
                 assert before["transitions"][0]["resume_operation_id"] == after["transitions"][0]["resume_operation_id"]
-            faults.append({"endpoint":endpoint,"fault":fault,"pre_restart":pre_restart,"before_replay":before,"after_replay":after})
-            print(f"PASS real postcommit lost {endpoint}: persisted replay, one generation advance",flush=True)
+            faults.append({"endpoint":endpoint,"delayed_cleanup":delayed_cleanup,"fault":fault,"pre_restart":pre_restart,"pending_before_ack":pending_before_ack,"after_denied_ack":after_denied_ack,"after_ack":after_ack,"before_replay":before,"after_replay":after})
+            print(f"PASS real postcommit lost {endpoint} (delayed={delayed_cleanup}): persisted replay, one generation advance",flush=True)
         finally:
             proxy.terminate()
             proxy.wait(timeout=5)
     logout_cases = []
     invalid_refresh_cases = []
     for delayed_cleanup in [False,True]:
-        if args.case_filter is not None:
+        if args.case_filter not in (None, "controlled-reauth"):
             continue
         login, work = prepare(f"invalid_refresh_{delayed_cleanup}")
         if delayed_cleanup:
@@ -249,7 +321,9 @@ def main():
         run([*fixture,"expire-refresh",login],env=env)
         if delayed_cleanup:
             time.sleep(1)  # Honor the real first persisted retry deadline.
-        run([binary,"recover",args.panel_url,work,login],expected=1)
+        pending = json.loads(run([binary,"recover",args.panel_url,work,login]))
+        assert pending["phase"] == "server_reconciling" and pending["barrier"]
+        assert "Pending" in pending["progress"]
         result = json.loads(run([binary,"assert-reauth-required",args.panel_url,work,login]))
         after = observe(login)
         assert after["device_ids"] == before["device_ids"] and after["device_generations"] == [1]
@@ -260,8 +334,36 @@ def main():
         if delayed_cleanup:
             assert after["jobs"][0]["status"] == "pending" and after["leases"][0]["status"] == "connected"
             assert after["transitions"][0]["barrier"]
-        invalid_refresh_cases.append({"delayed_cleanup":delayed_cleanup,"before":before,"after":after,"result":result})
-        print(f"PASS real invalid refresh: controlled recovery, no admission (delayed={delayed_cleanup})",flush=True)
+        logout = json.loads(run([binary,"controlled-logout",args.panel_url,work,login]))
+        assert logout["logged_out"] and logout["local_stop_complete"] and logout["cleanup_receipt_pending"]
+        recovered = json.loads(run([binary,"controlled-login",args.panel_url,work,login]))
+        assert recovered["usable_access"] and recovered["local_switch_journal_retired"] and recovered["cleanup_receipt_consumed"]
+        if delayed_cleanup:
+            blocked = observe(login)
+            assert blocked["active_sessions"] == 1 and blocked["transitions"][0]["barrier"]
+            assert not (work/"admitted-generation").exists()
+            start_blocked = json.loads(run([binary,"assert-start-blocked",args.panel_url,work,login]))
+            assert start_blocked["status"] == 409 and start_blocked["code"] == "runtime_switch_pending" and start_blocked["no_native_start"]
+            run([*fixture,"agent-fail",login],env=env)
+            assert observe(login)["leases"][0]["status"] == "connected"
+            run([*fixture,"agent-ack",login],env=env)
+            after_ack = observe(login)
+            assert all(not row["barrier"] for row in after_ack["transitions"])
+            start_unblocked = json.loads(run([binary,"assert-start-unblocked",args.panel_url,work,login]))
+            assert start_unblocked["code"] == "peer_binding_required" and start_unblocked["runtime_switch_barrier_absent"]
+        else:
+            start_blocked = None
+            start_unblocked = None
+            after_ack = None
+        final = observe(login)
+        assert final["devices"] == final["active_sessions"] == 1 and final["sessions"] == 2
+        assert final["device_ids"] == before["device_ids"]
+        assert all(row["id"] != before["session_identities"][0]["id"] and row["family"] != before["session_identities"][0]["family"] for row in final["session_identities"] if not row["revoked"])
+        if delayed_cleanup:
+            assert [lease["status"] for lease in final["leases"] if lease["id"] == before["leases"][0]["id"]] == ["released"]
+            assert final["jobs"][0]["status"] == "completed"
+        invalid_refresh_cases.append({"delayed_cleanup":delayed_cleanup,"before":before,"after_refusal":after,"result":result,"logout":logout,"recovered":recovered,"start_blocked_before_ack":start_blocked,"after_ack":after_ack,"start_unblocked_after_ack":start_unblocked,"after_reauthentication":final})
+        print(f"PASS real invalid refresh: logout/cleanup/password-login restored new family (delayed={delayed_cleanup})",flush=True)
     for issuance in ["refresh","resume"]:
       if args.case_filter is not None:
         continue

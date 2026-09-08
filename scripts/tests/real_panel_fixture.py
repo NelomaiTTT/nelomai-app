@@ -55,6 +55,7 @@ def main():
         if args.action.startswith("agent-"):
             from app import client_pools
             from app.client_connection_recovery import recover_client_operation
+            from app.client_runtime_switch import finalize_runtime_transitions
             from app.models import AppPoolPeer
             jobs = list(db.scalars(select(AppClientCleanupJob).where(AppClientCleanupJob.device_id.in_(ids))))
             jobs = [job for job in jobs if job.status.value in {"pending","processing"}]
@@ -72,7 +73,12 @@ def main():
             outcome = recover_client_operation(db, jobs[0].client_operation_id)
             assert calls == ["release_app_peer"], "actual remote ACK boundary was not reached"
             assert outcome == ("terminal" if args.action == "agent-ack" else "retryable")
-            print(json.dumps({"worker_outcome":outcome,"external_agent_calls":calls}))
+            if args.action == "agent-ack":
+                # The real worker follows terminal cleanup with its ordinary
+                # transition-finalization sweep; the fixture replaces only the
+                # external agent effect, not this panel state machine.
+                finalize_runtime_transitions(db)
+            print(json.dumps({"worker_outcome":outcome,"external_agent_calls":calls,"finalizer_sweep":args.action == "agent-ack"}))
             return
         if args.action.startswith("expire-"):
             for session in sessions:
