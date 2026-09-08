@@ -79,6 +79,7 @@
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
+  let localStopPendingCleanup = $state(false);
   let bootstrap = $state<Bootstrap | null>(null);
   let peers = $state<PeerOption[]>([]);
   let selectedPeerId = $state("");
@@ -428,6 +429,7 @@
       const previous = phase;
       const current = await nativeClient.state().catch(() => null);
       if (!current) return;
+      localStopPendingCleanup = current.localStopPendingCleanup === true;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       connectionIntentStatus = current.connectionIntentStatus;
@@ -464,6 +466,7 @@
 
   async function restore() {
     busy = true;
+    localStopPendingCleanup = false;
     error = null;
     diagnosticsStatus = null;
     startupSlow = false;
@@ -499,6 +502,7 @@
   }
 
   async function applyBootstrap(response: Bootstrap) {
+    localStopPendingCleanup = false;
     bootstrap = response;
     pinnedStray = response.pinned_stray;
     selectedLayer = response.defaults.layer;
@@ -526,6 +530,7 @@
 
     const state = await nativeClient.state();
     phase = state.phase;
+    localStopPendingCleanup = state.localStopPendingCleanup === true;
     connection = state.connection;
     connectionIntentStatus = state.connectionIntentStatus;
     nextRetryAtUnix = state.nextRetryAtUnix;
@@ -599,6 +604,7 @@
   }
 
   async function toggleConnection(forceStop = false) {
+    if (localStopPendingCleanup && !forceStop) return;
     if (
       !forceStop &&
       connectionAction !== "stop" &&
@@ -662,6 +668,8 @@
       }
       view = "connection";
       const current = await nativeClient.state();
+      localStopPendingCleanup = current.localStopPendingCleanup === true;
+      phase = current.phase;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
     } catch (reason) {
@@ -677,6 +685,7 @@
         );
       }
       const current = await nativeClient.state().catch(() => null);
+      localStopPendingCleanup = current?.localStopPendingCleanup === true;
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
       connectionIntentStatus = current?.connectionIntentStatus ?? connectionIntentStatus;
@@ -843,6 +852,7 @@
     error = null;
     try {
       await nativeClient.logout();
+      localStopPendingCleanup = false;
       bootstrap = null;
       connection = null;
       pinnedStray = null;
@@ -1084,6 +1094,7 @@
       const current = await nativeClient.state().catch(() => null);
       if (current) {
         phase = current.phase;
+        localStopPendingCleanup = current.localStopPendingCleanup === true;
         connection = current.connection;
         connectionIntentStatus = current.connectionIntentStatus;
         nextRetryAtUnix = current.nextRetryAtUnix;
@@ -1145,7 +1156,7 @@
     <div class="header-actions">
       <span class="status" data-phase={phase}>
         <span aria-hidden="true"></span>
-        {phaseLabels[phase]}
+        {localStopPendingCleanup ? "Туннель выключен" : phaseLabels[phase]}
       </span>
       {#if bootstrap}
         <button class="quiet-button" type="button" onclick={openChangelog}>
@@ -1379,7 +1390,9 @@
           <div>
             <p class="eyebrow">Подключение</p>
             <h1>
-              {visibleConnectionIntent === "recovering"
+              {localStopPendingCleanup
+                ? "Туннель выключен"
+                : visibleConnectionIntent === "recovering"
                 ? "Восстанавливаем подключение"
                 : visibleConnectionIntent === "blocked_terminal"
                   ? "Нужно ваше действие"
@@ -1394,11 +1407,11 @@
           </div>
 
           <button
-            class:stop={connectionAction === "stop"}
+            class:stop={connectionAction === "stop" && !localStopPendingCleanup}
             class="connect-button"
             type="button"
             onclick={() => toggleConnection()}
-            disabled={!canBeginConnectionAction(
+            disabled={localStopPendingCleanup || !canBeginConnectionAction(
               connectionActionState,
               busy,
               connectionAction === "stop" || connectionActionState.startBusy,
@@ -1408,14 +1421,16 @@
               (connectionAction !== "stop" && runtimeStartBlocked(runtimeStatus))}
           >
             <span>
-              {connectionAction === "stop"
+              {localStopPendingCleanup ? "Выключен" : connectionAction === "stop"
                 ? "Стоп"
                 : connectionAction === "retry"
                   ? "Повторить"
                   : "Старт"}
             </span>
             <small>
-              {busy
+              {localStopPendingCleanup
+                ? "Завершаем очистку на сервере"
+                : busy
                 ? phaseLabels[phase]
                 : connectionAction === "stop"
                   ? "Остановить и отменить повторы"
@@ -1425,7 +1440,18 @@
             </small>
           </button>
 
-          {#if connectionHasSecondaryStop}
+          {#if localStopPendingCleanup}
+            <p role="status">
+              VPN на устройстве выключен. Очистка на сервере выполняется в фоне.
+              {#if connectionIntentStatus === "recovering"}
+                Автоматическое восстановление остаётся включённым.
+              {:else}
+                Повторное подключение станет доступно после её завершения.
+              {/if}
+            </p>
+          {/if}
+
+          {#if connectionHasSecondaryStop || (localStopPendingCleanup && connectionIntentStatus === "recovering")}
             <button
               class="secondary-button blocked-stop-button"
               type="button"

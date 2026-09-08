@@ -565,11 +565,11 @@ fn start_physical_network_scheduler(
 
 fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
     tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(PENDING_STOP_RETRY_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = tokio::time::sleep(PENDING_STOP_RETRY_INTERVAL) => {},
+                _ = application.wait_for_pending_stop() => {},
+            }
             let _ = application.retry_pending_stop().await;
         }
     });

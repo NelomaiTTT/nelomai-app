@@ -1450,6 +1450,7 @@ async fn dynamic_handshake_timeout_replays_transient_stop_with_exact_marker_and_
         .unwrap()
         .pending_compensation_stop
         .expect("transient stop must retain the handshake compensation marker");
+    assert!(core.local_stop_pending_cleanup().await);
     assert!(pending.accept_warm);
     assert_eq!(
         serde_json::to_value(&pending).unwrap()["failure_code"],
@@ -2015,6 +2016,154 @@ async fn failed_fixed_start_accepts_panel_release_and_clears_compensation() {
         core.state().await.connection.unwrap().status,
         LeaseStatus::Released
     );
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn explicit_local_stop_journals_cleanup_and_replays_after_restart() {
+    let api = Arc::new(MockApi::new(0));
+    *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    let connected = core.start(options(), 1_700_000_000).await.unwrap();
+    let stopped = core.stop_locally().await.unwrap();
+    assert_eq!(stopped, connected);
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert!(core.local_stop_pending_cleanup().await);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    let pending = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .unwrap();
+    core.stop_locally().await.unwrap();
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .unwrap()
+            .pending_compensation_stop
+            .as_ref(),
+        Some(&pending)
+    );
+    assert!(core.stop().await.is_err());
+    assert!(core.local_stop_pending_cleanup().await);
+    let reconstructed = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    reconstructed.bootstrap(1_700_000_001).await.unwrap();
+    assert!(reconstructed.local_stop_pending_cleanup().await);
+    assert!(reconstructed.stop().await.is_err());
+    assert!(reconstructed.local_stop_pending_cleanup().await);
+    *api.stop_error.lock().unwrap() = None;
+    reconstructed.stop().await.unwrap();
+    assert!(!reconstructed.local_stop_pending_cleanup().await);
+    assert_eq!(
+        api.stop_operation_ids.lock().unwrap().as_slice(),
+        &[
+            pending.operation_id.clone(),
+            pending.operation_id.clone(),
+            pending.operation_id
+        ]
+    );
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .is_none());
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn explicit_local_stop_failure_retains_cleanup_without_claiming_local_disconnect() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    assert!(core.stop_locally().await.is_err());
+    assert!(!core.local_stop_pending_cleanup().await);
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .is_some());
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    core.stop_locally().await.unwrap();
+    assert!(core.local_stop_pending_cleanup().await);
+    assert!(core.start_saved_stray_offline(1_700_000_001).await.is_err());
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn explicit_local_stop_cleanup_fences_new_starts_and_conflicting_leases() {
+    let api = Arc::new(MockApi::new(0));
+    *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    core.start(options(), 1_700_000_000).await.unwrap();
+    core.stop_locally().await.unwrap();
+    assert!(core.start(options(), 1_700_000_001).await.is_err());
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 1);
+    let pending = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .unwrap();
+    *api.bootstrap_connection.lock().unwrap() = Some(connection("different-lease"));
+    let reconstructed = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    reconstructed.bootstrap(1_700_000_002).await.unwrap();
+    assert!(!reconstructed.local_stop_pending_cleanup().await);
+    assert!(reconstructed.stop().await.is_err());
+    assert!(reconstructed.stop_locally().await.is_err());
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .unwrap()
+            .pending_compensation_stop
+            .as_ref(),
+        Some(&pending)
+    );
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(not(target_os = "android"))]
@@ -6174,23 +6323,33 @@ async fn cancelled_panel_start_replays_lost_compensation_with_the_same_id_after_
 
 #[tokio::test(flavor = "current_thread")]
 async fn secret_store_failure_during_stop_never_blocks_the_local_tunnel_stop() {
-    let api = Arc::new(MockApi::new(0));
-    let store = Arc::new(ToggleLoadStore::new(auth()));
-    let tunnel = Arc::new(MemoryTunnel::default());
-    let core = support::core(
-        api,
-        store.clone(),
-        tunnel.clone(),
-        Arc::new(MemoryLogger::default()),
-    );
-    core.start(options(), 1_700_000_000).await.unwrap();
-    store.fail_load.store(true, Ordering::SeqCst);
+    for locally in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        let store = Arc::new(ToggleLoadStore::new(auth()));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = support::core(
+            api,
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.start(options(), 1_700_000_000).await.unwrap();
+        store.fail_load.store(true, Ordering::SeqCst);
 
-    let error = core.stop().await.unwrap_err();
+        #[cfg(not(target_os = "android"))]
+        let error = if locally {
+            core.stop_locally().await
+        } else {
+            core.stop().await
+        }
+        .unwrap_err();
+        #[cfg(target_os = "android")]
+        let error = core.stop().await.unwrap_err();
 
-    assert!(matches!(error, CoreError::Storage));
-    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
-    assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Stopped);
+        assert!(matches!(error, CoreError::Storage));
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Stopped);
+    }
 }
 
 #[tokio::test]

@@ -2417,6 +2417,89 @@ where
         }
     }
 
+    #[cfg(not(target_os = "android"))]
+    pub async fn stop_locally(&self) -> Result<Connection, CoreError> {
+        self.signal_start_cancellation();
+        let intent_guard = self.intent_recovery_gate.lock().await;
+        let split_guard = self.split_tunnel_gate.lock().await;
+        let connection_guard = self.connection_gate.lock().await;
+        let current = self.state.lock().await.connection.clone();
+        let stored = self.load_runtime();
+        // Unknown starts and stalled recovery retain their existing reconciliation path.
+        let Some(current) = current.filter(|_| {
+            !stored
+                .as_ref()
+                .is_ok_and(|stored| stored.pending_stalled_stop.is_some())
+        }) else {
+            drop(connection_guard);
+            drop(split_guard);
+            drop(intent_guard);
+            return self.stop().await;
+        };
+        let journal_result = match stored {
+            Ok(stored) => {
+                if let Some(pending) = stored.pending_compensation_stop {
+                    if pending.lease_id != current.lease_id {
+                        return Err(CoreError::Storage);
+                    }
+                    Ok(())
+                } else if !compensation_stop_confirms_finished(None, true, current.status) {
+                    self.pending_compensation_stop_identity(&current.lease_id, true, None)
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        *self.active_recovery_episode.lock().await = None;
+        self.set_phase(Phase::Stopping).await;
+        if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
+            self.tunnel.stop().await?;
+        }
+        // Storage failure must not leave the user's local tunnel running.
+        // No panel request is sent until a cleanup identity has been persisted.
+        journal_result?;
+        // The panel owns the lease status. Only the local tunnel is confirmed here.
+        self.physical_network_change.lock().await.reset();
+        self.clear_applied_physical_network_fingerprint();
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
+        if !self.has_pending_stop_cleanup()? {
+            self.set_phase(Phase::Ready).await;
+        }
+        Ok(current)
+    }
+
+    pub async fn local_stop_pending_cleanup(&self) -> bool {
+        if !matches!(self.auth.state().await, Ok(RuntimeAuthState::Active)) {
+            return false;
+        }
+        let Ok(stored) = self.load_runtime() else {
+            return false;
+        };
+        let Some(pending) = stored.pending_compensation_stop else {
+            return false;
+        };
+        let state = self.state.lock().await;
+        matches!(state.phase, Phase::Stopping | Phase::Ready)
+            && state
+                .connection
+                .as_ref()
+                .is_none_or(|current| current.lease_id == pending.lease_id)
+            && matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
+    }
+
+    pub fn has_pending_stop_cleanup(&self) -> Result<bool, CoreError> {
+        match self.load_runtime() {
+            Ok(stored) => Ok(stored.pending_compensation_stop.is_some()),
+            Err(CoreError::SignedOut) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn stop(&self) -> Result<Connection, CoreError> {
         self.signal_start_cancellation();
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
@@ -2717,6 +2800,10 @@ where
         {
             Ok(response) => response,
             Err(error) => {
+                // A transient panel outage does not undo the confirmed local stop.
+                if self.state.lock().await.phase == Phase::ServerUnavailable {
+                    self.set_phase(Phase::Stopping).await;
+                }
                 self.logger.record(CoreLogEvent {
                     kind: "connection.stop_failed",
                     operation_id: Some(request.operation_id),
@@ -3367,6 +3454,9 @@ where
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         let stored = self.load_runtime()?;
+        if stored.pending_compensation_stop.is_some() {
+            return Err(CoreError::SavedConnectionUnavailable);
+        }
         if stored
             .compatibility
             .as_ref()
@@ -4469,9 +4559,14 @@ where
                     request_id: None,
                     code: Some(compensation_error.to_string()),
                 });
+                let phase = phase_for_start_error(&compensation_error);
                 (
                     connection.clone(),
-                    phase_for_start_error(&compensation_error),
+                    if phase == Phase::ServerUnavailable {
+                        Phase::Stopping
+                    } else {
+                        phase
+                    },
                 )
             }
         };

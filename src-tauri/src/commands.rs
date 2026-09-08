@@ -1461,6 +1461,7 @@ async fn prepare_desktop_logout(
 #[serde(rename_all = "camelCase")]
 pub struct AppStateResponse {
     phase: &'static str,
+    local_stop_pending_cleanup: bool,
     connection: Option<Connection>,
     connection_intent_status: &'static str,
     next_retry_at_unix: Option<i64>,
@@ -1631,12 +1632,23 @@ impl AppStateResponse {
         };
         Self {
             phase,
+            local_stop_pending_cleanup: false,
             connection: state.connection,
             connection_intent_status: connection_intent_status_name(connection_intent_status),
             next_retry_at_unix,
             warning,
             metrics,
         }
+    }
+
+    fn with_local_stop_pending_cleanup(mut self, confirmed: bool) -> Self {
+        self.local_stop_pending_cleanup = confirmed
+            && (matches!(self.phase, "stopping" | "ready")
+                || (self.phase == "connecting" && self.connection_intent_status == "recovering"));
+        if self.local_stop_pending_cleanup {
+            self.metrics = None;
+        }
+        self
     }
 }
 
@@ -1859,13 +1871,18 @@ pub async fn app_state(
     let status_unavailable_fallback = android_status_unavailable_fallback();
     let (intent_status, next_retry_at_unix) =
         current_connection_intent(&app, status_unavailable_fallback).await;
+    #[cfg(not(target_os = "android"))]
+    let local_cleanup = application.local_stop_pending_cleanup().await;
+    #[cfg(target_os = "android")]
+    let local_cleanup = false;
     Ok(AppStateResponse::new(
         state,
         warning,
         current_metrics,
         intent_status,
         next_retry_at_unix,
-    ))
+    )
+    .with_local_stop_pending_cleanup(local_cleanup))
 }
 
 #[cfg(target_os = "android")]
@@ -2153,13 +2170,18 @@ pub(crate) async fn quick_toggle(
     let (intent_status, next_retry_at_unix) =
         current_connection_intent(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
             .await;
+    #[cfg(not(target_os = "android"))]
+    let local_cleanup = application.local_stop_pending_cleanup().await;
+    #[cfg(target_os = "android")]
+    let local_cleanup = false;
     Ok(AppStateResponse::new(
         state,
         warning,
         current_metrics,
         intent_status,
         next_retry_at_unix,
-    ))
+    )
+    .with_local_stop_pending_cleanup(local_cleanup))
 }
 
 #[tauri::command]
@@ -4030,6 +4052,49 @@ mod tests {
         assert_eq!(value["phase"], "error");
         assert_eq!(value["connectionIntentStatus"], "blocked_terminal");
         assert!(value["nextRetryAtUnix"].is_null());
+        assert_eq!(value["localStopPendingCleanup"], false);
+    }
+
+    #[test]
+    fn local_stop_projection_preserves_cleanup_and_recovery_intent() {
+        use nelomai_client_core::ConnectionIntentStatus;
+        for (phase, intent, confirmed, expected) in [
+            (Phase::Stopping, ConnectionIntentStatus::None, true, true),
+            (Phase::Ready, ConnectionIntentStatus::None, true, true),
+            (Phase::Stopping, ConnectionIntentStatus::None, false, false),
+            (Phase::Connected, ConnectionIntentStatus::None, true, false),
+            (Phase::SignedOut, ConnectionIntentStatus::None, true, false),
+            (
+                Phase::Stopping,
+                ConnectionIntentStatus::Recovering,
+                true,
+                true,
+            ),
+        ] {
+            let response = AppStateResponse::new(
+                CoreState {
+                    phase,
+                    connection: None,
+                },
+                None,
+                None,
+                intent,
+                None,
+            )
+            .with_local_stop_pending_cleanup(confirmed);
+            assert_eq!(response.local_stop_pending_cleanup, expected);
+            assert_eq!(
+                response.connection_intent_status,
+                connection_intent_status_name(intent)
+            );
+            if expected {
+                assert!(matches!(
+                    response.phase,
+                    "stopping" | "ready" | "connecting"
+                ));
+                assert!(response.metrics.is_none());
+            }
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ use nelomai_contracts::{
 use std::sync::{Arc, Mutex as StdMutex};
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 const PROBE_REFRESH_SECONDS: i64 = 300;
 const MAX_CONCURRENT_PROBES: usize = 4;
@@ -391,6 +391,7 @@ pub struct ClientApplication<A, S, T, L> {
     start_preflight: Arc<dyn RuntimeStartPreflight>,
     lifecycle_gate: Arc<AsyncMutex<()>>,
     probe_gate: AsyncMutex<()>,
+    pending_stop_wake: Notify,
     probe_cache: StdMutex<ProbeCache>,
 }
 
@@ -462,6 +463,7 @@ where
             start_preflight,
             lifecycle_gate,
             probe_gate: AsyncMutex::new(()),
+            pending_stop_wake: Notify::new(),
             probe_cache: StdMutex::new(ProbeCache::default()),
         }
     }
@@ -1112,16 +1114,36 @@ where
     pub async fn stop(&self) -> Result<Connection, ApplicationError> {
         self.core.signal_start_cancellation();
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        #[cfg(not(target_os = "android"))]
+        {
+            let result = self.core.stop_locally().await;
+            if result.is_ok() {
+                // Retain one permit if the scheduler is busy or has not started yet.
+                self.pending_stop_wake.notify_one();
+            }
+            result.map_err(Into::into)
+        }
+        #[cfg(target_os = "android")]
         self.core.stop().await.map_err(Into::into)
+    }
+
+    pub async fn local_stop_pending_cleanup(&self) -> bool {
+        self.core.local_stop_pending_cleanup().await
     }
 
     pub fn signal_start_cancellation(&self) -> bool {
         self.core.signal_start_cancellation()
     }
 
+    pub async fn wait_for_pending_stop(&self) {
+        self.pending_stop_wake.notified().await;
+    }
+
     pub async fn retry_pending_stop(&self) -> Result<Option<Connection>, ApplicationError> {
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
-        if self.core.state().await.phase != Phase::Stopping {
+        if self.core.state().await.phase != Phase::Stopping
+            && !self.core.has_pending_stop_cleanup()?
+        {
             return Ok(None);
         }
         self.core.stop().await.map(Some).map_err(Into::into)
@@ -1131,7 +1153,9 @@ where
         let cancelled_pending_start = self.core.signal_start_cancellation();
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         let state = self.core.state().await;
-        if shutdown_requires_core_stop(state.phase, cancelled_pending_start) {
+        if shutdown_requires_core_stop(state.phase, cancelled_pending_start)
+            || self.core.has_pending_stop_cleanup()?
+        {
             return self.core.stop().await.map(Some).map_err(Into::into);
         }
         Ok(None)
