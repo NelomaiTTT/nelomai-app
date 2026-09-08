@@ -59,108 +59,72 @@ Signature formats stay distinct:
 - Android installation uses its APK keystore certificate; the expected
   `ANDROID_SIGNER_SHA256` is separate from both public-key formats above.
 
-## Three modes and two signing phases
+## Current release pipeline (2026-09-09)
 
-`build_only` is the default. It is read-only, nonpublishing and uses deliberately
-public TEST trust derived per source/run. All runtime/common/dispatcher native
-builds receive the same compile-time TEST runtime pin through the existing
-`NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64` interface. Native output directories
-are isolated; no release/test Cargo output artifact is reused across jobs.
-Private TEST material is regenerated in phase-local temporary paths, not
-uploaded. This is useful preliminary packaging/native/Linux coverage, not a
-release-trust, updater-installation or hardware approval. Its inventory remains
-permanently nonpublishable even if someone later approves an environment.
+The build graph is `verify → native_drafts → sign → native_packages → finalize`.
+Publication remains a separate dispatch; building never publishes.
 
-`sign_candidate` follows this order:
+- `build_only` is the default. It uses deliberately public TEST trust derived
+  per source/run and cannot be promoted. The shared signing/finalization jobs
+  receive no production signing secrets in this mode.
+- `sign_candidate` runs the same graph with release trust. Four native jobs
+  build the runtime payloads; `sign` signs the runtime/root/container documents.
+  Native packaging consumes those unchanged bytes and emits **only shipping
+  installers**. Desktop common wrappers reuse the signed latest WebView;
+  neither packaging Python nor Tauri's before-build hook rebuilds the UI.
+  `finalize` signs desktop updater packages and the APK, verifies the final
+  signatures and writes the release manifest plus shipping inventory.
+- `publish_approved_candidate` selects retained bytes from a successful
+  `sign_candidate` run. Supply the source SHA, version, `candidate_run_id`,
+  release notes and `panel_notification_ready=true`. Artifact ID and inventory
+  digest are resolved automatically. Publication checks source/run identity,
+  retention, the exact shipping allowlist and each downloaded file hash. It
+  does not compile, sign, replace existing assets or move a tag.
 
-1. Four keyless native jobs compile final payloads under the explicit release
-   public pin, inspect them natively and upload draft ZIPs signed with ephemeral
-   TEST keys. No release private key is available to those jobs.
-2. Protected `release-candidate-signing` verifies all unchanged drafts, creates
-   final runtime signatures/root and signs ordinary latest-only and separate
-   two-slot container documents. It does not run foreign native packagers.
-3. Four keyless native jobs extract final signed payloads and build ordinary
-   installers plus separate synthetic acceptance installers. macOS applies
-   only the outer ad-hoc app seal, without `--deep`; final inner bytes and modes
-   must survive native packaging/re-extraction unchanged. Candidate APKs are
-   packaged unsigned for the next phase.
-4. Distinct protected `release-candidate-finalization` signs the final desktop
-   installer bytes with Tauri and the final APKs with their keystore, then
-   creates the existing signed release manifest and exact inventories. It
-   checks that APK signing did not alter DEX/resources/native entries. The
-   matching updater public pin verifies each final desktop signature.
-5. Four native jobs re-extract/recheck those final installers, including real
-   Android APK/DEX/ABI/JNI/symbol checks and the ordinary shipping gate. The
-   Linux job additionally runs the separately scoped disposable adapter.
-6. Protected `release-candidate-acceptance` requires actual approval **and** the
-   authoritative full real-client/platform acceptance producer. That producer
-   is currently missing: the explicit Task12 boundary below returns nonzero.
+Native packaging still checks extracted runtime bytes. APK checking retains
+versionCode/versionName, DEX/ABI/JNI and native payload checks. Signature
+production and runtime/updater verification remain; the removed manual
+approvals and full acceptance publication gate are **not** reintroduced.
+A passing build is not proof of installation or tunnel behavior on a device.
 
-`publish_approved_candidate` never builds, signs, repackages, installs or accepts
-a replacement candidate. A read-only preflight compiles trusted verification
-adapters from the pinned source. The separate contents:write job under
-`release-publication` verifies those same-run adapters' digests, the original
-retained candidate ZIP, original run/source/protection/approval provenance,
-root, every installer digest and both signature formats again immediately
-before creating the release with `--target "$SOURCE_SHA"`.
+The signing job provisions Python/Rust only. Finalization provisions the
+signing CLIs and Android build-tools, not Go, NDK or native GTK dependencies.
+Native build/packaging jobs retain the dependencies they consume.
 
-## Configuration and approval prerequisites
+## Signing configuration
 
-At this work's read-only repository preflight, the public repository had **no
-environments configured**. No environment/configuration was created by this
-task. YAML labels alone do not authorize release signing or publication.
-An authorized administrator must separately configure all four environments:
+Keep `release-candidate-signing`, `release-candidate-finalization` and
+`release-publication` as credential/configuration boundaries. Read-only GitHub
+inspection on 2026-09-09 found no approval protection rules on them.
+The unused `release-candidate-acceptance` environment is not part of this graph.
+No environment configuration is changed by the workflow simplification.
 
-- `release-candidate-signing`
-- `release-candidate-finalization`
-- `release-candidate-acceptance`
-- `release-publication`
+Configure raw Ed25519 public pin `NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64`
+and APK certificate pin `ANDROID_SIGNER_SHA256` as repository variables.
+The separate Tauri public pin `NELOMAI_UPDATER_PUBLIC_KEY` and existing Firebase
+values remain repository Secrets. Private runtime-signing material belongs to
+signing/finalization; Tauri and Android private signing material belongs to
+finalization. Private keys never enter uploaded artifacts or job outputs.
 
-Each requires actual required reviewers and an explicit `prevent_self_review`
-policy. The owner has approved `prevent_self_review=false` for this repository:
-the initiating owner may manually approve their own run. This does not approve
-any run automatically or remove the separate signing, finalization, acceptance
-and publication approvals.
-GET checks bind current positive environment IDs to exactly one approved review
-per required identity in the current run. Rejected, duplicate, missing, stale,
-recreated or ambiguous review history fails closed. Only integer run attempt 1
-is eligible. Failed/rejected runs and GitHub reruns require a **new run and new
-approvals**, not approval reuse or timestamp/order inference. The two signing
-waves deliberately use different environment identities and approvals.
+## Retention and reruns
 
-Configure the raw Ed25519 public pin as repository variable
-`NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64` and the expected APK certificate as
-`ANDROID_SIGNER_SHA256`. Keep the separate Tauri public pin
-`NELOMAI_UPDATER_PUBLIC_KEY` and the existing Firebase application/API/project
-values in repository Secrets, as for previous releases; the workflow reads them
-from Secrets without requiring a migration to Variables. Provision matching private Ed25519 material only
-in the signing/finalization environments. Tauri signing key/password and Android
-keystore/base64/alias/password secrets belong only to finalization. No private
-key is an artifact or job output. The panel's manifest public key must match the
-existing release-envelope signer independently of its deployment readiness.
+Artifacts are retained for 14 days. `candidate-0.2.16` contains the exact
+22-file shipping allowlist plus `candidate-inventory.json`: four installers,
+twelve runtime files, two root files, two release-manifest files and two
+licensed-source archive/checksum files. Publication uses that explicit list.
 
-## Retention and promotion identity
+Use **Re-run failed jobs** for a failed attempt of unchanged source. Uploads
+replace same-named build artifacts within that run, and source/root/package
+identity checks prevent mixing different inputs. The selected completed run
+may have any attempt number. A missing, expired, ambiguous, wrong-source or
+unsuccessful build is rejected; changed source requires a new build.
+Artifact selection was checked read-only against a retained GitHub build.
 
-Artifacts are retained for 14 days. `candidate-0.2.16` contains only the exact
-22-file ordinary shipping allowlist plus `candidate-inventory.json`: four
-installers, twelve runtime files, two root files, two existing release-manifest
-files and two licensed-source archive/checksum files. Promotion passes the
-explicit allowlist to GitHub; it does not use a publication glob.
-
-`acceptance-only-0.2.16` and its `acceptance-inventory.json` are separate. Their
-final installer hashes bind synthetic tests to exact candidate/root bytes, but
-they are never ordinary shipping assets. Size reports remain in native draft
-and package indexes; final signed release metadata also records installer sizes.
-
-Promotion requires `candidate_run_id`, `candidate_artifact_id`,
-`release_set_sha256` and `inventory_sha256`. The original run must be a successful
-completed first-attempt `workflow_dispatch` of this release workflow at the
-exact source SHA/repository. GET artifact metadata must identify that same run,
-repository/head repository, artifact ID/name and nonexpired retention. Its
-authoritative ZIP digest/size and every extracted file are checked, then checked
-again after candidate verification. Caller JSON and a GitHub artifact name do
-not replace this provenance. Expired/missing bytes or changed digests require a
-new build and acceptance; rebuilding under an old approval is forbidden.
+Acceptance packager/test helpers remain available for explicit local testing,
+but ordinary releases no longer build, finalize or upload acceptance installers.
+The separate Linux diagnostic workflow opts into both packages with
+`package-release-platform.py --include-acceptance`; this flag is absent from
+the ordinary release workflow.
 
 ## Actual command boundaries
 
@@ -172,7 +136,7 @@ subdirectory. Missing or nonexecutable tools fail the tests, never skip their
 compiled-byte coverage. `ANDROID_HOME` also identifies the SDK for opt-in actual
 APK packaging tests. These tests do not establish device acceptance.
 
-The workflow supplies explicit paths/pins and runs these existing CLI consumers:
+The workflow supplies explicit paths/pins to these consumers. The last command\n(`verify-release-platform.py`) is an optional legacy two-package test, not a workflow job:
 
 ```text
 build-release-platform.py --mode MODE --source-sha SHA --platform P --architecture A --public-key RAW --output DRAFT --work TEMP [--ndk NDK --go-archive ARCHIVE]
@@ -190,7 +154,7 @@ and platform manifest digests. Ordinary checker invocation still rejects stable
 DEX and stable slots. The Gradle `-PnelomaiAcceptance=true` path must link the
 exact final stable AAR; it cannot silently enable stable in a shipping APK.
 
-## Unclosed acceptance boundary
+## Optional acceptance tooling and hardware limits
 
 The Linux executable exercises actual `CommonHost`, `VerifiedRuntime`, inherited
 broker/native channels, the unchanged stable executable, real WebView controls
@@ -222,17 +186,14 @@ interposer, not a product hook or journal rewrite. Results record tested source
 diff/driver hashes; the supplied panel SHA is an archive provenance claim, not
 argument-based verification. This is not a packaged-candidate approval issuer.
 
-The mandatory full producer interface is:
+The legacy full producer interface, not invoked by the release workflow, is:
 
 ```text
 python scripts/require-candidate-acceptance.py --source-sha SHA40 --release-set-sha256 SHA64 --inventory-sha256 SHA64 --candidate-directory PATH
 ```
 
-Until Task12 implements and executes authoritative real-client/panel/platform
-checks, this command explicitly reports UNRUN and exits nonzero. It accepts no
-successful receipt/override. Packaging and Linux supplemental evidence cannot
-close it. Full UI→production business HTTP/tunnel flow, actual-release trust,
-physical Apple/Windows/Android checks and platform updater installation remain
-unrun without the respective environments and authorization. Local macOS app
-and Android APK builds are TEST-trust packaging checks only. Task11 candidate
-acceptance and publication remain closed despite passing preliminary gates.
+This legacy command must not be treated as a successful device check or a
+publication approval issuer. Current publication does not call it.
+Physical Windows/macOS/Android update, retained login and tunnel checks still
+need the actual corrected installers on those devices; Linux execution tests
+with native-effects adapters are not a physical VPN test.

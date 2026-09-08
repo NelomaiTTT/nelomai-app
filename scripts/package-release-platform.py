@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keyless native wrapping after final embedded manifest signatures.
 
-Shipping latest-only and two-slot acceptance outputs are separate directories.
+Only the ordinary shipping installer is built by the release pipeline.
 No installer execution, signing credentials, or publication is allowed here.
 """
 import argparse
@@ -27,6 +27,7 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--mode", choices=("build_only", "sign_candidate"), default="build_only")
     parser.add_argument("--ndk", type=Path)
+    parser.add_argument("--include-acceptance", action="store_true", help="Also build explicit diagnostic test inputs")
     args = parser.parse_args()
     builder.gates.require_operation(args.mode, "build")
     if any(os.environ.get(name) for name in ("TAURI_SIGNING_PRIVATE_KEY", "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64",
@@ -40,7 +41,6 @@ def main():
         setattr(args, name, getattr(args, name).resolve())
     environment = {**os.environ, "NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64": base64.b64encode(args.public_key.read_bytes()).decode()}
     builder.run("cargo", "build", "--locked", "-p", "nelomai-contracts", "--bin", "verify-runtime-manifest", env=environment)
-    builder.run("npm.cmd" if os.name == "nt" else "npm", "run", "build", env=environment)
     readelf = None
     if args.platform == "android":
         if args.ndk is None:
@@ -53,7 +53,7 @@ def main():
             "NELOMAI_FIREBASE_APPLICATION_ID", "NELOMAI_FIREBASE_API_KEY", "NELOMAI_FIREBASE_PROJECT_ID")):
             raise ValueError("candidate Android packaging requires public Firebase release configuration")
     packages = {}
-    for kind in ("shipping", "acceptance"):
+    for kind in (("shipping", "acceptance") if args.include_acceptance else ("shipping",)):
         staged = args.output / "staged" / kind
         container.stage_signed(args.signed, args.release_set_sha256, staged, args.public_key,
             args.platform, args.architecture, args.source_sha, kind, readelf)

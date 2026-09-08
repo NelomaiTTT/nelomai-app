@@ -238,6 +238,14 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
                "windows": ("x86_64-pc-windows-msvc", "nsis"), "macos": ("aarch64-apple-darwin", "app")}
     target, bundle = targets[platform]
     configuration = json.loads((root / "src-tauri" / f"bundle.{platform}.conf.json").read_bytes())
+    manifest = json.loads((staged / "runtime/container-manifest-v1.json").read_bytes())
+    latest = next(slot for slot in manifest["slots"] if slot["slot"] == "latest")
+    webview = staged / "runtime/engines/latest" / latest["manifest"]["runtime_version"] / "webview"
+    if not (webview / "index.html").is_file():
+        raise ValueError("staged runtime UI is missing")
+    # Reuse the UI already compiled and authenticated with this runtime. Tauri
+    # would otherwise run the repository's beforeBuildCommand a second time.
+    configuration["build"] = {"beforeBuildCommand": "", "frontendDist": str(webview.resolve())}
     resources = configuration["bundle"]["resources"]
     configuration["bundle"]["resources"] = {
         str(staged / source.removeprefix("platform-runtime/desktop-bundle/"))

@@ -47,7 +47,7 @@ jobs:
           python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUNNER_TEMP/runtime-public.raw"
           cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
           cargo build --locked -p nelomai-client-container --example linux-runtime-acceptance
-          python scripts/package-release-platform.py --mode build_only --source-sha "$SOURCE_SHA" \
+          python scripts/package-release-platform.py --mode build_only --include-acceptance --source-sha "$SOURCE_SHA" \
             --release-set-sha256 b343dd31ff2a1a75a0559915c4dc068ad7453e0649066da469d266b598298112 \
             --platform linux --architecture x86_64 --signed signed --draft draft/linux \
             --public-key "$RUNNER_TEMP/runtime-public.raw" --output packages/linux

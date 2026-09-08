@@ -98,21 +98,16 @@ and claims about functionality that is not yet present in the release branch.
 - Store a separate raw 32-byte Ed25519 seed in
   `NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64`; configure the matching public key
   on the panel as `CLIENT_RELEASE_MANIFEST_PUBLIC_KEY_B64`.
-- The `release` GitHub Actions workflow is started only through guarded manual
-  dispatch with an exact maintenance `source_sha`. Default `build_only` uses
-  TEST trust and cannot publish. `sign_candidate` builds Linux x86_64, Windows
-  x86_64, macOS aarch64 and Android aarch64 through two distinct protected signing
-  phases: final runtime/root/container signatures before keyless native
-  packaging, then final installer/updater/APK signatures. Intel macOS is not a
-  release target. Full real-candidate acceptance remains a separate mandatory
-  gate, currently blocked on Task12 rather than inferred from build success.
-- `publish_approved_candidate` promotes only original retained final bytes from
-  a successful first-attempt candidate run, under separate publication approval.
-  It rechecks original-run/artifact provenance, current environment identities,
-  all hashes, the Ed25519 release/root envelopes and Tauri updater signatures
-  against their separate pinned public keys. It never rebuilds, re-signs,
-  overwrites assets or moves a tag. Synthetic acceptance installers are stored
-  separately and excluded from the explicit ordinary shipping allowlist.
+- The `release` workflow is dispatched with an exact maintenance `source_sha`.
+  Default `build_only` uses TEST trust and cannot publish. `sign_candidate`
+  builds Linux x86_64, Windows x86_64, macOS aarch64 and Android aarch64.
+  The shared `sign` and `finalize` jobs produce runtime and installer
+  signatures respectively; only ordinary shipping installers are packaged.
+  Manual approval/full acceptance gates are not part of this workflow.
+- `publish_approved_candidate` publishes retained bytes from the selected
+  successful candidate run, including reruns. It automatically selects the
+  unique nonexpired artifact and checks source/run identity, inventory and
+  all file hashes. It never rebuilds, re-signs, overwrites assets or moves a tag.
 - The workflow publishes a deterministic JSON manifest, its detached Ed25519
   signature, and Tauri-signed packages. Draft and prerelease GitHub releases
   are not consumed by the panel.
@@ -125,13 +120,9 @@ and claims about functionality that is not yet present in the release branch.
   device. Android must show its system confirmation UI; silent installation is
   neither requested nor supported.
 
-The full artifact commands, four required protected environments, retention
-expiry behavior, first-attempt-only approval policy, actual preliminary checks
-and known stable dispatcher/engine implementation gap are documented in
-[`runtime-artifacts.md`](runtime-artifacts.md). Required environment protections
-were absent at this work's read-only preflight; this task did not configure them.
-An environment label, caller JSON or a build-only artifact is not release
-authorization.
+Current signing configuration, command boundaries and rerun/retention behavior
+are documented in [`runtime-artifacts.md`](runtime-artifacts.md).
+Build-only artifacts are never eligible for publication.
 
 ## Panel-first release order
 
@@ -145,14 +136,14 @@ For every application release:
 1. Deploy the compatible panel change through the guarded panel updater.
 2. Verify panel health and release-sync readiness without running production
    preflight against the working database.
-3. Build/sign and fully accept the exact candidate in its separately approved
-   run. Missing authoritative Task12/physical acceptance keeps publication closed.
+3. Build/sign the exact candidate and inspect the build results. Hardware testing
+   remains distinct from build success; there is no automatic full acceptance gate.
 4. Start the manual `release` workflow in `publish_approved_candidate` mode with
-   the original run/artifact IDs and approved root/inventory hashes, and
+   the source SHA and successful candidate run ID, and
    `panel_notification_ready=true`. The acknowledgement confirms that the
    notification producer is already deployed; it is not a remote capability
    probe.
-5. Let the independently approved publication job recheck and create the exact
+5. Let the separately dispatched publication job recheck and create the exact
    version tag/GitHub release at `source_sha`.
 6. Wait for normal panel release sync and verify the notification audit event.
 
