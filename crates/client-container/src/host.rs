@@ -750,17 +750,23 @@ impl CommonHost {
         {
             return Err(HostError::RecoveryRequired);
         }
+        crate::startup_diagnostics::stage("runtime.verify_selected");
         let runtime = crate::desktop::VerifiedRuntime::from_verified(
             &self.resources,
             self.installed.manifest().clone(),
             selected.target.runtime_slot,
             payload_owner,
         )
+        .inspect_err(|error| crate::startup_diagnostics::error("runtime.verify_selected", error))
         .map_err(|_| HostError::RecoveryRequired)?;
-        let mut child = tokio::task::spawn_blocking(move || runtime.spawn())
-            .await
-            .map_err(|_| HostError::RecoveryRequired)?
-            .map_err(|_| HostError::RecoveryRequired)?;
+        let mut child = tokio::task::spawn_blocking(move || {
+            runtime
+                .spawn()
+                .inspect_err(|error| crate::startup_diagnostics::error("runtime.spawn", error))
+        })
+        .await
+        .map_err(|_| HostError::RecoveryRequired)?
+        .map_err(|_| HostError::RecoveryRequired)?;
         child
             .verify_alive()
             .map_err(|_| HostError::RecoveryRequired)?;

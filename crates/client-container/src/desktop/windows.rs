@@ -416,8 +416,11 @@ fn remote_duplicate(source: &OwnedHandle, donor: &Process) -> io::Result<HANDLE>
 
 impl VerifiedRuntime {
     pub fn spawn(&self) -> io::Result<VerifiedChild> {
+        crate::startup_diagnostics::stage("runtime.reverify");
         self.reverify()?;
+        crate::startup_diagnostics::stage("runtime.verify_acl");
         self.verify_windows_acl()?;
+        crate::startup_diagnostics::stage("runtime.create_pipes");
         let executable = std::fs::canonicalize(&self.executable)?;
         let identity = self
             .manifest
@@ -428,6 +431,7 @@ impl VerifiedRuntime {
         let environment = environment()?;
         let mut info: STARTUPINFOW = unsafe { std::mem::zeroed() };
         info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        crate::startup_diagnostics::stage("runtime.create_donor");
         let donor = create(
             &executable,
             "--private-donor-never-resume",
@@ -445,11 +449,13 @@ impl VerifiedRuntime {
             remote_duplicate(native_handles[0], &donor)?,
             remote_duplicate(native_handles[1], &donor)?,
         ];
+        crate::startup_diagnostics::stage("runtime.prepare_handles");
         let startup = Startup::new(&donor, handles)?;
         let arguments = format!(
             "--private-runtime-v1 {} {}",
             handles[3] as usize, handles[4] as usize
         );
+        crate::startup_diagnostics::stage("runtime.create_process");
         let process = create(
             &executable,
             &arguments,
@@ -476,6 +482,7 @@ impl VerifiedRuntime {
         let mut auth = NativeStream::from_private_pipe(auth);
         auth.set_read_timeout(Some(Duration::from_secs(10)))?;
         let mut hello = [0; 12];
+        crate::startup_diagnostics::stage("runtime.wait_hello");
         auth.read_exact(&mut hello)?;
         if &hello != HELLO {
             return Err(blocked());
@@ -483,6 +490,7 @@ impl VerifiedRuntime {
         child.verify_alive()?;
         self.reverify()?;
         self.verify_windows_acl()?;
+        crate::startup_diagnostics::stage("runtime.hello_verified");
         child.auth = Some(auth.into_pipe()?);
         Ok(child)
     }

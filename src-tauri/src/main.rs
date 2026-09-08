@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    nelomai_client_container::startup_diagnostics::init();
     #[cfg(not(target_os = "android"))]
     nelomai_app_lib::container::run();
     #[cfg(target_os = "android")]

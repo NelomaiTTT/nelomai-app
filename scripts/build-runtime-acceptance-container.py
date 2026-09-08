@@ -224,7 +224,8 @@ def restore_linux_signed_payload(extracted, staged, public_key, architecture):
     verify_packaged_tree(extracted, staged, public_key, "linux", architecture)
 
 
-def package_desktop(staged, output, public_key, platform, architecture, *, root=ROOT, environment=None):
+def package_desktop(staged, output, public_key, platform, architecture, *, root=ROOT, environment=None,
+                    features="custom-protocol"):
     """Invoke the actual Tauri native bundler, then inspect its extracted bytes.
 
     --no-sign prevents the bundler from recursively re-signing stable resources.
@@ -256,7 +257,7 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
         environment["XDG_CACHE_HOME"] = str(output / "tools-cache")
     cli = root / "node_modules/.bin" / ("tauri.cmd" if os.name == "nt" else "tauri")
     subprocess.run([str(cli), "build", "--ci", "--no-sign", "--target", target,
-        "--features", "custom-protocol", "--bundles", bundle, "--config", str(config_path), "--", "--locked"],
+        "--features", features, "--bundles", bundle, "--config", str(config_path), "--", "--locked"],
         cwd=root, env=environment, check=True)
     bundle_dir = output / "target" / target / "release/bundle"
     suffix = {"linux": "*.AppImage", "windows": "*.exe", "macos": "*.app"}[platform]

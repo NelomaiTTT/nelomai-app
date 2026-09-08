@@ -9,6 +9,7 @@ mod installed_runtime;
 pub mod ipc;
 mod runtime_auth;
 mod selection;
+pub mod startup_diagnostics;
 mod switch;
 mod update;
 pub use auth_broker::*;

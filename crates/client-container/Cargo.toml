@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+startup-diagnostics = []
+
 [dependencies]
 async-trait = "0.1"
 nelomai-client-api = { path = "../client-api" }

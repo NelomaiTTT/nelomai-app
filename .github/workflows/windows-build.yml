@@ -3,6 +3,10 @@ name: Windows build
 on:
   workflow_dispatch:
     inputs:
+      startup_diagnostics:
+        description: "Диагностический Windows-установщик с журналом запуска, без публикации"
+        type: boolean
+        default: false
       download_diagnostics_only:
         description: "Только сравнить загрузку закреплённого архива, без сборки и секретов"
         type: boolean
@@ -12,8 +16,43 @@ permissions:
   contents: read
 
 jobs:
+  startup-diagnostic:
+    if: inputs.startup_diagnostics && !inputs.download_diagnostics_only
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: ${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: ./.github/actions/release-native-host
+        with:
+          platform: windows
+          target: x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: '10073502643'
+          path: signed
+          run-id: 34267783952
+          merge-multiple: true
+          github-token: ${{ github.token }}
+      - name: Проверить диагностический журнал
+        run: python -m unittest scripts/tests/test_startup_diagnostics.py
+      - name: Собрать только диагностический управляющий слой
+        run: python scripts/windows/build-startup-diagnostic.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nelomai-windows-startup-diagnostic
+          path: startup-diagnostic/delivery/
+          if-no-files-found: error
+          retention-days: 7
   download-diagnostics:
-    if: inputs.download_diagnostics_only
+    if: inputs.download_diagnostics_only && !inputs.startup_diagnostics
     runs-on: windows-2022
     timeout-minutes: 5
     steps:
@@ -22,7 +61,7 @@ jobs:
         shell: pwsh
         run: ./scripts/windows/check-toolchain-download.ps1
   build:
-    if: ${{ !inputs.download_diagnostics_only }}
+    if: ${{ !inputs.download_diagnostics_only && !inputs.startup_diagnostics }}
     name: Windows x86_64
     runs-on: windows-2022
     steps:

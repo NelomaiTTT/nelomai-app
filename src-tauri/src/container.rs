@@ -5,6 +5,7 @@ use crate::{
     runtime::{NativeControl, NativeExitReason, NativeReply, RuntimeAction, TraySnapshot},
     PANEL_BASE,
 };
+use nelomai_client_container::startup_diagnostics as startup;
 use nelomai_client_container::{
     host::{CommonHost, HostNativePorts},
     ipc::{BackgroundAction, PrivateBackgroundDispatcher},
@@ -262,6 +263,7 @@ pub(crate) fn tray_snapshot(app: &tauri::AppHandle) -> Option<TraySnapshot> {
 }
 
 pub fn run() {
+    startup::stage("common.entry");
     if std::env::args().nth(1).as_deref() == Some("--verify-runtime-layout") {
         let result = (|| -> io::Result<()> {
             if !matches!(std::env::args().count(), 3 | 4) {
@@ -290,7 +292,11 @@ pub fn run() {
         })();
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
-    if pre_auth_handoff().unwrap_or_else(|_| std::process::exit(1)) {
+    startup::stage("common.pre_auth_handoff");
+    if pre_auth_handoff().unwrap_or_else(|error| {
+        startup::error("common.pre_auth_handoff", &error);
+        std::process::exit(1)
+    }) {
         return;
     }
     let builder = tauri::Builder::default();
@@ -302,12 +308,15 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             use base64::Engine;
+            startup::stage("common.resources");
             let resources = installed_resources(app)?;
             let data = app.path().app_data_dir()?;
             // Establish the installed dispatcher identity before protected auth is
             // initialized. This also gives shutdown an actual native stop peer on
             // the first launch, before the user ever connects a tunnel.
+            startup::stage("native.prepare");
             tauri::async_runtime::block_on(prepare_native(app.handle().clone()))?;
+            startup::stage("common.public_key");
             let key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
                 .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
                 .transpose()?
@@ -334,6 +343,7 @@ pub fn run() {
             let updater = platform::updater::DesktopUpdateBackend::from_build(app.handle().clone())
                 .ok()
                 .map(|backend| Arc::new(backend) as Arc<dyn nelomai_client_updater::UpdateBackend>);
+            startup::stage("common.open_host");
             let host = Arc::new(CommonHost::open(
                 &data,
                 &resources.join("runtime"),
@@ -356,6 +366,7 @@ pub fn run() {
                     relaunch: None,
                 },
             )?);
+            startup::stage("native.bind_identity");
             let target = host.native_target();
             let engine =
                 nelomai_contracts::dispatcher::Installation::production(Path::new("/unused"))?
@@ -367,7 +378,9 @@ pub fn run() {
                 return Err(io::Error::other("common native identity mismatch").into());
             }
             native_binding.bind(engine)?;
+            startup::stage("runtime.launch");
             let mut child = tauri::async_runtime::block_on(host.launch_desktop(0))?;
+            startup::stage("runtime.native_channel");
             let native = child.take_native()?;
             stop.exit_owner.runtime_launched();
             *stop
@@ -382,6 +395,7 @@ pub fn run() {
                 finishing: AtomicBool::new(false),
             });
             app.manage(state.clone());
+            startup::stage("common.tray");
             desktop::setup_tray(app)?;
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -391,9 +405,12 @@ pub fn run() {
         });
     let mut context = crate::app_context();
     context.config_mut().app.windows.clear();
+    startup::stage("common.build");
     let app = builder
         .build(context)
+        .inspect_err(|error| startup::error("common.build", error))
         .expect("common desktop startup failed");
+    startup::stage("common.event_loop");
     app.run(|app, event| {
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = event {
@@ -679,7 +696,9 @@ async fn prepare_native(app: tauri::AppHandle) -> io::Result<()> {
         let _ = app;
         platform::windows::prepare_tunnel().await
     };
-    result.map_err(|_| io::Error::other("common preparation failed"))
+    result
+        .inspect_err(|error| startup::error("native.prepare", error))
+        .map_err(|_| io::Error::other("common preparation failed"))
 }
 fn installed_resources(app: &tauri::App) -> io::Result<PathBuf> {
     app.path()
