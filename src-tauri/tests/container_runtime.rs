@@ -78,11 +78,38 @@ impl Fixture {
 
 #[test]
 fn actual_spawn_verifies_kernel_path_and_does_not_inherit_secrets_or_unrelated_fds() {
+    use std::os::unix::process::CommandExt;
     use std::{io::Read, process::Command};
     // A separate test process supplies real synthetic secret variables without
     // mutating the environment of concurrently running test threads.
     if std::env::var_os("NELOMAI_TASK9_LAUNCHER_FIXTURE").is_none() {
-        assert!(Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        // Runner/shell descriptors are not launcher leaks. Isolate only the
+        // initial fixture process, before any private channel is created.
+        // The unrelated child below remains unsanitized to detect real leaks.
+        for fd in 3..256 {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                eprintln!("fixture inherited runner descriptor: {fd}");
+                #[cfg(target_os = "linux")]
+                eprintln!(
+                    "descriptor target: {:?}",
+                    fs::read_link(format!("/proc/self/fd/{fd}"))
+                );
+            }
+        }
+        unsafe {
+            command.pre_exec(|| {
+                for fd in 3..256 {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        assert!(command
             .args([
                 "--exact",
                 "actual_spawn_verifies_kernel_path_and_does_not_inherit_secrets_or_unrelated_fds"
@@ -126,6 +153,19 @@ fn actual_spawn_verifies_kernel_path_and_does_not_inherit_secrets_or_unrelated_f
         Some(42),
         "unrelated child cannot use launch IPC"
     );
+    // Negative control: initial fixture isolation must not hide a channel
+    // deliberately made inheritable after the launcher has run.
+    {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let fd = unsafe { libc::fcntl(child.native().as_raw_fd(), libc::F_DUPFD, 10) };
+        assert!((10..256).contains(&fd));
+        let _leaked_channel = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(
+            Command::new(f.executable()).status().unwrap().code(),
+            Some(44),
+            "probe must still detect an actual inherited launcher channel"
+        );
+    }
     let pid = child.id();
     let process = std::sync::Mutex::new(Some(child));
     let result = tauri::async_runtime::block_on(

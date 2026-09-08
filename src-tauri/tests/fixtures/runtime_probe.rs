@@ -12,6 +12,9 @@ fn main() {
         // an argv check. No launcher socket may survive its exec.
         for fd in 3..256 {
             if unsafe { fcntl(fd, 1) } >= 0 {
+                eprintln!("unexpected inherited descriptor: {fd}");
+                #[cfg(target_os = "linux")]
+                eprintln!("descriptor target: {:?}", std::fs::read_link(format!("/proc/self/fd/{fd}")));
                 std::process::exit(44);
             }
         }
