@@ -1,142 +1,100 @@
-# Task12: локальная контрольная точка, не завершение приёмки
+# Confirmed Stable bootstrap 0.2.16: итоговая evidence-точка перед review
 
-Ветка `codex/confirmed-stable-0.2.16`, исходная точка
-`d7267ae2153b9dc29a89f2e4ca174599608a0768`. Версия остаётся 0.2.16,
-changelog — черновик. Shipping layout остаётся latest-only; пользовательский
-переключатель Stable в maintenance-релиз не добавлен.
+Ветка `codex/confirmed-stable-0.2.16`, текущий HEAD
+`f31088124244e7a9620b9aca80fabe9acca1fa7c`. Это подготовка к единственному
+финальному whole-branch review в три прохода, а не его verdict. Все три прохода
+пока **PENDING**.
 
-## Реализовано и проверено локально
+Версия в `package.json` и `src-tauri/tauri.conf.json` остаётся `0.2.16`.
+`CHANGELOG.md` честно помечает её как «в разработке, не выпущена».
+Shipping layout по-прежнему latest-only: в 0.2.16 установлен только актуальный
+runtime, пользовательский Stable toggle скрыт; hot standby и дублирующий auth
+не добавлялись.
 
-- Подписанный slot выбирается production dispatcher только в idle-состоянии;
-  engine определяет свою идентичность по kernel executable и подписанным байтам.
-  Защищённый маркер, ownership, stale Stop и private operation fences сохранены.
-- CommonHost один раз связывает все клоны native transport с установленным
-  target текущего incarnation. До привязки Start запрещён; выполняющаяся
-  pre-auth очистка не может пересечь привязку. Installed-layout readiness
-  отделена от выбранного engine. Проверен реальный Unix socket→dispatcher→child.
-- При однозначном отказе из-за истёкшего access разрешён ограниченный refresh
-  той же текущей области авторизации. Frozen operation/body/scope не меняются.
-  Потерянный rotating refresh остаётся pending и не повторяется; неизвестный
-  reconcile не получает разрешение на refresh от последующего 401. Проверены
-  restart после известного отказа, accepted retry, unknown dispatch и logout.
-- Реальный CommonHost/private child сохраняет installed target при появлении
-  pending Stable, до перезапуска процесса.
+## Текущее состояние реализации
 
-Команда целевых Rust-проверок:
+- Production dispatcher выбирает только подписанный slot в idle-состоянии;
+  immutable stable engine проверяет собственную подписанную identity, а
+  CommonHost однократно привязывает native transport к установленному target
+  текущего incarnation. Ownership, stale Stop, private-operation и start fences
+  сохранены.
+- Единственный durable Requested journal является авторитетным switch intent.
+  Pending selection восстанавливается как проверенная проекция этого journal;
+  terminal, foreign-container и отсутствующий в manifest target не становятся
+  новой preference. Ранее открытый atomic-intent gap закрыт и scoped rereview
+  помечает finding как addressed.
+- Новый server Apply запрещён старому incarnation и разрешается только после
+  полного process restart с проверенным selected target. Exact persisted replay
+  сохраняется; prepared UUID сам по себе не разрешает новую выдачу. Cancel до
+  dispatch и lost/unknown Apply используют отдельные защищённые пути. Ранее
+  открытый pre-restart Apply gap закрыт scoped rereview.
+- Selected-empty cleanup binding ограничен exact retained source, пустым payload,
+  точным target и writer quiescence. Ordinary empty binding не ослаблен; retry
+  после отказа записи не создаёт второй Apply.
+- Истёкший access допускает только ограниченный refresh той же frozen auth scope.
+  Потерянный rotating refresh не повторяется. Истёкший refresh приводит к
+  RecoveryRequired/no-admission, после чего обычные logout → durable cleanup
+  receipt → password login очищают protected auth и создают generation 2 в
+  ожидаемом исходном slot.
+- Recovery producer разделяет старый switch process и новый recover process.
+  Числовой bounded retry сохраняет operation ID от исходного Pending switch до
+  самого первого и всех следующих recover. Exact gen2 replay отделён от
+  действительно stale accepted replay после обычного login до gen3; historical
+  receipt не может подменить текущую identity или изменить PostgreSQL state.
 
-```sh
-cargo test --locked --offline -p nelomai-client-container -p nelomai-contracts -p nelomai-unix-service -p nelomai-windows-service --all-targets
-cargo clippy --locked --offline -p nelomai-client-container -p nelomai-contracts -p nelomai-unix-service -p nelomai-windows-service --all-targets -- -D warnings
-cargo fmt --all -- --check
-```
+Scoped rereview fix round 4 помечает последний retry-identity finding как
+**ADDRESSED**, не находит нового Critical/Important breakage и сохраняет findings
+1–3 предыдущего matrix rereview закрытыми. Это ограниченный verdict harness diff,
+не whole-branch acceptance.
 
-Первый полный запуск целевой группы: 344 теста, 0 failed/ignored. Это macOS
-source-check: Windows-only тесты не превращаются в Windows execution evidence.
+## Зафиксированная evidence-хронология
 
-## Реальный локальный panel/PG producer
+| Evidence | Точная source-точка | Результат и граница |
+| --- | --- | --- |
+| Atomic intent / post-restart Apply / selected-empty binding | `fd66b16237e125be0648fe75081a7fd4f7227078` | 75 focused Rust PASS; root независимо повторил те же 75 PASS. Последующий fix2 rereview закрыл producer ordering regression. |
+| Полные локальные real-panel/PG matrix | `3e7afe6b3fca542aef49faaed1ab83181be1b481` | latest→stable 27 PASS и stable→latest 27 PASS, всего **54 PASS**. По 14 crash-phase, 4 lost-response, 2 controlled reauth и 4 race записи на направление плюс delayed/expiry coverage. Это instrumented local evidence, не packaged candidate. |
+| Retry identity fix round 4 | финальный runner связан с `f31088124244e7a9620b9aca80fabe9acca1fa7c` | Unit RED→GREEN и 8 focused real-panel команд: **14 PASS**, по 7 в каждом направлении. Проверены standalone delayed, clean/delayed expiry и clean/delayed lost reconcile/resume. Root независимо повторил unit PASS; scoped rereview чист. |
+| Frontend | product source `5ff3df65613265e2071ab4473eb58e90b8c916fc`; product source далее не менялся | `npm test`: 95 тестов/12 файлов, exit 0; Svelte 0 errors/0 warnings; production build PASS. |
+| Python/contracts/workflows | тот же product source | fixtures 32 PASS; release workflow checks 5+7 PASS. |
+| Rust workspace | тот же product source с acceptance-harness WIP; product source далее не менялся | `cargo test --workspace --locked --offline`: 907 top-level тестов + 5 nested child-process executions, 0 failed/ignored, exit 0. Full clippy с `-D warnings` exit 0; root повторил его после matrix freeze за 16.09s. `cargo fmt --all --check` и `git diff --check` exit 0. |
+| Android JVM | текущий product source | Prescribed aggregate `:app:testDebugUnitTest` неоднозначен и до тестов не стартует. Реальные `:app:testArmDebugUnitTest` и `:app:testUniversalDebugUnitTest`: по 16 тестов/4 XML, 0 failed/error/skipped, exit 0. Deprecated API и Gradle 9 warnings остаются. |
+| Host-supported native drafts | frozen `3f077c514a2584c26e67e46827bb2acf914669f4` | macOS/aarch64 и Android/aarch64 `build_only` PASS с единым public TEST pin. Android builder выполнил 432 теста без ошибок; macOS payload/codesign и Android stable payload/AAR/resource/license/ELF проверки PASS. |
+| Production read-only check | panel HEAD `89ef85dc0acc3de409507ca70304c2fe00a1447e` | health OK, clean checkout, `nelomai-panel`/nginx/PostgreSQL active; `BEGIN READ ONLY` подтвердил Alembic `20260904_0057`. Это тот же commit, что у isolated matrix archive. Deployment/migration/capability changes не выполнялись. |
 
-`scripts/run-real-panel-acceptance.py` использует настоящий AuthBroker,
-SwitchCoordinator, HTTP ClientApi, fsynced protected test storage, отдельные
-процессы и независимые запросы PostgreSQL. Panel — ранее зафиксированный Git
-archive `89ef85dc0acc3de409507ca70304c2fe00a1447e`, новая isolated DB
-`runtime016_task12_matrix`, миграция head `20260904_0057`. Параметр `--panel-sha`
-сам по себе не доказывает происхождение: используется известная подготовленная
-архивная копия. `results.json` фиксирует HEAD, diff hash и хеши исходников driver.
+Полные 54 matrix PASS принадлежат именно `3e7afe6`; после них `f310881` получил
+узкий retry-identity harness fix и отдельные 14 focused PASS. Полная matrix на
+`f310881` заново не запускалась и здесь так не обозначается. Между `3f077c5` и
+`f310881` изменены только три acceptance-harness файла; production source
+не менялся.
 
-```sh
-/tmp/nelomai-panel-ci-parity.PyRQE1/venv/bin/python scripts/run-real-panel-acceptance.py \
-  --panel-root /tmp/nelomai-runtime-panel-baseline.UjC4TL/panel \
-  --panel-sha 89ef85dc0acc3de409507ca70304c2fe00a1447e \
-  --database-url postgresql+psycopg://task12_test@127.0.0.1:56589/runtime016_task12_matrix \
-  --panel-url http://127.0.0.1:56590 \
-  --work /tmp/nelomai-runtime-panel-baseline.UjC4TL/matrix-v13
-```
+Root также подтвердил неизменность vendor gitlinks и отсутствие совпадений в
+tracked filename scan по известным secret-паттернам. Dirty vendor worktrees не
+очищались и не использовались как новое evidence.
 
-matrix-v13 завершён exit0: семь фаз аварийного выхода; lost committed
-reconcile/resume с теми же operation/device/session; delayed cleanup с реальными
-jobs/leases и отрицательным/положительным внешним ACK через штатный recovery
-worker; истёкший access до reconcile и во время accepted cleanup; отказ при
-истёкшем refresh; четыре logout race (refresh/resume × clean/delayed), lost logout
-ACK, новый login/family и неизменность новой connected lease после старого replay.
-Обычный refresh создаёт один revoked исторический session и один active successor
-в той же family/device; runtime-resume replay сохраняет session UUID.
+## Ограничения и незакрытая приёмка
 
-Обратный запуск с `--source-slot stable` и новым work
-`/tmp/nelomai-runtime-panel-baseline.UjC4TL/matrix-reverse-v1` также завершён exit0
-на том же наборе: Requested сохраняет старую Stable (открытый atomic-intent gap),
-шесть следующих фаз завершают Latest/gen2. Это две стороны синтетического
-broker/coordinator fixture, не две собранные релизные программы.
+- Финальный whole-branch review в три явных прохода — auth/migration/generation,
+  tunnel shutdown/dispatcher/update barrier и artifact integrity/packaging/
+  secrets — ещё **PENDING**. Этот документ не предрешает его результат.
+- Host drafts собраны на `3f077c5`, используют TEST trust и Node 26 вместо
+  workflow-pinned Node 24. Они не переносят approval на финальный source.
+  Android stable получил полную native проверку; latest collision input builder
+  проверяет с `inspect_native=False`, поэтому full latest native verification
+  не заявляется.
+- Linux/x86_64 и Windows/x86_64 native drafts отсутствуют; four-platform signed
+  root, реальные `.app`/APK installers, installer re-extraction, updater
+  signatures и release trust **UNRUN**. Точный release candidate должен быть
+  собран и полностью проверен из exact final source; preliminary artifacts не
+  являются повторно используемым approval.
+- Product installation, elevation, publication, production mutation и реальные
+  release keys не выполнялись. Локальная matrix использует synthetic identities
+  и documented external test adapters; после снятия cleanup barrier start доходит
+  до следующего честного server rule `409 peer_binding_required`, а успешный
+  native tunnel/agent start не заявляется.
+- Физические Windows/Linux/macOS/Android проверки **UNRUN**. В частности,
+  Android tile background/foreground stop regression должна быть проверена на
+  физическом устройстве до acceptance.
 
-Только внешние native/agent эффекты адаптированы: native child действительно
-владеет lock и подтверждает его захват; agent ACK проходит реальный worker.
-macOS rename-interposer завершает настоящий broker после durable journal rename,
-проверяется exit91 и точная фаза; journal не переписывается harness-ом.
-Синтетический manifest driver — fixture, не реальный packaged runtime artifact.
-Это не доказательство физического туннеля или immutable release-candidate.
-
-## Открытые вопросы спецификации и остаток
-
-1. **Atomic intent gap.** `SwitchCoordinator::request_locked` сначала вызывает
-   `begin_requested`, затем отдельно `set_pending_selection`. Сбой между ними
-   оставляет Requested и старую preference. Реальная проверка восстанавливает
-   старый Latest, сохраняет original operation как superseded и создаёт successor
-   с одним generation advance. Это честное наблюдение, но **не соответствие**
-   требованию design.md §транзакции, step1: атомарно сохранить pending slot и
-   Requested. Первоначальное толкование как допустимого поведения отозвано.
-2. **Apply before full restart.** `recover_locked` вызывает resume, local
-   admission, `finish_selection` и Complete в ещё текущем owner; UI restart идёт
-   отдельным `RuntimeRestart`/`prepare_runtime_restart`→relaunch путём.
-   Проверить против design.md требования успешного Apply только после полного
-   перезапуска. Task10 reverse-after-Complete и неизменный active target не
-   разрешают автоматически это противоречие. Нужна отдельная оценка root.
-3. Истёкший refresh пока проверен как безопасный RecoveryRequired/no-admission,
-   **не** как завершённая controlled reauthentication. Полный обычный
-   logout/cleanup→password-login recovery после этого отказа остаётся непроверен.
-4. Полное произведение всех crash/lost-reply фаз с delayed cleanup ещё не
-   выполнено. Отдельные delayed/expiry/logout случаи не заменяют его.
-5. Точный packaged UI/business HTTP/native tunnel candidate, release trust,
-   Windows/Android/Apple hardware и updater install acceptance остаются UNRUN.
-   `require-candidate-acceptance.py` безусловно возвращает nonzero: JSON receipt,
-   environment approval и локальная матрица не открывают публикацию.
-
-Это checkpoint для scoped/whole-branch review. Root владеет независимыми review
-passes. Дорогие clean-source build_only, полные workspace/Android проверки и
-финальная приёмка выполняются после разрешения вопросов исходников. Никаких
-push, CI, deploy, release, реальных ключей, установки продукта или production DB.
-
-## Task12 fix1: отдельный checkpoint после scoped review
-
-Исторические наблюдения выше сохранены; два пункта исходников исправлены в
-ограниченной волне от `d7b06c1754ad8270c7c4e87dfe5f7e40fa426658`, ожидают rereview.
-Единственный durable Requested journal теперь является авторитетным pending
-intent; preference — восстанавливаемая проекция, которую новый verified startup
-принимает без live-retarget текущего CommonHost. Terminal и чужой container
-journal не переопределяют новую selection.
-
-Новый Resume ticket разрешён лишь для неизменного verified installed target
-координатора; проверка под существующим issuance lock. Уже сохранённый exact
-ticket/evidence replay не блокируется. Prepared UUID не означает dispatch.
-Отмена до dispatch использует Cancel; неизвестный Apply сначала повторяется
-без изменения, затем выполняется отдельный reverse/supersede.
-
-Настоящий CommonHost/private-child тест выявил ещё существовавший отказ первого
-cross-slot admission: новый namespace корректно создаётся cleanup_only, а обычный
-bind не должен его снимать. Теперь только control cleanup после единственного
-exact retained-source match завершает пустой selected namespace и привязывает
-новый scope. Проверены отказ для foreign scope/nonempty/changed source и retry
-после реального отказа записи старого source; ordinary bind не ослаблен.
-
-Focused GREEN: selection16 + switch10 + transition_auth41 + runtime_state8 =75.
-Новый CommonHost до restart сохраняет generation7/Apply0, новый Stable host
-достигает generation8/Apply1, повторный Ready не выдаёт второй Apply. Реальные
-panel/PG smoke в `/tmp/nelomai-task12-fix1-smoke.wEMcuQ`: Requested exit91 теперь
-сохраняет запрошенную Stable и original operation без supersede; clean switch
-остаётся AuthResuming/server generation1 до нового процесса; Complete exit91
-в новом процессе и ещё один replay сохраняют единственный generation2/session.
-Оба восстановленных access проверены настоящим bootstrap.
-
-Producer остаётся instrumented native-effect adapter, не packaged/private-peer
-доказательством. Full matrix не перезапускалась в fix1; controlled reauth,
-delayed cross-product, clean-source full gates и физическая/candidate приёмка
-остаются OPEN/UNRUN. Проверка exact candidate по-прежнему nonzero. Полный fix1
-отчёт и точный freeze SHA находятся в рабочем `task-12-fix1-report.md` у root.
+Следующий шаг — один финальный whole-branch three-pass review на frozen source.
+Только после него можно определить оставшиеся blockers; текущая ветка не
+объявляется release-ready и Task 12 не объявляется полностью завершённой.
