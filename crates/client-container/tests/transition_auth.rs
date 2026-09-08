@@ -2669,6 +2669,33 @@ async fn exercise_logout_switch_cleanup(
     assert_eq!(tunnel.starts.load(Ordering::SeqCst), 1);
     assert_eq!(store.load().unwrap().unwrap(), before);
     assert_eq!(state.resume_calls.load(Ordering::SeqCst), 0);
+    assert!(before.completed_runtime_logout.is_none());
+    // The real owner cleanup consumed the logout ACK; it must not disable
+    // compaction for this new login's future completed transitions.
+    for _ in 0..20 {
+        assert_eq!(
+            coordinator.request(RuntimeSlot::Latest).await.unwrap(),
+            SwitchProgress::Ready
+        );
+    }
+    let after = store.load().unwrap().unwrap();
+    assert_eq!(after.auth_epoch, before.auth_epoch);
+    assert_eq!(after.install_secret, before.install_secret);
+    assert_eq!(after.session_generation, Some(21));
+    assert_eq!(
+        after
+            .broker
+            .as_ref()
+            .unwrap()
+            .confirmed_device_id
+            .as_deref(),
+        Some("device-b")
+    );
+    // The old logout transition has no resume result and remains retained.
+    assert_eq!(
+        after.broker.as_ref().unwrap().transition_authorities.len(),
+        2
+    );
     server.abort();
 }
 
@@ -2676,7 +2703,7 @@ async fn exercise_committed_apply_updates(repeated: bool) {
     let state = Arc::new(Panel::default());
     let (api, server) = panel(state.clone()).await;
     let store = enrolled_store();
-    let broker = Arc::new(AuthBroker::new(api, store, Arc::new(Stop)).unwrap());
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap());
     let control = Arc::new(SwitchControl::default());
     control.hold_completion.store(1, Ordering::SeqCst);
     let root = tempfile::tempdir().unwrap();
@@ -2761,6 +2788,34 @@ async fn exercise_committed_apply_updates(repeated: bool) {
             "0.2.18"
         );
         assert_eq!(control.completions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .broker
+                .unwrap()
+                .transition_authorities
+                .len(),
+            3,
+            "current original journal retains every successor needed for replay"
+        );
+        assert_eq!(
+            newest.request(RuntimeSlot::Latest).await.unwrap(),
+            SwitchProgress::Ready
+        );
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .broker
+                .unwrap()
+                .transition_authorities
+                .len(),
+            1,
+            "a new durable journal releases the completed supersede chain"
+        );
         server.abort();
         return;
     }

@@ -959,6 +959,12 @@ impl SwitchCoordinator {
                 Some(journal) => journal,
                 None => return Ok(SwitchProgress::Ready),
             };
+            broker
+                .retire_completed_transitions(
+                    &journal.operation_id,
+                    journal.active_reconcile_operation_id.as_deref(),
+                )
+                .await?;
             let snapshot = journal
                 .runtime_snapshot
                 .as_ref()
@@ -1395,11 +1401,8 @@ impl SwitchCoordinator {
             )
             .await
             {
-                Ok(result) => {
-                    result?;
-                    false
-                }
-                Err(_) => {
+                Ok(Ok(())) => false,
+                Ok(Err(_)) | Err(_) => {
                     self.update(|journal| journal.force_stop_requested = true)?;
                     control.force_stop(&journal.operation_id, snapshot).await?;
                     true

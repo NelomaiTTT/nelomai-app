@@ -95,6 +95,44 @@ impl ProtectedRecordStore for Record {
 
 struct Stop;
 
+struct FailRetirementSave {
+    inner: Arc<dyn AuthStore>,
+    // 1 fails before atomic replacement; 2 reports a crash after replacement.
+    mode: AtomicUsize,
+}
+
+impl AuthStore for FailRetirementSave {
+    fn load(&self) -> Result<Option<AuthStoreV1>, StorageError> {
+        self.inner.load()
+    }
+
+    fn save(&self, value: &AuthStoreV1) -> Result<(), StorageError> {
+        let count = |auth: &AuthStoreV1| auth.broker.as_ref().unwrap().transition_authorities.len();
+        if self
+            .inner
+            .load()?
+            .as_ref()
+            .is_some_and(|before| count(value) < count(before))
+        {
+            match self.mode.swap(0, Ordering::SeqCst) {
+                1 => {
+                    return Err(StorageError::RecoveryRequired(
+                        "crash before retirement save",
+                    ))
+                }
+                2 => {
+                    self.inner.save(value)?;
+                    return Err(StorageError::RecoveryRequired(
+                        "crash after retirement save",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        self.inner.save(value)
+    }
+}
+
 #[async_trait]
 impl LocalAuthStop for Stop {
     async fn stop_local(&self) -> Result<(), BrokerError> {
@@ -551,6 +589,80 @@ async fn graceful_stop_timeout_is_forced_once_and_retry_reuses_the_same_journal(
     assert_eq!(control.forced.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn immediate_graceful_error_uses_durable_force_stop() {
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let control = Arc::new(Control::default());
+    control.fail_graceful.store(1, Ordering::SeqCst);
+    let coordinator = offline_coordinator(
+        owner,
+        enrolled_store(RuntimeSlot::Latest),
+        control.clone(),
+        manifest("0.2.16", "0.2.16", false),
+    );
+    let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+    assert_eq!(
+        barrier.prepare("0.2.17").await.unwrap(),
+        UpdatePrepare::LocalStopped
+    );
+    let journal = serde_json::to_value(coordinator.snapshot().unwrap().unwrap()).unwrap();
+    assert_eq!(journal["force_stop_requested"], true);
+    assert_eq!(journal["local_stop_receipt"]["forced"], true);
+    assert!(barrier
+        .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+        .is_ok());
+    assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
+    assert_eq!(control.forced.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn immediate_graceful_error_and_failed_force_recover_without_inventing_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let control = Arc::new(Control::default());
+    control.fail_graceful.store(1, Ordering::SeqCst);
+    control.fail_force.store(1, Ordering::SeqCst);
+    let coordinator = offline_coordinator(
+        owner.clone(),
+        store.clone(),
+        control.clone(),
+        manifest("0.2.16", "0.2.16", false),
+    );
+    let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+    assert!(barrier.prepare("0.2.17").await.is_err());
+    let stopped = coordinator.snapshot().unwrap().unwrap();
+    let pending = serde_json::to_value(&stopped).unwrap();
+    assert_eq!(stopped.phase(), SwitchPhase::RuntimeStopping);
+    assert!(pending["local_stop_receipt"].is_null());
+    assert!(barrier
+        .stop_proof("0.2.17", UpdateJournalPhase::LocalStopped)
+        .is_err());
+    assert_eq!(pending["force_stop_requested"], true);
+    drop(barrier);
+    drop(coordinator);
+
+    let recovered = offline_coordinator(
+        owner,
+        store,
+        control.clone(),
+        manifest("0.2.16", "0.2.16", false),
+    );
+    let reopened = UpdateBarrier::open(recovered.clone()).unwrap();
+    assert_eq!(
+        reopened.prepare("0.2.17").await.unwrap(),
+        UpdatePrepare::LocalStopped
+    );
+    let completed = serde_json::to_value(recovered.snapshot().unwrap().unwrap()).unwrap();
+    assert_eq!(completed["operation_id"], pending["operation_id"]);
+    assert_eq!(completed["local_stop_receipt"]["forced"], true);
+    assert_eq!(control.graceful.load(Ordering::SeqCst), 1);
+    assert_eq!(control.forced.load(Ordering::SeqCst), 2);
+}
+
 #[cfg(unix)]
 #[tokio::test(start_paused = true)]
 async fn forced_timeout_native_eof_preserves_common_until_durable_helper_receipt() {
@@ -814,7 +926,8 @@ async fn resume(
         json!({"identity":{"container_version":body["target_identity"]["container_version"],
         "runtime_version":body["target_identity"]["runtime_version"],
         "runtime_contract_version":body["target_identity"]["runtime_contract_version"],
-        "runtime_slot":body["target_identity"]["runtime_slot"],"session_generation":8},
+        "runtime_slot":body["target_identity"]["runtime_slot"],
+        "session_generation":body["expected_session_generation"].as_u64().unwrap_or(0) + 1},
         "access_token":"resumed-access","token_type":"Bearer","access_expires_in":900}),
     ))
 }
@@ -864,6 +977,275 @@ fn online_coordinator(
             .unwrap()
             .attach(broker, control),
     )
+}
+
+#[tokio::test]
+async fn completed_update_cancellations_exceed_authority_capacity_across_restarts() {
+    let (panel, api, server) = panel().await;
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let initial = store.load().unwrap().unwrap();
+    let mut first_resume = None;
+    for cycle in 0..20 {
+        let broker = Arc::new(AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap());
+        let coordinator = Arc::new(
+            SwitchCoordinator::open(owner.clone(), manifest("0.2.16", "0.2.16", false))
+                .unwrap()
+                .attach(broker.clone(), Arc::new(Control::default())),
+        );
+        let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+        assert_eq!(
+            barrier.prepare("0.2.17").await.unwrap(),
+            UpdatePrepare::LocalStopped
+        );
+        barrier
+            .installer_failed()
+            .await
+            .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
+        assert!(barrier.snapshot().unwrap().is_none());
+        coordinator.before_tunnel_start().await.unwrap();
+        assert_eq!(
+            coordinator.snapshot().unwrap().unwrap().phase(),
+            SwitchPhase::Complete
+        );
+        let auth = store.load().unwrap().unwrap();
+        assert_eq!(auth.auth_epoch, initial.auth_epoch);
+        assert_eq!(auth.install_secret, initial.install_secret);
+        assert_eq!(auth.session_generation, Some(8 + cycle));
+        let metadata = auth.broker.as_ref().unwrap();
+        assert_eq!(
+            metadata.confirmed_device_id,
+            initial.broker.as_ref().unwrap().confirmed_device_id
+        );
+        let current = metadata.completed_resume.as_ref().unwrap();
+        let args = current.request.resume.as_ref().unwrap();
+        let resume = nelomai_client_container::ResumeArguments {
+            operation_id: current.request.operation_id.clone(),
+            reconcile_operation_id: args.reconcile_operation_id.clone(),
+            decision: args.decision.clone(),
+            target: nelomai_client_api::RuntimeTarget::from_identity(&args.target),
+            expected_session_generation: args.expected_session_generation,
+        };
+        // The current Complete journal still owns its exact replay evidence.
+        assert!(broker
+            .resume_transition(resume.clone())
+            .await
+            .unwrap()
+            .current_access()
+            .is_some());
+        if first_resume.is_none() {
+            first_resume = Some(resume);
+        }
+        if cycle == 19 {
+            assert!(metadata.transition_authorities.len() < 16);
+            assert!(broker
+                .resume_transition(first_resume.clone().unwrap())
+                .await
+                .is_err());
+            assert_eq!(store.load().unwrap().unwrap(), auth);
+        }
+    }
+    assert_eq!(panel.resume_cancel.load(Ordering::SeqCst), 20);
+    assert_eq!(panel.resume_apply.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn retirement_save_crashes_recover_with_current_replay_and_unresolved_authority() {
+    for mode in [1, 2] {
+        let (_, api, server) = panel().await;
+        let root = tempfile::tempdir().unwrap();
+        write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+        let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+        let store = Arc::new(FailRetirementSave {
+            inner: enrolled_store(RuntimeSlot::Latest),
+            mode: AtomicUsize::new(0),
+        });
+        let coordinator = online_coordinator(
+            owner.clone(),
+            store.clone(),
+            Arc::new(Control::default()),
+            manifest("0.2.16", "0.2.16", false),
+            api.clone(),
+        );
+        let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+        barrier.prepare("0.2.17").await.unwrap();
+        barrier.installer_failed().await.unwrap();
+        let mut auth = store.load().unwrap().unwrap();
+        let mut unresolved = auth.broker.as_ref().unwrap().transition_authorities[0].clone();
+        unresolved.reconcile_operation_id = "99999999-9999-4999-8999-999999999999".into();
+        unresolved.reconcile_receipt.as_mut().unwrap().operation_id =
+            unresolved.reconcile_operation_id.clone();
+        unresolved.resume_ticket = None;
+        unresolved.resume_evidence = None;
+        auth.broker
+            .as_mut()
+            .unwrap()
+            .transition_authorities
+            .push(unresolved.clone());
+        store.save(&auth).unwrap();
+
+        // New journal is durably installed before old authority can retire.
+        barrier.prepare("0.2.17").await.unwrap();
+        let operation = barrier
+            .snapshot()
+            .unwrap()
+            .unwrap()
+            .operation_id()
+            .to_owned();
+        store.mode.store(mode, Ordering::SeqCst);
+        assert!(barrier.installer_failed().await.is_err());
+        let persisted = store.load().unwrap().unwrap();
+        assert!(persisted
+            .broker
+            .as_ref()
+            .unwrap()
+            .transition_authorities
+            .contains(&unresolved));
+        assert_eq!(persisted.session_generation, Some(9));
+        drop(barrier);
+        drop(coordinator);
+
+        let reopened = online_coordinator(
+            owner,
+            store.clone(),
+            Arc::new(Control::default()),
+            manifest("0.2.16", "0.2.16", false),
+            api,
+        );
+        let barrier = UpdateBarrier::open(reopened.clone()).unwrap();
+        reopened.before_tunnel_start().await.unwrap();
+        assert!(barrier.snapshot().unwrap().is_none());
+        reopened.before_tunnel_start().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.snapshot().unwrap().unwrap()).unwrap()["operation_id"],
+            operation
+        );
+        let recovered = store.load().unwrap().unwrap();
+        assert_eq!(recovered.session_generation, persisted.session_generation);
+        assert_eq!(recovered.auth_epoch, persisted.auth_epoch);
+        assert_eq!(recovered.access_token, persisted.access_token);
+        let entries = &recovered.broker.as_ref().unwrap().transition_authorities;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&unresolved));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.reconcile_operation_id == operation
+                && entry.resume_evidence.is_some()));
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn retirement_waits_for_pending_auth_logout_and_supersede_dependencies() {
+    let (_, api, server) = panel().await;
+    let root = tempfile::tempdir().unwrap();
+    write_selection(root.path(), "0.2.16", RuntimeSlot::Latest);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let store = enrolled_store(RuntimeSlot::Latest);
+    let coordinator = online_coordinator(
+        owner,
+        store.clone(),
+        Arc::new(Control::default()),
+        manifest("0.2.16", "0.2.16", false),
+        api,
+    );
+    let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+    barrier.prepare("0.2.17").await.unwrap();
+    barrier.installer_failed().await.unwrap();
+    let old = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .transition_authorities[0]
+        .clone();
+    barrier.prepare("0.2.17").await.unwrap();
+    barrier.installer_failed().await.unwrap();
+    let mut base = store.load().unwrap().unwrap();
+    // Restore the valid state left by a crash before a prior retirement save.
+    base.broker
+        .as_mut()
+        .unwrap()
+        .transition_authorities
+        .push(old.clone());
+    let source = nelomai_client_storage::RuntimeLogoutSourceV1 {
+        auth_epoch: old.source_auth_epoch,
+        family: old.source_family.clone(),
+        identity: old.source_identity.clone(),
+        device_id: old.source_device_id.clone(),
+        scope_fingerprint: old.source_scope_fingerprint.clone(),
+    };
+    for dependency in ["resume", "recovery", "logout", "logout_ack", "supersede"] {
+        let mut pending = base.clone();
+        let meta = pending.broker.as_mut().unwrap();
+        match dependency {
+            "resume" => meta.pending_request = old.resume_ticket.clone(),
+            "recovery" => {
+                meta.pending_recovery = Some(nelomai_client_storage::RecoveryTicketV1 {
+                    operation_id: "88888888-8888-4888-8888-888888888888".into(),
+                    auth_epoch: pending.auth_epoch,
+                    attempt: meta.next_attempt,
+                    family: meta.family.clone(),
+                    identity: pending.confirmed_identity.clone().unwrap(),
+                    device_id: meta.confirmed_device_id.clone(),
+                })
+            }
+            "logout" => {
+                meta.pending_logout = Some(nelomai_client_storage::PendingLogoutV1 {
+                    operation_id: "88888888-8888-4888-8888-888888888888".into(),
+                    refresh_proof: old.resume_refresh_proof.clone(),
+                    source: Some(source.clone()),
+                })
+            }
+            "logout_ack" => {
+                pending.completed_runtime_logout =
+                    Some(nelomai_client_storage::CompletedRuntimeLogoutV1 {
+                        operation_id: "88888888-8888-4888-8888-888888888888".into(),
+                        source: source.clone(),
+                        code: "session_revoked_cleanup_accepted".into(),
+                        cleanup_reconcile_operation_id: Some(old.reconcile_operation_id.clone()),
+                    })
+            }
+            "supersede" => {
+                pending.pending_runtime_supersede =
+                    Some(nelomai_client_storage::PendingRuntimeSupersedeV1 {
+                        operation_id: "88888888-8888-4888-8888-888888888888".into(),
+                        superseded_reconcile_operation_id: old.reconcile_operation_id.clone(),
+                        expected_session_generation: old.expected_session_generation,
+                        target_identity: old.target_identity.clone(),
+                        source: source.clone(),
+                        refresh_proof: old.resume_refresh_proof.clone(),
+                        response_state: None,
+                        response_reconcile_operation_id: None,
+                        retry_after_seconds: None,
+                    })
+            }
+            _ => unreachable!(),
+        }
+        store.save(&pending).unwrap();
+        coordinator.recover().await.unwrap();
+        assert_eq!(store.load().unwrap().unwrap(), pending, "{dependency}");
+    }
+    store.save(&base).unwrap();
+    coordinator.recover().await.unwrap();
+    let retired = store.load().unwrap().unwrap();
+    assert_eq!(
+        retired
+            .broker
+            .as_ref()
+            .unwrap()
+            .transition_authorities
+            .len(),
+        1
+    );
+    assert_eq!(retired.session_generation, base.session_generation);
+    assert_eq!(retired.auth_epoch, base.auth_epoch);
+    assert_eq!(retired.access_token, base.access_token);
+    server.abort();
 }
 
 async fn interrupt_after_update_cancel_before_switch_cancel(
@@ -1394,6 +1776,7 @@ async fn failed_pre_stop_cancellation_keeps_exact_work_reopenable_for_admission_
 
     let failing_control = Arc::new(Control::default());
     failing_control.fail_graceful.store(1, Ordering::SeqCst);
+    failing_control.fail_force.store(1, Ordering::SeqCst);
     let failing = online_coordinator(
         owner.clone(),
         store.clone(),

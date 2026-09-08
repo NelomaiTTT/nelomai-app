@@ -1276,6 +1276,95 @@ impl AuthBroker {
         self.save_transition_write(&auth)
     }
 
+    /// Called under coordinator execution ownership with its durable journal's
+    /// roots. Replacing that journal releases historical replay dependencies;
+    /// a crash before this atomic save merely leaves extra retained authority.
+    pub(crate) async fn retire_completed_transitions(
+        &self,
+        journal_operation: &str,
+        active_reconcile_operation: Option<&str>,
+    ) -> Result<(), BrokerError> {
+        // Maintenance must not delay local stop behind in-flight auth. Its
+        // next recovery pass can retry after that issuance has finished.
+        let Ok(_issuance) = self.issuance.try_lock() else {
+            return Ok(());
+        };
+        let _state = self.state.lock().await;
+        let mut auth = self.load()?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        // Logout cleanup may need the original family/scope even after resume.
+        // Unknown issuance and supersede replay retain their entire dependency
+        // graph until the existing durable acknowledgement consumes the ticket.
+        if meta.pending_request.is_some()
+            || meta.pending_recovery.is_some()
+            || meta.pending_logout.is_some()
+            || auth.pending_runtime_supersede.is_some()
+            || auth.completed_runtime_logout.is_some()
+        {
+            return Ok(());
+        }
+        let authorities = &meta.transition_authorities;
+        let mut terminal: std::collections::HashSet<&str> = authorities
+            .iter()
+            .filter(|entry| entry.resume_evidence.is_some())
+            .map(|entry| entry.reconcile_operation_id.as_str())
+            .collect();
+        // A superseded predecessor is terminal only if its successor chain has
+        // a known resume result. Cycles/unknown outcomes are never evicted.
+        for _ in 0..authorities.len() {
+            for entry in authorities {
+                if entry
+                    .superseded_by
+                    .as_deref()
+                    .is_some_and(|id| terminal.contains(id))
+                {
+                    terminal.insert(&entry.reconcile_operation_id);
+                }
+            }
+        }
+        let completed_reconcile = meta
+            .completed_resume
+            .as_ref()
+            .and_then(|done| done.request.resume.as_ref())
+            .map(|resume| resume.reconcile_operation_id.as_str());
+        let mut retained: std::collections::HashSet<&str> = authorities
+            .iter()
+            .filter(|entry| {
+                let id = entry.reconcile_operation_id.as_str();
+                !terminal.contains(id)
+                    || id == journal_operation
+                    || Some(id) == active_reconcile_operation
+                    || Some(id) == completed_reconcile
+            })
+            .map(|entry| entry.reconcile_operation_id.as_str())
+            .collect();
+        // Every retained predecessor still needs all successors for protected
+        // lineage validation and exact replay, including the current journal.
+        for _ in 0..authorities.len() {
+            for entry in authorities {
+                if retained.contains(entry.reconcile_operation_id.as_str()) {
+                    if let Some(successor) = entry.superseded_by.as_deref() {
+                        retained.insert(successor);
+                    }
+                }
+            }
+        }
+        let retired: Vec<String> = authorities
+            .iter()
+            .filter(|entry| !retained.contains(entry.reconcile_operation_id.as_str()))
+            .map(|entry| entry.reconcile_operation_id.clone())
+            .collect();
+        if retired.is_empty() {
+            return Ok(());
+        }
+        auth.broker
+            .as_mut()
+            .ok_or(BrokerError::RecoveryRequired)?
+            .transition_authorities
+            .retain(|entry| !retired.contains(&entry.reconcile_operation_id));
+        self.save_transition_write(&auth)
+    }
+
     /// Reconstruct only the active request's source from protected provenance.
     /// The public cleanup IDs/target must still reproduce the exact saved hash.
     pub(crate) async fn restore_transition_request(

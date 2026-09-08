@@ -1,9 +1,11 @@
-# Confirmed Stable bootstrap 0.2.16: итоговая evidence-точка перед review
+# Confirmed Stable bootstrap 0.2.16: evidence после единственной final fix wave
 
-Ветка `codex/confirmed-stable-0.2.16`, текущий HEAD
-`f31088124244e7a9620b9aca80fabe9acca1fa7c`. Это подготовка к единственному
-финальному whole-branch review в три прохода, а не его verdict. Все три прохода
-пока **PENDING**.
+Ветка `codex/confirmed-stable-0.2.16`. Единственный final whole-branch review
+в три прохода выполнен на `59818c392601b6e851b4747d2a609ee276379cc0`:
+**0 Critical, 2 Important (P2), 0 Minor; With fixes; not release-ready**.
+Этот commit содержит одну разрешённую fix wave поверх указанного HEAD.
+Итоговый независимый **SCOPED review двух исправлений — PENDING**;
+автор исправлений не объявляет замечания закрытыми review.
 
 Версия в `package.json` и `src-tauri/tauri.conf.json` остаётся `0.2.16`.
 `CHANGELOG.md` честно помечает её как «в разработке, не выпущена».
@@ -54,10 +56,10 @@ Scoped rereview fix round 4 помечает последний retry-identity f
 | Atomic intent / post-restart Apply / selected-empty binding | `fd66b16237e125be0648fe75081a7fd4f7227078` | 75 focused Rust PASS; root независимо повторил те же 75 PASS. Последующий fix2 rereview закрыл producer ordering regression. |
 | Полные локальные real-panel/PG matrix | `3e7afe6b3fca542aef49faaed1ab83181be1b481` | latest→stable 27 PASS и stable→latest 27 PASS, всего **54 PASS**. По 14 crash-phase, 4 lost-response, 2 controlled reauth и 4 race записи на направление плюс delayed/expiry coverage. Это instrumented local evidence, не packaged candidate. |
 | Retry identity fix round 4 | финальный runner связан с `f31088124244e7a9620b9aca80fabe9acca1fa7c` | Unit RED→GREEN и 8 focused real-panel команд: **14 PASS**, по 7 в каждом направлении. Проверены standalone delayed, clean/delayed expiry и clean/delayed lost reconcile/resume. Root независимо повторил unit PASS; scoped rereview чист. |
-| Frontend | product source `5ff3df65613265e2071ab4473eb58e90b8c916fc`; product source далее не менялся | `npm test`: 95 тестов/12 файлов, exit 0; Svelte 0 errors/0 warnings; production build PASS. |
+| Frontend | frontend source `5ff3df65613265e2071ab4473eb58e90b8c916fc`, frontend далее не менялся | Исторический результат: 95 тестов/12 файлов, Svelte 0 errors/0 warnings, production build PASS. Root повторил эти проверки 2026-09-08 на Node 24.19.0 / npm 11.17: те же 95/12 PASS, 0/0, build PASS. |
 | Python/contracts/workflows | тот же product source | fixtures 32 PASS; release workflow checks 5+7 PASS. |
-| Rust workspace | тот же product source с acceptance-harness WIP; product source далее не менялся | `cargo test --workspace --locked --offline`: 907 top-level тестов + 5 nested child-process executions, 0 failed/ignored, exit 0. Full clippy с `-D warnings` exit 0; root повторил его после matrix freeze за 16.09s. `cargo fmt --all --check` и `git diff --check` exit 0. |
-| Android JVM | текущий product source | Prescribed aggregate `:app:testDebugUnitTest` неоднозначен и до тестов не стартует. Реальные `:app:testArmDebugUnitTest` и `:app:testUniversalDebugUnitTest`: по 16 тестов/4 XML, 0 failed/error/skipped, exit 0. Deprecated API и Gradle 9 warnings остаются. |
+| Rust workspace | исторический `5ff3df6` с acceptance-harness WIP, до нынешних двух product fixes | `cargo test --workspace --locked --offline`: 907 top-level тестов + 5 nested child-process executions, 0 failed/ignored, exit 0. Full clippy с `-D warnings` exit 0; root повторил его после matrix freeze за 16.09s. Это не final-fix workspace evidence. |
+| Android JVM | исторический product source до final fix wave | Prescribed aggregate `:app:testDebugUnitTest` неоднозначен и до тестов не стартует. Реальные `:app:testArmDebugUnitTest` и `:app:testUniversalDebugUnitTest`: по 16 тестов/4 XML, 0 failed/error/skipped, exit 0. Deprecated API и Gradle 9 warnings остаются. |
 | Host-supported native drafts | frozen `3f077c514a2584c26e67e46827bb2acf914669f4` | macOS/aarch64 и Android/aarch64 `build_only` PASS с единым public TEST pin. Android builder выполнил 432 теста без ошибок; macOS payload/codesign и Android stable payload/AAR/resource/license/ELF проверки PASS. |
 | Production read-only check | panel HEAD `89ef85dc0acc3de409507ca70304c2fe00a1447e` | health OK, clean checkout, `nelomai-panel`/nginx/PostgreSQL active; `BEGIN READ ONLY` подтвердил Alembic `20260904_0057`. Это тот же commit, что у isolated matrix archive. Deployment/migration/capability changes не выполнялись. |
 
@@ -65,7 +67,49 @@ Scoped rereview fix round 4 помечает последний retry-identity f
 узкий retry-identity harness fix и отдельные 14 focused PASS. Полная matrix на
 `f310881` заново не запускалась и здесь так не обозначается. Между `3f077c5` и
 `f310881` изменены только три acceptance-harness файла; production source
-не менялся.
+не менялся именно в этом историческом интервале. Нынешняя fix wave меняет
+production Rust broker/coordinator, поэтому прежние native drafts и full
+workspace результаты не обозначаются evidence финального product source.
+
+## Два замечания final review и проверенные исправления
+
+1. **P2: lifetime exhaustion 16 authorities.** RED: после 16 успешных
+   update-cancel/resume следующий цикл (индекс 16) возвращал `RecoveryRequired`.
+   Broker теперь атомарно удаляет только завершённые исторические authorities
+   и supersede-цепочки с известным resume result, когда durable coordinator
+   journal больше не требует их. Current operation, active reconcile,
+   completed resume и все successors сохранённых predecessors защищены;
+   pending resume/recovery/logout/supersede и непринятый cleanup ACK откладывают
+   compaction. In-flight auth также откладывает compaction без ожидания его
+   issuance lock перед local stop. Лимиты **16 / 1 MiB** неизменны;
+   unresolved authority не удаляется.
+   GREEN покрывает 20 полных update-cancel с пересозданием broker/coordinator,
+   exact replay текущего Complete, отказ старого retired replay без изменения
+   текущей auth, crash до/после protected save, pending зависимости, транзитивную
+   supersede-цепочку и реальные logout → ACK consumption → login → 20 transitions.
+2. **P2: immediate graceful-stop error.** RED: оба новых теста немедленной
+   graceful ошибки воспроизводили отсутствие force intent/receipt.
+   Только `Ok(Ok(()))` считается graceful success; ошибка и timeout проходят
+   через один durable force-stop путь. GREEN подтверждает forced receipt после
+   успеха, отсутствие receipt/stop proof после force failure и точный retry
+   после reopen без повторного graceful stop. Существующий тест failed
+   pre-stop cancellation теперь явно отказывает обоим stop методам.
+
+Это implementation/test evidence, а не scoped-review approval. Полный Rust
+workspace gate и новые host native drafts после freeze выполняет root;
+на момент данного commit они **PENDING**. Старые `3f077c5` drafts не являются
+final product evidence.
+
+На final source этой fix wave `cargo test -p nelomai-client-container
+-p nelomai-client-storage --locked --offline` завершился exit 0:
+**238 top-level PASS + 4 успешных nested test summaries**, 0 failed/ignored.
+В их числе transition-auth 41, update 26, auth-broker 37, switch 10,
+auth-migration 11, startup-storage 11. Отдельный focused повтор transition-auth
+и update — **67/67 PASS**. `cargo clippy -p nelomai-client-container
+-p nelomai-client-storage --all-targets --locked --offline -- -D warnings`,
+`cargo fmt --all --check` и `git diff --check` — exit 0. Полные команды,
+RED/GREEN и журналы находятся в `final-fix-wave-report.md` рабочего evidence
+каталога; это ограниченные package gates, не full workspace/native acceptance.
 
 Root также подтвердил неизменность vendor gitlinks и отсутствие совпадений в
 tracked filename scan по известным secret-паттернам. Dirty vendor worktrees не
@@ -73,9 +117,9 @@ tracked filename scan по известным secret-паттернам. Dirty v
 
 ## Ограничения и незакрытая приёмка
 
-- Финальный whole-branch review в три явных прохода — auth/migration/generation,
-  tunnel shutdown/dispatcher/update barrier и artifact integrity/packaging/
-  secrets — ещё **PENDING**. Этот документ не предрешает его результат.
+- Whole-branch review выполнен в трёх явных проходах: auth/migration/generation,
+  tunnel shutdown/dispatcher/update barrier, artifact integrity/packaging/secrets.
+  После двух исправлений независимый final **SCOPED review — PENDING**.
 - Host drafts собраны на `3f077c5`, используют TEST trust и Node 26 вместо
   workflow-pinned Node 24. Они не переносят approval на финальный source.
   Android stable получил полную native проверку; latest collision input builder
@@ -95,6 +139,5 @@ tracked filename scan по известным secret-паттернам. Dirty v
   Android tile background/foreground stop regression должна быть проверена на
   физическом устройстве до acceptance.
 
-Следующий шаг — один финальный whole-branch three-pass review на frozen source.
-Только после него можно определить оставшиеся blockers; текущая ветка не
-объявляется release-ready и Task 12 не объявляется полностью завершённой.
+Следующий шаг — scoped review двух исправлений и root gates на frozen source.
+Ветка не объявляется release-ready; Task 12 не объявляется полностью завершённой.
