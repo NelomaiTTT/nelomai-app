@@ -407,44 +407,56 @@ pub fn serve_dispatcher_one(
     owner: &Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
     private: bool,
 ) -> Result<(), ServiceError> {
-    use nelomai_contracts::dispatcher as d;
     let (mut stream, _) = listener.accept().map_err(transport_error)?;
     configure_stream(&stream)?;
     let watchdog = RequestWatchdog::arm()?;
     let result = (|| {
         let identity = peer_identity(&stream).map_err(transport_error)?;
-        let mut dispatcher = owner
-            .try_lock()
-            .map_err(|_| ServiceError::Backend("dispatcher_busy".into()))?;
-        dispatcher
-            .layout
-            .broker
-            .authorize(&identity.uid.to_string(), &identity.process_path)
-            .map_err(|_| ServiceError::UnauthorizedClient)?;
-        let frame = d::read_frame(
-            &mut stream,
-            if private {
-                MAX_FRAME_SIZE
-            } else {
-                d::MAX_DISPATCHER_FRAME
-            },
-        )
-        .map_err(transport_error)?;
-        let output = if private {
-            dispatcher
-                .relay(&frame, &mut |_, _| Err(d::blocked()))
-                .map_err(transport_error)?
-        } else {
-            let response = d::decode_request(&frame)
-                .map(|request| dispatcher.handle(request, &mut |_, _| Err(d::blocked())))
-                .unwrap_or_else(|_| d::DispatcherResponse::failure());
-            d::encode_frame(&response).map_err(transport_error)?
-        };
-        stream.write_all(&output).map_err(transport_error)?;
-        stream.flush().map_err(transport_error)
+        serve_dispatcher_stream(&mut stream, &identity, owner, private)
     })();
     watchdog.complete();
     result
+}
+
+fn serve_dispatcher_stream(
+    stream: &mut (impl Read + Write),
+    identity: &ClientIdentity,
+    owner: &Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+    private: bool,
+) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    let mut dispatcher = owner
+        .try_lock()
+        .map_err(|_| ServiceError::Backend("dispatcher_busy".into()))?;
+    dispatcher
+        .layout
+        .broker
+        .authorize(&identity.uid.to_string(), &identity.process_path)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let frame = d::read_frame(
+        stream,
+        if private {
+            MAX_FRAME_SIZE
+        } else {
+            d::MAX_DISPATCHER_FRAME
+        },
+    )
+    .map_err(transport_error)?;
+    let output = if private {
+        dispatcher
+            .relay(&frame, &mut |_, _| Err(d::blocked()))
+            .map_err(transport_error)?
+    } else {
+        let response = d::decode_request(&frame)
+            .map(|request| dispatcher.handle(request, &mut |_, _| Err(d::blocked())))
+            .unwrap_or_else(|_| d::DispatcherResponse::failure());
+        d::encode_frame(&response).map_err(transport_error)?
+    };
+    // The reply can trigger the next request on the other socket before
+    // write_all returns. Dispatch is complete; release ownership first.
+    drop(dispatcher);
+    stream.write_all(&output).map_err(transport_error)?;
+    stream.flush().map_err(transport_error)
 }
 
 pub fn recover_dispatcher(
@@ -507,4 +519,143 @@ fn path_to_c_string(path: &Path) -> io::Result<std::ffi::CString> {
 
     std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a null byte"))
+}
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod dispatcher_test_support;
+
+#[cfg(test)]
+mod dispatcher_response_tests {
+    use super::*;
+    use nelomai_contracts::dispatcher as d;
+    use std::sync::mpsc;
+
+    struct PublishedResponseGate {
+        stream: UnixStream,
+        release: Option<mpsc::Receiver<()>>,
+    }
+
+    impl Read for PublishedResponseGate {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.stream.read(bytes)
+        }
+    }
+
+    impl Write for PublishedResponseGate {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.stream.write_all(bytes)?;
+            if let Some(release) = self.release.take() {
+                release
+                    .recv()
+                    .map_err(|_| io::Error::other("response gate closed"))?;
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
+        }
+    }
+
+    #[test]
+    fn dispatcher_still_rejects_a_request_while_mutation_owns_state() {
+        let (_root, owner) = super::dispatcher_test_support::owned_dispatcher();
+        let guard = owner.lock().unwrap();
+        let peer = ClientIdentity {
+            uid: unsafe { libc::geteuid() },
+            process_path: std::env::current_exe().unwrap(),
+        };
+        let mut stream = io::Cursor::new(
+            d::encode_frame(&d::DispatcherRequest::Version {
+                contract_version: 1,
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            serve_dispatcher_stream(&mut stream, &peer, &owner, false),
+            Err(ServiceError::Backend("dispatcher_busy".into()))
+        );
+        assert_eq!(
+            stream.position(),
+            0,
+            "busy request must not dispatch or publish"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn published_lifecycle_response_allows_private_request_before_write_returns() {
+        let (root, owner) = super::dispatcher_test_support::owned_dispatcher();
+        let identity = owner.lock().unwrap().layout.identity.clone();
+        assert!(
+            owner
+                .lock()
+                .unwrap()
+                .handle(
+                    d::DispatcherRequest::Start {
+                        contract_version: 1,
+                        identity: identity.clone(),
+                    },
+                    &mut |_, _| Err(d::blocked())
+                )
+                .running
+        );
+        let path = root.path().join("private.sock");
+        let listener = bind_listener(&path, unsafe { libc::geteuid() }).unwrap();
+        let private_owner = owner.clone();
+        let private =
+            std::thread::spawn(move || serve_dispatcher_one(&listener, &private_owner, true));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        configure_stream(&client).unwrap();
+        configure_stream(&server).unwrap();
+        let peer = peer_identity(&server).unwrap();
+        let (release, released) = mpsc::channel();
+        let lifecycle_owner = owner.clone();
+        let lifecycle = std::thread::spawn(move || {
+            let mut gated = PublishedResponseGate {
+                stream: server,
+                release: Some(released),
+            };
+            serve_dispatcher_stream(&mut gated, &peer, &lifecycle_owner, false)
+        });
+        client
+            .write_all(
+                &d::encode_frame(&d::DispatcherRequest::Version {
+                    contract_version: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let lifecycle_response = d::read_frame(&mut client, d::MAX_DISPATCHER_FRAME);
+        // Receiving the complete frame proves publication, while the first
+        // server's write cannot return until this test releases its channel.
+        let mut request = UnixStream::connect(&path).unwrap();
+        configure_stream(&request).unwrap();
+        let private_response = request
+            .write_all(&encode_request(&Request::version()).unwrap())
+            .and_then(|()| d::read_frame(&mut request, MAX_FRAME_SIZE));
+        // Release and join even on the expected RED busy/EOF path.
+        let _ = release.send(());
+        let lifecycle_result = lifecycle.join();
+        let private_result = private.join();
+        let stopped = owner.lock().unwrap().handle(
+            d::DispatcherRequest::Stop {
+                contract_version: 1,
+                identity,
+            },
+            &mut |_, _| Err(d::blocked()),
+        );
+        assert!(stopped.ok && !stopped.running);
+        assert!(lifecycle_response.is_ok());
+        assert_eq!(lifecycle_result.unwrap(), Ok(()));
+        assert_eq!(
+            private_result.unwrap(),
+            Ok(()),
+            "completed lifecycle response must release dispatcher ownership before publication"
+        );
+        let response = decode_response(&private_response.unwrap()).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.service_version.as_deref(), Some("0.2.16"));
+    }
 }

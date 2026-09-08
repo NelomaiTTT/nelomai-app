@@ -141,3 +141,33 @@ tracked filename scan по известным secret-паттернам. Dirty v
 
 Следующий шаг — scoped review двух исправлений и root gates на frozen source.
 Ветка не объявляется release-ready; Task 12 не объявляется полностью завершённой.
+
+## Отдельное исправление сбоя final workspace gate
+
+После fix wave `73a3d4475d05b2272fc1623ddd5eb72379d2167c` root запустил
+`cargo test --workspace --locked --offline`. Gate завершился ошибкой в
+`common_bound_transport_launches_signed_stable_through_real_dispatcher_socket`:
+private server получил `Backend("dispatcher_busy")`, клиент — `TruncatedFrame`.
+Отдельный повтор проходил; это новый intermittent verification defect, не
+переоткрытие двух предыдущих P2 и не новый broad review.
+
+Причина подтверждена детерминированным RED: mutex dispatcher оставался занят
+при публикации уже готового lifecycle response, и запрос клиента на другом
+socket мог прийти до освобождения guard. В отдельном исправлении guard
+освобождается перед первым response write. Kernel peer identity, authorization,
+request read, `handle`/`relay` и формирование ответа сохраняют прежнюю защиту.
+Существующий код обработки stream механически вынесен в private generic
+helper для regression; test-only writer удерживает возврат write через channel
+после публикации полного frame. RED гарантированно даёт `dispatcher_busy`;
+barrier освобождается, потоки joined и engine остановлен до assertion.
+GREEN допускает реальный private request; настоящий busy mutation guard
+по-прежнему отклоняет конкурентный запрос. Sleeps/retry loops не добавлены.
+
+Scoped evidence этого отдельного исправления: socket integration **7/7 PASS**;
+`cargo test -p nelomai-unix-service -p nelomai-contracts --locked --offline` —
+**131 PASS**, 0 failed/ignored (contracts 19+21+17, Unix unit 50, helper 17,
+socket 7). Scoped clippy `--all-targets --locked --offline -- -D warnings`,
+`cargo fmt --all --check` и `git diff --check` — exit 0. Независимый socket
+**SCOPED review и новые root full/native gates — PENDING**. Ранее указанные
+54 matrix, 73a3d44 package tests и исторические full workspace/native результаты
+остаются привязаны к своим source-точкам и здесь не переносятся на новый commit.
