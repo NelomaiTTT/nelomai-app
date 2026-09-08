@@ -70,7 +70,7 @@ def session(kind):
         return run(ISOLATED / "linux-runtime-acceptance", ISOLATED / "acceptance-resources",
                    ISOLATED / "inputs/public-key.raw", "http://127.0.0.1:56590")
     common = APP / "usr/bin/nelomai-app"
-    expected = APP / "usr/lib/nelomai-app/runtime/engines/latest/0.2.16/nelomai-runtime"
+    expected = APP / "usr/lib/Nelomai/runtime/engines/latest/0.2.16/nelomai-runtime"
     with subprocess.Popen([str(common)]) as child:
         try:
             deadline = time.monotonic() + 30
@@ -92,7 +92,7 @@ def session(kind):
                 time.sleep(0.2)
             if engine is None or not str(engine[1]).startswith("/usr/local/libexec/nelomai/"):
                 raise RuntimeError("ordinary dispatcher did not execute its real installed engine")
-            source_engine = APP / "usr/lib/nelomai-app/runtime/engines/latest/0.2.16/nelomai-unix-service"
+            source_engine = APP / "usr/lib/Nelomai/runtime/engines/latest/0.2.16/nelomai-unix-service"
             if digest(engine[1]) != digest(source_engine):
                 raise RuntimeError("ordinary installed engine bytes differ from final package")
             print(json.dumps(dict(scope="ordinary-installed-latest-startup", common_sha256=digest(common),
@@ -127,7 +127,7 @@ def inside():
         else:
             shutil.copytree(runtime.parent, ISOLATED / "acceptance-resources")
     common = APP / "usr/bin/nelomai-app"
-    resources = APP / "usr/lib/nelomai-app"
+    resources = APP / "usr/lib/Nelomai"
     helper = resources / "dispatcher/1/nelomai-unix-service"
     # The real production installation API, but in a disposable root-owned
     # namespace only. No sudo/pkexec/host installer is invoked.

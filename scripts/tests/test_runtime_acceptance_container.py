@@ -35,8 +35,8 @@ class AcceptanceContainerTest(ArtifactFixture):
             elif command[1] == "--appimage-extract":
                 destination = kwargs["cwd"] / "squashfs-root"
                 if Path(command[0]).name == "test.AppImage":
-                    shutil.copytree(self.root / "staged", destination / "usr/lib/nelomai-app")
-                    (destination / "usr/lib/nelomai-app/runtime/engines/latest/0.2.17/nelomai-runtime").write_bytes(b"patched")
+                    shutil.copytree(self.root / "staged", destination / "usr/lib/Nelomai")
+                    (destination / "usr/lib/Nelomai/runtime/engines/latest/0.2.17/nelomai-runtime").write_bytes(b"patched")
                 else:
                     shutil.copytree(output / "linuxdeploy-extracted/squashfs-root", destination)
             else:
@@ -52,7 +52,7 @@ class AcceptanceContainerTest(ArtifactFixture):
     def test_linux_repack_restores_only_signed_payload_and_preserves_dependencies(self):
         self.stage()
         builder = module("build-runtime-acceptance-container")
-        extracted = self.root / "extracted/AppDir/usr/lib/nelomai-app"
+        extracted = self.root / "extracted/AppDir/usr/lib/Nelomai"
         shutil.copytree(self.root / "staged", extracted)
         dependency = extracted.parent / "libexample.so"
         dependency.write_bytes(b"bundled dependency")
@@ -163,7 +163,7 @@ class AcceptanceContainerTest(ArtifactFixture):
         self.stage()
         builder = module("build-runtime-acceptance-container")
         self.assertTrue(callable(getattr(builder, "verify_packaged_tree", None)), "post-packager exact-byte verification is missing")
-        extracted = self.root / "extracted/AppDir/usr/lib/nelomai-app"
+        extracted = self.root / "extracted/AppDir/usr/lib/Nelomai"
         shutil.copytree(self.root / "staged", extracted)
         builder.verify_packaged_tree(self.root / "extracted", self.root / "staged", self.public, "linux", "x86_64")
         executable = extracted / "runtime/engines/stable/0.2.16/nelomai-runtime"

@@ -784,13 +784,13 @@ fn pre_auth_handoff() -> io::Result<bool> {
         use std::os::unix::process::CommandExt;
         let installed = Path::new("/usr/local/libexec/nelomai/common");
         let installed_exe = installed.join("AppDir/usr/bin/nelomai-app");
-        let installed_resources = installed.join("AppDir/usr/lib/nelomai-app");
+        let installed_resources = installed.join("AppDir/usr/lib/Nelomai");
         let source_dir = executable
             .parent()
             .and_then(Path::parent)
             .and_then(Path::parent)
             .ok_or_else(|| io::Error::other("AppImage layout unavailable"))?;
-        let source_resources = source_dir.join("usr/lib/nelomai-app");
+        let source_resources = source_dir.join("usr/lib/Nelomai");
         let candidate = verify_layout(&source_resources.join("runtime"))?;
         let existing = if installed_resources.join("runtime").exists() {
             Some(verify_layout(&installed_resources.join("runtime"))?)

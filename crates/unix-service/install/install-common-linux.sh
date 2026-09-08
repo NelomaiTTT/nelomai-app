@@ -17,7 +17,7 @@ install -o root -g root -m 0755 "$SOURCE_IMAGE" "$STAGING/Nelomai.AppImage"
 (cd "$STAGING" && ./Nelomai.AppImage --appimage-extract >/dev/null)
 APPDIR=$STAGING/squashfs-root
 COMMON=$APPDIR/usr/bin/nelomai-app
-RESOURCES=$APPDIR/usr/lib/nelomai-app
+RESOURCES=$APPDIR/usr/lib/Nelomai
 [ -x "$COMMON" ] && [ -e "$APPDIR/AppRun" ] || exit 1
 [ -d "$RESOURCES/runtime" ] || exit 1
 # AppImages legitimately contain internal library symlinks; none may resolve
@@ -28,8 +28,8 @@ find "$APPDIR" -type l -print | while IFS= read -r link; do
 done
 chown -R root:root "$APPDIR"
 chmod -R go-w "$APPDIR"
-if [ -d "$INSTALL_ROOT/AppDir/usr/lib/nelomai-app/runtime" ]; then
-  LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/x86_64-linux-gnu" "$COMMON" --verify-runtime-layout "$RESOURCES/runtime" "$INSTALL_ROOT/AppDir/usr/lib/nelomai-app/runtime"
+if [ -d "$INSTALL_ROOT/AppDir/usr/lib/Nelomai/runtime" ]; then
+  LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/x86_64-linux-gnu" "$COMMON" --verify-runtime-layout "$RESOURCES/runtime" "$INSTALL_ROOT/AppDir/usr/lib/Nelomai/runtime"
 else
   LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/x86_64-linux-gnu" "$COMMON" --verify-runtime-layout "$RESOURCES/runtime"
 fi
