@@ -1728,7 +1728,6 @@ mod tests {
         );
         assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(1));
         drop(busy);
-        drop(scheduler);
         drop(broker);
         drop(store);
         let store = Arc::new(ProtectedAuthStore::new(record));
