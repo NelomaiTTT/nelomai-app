@@ -1,4 +1,9 @@
 //! Opt-in diagnostic build only; ordinary releases do not write startup logs.
+pub fn setup<T>(
+    run: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    run().inspect_err(|cause| error("common.setup", cause.as_ref()))
+}
 pub fn init() {
     #[cfg(feature = "startup-diagnostics")]
     enabled::init();

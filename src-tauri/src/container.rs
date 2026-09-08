@@ -307,101 +307,107 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            use base64::Engine;
-            startup::stage("common.resources");
-            let resources = installed_resources(app)?;
-            let data = app.path().app_data_dir()?;
-            // Establish the installed dispatcher identity before protected auth is
-            // initialized. This also gives shutdown an actual native stop peer on
-            // the first launch, before the user ever connects a tunnel.
-            startup::stage("native.prepare");
-            tauri::async_runtime::block_on(prepare_native(app.handle().clone()))?;
-            startup::stage("common.public_key");
-            let key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
-                .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
-                .transpose()?
-                .ok_or_else(|| io::Error::other("pinned runtime manifest key unavailable"))?;
-            let native_binding = nelomai_contracts::dispatcher::CommonEngineBinding::default();
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let tunnel = Arc::new(platform::unix::common_tunnel_controller(
-                native_binding.clone(),
-            ));
-            #[cfg(windows)]
-            let tunnel = Arc::new(platform::windows::common_tunnel_controller(
-                native_binding.clone(),
-            ));
-            let stop = Arc::new(NativeStop {
-                child: Mutex::new(None),
-                exit_owner: Default::default(),
-                tunnel,
-                operation: tokio::sync::Mutex::new(NativeOperationState::default()),
-            });
-            #[cfg(target_os = "linux")]
-            let fallback = Some(data.join("credentials"));
-            #[cfg(not(target_os = "linux"))]
-            let fallback = None;
-            let updater = platform::updater::DesktopUpdateBackend::from_build(app.handle().clone())
-                .ok()
-                .map(|backend| Arc::new(backend) as Arc<dyn nelomai_client_updater::UpdateBackend>);
-            startup::stage("common.open_host");
-            let host = Arc::new(CommonHost::open(
-                &data,
-                &resources.join("runtime"),
-                Some(&key),
-                std::env::consts::OS,
-                std::env::consts::ARCH,
-                || nelomai_client_storage::SystemRecordFactory::new("primary", fallback),
-                nelomai_client_api::ClientApi::new(PANEL_BASE)?,
-                RuntimeClientProfile {
-                    platform: crate::commands::current_platform(),
-                    platform_version: None,
-                    architecture: std::env::consts::ARCH.into(),
-                },
-                HostNativePorts {
-                    stop: stop.clone(),
-                    force: stop.clone(),
-                    background: Arc::new(DesktopBackground),
-                    updater,
-                    storage: None,
-                    relaunch: None,
-                },
-            )?);
-            startup::stage("native.bind_identity");
-            let target = host.native_target();
-            let engine =
-                nelomai_contracts::dispatcher::Installation::production(Path::new("/unused"))?
-                    .manifest_identity_for(&resources.join("runtime"), target.runtime_slot)?;
-            if engine.runtime_version != target.runtime_version
-                || engine.runtime_contract_version != target.runtime_contract_version
-                || engine.container_version != target.container_version
-            {
-                return Err(io::Error::other("common native identity mismatch").into());
-            }
-            native_binding.bind(engine)?;
-            startup::stage("runtime.launch");
-            let mut child = tauri::async_runtime::block_on(host.launch_desktop(0))?;
-            startup::stage("runtime.native_channel");
-            let native = child.take_native()?;
-            stop.exit_owner.runtime_launched();
-            *stop
-                .child
-                .lock()
-                .map_err(|_| io::Error::other("common process state unavailable"))? = Some(child);
-            let state = Arc::new(CommonState {
-                host,
-                stop,
-                presentation: Mutex::new(TraySnapshot::default()),
-                actions: Mutex::new(VecDeque::new()),
-                finishing: AtomicBool::new(false),
-            });
-            app.manage(state.clone());
-            startup::stage("common.tray");
-            desktop::setup_tray(app)?;
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || serve_native(handle, state, native));
-            Ok(())
+            startup::setup(|| {
+                use base64::Engine;
+                startup::stage("common.resources");
+                let resources = installed_resources(app)?;
+                let data = app.path().app_data_dir()?;
+                // Establish the installed dispatcher identity before protected auth is
+                // initialized. This also gives shutdown an actual native stop peer on
+                // the first launch, before the user ever connects a tunnel.
+                startup::stage("native.prepare");
+                tauri::async_runtime::block_on(prepare_native(app.handle().clone()))?;
+                startup::stage("common.public_key");
+                let key = option_env!("NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64")
+                    .map(|value| base64::engine::general_purpose::STANDARD.decode(value))
+                    .transpose()?
+                    .ok_or_else(|| io::Error::other("pinned runtime manifest key unavailable"))?;
+                let native_binding = nelomai_contracts::dispatcher::CommonEngineBinding::default();
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let tunnel = Arc::new(platform::unix::common_tunnel_controller(
+                    native_binding.clone(),
+                ));
+                #[cfg(windows)]
+                let tunnel = Arc::new(platform::windows::common_tunnel_controller(
+                    native_binding.clone(),
+                ));
+                let stop = Arc::new(NativeStop {
+                    child: Mutex::new(None),
+                    exit_owner: Default::default(),
+                    tunnel,
+                    operation: tokio::sync::Mutex::new(NativeOperationState::default()),
+                });
+                #[cfg(target_os = "linux")]
+                let fallback = Some(data.join("credentials"));
+                #[cfg(not(target_os = "linux"))]
+                let fallback = None;
+                let updater =
+                    platform::updater::DesktopUpdateBackend::from_build(app.handle().clone())
+                        .ok()
+                        .map(|backend| {
+                            Arc::new(backend) as Arc<dyn nelomai_client_updater::UpdateBackend>
+                        });
+                startup::stage("common.open_host");
+                let host = Arc::new(CommonHost::open(
+                    &data,
+                    &resources.join("runtime"),
+                    Some(&key),
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    || nelomai_client_storage::SystemRecordFactory::new("primary", fallback),
+                    nelomai_client_api::ClientApi::new(PANEL_BASE)?,
+                    RuntimeClientProfile {
+                        platform: crate::commands::current_platform(),
+                        platform_version: None,
+                        architecture: std::env::consts::ARCH.into(),
+                    },
+                    HostNativePorts {
+                        stop: stop.clone(),
+                        force: stop.clone(),
+                        background: Arc::new(DesktopBackground),
+                        updater,
+                        storage: None,
+                        relaunch: None,
+                    },
+                )?);
+                startup::stage("native.bind_identity");
+                let target = host.native_target();
+                let engine =
+                    nelomai_contracts::dispatcher::Installation::production(Path::new("/unused"))?
+                        .manifest_identity_for(&resources.join("runtime"), target.runtime_slot)?;
+                if engine.runtime_version != target.runtime_version
+                    || engine.runtime_contract_version != target.runtime_contract_version
+                    || engine.container_version != target.container_version
+                {
+                    return Err(io::Error::other("common native identity mismatch").into());
+                }
+                native_binding.bind(engine)?;
+                startup::stage("runtime.launch");
+                let mut child = tauri::async_runtime::block_on(host.launch_desktop(0))?;
+                startup::stage("runtime.native_channel");
+                let native = child.take_native()?;
+                stop.exit_owner.runtime_launched();
+                *stop
+                    .child
+                    .lock()
+                    .map_err(|_| io::Error::other("common process state unavailable"))? =
+                    Some(child);
+                let state = Arc::new(CommonState {
+                    host,
+                    stop,
+                    presentation: Mutex::new(TraySnapshot::default()),
+                    actions: Mutex::new(VecDeque::new()),
+                    finishing: AtomicBool::new(false),
+                });
+                app.manage(state.clone());
+                startup::stage("common.tray");
+                desktop::setup_tray(app)?;
+                #[cfg(target_os = "macos")]
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || serve_native(handle, state, native));
+                Ok(())
+            })
         });
     let mut context = crate::app_context();
     context.config_mut().app.windows.clear();

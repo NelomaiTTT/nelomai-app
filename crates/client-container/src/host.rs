@@ -37,7 +37,9 @@ pub fn prepare_host<F: ProtectedRecordFactory>(
     architecture: &str,
     create_records: impl FnOnce() -> F,
 ) -> Result<PreparedHost<F>, SelectionStartupError> {
+    crate::startup_diagnostics::stage("host.owner_lock");
     let owner = Arc::new(ContainerOwnerLock::try_acquire(data_root)?);
+    crate::startup_diagnostics::stage("host.runtime_selection");
     let prepared = InstalledRuntimeSelection::prepare(
         resource_root,
         owner.as_ref(),
@@ -47,8 +49,11 @@ pub fn prepare_host<F: ProtectedRecordFactory>(
     )?;
     // The factory itself may initialize native keychain/keystore context, so it
     // must not run until both exclusivity and manifest trust are established.
+    crate::startup_diagnostics::stage("host.record_factory");
     let records = create_records();
+    crate::startup_diagnostics::stage("host.prepare_storage");
     let (selection, storage) = prepared.prepare_runtime_storage(owner.as_ref(), &records)?;
+    crate::startup_diagnostics::stage("host.storage_ready");
     Ok(PreparedHost {
         owner,
         selection,
@@ -625,6 +630,7 @@ impl CommonHost {
         let api = api
             .with_app_version(&selection.target().container_version)
             .map_err(|_| HostError::RecoveryRequired)?;
+        crate::startup_diagnostics::stage("host.auth_broker");
         let broker = Arc::new(AuthBroker::new(
             api.clone(),
             Arc::new(storage.auth),
@@ -634,6 +640,7 @@ impl CommonHost {
             .broker
             .set(Arc::downgrade(&broker))
             .map_err(|_| HostError::RecoveryRequired)?;
+        crate::startup_diagnostics::stage("host.switch_coordinator");
         let mut coordinator = SwitchCoordinator::open(owner.clone(), selection.manifest().clone())
             .map_err(|_| HostError::RecoveryRequired)?
             .attach(broker.clone(), bridge.clone());
@@ -641,6 +648,7 @@ impl CommonHost {
             coordinator = coordinator.require_initial_transition(selection.state().selected_slot);
         }
         let coordinator = Arc::new(coordinator);
+        crate::startup_diagnostics::stage("host.updater");
         let updater = Arc::new(
             HostUpdater::new(
                 owner.root(),
