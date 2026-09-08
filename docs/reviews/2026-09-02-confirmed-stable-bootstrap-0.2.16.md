@@ -1,11 +1,33 @@
-# Confirmed Stable bootstrap 0.2.16: evidence после единственной final fix wave
+# Confirmed Stable bootstrap 0.2.16: итоговое evidence после локальных gates
 
 Ветка `codex/confirmed-stable-0.2.16`. Единственный final whole-branch review
 в три прохода выполнен на `59818c392601b6e851b4747d2a609ee276379cc0`:
 **0 Critical, 2 Important (P2), 0 Minor; With fixes; not release-ready**.
-Этот commit содержит одну разрешённую fix wave поверх указанного HEAD.
-Итоговый независимый **SCOPED review двух исправлений — PENDING**;
-автор исправлений не объявляет замечания закрытыми review.
+Единственная fix wave `73a3d4475d05b2272fc1623ddd5eb72379d2167c` прошла
+независимый scoped review: **оба P2 ADDRESSED, 0 новых findings**. Отдельный
+verification socket fix `3e47b1fc7ed2444704ce6dfe47b33d97d84a6bbf` также
+прошёл scoped review: **ADDRESSED, 0 новых findings**. Открытых source-review
+замечаний нет.
+
+Product source заморожен на `3e47b1fc7ed2444704ce6dfe47b33d97d84a6bbf`.
+Этот итоговый documentation commit меняет только evidence-документ; native builds остаются
+привязаны к `3e47b1f` и не переобозначаются сборками documentation commit.
+
+## Новейшие проверенные gates
+
+| Gate | Source и результат | Граница evidence |
+| --- | --- | --- |
+| Source reviews | Whole-branch `59818c3`: 2 P2; scoped `73a3d44` и socket `3e47b1f`: все ADDRESSED, **0 open** | Единственный broad review и два ограниченных rereview; не release acceptance. |
+| Full Rust workspace | `3e47b1f`: `cargo test --workspace --locked --offline`, **914 top-level PASS + 5 nested**, 0 failed/ignored, exit 0 | Включает прежний socket failure и новые regressions; Windows-labelled host tests не означают запуск Windows-only кода на Windows. |
+| Full Rust quality | `3e47b1f`: `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`, exit 0, 38.48s; fmt/diff-check exit 0 | Финальный root gate после socket fix. |
+| Real-panel/PostgreSQL matrix | Точно `73a3d4475d05b2272fc1623ddd5eb72379d2167c`: без фильтра **54 PASS**, 27 на направление; panel archive `89ef85dc` + `0057` | После неё изменена только публикация Unix socket response; broker/coordinator неизменны. Matrix не запускалась заново на `3e47b1f`; synthetic adapter не доказывает native tunnel admission. |
+| Final host native drafts | Точно `3e47b1f`: macOS/aarch64 и Android/aarch64 `build_only` **exit 0**, stable verification **exit 0**; Node 24; root сверил размеры/SHA всех artifacts и оба sizes JSON. Android XML: app 16 + tunnel 416 = **432 PASS**, 0 failed/errors/skipped | Финальные host-supported drafts, не exact installer/candidate и не four-platform release root. |
+| Frontend | Неизменённый frontend; Node 24.19.0 / npm 11.17: **95 tests / 12 files PASS**, Svelte 0 errors / 0 warnings, static build PASS | Root повторил проверки в финальной Rust-only wave. |
+| Python/contracts/workflows | Исходники проверок не менялись при socket fix: fixtures **32 PASS**, workflow **5+7 PASS**, retry-identity unit **1 test / 2 subcases PASS** | Проверки выполнены root до socket-only изменения; к новому source не переобозначаются. |
+
+Оба финальных native draft используют один public TEST pin
+`35cd9a85381733caec0c92e76f68cce594902c04371fa530e8413bc0d1d92e7d`;
+это тестовое доверие, а не production release trust.
 
 Версия в `package.json` и `src-tauri/tauri.conf.json` остаётся `0.2.16`.
 `CHANGELOG.md` честно помечает её как «в разработке, не выпущена».
@@ -63,7 +85,7 @@ Scoped rereview fix round 4 помечает последний retry-identity f
 | Host-supported native drafts | frozen `3f077c514a2584c26e67e46827bb2acf914669f4` | macOS/aarch64 и Android/aarch64 `build_only` PASS с единым public TEST pin. Android builder выполнил 432 теста без ошибок; macOS payload/codesign и Android stable payload/AAR/resource/license/ELF проверки PASS. |
 | Production read-only check | panel HEAD `89ef85dc0acc3de409507ca70304c2fe00a1447e` | health OK, clean checkout, `nelomai-panel`/nginx/PostgreSQL active; `BEGIN READ ONLY` подтвердил Alembic `20260904_0057`. Это тот же commit, что у isolated matrix archive. Deployment/migration/capability changes не выполнялись. |
 
-Полные 54 matrix PASS принадлежат именно `3e7afe6`; после них `f310881` получил
+Исторические 54 matrix PASS этой таблицы принадлежат `3e7afe6`; после них `f310881` получил
 узкий retry-identity harness fix и отдельные 14 focused PASS. Полная matrix на
 `f310881` заново не запускалась и здесь так не обозначается. Между `3f077c5` и
 `f310881` изменены только три acceptance-harness файла; production source
@@ -95,12 +117,12 @@ workspace результаты не обозначаются evidence финал
    после reopen без повторного graceful stop. Существующий тест failed
    pre-stop cancellation теперь явно отказывает обоим stop методам.
 
-Это implementation/test evidence, а не scoped-review approval. Полный Rust
-workspace gate и новые host native drafts после freeze выполняет root;
-на момент данного commit они **PENDING**. Старые `3f077c5` drafts не являются
-final product evidence.
+Это implementation/test evidence wave `73a3d44`. Последующий независимый
+scoped review закрыл оба P2 без новых findings. Финальные root workspace
+и host native gates на `3e47b1f` приведены выше; старые `3f077c5` drafts
+сохраняются только как историческое evidence.
 
-На final source этой fix wave `cargo test -p nelomai-client-container
+На source `73a3d44` этой fix wave `cargo test -p nelomai-client-container
 -p nelomai-client-storage --locked --offline` завершился exit 0:
 **238 top-level PASS + 4 успешных nested test summaries**, 0 failed/ignored.
 В их числе transition-auth 41, update 26, auth-broker 37, switch 10,
@@ -119,10 +141,10 @@ tracked filename scan по известным secret-паттернам. Dirty v
 
 - Whole-branch review выполнен в трёх явных проходах: auth/migration/generation,
   tunnel shutdown/dispatcher/update barrier, artifact integrity/packaging/secrets.
-  После двух исправлений независимый final **SCOPED review — PENDING**.
-- Host drafts собраны на `3f077c5`, используют TEST trust и Node 26 вместо
-  workflow-pinned Node 24. Они не переносят approval на финальный source.
-  Android stable получил полную native проверку; latest collision input builder
+  Оба P2 и отдельный socket defect закрыты независимыми scoped reviews;
+  **0 source findings open**, без заявления release readiness.
+- Финальные host drafts собраны на `3e47b1f`, используют public TEST trust и
+  Node 24. Android stable получил полную native проверку; latest collision input builder
   проверяет с `inspect_native=False`, поэтому full latest native verification
   не заявляется.
 - Linux/x86_64 и Windows/x86_64 native drafts отсутствуют; four-platform signed
@@ -139,8 +161,9 @@ tracked filename scan по известным secret-паттернам. Dirty v
   Android tile background/foreground stop regression должна быть проверена на
   физическом устройстве до acceptance.
 
-Следующий шаг — scoped review двух исправлений и root gates на frozen source.
-Ветка не объявляется release-ready; Task 12 не объявляется полностью завершённой.
+Source reviews и локальные root gates завершены. Остаётся exact-candidate и
+физическая приёмка, перечисленная выше. Ветка не объявляется release-ready;
+Task 12 не объявляется полностью завершённой.
 
 ## Отдельное исправление сбоя final workspace gate
 
@@ -168,6 +191,8 @@ Scoped evidence этого отдельного исправления: socket i
 **131 PASS**, 0 failed/ignored (contracts 19+21+17, Unix unit 50, helper 17,
 socket 7). Scoped clippy `--all-targets --locked --offline -- -D warnings`,
 `cargo fmt --all --check` и `git diff --check` — exit 0. Независимый socket
-**SCOPED review и новые root full/native gates — PENDING**. Ранее указанные
-54 matrix, 73a3d44 package tests и исторические full workspace/native результаты
-остаются привязаны к своим source-точкам и здесь не переносятся на новый commit.
+**SCOPED review: ADDRESSED, 0 новых findings, 0 open**. Root повторил full
+workspace на `3e47b1f`: 914 top-level PASS + 5 nested, exit 0; финальные host
+native drafts также PASS. Это заменяет прежний failure как текущий gate,
+сохраняя его историю. Matrix `73a3d44`, package tests и исторические full
+workspace/native результаты остаются привязаны к своим source-точкам.
