@@ -314,6 +314,15 @@ class ReleaseAuthorizationTest(ArtifactFixture):
             "type": "required_reviewers", "prevent_self_review": True,
             "reviewers": [{"type": "User", "reviewer": {"id": 1}}]}]})
 
+    def test_manual_self_review_still_requires_configured_reviewers(self):
+        gates = module("release-candidate-gates")
+        rule = {"type": "required_reviewers", "prevent_self_review": False,
+                "reviewers": [{"type": "User", "reviewer": {"id": 149905325}}]}
+        gates.require_protected_environment({"protection_rules": [rule]})
+        for reviewers in ([], [{"type": "User", "reviewer": {}}]):
+            with self.assertRaises(ValueError):
+                gates.require_protected_environment({"protection_rules": [{**rule, "reviewers": reviewers}]})
+
     def test_test_trust_failed_run_or_wrong_source_cannot_be_promoted(self):
         gates = module("release-candidate-gates")
         run = dict(id=42, run_attempt=1, status="completed", conclusion="success", event="workflow_dispatch",

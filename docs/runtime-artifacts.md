@@ -116,7 +116,11 @@ An authorized administrator must separately configure all four environments:
 - `release-candidate-acceptance`
 - `release-publication`
 
-Each requires actual required reviewers and `prevent_self_review=true`.
+Each requires actual required reviewers and an explicit `prevent_self_review`
+policy. The owner has approved `prevent_self_review=false` for this repository:
+the initiating owner may manually approve their own run. This does not approve
+any run automatically or remove the separate signing, finalization, acceptance
+and publication approvals.
 GET checks bind current positive environment IDs to exactly one approved review
 per required identity in the current run. Rejected, duplicate, missing, stale,
 recreated or ambiguous review history fails closed. Only integer run attempt 1
@@ -125,10 +129,11 @@ approvals**, not approval reuse or timestamp/order inference. The two signing
 waves deliberately use different environment identities and approvals.
 
 Configure the raw Ed25519 public pin as repository variable
-`NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64`, the separate Tauri public pin as
-`NELOMAI_UPDATER_PUBLIC_KEY`, the expected APK certificate as
-`ANDROID_SIGNER_SHA256`, and the existing public Firebase application/API/project
-values as repository variables. Provision matching private Ed25519 material only
+`NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64` and the expected APK certificate as
+`ANDROID_SIGNER_SHA256`. Keep the separate Tauri public pin
+`NELOMAI_UPDATER_PUBLIC_KEY` and the existing Firebase application/API/project
+values in repository Secrets, as for previous releases; the workflow reads them
+from Secrets without requiring a migration to Variables. Provision matching private Ed25519 material only
 in the signing/finalization environments. Tauri signing key/password and Android
 keystore/base64/alias/password secrets belong only to finalization. No private
 key is an artifact or job output. The panel's manifest public key must match the

@@ -98,10 +98,10 @@ def require_protected_environment(environment):
     rules = environment.get("protection_rules", [])
     approval = [rule for rule in rules if rule.get("type") == "required_reviewers"]
     if (len(approval) != 1
-            or approval[0].get("prevent_self_review") is not True
+            or type(approval[0].get("prevent_self_review")) is not bool
             or not approval[0].get("reviewers")
             or not all(reviewer.get("reviewer", {}).get("id") for reviewer in approval[0]["reviewers"])):
-        raise ValueError("environment requires configured reviewers and no self-review")
+        raise ValueError("environment requires configured reviewers and an explicit self-review policy")
 
 
 def require_first_attempt(run, run_id, run_attempt=1):

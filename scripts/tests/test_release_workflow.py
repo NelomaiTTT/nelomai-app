@@ -7,6 +7,15 @@ from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_existing_release_inputs_keep_repository_secret_bindings(self):
+        # These inputs were provisioned as Secrets for existing releases.
+        # A Variables-only binding silently passes an empty value to the runner.
+        environment = self.workflow()["env"]
+        for name in ("NELOMAI_UPDATER_PUBLIC_KEY", "NELOMAI_FIREBASE_APPLICATION_ID",
+                     "NELOMAI_FIREBASE_API_KEY", "NELOMAI_FIREBASE_PROJECT_ID"):
+            with self.subTest(name=name):
+                self.assertEqual(environment[name], "${{ secrets." + name + " }}")
+
     def test_discovery_host_provisions_mandatory_compiled_android_fixtures(self):
         steps = self.workflow()["jobs"]["verify"]["steps"]
         host = next(step for step in steps if step.get("uses") == "./.github/actions/release-native-host")
