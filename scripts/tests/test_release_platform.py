@@ -8,6 +8,14 @@ from scripts.tests.test_runtime_artifact import ArtifactFixture, SCRIPTS, module
 
 
 class ReleasePlatformTest(ArtifactFixture):
+    def test_build_capture_decodes_utf8_independently_of_windows_locale(self):
+        builder = module("build-release-platform")
+        metadata = json.dumps({"description": "Сборка"}, ensure_ascii=False)
+        command = "import sys; sys.stdout.buffer.write(" + repr(metadata.encode("utf-8")) + ")"
+        with patch.object(subprocess, "_text_encoding", return_value="cp1252"):
+            result = builder.run(sys.executable, "-c", command, capture=True)
+        self.assertEqual(json.loads(result.stdout), {"description": "Сборка"})
+
     def test_android_fetches_locked_graph_before_offline_input_generation(self):
         builder = module("build-release-platform")
         events = []

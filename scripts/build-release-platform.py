@@ -38,7 +38,7 @@ def build_trust(mode, private, public):
 
 def run(*command, cwd=ROOT, env=None, capture=False):
     return subprocess.run(list(map(str, command)), cwd=cwd, env=env, check=True,
-                          capture_output=capture, text=True)
+                          capture_output=capture, text=True, encoding="utf-8")
 
 
 def script(name, *arguments, **kwargs):
