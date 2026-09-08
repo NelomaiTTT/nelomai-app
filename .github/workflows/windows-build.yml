@@ -2,12 +2,27 @@ name: Windows build
 
 on:
   workflow_dispatch:
+    inputs:
+      download_diagnostics_only:
+        description: "Только сравнить загрузку закреплённого архива, без сборки и секретов"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  download-diagnostics:
+    if: inputs.download_diagnostics_only
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Проверить TLS и SHA-256 двумя curl
+        shell: pwsh
+        run: ./scripts/windows/check-toolchain-download.ps1
   build:
+    if: ${{ !inputs.download_diagnostics_only }}
     name: Windows x86_64
     runs-on: windows-2022
     steps:
