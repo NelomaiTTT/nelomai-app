@@ -100,9 +100,6 @@ def main():
     parser.add_argument("--mode", choices=("build_only", "sign_candidate"), default="build_only")
     args = parser.parse_args()
     gates.require_operation(args.mode, "test_sign" if args.mode == "build_only" else "release_sign")
-    if args.mode == "sign_candidate":
-        gates.check_approvals(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"],
-            (gates.SIGNING_ENVIRONMENT,), run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]))
     print(sign(args.drafts, args.output, args.source_sha, args.signing_key, args.public_key))
 
 

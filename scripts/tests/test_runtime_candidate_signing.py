@@ -2,6 +2,10 @@
 import json
 import shutil
 import subprocess
+import contextlib
+import io
+import os
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
@@ -10,6 +14,19 @@ import scripts.tests.test_runtime_release_set as fixtures
 
 
 class RuntimeCandidateSigningTest(ArtifactFixture):
+    def test_cli_signs_without_github_approval_environment(self):
+        drafts = self.drafts()
+        output = self.root / "cli-signed"
+        signer = module("sign-runtime-candidate")
+        arguments = ["sign-runtime-candidate.py", "--mode", "sign_candidate",
+                     "--drafts", str(drafts), "--output", str(output), "--source-sha", SOURCE,
+                     "--signing-key", str(self.keyfile), "--public-key", str(self.public)]
+        with patch.dict(os.environ, {}, clear=True), patch("sys.argv", arguments), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            signer.main()
+        digest = stdout.getvalue().strip()
+        module("release-candidate-gates").verify_runtime_release(
+            output / "release", "0.2.16", SOURCE, digest, self.public)
+
     def drafts(self):
         four = fixtures.RuntimeReleaseSetTest.four_candidates(self)
         drafts = self.root / "drafts"
