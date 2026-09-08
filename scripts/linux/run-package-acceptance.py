@@ -101,6 +101,8 @@ def session(kind):
 
 def inside():
     isolated()
+    import pwd
+    acceptance_uid = pwd.getpwnam("acceptance").pw_uid
     spec = importlib.util.spec_from_file_location("container", ROOT / "scripts/build-runtime-acceptance-container.py")
     container = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(container)
@@ -121,7 +123,7 @@ def inside():
     helper = resources / "dispatcher/1/nelomai-unix-service"
     # The real production installation API, but in a disposable root-owned
     # namespace only. No sudo/pkexec/host installer is invoked.
-    installed = run(helper, "install-layout", resources, common, "1000", capture_output=True, text=True).stdout.strip()
+    installed = run(helper, "install-layout", resources, common, acceptance_uid, capture_output=True, text=True).stdout.strip()
     dispatcher = subprocess.Popen([installed, "--dispatcher"])
     xvfb = subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
     environment = {**os.environ, "DISPLAY": ":99", "NO_AT_BRIDGE": "0", "GTK_MODULES": "gail:atk-bridge"}
