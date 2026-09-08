@@ -4,6 +4,18 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Upstream build.bat extracts verified ZIP files with tar. Git Bash prepends
+# GNU tar, which cannot read ZIP; use Windows' ZIP-capable bsdtar explicitly.
+$systemToolDirectory = [System.Environment]::SystemDirectory
+$nativeTar = Join-Path $systemToolDirectory "tar.exe"
+if (-not (Test-Path -LiteralPath $nativeTar -PathType Leaf)) {
+    throw "Windows system tar.exe is required to extract the pinned toolchain ZIP archives"
+}
+$env:PATH = "$systemToolDirectory;$env:PATH"
+& $nativeTar --version
+if ($LASTEXITCODE -ne 0) {
+    throw "Windows system tar.exe is unavailable"
+}
 $WireGuardWindowsCommit = "4e6726c23ae9c5cb58e0c9910f3b7515621d133d"
 $WireGuardNtVersion = "1.1"
 $WireGuardNtArchiveSha256 = "dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace"
