@@ -67,14 +67,27 @@ def main():
         run([*fixture, "seed", login], env=env)
         run([binary, "login", args.panel_url, work, login])
         return login, work
+    def assert_pending(result, operation_id=None):
+        assert result["progress"] == "pending"
+        assert type(result["retry_after_seconds"]) is int
+        assert 1 <= result["retry_after_seconds"] <= 30
+        assert operation_id is None or result["operation_id"] == operation_id
+        if result["journal_retry"] is not None:
+            assert result["journal_retry"]["retry_after_seconds"] == result["retry_after_seconds"]
+            assert 1 <= result["journal_retry"]["attempt"] <= 32
+        return result["retry_after_seconds"]
     def drive(work, login, url=None):
         deadline = time.monotonic()+30
+        operation_id = None
         while True:
             result = json.loads(run([binary, "recover", url or args.panel_url, work, login]))
-            if result["phase"] == "complete" or "Pending" not in result["progress"]:
+            operation_id = operation_id or result["operation_id"]
+            assert result["operation_id"] == operation_id
+            if result["phase"] == "complete":
                 return result
+            delay = assert_pending(result, operation_id)
             assert time.monotonic() < deadline, "real recovery remained pending"
-            time.sleep(1)
+            time.sleep(delay)
     def assert_applied(login, result, session_rows=1):
         observed = observe(login)
         assert result["phase"] == "complete" and not result["barrier"]
@@ -117,7 +130,8 @@ def main():
                 pending = json.loads(run([binary, "recover", args.panel_url, work, login]))
             else:
                 pending = json.loads(run([binary, "switch", args.panel_url, work, login]))
-            assert pending["phase"] == "server_reconciling" and pending["barrier"] and "Pending" in pending["progress"]
+            assert pending["phase"] == "server_reconciling" and pending["barrier"]
+            assert_pending(pending, before["operation_id"] if phase in PHASES[:5] else None)
             pending_before_ack = observe(login)
             assert pending_before_ack["device_generations"] == [1]
             assert pending_before_ack["transitions"][0]["state"] == "cleaning" and pending_before_ack["transitions"][0]["barrier"]
@@ -211,7 +225,8 @@ def main():
             result = drive(work,login)
         else:
             pending = json.loads(run([binary,"switch",args.panel_url,work,login]))
-            assert pending["phase"] == "auth_resuming" and pending["barrier"] and "Pending" in pending["progress"]
+            assert pending["phase"] == "auth_resuming" and pending["barrier"]
+            assert_pending(pending)
             pre_restart = observe(login)
             assert pre_restart["device_generations"] == [1]
             assert pre_restart["transitions"][0]["state"] == "clean" and pre_restart["transitions"][0]["barrier"]
@@ -254,7 +269,8 @@ def main():
             after_denied_ack = None
             after_ack = None
             if delayed_cleanup:
-                assert pending["phase"] == "server_reconciling" and "Pending" in pending["progress"]
+                assert pending["phase"] == "server_reconciling"
+                assert_pending(pending)
                 assert marker.exists() == (endpoint == "reconcile")
                 pending_before_ack = observe(login)
                 assert pending_before_ack["device_generations"] == [1]
@@ -273,7 +289,8 @@ def main():
                     pre_restart = after_ack
                     run([binary,"recover",url,work,login],expected=1)
             elif endpoint == "resume":
-                assert pending["phase"] == "auth_resuming" and "Pending" in pending["progress"]
+                assert pending["phase"] == "auth_resuming"
+                assert_pending(pending)
                 assert not marker.exists(), "old process must not dispatch resume"
                 pre_restart = observe(login)
                 assert pre_restart["device_generations"] == [1]
@@ -299,8 +316,27 @@ def main():
                 assert before["transitions"][0]["operation_id"] == pending["operation_id"]
                 assert before["transitions"][0]["resume_operation_id"] is not None
                 assert before["transitions"][0]["resume_operation_id"] == after["transitions"][0]["resume_operation_id"]
-            faults.append({"endpoint":endpoint,"delayed_cleanup":delayed_cleanup,"fault":fault,"pre_restart":pre_restart,"pending_before_ack":pending_before_ack,"after_denied_ack":after_denied_ack,"after_ack":after_ack,"before_replay":before,"after_replay":after})
-            print(f"PASS real postcommit lost {endpoint} (delayed={delayed_cleanup}): persisted replay, one generation advance",flush=True)
+            stale_process = subprocess.Popen([str(binary),"stale-"+endpoint+"-after-advance",args.panel_url,str(work),login],cwd=ROOT,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            deadline = time.monotonic()+15
+            while not (work/"new-state-ready").exists():
+                assert stale_process.poll() is None and time.monotonic()<deadline, "stale replay process did not reach newer auth state"
+                time.sleep(.01)
+            advanced_before_stale = observe(login)
+            assert advanced_before_stale["device_ids"] == after["device_ids"]
+            assert advanced_before_stale["device_generations"] == [3]
+            assert advanced_before_stale["devices"] == advanced_before_stale["active_sessions"] == 1
+            (work/"allow-stale-replay").write_text("continue")
+            stale_output, stale_error = stale_process.communicate(timeout=15)
+            assert stale_process.returncode == 0, stale_error[-1500:]
+            stale = json.loads(stale_output)
+            assert stale["endpoint"] == endpoint and stale["source_generation"] == 1 and stale["current_generation"] == 3
+            assert not stale["historical_identity_adopted"]
+            expected_stale_operation = after["transitions"][0]["operation_id"] if endpoint == "reconcile" else after["transitions"][0]["resume_operation_id"]
+            assert stale["operation_id"] == expected_stale_operation
+            after_stale = observe(login)
+            assert after_stale == advanced_before_stale, "stale operation changed relevant panel state"
+            faults.append({"endpoint":endpoint,"delayed_cleanup":delayed_cleanup,"fault":fault,"pre_restart":pre_restart,"pending_before_ack":pending_before_ack,"after_denied_ack":after_denied_ack,"after_ack":after_ack,"before_replay":before,"after_replay":after,"advanced_before_stale":advanced_before_stale,"stale_replay":stale,"after_stale":after_stale})
+            print(f"PASS real postcommit lost {endpoint} (delayed={delayed_cleanup}): valid gen2 retry; intentional login to gen3; stale replay nonadopting",flush=True)
         finally:
             proxy.terminate()
             proxy.wait(timeout=5)
@@ -323,7 +359,7 @@ def main():
             time.sleep(1)  # Honor the real first persisted retry deadline.
         pending = json.loads(run([binary,"recover",args.panel_url,work,login]))
         assert pending["phase"] == "server_reconciling" and pending["barrier"]
-        assert "Pending" in pending["progress"]
+        assert_pending(pending)
         result = json.loads(run([binary,"assert-reauth-required",args.panel_url,work,login]))
         after = observe(login)
         assert after["device_ids"] == before["device_ids"] and after["device_generations"] == [1]
@@ -336,8 +372,12 @@ def main():
             assert after["transitions"][0]["barrier"]
         logout = json.loads(run([binary,"controlled-logout",args.panel_url,work,login]))
         assert logout["logged_out"] and logout["local_stop_complete"] and logout["cleanup_receipt_pending"]
+        cleared = json.loads(run([binary,"assert-logged-out",args.panel_url,work,login]))
+        assert cleared["state"] == "logged_out" and cleared["credentials_cleared"] and cleared["access_denied"]
+        assert cleared["cleanup_receipt_present"] and cleared["operation_id"] == logout["operation_id"]
         recovered = json.loads(run([binary,"controlled-login",args.panel_url,work,login]))
         assert recovered["usable_access"] and recovered["local_switch_journal_retired"] and recovered["cleanup_receipt_consumed"]
+        assert recovered["slot"] == args.source_slot and recovered["generation"] == 2
         if delayed_cleanup:
             blocked = observe(login)
             assert blocked["active_sessions"] == 1 and blocked["transitions"][0]["barrier"]
@@ -357,12 +397,13 @@ def main():
             after_ack = None
         final = observe(login)
         assert final["devices"] == final["active_sessions"] == 1 and final["sessions"] == 2
+        assert final["device_generations"] == [2]
         assert final["device_ids"] == before["device_ids"]
         assert all(row["id"] != before["session_identities"][0]["id"] and row["family"] != before["session_identities"][0]["family"] for row in final["session_identities"] if not row["revoked"])
         if delayed_cleanup:
             assert [lease["status"] for lease in final["leases"] if lease["id"] == before["leases"][0]["id"]] == ["released"]
             assert final["jobs"][0]["status"] == "completed"
-        invalid_refresh_cases.append({"delayed_cleanup":delayed_cleanup,"before":before,"after_refusal":after,"result":result,"logout":logout,"recovered":recovered,"start_blocked_before_ack":start_blocked,"after_ack":after_ack,"start_unblocked_after_ack":start_unblocked,"after_reauthentication":final})
+        invalid_refresh_cases.append({"delayed_cleanup":delayed_cleanup,"before":before,"after_refusal":after,"result":result,"logout":logout,"logged_out":cleared,"recovered":recovered,"start_blocked_before_ack":start_blocked,"after_ack":after_ack,"start_unblocked_after_ack":start_unblocked,"after_reauthentication":final})
         print(f"PASS real invalid refresh: logout/cleanup/password-login restored new family (delayed={delayed_cleanup})",flush=True)
     for issuance in ["refresh","resume"]:
       if args.case_filter is not None:

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use nelomai_client_api::{
     ClientApi, ClientApiError, LoginRequest, RuntimeLogin, RuntimeSwitchReconcileRequest,
-    RuntimeTarget,
+    RuntimeSwitchState, RuntimeTarget,
 };
 use nelomai_client_container::{
     AuthBroker, BrokerError, FrozenReconcileRequest, LocalAuthStop, LocalStopReceiptV1,
@@ -306,6 +306,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         native.clone(),
     )?);
     match arguments[1].as_str() {
+        "assert-logged-out" => {
+            let auth = store.load()?.ok_or("protected auth record missing")?;
+            let meta = auth.broker.as_ref().ok_or("broker metadata missing")?;
+            let receipt = auth
+                .completed_runtime_logout
+                .as_ref()
+                .ok_or("durable runtime logout cleanup receipt missing")?;
+            assert_eq!(
+                auth.logout_state,
+                nelomai_client_storage::LogoutState::LoggedOut
+            );
+            assert!(auth.access_token.is_none() && auth.refresh_token.is_none());
+            assert!(meta.pending_request.is_none() && meta.pending_recovery.is_none());
+            assert!(meta.pending_logout.is_none());
+            assert_eq!(
+                broker.observe_stamped().await?.1.state,
+                nelomai_client_container::BrokerAuthState::LoggedOut
+            );
+            assert!(matches!(
+                broker.access_token(None).await,
+                Err(BrokerError::Cancelled)
+            ));
+            println!(
+                "{}",
+                json!({
+                    "case":"assert-logged-out",
+                    "state":"logged_out",
+                    "credentials_cleared":true,
+                    "access_denied":true,
+                    "cleanup_receipt_present":true,
+                    "operation_id":receipt.operation_id,
+                    "receipt_code":receipt.code
+                })
+            );
+        }
         "controlled-logout" => {
             broker.logout().await?;
             let receipt = broker
@@ -652,6 +687,153 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 json!({"case":"real-resume", "operation_id":operation_id, "generation":access.identity().session_generation, "access_usable":true})
             );
         }
+        "stale-reconcile-after-advance" | "stale-resume-after-advance" => {
+            // Capture the exact accepted operation arguments before advancing
+            // the authenticated identity. This is deliberately not a new UUID
+            // or a credential-mismatch surrogate for a stale replay.
+            let journal_path = root.join("common/runtime-switch-v1.json");
+            let saved: serde_json::Value = serde_json::from_slice(&fs::read(&journal_path)?)?;
+            assert_eq!(saved["phase"], "complete");
+            let reconcile_operation_id = saved["active_reconcile_operation_id"]
+                .as_str()
+                .or_else(|| saved["operation_id"].as_str())
+                .ok_or("completed switch operation id missing")?
+                .to_owned();
+            let source_generation = saved["source_identity"]["session_generation"]
+                .as_u64()
+                .ok_or("completed switch source generation missing")?;
+            assert_eq!(source_generation, 1);
+            let reconcile_request = RuntimeSwitchReconcileRequest {
+                operation_id: reconcile_operation_id.clone(),
+                source_identity: serde_json::from_value(saved["source_identity"].clone())?,
+                target_identity: serde_json::from_value(saved["target_identity"].clone())?,
+                expected_session_generation: saved["expected_session_generation"].as_u64(),
+                cleanup_contract_version: u32::try_from(
+                    saved["cleanup_envelope"]["cleanup_contract_version"]
+                        .as_u64()
+                        .ok_or("cleanup contract version missing")?,
+                )?,
+                lease_ids: serde_json::from_value(saved["cleanup_envelope"]["lease_ids"].clone())?,
+                redundant_session_ids: serde_json::from_value(
+                    saved["cleanup_envelope"]["redundant_session_ids"].clone(),
+                )?,
+                client_operation_ids: saved["cleanup_envelope"]["operations"]
+                    .as_array()
+                    .ok_or("cleanup operations missing")?
+                    .iter()
+                    .map(|operation| {
+                        operation["operation_id"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .ok_or("cleanup operation id missing")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            let frozen_reconcile = FrozenReconcileRequest::from_persisted(
+                reconcile_request,
+                saved["source_device_id"]
+                    .as_str()
+                    .ok_or("completed switch source device missing")?
+                    .to_owned(),
+                saved["source_scope_fingerprint"]
+                    .as_str()
+                    .ok_or("completed switch source scope missing")?
+                    .to_owned(),
+                Some(
+                    saved["request_fingerprint"]
+                        .as_str()
+                        .ok_or("completed switch request fingerprint missing")?,
+                ),
+            )?;
+            let resume_operation_id = saved["resume_operation_id"]
+                .as_str()
+                .ok_or("completed resume operation id missing")?
+                .to_owned();
+            let resume_arguments = ResumeArguments {
+                operation_id: resume_operation_id.clone(),
+                reconcile_operation_id: reconcile_operation_id.clone(),
+                decision: saved["decision"]
+                    .as_str()
+                    .ok_or("completed switch decision missing")?
+                    .to_owned(),
+                target: serde_json::from_value(saved["target_identity"].clone())?,
+                expected_session_generation: saved["active_session_generation"]
+                    .as_u64()
+                    .or_else(|| saved["expected_session_generation"].as_u64()),
+            };
+
+            let current = broker.access_token(None).await?;
+            assert_eq!(current.identity().session_generation, Some(2));
+            let current_target = target(current.identity().slot);
+            broker.logout().await?;
+            let owner = Arc::new(ContainerOwnerLock::try_acquire(&root)?);
+            let coordinator = Arc::new(
+                SwitchCoordinator::open(owner, test_manifest())?
+                    .attach(broker.clone(), native.clone()),
+            );
+            let port = OwnerRuntimeAuth::new(
+                broker.clone(),
+                current_target.clone(),
+                RuntimeClientProfile {
+                    platform: Platform::Linux,
+                    platform_version: None,
+                    architecture: "x86_64".into(),
+                },
+                Arc::new(FileAdmission(root.clone())),
+                native.writers.clone(),
+            )?
+            .with_switch_coordinator(coordinator);
+            let advanced = port
+                .login(RuntimeLogin {
+                    login: arguments[4].clone(),
+                    password: "synthetic-task12-password".into(),
+                    device_name: "Task12 stale replay successor".into(),
+                })
+                .await?;
+            assert_eq!(advanced.identity().session_generation, Some(3));
+            assert_eq!(advanced.identity().slot, current_target.runtime_slot);
+            ClientApi::new(url)?
+                .with_access_snapshot(&advanced)?
+                .bootstrap(advanced.access_token())
+                .await?;
+            fs::write(root.join("new-state-ready"), b"ready")?;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !root.join("allow-stale-replay").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+
+            let (endpoint_name, replay_operation_id, outcome) =
+                if arguments[1] == "stale-reconcile-after-advance" {
+                    let receipt = broker.reconcile_transition(frozen_reconcile).await?;
+                    assert_eq!(receipt.state, RuntimeSwitchState::Clean);
+                    (
+                        "reconcile",
+                        reconcile_operation_id,
+                        "historical_clean_receipt",
+                    )
+                } else {
+                    let receipt = broker.resume_transition(resume_arguments).await?;
+                    assert_eq!(receipt.identity().session_generation, Some(2));
+                    assert!(receipt.current_access().is_none());
+                    ("resume", resume_operation_id, "historical_resume_receipt")
+                };
+            let after_replay = broker.access_token(None).await?;
+            assert_eq!(after_replay, advanced);
+            println!(
+                "{}",
+                json!({
+                    "case":"stale-replay-after-advance",
+                    "endpoint":endpoint_name,
+                    "operation_id":replay_operation_id,
+                    "source_generation":source_generation,
+                    "current_generation":after_replay.identity().session_generation,
+                    "historical_identity_adopted":false,
+                    "outcome":outcome
+                })
+            );
+        }
         "switch" | "recover" => {
             let owner = Arc::new(ContainerOwnerLock::try_acquire(&root)?);
             let selection = root.join("common/runtime-selection-v1.json");
@@ -718,9 +900,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+            let (progress, retry_after_seconds) = match result {
+                nelomai_client_container::SwitchProgress::Ready => ("ready", None),
+                nelomai_client_container::SwitchProgress::Pending {
+                    retry_after_seconds,
+                } => ("pending", Some(retry_after_seconds)),
+            };
             println!(
                 "{}",
-                json!({"case":arguments[1],"progress":format!("{result:?}"),"phase":journal.phase(),"barrier":nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&coordinator).is_err(),"operation_id":saved["operation_id"],"active_operation_id":saved["active_reconcile_operation_id"],"target":journal.target_identity(),"confirmed_identity":access.as_ref().map(|access| access.identity())})
+                json!({"case":arguments[1],"progress":progress,"retry_after_seconds":retry_after_seconds,"journal_retry":saved["retry"],"phase":journal.phase(),"barrier":nelomai_client_core::RuntimeStartPreflight::check_start_barrier(&coordinator).is_err(),"operation_id":saved["operation_id"],"active_operation_id":saved["active_reconcile_operation_id"],"target":journal.target_identity(),"confirmed_identity":access.as_ref().map(|access| access.identity())})
             );
         }
         _ => return Err("unsupported acceptance operation".into()),
