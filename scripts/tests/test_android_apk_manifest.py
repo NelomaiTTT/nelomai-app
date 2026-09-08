@@ -10,11 +10,23 @@ class ApkManifestTest(unittest.TestCase):
         self.assertTrue(callable(getattr(check, 'verify_classes', None)), 'explicit acceptance-only DEX gate is missing')
         latest = {'ru.nelomai.client.MainActivity', 'ru.nelomai.client.RuntimeAuthBrokerService',
             'ru.nelomai.client.RuntimeVpnDispatcherService', 'ru.nelomai.client.LatestRuntimeActivity',
-            'ru.nelomai.tunnel.LatestRuntimeVpnEngineV1'}
+            'ru.nelomai.tunnel.LatestRuntimeVpnEngineV1',
+            'ru.nelomai.tunnel.LatestRuntimeQuickActionsV1', 'ru.nelomai.tunnel.LatestRuntimeStorageV1',
+            'ru.nelomai.tunnel.LatestRuntimeNativeBridgeV1', 'ru.nelomai.client.RuntimeNativeCallbacks',
+            'ru.nelomai.client.RuntimeNativeHost', 'ru.nelomai.client.RuntimeEntrypoint'}
         stable = {'ru.nelomai.runtime.stable.LatestRuntimeActivity', 'ru.nelomai.runtime.stable.RuntimeEntrypoint',
-            'ru.nelomai.runtime.stable.tunnel.LatestRuntimeVpnEngineV1'}
+            'ru.nelomai.runtime.stable.tunnel.LatestRuntimeVpnEngineV1',
+            'ru.nelomai.runtime.stable.tunnel.LatestRuntimeQuickActionsV1',
+            'ru.nelomai.runtime.stable.tunnel.LatestRuntimeStorageV1',
+            'ru.nelomai.runtime.stable.tunnel.LatestRuntimeNativeBridgeV1'}
         check.verify_classes(latest)
         check.verify_classes(latest | stable, acceptance=True)
+        for name in latest:
+            with self.subTest(missing=name), self.assertRaisesRegex(ValueError, name):
+                check.verify_classes(latest - {name})
+        for name in stable:
+            with self.subTest(missing=name), self.assertRaisesRegex(ValueError, name):
+                check.verify_classes((latest | stable) - {name}, acceptance=True)
         with self.assertRaisesRegex(ValueError, 'latest-only'):
             check.verify_classes(latest | stable)
         with self.assertRaisesRegex(ValueError, 'stable'):

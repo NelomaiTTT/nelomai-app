@@ -58,14 +58,20 @@ def verify_manifest(xml, acceptance=False):
 def verify_classes(classes, acceptance=False):
     required = {'ru.nelomai.client.MainActivity', 'ru.nelomai.client.RuntimeAuthBrokerService',
         'ru.nelomai.client.RuntimeVpnDispatcherService', 'ru.nelomai.client.LatestRuntimeActivity',
-        'ru.nelomai.tunnel.LatestRuntimeVpnEngineV1'}
+        'ru.nelomai.tunnel.LatestRuntimeVpnEngineV1',
+        'ru.nelomai.tunnel.LatestRuntimeQuickActionsV1', 'ru.nelomai.tunnel.LatestRuntimeStorageV1',
+        'ru.nelomai.tunnel.LatestRuntimeNativeBridgeV1', 'ru.nelomai.client.RuntimeNativeCallbacks',
+        'ru.nelomai.client.RuntimeNativeHost', 'ru.nelomai.client.RuntimeEntrypoint'}
     if not required <= classes:
-        raise ValueError('APK omits compiled dispatcher/runtime classes')
+        raise ValueError('APK omits compiled dispatcher/runtime classes: ' + ', '.join(sorted(required - classes)))
     stable = {'ru.nelomai.runtime.stable.LatestRuntimeActivity', 'ru.nelomai.runtime.stable.RuntimeEntrypoint',
-        'ru.nelomai.runtime.stable.tunnel.LatestRuntimeVpnEngineV1'}
+        'ru.nelomai.runtime.stable.tunnel.LatestRuntimeVpnEngineV1',
+        'ru.nelomai.runtime.stable.tunnel.LatestRuntimeQuickActionsV1',
+        'ru.nelomai.runtime.stable.tunnel.LatestRuntimeStorageV1',
+        'ru.nelomai.runtime.stable.tunnel.LatestRuntimeNativeBridgeV1'}
     if acceptance:
         if not stable <= classes:
-            raise ValueError('acceptance APK omits compiled stable entrypoints')
+            raise ValueError('acceptance APK omits compiled stable entrypoints: ' + ', '.join(sorted(stable - classes)))
     elif any(name.startswith('ru.nelomai.runtime.stable.') for name in classes):
         raise ValueError('0.2.16 container must be latest-only')
 

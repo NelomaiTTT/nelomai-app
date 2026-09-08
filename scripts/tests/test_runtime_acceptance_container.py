@@ -105,11 +105,11 @@ class AcceptanceContainerTest(ArtifactFixture):
         executable = extracted / "runtime/engines/stable/0.2.16/nelomai-runtime"
         original = executable.read_bytes()
         executable.write_bytes(b"rewritten after final signing")
-        with self.assertRaisesRegex(ValueError, "packaged"):
+        with self.assertRaisesRegex(ValueError, "packaged runtime bytes changed: engines/stable/0.2.16/nelomai-runtime"):
             builder.verify_packaged_tree(self.root / "extracted", self.root / "staged", self.public, "linux", "x86_64")
         executable.write_bytes(original)
         executable.chmod(0o644)
-        with self.assertRaisesRegex(ValueError, "packaged"):
+        with self.assertRaisesRegex(ValueError, "packaged runtime mode changed: engines/stable/0.2.16/nelomai-runtime.*0755.*0644"):
             builder.verify_packaged_tree(self.root / "extracted", self.root / "staged", self.public, "linux", "x86_64")
         executable.chmod(0o755)
         (extracted / "runtime/unindexed").write_bytes(b"unexpected")

@@ -178,11 +178,13 @@ def verify_packaged_tree(extracted, staged, public_key, platform, architecture):
     expected_files = {path.relative_to(expected).as_posix() for path in expected.rglob("*") if not path.is_dir()}
     if actual_files != expected_files or any(path.is_symlink() for path in runtime.rglob("*")):
         raise ValueError("packaged runtime file set differs from staged signed inputs")
-    for name in expected_files:
-        if (verifier.digest(runtime / name) != verifier.digest(expected / name)
-                or (platform != "windows" and (runtime / name).stat().st_mode & 0o777
-                    != (expected / name).stat().st_mode & 0o777)):
-            raise ValueError("packaged runtime bytes or executable modes changed")
+    for name in sorted(expected_files):
+        if verifier.digest(runtime / name) != verifier.digest(expected / name):
+            raise ValueError(f"packaged runtime bytes changed: {name}")
+        actual_mode = (runtime / name).stat().st_mode & 0o777
+        expected_mode = (expected / name).stat().st_mode & 0o777
+        if platform != "windows" and actual_mode != expected_mode:
+            raise ValueError(f"packaged runtime mode changed: {name}: expected {expected_mode:04o}, actual {actual_mode:04o}")
     manifest = verifier.authenticated("container", runtime / "container-manifest-v1.json",
         runtime / "container-manifest-v1.sig", public_key, platform, architecture)
     for slot in manifest["slots"]:
