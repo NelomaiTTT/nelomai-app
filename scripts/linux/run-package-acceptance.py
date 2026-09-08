@@ -131,7 +131,8 @@ def inside():
     helper = resources / "dispatcher/1/nelomai-unix-service"
     # The real production installation API, but in a disposable root-owned
     # namespace only. No sudo/pkexec/host installer is invoked.
-    installed = run(helper, "install-layout", resources, common, acceptance_uid, capture_output=True, text=True).stdout.strip()
+    installed = run(helper, "install-layout", resources / "runtime", common, acceptance_uid,
+                    capture_output=True, text=True).stdout.strip()
     dispatcher = subprocess.Popen([installed, "--dispatcher"])
     xvfb = subprocess.Popen(["Xvfb", ":99", "-screen", "0", "1280x800x24", "-nolisten", "tcp"])
     environment = {**os.environ, "DISPLAY": ":99", "NO_AT_BRIDGE": "0", "GTK_MODULES": "gail:atk-bridge"}
