@@ -212,7 +212,6 @@ fn fresh_adapter_replays_protected_target_after_each_owner_write_crash() {
             _ => unreachable!(),
         };
         assert!(adapter.save(&projection).is_err());
-        drop(adapter);
         let fresh = RuntimeStorageSession::new(&auth, &runtime, &journal, &staging);
         let recovered = fresh.load().unwrap().unwrap();
         if owner == "staging" && !after {
@@ -370,7 +369,6 @@ fn stale_staging_cannot_rollback_later_broker_enrollment_or_epoch() {
             *runtime_raw.1.lock().unwrap() = Some(false);
         }
         assert!(adapter.save(&old).is_err());
-        drop(adapter);
         let mut newer = auth.load().unwrap().unwrap();
         newer.auth_epoch = 10;
         newer.session_generation = Some(99);
