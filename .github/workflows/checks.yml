@@ -1,12 +1,58 @@
 name: checks
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
 
 jobs:
+  linux-package-diagnostic:
+    if: github.event_name == 'workflow_dispatch'
+    name: Linux packaging diagnostic (not a release)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # Retained signed test inputs; the current common wrapper is under test.
+      # No output of this job may be promoted as a release candidate.
+      SOURCE_SHA: 69737c97ca189a88a0ced2282226c0b2cdb78299
+      NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: ${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: ./.github/actions/release-native-host
+        with:
+          platform: linux
+          target: x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-runtime
+          path: signed
+          run-id: 34226937045
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: draft-linux
+          path: draft
+          run-id: 34226937045
+          github-token: ${{ github.token }}
+      - name: Test exact payload preservation with current Linux packager
+        shell: bash
+        run: |
+          python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUNNER_TEMP/runtime-public.raw"
+          root_digest=$(sha256sum signed/release/nelomai-runtime-0.2.16-release-set.manifest.json | cut -d ' ' -f 1)
+          python scripts/package-release-platform.py --mode build_only --source-sha "$SOURCE_SHA" \
+            --release-set-sha256 "$root_digest" --platform linux --architecture x86_64 \
+            --signed signed --draft draft/linux --public-key "$RUNNER_TEMP/runtime-public.raw" \
+            --output packages/linux
+          echo 'Packaging regression passed; not release or physical acceptance evidence.'
   frontend:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,6 +64,7 @@ jobs:
       - run: npm test
 
   rust:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +81,7 @@ jobs:
       - run: cargo test --workspace
 
   android-plugin:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +179,7 @@ jobs:
             testDebugUnitTest
 
   windows:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -144,6 +193,7 @@ jobs:
       - run: cargo test -p nelomai-windows-service
 
   macos:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -156,6 +206,7 @@ jobs:
       - run: cargo test -p nelomai-unix-service
 
   contracts-python:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
