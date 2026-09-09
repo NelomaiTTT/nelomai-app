@@ -77,6 +77,44 @@ impl Fixture {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
+fn macos_admits_product_named_runtime_and_rejects_modified_bytes() {
+    for name in ["Nelomai", "Nelomai.app/Contents/MacOS/Nelomai"] {
+        let fixture = Fixture::new();
+        assert!(
+            fixture.open(RuntimeSlot::Latest).is_ok(),
+            "legacy runtime remains supported"
+        );
+        let resources = fixture.executable().parent().unwrap().to_path_buf();
+        let executable = resources.join(name);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::rename(fixture.executable(), &executable).unwrap();
+        let manifest = fixture.root.path().join("container-manifest-v1.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        value["slots"][0]["manifest"]["files"][0]["path"] = name.into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let signed = [CONTAINER_MANIFEST_SIGNATURE_DOMAIN, bytes.as_slice()].concat();
+        fs::write(&manifest, bytes).unwrap();
+        fs::write(
+            fixture.root.path().join("container-manifest-v1.sig"),
+            fixture.key.sign(&signed).to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.open(RuntimeSlot::Latest).unwrap().executable(),
+            executable
+        );
+        assert_eq!(
+            fixture.open(RuntimeSlot::Latest).unwrap().resource_root(),
+            resources
+        );
+        fs::write(executable, b"modified runtime!!").unwrap();
+        assert!(fixture.open(RuntimeSlot::Latest).is_err());
+    }
+}
+
+#[test]
 fn actual_spawn_verifies_kernel_path_and_does_not_inherit_secrets_or_unrelated_fds() {
     use std::os::unix::process::CommandExt;
     use std::{io::Read, process::Command};

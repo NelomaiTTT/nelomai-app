@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import stat
@@ -208,18 +209,27 @@ class DesktopPackageTest(unittest.TestCase):
         self.assertEqual(runtime.read_bytes(), original)
         manifest = json.loads((self.root / "output/runtime-manifest-v1.json").read_bytes())
         with zipfile.ZipFile(self.root / "output/runtime.zip") as archive:
+            self.assertIn("Nelomai.app/Contents/MacOS/Nelomai", archive.namelist())
+            info = plistlib.loads(archive.read("Nelomai.app/Contents/Info.plist"))
+            self.assertEqual(info["CFBundleExecutable"], "Nelomai")
+            self.assertEqual(info["CFBundleIconFile"], "icon.icns")
+            self.assertIn("Nelomai.app/Contents/Resources/icon.icns", archive.namelist())
+            self.assertNotIn("nelomai-runtime", archive.namelist())
+            extracted_bundle = self.root / "extracted"
+            archive.extractall(extracted_bundle)
             for item in manifest["files"]:
                 value = archive.read(item["path"])
                 self.assertEqual(hashlib.sha256(value).hexdigest(), item["sha256"])
                 if item["role"] == "executable":
-                    extracted = self.root / ("signed-" + Path(item["path"]).name)
-                    extracted.write_bytes(value)
+                    extracted = extracted_bundle / item["path"]
                     subprocess.run(["/usr/bin/codesign", "--verify", "--strict", str(extracted)],
                                    check=True, capture_output=True)
                     detail = subprocess.run(["/usr/bin/codesign", "-dv", str(extracted)],
                                             check=True, capture_output=True, text=True)
                     self.assertIn("Signature=adhoc", detail.stderr)
                     self.assertNotEqual(value, original)
+            subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict",
+                            str(extracted_bundle / "Nelomai.app")], check=True, capture_output=True)
         again = self.run_package("repeat-mac", platform="macos", architecture="aarch64")
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual((self.root / "output/runtime.zip").read_bytes(),

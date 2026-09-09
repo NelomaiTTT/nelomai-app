@@ -1,5 +1,8 @@
 {
   "bundle": {
+    "macOS": {
+      "infoPlist": "Info.macos.plist"
+    },
     "resources": {
       "platform-runtime/desktop-bundle/runtime/": "runtime/",
       "platform-runtime/desktop-bundle/dispatcher/1/nelomai-unix-service": "dispatcher/1/nelomai-unix-service",

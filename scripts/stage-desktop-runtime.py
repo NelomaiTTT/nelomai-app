@@ -67,6 +67,10 @@ def stage(artifact,output,signing_key):
                 path.chmod(0o755 if item['role']=='executable' else 0o644)
         service='nelomai-windows-service.exe' if manifest['platform']=='windows' else 'nelomai-unix-service'
         runtime='nelomai-runtime.exe' if manifest['platform']=='windows' else 'nelomai-runtime'
+        if manifest['platform']=='macos':
+            candidates=entries.keys() & {'nelomai-runtime','Nelomai','Nelomai.app/Contents/MacOS/Nelomai'}
+            if len(candidates)!=1:raise ValueError('missing or ambiguous macOS runtime executable')
+            runtime=candidates.pop()
         for name in (service,runtime):
             if name not in entries or entries[name]['role']!='executable':raise ValueError('runtime executable missing')
         dispatcher=staged/'dispatcher/1'/service;dispatcher.parent.mkdir(parents=True)

@@ -196,12 +196,21 @@ impl CommonState {
             return;
         }
         if restart {
-            #[cfg(unix)]
+            #[cfg(target_os = "macos")]
+            {
+                if crate::macos_launch::restart_after_exit(Path::new(
+                    "/Library/Application Support/Nelomai/common/Nelomai.app",
+                ))
+                .is_ok()
+                {
+                    app.exit(0);
+                } else {
+                    self.finishing.store(false, Ordering::Release);
+                }
+            }
+            #[cfg(target_os = "linux")]
             {
                 use std::os::unix::process::CommandExt;
-                #[cfg(target_os="macos")]
-                let mut command=std::process::Command::new("/Library/Application Support/Nelomai/common/Nelomai.app/Contents/MacOS/nelomai-app");
-                #[cfg(target_os = "linux")]
                 let mut command = {
                     let mut command = std::process::Command::new(
                         "/usr/local/libexec/nelomai/common/AppDir/AppRun",
@@ -402,8 +411,6 @@ pub fn run() {
                 app.manage(state.clone());
                 startup::stage("common.tray");
                 desktop::setup_tray(app)?;
-                #[cfg(target_os = "macos")]
-                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn_blocking(move || serve_native(handle, state, native));
                 Ok(())
@@ -416,6 +423,15 @@ pub fn run() {
         .build(context)
         .inspect_err(|error| startup::error("common.build", error))
         .expect("common desktop startup failed");
+    #[cfg(target_os = "macos")]
+    let app = {
+        let mut app = app;
+        // App::set_activation_policy configures the event loop's initial policy.
+        // In setup the loop has already launched, so the common host kept a
+        // second Dock tile. Set it before run; only the runtime owns a window.
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        app
+    };
     startup::stage("common.event_loop");
     app.run(|app, event| {
         #[cfg(target_os = "macos")]
@@ -435,11 +451,15 @@ pub fn run() {
 
 fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: NativeStream) {
     use nelomai_client_container::desktop::{read_native_frame, write_native_frame};
+    #[cfg(target_os = "macos")]
+    let mut storage_opened = false;
     loop {
         let Ok((tag, body)) = read_native_frame(&mut stream) else {
             break;
         };
         let mut exit = None;
+        #[cfg(target_os = "macos")]
+        let mut storage_endpoint = None;
         let reply = if tag == 1 {
             tauri::async_runtime::block_on(engine_exchange(&state, &body))
         } else if tag == 2 {
@@ -447,6 +467,31 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
                 .map_err(io::Error::from)
                 .and_then(|request| {
                     let reply = match request {
+                        #[cfg(target_os = "macos")]
+                        NativeControl::OpenStorage => {
+                            use nelomai_client_storage::ProtectedRecordFactory;
+                            if storage_opened {
+                                return Err(io::Error::other("storage already opened"));
+                            }
+                            let selection = tauri::async_runtime::block_on(state.host.selection())
+                                .map_err(|_| io::Error::other("storage selection unavailable"))?;
+                            let paths = selection
+                                .runtime_paths()
+                                .map_err(|_| io::Error::other("storage selection invalid"))?;
+                            let records =
+                                nelomai_client_storage::SystemRecordFactory::new("primary", None);
+                            let records: Vec<_> = paths
+                                .iter()
+                                .map(|path| records.record(path.namespace()))
+                                .collect();
+                            let (server, client) = std::os::unix::net::UnixStream::pair()?;
+                            std::thread::Builder::new()
+                                .name("runtime-storage".into())
+                                .spawn(move || crate::macos_storage::serve(server, records))?;
+                            storage_endpoint = Some(client);
+                            storage_opened = true;
+                            NativeReply::Done
+                        }
                         NativeControl::Prepare => {
                             let operation =
                                 tauri::async_runtime::block_on(state.stop.operation.lock());
@@ -543,6 +588,12 @@ fn serve_native(app: tauri::AppHandle, state: Arc<CommonState>, mut stream: Nati
         };
         if write_native_frame(&mut stream, response_tag, &response).is_err() {
             break;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(endpoint) = storage_endpoint {
+            if crate::macos_storage::send_endpoint(&mut stream, &endpoint).is_err() {
+                break;
+            }
         }
         if let Some(restart) = exit {
             tauri::async_runtime::block_on(state.finish(app, restart));
@@ -751,7 +802,6 @@ fn pre_auth_handoff() -> io::Result<bool> {
     }
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::process::CommandExt;
         let source = executable
             .parent()
             .and_then(Path::parent)
@@ -802,7 +852,8 @@ fn pre_auth_handoff() -> io::Result<bool> {
             return Err(io::Error::other("installed common broker required"));
         }
         verify_layout(&installed.join("Contents/Resources/runtime"))?;
-        Err(std::process::Command::new(installed_exe).exec())
+        crate::macos_launch::launch_application(installed)?;
+        Ok(true)
     }
     #[cfg(target_os = "linux")]
     {

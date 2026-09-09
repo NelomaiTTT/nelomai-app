@@ -11,8 +11,14 @@ pub mod container;
 #[cfg(desktop)]
 mod desktop;
 mod diagnostics;
+#[cfg(target_os = "macos")]
+mod macos_identity;
+#[cfg(target_os = "macos")]
+mod macos_launch;
 #[cfg(any(target_os = "macos", test))]
 mod macos_power;
+#[cfg(target_os = "macos")]
+mod macos_storage;
 #[cfg(desktop)]
 mod network_incidents;
 #[cfg(target_os = "android")]
@@ -33,9 +39,9 @@ use nelomai_client_application::{ApplicationError, ClientApplication};
 #[cfg(test)]
 use nelomai_client_container::AuthBroker;
 use nelomai_client_core::CoreLocalStop;
-use nelomai_client_storage::{
-    ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner, SystemSecretStore,
-};
+#[cfg(target_os = "android")]
+use nelomai_client_storage::SystemSecretStore;
+use nelomai_client_storage::{ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "android")]
@@ -52,9 +58,14 @@ const CONNECTION_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(desktop)]
 const AUTOMATIC_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+#[cfg(target_os = "macos")]
+type RuntimeRecordBackend = macos_storage::RemoteRecord;
+#[cfg(not(target_os = "macos"))]
+type RuntimeRecordBackend = nelomai_client_storage::SystemSecretStore;
+
 type NativeApplication = ClientApplication<
     ClientApi,
-    RuntimeOperationalStore<ProtectedRuntimeStore<SystemSecretStore>>,
+    RuntimeOperationalStore<ProtectedRuntimeStore<RuntimeRecordBackend>>,
     platform::PlatformTunnelController,
     diagnostics::AppDiagnostics,
 >;
@@ -283,6 +294,10 @@ pub(crate) fn run_product(
 
     app.run(|_app, _event| {
         #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Ready = _event {
+            macos_identity::install_icon(objc2::MainThreadMarker::new().expect("app main thread"));
+        }
+        #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = _event {
             desktop::show_window(_app);
         }
@@ -290,7 +305,55 @@ pub(crate) fn run_product(
 }
 
 pub(crate) fn app_context() -> tauri::Context<tauri::Wry> {
-    tauri::generate_context!()
+    let context = tauri::generate_context!();
+    #[cfg(windows)]
+    {
+        // NSIS uses this identifier for shortcuts. Both common and runtime must
+        // register it before Tauri creates windows, regardless of executable path.
+        let app_id: Vec<u16> = context
+            .config()
+            .identifier
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let result = unsafe {
+            windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr())
+        };
+        if result < 0 {
+            // Shell grouping is noncritical: never block VPN startup on its failure.
+            nelomai_client_container::startup_diagnostics::error(
+                "windows.taskbar_identity",
+                &std::io::Error::other(format!("AppUserModelID registration failed: {result:#x}")),
+            );
+        }
+    }
+    context
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn app_context_registers_taskbar_identity_matching_installer_shortcuts() {
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree, UI::Shell::GetCurrentProcessExplicitAppUserModelID,
+    };
+    // Both common and runtime consume this context before Tauri creates windows.
+    // Reading the native process property catches a missing registration, not
+    // merely a changed string constant or a config-to-config comparison.
+    let context = app_context();
+    let mut value = std::ptr::null_mut();
+    let result = unsafe { GetCurrentProcessExplicitAppUserModelID(&mut value) };
+    assert_eq!(result, 0, "the process has no explicit taskbar identity");
+    assert!(!value.is_null());
+    let actual = unsafe {
+        let mut len = 0;
+        while *value.add(len) != 0 {
+            len += 1;
+        }
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(value, len));
+        CoTaskMemFree(value.cast());
+        result
+    };
+    assert_eq!(actual, context.config().identifier);
 }
 
 #[cfg(desktop)]

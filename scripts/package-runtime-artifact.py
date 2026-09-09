@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import plistlib
 from pathlib import Path
 import re
 import shutil
@@ -110,6 +111,11 @@ def validate_payload(payload, platform, architecture):
     if platform == "linux":
         scripts.add("resolvconf")
     elif platform == "macos":
+        candidates = paths.keys() & {"nelomai-runtime", "Nelomai", "Nelomai.app/Contents/MacOS/Nelomai"}
+        if len(candidates) != 1:
+            raise ValueError("missing or ambiguous macOS runtime executable")
+        binaries.remove("nelomai-runtime")
+        binaries.update(candidates)
         binaries.add("wireguard-go")
         licenses.add("WIREGUARD-GO-LICENSE.txt")
     else:
@@ -167,13 +173,28 @@ def package(payload, output, version, source_commit, platform, architecture, sig
         final_payload = Path(temporary) / "payload"
         final_payload.mkdir()
         for name, source in files:
-            destination = final_payload / name
+            final_name = "Nelomai.app/Contents/MacOS/Nelomai" if platform == "macos" and name in ("nelomai-runtime", "Nelomai") else name
+            destination = final_payload / final_name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, destination)
             destination.chmod(0o755 if file_role(name, source) == "executable" else 0o644)
         files = validate_payload(final_payload, platform, architecture)
         if platform == "macos":
+            bundle = final_payload / "Nelomai.app"
+            assets = Path(__file__).resolve().parents[1] / "src-tauri"
+            info = plistlib.loads((assets / "Info.runtime.macos.plist").read_bytes())
+            info.update(CFBundleVersion=version, CFBundleShortVersionString=version)
+            (bundle / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+            (bundle / "Contents/Resources").mkdir(exist_ok=True)
+            shutil.copyfile(assets / "icons/icon.icns", bundle / "Contents/Resources/icon.icns")
             sign_macos(files, version)
+            # Seal the UI bundle before computing the immutable manifest. Stable
+            # artifacts are staged byte-for-byte and never re-signed here.
+            subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none",
+                            str(bundle)], check=True, capture_output=True)
+            subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(bundle)],
+                           check=True, capture_output=True)
+            files = validate_payload(final_payload, platform, architecture)
         staged = Path(temporary) / "ready"
         staged.mkdir()
         index = []

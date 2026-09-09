@@ -22,6 +22,8 @@ type NativeStream = nelomai_client_container::desktop::NativeStream;
 #[cfg(windows)]
 type AuthStream = nelomai_client_container::ipc::windows::PrivatePipeIo;
 static NATIVE: OnceLock<Arc<NativeClient>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static STORAGE: OnceLock<Arc<crate::macos_storage::StorageClient>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -46,6 +48,8 @@ pub(crate) enum NativeExitReason {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeControl {
+    #[cfg(target_os = "macos")]
+    OpenStorage,
     Prepare,
     Poll {
         presentation: TraySnapshot,
@@ -249,8 +253,34 @@ pub fn run() {
         })?;
         let bootstrap: RuntimeBootstrapV1 = serde_json::from_slice(&bytes)?;
         bootstrap.runtime_paths()?;
+        let native = Arc::new(NativeClient::new(native_stream)?);
+        #[cfg(target_os = "macos")]
+        {
+            use nelomai_client_container::desktop::{read_native_frame, write_native_frame};
+            let mut guard = native
+                .stream
+                .lock()
+                .map_err(|_| io::Error::other("native unavailable"))?;
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| io::Error::other("native unavailable"))?;
+            write_native_frame(stream, 2, &serde_json::to_vec(&NativeControl::OpenStorage)?)?;
+            let (tag, reply) = read_native_frame(stream)?;
+            if tag != 2
+                || !matches!(
+                    serde_json::from_slice::<NativeReply>(&reply)?,
+                    NativeReply::Done
+                )
+            {
+                return Err(io::Error::other("common storage unavailable").into());
+            }
+            let storage = crate::macos_storage::receive_endpoint(stream)?;
+            STORAGE
+                .set(Arc::new(crate::macos_storage::StorageClient::new(storage)?))
+                .map_err(|_| io::Error::other("duplicate runtime storage"))?;
+        }
         NATIVE
-            .set(Arc::new(NativeClient::new(native_stream)?))
+            .set(native)
             .map_err(|_| io::Error::other("duplicate runtime bootstrap"))?;
         Ok((auth, bootstrap))
     })();
@@ -263,6 +293,7 @@ fn setup_desktop(
     auth: AuthStream,
     bootstrap: RuntimeBootstrapV1,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(target_os = "macos"))]
     use nelomai_client_storage::ProtectedRecordFactory;
     let paths = bootstrap.runtime_paths()?;
     let selected = paths
@@ -275,14 +306,28 @@ fn setup_desktop(
         .clone();
     #[cfg(target_os = "linux")]
     let fallback = Some(bootstrap.data_root.join("credentials"));
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let fallback = None;
+    #[cfg(not(target_os = "macos"))]
     let records = nelomai_client_storage::SystemRecordFactory::new("primary", fallback);
+    #[cfg(target_os = "macos")]
+    let indexes: std::collections::HashMap<_, _> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.namespace().to_owned(), index as u8))
+        .collect();
     let open = |path: nelomai_client_storage::RuntimePaths| {
-        RuntimeRecordOwner::new(ProtectedRuntimeStore::new(
-            records.record(path.namespace()),
-            path,
-        ))
+        #[cfg(target_os = "macos")]
+        let backend = crate::macos_storage::RemoteRecord::new(
+            STORAGE
+                .get()
+                .expect("private storage established before product startup")
+                .clone(),
+            indexes[path.namespace()],
+        );
+        #[cfg(not(target_os = "macos"))]
+        let backend = records.record(path.namespace());
+        RuntimeRecordOwner::new(ProtectedRuntimeStore::new(backend, path))
     };
     let retained = paths
         .into_iter()

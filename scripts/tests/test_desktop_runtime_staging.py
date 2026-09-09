@@ -54,4 +54,45 @@ class RuntimeStagingTest(unittest.TestCase):
         self.assertNotEqual(self.run_stage().returncode,0)
         self.assertFalse((self.root/'bundle').exists())
 
+    def macos_fixture(self, ambiguous=False, runtime='Nelomai'):
+        manifest=json.loads(self.raw);manifest['platform']='macos';manifest['architecture']='aarch64'
+        with zipfile.ZipFile(self.artifact/'runtime.zip') as archive:
+            files=[(item,archive.read(item.filename)) for item in archive.infolist()]
+        with zipfile.ZipFile(self.artifact/'runtime.zip','w') as archive:
+            for info,data in files:
+                if info.filename=='nelomai-runtime':
+                    if ambiguous:archive.writestr(info,data)
+                    info.filename=runtime
+                archive.writestr(info,data)
+        original=manifest['files'][0]
+        if ambiguous:manifest['files'].append(dict(original))
+        original['path']=runtime
+        raw=json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()
+        (self.artifact/'runtime-manifest-v1.json').write_bytes(raw)
+        (self.artifact/'runtime-manifest-v1.sig').write_bytes(self.key.sign(b'nelomai-runtime-manifest-v1\0'+raw))
+
+    def test_macos_product_named_runtime_is_staged_with_signed_bytes_and_execute_mode(self):
+        self.macos_fixture()
+        result=self.run_stage();self.assertEqual(result.returncode,0,result.stderr)
+        executable=self.root/'bundle/runtime/engines/latest/0.2.16/Nelomai'
+        self.assertEqual(executable.read_bytes(),b'signed executable fixture')
+        self.assertEqual(executable.stat().st_mode&0o777,0o755)
+        self.assertFalse(executable.with_name('nelomai-runtime').exists())
+
+    def test_macos_ambiguous_runtime_names_are_rejected(self):
+        self.macos_fixture(ambiguous=True)
+        self.assertNotEqual(self.run_stage().returncode,0)
+        self.assertFalse((self.root/'bundle').exists())
+
+    def test_macos_bundle_runtime_is_staged_without_rewriting_signed_bytes(self):
+        runtime='Nelomai.app/Contents/MacOS/Nelomai'
+        self.macos_fixture(runtime=runtime)
+        result=self.run_stage();self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((self.root/'bundle/runtime/engines/latest/0.2.16'/runtime).read_bytes(),
+                         b'signed executable fixture')
+
+    def test_macos_bundle_and_legacy_executable_are_rejected_together(self):
+        self.macos_fixture(ambiguous=True,runtime='Nelomai.app/Contents/MacOS/Nelomai')
+        self.assertNotEqual(self.run_stage().returncode,0)
+
 if __name__=='__main__':unittest.main()

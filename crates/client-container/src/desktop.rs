@@ -117,6 +117,7 @@ impl RuntimeExitOwner {
 pub struct VerifiedRuntime {
     root: PathBuf,
     executable: PathBuf,
+    resource_root: PathBuf,
     manifest: VerifiedContainerManifest,
     slot: RuntimeSlot,
     owner: u32,
@@ -151,6 +152,18 @@ impl VerifiedRuntime {
         let runtime = manifest.selected(slot).ok_or_else(blocked)?;
         let name = if runtime.platform == "windows" {
             "nelomai-runtime.exe"
+        } else if runtime.platform == "macos" {
+            let mut candidates = runtime.files.iter().filter(|entry| {
+                matches!(
+                    entry.path.as_str(),
+                    "nelomai-runtime" | "Nelomai" | "Nelomai.app/Contents/MacOS/Nelomai"
+                )
+            });
+            let name = candidates.next().ok_or_else(blocked)?.path.as_str();
+            if candidates.next().is_some() {
+                return Err(blocked());
+            }
+            name
         } else {
             "nelomai-runtime"
         };
@@ -161,17 +174,18 @@ impl VerifiedRuntime {
         {
             return Err(blocked());
         }
-        let executable = root
+        let resource_root = root
             .join("engines")
             .join(match slot {
                 RuntimeSlot::Latest => "latest",
                 RuntimeSlot::Stable => "stable",
             })
-            .join(&runtime.runtime_version)
-            .join(name);
+            .join(&runtime.runtime_version);
+        let executable = resource_root.join(name);
         let verified = Self {
             root: root.into(),
             executable,
+            resource_root,
             manifest,
             slot,
             owner,
@@ -186,9 +200,7 @@ impl VerifiedRuntime {
         &self.manifest.manifest().container_version
     }
     pub fn resource_root(&self) -> &Path {
-        self.executable
-            .parent()
-            .expect("verified executable parent")
+        &self.resource_root
     }
     pub(crate) fn reverify(&self) -> io::Result<()> {
         trusted(&self.root, self.owner)?;

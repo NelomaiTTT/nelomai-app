@@ -284,12 +284,8 @@ mod tests {
 
     #[test]
     fn preferences_default_and_persist_independently() {
-        let directory = std::env::temp_dir().join(format!(
-            "nelomai-preferences-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let path = directory.join("preferences.json");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
         let store = AppPreferenceStore::new(&path);
         assert!(store.get().close_to_tray);
         assert_eq!(store.get().dns_provider, DnsProvider::Auto);
@@ -302,19 +298,12 @@ mod tests {
 
         store.set_close_to_tray(true).unwrap();
         assert_eq!(store.get().dns_provider, DnsProvider::Quad9);
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn legacy_preferences_default_to_automatic_dns() {
-        let directory = std::env::temp_dir().join(format!(
-            "nelomai-legacy-preferences-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("preferences.json");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
         fs::write(&path, br#"{"close_to_tray":false}"#).unwrap();
 
         let restored = AppPreferenceStore::new(&path).get();
@@ -329,17 +318,12 @@ mod tests {
             restored.dynamic_tic_egress_mode,
             nelomai_contracts::EgressMode::Ipv4
         );
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn personal_and_dynamic_tic_egress_modes_persist_independently() {
-        let directory = std::env::temp_dir().join(format!(
-            "nelomai-egress-preferences-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let path = directory.join("preferences.json");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
         let store = AppPreferenceStore::new(&path);
 
         store
@@ -372,8 +356,6 @@ mod tests {
             restored.dynamic_tic_egress_mode,
             nelomai_contracts::EgressMode::PreferIpv6
         );
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
