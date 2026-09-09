@@ -288,6 +288,16 @@ impl<S: RuntimeStateStore> RuntimeAdmission for RuntimeCacheAdmission<S> {
         }
         let matches = match (&receipt.source.identity, &snapshot.auth_scope) {
             (None, None) => snapshot.cleanup_only,
+            (None, Some(_)) => {
+                // Only the selected namespace receives a legacy receipt. The
+                // owner has confirmed logout and stopped the local tunnel under
+                // writer quiescence. Recover an empty orphan binding, never
+                // erase another scope's leases, pending work or split state.
+                return self
+                    .owner
+                    .complete_empty_logout(&snapshot)
+                    .map_err(|_| CoreError::AuthRecoveryRequired);
+            }
             (Some(identity), Some(scope)) => {
                 &scope.identity == identity
                     && scope.auth_epoch == receipt.source.auth_epoch

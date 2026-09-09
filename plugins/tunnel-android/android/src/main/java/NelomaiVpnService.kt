@@ -193,6 +193,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         cancel = restoreHandler::removeCallbacks,
     )
     private var restoreRetryAttempt = 0
+    @Volatile private var lastHandledStartId = 0
     private lateinit var recoveryStore: AndroidRecoveryStore
     private var redundantVpnOwner: RedundantVpnProcessOwner? = null
     private val restoreRetry = Runnable { connectionIntentLifecycle.onRetryTimer() }
@@ -208,6 +209,12 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     private val logoutRetry = Runnable { scheduleLogoutAttempt() }
     private val unreadableRecoveryRetry = Runnable { retryUnreadableRecoveryStore() }
     private var unreadableRecoveryRetryAttempt = 0
+
+    override fun onTunnelDown() {
+        // WG and AWG share this backend. DOWN only closes the transport: the
+        // owner must finish durable cleanup and publish state before stopSelf.
+        // Explicit owner stops and Android's onRevoke retain their semantics.
+    }
 
     override fun getBuilder(): VpnService.Builder =
         runtimeHost.builder { builder ->
@@ -294,6 +301,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastHandledStartId = startId
         idleStopDebouncer.cancel()
         if (intent == null || intent.action in FOREGROUND_ACTIONS) {
             promoteToForeground()
@@ -345,8 +353,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             intent == null && hasPendingBackgroundLogout() -> scheduleLogoutAttempt()
             intent == null -> {
                 TunnelLog.info("service.idle_restart_stopped")
-                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf(startId)
+                finishService(startId)
                 return START_NOT_STICKY
             }
         }
@@ -976,8 +983,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             try {
                 val store = AndroidBackgroundCredentialStores.open(applicationContext)
                 val ownerOperation = NativeOwnerOperation.fromJson(JSONObject(requireNotNull(intent.getStringExtra(EXTRA_OWNER_OPERATION))))
-                val current = store.read().credentialOrThrow()
-                store.beginOwnerOperation(current.revision, ownerOperation, true).credentialOrThrow()
+                admitBackgroundRecovery(store, ownerOperation)
                 val recovered = store.withOwnerOperation(ownerOperation) {
                 val credential = backgroundCredentialForSessionRecovery(store) { envelope ->
                     provisionBackgroundCredential(
@@ -1769,8 +1775,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         runCatching {
             ContextCompat.startForegroundService(
                 applicationContext,
-                ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(applicationContext)
-                    .setAction(ACTION_ENSURE_RUNNING),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(applicationContext)
+                        .setAction(ACTION_ENSURE_RUNNING)),
             )
         }.onFailure { error ->
             TunnelLog.warning("service.recovery_owner_request_failed", error = error)
@@ -1955,6 +1962,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
     private fun stopIfIdle() {
         if (!serviceCallbackGate.isOpen()) return
+        val startId = lastHandledStartId
         applyAndroidVpnServiceIdleLifecycle(
             debouncer = idleStopDebouncer,
             shouldStop = {
@@ -1966,10 +1974,24 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 )
             },
             stop = {
-                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                finishService(startId)
             },
         )
+    }
+
+    private fun finishService(startId: Int = lastHandledStartId) {
+        val finish = Runnable {
+            if (startId <= 0 || startId != lastHandledStartId) return@Runnable
+            // AMS may already have accepted a new foreground start that has not
+            // reached onStartCommand (or is waiting for runtime selection).
+            // Unconditional stopSelf would kill it before startForeground and
+            // Android would crash this process. Let AMS fence the handled ID.
+            if (systemServiceHost.stopSelfResult(startId)) {
+                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            }
+        }
+        // Keep foreground removal serialized with command delivery/promotion.
+        if (Looper.myLooper() == mainLooper) finish.run() else restoreHandler.post(finish)
     }
 
     private fun completeBackgroundAction(
@@ -2186,7 +2208,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             }
             ContextCompat.startForegroundService(
                 context,
-                ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_ENSURE_RUNNING),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_ENSURE_RUNNING)),
             )
             return serviceReady
         }
@@ -2194,15 +2217,13 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         fun requestToggle(context: Context) {
             ContextCompat.startForegroundService(
                 context,
-                ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_QUICK_TOGGLE),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_QUICK_TOGGLE)),
             )
         }
 
         fun stopForegroundService() {
-            activeService?.run {
-                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
+            activeService?.finishService()
         }
 
         fun reportDataPlaneStall(leaseId: String): Boolean =
@@ -2772,7 +2793,8 @@ internal class AndroidLogoutCoordinator(
         } catch (_: Throwable) {
             return AndroidLogoutStep.RETRY
         }
-        if (accepted.code != "device_revoked_cleanup_accepted") {
+        if (accepted.code != "device_revoked_cleanup_accepted" &&
+            !(accepted.code == "background_logout_superseded" && accepted.cleanupJobs == 0)) {
             return AndroidLogoutStep.RETRY
         }
         return when (credentialStore.finalizeLogout(envelope.revision, logout.operationId)) {

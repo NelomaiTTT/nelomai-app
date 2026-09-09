@@ -391,7 +391,7 @@ internal class BackgroundCredentialStore(
             val finalizedClean = current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED &&
                 current.installSecret == null && current.active == null && current.previous == null &&
                 current.pending == null && current.reservation == null && current.cleanupCredential == null &&
-                current.ownerScope?.let { operation.scope.authEpoch > it.authEpoch } == true
+                (current.ownerScope == null || operation.scope.authEpoch > current.ownerScope.authEpoch)
             if (current.ownerScope != operation.scope &&
                 (requireExistingScope || (!finalizedClean && (current.ownerScope != null || hasCredentials)))
             ) throw MutationFailure("background_owner_scope_mismatch")

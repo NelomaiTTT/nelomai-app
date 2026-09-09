@@ -53,8 +53,25 @@ class RuntimeNativeCallbacks(private val context: RuntimeAuthBrokerService) {
         await { bridge().prepareRevocation(context, cancelEpoch, it) }
         return true
     }
-    fun background(action: String, request: String): String =
-        ru.nelomai.runtime.v1.RuntimeNativeBackgroundReplyV1.await { bridge().background(context, action, request, it) }
+    fun background(action: String, request: String): String {
+        require(action in setOf("provision", "recover", "status"))
+        return try {
+            ru.nelomai.runtime.v1.RuntimeNativeBackgroundReplyV1.await { result ->
+                bridge().background(context, action, request, object : RuntimeNativeResultV1 {
+                    override fun success(value: String) = result.success(value)
+                    override fun failure(code: String) {
+                        // Only bounded machine codes, never callback payloads or exceptions' messages.
+                        val safeCode = code.takeIf { it.matches(Regex("[a-z_]{1,80}")) } ?: "unknown"
+                        android.util.Log.w("NelomaiOwner", "background.$action.failed code=$safeCode")
+                        result.failure(code)
+                    }
+                })
+            }
+        } catch (error: Exception) {
+            android.util.Log.w("NelomaiOwner", "background.$action.exception class=${error.javaClass.simpleName}")
+            throw error
+        }
+    }
 
     fun stopVpn(force: Boolean): Boolean {
         val manager = context.getSystemService(ActivityManager::class.java)

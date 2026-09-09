@@ -9,6 +9,31 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Default)]
 struct Raw(Arc<Mutex<Option<Vec<u8>>>>);
+
+#[test]
+fn protected_runtime_roundtrips_fractional_probe_latency() {
+    let paths = RuntimePaths::new("/synthetic", RuntimeSlot::Latest, "0.2.16").unwrap();
+    let store = ProtectedRuntimeStore::new(Raw::default(), paths.clone());
+    for latency in [253.17218699999998, 265.922552]
+        .into_iter()
+        .chain((1..1000).map(|n| n as f64 / 37.0))
+    {
+        let mut json = serde_json::to_value(RuntimeStateV1::empty(&paths, false)).unwrap();
+        json["pending_start"] = serde_json::json!({
+            "operation_id":"synthetic", "layer":"tic", "tic_connection_mode":"dynamic",
+            "route_mode":"standalone", "egress_mode":"ipv4", "allow_alternate":true,
+            "probes":[{"candidate_id":"synthetic", "latency_ms":latency, "measured_at":"2026-09-09T00:00:00Z"}]
+        });
+        let state: RuntimeStateV1 = serde_json::from_value(json).unwrap();
+        store.save(&state).unwrap();
+        assert_eq!(
+            store
+                .load()
+                .unwrap_or_else(|error| panic!("latency {latency}: {error}")),
+            Some(state)
+        );
+    }
+}
 impl ProtectedRecordStore for Raw {
     fn load_record(&self) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(self.0.lock().unwrap().clone())

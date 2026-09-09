@@ -374,6 +374,7 @@ impl TunnelController for MemoryTunnel {
 }
 
 struct MockApi {
+    stop_response_override: Mutex<Option<Connection>>,
     transport_resets: AtomicUsize,
     refresh_calls: AtomicUsize,
     start_calls: AtomicUsize,
@@ -422,6 +423,7 @@ struct MockApi {
 impl MockApi {
     fn new(start_failures: usize) -> Self {
         Self {
+            stop_response_override: Mutex::new(None),
             transport_resets: AtomicUsize::new(0),
             refresh_calls: AtomicUsize::new(0),
             start_calls: AtomicUsize::new(0),
@@ -655,6 +657,13 @@ impl CoreApi for MockApi {
             .unwrap()
             .last()
             .map(|start| start.tic_connection_mode);
+        if let Some(connection) = self.stop_response_override.lock().unwrap().clone() {
+            return Ok(ConnectionOperationResponse {
+                api_version: ApiVersion::V1,
+                request_id: "req-stop".into(),
+                connection,
+            });
+        }
         let fixed_personal = !self.pinned_start.load(Ordering::SeqCst)
             && last_start_mode == Some(TicConnectionMode::Personal);
         let dynamic_handshake_failure = request.failure_code.as_deref()
@@ -2955,6 +2964,180 @@ async fn a_different_start_intent_cannot_replace_an_unresolved_operation() {
             .operation_id,
         "unresolved-operation"
     );
+}
+
+fn pending_explicit_start() -> StoredPendingStart {
+    StoredPendingStart {
+        operation_id: "old-stray-start".to_string(),
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        allow_alternate: false,
+        probes: Vec::new(),
+        recovery_contract_version: None,
+        request_fingerprint: None,
+        cancel_operation_id: None,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_retry_requires_confirmed_cleanup_of_the_exact_lease() {
+    for (lease_id, status) in [
+        ("old-stray-start", LeaseStatus::Connected),
+        ("other-lease", LeaseStatus::Released),
+    ] {
+        let api = Arc::new(MockApi::new(0));
+        *api.stop_response_override.lock().unwrap() = Some(Connection {
+            status,
+            ..connection(lease_id)
+        });
+        let mut stored = auth();
+        stored.pending_start = Some(pending_explicit_start());
+        let store = Arc::new(MemoryStore::new(stored));
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        );
+        let new_options = ConnectOptions {
+            layer: Layer::Tic,
+            route_mode: RouteMode::ViaTak,
+            ..options()
+        };
+        let epoch = core.begin_start_attempt();
+        assert!(core
+            .prepare_explicit_start(&new_options, epoch)
+            .await
+            .is_err());
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .pending_start
+                .unwrap()
+                .operation_id,
+            "old-stray-start"
+        );
+        assert_eq!(
+            api.start_requests.lock().unwrap().len(),
+            1,
+            "only exact old replay is allowed"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_retry_finishes_old_intent_before_starting_new_route() {
+    let api = Arc::new(MockApi::new(0));
+    let mut stored = auth();
+    stored.pending_start = Some(pending_explicit_start());
+    let store = Arc::new(MemoryStore::new(stored));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let new_options = ConnectOptions {
+        layer: Layer::Tic,
+        route_mode: RouteMode::ViaTak,
+        ..options()
+    };
+    let epoch = core.begin_start_attempt();
+
+    core.prepare_explicit_start(&new_options, epoch)
+        .await
+        .unwrap();
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+    core.start_with_cancellation_epoch(new_options, 1_700_000_000, epoch)
+        .await
+        .unwrap();
+    core.finish_start_attempt();
+
+    let requests = api.start_requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].operation_id, "old-stray-start");
+    assert_eq!(requests[0].layer, Layer::Stray);
+    assert_ne!(requests[1].operation_id, "old-stray-start");
+    assert_eq!(requests[1].layer, Layer::Tic);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_retry_preserves_failed_cleanup_and_reuses_its_stop_id() {
+    let api = Arc::new(MockApi::new(0));
+    api.stop_failures.store(1, Ordering::SeqCst);
+    let mut stored = auth();
+    let mut pending = pending_explicit_start();
+    pending.cancel_operation_id = Some("existing-stop-id".into());
+    stored.pending_start = Some(pending.clone());
+    let store = Arc::new(MemoryStore::new(stored));
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    let epoch = core.begin_start_attempt();
+    assert!(core
+        .prepare_explicit_start(&options(), epoch)
+        .await
+        .is_err());
+    assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+    core.prepare_explicit_start(&options(), epoch)
+        .await
+        .unwrap();
+    assert!(store.load().unwrap().unwrap().pending_start.is_none());
+    assert_eq!(
+        *api.stop_operation_ids.lock().unwrap(),
+        vec!["existing-stop-id", "existing-stop-id"]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn explicit_retry_does_not_touch_a_running_tunnel_or_matching_replay() {
+    for running in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        let mut stored = auth();
+        stored.pending_start = Some(pending_explicit_start());
+        let store = Arc::new(MemoryStore::new(stored));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        if running {
+            *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        }
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        let requested = if running {
+            ConnectOptions {
+                layer: Layer::Tic,
+                route_mode: RouteMode::ViaTak,
+                ..options()
+            }
+        } else {
+            options()
+        };
+        let epoch = core.begin_start_attempt();
+        let result = core.prepare_explicit_start(&requested, epoch).await;
+        assert_eq!(result.is_err(), running);
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load().unwrap().unwrap().pending_start,
+            Some(pending_explicit_start())
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -6,6 +6,15 @@ import ru.nelomai.runtime.v1.RuntimeVpnHostV1
 
 /** Fixed ABI mapping, resolved only after the common owner admitted selection. */
 object RuntimeAdapters {
+    /** Both activities live in :runtime. Consume the Binder endpoint locally:
+     * Android explicitly rejects file descriptors in startActivity intents. */
+    fun prepareActivity(selected: RuntimeSelectionV1, intent: android.content.Intent) {
+        val entrypoint = Class.forName(activity(selected).substringBeforeLast('.') + ".RuntimeEntrypoint")
+        entrypoint.getMethod("attachFromIntent", android.content.Intent::class.java)
+            .invoke(entrypoint.getField("INSTANCE").get(null), intent)
+        check(!intent.hasFileDescriptors()) { "runtime_endpoint_not_consumed" }
+    }
+
     private fun tunnelPackage(selected: RuntimeSelectionV1): String = when (selected.slot) {
         "latest" -> "ru.nelomai.tunnel"
         "stable" -> "ru.nelomai.runtime.stable.tunnel"

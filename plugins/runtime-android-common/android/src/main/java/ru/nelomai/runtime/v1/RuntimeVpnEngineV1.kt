@@ -44,5 +44,7 @@ interface RuntimeVpnHostV1 {
 /** The name is container-owned and cannot be supplied by a runtime command. */
 object RuntimeServiceIntents {
     const val VPN_COMPONENT = "ru.nelomai.client.RuntimeVpnDispatcherService"
+    const val EXTRA_FOREGROUND_START = "ru.nelomai.runtime.v1.FOREGROUND_START"
+    @JvmStatic fun foreground(intent: Intent): Intent = intent.putExtra(EXTRA_FOREGROUND_START, true)
     @JvmStatic fun vpn(context: Context): Intent = Intent().setClassName(context.packageName, VPN_COMPONENT)
 }

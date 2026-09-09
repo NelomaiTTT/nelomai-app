@@ -898,6 +898,31 @@ class BackgroundConnectionClientTest {
     }
 
     @Test
+    fun logoutSupersededIsExplicitAndCannotClaimCleanupWork() {
+        for ((code, jobs, valid) in listOf(
+            Triple("background_logout_superseded", 0, true),
+            Triple("background_logout_superseded", 1, false),
+            Triple("unknown_logout_result", 0, false),
+        )) {
+            val transport = RecordingBackgroundTransport(JSONObject().apply {
+                put("code", code)
+                put("cleanup_jobs", jobs)
+            })
+            try {
+                val result = BackgroundOperationClient(transport).finalizeLogout(
+                    credential(), DEVICE_ID, 4, LOGOUT_ID, INSTALL_SECRET,
+                )
+                assertTrue(valid)
+                assertEquals("background_logout_superseded", result.code)
+                assertEquals(0, result.cleanupJobs)
+            } catch (error: BackgroundConnectionException) {
+                if (valid) throw error
+                assertEquals("invalid_background_response", error.code)
+            }
+        }
+    }
+
+    @Test
     fun reconcileAndLogoutFinalizePreserveImmutableSignature() {
         val transport = RecordingBackgroundTransport(
             JSONObject().apply {

@@ -927,3 +927,26 @@ fn canonical(value: &Value) -> Vec<u8> {
     write(value, &mut bytes);
     bytes
 }
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn reads_existing_fractional_payload_without_rewriting_or_skipping_checksum() {
+        // Literal bytes in the existing envelope format; digest independently
+        // calculated over {"latency_ms":253.17218699999998}.
+        let bytes = br#"{"checksum":"fd2b15340dbdb4be6d809c82a97fcf985ebd834b386ec9a3b67adcf3233f5814","namespace":"synthetic","payload":{"latency_ms":253.17218699999998},"schema_version":1}"#;
+        #[derive(Deserialize)]
+        struct Probe {
+            latency_ms: f64,
+        }
+        let probe: Probe = decode_record(bytes, "synthetic").unwrap();
+        assert_eq!(probe.latency_ms, 253.17218699999998);
+        assert!(decode_record::<Probe>(bytes, "other").is_err());
+        let altered = String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .replace("253.17218699999998", "254.17218699999998");
+        assert!(decode_record::<Probe>(altered.as_bytes(), "synthetic").is_err());
+    }
+}

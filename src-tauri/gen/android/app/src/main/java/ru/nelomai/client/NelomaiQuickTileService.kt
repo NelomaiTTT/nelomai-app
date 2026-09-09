@@ -20,6 +20,7 @@ class NelomaiQuickTileService : TileService() {
     }
 
     private fun dispatchOrOpen() {
+        android.util.Log.i("NelomaiTile", "toggle.requested")
         qsTile?.apply {
             state = Tile.STATE_UNAVAILABLE
             updateTile()
@@ -49,6 +50,7 @@ class NelomaiQuickTileService : TileService() {
                 "starting", "stopping" -> Tile.STATE_UNAVAILABLE
                 else -> Tile.STATE_INACTIVE
             }
+            android.util.Log.i("NelomaiTile", "state.updated engine=$engineState tile=$state")
             updateTile()
         } }
     }

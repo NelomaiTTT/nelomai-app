@@ -96,6 +96,7 @@ async fn actual_reply_adapter_clears_only_known_refusal_ticket_and_permits_refre
     for (code, unknown, access_expired) in [
         ("invalid_background_token", false, false),
         ("background_credential_unavailable", false, false),
+        ("background_recovery_not_issued", false, false),
         ("app_access_unavailable", false, true),
         ("native_outcome_unknown", true, false),
     ] {

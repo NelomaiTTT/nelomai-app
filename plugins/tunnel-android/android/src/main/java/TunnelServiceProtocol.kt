@@ -600,7 +600,8 @@ internal object TunnelServiceClient {
     ) {
         try {
             if (foreground) {
-                ContextCompat.startForegroundService(context.applicationContext, intent)
+                ContextCompat.startForegroundService(context.applicationContext,
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(intent))
             } else {
                 context.applicationContext.startService(intent)
             }

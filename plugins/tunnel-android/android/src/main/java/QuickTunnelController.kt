@@ -140,6 +140,13 @@ object QuickTunnelController {
                 TunnelLog.warning("quick_state.broadcast_failed", "broadcast_failed", error)
             }
         }
+        if (saved) {
+            // All writers (including client stop and stale completions) must wake
+            // SystemUI after persistence. The UI-change flag is not tile delivery.
+            runCatching { TunnelPlugin.refreshQuickTile(context) }.onFailure { error ->
+                TunnelLog.warning("quick_state.tile_refresh_failed", error = error)
+            }
+        }
         // The encrypted intent is authoritative. Once it matches the requested value,
         // a best-effort display-state failure must not turn an accepted action into a
         // reported rejection that the service could later restore unexpectedly.

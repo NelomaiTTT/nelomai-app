@@ -3713,6 +3713,29 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun supersededLogoutCompletesLocallyOnlyOnExplicitAcknowledgement() {
+        for (code in listOf("background_logout_superseded", "unknown_logout_result")) {
+            val credentials = configuredCredentialStore()
+            val logout = AndroidLogoutCoordinator(credentials, coordinator(recoveryStore(ServiceRecoveryBackend())))
+            logout.begin()
+            val step = logout.runOnce(ServicePanelFake(), ServiceRuntimeFake(),
+                activate = { _, _, _ -> error("no staged activation") },
+                finalize = { _, _, _, _, _ -> BackgroundLogoutFinalizeResult(code, 0) })
+            val after = credentials.read().credentialSuccess()
+            if (code == "background_logout_superseded") {
+                assertEquals(AndroidLogoutStep.COMPLETE, step)
+                assertEquals(BackgroundLogoutPhase.FINALIZED, after.logoutState?.phase)
+                assertNull(after.cleanupCredential)
+                assertNull(after.installSecret)
+            } else {
+                assertEquals(AndroidLogoutStep.RETRY, step)
+                assertEquals(BackgroundLogoutPhase.PENDING, after.logoutState?.phase)
+                assertTrue(after.cleanupCredential != null)
+            }
+        }
+    }
+
+    @Test
     fun offlineLogoutPersistsCancellationAndCleanupOnlyCredentialBeforeNetwork() {
         val recovery = recoveryStore(ServiceRecoveryBackend())
         val connection = coordinator(recovery)

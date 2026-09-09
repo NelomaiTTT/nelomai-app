@@ -29,6 +29,18 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct TunnelAndroid<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> TunnelAndroid<R> {
+    async fn run_mobile_plugin_async<T: DeserializeOwned + 'static>(
+        &self,
+        command: &'static str,
+        payload: impl serde::Serialize + Send + 'static,
+    ) -> std::result::Result<T, tauri::plugin::mobile::PluginInvokeError> {
+        let handle = self.0.clone();
+        crate::reply_guard::await_plugin_reply(async move {
+            handle.run_mobile_plugin_async(command, payload).await
+        })
+        .await
+    }
+
     pub fn probe(&self) -> crate::Result<ProbeResponse> {
         self.0
             .run_mobile_plugin("probe", ProbeRequest::default())
@@ -72,15 +84,13 @@ impl<R: Runtime> TunnelAndroid<R> {
         &self,
         request: StartFailureDiagnosticsRequest,
     ) -> crate::Result<()> {
-        self.0
-            .run_mobile_plugin_async::<()>("queueStartFailureDiagnostics", request)
+        self.run_mobile_plugin_async::<()>("queueStartFailureDiagnostics", request)
             .await
             .map_err(Into::into)
     }
 
     pub async fn update_quick_dns_async(&self, request: DnsServersRequest) -> crate::Result<()> {
-        self.0
-            .run_mobile_plugin_async::<()>("updateQuickDns", request)
+        self.run_mobile_plugin_async::<()>("updateQuickDns", request)
             .await
             .map_err(Into::into)
     }
@@ -110,8 +120,7 @@ impl<R: Runtime> TunnelAndroid<R> {
         &self,
         request: BackgroundUiProvisionRequest,
     ) -> crate::Result<()> {
-        self.0
-            .run_mobile_plugin_async::<()>("provisionBackground", request)
+        self.run_mobile_plugin_async::<()>("provisionBackground", request)
             .await
             .map_err(Into::into)
     }
@@ -119,8 +128,7 @@ impl<R: Runtime> TunnelAndroid<R> {
     pub async fn background_credential_status_async(
         &self,
     ) -> crate::Result<BackgroundCredentialStatusResponse> {
-        self.0
-            .run_mobile_plugin_async("backgroundCredentialStatus", EmptyRequest {})
+        self.run_mobile_plugin_async("backgroundCredentialStatus", EmptyRequest {})
             .await
             .map_err(Into::into)
     }
@@ -146,8 +154,7 @@ impl<R: Runtime> TunnelAndroid<R> {
         &self,
         request: BeginConnectionIntentRequest,
     ) -> crate::Result<ConnectionIntentStatusResponse> {
-        self.0
-            .run_mobile_plugin_async("beginConnectionIntent", request)
+        self.run_mobile_plugin_async("beginConnectionIntent", request)
             .await
             .map_err(Into::into)
     }
@@ -197,8 +204,7 @@ impl<R: Runtime> TunnelAndroid<R> {
         &self,
         request: BackgroundOwnerLogoutRequest,
     ) -> crate::Result<BackgroundLogoutOwnershipResponse> {
-        self.0
-            .run_mobile_plugin_async("beginBackgroundLogout", request)
+        self.run_mobile_plugin_async("beginBackgroundLogout", request)
             .await
             .map_err(Into::into)
     }
@@ -207,8 +213,7 @@ impl<R: Runtime> TunnelAndroid<R> {
         &self,
         request: BackgroundSessionRecoveryRequest,
     ) -> crate::Result<BackgroundSessionRecoveryResponse> {
-        self.0
-            .run_mobile_plugin_async("recoverBackgroundSession", request)
+        self.run_mobile_plugin_async("recoverBackgroundSession", request)
             .await
             .map_err(Into::into)
     }
@@ -249,15 +254,14 @@ impl<R: Runtime> TunnelAndroid<R> {
     }
 
     pub async fn stop_tunnel_async(&self) -> crate::Result<TunnelOperationResponse> {
-        self.0
-            .run_mobile_plugin_async(
-                "stopTunnel",
-                StopTunnelRequest {
-                    api_version: TUNNEL_API_VERSION,
-                },
-            )
-            .await
-            .map_err(Into::into)
+        self.run_mobile_plugin_async(
+            "stopTunnel",
+            StopTunnelRequest {
+                api_version: TUNNEL_API_VERSION,
+            },
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub fn tunnel_status(&self) -> crate::Result<TunnelOperationResponse> {
@@ -272,39 +276,36 @@ impl<R: Runtime> TunnelAndroid<R> {
     }
 
     pub async fn tunnel_status_async(&self) -> crate::Result<TunnelOperationResponse> {
-        self.0
-            .run_mobile_plugin_async(
-                "tunnelStatus",
-                TunnelStatusRequest {
-                    api_version: TUNNEL_API_VERSION,
-                },
-            )
-            .await
-            .map_err(Into::into)
+        self.run_mobile_plugin_async(
+            "tunnelStatus",
+            TunnelStatusRequest {
+                api_version: TUNNEL_API_VERSION,
+            },
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn tunnel_metrics_async(&self, probe: bool) -> crate::Result<TunnelMetricsResponse> {
-        self.0
-            .run_mobile_plugin_async(
-                "tunnelMetrics",
-                TunnelMetricsRequest {
-                    api_version: TUNNEL_API_VERSION,
-                    probe,
-                },
-            )
-            .await
-            .map_err(Into::into)
+        self.run_mobile_plugin_async(
+            "tunnelMetrics",
+            TunnelMetricsRequest {
+                api_version: TUNNEL_API_VERSION,
+                probe,
+            },
+        )
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn tunnel_rebind_udp_async(&self) -> crate::Result<TunnelOperationResponse> {
-        self.0
-            .run_mobile_plugin_async(
-                "tunnelRebindUdp",
-                TunnelStatusRequest {
-                    api_version: TUNNEL_API_VERSION,
-                },
-            )
-            .await
-            .map_err(Into::into)
+        self.run_mobile_plugin_async(
+            "tunnelRebindUdp",
+            TunnelStatusRequest {
+                api_version: TUNNEL_API_VERSION,
+            },
+        )
+        .await
+        .map_err(Into::into)
     }
 }

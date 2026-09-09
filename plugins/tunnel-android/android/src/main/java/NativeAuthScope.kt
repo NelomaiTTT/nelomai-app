@@ -3,6 +3,16 @@ package ru.nelomai.tunnel
 import org.json.JSONObject
 import java.util.UUID
 
+/** A refusal here precedes all recovery HTTP. Never use this category for a
+ * cancellation observed after dispatch: that outcome may genuinely be lost. */
+internal fun admitBackgroundRecovery(store: BackgroundCredentialStore, operation: NativeOwnerOperation) {
+    val current = store.read()
+    if (current !is CredentialStoreResult.Success ||
+        store.beginOwnerOperation(current.value.revision, operation, true) !is CredentialStoreResult.Success) {
+        throw BackgroundConnectionException("background_recovery_not_issued")
+    }
+}
+
 /** Owner-issued provenance, stored inside the existing protected envelope. */
 internal data class NativeOwnerScope(
     val authEpoch: Long,

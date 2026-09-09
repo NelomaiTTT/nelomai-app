@@ -60,6 +60,14 @@ def verify_manifest(xml, acceptance=False):
     runtime = components.get('ru.nelomai.client.LatestRuntimeActivity')
     if runtime is None or runtime.get(ANDROID + 'exported') != 'false' or runtime.get(ANDROID + 'process') != ':runtime':
         raise ValueError('APK runtime Activity must be private and isolated')
+    lifecycle = components.get('androidx.startup.InitializationProvider')
+    if (lifecycle is None or lifecycle.tag != 'provider'
+            or lifecycle.get(ANDROID + 'process') != ':runtime'
+            or lifecycle.get(ANDROID + 'exported') != 'false'
+            or not any(item.get(ANDROID + 'name') == 'androidx.lifecycle.ProcessLifecycleInitializer'
+                       and item.get(ANDROID + 'value') == 'androidx.startup'
+                       for item in lifecycle.findall('meta-data'))):
+        raise ValueError('APK runtime lifecycle initializer must run in the UI process')
     stable = components.get('ru.nelomai.runtime.stable.LatestRuntimeActivity')
     if acceptance:
         if stable is None or stable.get(ANDROID + 'exported') != 'false' or stable.get(ANDROID + 'process') != ':runtime':
@@ -115,6 +123,12 @@ def main():
     args = parser.parse_args()
     xml = subprocess.run([str(args.apkanalyzer), 'manifest', 'print', str(args.apk)], check=True, capture_output=True, text=True).stdout
     verify_manifest(xml, args.acceptance)
+    # Called from Rust/JNI, invisible to R8's Java reachability analysis.
+    # Inspect the final DEX, not merely the presence of a ProGuard source rule.
+    subprocess.run([str(args.apkanalyzer), 'dex', 'code', '--class',
+                    'ru.nelomai.client.TauriActivity', '--method',
+                    'getPluginManager()Lapp/tauri/plugin/PluginManager;',
+                    str(args.apk)], check=True, capture_output=True, text=True)
     spec = importlib.util.spec_from_file_location('collisions', Path(__file__).with_name('check-runtime-collisions.py'))
     check = importlib.util.module_from_spec(spec); spec.loader.exec_module(check)
     classes = set()

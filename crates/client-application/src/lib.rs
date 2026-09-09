@@ -905,6 +905,9 @@ where
         let _lifecycle_guard = self.lifecycle_gate.lock().await;
         self.start_preflight.check_start_barrier()?;
         options = options.normalized_for_layer();
+        self.core
+            .prepare_explicit_start(&options, cancel_epoch)
+            .await?;
         options.probes = if options.layer == Layer::Tic
             && options.tic_connection_mode == TicConnectionMode::Personal
         {

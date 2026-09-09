@@ -685,6 +685,131 @@ async fn accepted_runtime_restart_survives_peer_eof_until_owner_release() {
 struct Record(Arc<Mutex<Option<Vec<u8>>>>);
 
 #[tokio::test]
+async fn legacy_logout_recovers_empty_orphan_scope_but_preserves_operational_state() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route("/api/client/v1/auth/logout-runtime", axum::routing::post(|| async {
+        axum::Json(serde_json::json!({"api_version":"1","request_id":"synthetic","code":"session_revoked_cleanup_accepted", "cleanup_reconcile_operation_id":"22222222-2222-4222-8222-222222222222"}))
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    // Reproduce the pre-provider Android lost update: owner auth is legacy,
+    // while the runtime has already durably bound a different scoped family.
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.confirmed_identity = None;
+    auth.session_generation = None;
+    let meta = auth.broker.as_mut().unwrap();
+    meta.family = "33333333-3333-4333-8333-333333333333".into();
+    meta.confirmed_device_id = Some("11111111-1111-4111-8111-111111111111".into());
+    fixture.auth.save(&auth).unwrap();
+    fixture.broker.logout().await.unwrap();
+    let receipt = fixture
+        .broker
+        .completed_runtime_logout()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(receipt.source.identity.is_none());
+    let operational = fixture.record.operational();
+    let empty = operational.load().unwrap().unwrap();
+    assert_ne!(
+        empty.auth_scope.as_ref().unwrap().family,
+        receipt.source.family
+    );
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let lease = fixture.parent.prepare(deadline).await.unwrap();
+    fixture
+        .broker
+        .stop_runtime_logout_cleanup(&receipt)
+        .await
+        .unwrap();
+    let mut nonempty = empty.clone();
+    nonempty.compatibility = Some(StoredCompatibility {
+        update_required: false,
+        observed_at_unix: 1,
+    });
+    let mut pending = empty.clone();
+    pending.pending_compensation_stop = Some(StoredPendingCompensationStop {
+        operation_id: "synthetic-stop".into(),
+        lease_id: "synthetic-lease".into(),
+        accept_warm: false,
+        failure_code: None,
+    });
+    let mut split = empty.clone();
+    split.applied_split_tunnel.last_full_sync_unix = Some(1);
+    for state in [nonempty, pending, split] {
+        operational.save(&state).unwrap();
+        fixture
+            .record
+            .split()
+            .save(&state.applied_split_tunnel)
+            .unwrap();
+        assert!(!operational.load().unwrap().unwrap().operationally_empty());
+        let before = fixture.runtime_backend.load_record().unwrap();
+        assert!(matches!(
+            fixture
+                .parent
+                .control(
+                    ControlV1::CompleteLogout {
+                        lease: lease.clone(),
+                        receipt: receipt.clone()
+                    },
+                    deadline
+                )
+                .await,
+            Err(_) | Ok(ControlAckV1::Error { .. })
+        ));
+        assert_eq!(fixture.runtime_backend.load_record().unwrap(), before);
+    }
+    operational.save(&empty).unwrap();
+    fixture
+        .record
+        .split()
+        .save(&empty.applied_split_tunnel)
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .parent
+            .control(
+                ControlV1::CompleteLogout {
+                    lease: lease.clone(),
+                    receipt
+                },
+                deadline
+            )
+            .await
+            .unwrap(),
+        ControlAckV1::Done
+    ));
+    let cleared = operational.load().unwrap().unwrap();
+    assert!(cleared.auth_scope.is_none());
+    assert!(cleared.operationally_empty());
+    fixture.child.abort(&lease);
+    fixture
+        .broker
+        .finish_runtime_logout_cleanup(
+            &fixture
+                .broker
+                .completed_runtime_logout()
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture.client.access(None).await,
+        Err(nelomai_client_core::CoreError::SignedOut)
+    ));
+    server.abort();
+}
+
+#[tokio::test]
 async fn completed_logout_clears_only_receipt_source_under_live_child_lease() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
@@ -1137,6 +1262,64 @@ async fn closed_restart_recovers_only_matching_persisted_scope_after_lost_refres
 }
 
 struct Provision(AtomicUsize, AtomicUsize);
+
+struct RefuseRecovery(bool);
+#[async_trait::async_trait]
+impl PrivateBackgroundDispatcher for RefuseRecovery {
+    async fn prepare_revocation(&self, _: u64) -> Result<(), crate::BrokerError> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        _: crate::NativeAuthRequest,
+        action: BackgroundAction,
+    ) -> Result<Option<nelomai_client_api::TokenResponse>, crate::NativeAuthFailure> {
+        assert!(matches!(action, BackgroundAction::Recover));
+        Err(if self.0 {
+            crate::NativeAuthFailure::OutcomeUnknown
+        } else {
+            crate::NativeAuthFailure::NotIssued
+        })
+    }
+}
+
+#[tokio::test]
+async fn refused_private_recovery_restores_only_known_current_admission_for_refresh_fallback() {
+    for unknown in [false, true] {
+        let fixture = Fixture::with_background(
+            ClientApi::new("http://127.0.0.1:9").unwrap(),
+            true,
+            Some(Arc::new(RefuseRecovery(unknown))),
+        );
+        let mut auth = fixture.auth.load().unwrap().unwrap();
+        auth.broker.as_mut().unwrap().confirmed_device_id = Some("synthetic-device".into());
+        fixture.auth.save(&auth).unwrap();
+        fixture
+            .parent
+            .admit_empty_current(&fixture.broker)
+            .await
+            .unwrap();
+        let original = fixture.client.access(None).await.unwrap();
+        assert!(fixture
+            .client
+            .background(BackgroundAction::Recover)
+            .await
+            .is_err());
+        let fallback = fixture.client.access(None).await;
+        if unknown {
+            assert!(fallback.is_err());
+            assert!(fixture.child.check(&transport::scope(&original)).is_err());
+        } else {
+            assert_eq!(fallback.unwrap(), original);
+            fixture.child.check(&transport::scope(&original)).unwrap();
+        }
+        assert_eq!(
+            fixture.auth.load().unwrap().unwrap().refresh_token,
+            auth.refresh_token
+        );
+    }
+}
+
 #[async_trait::async_trait]
 impl PrivateBackgroundDispatcher for Provision {
     async fn prepare_revocation(&self, _: u64) -> Result<(), crate::BrokerError> {

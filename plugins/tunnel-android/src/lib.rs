@@ -19,6 +19,8 @@ mod mobile;
 mod commands;
 mod error;
 mod models;
+#[cfg(any(mobile, test))]
+mod reply_guard;
 
 pub use error::{Error, Result};
 

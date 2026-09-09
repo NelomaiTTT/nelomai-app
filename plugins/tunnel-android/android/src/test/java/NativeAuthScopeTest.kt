@@ -8,6 +8,54 @@ import javax.net.ssl.HttpsURLConnection
 import java.security.cert.Certificate
 
 class NativeAuthScopeTest {
+    @Test fun finalizedLegacyLogoutAdmitsFreshOwnerButNotCancelledOwner() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val owner = operation(1, 5)
+        store.configure(0, BackgroundCredentialProvision(owner.scope.deviceId, "https://synthetic.invalid",
+            "old-background", 1000, "synthetic-install", 1, BackgroundCapabilitySnapshot(0, false, 1))).value()
+        store.fenceOwnerLogout(4).value()
+        var current = store.beginLogoutCurrent("legacy-logout").value().envelope
+        assertTrue(store.beginOwnerOperation(current.revision, owner, false) is CredentialStoreResult.Failure)
+        current = store.finalizeLogout(current.revision, "legacy-logout").value()
+        assertNull(current.ownerScope)
+        assertTrue(store.beginOwnerOperation(current.revision, operation(1, 4), false) is CredentialStoreResult.Failure)
+        assertTrue(store.beginOwnerOperation(current.revision, owner, true) is CredentialStoreResult.Failure)
+        val admitted = store.beginOwnerOperation(current.revision, owner, false).value()
+        assertEquals(owner.scope, admitted.ownerScope)
+        assertNull(admitted.cleanupCredential)
+    }
+
+    @Test fun rejectedRecoveryAdmissionKeepsOldLogoutAndCredentialsWithoutClaimingAnUnknownHttpOutcome() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val owner = operation()
+        store.configure(0, BackgroundCredentialProvision(owner.scope.deviceId, "https://synthetic.invalid",
+            "old-background", 1000, "synthetic-install", 1, BackgroundCapabilitySnapshot(0, false, 1))).value()
+        store.beginLogoutCurrent("old-logout").value()
+        val before = store.read().value()
+        try {
+            admitBackgroundRecovery(store, owner)
+            fail("pending legacy logout must refuse recovery before HTTP")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_recovery_not_issued", error.code)
+        }
+        assertEquals(before, store.read().value())
+        assertNotNull(before.cleanupCredential)
+        assertEquals(BackgroundLogoutPhase.PENDING, before.logoutState?.phase)
+    }
+
+    @Test fun admittedRecoveryStillRejectsExpiredCallbacksWithoutReclassifyingTheirOutcome() {
+        var now = 1000L
+        val store = BackgroundCredentialStore(MemoryBackend(), nowMillis = { now })
+        val owner = operation().copy(expiresAtUnixMs = 2000)
+        store.beginOwnerOperation(0, owner, false).value()
+        val next = operation(2).copy(expiresAtUnixMs = 2000)
+        admitBackgroundRecovery(store, next)
+        now = 2001
+        store.withOwnerOperation(next) {
+            assertEquals(CredentialStoreResult.Failure("background_owner_cancelled"), store.read())
+        }
+    }
+
     private fun operation(attempt: Long = 1, epoch: Long = 3) = NativeOwnerOperation.fromJson(JSONObject("""
         {"ticket":{"operation_id":"11111111-1111-4111-8111-111111111111","auth_epoch":$epoch,"attempt":$attempt,"family":"synthetic-family","device_id":"22222222-2222-4222-8222-222222222222","identity":{"slot":"stable","container_version":"0.2.16","runtime_version":"0.2.15","runtime_contract_version":1,"session_generation":7}},"expires_at_unix_ms":9999999999999}
     """))

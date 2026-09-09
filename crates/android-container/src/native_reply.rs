@@ -32,6 +32,7 @@ pub fn decode_background_reply(
             | "invalid_background_recovery"
             | "activation_not_applied"
             | "background_recovery_unsupported"
+            | "background_recovery_not_issued"
             | "background_owner_scope_mismatch"
             | "background_credential_unavailable" => NativeAuthFailure::NotIssued,
             "app_access_unavailable" => NativeAuthFailure::AccessUnavailable,

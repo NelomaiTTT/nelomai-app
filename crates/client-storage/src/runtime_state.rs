@@ -371,6 +371,26 @@ impl<S: RuntimeStateStore> RuntimeRecordOwner<S> {
         current.complete_legacy_cleanup();
         self.backend.save(&current)
     }
+    /// Completed legacy logout may leave an orphan scope after an old storage
+    /// lost update. Under writer quiescence, forget only a truly empty binding;
+    /// no receipt for another family may discharge operational cleanup debt.
+    pub fn complete_empty_logout(
+        &self,
+        frozen: &RuntimeCleanupSnapshotV1,
+    ) -> Result<(), StorageError> {
+        let _guard = self
+            .gate
+            .lock()
+            .map_err(|_| StorageError::RecoveryRequired("runtime owner lock poisoned"))?;
+        let mut current = self.load_required()?;
+        if cleanup_snapshot(&current) != *frozen || !current.operationally_empty() {
+            return Err(StorageError::RecoveryRequired(
+                "runtime is not empty at logout",
+            ));
+        }
+        current.complete_legacy_cleanup();
+        self.backend.save(&current)
+    }
     /// Atomically clears and rebinds a same-record transition. This avoids an
     /// unrecoverable gap between destructive cleanup and target admission.
     pub fn complete_cleanup_and_bind(

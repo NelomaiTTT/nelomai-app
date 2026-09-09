@@ -1828,6 +1828,44 @@ where
         .await
     }
 
+    /// A new user request may supersede an old unresolved intent, but only
+    /// after its exact replay/reconciliation and cleanup have completed.
+    /// Automatic retries continue to use start_internal's strict replay fence.
+    pub async fn prepare_explicit_start(
+        &self,
+        options: &ConnectOptions,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<(), CoreError> {
+        let _intent_guard = self.intent_recovery_gate.lock().await;
+        let _split_guard = self.split_tunnel_gate.lock().await;
+        let _connection_guard = self.connection_gate.lock().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        let stored = self.load_runtime()?;
+        let Some(pending) = stored.pending_start.as_ref() else {
+            return Ok(());
+        };
+        let options = options.clone().normalized_for_layer();
+        if pending.cancel_operation_id.is_none() && pending_start_matches_options(pending, &options)
+        {
+            return Ok(());
+        }
+        // The UI can lag behind a tunnel started by the tile. Never retire its
+        // lease on the strength of the cached UI phase alone.
+        if self.connected_connection().await.is_some()
+            || self.tunnel.status().await? != TunnelStatus::Stopped
+        {
+            return Err(unresolved_start_operation_error());
+        }
+        self.logger.record(CoreLogEvent {
+            kind: "connection.explicit_retry_cleanup",
+            operation_id: Some(pending.operation_id.clone()),
+            request_id: None,
+            code: None,
+        });
+        self.cancel_unknown_pending_start().await?;
+        self.ensure_start_not_cancelled(cancel_epoch)
+    }
+
     #[cfg(not(target_os = "android"))]
     pub async fn connection_intent_attempt(
         &self,
@@ -3031,6 +3069,11 @@ where
         lease_id: &str,
     ) -> Result<Connection, CoreError> {
         let stop_operation_id = self.pending_cancel_operation_id(pending_operation_id)?;
+        let pending = self
+            .load_runtime()?
+            .pending_start
+            .filter(|pending| pending.operation_id == pending_operation_id)
+            .ok_or(CoreError::Storage)?;
         let response = match self
             .retry_operation(
                 access_token,
@@ -3049,6 +3092,13 @@ where
                 return Err(error);
             }
         };
+        if response.connection.lease_id != lease_id {
+            return Err(invalid_operation_reconcile_response());
+        }
+        let accept_warm = response.connection.pinned
+            || pending.layer != Layer::Tic
+            || pending.tic_connection_mode != TicConnectionMode::Personal;
+        require_compensation_stop_finished(None, accept_warm, response.connection.status)?;
         self.clear_pending_start(pending_operation_id)?;
         *self.state.lock().await = CoreState {
             phase: Phase::Ready,

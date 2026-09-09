@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the bundled GoBackend host adapter without editing vendor checkouts.
 
-Inputs are vendor HEAD plus the two tracked parent Java patches. Working-tree
+Inputs are vendor HEAD plus tracked parent Java patches. Working-tree
 vendor mutations and build caches are neither used as source nor overwritten.
 """
 import argparse
@@ -26,7 +26,9 @@ def generate(root, output):
         staged = Path(temporary)
         with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
             archive.extractall(staged, filter='data')
-        for name in ('amneziawg-android-network-telemetry.patch', 'amneziawg-android-memory-diagnostics.patch'):
+        for name in ('amneziawg-android-network-telemetry.patch',
+                     'amneziawg-android-memory-diagnostics.patch',
+                     'amneziawg-android-service-lifecycle.patch'):
             subprocess.run(['git', 'apply', str(root / 'patches' / name)], cwd=staged, check=True, capture_output=True)
         source = staged / 'tunnel/src/main/java'
         backend = source / 'org/amnezia/awg/backend/GoBackend.java'

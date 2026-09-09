@@ -34,15 +34,24 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
     override fun onCreate() {
         super.onCreate()
         selection = RuntimeSelectionStore(this)
+        handler.post(verifySelection)
+    }
+
+    private fun promoteToForeground() {
         if (Build.VERSION.SDK_INT >= 26) getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("runtime_dispatcher", "VPN", NotificationManager.IMPORTANCE_LOW))
         ServiceCompat.startForeground(this, 1701, NotificationCompat.Builder(this, "runtime_dispatcher")
             .setSmallIcon(R.drawable.ic_quick_tile).setContentTitle("Nelomai VPN").setOngoing(true).build(),
             if (Build.VERSION.SDK_INT >= 34) android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED else 0)
-        handler.post(verifySelection)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // A status/read request is not a foreground-service launch. Real FGS
+        // launches must be acknowledged before waiting for the owner Binder.
+        if (intent == null || intent.getBooleanExtra(
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_FOREGROUND_START, false)) {
+            promoteToForeground()
+        }
         selection.read { result ->
             if (destroyed) return@read
             val active = result.getOrElse { stopSelf(startId); return@read }

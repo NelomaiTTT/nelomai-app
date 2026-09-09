@@ -80,8 +80,13 @@ class ApkManifestTest(unittest.TestCase):
         broker = '<service android:name="ru.nelomai.client.RuntimeAuthBrokerService" android:exported="false"/>'
         launcher = '<activity android:name="ru.nelomai.client.MainActivity" android:exported="true"/>'
         runtime = '<activity android:name="ru.nelomai.client.LatestRuntimeActivity" android:exported="false" android:process=":runtime"/>'
-        xml = prefix + vpn + broker + launcher + runtime + '</application></manifest>'
+        lifecycle = '<provider android:name="androidx.startup.InitializationProvider" android:exported="false" android:process=":runtime"><meta-data android:name="androidx.lifecycle.ProcessLifecycleInitializer" android:value="androidx.startup"/></provider>'
+        xml = prefix + vpn + broker + launcher + runtime + lifecycle + '</application></manifest>'
         check.verify_manifest(xml)
+        for broken in ['', lifecycle.replace('android:process=":runtime"', ''),
+                       lifecycle.replace('ProcessLifecycleInitializer', 'UnknownInitializer')]:
+            with self.subTest(lifecycle=broken), self.assertRaisesRegex(ValueError, 'lifecycle'):
+                check.verify_manifest(xml.replace(lifecycle, broken))
         with self.assertRaisesRegex(ValueError, 'VPN'):
             check.verify_manifest(xml.replace('</application>', vpn.replace('RuntimeVpnDispatcherService', 'LegacyVpn') + '</application>'))
         with self.assertRaisesRegex(ValueError, 'broker'):

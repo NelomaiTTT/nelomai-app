@@ -8,7 +8,7 @@ import org.json.JSONObject
 object RuntimeNativeBackgroundReplyV1 {
     private const val MAX_REPLY_BYTES = 65536
     private val refusals = setOf("invalid_background_token", "invalid_background_recovery", "activation_not_applied",
-        "background_recovery_unsupported", "background_owner_scope_mismatch", "background_credential_unavailable", "app_access_unavailable")
+        "background_recovery_unsupported", "background_owner_scope_mismatch", "background_credential_unavailable", "background_recovery_not_issued", "app_access_unavailable")
     fun await(call: (RuntimeNativeResultV1) -> Unit): String {
         val completed = CompletableFuture<String>()
         call(object : RuntimeNativeResultV1 {

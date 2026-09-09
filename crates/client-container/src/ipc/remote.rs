@@ -696,7 +696,23 @@ impl RemoteOwner {
             }
             AuthRequestV1::AccessToken { stamp, stale } => {
                 let stamp = stamp.ok_or(PrivateError::Cancelled)?;
-                let (_, observation) = broker.observe_stamped().await.map_err(broker_error)?;
+                let (observed_stamp, observation) =
+                    broker.observe_stamped().await.map_err(broker_error)?;
+                if observation.state == BrokerAuthState::LoggedOut {
+                    // A completed logout has no token by design, not because
+                    // protected storage needs recovery. Preserve that state so
+                    // bootstrap can show sign-in without granting any access.
+                    return self.outbox.enqueue(
+                        FrameV1::new(
+                            id,
+                            MessageV1::Response(AuthResponseV1::State {
+                                stamp: observed_stamp,
+                                state: RuntimeAuthState::LoggedOut,
+                            }),
+                        ),
+                        deadline,
+                    );
+                }
                 let current = observation.access.ok_or(PrivateError::RecoveryRequired)?;
                 self.check_target(&current)?;
                 if stamp != ScopeStamp::from_access(&current) {
@@ -830,7 +846,7 @@ impl RemoteOwner {
                     .background
                     .as_ref()
                     .ok_or(PrivateError::RecoveryRequired)?;
-                let access = broker
+                let recovered = broker
                     .native_auth_until(
                         |access| {
                             if ScopeStamp::from_access(access) != stamp {
@@ -842,8 +858,36 @@ impl RemoteOwner {
                         matches!(action, BackgroundAction::Recover),
                         deadline,
                     )
-                    .await
-                    .map_err(broker_error)?;
+                    .await;
+                let access = match recovered {
+                    Ok(access) => access,
+                    Err(error) => {
+                        // A known-not-issued native refusal clears its ticket,
+                        // but Prepare also closed the child latch. Restore only
+                        // this unchanged, active scope before the caller tries
+                        // ordinary refresh. Unknown outcomes remain fenced.
+                        if matches!(error, BrokerError::RecoveryRequired) {
+                            if let Some(held) = recovery_lease.as_mut() {
+                                let current = broker.observe().await.map_err(broker_error)?;
+                                if let Some(access) = current
+                                    .access
+                                    .filter(|access| ScopeStamp::from_access(access) == stamp)
+                                {
+                                    self.commit_and_grant(
+                                        broker,
+                                        access,
+                                        held.lease.clone(),
+                                        None,
+                                        deadline,
+                                    )
+                                    .await?;
+                                    held.granted = true;
+                                }
+                            }
+                        }
+                        return Err(broker_error(error));
+                    }
+                };
                 if let Some(held) = recovery_lease.as_mut() {
                     self.commit_and_grant(broker, access, held.lease.clone(), Some(id), deadline)
                         .await?;
@@ -1231,6 +1275,10 @@ impl RuntimeAuthProvider for PrivateRuntimeAuthClient {
             .await
             .map_err(core_error)?
         {
+            AuthResponseV1::State {
+                state: RuntimeAuthState::LoggedOut,
+                ..
+            } => Err(CoreError::SignedOut),
             AuthResponseV1::Access { access, .. } => {
                 self.child.check(&scope(&access)).map_err(core_error)?;
                 Ok(access)

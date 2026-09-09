@@ -768,10 +768,12 @@ internal class BackgroundOperationClient(
         )
         return parseResponse {
             val code = payload.getString("code")
-            require(code == "device_revoked_cleanup_accepted")
+            require(code == "device_revoked_cleanup_accepted" || code == "background_logout_superseded")
             BackgroundLogoutFinalizeResult(
                 code,
-                payload.getInt("cleanup_jobs").also { require(it >= 0) },
+                payload.getInt("cleanup_jobs").also {
+                    require(it >= 0 && (code != "background_logout_superseded" || it == 0))
+                },
             )
         }
     }

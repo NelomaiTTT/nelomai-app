@@ -13,7 +13,8 @@ val prepareRuntimeHostAdapter by tasks.registering(Exec::class) {
         "--root", repositoryProjectRoot, "--output", generatedHostJava.get().asFile)
     inputs.files(repositoryProjectRoot.resolve("scripts/android/generate-vpn-host-adapter.py"),
         repositoryProjectRoot.resolve("patches/amneziawg-android-network-telemetry.patch"),
-        repositoryProjectRoot.resolve("patches/amneziawg-android-memory-diagnostics.patch"))
+        repositoryProjectRoot.resolve("patches/amneziawg-android-memory-diagnostics.patch"),
+        repositoryProjectRoot.resolve("patches/amneziawg-android-service-lifecycle.patch"))
     outputs.dir(generatedHostJava)
 }
 val applyAmneziaWgOverrides by tasks.registering(Exec::class) {
