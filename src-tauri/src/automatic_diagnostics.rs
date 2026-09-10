@@ -204,12 +204,18 @@ impl DesktopAutomaticDiagnostics {
         &self,
         seal: &PendingSeal,
         report: &DiagnosticUploadRequest,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if report.report_id.as_deref() != Some(seal.report_id.as_str()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "automatic diagnostics report id mismatch",
             ));
+        }
+        // Claim the seal before touching files. A second observer may have
+        // captured it before the first writer finished (or uploaded) the report.
+        let mut state = self.lock_state()?;
+        if state.pending_seal.as_ref() != Some(seal) {
+            return Ok(false);
         }
         let name = report_name(seal)?;
         let destination = self.pending_directory().join(&name);
@@ -217,12 +223,6 @@ impl DesktopAutomaticDiagnostics {
             write_json_atomically(&destination, report, MAX_REPORT_BYTES)?;
         }
 
-        let mut state = self.lock_state()?;
-        if state.pending_seal.as_ref() != Some(seal) {
-            return Err(io::Error::other(
-                "automatic diagnostics seal changed while materializing",
-            ));
-        }
         if seal.tunnel_running {
             let session = state
                 .session
@@ -234,7 +234,8 @@ impl DesktopAutomaticDiagnostics {
             state.session = None;
         }
         state.pending_seal = None;
-        self.save_state(&state)
+        self.save_state(&state)?;
+        Ok(true)
     }
 
     pub(crate) fn upload_candidate(&self, now: i64) -> io::Result<Option<UploadCandidate>> {
@@ -602,6 +603,76 @@ mod tests {
             network_incidents: None,
             resource_usage: None,
         }
+    }
+
+    #[test]
+    fn duplicate_materialization_is_harmless_even_after_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DesktopAutomaticDiagnostics::new(directory.path().to_path_buf()).unwrap();
+        queue.set_current_device("device-1").unwrap();
+        queue.observe(Some("session-1"), true, 10).unwrap();
+        queue.observe(None, false, 20).unwrap();
+        let seal = queue.pending_seal().unwrap().unwrap();
+        assert!(queue.materialize(&seal, &report(&seal)).unwrap());
+        assert!(!queue.materialize(&seal, &report(&seal)).unwrap());
+        let candidate = queue.upload_candidate(20).unwrap().unwrap();
+        queue.upload_succeeded(&candidate, 20).unwrap();
+        drop(candidate);
+        queue.observe(Some("session-2"), true, 30).unwrap();
+        queue.observe(None, false, 40).unwrap();
+        let next = queue.pending_seal().unwrap().unwrap();
+        assert!(!queue.materialize(&seal, &report(&seal)).unwrap());
+        assert_eq!(queue.pending_seal().unwrap(), Some(next));
+        assert!(
+            queue.upload_candidate(40).unwrap().is_none(),
+            "stale writer must not resurrect an uploaded report"
+        );
+    }
+
+    #[test]
+    fn concurrent_materializers_have_exactly_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DesktopAutomaticDiagnostics::new(directory.path().to_path_buf()).unwrap();
+        queue.set_current_device("device-1").unwrap();
+        queue.observe(Some("session-1"), true, 10).unwrap();
+        queue.observe(None, false, 20).unwrap();
+        let seal = queue.pending_seal().unwrap().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let write = || {
+                barrier.wait();
+                queue.materialize(&seal, &report(&seal)).unwrap()
+            };
+            let first = scope.spawn(write);
+            let second = scope.spawn(write);
+            assert_ne!(first.join().unwrap(), second.join().unwrap());
+        });
+        assert!(queue.pending_seal().unwrap().is_none());
+        assert_eq!(fs::read_dir(queue.pending_directory()).unwrap().count(), 1);
+        assert_eq!(
+            queue
+                .upload_candidate(20)
+                .unwrap()
+                .unwrap()
+                .report
+                .report_id,
+            Some(seal.report_id)
+        );
+    }
+
+    #[test]
+    fn materialization_write_failure_retains_seal_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DesktopAutomaticDiagnostics::new(directory.path().to_path_buf()).unwrap();
+        queue.set_current_device("device-1").unwrap();
+        queue.observe(Some("session-1"), true, 10).unwrap();
+        queue.observe(None, false, 20).unwrap();
+        let seal = queue.pending_seal().unwrap().unwrap();
+        let mut oversized = report(&seal);
+        oversized.application_log = "x".repeat(MAX_REPORT_BYTES + 1);
+        assert!(queue.materialize(&seal, &oversized).is_err());
+        assert_eq!(queue.pending_seal().unwrap(), Some(seal.clone()));
+        assert!(queue.materialize(&seal, &report(&seal)).unwrap());
     }
 
     #[test]

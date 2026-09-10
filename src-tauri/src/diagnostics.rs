@@ -773,7 +773,7 @@ impl AppDiagnostics {
         seal: &PendingSeal,
         resource_snapshot: ResourceSnapshot,
         helper_override: Option<String>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let _guard = self
             .write_gate
             .lock()
@@ -831,7 +831,9 @@ impl AppDiagnostics {
             resource_usage,
         };
         drop(_guard);
-        self.automatic.materialize(seal, &report)?;
+        if !self.automatic.materialize(seal, &report)? {
+            return Ok(false);
+        }
         if let (Some(connection_id), Some(snapshot)) = (
             seal.connection_id.as_deref(),
             network_incident_snapshot.as_ref(),
@@ -851,10 +853,28 @@ impl AppDiagnostics {
         if !seal.tunnel_running {
             self.reset_network_incident_detector();
         }
+        self.finish_automatic_resource_interval(seal, resource_snapshot)?;
+        Ok(true)
+    }
+
+    #[cfg(desktop)]
+    fn finish_automatic_resource_interval(
+        &self,
+        seal: &PendingSeal,
+        resource_snapshot: ResourceSnapshot,
+    ) -> io::Result<()> {
         let mut baseline = self
             .automatic_resource_baseline
             .lock()
             .map_err(|_| io::Error::other("automatic resource baseline lock poisoned"))?;
+        // The queue lock has already been released after saving the report.
+        // Compare and update under the baseline lock so a late completion
+        // cannot clear another session or roll back a newer checkpoint.
+        if baseline.as_ref().is_some_and(|current| {
+            current.session_id != seal.session_id || current.interval_started_at != seal.started_at
+        }) {
+            return Ok(());
+        }
         if seal.tunnel_running {
             *baseline = Some(AutomaticResourceBaseline {
                 session_id: seal.session_id.clone(),
@@ -1582,6 +1602,152 @@ mod tests {
         assert_eq!(counter_delta(None, 12), 12);
         assert_eq!(counter_delta(Some(10), 14), 4);
         assert_eq!(counter_delta(Some(10), 3), 3);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn completed_report_preserves_a_newer_resource_interval() {
+        for running in [false, true] {
+            for same_session in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let diagnostics = AppDiagnostics::new(
+                    directory.path().to_path_buf(),
+                    ResourceSnapshot::capture_for_test(),
+                )
+                .unwrap();
+                diagnostics.set_automatic_device("device-1");
+                diagnostics
+                    .observe_automatic_tunnel(Some("connection-1"), true, 10)
+                    .unwrap();
+                if running {
+                    diagnostics
+                        .observe_automatic_tunnel(Some("connection-1"), true, 21610)
+                        .unwrap();
+                } else {
+                    diagnostics
+                        .observe_automatic_tunnel(None, false, 20)
+                        .unwrap();
+                }
+                let old = diagnostics.pending_automatic_seal().unwrap().unwrap();
+                // Interleave begin(new) with the winning writer's post-save
+                // completion, not a duplicate materialize that returns false.
+                let new_session = if same_session {
+                    old.session_id.clone()
+                } else {
+                    "new-session".into()
+                };
+                let observation = AutomaticObservation {
+                    seal_pending: false,
+                    interval_started: Some(crate::automatic_diagnostics::AutomaticInterval {
+                        session_id: new_session.clone(),
+                        started_at: 30000,
+                    }),
+                };
+                diagnostics.begin_automatic_resource_interval(
+                    &observation,
+                    ResourceSnapshot::capture_for_test(),
+                );
+                diagnostics
+                    .finish_automatic_resource_interval(&old, ResourceSnapshot::capture_for_test())
+                    .unwrap();
+                let baseline = diagnostics.automatic_resource_baseline.lock().unwrap();
+                let baseline = baseline
+                    .as_ref()
+                    .expect("old completion must preserve new baseline");
+                assert_eq!(baseline.session_id, new_session);
+                assert_eq!(baseline.interval_started_at, 30000);
+            }
+        }
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn report_completion_advances_matching_or_missing_baseline_and_clears_on_stop() {
+        for missing in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let diagnostics = AppDiagnostics::new(
+                directory.path().to_path_buf(),
+                ResourceSnapshot::capture_for_test(),
+            )
+            .unwrap();
+            diagnostics.set_automatic_device("device-1");
+            let observation = diagnostics
+                .observe_automatic_tunnel(Some("connection-1"), true, 10)
+                .unwrap();
+            if !missing {
+                diagnostics.begin_automatic_resource_interval(
+                    &observation,
+                    ResourceSnapshot::capture_for_test(),
+                );
+            }
+            diagnostics
+                .observe_automatic_tunnel(Some("connection-1"), true, 21610)
+                .unwrap();
+            let checkpoint = diagnostics.pending_automatic_seal().unwrap().unwrap();
+            assert!(diagnostics
+                .materialize_automatic_report(
+                    &checkpoint,
+                    ResourceSnapshot::capture_for_test(),
+                    None
+                )
+                .unwrap());
+            {
+                let baseline = diagnostics.automatic_resource_baseline.lock().unwrap();
+                let baseline = baseline
+                    .as_ref()
+                    .expect("checkpoint must establish next baseline even after restart");
+                assert_eq!(baseline.session_id, checkpoint.session_id);
+                assert_eq!(baseline.interval_started_at, 21610);
+            }
+            diagnostics
+                .observe_automatic_tunnel(None, false, 21620)
+                .unwrap();
+            let stop = diagnostics.pending_automatic_seal().unwrap().unwrap();
+            assert!(diagnostics
+                .materialize_automatic_report(&stop, ResourceSnapshot::capture_for_test(), None)
+                .unwrap());
+            assert!(diagnostics
+                .automatic_resource_baseline
+                .lock()
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn stale_materializer_does_not_clear_new_resource_interval() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().to_path_buf(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        diagnostics.set_automatic_device("device-1");
+        diagnostics
+            .observe_automatic_tunnel(Some("connection-1"), true, 10)
+            .unwrap();
+        diagnostics
+            .observe_automatic_tunnel(None, false, 20)
+            .unwrap();
+        let old = diagnostics.pending_automatic_seal().unwrap().unwrap();
+        assert!(diagnostics
+            .materialize_automatic_report(&old, ResourceSnapshot::capture_for_test(), None)
+            .unwrap());
+        let observation = diagnostics
+            .observe_automatic_tunnel(Some("connection-2"), true, 30)
+            .unwrap();
+        diagnostics
+            .begin_automatic_resource_interval(&observation, ResourceSnapshot::capture_for_test());
+        assert!(!diagnostics
+            .materialize_automatic_report(&old, ResourceSnapshot::capture_for_test(), None)
+            .unwrap());
+        let baseline = diagnostics.automatic_resource_baseline.lock().unwrap();
+        assert_eq!(
+            baseline.as_ref().unwrap().session_id,
+            observation.interval_started.unwrap().session_id
+        );
+        assert_eq!(baseline.as_ref().unwrap().interval_started_at, 30);
     }
 
     #[cfg(desktop)]

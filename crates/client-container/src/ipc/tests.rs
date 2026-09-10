@@ -1142,6 +1142,108 @@ async fn logout_at_prepared_or_committed_ack_prevents_final_grant() {
 }
 
 struct Recover(AtomicUsize);
+#[tokio::test]
+async fn private_access_waits_for_live_refresh_without_false_recovery() {
+    for stale_request in [false, true] {
+        private_access_during_refresh(stale_request, false).await;
+    }
+}
+
+#[tokio::test]
+async fn private_access_preserves_recovery_after_failed_refresh() {
+    private_access_during_refresh(false, true).await;
+}
+
+async fn private_access_during_refresh(stale_request: bool, fail: bool) {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let incoming = entered.clone();
+    let released = release.clone();
+    let observed = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route("/api/client/v1/auth/refresh", axum::routing::post(move || {
+        let incoming = incoming.clone();
+        let released = released.clone();
+        let observed = observed.clone();
+        async move {
+            use axum::response::IntoResponse;
+            observed.fetch_add(1, Ordering::SeqCst);
+            incoming.notify_one();
+            released.notified().await;
+            if fail {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            } else {
+                axum::Json(serde_json::json!({
+                    "api_version":"1", "request_id":"synthetic", "token_type":"Bearer",
+                    "access_token":"recovered-access", "access_expires_in":900,
+                    "refresh_token":"recovered-refresh", "refresh_expires_in":3600,
+                    "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
+                    "device":{"id":"device","name":"synthetic","platform":"macos",
+                        "container_version":"0.2.16","runtime_version":"0.2.16",
+                        "runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}
+                })).into_response()
+            }
+        }
+    }));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    let mut initial = fixture.auth.load().unwrap().unwrap();
+    initial.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&initial).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let old = fixture.client.access(None).await.unwrap();
+    let client = fixture.client.clone();
+    let stale = old.clone();
+    let refresh = tokio::spawn(async move { client.access(Some(&stale)).await });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let mut waiting = Box::pin(fixture.client.access(stale_request.then_some(&old)));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err(),
+        "live refresh must be awaited, not reported as broken authorization"
+    );
+    release.notify_one();
+    let refreshed = refresh.await.unwrap();
+    let result = waiting.await;
+    if fail {
+        assert!(refreshed.is_err());
+        assert!(matches!(
+            result,
+            Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+        ));
+        assert!(fixture.client.access(None).await.is_err());
+        assert!(fixture
+            .auth
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .pending_request
+            .is_some());
+    } else {
+        let refreshed = refreshed.unwrap();
+        assert_eq!(result.unwrap(), refreshed);
+        assert_eq!(refreshed.access_token(), "recovered-access");
+        assert_eq!(refreshed.identity(), old.identity());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "never rotate the same refresh proof twice"
+    );
+    server.abort();
+}
+
 fn recovered_response() -> nelomai_client_api::TokenResponse {
     serde_json::from_value(serde_json::json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"recovered-access","access_expires_in":900,"refresh_token":"recovered-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"synthetic","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}})).unwrap()
 }

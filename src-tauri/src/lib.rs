@@ -404,25 +404,28 @@ fn start_automatic_diagnostics_scheduler(
                 Ok(Some(seal)) => {
                     let helper_log = platform::diagnostic_helper_log(&tunnel).await;
                     let resource_snapshot = resource_usage::ResourceSnapshot::capture(&app);
-                    if let Err(error) = diagnostics.materialize_automatic_report(
+                    match diagnostics.materialize_automatic_report(
                         &seal,
                         resource_snapshot,
                         helper_log,
                     ) {
-                        diagnostics.record_named(
-                            "diagnostics.automatic_report_queue_failed",
+                        Ok(true) => diagnostics.record_named(
+                            "diagnostics.automatic_report_queued",
                             Some(&seal.session_id),
-                            None,
-                            Some(&error.kind().to_string()),
-                        );
-                        continue;
+                            Some(&seal.report_id),
+                            Some(&seal.trigger),
+                        ),
+                        Ok(false) => {}
+                        Err(error) => {
+                            diagnostics.record_named(
+                                "diagnostics.automatic_report_queue_failed",
+                                Some(&seal.session_id),
+                                None,
+                                Some(&error.kind().to_string()),
+                            );
+                            continue;
+                        }
                     }
-                    diagnostics.record_named(
-                        "diagnostics.automatic_report_queued",
-                        Some(&seal.session_id),
-                        Some(&seal.report_id),
-                        Some(&seal.trigger),
-                    );
                 }
                 Ok(None) => {}
                 Err(error) => {

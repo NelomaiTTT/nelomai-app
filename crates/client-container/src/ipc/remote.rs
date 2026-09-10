@@ -696,8 +696,10 @@ impl RemoteOwner {
             }
             AuthRequestV1::AccessToken { stamp, stale } => {
                 let stamp = stamp.ok_or(PrivateError::Cancelled)?;
-                let (observed_stamp, observation) =
-                    broker.observe_stamped().await.map_err(broker_error)?;
+                let (observed_stamp, observation) = broker
+                    .observe_access_stamped()
+                    .await
+                    .map_err(broker_error)?;
                 if observation.state == BrokerAuthState::LoggedOut {
                     // A completed logout has no token by design, not because
                     // protected storage needs recovery. Preserve that state so

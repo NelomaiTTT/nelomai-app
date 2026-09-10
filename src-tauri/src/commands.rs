@@ -1401,12 +1401,13 @@ async fn queue_desktop_tunnel_stopped(app: &AppHandle) {
     let helper_log = crate::platform::diagnostic_helper_log(&tunnel).await;
     let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(app);
     match diagnostics.materialize_automatic_report(&seal, resource_snapshot, helper_log) {
-        Ok(()) => diagnostics.record_named(
+        Ok(true) => diagnostics.record_named(
             "diagnostics.automatic_report_queued",
             Some(&seal.session_id),
             Some(&seal.report_id),
             Some(&seal.trigger),
         ),
+        Ok(false) => {}
         Err(error) => diagnostics.record_named(
             "diagnostics.automatic_report_queue_failed",
             Some(&seal.session_id),

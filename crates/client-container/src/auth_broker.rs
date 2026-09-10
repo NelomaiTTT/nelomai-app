@@ -1630,6 +1630,20 @@ impl AuthBroker {
         ))
     }
 
+    /// Access callers may overlap an in-flight refresh. Observe again after
+    /// issuance completes before treating its pending ticket as lost. A failed
+    /// or restarted refresh retains its ticket and still requires recovery.
+    pub(crate) async fn observe_access_stamped(
+        &self,
+    ) -> Result<(ScopeStamp, BrokerObservation), BrokerError> {
+        let observed = self.observe_stamped().await?;
+        if observed.1.state != BrokerAuthState::RecoveryRequired {
+            return Ok(observed);
+        }
+        let _issuance = self.issuance.lock().await;
+        self.observe_stamped().await
+    }
+
     fn observed_state(auth: &AuthStoreV1) -> Result<BrokerAuthState, BrokerError> {
         let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
         if meta.authentication_outcome_unknown {
