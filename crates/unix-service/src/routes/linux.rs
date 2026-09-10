@@ -307,6 +307,20 @@ impl LinuxUserspaceRouteManager {
     }
 
     fn apply_state(&self, state: &UserspaceRouteState) -> Result<(), ServiceError> {
+        // The userspace AWG launcher creates a DOWN TUN device; configuring
+        // addresses/MTU through defguard does not activate it for routing.
+        mutate_ip(
+            &self.ip,
+            &[
+                "link".to_string(),
+                "set".to_string(),
+                "dev".to_string(),
+                state.interface_name.clone(),
+                "up".to_string(),
+            ],
+            false,
+            "interface_up_failed",
+        )?;
         for route in &state.routes {
             mutate_ip(
                 &self.ip,
@@ -869,6 +883,72 @@ mod tests {
     use defguard_wireguard_rs::{key::Key, net::IpAddrMask};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn userspace_link_is_up_before_ipv4_and_ipv6_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let ip = directory.path().join("ip");
+        let calls = directory.path().join("calls");
+        fs::write(
+            &ip,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = LinuxUserspaceRouteManager {
+            ip,
+            state_path: directory.path().join("state.json"),
+            state: None,
+        };
+        let state = UserspaceRouteState {
+            format_version: AWG_ROUTE_STATE_FORMAT,
+            interface_name: "nlm-awg0".into(),
+            default_families: vec![RouteFamily::Ipv4, RouteFamily::Ipv6],
+            routes: vec![UserspaceRoute {
+                family: RouteFamily::Ipv4,
+                destination: "192.0.2.0/24".into(),
+            }],
+        };
+        manager.apply_state(&state).unwrap();
+        let output = fs::read_to_string(calls).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "link set dev nlm-awg0 up");
+        assert!(lines.contains(&"-4 route add 192.0.2.0/24 dev nlm-awg0 proto static"));
+        assert!(lines.contains(&"-4 route add default dev nlm-awg0 table 42761"));
+        assert!(lines.contains(&"-6 route add default dev nlm-awg0 table 42761"));
+    }
+
+    #[test]
+    fn userspace_link_up_failure_aborts_routes_and_clears_saved_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let ip = directory.path().join("ip");
+        let calls = directory.path().join("calls");
+        fs::write(&ip, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n'link set dev nlm-awg0 up') exit 2;;\nesac\nexit 0\n", calls.display()
+        )).unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = directory.path().join("state.json");
+        let mut manager = LinuxUserspaceRouteManager {
+            ip,
+            state_path: state_path.clone(),
+            state: None,
+        };
+        let error = manager
+            .apply(
+                "nlm-awg0",
+                &[peer_with_allowed_ips(vec!["192.0.2.0/24".parse().unwrap()])],
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Backend(code) if code == "interface_up_failed"));
+        let output = fs::read_to_string(calls).unwrap();
+        assert!(!output.contains("route add"));
+        assert!(!output.contains("rule add"));
+        assert!(!state_path.exists());
+        assert!(!manager.has_routes());
+    }
 
     #[test]
     fn userspace_preflight_accepts_missing_fib_table_but_not_other_query_failures() {

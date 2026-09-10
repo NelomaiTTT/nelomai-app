@@ -503,6 +503,7 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "route_state_activate_failed" => "route_state_activate_failed",
         "route_state_remove_failed" => "route_state_remove_failed",
         "route_add_failed" => "route_add_failed",
+        "interface_up_failed" => "interface_up_failed",
         "route_del_failed" => "route_del_failed",
         "route_delete_failed" => "route_delete_failed",
         "route_command_failed" => "route_command_failed",
@@ -888,6 +889,10 @@ mod service_error_tests {
 
     #[test]
     fn exposes_only_allowlisted_backend_codes() {
+        assert_eq!(
+            ServiceError::Backend("interface_up_failed".to_string()).code(),
+            "interface_up_failed"
+        );
         assert_eq!(
             ServiceError::Backend("route_conflict".to_string()).code(),
             "route_conflict"
