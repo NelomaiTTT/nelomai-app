@@ -296,6 +296,18 @@ class ReleaseAuthorizationTest(ArtifactFixture):
         git("tag", "v0.2.16", base)
         with self.assertRaises(ValueError):
             gates.verify_source(repo, source, "0.2.16", base=base)
+        gates.verify_source(repo, source, "0.2.16", base=base, mode="build_only")
+        self.assertEqual(git("rev-parse", "refs/tags/v0.2.16^{}"), base)
+        for mode in ("sign_candidate", "publish_approved_candidate", "unknown"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                gates.verify_source(repo, source, "0.2.16", base=base, mode=mode)
+        tracked.write_text("uncommitted source change")
+        with self.assertRaises(ValueError):
+            gates.verify_source(repo, source, "0.2.16", base=base, mode="build_only")
+        tracked.write_text("pinned source")
+        for invalid in ("main", source[:12], "A" * 40, base):
+            with self.assertRaises(ValueError):
+                gates.verify_source(repo, invalid, "0.2.16", base=base, mode="build_only")
         git("tag", "-d", "v0.2.16")
         git("checkout", "-b", "foreign", base)
         git("commit", "--allow-empty", "-m", "foreign work")
@@ -303,6 +315,8 @@ class ReleaseAuthorizationTest(ArtifactFixture):
         git("merge", "--no-ff", "foreign", "-m", "merge")
         with self.assertRaises(ValueError):
             gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.16", base=base)
+        with self.assertRaises(ValueError):
+            gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.16", base=base, mode="build_only")
 
     def test_environment_name_without_actual_review_protection_is_rejected(self):
         gates = module("release-candidate-gates")

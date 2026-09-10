@@ -79,7 +79,7 @@ jobs:
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16 --mode "$RELEASE_MODE"
       -
         name: "Pinned AmneziaWG source"
         run: |

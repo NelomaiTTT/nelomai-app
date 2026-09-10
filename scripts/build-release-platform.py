@@ -199,7 +199,7 @@ def main():
     policy = gates.mode_policy(args.mode)
     if args.public_key.is_symlink() or args.public_key.stat().st_size != 32:
         raise ValueError("explicit regular raw compile-time public pin required")
-    gates.verify_source(ROOT, args.source_sha, "0.2.16")
+    gates.verify_source(ROOT, args.source_sha, "0.2.16", mode=args.mode)
     if (args.platform, args.architecture) not in verifier.TARGETS:
         raise ValueError("unsupported native release target")
     if args.work.exists() or args.output.exists():

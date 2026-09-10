@@ -74,7 +74,8 @@ def full_source(source):
         raise ValueError("source_sha must be full lowercase 40-hex")
 
 
-def verify_source(root, source, version, *, base=BASE):
+def verify_source(root, source, version, *, base=BASE, mode="sign_candidate"):
+    mode_policy(mode)
     full_source(source)
     if version != "0.2.16":
         raise ValueError("this maintenance workflow only builds 0.2.16")
@@ -89,7 +90,9 @@ def verify_source(root, source, version, *, base=BASE):
     if git(root, "rev-list", "--merges", base + ".." + source):
         raise ValueError("maintenance source must not contain merges")
     tag = "refs/tags/v" + version
-    if git(root, "show-ref", "--verify", "--quiet", tag, allow_missing=True) is not None:
+    # Test-key builds cannot be published and may test fixes after this tag.
+    # Release callers (including callers without an explicit mode) stay strict.
+    if mode != "build_only" and git(root, "show-ref", "--verify", "--quiet", tag, allow_missing=True) is not None:
         if git(root, "rev-parse", tag + "^{}") != source:
             raise ValueError("existing peeled tag differs from source_sha")
 
@@ -336,6 +339,7 @@ def main():
     source_parser.add_argument("--root", type=Path, default=Path.cwd())
     source_parser.add_argument("--source-sha", required=True)
     source_parser.add_argument("--version", required=True)
+    source_parser.add_argument("--mode", default="sign_candidate")
     environment_parser = commands.add_parser("environment")
     environment_parser.add_argument("--repository", required=True)
     environment_parser.add_argument("--name", required=True)
@@ -364,7 +368,7 @@ def main():
         print(json.dumps(mode_policy(args.mode)))
         return
     if args.command == "source":
-        verify_source(args.root, args.source_sha, args.version)
+        verify_source(args.root, args.source_sha, args.version, mode=args.mode)
         config = json.loads((args.root / "src-tauri/tauri.conf.json").read_bytes())
         if config["version"] != args.version:
             raise ValueError("checked-in version differs; pinned source must not be rewritten")
