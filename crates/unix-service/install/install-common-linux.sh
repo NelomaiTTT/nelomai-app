@@ -28,6 +28,9 @@ find "$APPDIR" -type l -print | while IFS= read -r link; do
 done
 chown -R root:root "$APPDIR"
 chmod -R go-w "$APPDIR"
+# linuxdeploy can package this launcher as 0770. Once root owns the AppDir,
+# the desktop user still needs to read and execute it.
+if [ -f "$APPDIR/AppRun.wrapped" ]; then chmod 0755 "$APPDIR/AppRun.wrapped"; fi
 if [ -d "$INSTALL_ROOT/AppDir/usr/lib/Nelomai/runtime" ]; then
   LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/x86_64-linux-gnu" "$COMMON" --verify-runtime-layout "$RESOURCES/runtime" "$INSTALL_ROOT/AppDir/usr/lib/Nelomai/runtime"
 else

@@ -81,6 +81,8 @@ Environment=PATH=$INSTALL_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 NoNewPrivileges=true
 ProtectHome=true
 ProtectSystem=full
+# Dispatcher mutation locks and engine lifecycle markers live beside releases.
+ReadWritePaths=$INSTALL_DIR
 PrivateTmp=true
 # Required to resolve /proc/<unprivileged-peer-pid>/exe for broker identity.
 CapabilityBoundingSet=CAP_CHOWN CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE

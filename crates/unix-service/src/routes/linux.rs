@@ -696,7 +696,20 @@ fn route_matches_tokens(tokens: &[&str], route: &OwnedRoute) -> bool {
     let Some(expected_metric) = route.metric else {
         return false;
     };
-    tokens.first() == Some(&route.destination.as_str())
+    let Ok(expected_destination) = route.destination.parse::<Ipv4Net>() else {
+        return false;
+    };
+    // iproute2 omits /32 when rendering a host route. Compare the network,
+    // retaining every ownership check before cleanup may remove the route.
+    let destination = tokens.first().and_then(|value| {
+        value.parse::<Ipv4Net>().ok().or_else(|| {
+            value
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .and_then(|address| Ipv4Net::new(address, 32).ok())
+        })
+    });
+    destination == Some(expected_destination)
         && value_after(tokens, "via") == route.gateway.as_deref()
         && value_after(tokens, "dev") == Some(route.interface_identifier.as_str())
         && value_after(tokens, "metric").and_then(|value| value.parse::<u32>().ok())
@@ -828,6 +841,36 @@ mod tests {
     use defguard_wireguard_rs::{key::Key, net::IpAddrMask};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn host_route_without_printed_prefix_is_recognized_for_cleanup() {
+        let route = OwnedRoute {
+            destination: "91.221.164.24/32".into(),
+            interface_identifier: "wlan0".into(),
+            gateway: Some("10.60.26.17".into()),
+            metric: Some(42760),
+        };
+        for destination in ["91.221.164.24", "91.221.164.24/32"] {
+            let line = format!("{destination} via 10.60.26.17 dev wlan0 proto static metric 42760");
+            assert!(route_matches_tokens(
+                &line.split_whitespace().collect::<Vec<_>>(),
+                &route
+            ));
+        }
+        for line in [
+            "91.221.164.25 via 10.60.26.17 dev wlan0 proto static metric 42760",
+            "91.221.164.0/24 via 10.60.26.17 dev wlan0 proto static metric 42760",
+            "91.221.164.24 via 10.60.26.18 dev wlan0 proto static metric 42760",
+            "91.221.164.24 via 10.60.26.17 dev wlan1 proto static metric 42760",
+            "91.221.164.24 via 10.60.26.17 dev wlan0 proto dhcp metric 42760",
+            "91.221.164.24 via 10.60.26.17 dev wlan0 proto static metric 600",
+        ] {
+            assert!(!route_matches_tokens(
+                &line.split_whitespace().collect::<Vec<_>>(),
+                &route
+            ));
+        }
+    }
 
     fn peer_with_allowed_ips(allowed_ips: Vec<IpAddrMask>) -> Peer {
         let mut peer = Peer::new(Key::new([7; 32]));
