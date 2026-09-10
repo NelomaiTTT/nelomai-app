@@ -1,5 +1,6 @@
 """Required static authorization graph checks, complemented by executable gates."""
 import re
+import shlex
 import unittest
 import yaml
 
@@ -7,6 +8,22 @@ from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_every_source_gate_receives_the_selected_release_mode(self):
+        workflow = self.workflow()
+        for name, job in workflow["jobs"].items():
+            for step in job.get("steps", []):
+                for line in step.get("run", "").replace("\\\n", " ").splitlines():
+                    if "scripts/release-candidate-gates.py source" not in line:
+                        continue
+                    command = shlex.split(line)
+                    if "scripts/release-candidate-gates.py" not in command or "source" not in command:
+                        continue
+                    with self.subTest(job=name):
+                        self.assertIn("--mode", command)
+                        variable = command[command.index("--mode") + 1]
+                        self.assertEqual(variable, "$RELEASE_MODE")
+                        self.assertEqual(workflow["env"][variable[1:]], "${{ inputs.mode }}")
+
     def test_existing_release_inputs_keep_repository_secret_bindings(self):
         # These inputs were provisioned as Secrets for existing releases.
         # A Variables-only binding silently passes an empty value to the runner.

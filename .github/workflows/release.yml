@@ -152,7 +152,7 @@ jobs:
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -197,7 +197,7 @@ jobs:
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -278,7 +278,7 @@ jobs:
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -342,7 +342,7 @@ jobs:
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -427,7 +427,7 @@ jobs:
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
           test "$RELEASE_VERSION" = 0.2.16
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
