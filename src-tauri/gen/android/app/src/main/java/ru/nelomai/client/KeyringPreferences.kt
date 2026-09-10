@@ -11,6 +11,11 @@ import android.os.Process
  * Keep one SharedPreferences cache/writer for its encrypted vault, across processes.
  * Keystore encryption, record names and on-disk format remain unchanged. */
 class NelomaiApplication : android.app.Application() {
+    override fun onCreate() {
+        super.onCreate()
+        ru.nelomai.runtime.v1.PersistentLogcat.start(this)
+    }
+
     internal fun ownerKeyringPreferences(): SharedPreferences =
         super.getSharedPreferences("keyring-default", Context.MODE_PRIVATE)
     override fun getSharedPreferences(name: String?, mode: Int): SharedPreferences =

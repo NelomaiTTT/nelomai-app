@@ -13,6 +13,104 @@ import kotlin.concurrent.thread
 
 class AutomaticDiagnosticsTest {
     @Test
+    fun fullLogcatAttachmentSurvivesBaseCompactionAndGzipRetrySnapshot() {
+        val logcat = "\u0001".repeat(2 * 1024 * 1024)
+        val payload = JSONObject()
+            .put("application_log", "a".repeat(600 * 1024))
+            .put("helper_log", "helper")
+            .put("logcat_log", logcat)
+        val compacted = automaticDiagnosticsCompactReportToBytes(payload, maximum = 512 * 1024)
+        assertEquals(logcat, compacted.getString("logcat_log"))
+        val frozen = java.io.ByteArrayOutputStream().also { bytes ->
+            java.util.zip.GZIPOutputStream(bytes).use { gzip ->
+                gzip.write(compacted.toString().toByteArray(Charsets.UTF_8))
+            }
+        }.toByteArray()
+        payload.put("logcat_log", "later collector snapshot")
+        repeat(2) {
+            val restored = automaticDiagnosticsReadCompressedReport(frozen.inputStream())
+            assertEquals(logcat, restored.remove("logcat_log"))
+            assertEquals("helper", restored.getString("helper_log"))
+            assertTrue(restored.toString().toByteArray(Charsets.UTF_8).size <= 512 * 1024)
+        }
+    }
+
+    @Test
+    fun logcatAttachmentLimitCountsUtf8Bytes() {
+        val payload = JSONObject().put("application_log", "old report")
+            .put("logcat_log", "🦀".repeat(512 * 1024))
+        assertEquals(
+            2 * 1024 * 1024,
+            automaticDiagnosticsCompactReportToBytes(payload, 512 * 1024)
+                .getString("logcat_log").toByteArray(Charsets.UTF_8).size,
+        )
+        payload.put("logcat_log", "🦀".repeat(512 * 1024) + "x")
+        assertTrue(runCatching {
+            automaticDiagnosticsCompactReportToBytes(payload, 512 * 1024)
+        }.isFailure)
+    }
+
+    @Test
+    fun unavailableLogcatKeepsAFullBaseReportWithinTheOrdinaryWireLimit() {
+        val payload = automaticDiagnosticsCompactReportToBytes(
+            JSONObject().put("application_log", "a".repeat(600 * 1024)),
+            maximum = 512 * 1024,
+        )
+        assertEquals(512 * 1024, payload.toString().toByteArray(Charsets.UTF_8).size)
+        assertTrue(automaticDiagnosticsAttachLogcatOnce(payload) { null })
+
+        val frozen = automaticDiagnosticsCompactReportToBytes(payload, maximum = 512 * 1024)
+
+        assertTrue(frozen.has("logcat_log"))
+        assertTrue(frozen.isNull("logcat_log"))
+        assertTrue(frozen.toString().toByteArray(Charsets.UTF_8).size <= 512 * 1024)
+    }
+
+    @Test
+    fun attachmentIsFrozenOnceIncludingFailedAndEmptySnapshots() {
+        for (snapshot in listOf("first snapshot", null, "")) {
+            val payload = JSONObject().put("application_log", "old report")
+            assertTrue(automaticDiagnosticsAttachLogcatOnce(payload) { snapshot })
+            val frozen = payload.toString()
+            val restored = JSONObject(frozen)
+            assertFalse(automaticDiagnosticsAttachLogcatOnce(restored) {
+                error("Retry must not ask for another snapshot")
+            })
+            assertEquals(frozen, restored.toString())
+        }
+        val payload = JSONObject().put("application_log", "old report")
+        assertTrue(automaticDiagnosticsAttachLogcatOnce(payload) { error("collector unavailable") })
+        assertTrue(payload.has("logcat_log"))
+        assertTrue(payload.isNull("logcat_log"))
+    }
+
+    @Test
+    fun pendingReaderRejectsOversizedBaseAndUtf8AttachmentAndAcceptsLegacyReports() {
+        fun read(payload: JSONObject): JSONObject {
+            val compressed = java.io.ByteArrayOutputStream().also { bytes ->
+                java.util.zip.GZIPOutputStream(bytes).use {
+                    it.write(payload.toString().toByteArray(Charsets.UTF_8))
+                }
+            }.toByteArray()
+            return automaticDiagnosticsReadCompressedReport(compressed.inputStream())
+        }
+        val legacy = read(JSONObject().put("application_log", "legacy"))
+        assertEquals("legacy", legacy.getString("application_log"))
+        assertFalse(legacy.has("logcat_log"))
+        assertTrue(runCatching {
+            read(JSONObject().put("application_log", "a".repeat(512 * 1024)))
+        }.isFailure)
+        assertTrue(runCatching {
+            read(JSONObject().put("application_log", "base")
+                .put("logcat_log", "🦀".repeat(512 * 1024) + "x"))
+        }.isFailure)
+        assertTrue(runCatching {
+            read(JSONObject().put("application_log", "base")
+                .put("logcat_log", "\u0001".repeat(3 * 1024 * 1024)))
+        }.isFailure)
+    }
+
+    @Test
     fun connectionIntentDiagnosticsReportsAndNotifiesOncePerEpisode() {
         val episode = AutomaticDiagnosticsConnectionIntentEpisode()
 

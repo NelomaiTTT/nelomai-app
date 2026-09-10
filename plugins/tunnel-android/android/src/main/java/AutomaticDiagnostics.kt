@@ -17,6 +17,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
 import java.time.Instant
@@ -59,6 +60,9 @@ private const val MAX_STARTUP_LOG_BYTES = 16 * 1024
 private const val MAX_HELPER_LOG_BYTES = 64 * 1024
 private const val MAX_NETWORK_INCIDENT_LOG_BYTES = 48 * 1024
 private const val MAX_REPORT_BYTES = 512 * 1024
+private const val MAX_LOGCAT_BYTES = 2 * 1024 * 1024
+// A single UTF-8 byte can require six JSON bytes (for example, \u0001).
+private const val MAX_PENDING_REPORT_BYTES = MAX_REPORT_BYTES + 6 * MAX_LOGCAT_BYTES
 private const val TUNNEL_START_MEMORY_GROWTH_THRESHOLD_BYTES = 256L * 1024L * 1024L
 private const val TUNNEL_START_MEMORY_ABSOLUTE_THRESHOLD_BYTES = 300L * 1024L * 1024L
 private const val TUNNEL_START_MEMORY_TOP_MAPPINGS = 12
@@ -1282,7 +1286,7 @@ internal object AutomaticDiagnostics {
             MAX_REPORT_BYTES,
         ).toString().toByteArray(StandardCharsets.UTF_8)
         try {
-            check(encoded.size <= MAX_REPORT_BYTES) { "automatic_diagnostics_report_too_large" }
+            check(encoded.size <= MAX_PENDING_REPORT_BYTES) { "automatic_diagnostics_report_too_large" }
             FileOutputStream(temporaryFile).use { output ->
                 val gzip = GZIPOutputStream(output)
                 gzip.write(encoded)
@@ -1570,6 +1574,16 @@ internal object AutomaticDiagnostics {
                 preferences.edit().putString(KEY_LAST_ATTEMPTED_REPORT, report.name).commit(),
             ) { "automatic_diagnostics_attempt_write_failed" }
             val payload = readPendingReport(report)
+            // Lifecycle reports seal their base at the event. Capture logcat on this
+            // upload worker just before the first attempt, so lifecycle/main-thread
+            // hooks never read/compress the 2 MiB attachment. Persist before HTTP;
+            // all retries (also after restart) reuse this exact snapshot or null.
+            if (automaticDiagnosticsAttachLogcatOnce(payload) {
+                    ru.nelomai.runtime.v1.PersistentLogcat.snapshot(context.noBackupFilesDir.absolutePath)
+                }
+            ) {
+                writePendingReport(report, payload)
+            }
             val expectedReportId = payload.getString("report_id")
             val response = BackgroundConnectionClient.uploadDiagnostics(credential, payload)
             if (response.getString("report_id") != expectedReportId) {
@@ -1622,18 +1636,8 @@ internal object AutomaticDiagnostics {
     }
 
     private fun readPendingReport(file: File): JSONObject =
-        GZIPInputStream(FileInputStream(file)).use { input ->
-            val output = ByteArrayOutputStream()
-            val buffer = ByteArray(8 * 1024)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                check(output.size() + count <= MAX_REPORT_BYTES) {
-                    "automatic_diagnostics_report_too_large"
-                }
-                output.write(buffer, 0, count)
-            }
-            JSONObject(output.toString(StandardCharsets.UTF_8.name()))
+        FileInputStream(file).use { input ->
+            automaticDiagnosticsReadCompressedReport(input)
         }
 
     private fun markSent(context: Context, report: File) {
@@ -2215,6 +2219,73 @@ internal fun automaticDiagnosticsCompactReportToBytes(
     maximum: Int,
 ): JSONObject {
     require(maximum > 0)
+    val attachment = payload.remove("logcat_log")
+    try {
+        validateAutomaticDiagnosticsLogcat(attachment)
+        // A frozen unavailable snapshot uses null (18 bytes), while a string's
+        // field syntax takes 16 bytes before its independently bounded content.
+        val attachmentOverhead = when {
+            attachment == null -> 0
+            attachment == JSONObject.NULL -> 18
+            else -> 16
+        }
+        return compactAutomaticDiagnosticsBaseReport(
+            payload,
+            maximum - attachmentOverhead,
+        )
+    } finally {
+        if (attachment != null) payload.put("logcat_log", attachment)
+    }
+}
+
+internal fun automaticDiagnosticsAttachLogcatOnce(
+    payload: JSONObject,
+    snapshot: () -> String?,
+): Boolean {
+    if (payload.has("logcat_log")) return false
+    val attachment = runCatching {
+        snapshot()?.takeIf(String::isNotEmpty)?.also(::validateAutomaticDiagnosticsLogcat)
+    }.getOrNull()
+    payload.put("logcat_log", attachment ?: JSONObject.NULL)
+    return true
+}
+
+internal fun automaticDiagnosticsReadCompressedReport(compressed: InputStream): JSONObject =
+    GZIPInputStream(compressed).use { input ->
+        val output = ByteArrayOutputStream()
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            check(output.size() + count <= MAX_PENDING_REPORT_BYTES) {
+                "automatic_diagnostics_report_too_large"
+            }
+            output.write(buffer, 0, count)
+        }
+        val payload = JSONObject(output.toString(StandardCharsets.UTF_8.name()))
+        val attachment = payload.remove("logcat_log")
+        try {
+            validateAutomaticDiagnosticsLogcat(attachment)
+            check(payload.toString().toByteArray(StandardCharsets.UTF_8).size <= MAX_REPORT_BYTES) {
+                "automatic_diagnostics_report_too_large"
+            }
+        } finally {
+            if (attachment != null) payload.put("logcat_log", attachment)
+        }
+        payload
+    }
+
+private fun validateAutomaticDiagnosticsLogcat(attachment: Any?) {
+    if (attachment == null || attachment == JSONObject.NULL) return
+    check(attachment is String && attachment.toByteArray(StandardCharsets.UTF_8).size <= MAX_LOGCAT_BYTES) {
+        "automatic_diagnostics_logcat_too_large"
+    }
+}
+
+private fun compactAutomaticDiagnosticsBaseReport(
+    payload: JSONObject,
+    maximum: Int,
+): JSONObject {
     fun encodedSize(): Int = payload.toString().toByteArray(StandardCharsets.UTF_8).size
     if (encodedSize() <= maximum) return payload
 

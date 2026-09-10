@@ -600,6 +600,7 @@ mod tests {
             architecture: "test".to_string(),
             application_log: "test".to_string(),
             helper_log: None,
+            logcat_log: None,
             network_incidents: None,
             resource_usage: None,
         }

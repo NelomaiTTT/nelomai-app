@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Runtime operational state and frozen diagnostic attachments are device-local.
+     Preferences live outside these state directories and remain backup-eligible. -->
+<full-backup-content>
+    <exclude domain="file" path="diagnostics/automatic" />
+    <exclude domain="file" path="runtime/latest/state" />
+    <exclude domain="file" path="runtime/stable/state" />
+</full-backup-content>

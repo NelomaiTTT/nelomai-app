@@ -645,6 +645,10 @@ impl AppDiagnostics {
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
             helper_log: bounded_helper_log(helper_override.or_else(|| helper_log(&self.directory))),
+            #[cfg(target_os = "android")]
+            logcat_log: crate::android_runtime::logcat_snapshot(),
+            #[cfg(not(target_os = "android"))]
+            logcat_log: None,
             network_incidents,
             resource_usage: Some(self.resource_baseline.report(resource_snapshot)),
         })
@@ -759,6 +763,7 @@ impl AppDiagnostics {
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
             helper_log: None,
+            logcat_log: None,
             network_incidents: None,
             resource_usage: None,
         };
@@ -828,6 +833,7 @@ impl AppDiagnostics {
             network_incidents: network_incident_snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.payload.clone()),
+            logcat_log: None,
             resource_usage,
         };
         drop(_guard);

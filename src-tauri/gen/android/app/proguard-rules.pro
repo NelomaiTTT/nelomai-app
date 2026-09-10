@@ -31,3 +31,6 @@
 -keep class ru.nelomai.client.RuntimeNativeCallbacks { *; }
 -keep class ru.nelomai.client.RuntimeNativeHost { *; }
 -keep class ru.nelomai.client.RuntimeEntrypoint { *; }
+-keep class ru.nelomai.runtime.v1.PersistentLogcat {
+    public static java.lang.String snapshot(java.lang.String);
+}

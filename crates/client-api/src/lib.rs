@@ -615,6 +615,8 @@ pub struct DiagnosticUploadRequest {
     pub architecture: String,
     pub application_log: String,
     pub helper_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logcat_log: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_incidents: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -676,6 +678,10 @@ impl fmt::Debug for DiagnosticUploadRequest {
             .field(
                 "network_incidents",
                 &self.network_incidents.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "logcat_log",
+                &self.logcat_log.as_ref().map(|_| "<redacted>"),
             )
             .field("resource_usage", &self.resource_usage)
             .finish()
@@ -2316,6 +2322,28 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_optional_logcat_round_trips_and_is_redacted() {
+        let old_payload = serde_json::json!({
+            "trigger": "manual", "generated_at_unix": 1, "app_version": "0.2.16",
+            "platform_version": null, "architecture": "aarch64",
+            "application_log": "application", "helper_log": null
+        });
+        let old: DiagnosticUploadRequest = serde_json::from_value(old_payload.clone()).unwrap();
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("logcat_log")
+            .is_none());
+        let mut payload = old_payload;
+        payload["logcat_log"] = serde_json::json!("logcat-secret\n🦀");
+        let request: DiagnosticUploadRequest = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["logcat_log"],
+            "logcat-secret\n🦀"
+        );
+        assert!(!format!("{request:?}").contains("logcat-secret"));
+    }
+
+    #[test]
     fn diagnostics_debug_output_redacts_both_logs() {
         let request = DiagnosticUploadRequest {
             report_id: None,
@@ -2332,6 +2360,7 @@ mod tests {
             architecture: "x86_64".to_string(),
             application_log: "application-secret".to_string(),
             helper_log: Some("helper-secret".to_string()),
+            logcat_log: None,
             network_incidents: Some("incident-secret".to_string()),
             resource_usage: None,
         };

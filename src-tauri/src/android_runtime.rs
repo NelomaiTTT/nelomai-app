@@ -1,8 +1,8 @@
 //! One-shot admitted Android child endpoint, received before Tauri starts.
 use jni::{
-    objects::{JObject, JString},
+    objects::{JClass, JObject, JString, JValue},
     sys::jint,
-    JNIEnv,
+    JNIEnv, JavaVM,
 };
 use nelomai_client_container::host::RuntimeBootstrapV1;
 use std::{
@@ -11,6 +11,51 @@ use std::{
 };
 
 static BOOTSTRAP: OnceLock<Mutex<Option<(OwnedFd, RuntimeBootstrapV1)>>> = OnceLock::new();
+
+/// Read through the container class loader and its collector's rotation lock.
+/// Diagnostics are optional: JNI failures must not prevent the existing report.
+pub fn logcat_snapshot() -> Option<String> {
+    let context = ndk_context::android_context();
+    let vm = unsafe { JavaVM::from_raw(context.vm().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    let result = env.with_local_frame(16, |env| -> jni::errors::Result<String> {
+        let context = unsafe { JObject::from_raw(context.context().cast()) };
+        let loader = env
+            .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .l()?;
+        let name = env.new_string("ru.nelomai.runtime.v1.PersistentLogcat")?;
+        let class = env
+            .call_method(
+                loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        let files = env
+            .call_method(&context, "getNoBackupFilesDir", "()Ljava/io/File;", &[])?
+            .l()?;
+        let path = env
+            .call_method(files, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let snapshot = env
+            .call_static_method(
+                JClass::from(class),
+                "snapshot",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[JValue::Object(&path)],
+            )?
+            .l()?;
+        let text: String = env.get_string(&JString::from(snapshot))?.into();
+        Ok(text)
+    });
+    if result.is_err() {
+        let _ = env.exception_clear();
+    }
+    result
+        .ok()
+        .filter(|text| !text.is_empty() && text.len() <= 2 * 1024 * 1024)
+}
 
 pub fn take_bootstrap() -> std::io::Result<(OwnedFd, RuntimeBootstrapV1)> {
     BOOTSTRAP
