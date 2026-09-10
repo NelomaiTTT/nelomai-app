@@ -427,7 +427,35 @@ fn ensure_ip_query_empty(ip: &Path, arguments: &[&str]) -> Result<(), ServiceErr
 }
 
 fn query_ip(ip: &Path, arguments: &[&str]) -> Result<String, ServiceError> {
-    let output = run(ip, arguments)?;
+    let output = output_with_timeout(
+        Command::new(ip)
+            .args(arguments)
+            .env("LANG", "C")
+            .env("LC_ALL", "C"),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
+    if !output.status.success() {
+        // A FIB table is created lazily. Before the first AWG start (or after
+        // cleanup), iproute2 reports its absence with exit 2, not empty success.
+        // Only accept this exact read-only query/result; fail closed otherwise.
+        let missing_table_message = match arguments {
+            ["-4", "route", "show", "table", "42761"] => {
+                "Error: ipv4: FIB table does not exist.\nDump terminated"
+            }
+            ["-6", "route", "show", "table", "42761"] => {
+                "Error: ipv6: FIB table does not exist.\nDump terminated"
+            }
+            _ => "",
+        };
+        if output.status.code() != Some(2)
+            || !output.stdout.is_empty()
+            || missing_table_message.is_empty()
+            || String::from_utf8_lossy(&output.stderr).trim() != missing_table_message
+        {
+            return Err(ServiceError::Backend("route_command_failed".to_string()));
+        }
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -841,6 +869,56 @@ mod tests {
     use defguard_wireguard_rs::{key::Key, net::IpAddrMask};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn userspace_preflight_accepts_missing_fib_table_but_not_other_query_failures() {
+        // Match iproute2 on SteamOS before the first AWG connection. The real
+        // query/preflight must treat only a missing route table as empty.
+        let directory = tempfile::tempdir().unwrap();
+        let ip = directory.path().join("ip");
+        for (stderr, stdout, exit, accepted) in [
+            (
+                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+                "",
+                2,
+                true,
+            ),
+            ("RTNETLINK answers: Operation not permitted\n", "", 2, false),
+            (
+                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+                "default dev foreign0\n",
+                2,
+                false,
+            ),
+            (
+                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+                "",
+                1,
+                false,
+            ),
+            ("", "default dev foreign0\n", 0, false),
+        ] {
+            fs::write(
+                &ip,
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {exit}\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
+            let result = ensure_ip_query_empty(&ip, &["-4", "route", "show", "table", "42761"]);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "stderr={stderr:?} stdout={stdout:?} exit={exit}"
+            );
+            if exit != 0 {
+                assert!(query_ip(&ip, &["-4", "rule", "show"]).is_err());
+            }
+        }
+        fs::write(&ip, "#!/bin/sh\nprintf 'Error: ipv6: FIB table does not exist.\\nDump terminated\\n' >&2\nexit 2\n").unwrap();
+        assert!(ensure_ip_query_empty(&ip, &["-6", "route", "show", "table", "42761"]).is_ok());
+    }
 
     #[test]
     fn host_route_without_printed_prefix_is_recognized_for_cleanup() {
