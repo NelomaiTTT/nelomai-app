@@ -52,12 +52,45 @@ class LatestRuntimeStorageTest {
     }
     private fun resealed(): Pair<LatestRuntimeStorageV1, Storage> {
         val runtime = LatestRuntimeStorageV1(); val storage = Storage()
-        runtime.prepare(storage, "latest", "0.2.16", legacyMigration = true, migrationComplete = false)
+        runtime.prepare(storage, "latest", AndroidRuntimeNamespace.version, legacyMigration = true, migrationComplete = false)
         assertTrue(storage.names.all(storage::hasLegacy))
         return runtime to storage
     }
     private fun reopenCompleted(runtime: LatestRuntimeStorageV1, storage: Storage) =
-        runtime.prepare(storage, "latest", "0.2.16", legacyMigration = false, migrationComplete = true)
+        runtime.prepare(storage, "latest", AndroidRuntimeNamespace.version, legacyMigration = false, migrationComplete = true)
+
+    @Test fun mismatchedRuntimeIdentityCannotMigrateOrRetireSources() {
+        for ((slot, version) in listOf("stable" to AndroidRuntimeNamespace.version, "latest" to "0.0.0")) {
+            val storage = Storage()
+            assertThrows(IllegalStateException::class.java) {
+                LatestRuntimeStorageV1().prepare(storage, slot, version, legacyMigration = true, migrationComplete = false)
+            }
+            assertTrue(storage.names.all(storage::hasLegacy))
+            assertTrue(storage.targets.values.all { it.ciphertext == null })
+            assertTrue(storage.quickSource)
+        }
+    }
+
+    @Test fun missingCommonMigrationCannotAdmitOrphanNativeSources() {
+        val storage = Storage()
+        assertThrows(IllegalStateException::class.java) {
+            LatestRuntimeStorageV1().prepare(storage, "latest", AndroidRuntimeNamespace.version,
+                legacyMigration = false, migrationComplete = false)
+        }
+        assertTrue(storage.names.all(storage::hasLegacy))
+        assertTrue(storage.targets.values.all { it.ciphertext == null })
+    }
+
+    @Test fun completedMigrationWithoutLegacySourcesDoesNotRequireOldNativeReceipts() {
+        val storage = Storage()
+        storage.sources.values.forEach { it.ciphertext = null }
+        storage.quickSource = false
+        val runtime = LatestRuntimeStorageV1()
+        reopenCompleted(runtime, storage)
+        runtime.acknowledge(storage)
+        assertTrue(storage.targets.values.all { it.ciphertext == null })
+        assertTrue(storage.proofs.values.all { it.ciphertext == null })
+    }
 
     @Test fun commonAckBeforeNativeRetirementNeverDiscardsSourceWhenDestinationDisappears() {
         for (name in Storage().names) {

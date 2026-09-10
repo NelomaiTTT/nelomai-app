@@ -25,7 +25,10 @@ class LatestRuntimeStorageV1 : RuntimeNativeStorageV1 {
     }
     internal fun prepare(storage: NativeRuntimeStorageAccess, slot: String, version: String, legacyMigration: Boolean, migrationComplete: Boolean) {
         check(slot == AndroidRuntimeNamespace.slot && version == AndroidRuntimeNamespace.version)
-        if (slot != "latest" || version != "0.2.16") { check(!legacyMigration); return }
+        // Legacy users can upgrade directly to any maintenance release. The
+        // compiled identity above selects the destination; only latest may
+        // import/retire legacy records, regardless of its release number.
+        if (slot != "latest") { check(!legacyMigration); return }
         if (migrationComplete) { acknowledge(storage); return }
         if (!legacyMigration) {
             check(legacyNames.none(storage::hasLegacy)) { "orphan_native_legacy_state" }
@@ -40,7 +43,7 @@ class LatestRuntimeStorageV1 : RuntimeNativeStorageV1 {
     override fun acknowledge(context: Context) = acknowledge(AndroidNativeRuntimeStorageAccess(context))
 
     internal fun acknowledge(storage: NativeRuntimeStorageAccess) {
-        check(AndroidRuntimeNamespace.slot == "latest" && AndroidRuntimeNamespace.version == "0.2.16")
+        check(AndroidRuntimeNamespace.slot == "latest")
         // The common ACK can survive a crash before native source retirement.
         // Validate every remaining destination before deleting any source.
         // Once a source is gone, later opens do not depend on its old receipt.
