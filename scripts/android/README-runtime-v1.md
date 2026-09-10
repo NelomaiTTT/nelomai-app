@@ -27,12 +27,16 @@ standard library.
 1. `python3 scripts/android/generate-build-inputs.py --root "$TASK_ROOT"`
 2. In `src-tauri/gen/android`, run
    `./gradlew :app:testArm64DebugUnitTest :tauri-plugin-tunnel-android:testDebugUnitTest :stable-runtime-android:assembleDebug --offline`.
-3. Build `nelomai-android-container` and `nelomai-app --lib` for
-   `aarch64-linux-android`, with the NDK's `aarch64-linux-android24-clang` /
+3. Build **both** `nelomai-android-container` and `nelomai-app --lib` with
+   `cargo rustc --locked --release --target aarch64-linux-android`, with the NDK's `aarch64-linux-android24-clang` /
    `llvm-ar` and explicit ELF SONAME linker flags. Set
    `WRY_ANDROID_PACKAGE=ru.nelomai.client`,
    `WRY_ANDROID_LIBRARY=nelomai_app_lib`, and `WRY_ANDROID_KOTLIN_FILES_OUT_DIR`
    to the app's ignored generated Kotlin directory for the latest build.
+   Stage the libraries from `target/aarch64-linux-android/release/`.
+   Gradle's `assembleArm64Release` does not optimize prebuilt Rust libraries:
+   staging a `debug/` host still leaves manifest/payload hashing unoptimized.
+   Use debug Rust builds for debugging, not cold-start performance acceptance.
 4. `prepare-stable-rust.py --root ... --output <fresh directory>` makes the
    stable source variant, including namespaced Tauri/keyring/opener JNI.
    Build it with `WRY_ANDROID_PACKAGE=ru.nelomai.runtime.stable`,

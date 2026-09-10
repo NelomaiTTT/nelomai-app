@@ -7,6 +7,8 @@ import android.os.IBinder
 import android.os.Parcel
 import android.os.ParcelFileDescriptor
 import android.os.Process
+import android.os.SystemClock
+import android.util.Log
 
 class RuntimeAuthBrokerService : Service() {
     private var host: Long = 0
@@ -33,7 +35,9 @@ class RuntimeAuthBrokerService : Service() {
                     require(RuntimeDispatchPolicy.admit(active, RuntimeSelectionStore.decode(request), Binder.getCallingUid(), Process.myUid()))
                     val pair = ParcelFileDescriptor.createSocketPair()
                     try {
+                        val started = SystemClock.elapsedRealtime()
                         val bootstrap = RuntimeNativeHost.nativeAttach(host, pair[0].detachFd(), Binder.getCallingPid(), Binder.getCallingUid(), request)
+                        Log.i("NelomaiStartup", "owner.attach duration_ms=${SystemClock.elapsedRealtime() - started}")
                         reply.writeNoException(); reply.writeString(bootstrap)
                         reply.writeParcelable(pair[1], 0)
                     } finally { pair.forEach { it.close() } }
@@ -46,7 +50,15 @@ class RuntimeAuthBrokerService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        host = runCatching { RuntimeNativeHost.nativeOpen(applicationContext, filesDir.absolutePath, RuntimeContainerAssets.prepare(this).absolutePath, RuntimeNativeCallbacks(this)) }.getOrDefault(0L)
+        host = runCatching {
+            var started = SystemClock.elapsedRealtime()
+            val resources = RuntimeContainerAssets.prepare(this)
+            Log.i("NelomaiStartup", "owner.assets duration_ms=${SystemClock.elapsedRealtime() - started}")
+            started = SystemClock.elapsedRealtime()
+            RuntimeNativeHost.nativeOpen(applicationContext, filesDir.absolutePath, resources.absolutePath, RuntimeNativeCallbacks(this)).also {
+                Log.i("NelomaiStartup", "owner.open duration_ms=${SystemClock.elapsedRealtime() - started} ready=${it != 0L}")
+            }
+        }.getOrDefault(0L)
         RuntimeOwnerReloadGate.ownerReady(host != 0L)
     }
 
