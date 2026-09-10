@@ -22,7 +22,7 @@ class RetainedCandidateTest(unittest.TestCase):
             for name, value in self.files.items():
                 archive.writestr(name, value)
                 (self.directory / name).write_bytes(value)
-        self.metadata = {"id": 17, "name": "candidate-0.2.16", "expired": False,
+        self.metadata = {"id": 17, "name": "candidate-0.2.17", "expired": False,
             "expires_at": "2999-01-01T00:00:00Z", "size_in_bytes": self.archive.stat().st_size,
             "digest": "sha256:" + hashlib.sha256(self.archive.read_bytes()).hexdigest(),
             "workflow_run": {"id": 42, "head_sha": SOURCE, "repository_id": 123, "head_repository_id": 123}}

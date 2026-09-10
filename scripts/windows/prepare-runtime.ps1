@@ -166,7 +166,7 @@ if (-not (Test-Path -LiteralPath $ServiceExecutable -PathType Leaf)) {
     throw "Versioned Windows service executable is required: $ServiceExecutable"
 }
 Copy-Item -LiteralPath $ServiceExecutable -Destination (Join-Path $OutputDirectory "nelomai-windows-service.exe") -Force
-$engineDirectory = Join-Path $OutputDirectory "engines/latest/0.2.16"
+$engineDirectory = Join-Path $OutputDirectory "engines/latest/0.2.17"
 $dispatcherDirectory = Join-Path $OutputDirectory "dispatcher/1"
 New-Item -ItemType Directory -Force $engineDirectory, $dispatcherDirectory | Out-Null
 Get-ChildItem -LiteralPath $OutputDirectory -File | ForEach-Object {

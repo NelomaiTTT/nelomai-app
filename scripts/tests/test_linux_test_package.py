@@ -29,7 +29,7 @@ class LinuxTestPackageTest(ArtifactFixture):
         self.key.public_key().verify((staged / 'runtime/container-manifest-v1.sig').read_bytes(),
             b'nelomai-container-manifest-v1\0' + (staged / 'runtime/container-manifest-v1.json').read_bytes())
         for name in ('nelomai-runtime', 'nelomai-unix-service', 'amneziawg-go'):
-            self.assertEqual((staged / 'runtime/engines/latest/0.2.16' / name).read_bytes(),
+            self.assertEqual((staged / 'runtime/engines/latest/0.2.17' / name).read_bytes(),
                 (self.payload / name).read_bytes())
         self.assertEqual((staged / 'dispatcher/1/nelomai-unix-service').read_bytes(),
             (self.payload / 'nelomai-unix-service').read_bytes())
