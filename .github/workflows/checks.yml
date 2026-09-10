@@ -9,51 +9,51 @@ on:
 jobs:
   linux-package-diagnostic:
     if: github.event_name == 'workflow_dispatch'
-    name: Linux recheck diagnostic (not a release)
+    name: Linux test AppImage (not a release)
     runs-on: ubuntu-22.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     permissions:
       contents: read
-      actions: read
     env:
-      # Retained signed runtime; current common wrapper and installer are under test.
-      # No output of this job may be promoted as a release candidate.
-      SOURCE_SHA: 46cfa3e0b4f31c39e43fb95f1019e12939a1e19f
-      NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: ${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}
+      SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
           persist-credentials: false
       - uses: ./.github/actions/release-native-host
         with:
           platform: linux
           target: x86_64-unknown-linux-gnu
-      - uses: actions/download-artifact@v4
-        with:
-          name: signed-runtime
-          path: signed
-          run-id: 34248566038
-          github-token: ${{ github.token }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: draft-linux
-          path: draft
-          run-id: 34248566038
-          github-token: ${{ github.token }}
-      - name: Test corrected Linux wrapper and installer with signed runtime
+      - name: Verify exact source and Linux regressions
         shell: bash
         run: |
-          python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUNNER_TEMP/runtime-public.raw"
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.16 --mode build_only
+          cargo fmt --all --check
+          cargo test --locked -p nelomai-unix-service --lib
           cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest
-          cargo build --locked -p nelomai-client-container --example linux-runtime-acceptance
-          python scripts/package-release-platform.py --mode build_only --include-acceptance --source-sha "$SOURCE_SHA" \
-            --release-set-sha256 b343dd31ff2a1a75a0559915c4dc068ad7453e0649066da469d266b598298112 \
-            --platform linux --architecture x86_64 --signed signed --draft draft/linux \
-            --public-key "$RUNNER_TEMP/runtime-public.raw" --output packages/linux
-          python scripts/linux/run-package-acceptance.py --packages packages/linux \
-            --public-key "$RUNNER_TEMP/runtime-public.raw" --output evidence/linux.json
-          echo 'Harness regression passed; not release or physical acceptance evidence.'
+          python -m unittest scripts.tests.test_linux_test_package
+      - name: Build fresh Linux runtime and helper with test trust
+        shell: bash
+        run: |
+          python scripts/prepare-release-trust.py --mode build_only --phase signing \
+            --public-key "$RUNNER_TEMP/runtime-public.raw" --private-key "$RUNNER_TEMP/runtime-private.raw"
+          python scripts/build-release-platform.py --mode build_only --source-sha "$SOURCE_SHA" \
+            --platform linux --architecture x86_64 --public-key "$RUNNER_TEMP/runtime-public.raw" \
+            --output "$RUNNER_TEMP/draft" --work "$RUNNER_TEMP/native-work"
+      - name: Package and re-extract Linux only
+        shell: bash
+        run: |
+          python scripts/package-linux-test.py --source-sha "$SOURCE_SHA" \
+            --draft "$RUNNER_TEMP/draft" --output "$RUNNER_TEMP/packages-linux" --work "$RUNNER_TEMP/package-work" \
+            --public-key "$RUNNER_TEMP/runtime-public.raw" --private-key "$RUNNER_TEMP/runtime-private.raw"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-linux
+          path: ${{ runner.temp }}/packages-linux/
+          if-no-files-found: error
+          retention-days: 14
   frontend:
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
