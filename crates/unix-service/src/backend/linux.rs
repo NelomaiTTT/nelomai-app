@@ -72,7 +72,7 @@ impl LinuxBackend {
             .as_ref()
             .map(rebind_peers_from_host)
             .unwrap_or_default();
-        let mut diagnostics = DiagnosticJournal::default();
+        let mut diagnostics = DiagnosticJournal::persistent(&runtime_directory);
         diagnostics.record(
             "helper_initialized",
             &format!(

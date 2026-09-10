@@ -168,17 +168,21 @@ impl UnixSocketTransport {
             }
             if !matches!(request, Request::Start { .. }) {
                 if !version.running {
-                    return match request {
+                    match request {
                         Request::Status { .. } => {
-                            Ok(Response::success(Some(crate::ServiceTunnelState::Stopped)))
+                            return Ok(Response::success(Some(crate::ServiceTunnelState::Stopped)));
                         }
                         Request::Version { .. } => {
                             let mut response = Response::success(None);
                             response.service_version = Some(identity.runtime_version);
-                            Ok(response)
+                            return Ok(response);
                         }
-                        _ => Err(ServiceError::Backend("engine_not_running".into())),
-                    };
+                        // Linux's authenticated private endpoint can read persisted
+                        // diagnostics without creating a tunnel engine.
+                        #[cfg(any(target_os = "linux", test))]
+                        Request::Diagnostics { .. } => {}
+                        _ => return Err(ServiceError::Backend("engine_not_running".into())),
+                    }
                 }
             } else {
                 let started = dispatcher_exchange(&d::DispatcherRequest::Start {
@@ -412,7 +416,12 @@ pub fn serve_dispatcher_one(
     let watchdog = RequestWatchdog::arm()?;
     let result = (|| {
         let identity = peer_identity(&stream).map_err(transport_error)?;
-        serve_dispatcher_stream(&mut stream, &identity, owner, private)
+        let address = listener.local_addr().map_err(transport_error)?;
+        let directory = address
+            .as_pathname()
+            .and_then(Path::parent)
+            .ok_or(ServiceError::InvalidRequest)?;
+        serve_dispatcher_stream(&mut stream, &identity, owner, private, directory)
     })();
     watchdog.complete();
     result
@@ -423,6 +432,7 @@ fn serve_dispatcher_stream(
     identity: &ClientIdentity,
     owner: &Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
     private: bool,
+    _runtime_directory: &Path,
 ) -> Result<(), ServiceError> {
     use nelomai_contracts::dispatcher as d;
     let mut dispatcher = owner
@@ -443,6 +453,28 @@ fn serve_dispatcher_stream(
     )
     .map_err(transport_error)?;
     let output = if private {
+        #[cfg(any(target_os = "linux", test))]
+        if matches!(
+            decode_request(&frame),
+            Ok(Request::Diagnostics {
+                protocol_version: crate::PROTOCOL_VERSION
+            })
+        ) && !dispatcher
+            .handle(
+                d::DispatcherRequest::Status {
+                    contract_version: 1,
+                },
+                &mut |_, _| Err(d::blocked()),
+            )
+            .running
+        {
+            let mut response = Response::success(None);
+            response.diagnostics = Some(crate::backend::persisted_diagnostics(_runtime_directory));
+            let output = encode_response(&response)?;
+            drop(dispatcher);
+            stream.write_all(&output).map_err(transport_error)?;
+            return stream.flush().map_err(transport_error);
+        }
         dispatcher
             .relay(&frame, &mut |_, _| Err(d::blocked()))
             .map_err(transport_error)?
@@ -531,9 +563,142 @@ mod dispatcher_response_tests {
     use nelomai_contracts::dispatcher as d;
     use std::sync::mpsc;
 
+    #[tokio::test]
+    async fn stopped_linux_diagnostics_read_private_logs_without_starting_engine() {
+        let (root, owner) = super::dispatcher_test_support::owned_dispatcher();
+        {
+            let mut dispatcher = owner.lock().unwrap();
+            let identity = dispatcher.layout.identity.clone();
+            assert!(
+                dispatcher
+                    .handle(
+                        d::DispatcherRequest::Start {
+                            contract_version: 1,
+                            identity: identity.clone()
+                        },
+                        &mut |_, _| Err(d::blocked())
+                    )
+                    .running
+            );
+            let stopped = dispatcher.handle(
+                d::DispatcherRequest::Stop {
+                    contract_version: 1,
+                    identity,
+                },
+                &mut |_, _| Err(d::blocked()),
+            );
+            assert!(stopped.ok && !stopped.running);
+        }
+        fs::write(
+            root.path().join("userspace-tunnel.log"),
+            "ERROR: handshake timeout\n",
+        )
+        .unwrap();
+        fs::set_permissions(
+            root.path().join("userspace-tunnel.log"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let lifecycle_path = root.path().join("lifecycle.sock");
+        let private_path = root.path().join("private.sock");
+        let lifecycle = bind_listener(&lifecycle_path, unsafe { libc::geteuid() }).unwrap();
+        let private = bind_listener(&private_path, unsafe { libc::geteuid() }).unwrap();
+        private.set_nonblocking(true).unwrap();
+        let lifecycle_owner = owner.clone();
+        let lifecycle_thread =
+            std::thread::spawn(move || serve_dispatcher_one(&lifecycle, &lifecycle_owner, false));
+        let private_owner = owner.clone();
+        let (done, finished) = mpsc::channel();
+        let private_thread = std::thread::spawn(move || loop {
+            if let Ok(()) = serve_dispatcher_one(&private, &private_owner, true) {
+                break;
+            }
+            if finished.try_recv().is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let binding = d::CommonEngineBinding::default();
+        binding
+            .bind(owner.lock().unwrap().layout.identity.clone())
+            .unwrap();
+        let controller = crate::UnixTunnelController::new(
+            UnixSocketTransport::with_dispatcher(private_path, lifecycle_path).for_common(binding),
+        );
+        let result = controller.diagnostics().await;
+        let _ = done.send(());
+        lifecycle_thread.join().unwrap().unwrap();
+        private_thread.join().unwrap();
+        let log = result.expect("stopped engine must not hide persisted diagnostics");
+        assert!(log.contains("source=persisted"));
+        assert!(log.contains("ERROR: handshake timeout"));
+        assert!(!root.path().join(d::ACTIVE_ENGINE_NAME).exists());
+        assert!(
+            !owner
+                .lock()
+                .unwrap()
+                .handle(
+                    d::DispatcherRequest::Status {
+                        contract_version: 1
+                    },
+                    &mut |_, _| Err(d::blocked())
+                )
+                .running
+        );
+        assert_eq!(
+            fs::metadata(root.path().join("userspace-tunnel.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
     struct PublishedResponseGate {
         stream: UnixStream,
         release: Option<mpsc::Receiver<()>>,
+    }
+
+    #[test]
+    fn persisted_diagnostics_still_require_verified_broker_and_protocol() {
+        let (root, owner) = super::dispatcher_test_support::owned_dispatcher();
+        for peer in [
+            ClientIdentity {
+                uid: unsafe { libc::geteuid() } + 1,
+                process_path: std::env::current_exe().unwrap(),
+            },
+            ClientIdentity {
+                uid: unsafe { libc::geteuid() },
+                process_path: PathBuf::from("/untrusted-client"),
+            },
+        ] {
+            let mut stream = io::Cursor::new(encode_request(&Request::diagnostics()).unwrap());
+            assert_eq!(
+                serve_dispatcher_stream(&mut stream, &peer, &owner, true, root.path()),
+                Err(ServiceError::UnauthorizedClient)
+            );
+            assert_eq!(
+                stream.position(),
+                0,
+                "reject before decoding or reading logs"
+            );
+        }
+        let peer = ClientIdentity {
+            uid: unsafe { libc::geteuid() },
+            process_path: std::env::current_exe().unwrap(),
+        };
+        let frame =
+            d::encode_frame(&serde_json::json!({"command":"diagnostics","protocolVersion":0}))
+                .unwrap();
+        let mut stream = io::Cursor::new(frame.clone());
+        assert!(serve_dispatcher_stream(&mut stream, &peer, &owner, true, root.path()).is_err());
+        assert_eq!(
+            stream.into_inner(),
+            frame,
+            "no logs sent on an unsupported protocol"
+        );
+        assert!(!root.path().join(d::ACTIVE_ENGINE_NAME).exists());
     }
 
     impl Read for PublishedResponseGate {
@@ -573,7 +738,7 @@ mod dispatcher_response_tests {
             .unwrap(),
         );
         assert_eq!(
-            serve_dispatcher_stream(&mut stream, &peer, &owner, false),
+            serve_dispatcher_stream(&mut stream, &peer, &owner, false, _root.path()),
             Err(ServiceError::Backend("dispatcher_busy".into()))
         );
         assert_eq!(
@@ -617,7 +782,13 @@ mod dispatcher_response_tests {
                 stream: server,
                 release: Some(released),
             };
-            serve_dispatcher_stream(&mut gated, &peer, &lifecycle_owner, false)
+            serve_dispatcher_stream(
+                &mut gated,
+                &peer,
+                &lifecycle_owner,
+                false,
+                Path::new("/unused"),
+            )
         });
         client
             .write_all(

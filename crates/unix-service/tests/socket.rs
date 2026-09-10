@@ -73,6 +73,17 @@ async fn production_transport_stop_then_passive_poll_preserves_quiescence() {
     let path = target.path().join("dispatcher.sock");
     let listener = bind_listener(&path, unsafe { libc::geteuid() }).unwrap();
     let server_owner = owner.clone();
+    #[cfg(target_os = "linux")]
+    let private_thread = {
+        let private = bind_listener(&target.path().join("private.sock"), unsafe {
+            libc::geteuid()
+        })
+        .unwrap();
+        let private_owner = owner.clone();
+        std::thread::spawn(move || {
+            nelomai_unix_service::serve_dispatcher_one(&private, &private_owner, true)
+        })
+    };
     // Stop performs version + stop; each passive poll only reads version.
     let server = std::thread::spawn(move || {
         for _ in 0..5 {
@@ -90,6 +101,16 @@ async fn production_transport_stop_then_passive_poll_preserves_quiescence() {
     let controller = nelomai_unix_service::UnixTunnelController::new(transport);
     assert_eq!(controller.status().await.unwrap(), TunnelStatus::Stopped);
     assert_eq!(controller.service_version().await.unwrap(), "0.2.16");
+    #[cfg(target_os = "linux")]
+    {
+        assert!(controller
+            .diagnostics()
+            .await
+            .unwrap()
+            .contains("source=persisted"));
+        private_thread.join().unwrap().unwrap();
+    }
+    #[cfg(not(target_os = "linux"))]
     assert!(controller.diagnostics().await.is_err());
     server.join().unwrap();
     assert!(!target.path().join(d::ACTIVE_ENGINE_NAME).exists());
