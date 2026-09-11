@@ -613,7 +613,7 @@ impl AppDiagnostics {
             format!("{previous}{current}")
         };
         application_log = include_android_startup_log(&self.directory, application_log);
-        application_log = tail_string(&application_log, MAX_APPLICATION_REPORT_BYTES);
+        application_log = include_refresh_log(&self.directory, application_log);
         #[cfg(desktop)]
         let network_incident_device_id = self.network_incidents.current_device_id()?;
         #[cfg(desktop)]
@@ -747,7 +747,10 @@ impl AppDiagnostics {
             &self.directory.join(CURRENT_LOG),
             MAX_APPLICATION_REPORT_BYTES,
         )?;
-        let application_log = safe_connection_intent_log(&format!("{previous}{current}"));
+        let application_log = include_refresh_log(
+            &self.directory,
+            safe_connection_intent_log(&format!("{previous}{current}")),
+        );
         let report = DiagnosticUploadRequest {
             report_id: Some(Uuid::new_v4().to_string()),
             trigger: trigger.as_str().to_string(),
@@ -791,13 +794,13 @@ impl AppDiagnostics {
             &self.directory.join(CURRENT_LOG),
             MAX_APPLICATION_REPORT_BYTES,
         )?;
-        let application_log = tail_string(
-            &if previous.is_empty() {
+        let application_log = include_refresh_log(
+            &self.directory,
+            if previous.is_empty() {
                 current
             } else {
                 format!("{previous}{current}")
             },
-            MAX_APPLICATION_REPORT_BYTES,
         );
         let resource_usage = self
             .automatic_resource_baseline
@@ -935,6 +938,21 @@ fn counter_delta(previous: Option<u64>, current: u64) -> u64 {
             current
         }
     })
+}
+
+fn include_refresh_log(directory: &Path, application_log: String) -> String {
+    // The common owner writes this separate journal, including while bootstrap
+    // is blocked. Reading it never triggers authentication or stops the tunnel.
+    const BUDGET: usize = 32 * 1024;
+    let previous =
+        read_tail(&directory.join("auth-refresh.previous.jsonl"), BUDGET / 2).unwrap_or_default();
+    let current = read_tail(&directory.join("auth-refresh.jsonl"), BUDGET).unwrap_or_default();
+    let refresh = tail_string(&format!("{previous}{current}"), BUDGET);
+    let application = tail_string(
+        &application_log,
+        MAX_APPLICATION_REPORT_BYTES - refresh.len(),
+    );
+    format!("{application}{refresh}")
 }
 
 #[cfg(target_os = "android")]
@@ -1243,6 +1261,105 @@ fn safe_connection_intent_log(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_report_includes_refresh_after_startup_and_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let event = "{\"timestamp_unix\":123,\"kind\":\"auth.refresh.complete\",\"operation_id\":\"11111111-1111-4111-8111-111111111111\",\"code\":\"saved\"}\n";
+        fs::write(directory.path().join("auth-refresh.jsonl"), event).unwrap();
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
+        assert!(
+            report.application_log.contains(event),
+            "report omitted owner refresh journal"
+        );
+        drop(diagnostics);
+        let reopened = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        assert!(reopened
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap()
+            .application_log
+            .contains(event));
+    }
+
+    #[test]
+    fn refresh_journal_is_bounded_and_unreadable_journal_does_not_break_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("auth-refresh.previous.jsonl"),
+            "old\n".repeat(20_000),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("auth-refresh.jsonl"),
+            format!("{}latest-refresh\n", "fresh\n".repeat(20_000)),
+        )
+        .unwrap();
+        let combined = include_refresh_log(
+            directory.path(),
+            format!(
+                "{}latest-application\n",
+                "я".repeat(MAX_APPLICATION_REPORT_BYTES)
+            ),
+        );
+        assert!(combined.len() <= MAX_APPLICATION_REPORT_BYTES);
+        assert!(combined.contains("latest-application\n"));
+        assert!(combined.ends_with("latest-refresh\n"));
+        fs::remove_file(directory.path().join("auth-refresh.jsonl")).unwrap();
+        fs::create_dir(directory.path().join("auth-refresh.jsonl")).unwrap();
+        assert!(diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .is_ok());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn automatic_reports_include_owner_refresh_without_startup_collection() {
+        for intent in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let diagnostics = AppDiagnostics::new(
+                directory.path().into(),
+                ResourceSnapshot::capture_for_test(),
+            )
+            .unwrap();
+            diagnostics.set_automatic_device("device-1");
+            let event = "{\"timestamp_unix\":12,\"kind\":\"auth.refresh.pending\",\"operation_id\":\"11111111-1111-4111-8111-111111111111\",\"code\":\"retryable\"}\n";
+            fs::write(directory.path().join("auth-refresh.jsonl"), event).unwrap();
+            if intent {
+                diagnostics
+                    .queue_connection_intent_report(ConnectionIntentReportTrigger::SlowRecovery, 20)
+                    .unwrap();
+            } else {
+                diagnostics
+                    .observe_automatic_tunnel(Some("connection-1"), true, 10)
+                    .unwrap();
+                diagnostics
+                    .observe_automatic_tunnel(None, false, 20)
+                    .unwrap();
+                let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+                assert!(diagnostics
+                    .materialize_automatic_report(&seal, ResourceSnapshot::capture_for_test(), None)
+                    .unwrap());
+            }
+            let candidate = diagnostics.automatic_upload_candidate(20).unwrap().unwrap();
+            assert!(candidate.report.application_log.contains(event));
+        }
+    }
 
     #[test]
     fn runtime_action_sources_keep_the_diagnostic_wire_strings() {

@@ -580,7 +580,7 @@ async fn common_host_restart_case(
             let count = refresh_counted.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(body["mode"], "recover_legacy_pending");
+                assert!(matches!(body["mode"].as_str(), Some("recover_legacy_pending" | "refresh")));
                 assert_eq!(body["source_identity"]["session_generation"], 7);
                 let mut device = body["source_identity"].clone();
                 device["id"] = body["device_id"].clone();
@@ -728,6 +728,32 @@ async fn common_host_restart_case(
         usize::from(pending_refresh)
     );
     if pending_refresh {
+        // A refresh after admission must be durable without a second RuntimeReady
+        // or a diagnostic IPC drain (manual reports read this journal directly).
+        let stale = client.access(None).await.unwrap();
+        client.access(Some(&stale)).await.unwrap();
+        let journal = selected
+            .operational_state
+            .parent()
+            .unwrap()
+            .join("diagnostics/auth-refresh.jsonl");
+        let saved = std::fs::read_to_string(&journal).unwrap_or_default();
+        assert!(
+            saved.contains("auth.refresh.begin"),
+            "ordinary refresh not persisted"
+        );
+        assert!(saved.contains("auth.refresh.complete"));
+        assert!(!saved.contains("recovered-refresh"));
+        // A failed diagnostic append must not turn a successful refresh into
+        // an authorization failure. Only this disposable fixture is changed.
+        let directory = journal.parent().unwrap();
+        let retained = directory.with_file_name("diagnostics-retained");
+        std::fs::rename(directory, &retained).unwrap();
+        std::fs::write(directory, "blocked diagnostic directory").unwrap();
+        let stale = client.access(None).await.unwrap();
+        assert!(client.access(Some(&stale)).await.is_ok());
+        std::fs::remove_file(directory).unwrap();
+        std::fs::rename(retained, directory).unwrap();
         let HostResponseV1::AuthRefreshDiagnostics { events } = client
             .owner_request(HostRequestV1::AuthRefreshDiagnostics)
             .await

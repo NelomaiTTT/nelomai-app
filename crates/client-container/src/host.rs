@@ -658,11 +658,17 @@ impl CommonHost {
             .with_app_version(&selection.target().container_version)
             .map_err(|_| HostError::RecoveryRequired)?;
         crate::startup_diagnostics::stage("host.auth_broker");
-        let broker = Arc::new(AuthBroker::new(
-            api.clone(),
-            Arc::new(storage.auth),
-            bridge.clone(),
-        )?);
+        let refresh_diagnostics_directory = storage
+            .runtime
+            .paths()
+            .operational_state
+            .parent()
+            .ok_or(HostError::RecoveryRequired)?
+            .join("diagnostics");
+        let broker = Arc::new(
+            AuthBroker::new(api.clone(), Arc::new(storage.auth), bridge.clone())?
+                .with_refresh_diagnostics(refresh_diagnostics_directory),
+        );
         bridge
             .broker
             .set(Arc::downgrade(&broker))

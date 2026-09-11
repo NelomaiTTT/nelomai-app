@@ -7,6 +7,7 @@ pub mod host;
 mod host_updater;
 mod installed_runtime;
 pub mod ipc;
+mod refresh_diagnostics;
 mod runtime_auth;
 mod selection;
 pub mod startup_diagnostics;

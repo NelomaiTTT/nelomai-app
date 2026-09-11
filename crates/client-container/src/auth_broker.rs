@@ -364,10 +364,13 @@ pub struct AuthBroker {
     issuance: Mutex<()>,
     refresh_retry: std::sync::Mutex<Option<RefreshRetry>>,
     refresh_events: std::sync::Mutex<std::collections::VecDeque<RefreshDiagnosticV1>>,
+    refresh_diagnostics_directory: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RefreshDiagnosticV1 {
+    #[serde(default)]
+    pub timestamp_unix: u64,
     pub kind: String,
     pub operation_id: String,
     pub code: String,
@@ -430,7 +433,13 @@ impl AuthBroker {
             issuance: Mutex::new(()),
             refresh_retry: std::sync::Mutex::new(None),
             refresh_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            refresh_diagnostics_directory: None,
         })
+    }
+
+    pub(crate) fn with_refresh_diagnostics(mut self, directory: std::path::PathBuf) -> Self {
+        self.refresh_diagnostics_directory = Some(directory);
+        self
     }
 
     fn record_refresh(&self, kind: &str, ticket: &BrokerRequestV1, code: &str) {
@@ -438,11 +447,21 @@ impl AuthBroker {
             if events.len() == 32 {
                 events.pop_front();
             }
-            events.push_back(RefreshDiagnosticV1 {
+            let event = RefreshDiagnosticV1 {
+                timestamp_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
                 kind: kind.into(),
                 operation_id: ticket.operation_id.clone(),
                 code: code.into(),
-            });
+            };
+            if let Some(directory) = &self.refresh_diagnostics_directory {
+                // Best effort; disk diagnostics must never fail token recovery.
+                // The event mutex also serializes append/rotation in this owner.
+                let _ = crate::refresh_diagnostics::append(directory, &event);
+            }
+            events.push_back(event);
         }
     }
 

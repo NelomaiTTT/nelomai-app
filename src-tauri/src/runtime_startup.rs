@@ -9,24 +9,6 @@ pub(crate) async fn request_ready(
 ) -> Result<(), PrivateError> {
     use nelomai_client_container::host::{HostRequestV1, HostResponseV1};
     let result = port.owner_request(HostRequestV1::RuntimeReady).await;
-    if !matches!(
-        result,
-        Err(PrivateError::Closed | PrivateError::Timeout | PrivateError::Protocol)
-    ) {
-        if let Ok(HostResponseV1::AuthRefreshDiagnostics { events }) = port
-            .owner_request(HostRequestV1::AuthRefreshDiagnostics)
-            .await
-        {
-            for event in events {
-                diagnostics.record_named(
-                    &event.kind,
-                    Some(&event.operation_id),
-                    None,
-                    Some(&event.code),
-                );
-            }
-        }
-    }
     match result {
         Ok(HostResponseV1::Done) => Ok(()),
         Ok(_) => Err(PrivateError::Protocol),
