@@ -102,9 +102,25 @@ async fn actual_reply_adapter_clears_only_known_refusal_ticket_and_permits_refre
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
-        let router = Router::new().route("/api/client/v1/auth/refresh", post(move || {
+        // Host-side tests use the desktop broker; Android keeps legacy refresh.
+        let refresh_path = if cfg!(target_os = "android") {
+            "/api/client/v1/auth/refresh"
+        } else {
+            "/api/client/v1/auth/refresh-recoverable"
+        };
+        let router = Router::new().route(refresh_path, post(move |Json(body): Json<serde_json::Value>| {
             let count = count.clone();
             async move {
+                assert_eq!(body["refresh_token"], "initial-refresh");
+                if cfg!(target_os = "android") {
+                    assert_eq!(body, json!({"refresh_token":"initial-refresh"}));
+                } else {
+                    assert_eq!(body["contract_version"], 1);
+                    assert_eq!(body["mode"], "refresh");
+                    assert_eq!(body["device_id"], "device");
+                    assert_eq!(body["install_secret"], "synthetic-install");
+                    assert!(!body["operation_id"].as_str().unwrap().is_empty());
+                }
                 count.fetch_add(1, Ordering::SeqCst);
                 Json(json!({"api_version":"1","request_id":"synthetic","token_type":"Bearer",
                     "access_token":"successor-access","access_expires_in":900,"refresh_token":"successor-refresh","refresh_expires_in":3600,
