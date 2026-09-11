@@ -2,6 +2,32 @@ use nelomai_client_storage::*;
 use nelomai_contracts::{RuntimeIdentity, RuntimeSlot};
 
 #[test]
+fn old_refresh_ticket_remains_readable_and_new_protocol_is_never_silently_dropped() {
+    let old = serde_json::json!({"kind":"refresh", "operation_id":"11111111-1111-4111-8111-111111111111",
+        "attempt":1, "auth_epoch":0, "source_identity":null, "source_device_id":"device-a", "resume":null});
+    let ticket: BrokerRequestV1 = serde_json::from_value(old.clone()).unwrap();
+    assert!(ticket.refresh.is_none());
+    assert!(serde_json::to_value(&ticket)
+        .unwrap()
+        .get("refresh")
+        .is_none());
+    let mut new = old;
+    new["refresh"] = serde_json::json!({"contract_version":1, "mode":"refresh"});
+    let ticket: BrokerRequestV1 = serde_json::from_value(new).unwrap();
+    assert_eq!(
+        serde_json::to_value(ticket).unwrap()["refresh"]["contract_version"],
+        1
+    );
+    let mut unknown = serde_json::to_value(StoredRecoverableRefreshV1 {
+        contract_version: 1,
+        mode: "refresh".into(),
+    })
+    .unwrap();
+    unknown["unknown"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<StoredRecoverableRefreshV1>(unknown).is_err());
+}
+
+#[test]
 fn malformed_protected_broker_metadata_fails_closed_without_new_install() {
     let legacy: StoredAuth =
         serde_json::from_str(r#"{"install_secret":"synthetic-install"}"#).unwrap();
@@ -109,6 +135,7 @@ fn transition_resume_proof_requires_exact_clean_receipt_and_full_access_evidence
         retry_after_seconds: Some(1),
     });
     let ticket = BrokerRequestV1 {
+        refresh: None,
         kind: BrokerRequestKind::Resume,
         operation_id: "22222222-2222-4222-8222-222222222222".into(),
         attempt: 1,
@@ -214,6 +241,7 @@ fn legacy_transition_tickets_reject_nonlegacy_source_provenance() {
         family: "family-a".into(),
         next_attempt: 1,
         pending_request: Some(BrokerRequestV1 {
+            refresh: None,
             kind: BrokerRequestKind::LegacyRefresh,
             operation_id: "11111111-1111-4111-8111-111111111111".into(),
             attempt: 1,

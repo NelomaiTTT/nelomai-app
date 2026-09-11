@@ -715,7 +715,13 @@ impl RemoteOwner {
                         deadline,
                     );
                 }
-                let current = observation.access.ok_or(PrivateError::RecoveryRequired)?;
+                let current = match observation.access {
+                    Some(access) => access,
+                    None => broker
+                        .pending_refresh_access()
+                        .await
+                        .map_err(broker_error)?,
+                };
                 self.check_target(&current)?;
                 if stamp != ScopeStamp::from_access(&current) {
                     return Err(PrivateError::Cancelled);
@@ -740,6 +746,18 @@ impl RemoteOwner {
                     .await
                     .map_err(broker_error)?;
                 self.check_target(&access)?;
+                if !matches!(
+                    self.control(
+                        ControlV1::CheckScope {
+                            scope: scope(&access)
+                        },
+                        deadline
+                    )
+                    .await?,
+                    ControlAckV1::Done
+                ) {
+                    return Err(PrivateError::Protocol);
+                }
                 return broker
                     .with_current_access(&access, || {
                         self.live(deadline).map_err(|_| BrokerError::Cancelled)?;

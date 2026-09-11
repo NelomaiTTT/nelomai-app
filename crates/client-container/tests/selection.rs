@@ -527,25 +527,31 @@ fn first_start_persists_latest_only_after_real_storage_startup_succeeds() {
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_admits_real_private_child_and_preserves_generation_without_access() {
-    common_host_restart_case(false, false, false).await;
+    common_host_restart_case(false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_cancels_prepared_apply_before_restart_without_resurrecting_stable() {
-    common_host_restart_case(true, false, false).await;
+    common_host_restart_case(true, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_retries_selected_binding_when_exact_old_source_clear_failed() {
-    common_host_restart_case(false, true, false).await;
+    common_host_restart_case(false, true, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn common_host_rejects_changed_source_before_binding_selected_empty_runtime() {
-    common_host_restart_case(false, false, true).await;
+    common_host_restart_case(false, false, true, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn common_host_recovers_pending_refresh_before_real_runtime_ready_admission() {
+    common_host_restart_case(false, false, false, true).await;
 }
 
 #[cfg(unix)]
@@ -553,6 +559,7 @@ async fn common_host_restart_case(
     cancel_before_restart: bool,
     fail_source_clear: bool,
     change_source: bool,
+    pending_refresh: bool,
 ) {
     use axum::{routing::post, Json, Router};
     use nelomai_client_container::{host::*, ipc::*};
@@ -566,7 +573,25 @@ async fn common_host_restart_case(
     let records = Records::default();
     let resume_calls = Arc::new(AtomicUsize::new(0));
     let counted = resume_calls.clone();
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let refresh_counted = refresh_calls.clone();
     let router = Router::new()
+        .route("/api/client/v1/auth/refresh-recoverable", post(move |Json(body): Json<Value>| {
+            let count = refresh_counted.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(body["mode"], "recover_legacy_pending");
+                assert_eq!(body["source_identity"]["session_generation"], 7);
+                let mut device = body["source_identity"].clone();
+                device["id"] = body["device_id"].clone();
+                device["name"] = json!("synthetic");
+                device["platform"] = json!("android");
+                Json(json!({"api_version":"1", "request_id":"synthetic", "device":device,
+                    "token_type":"Bearer", "access_token":"recovered-access", "refresh_token":"recovered-refresh",
+                    "access_expires_in":900, "refresh_expires_in":3600,
+                    "access":{"state":"active", "can_login":true, "can_connect":true, "expires_at":null}}))
+            }
+        }))
         .route(
             "/api/client/v1/connections/runtime-switch/reconcile",
             post(|Json(body): Json<Value>| async move {
@@ -629,6 +654,21 @@ async fn common_host_restart_case(
         "missing access must not erase confirmed generation"
     );
     state.access_token = Some("synthetic-access".into());
+    if pending_refresh {
+        let meta = state.broker.as_mut().unwrap();
+        meta.next_attempt += 1;
+        meta.pending_request = Some(BrokerRequestV1 {
+            kind: BrokerRequestKind::Refresh,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            auth_epoch: state.auth_epoch,
+            attempt: meta.next_attempt,
+            source_identity: state.confirmed_identity.clone(),
+            source_device_id: meta.confirmed_device_id.clone(),
+            prior_login_outcome_unknown: false,
+            resume: None,
+            refresh: None,
+        });
+    }
     auth.save(&state).unwrap();
     let view = host.selection().await.unwrap();
     let paths = view.runtime_paths().unwrap();
@@ -661,13 +701,18 @@ async fn common_host_restart_case(
     let client = PrivateRuntimeAuthClient::new(child_socket, child, Arc::new(NoNativeWork));
     assert!(client.access(None).await.is_err());
     assert!(client.check_start_barrier().is_err());
-    assert!(matches!(
-        client
-            .owner_request(HostRequestV1::RuntimeReady)
-            .await
-            .unwrap(),
-        HostResponseV1::Done
-    ));
+    let ready = client.owner_request(HostRequestV1::RuntimeReady).await;
+    assert!(
+        matches!(ready, Ok(HostResponseV1::Done)),
+        "ready={ready:?}, refresh_calls={}, pending={:?}",
+        refresh_calls.load(Ordering::SeqCst),
+        auth.load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .pending_request
+    );
     assert_eq!(
         client
             .access(None)
@@ -678,6 +723,34 @@ async fn common_host_restart_case(
         Some(7)
     );
     assert!(client.check_start_barrier().is_ok());
+    assert_eq!(
+        refresh_calls.load(Ordering::SeqCst),
+        usize::from(pending_refresh)
+    );
+    if pending_refresh {
+        let HostResponseV1::AuthRefreshDiagnostics { events } = client
+            .owner_request(HostRequestV1::AuthRefreshDiagnostics)
+            .await
+            .unwrap()
+        else {
+            panic!("expected refresh diagnostics")
+        };
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "auth.refresh.replay"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "auth.refresh.complete"));
+        let safe = serde_json::to_string(&events).unwrap();
+        for secret in [
+            "synthetic-access",
+            "synthetic-refresh",
+            "recovered-access",
+            "recovered-refresh",
+        ] {
+            assert!(!safe.contains(secret));
+        }
+    }
     assert!(record.cleanup_snapshot().unwrap().auth_scope.is_some());
     let installed = host.native_target().clone();
     let _reply = client

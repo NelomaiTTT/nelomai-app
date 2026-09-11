@@ -726,6 +726,20 @@ async fn panel(state: Arc<Panel>) -> (nelomai_client_api::ClientApi, tokio::task
         .route("/api/client/v1/bootstrap", get(bootstrap))
         .route("/api/client/v1/auth/refresh", post(refresh))
         .route(
+            "/api/client/v1/auth/refresh-recoverable",
+            post(
+                |state: State<Arc<Panel>>, Json(body): Json<Value>| async move {
+                    let Json(mut reply) = refresh(state, Json(body.clone())).await?;
+                    let mut device = body["source_identity"].clone();
+                    device["id"] = body["device_id"].clone();
+                    device["name"] = json!("synthetic");
+                    device["platform"] = json!("macos");
+                    reply["device"] = device;
+                    Ok::<_, StatusCode>(Json(reply))
+                },
+            ),
+        )
+        .route(
             "/api/client/v1/connections/runtime-switch/reconcile",
             post(reconcile),
         )
@@ -1026,6 +1040,18 @@ async fn lost_bound_refresh_response_keeps_pending_ticket_and_never_rotates_agai
     assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
     drop(broker);
     let before = store.load().unwrap().unwrap();
+    assert!(
+        before
+            .broker
+            .as_ref()
+            .unwrap()
+            .pending_request
+            .as_ref()
+            .unwrap()
+            .refresh
+            .is_none(),
+        "transition-specific legacy HTTP must never be labelled as an ordinary idempotent request"
+    );
     assert_eq!(
         before
             .broker
@@ -1302,6 +1328,7 @@ async fn enrolled_source_snapshot_rejects_an_incompatible_pending_issuance() {
     auth.broker.as_mut().unwrap().confirmed_device_id = Some("device-a".into());
     auth.broker.as_mut().unwrap().next_attempt = 1;
     auth.broker.as_mut().unwrap().pending_request = Some(BrokerRequestV1 {
+        refresh: None,
         kind: BrokerRequestKind::Refresh,
         operation_id: "11111111-1111-4111-8111-111111111111".into(),
         attempt: 1,
@@ -1627,6 +1654,128 @@ async fn coordinator_runs_the_real_broker_flow_and_recovery_stays_complete() {
     }
     assert_eq!(control.writer_acquired.load(Ordering::SeqCst), 1);
     assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn updated_runtime_recovers_source_refresh_before_any_cleanup_or_admission() {
+    let state = Arc::new(Panel::default());
+    state.bound_refresh.store(1, Ordering::SeqCst);
+    state.fail_refresh.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let mut auth = store.load().unwrap().unwrap();
+    let meta = auth.broker.as_mut().unwrap();
+    meta.next_attempt = 1;
+    meta.pending_request = Some(BrokerRequestV1 {
+        kind: BrokerRequestKind::Refresh,
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        attempt: 1,
+        auth_epoch: auth.auth_epoch,
+        source_identity: auth.confirmed_identity.clone(),
+        source_device_id: meta.confirmed_device_id.clone(),
+        prior_login_outcome_unknown: false,
+        resume: None,
+        refresh: None,
+    });
+    store.save(&auth).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("common")).unwrap();
+    std::fs::write(
+        root.path().join("common/runtime-selection-v1.json"),
+        SlotSelectionV1 {
+            container_version: "0.2.17".into(),
+            selected_slot: RuntimeSlot::Latest,
+            pending_slot: None,
+        }
+        .to_persisted_bytes()
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let control = Arc::new(SwitchControl::default());
+    let broker = Arc::new(AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap());
+    let coordinator = SwitchCoordinator::open(owner.clone(), manifest_for("0.2.17", "0.2.17"))
+        .unwrap()
+        .attach(broker, control.clone())
+        .require_initial_transition(RuntimeSlot::Latest);
+    assert!(coordinator.recover_refresh_before_start().await.is_err());
+    assert!(coordinator.before_tunnel_start().await.is_err());
+    assert_eq!(control.handoffs.load(Ordering::SeqCst), 0);
+    assert_eq!(control.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 0);
+    drop(coordinator);
+    state.fail_refresh.store(0, Ordering::SeqCst);
+    let broker = Arc::new(AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap());
+    let coordinator = SwitchCoordinator::open(owner, manifest_for("0.2.17", "0.2.17"))
+        .unwrap()
+        .attach(broker, control.clone())
+        .require_initial_transition(RuntimeSlot::Latest);
+    coordinator.recover_refresh_before_start().await.unwrap();
+    assert_eq!(
+        store.load().unwrap().unwrap().confirmed_identity,
+        auth.confirmed_identity
+    );
+    assert_eq!(control.handoffs.load(Ordering::SeqCst), 0);
+    coordinator.before_tunnel_start().await.unwrap();
+    let mut current = store.load().unwrap().unwrap();
+    assert_eq!(
+        current
+            .confirmed_identity
+            .as_ref()
+            .unwrap()
+            .container_version,
+        "0.2.17"
+    );
+    assert_eq!(control.completions.load(Ordering::SeqCst), 1);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 1);
+    let journal_path = root.path().join("common/runtime-switch-v1.json");
+    let journal_before = std::fs::read(&journal_path).unwrap();
+    let authorities_before = current
+        .broker
+        .as_ref()
+        .unwrap()
+        .transition_authorities
+        .clone();
+    let meta = current.broker.as_mut().unwrap();
+    meta.next_attempt += 1;
+    meta.pending_request = Some(BrokerRequestV1 {
+        kind: BrokerRequestKind::Refresh,
+        operation_id: uuid::Uuid::new_v4().to_string(),
+        attempt: meta.next_attempt,
+        auth_epoch: current.auth_epoch,
+        source_identity: current.confirmed_identity.clone(),
+        source_device_id: meta.confirmed_device_id.clone(),
+        prior_login_outcome_unknown: false,
+        resume: None,
+        refresh: None,
+    });
+    store.save(&current).unwrap();
+    drop(coordinator);
+    let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap());
+    let restarted = SwitchCoordinator::open(owner, manifest_for("0.2.17", "0.2.17"))
+        .unwrap()
+        .attach(broker, control.clone())
+        .require_initial_transition(RuntimeSlot::Latest);
+    restarted.recover_refresh_before_start().await.unwrap();
+    restarted.before_tunnel_start().await.unwrap();
+    assert_eq!(std::fs::read(journal_path).unwrap(), journal_before);
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .unwrap()
+            .broker
+            .unwrap()
+            .transition_authorities,
+        authorities_before
+    );
+    assert_eq!(
+        control.completions.load(Ordering::SeqCst),
+        1,
+        "completed transition must not be repeated"
+    );
     server.abort();
 }
 

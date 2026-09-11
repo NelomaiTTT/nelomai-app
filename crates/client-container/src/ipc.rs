@@ -30,6 +30,10 @@ pub enum PrivateError {
     Closed,
     #[error("private request deadline exceeded")]
     Timeout,
+    #[error("authentication refresh is pending")]
+    RefreshPending,
+    #[error("authentication refresh was rejected")]
+    RefreshRejected,
     #[error("invalid private protocol")]
     Protocol,
     #[error("private request cancelled")]

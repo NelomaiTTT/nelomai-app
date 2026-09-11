@@ -236,11 +236,21 @@ impl fmt::Debug for RuntimeResumeRequest {
 }
 
 /// The panel calls this field runtime_slot, unlike the internal identity DTO.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct RuntimeIdentityWire {
     #[serde(flatten)]
     target: RuntimeTarget,
     session_generation: Option<u64>,
+}
+fn serialize_identity<S: serde::Serializer>(
+    identity: &RuntimeIdentity,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    RuntimeIdentityWire {
+        target: RuntimeTarget::from_identity(identity),
+        session_generation: identity.session_generation,
+    }
+    .serialize(serializer)
 }
 fn deserialize_identity<'de, D: serde::Deserializer<'de>>(
     de: D,
@@ -497,6 +507,47 @@ impl fmt::Debug for LoginRequest {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct RefreshRequest {
     pub refresh_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshModeV1 {
+    Refresh,
+    RecoverLegacyPending,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct RecoverableRefreshRequest {
+    pub contract_version: u32,
+    pub operation_id: String,
+    pub device_id: String,
+    #[serde(serialize_with = "serialize_identity")]
+    pub source_identity: RuntimeIdentity,
+    pub mode: RefreshModeV1,
+    pub refresh_token: String,
+    pub install_secret: String,
+}
+impl fmt::Debug for RecoverableRefreshRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecoverableRefreshRequest")
+            .field("operation_id", &self.operation_id)
+            .field("mode", &self.mode)
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+impl ClientApi {
+    pub async fn refresh_recoverable(
+        &self,
+        request: &RecoverableRefreshRequest,
+    ) -> Result<TokenResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("auth/refresh-recoverable")?)
+                .json(request),
+        )
+        .await
+    }
 }
 
 impl fmt::Debug for RefreshRequest {

@@ -348,12 +348,24 @@ async fn runtime_owner_port_binds_trusted_target_and_keeps_migration_credentials
     );
     assert_eq!(state.calls.load(Ordering::SeqCst), 0);
     let mut legacy = store.load().unwrap().unwrap();
+    state.lose_refresh.store(true, Ordering::SeqCst);
+    let old = port.access(None).await.unwrap();
+    assert!(port.access(Some(&old)).await.is_err());
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    tokio::time::resume();
+    assert!(wrong.access(None).await.is_err());
+    assert_eq!(
+        state.refresh_requests.lock().unwrap().len(),
+        1,
+        "foreign runtime must not trigger pending recovery"
+    );
     legacy.session_generation = None;
     legacy.confirmed_identity = None;
     store.save(&legacy).unwrap();
     assert!(port.access(None).await.is_err());
     assert_eq!(store.load().unwrap().unwrap(), legacy);
-    assert_eq!(state.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
     server.abort();
 }
 fn response(generation: u64, access: &str) -> Value {
@@ -365,6 +377,12 @@ fn response(generation: u64, access: &str) -> Value {
 }
 #[derive(Default)]
 struct Panel {
+    hold_refresh_result: AtomicBool,
+    result_saved: Notify,
+    zero_refreshes: AtomicUsize,
+    refresh_results: Mutex<std::collections::HashMap<String, Value>>,
+    refresh_requests: Mutex<Vec<Value>>,
+    lose_refresh: AtomicBool,
     calls: AtomicUsize,
     entered: Notify,
     release: Notify,
@@ -415,7 +433,10 @@ async fn login(
     ))
 }
 async fn refresh(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
-    assert_eq!(body["refresh_token"], "initial-refresh");
+    assert!(matches!(
+        body["refresh_token"].as_str(),
+        Some("initial-refresh" | "successor-refresh")
+    ));
     panel.calls.fetch_add(1, Ordering::SeqCst);
     panel.entered.notify_one();
     if panel.held.load(Ordering::SeqCst) {
@@ -431,6 +452,13 @@ async fn refresh(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Js
     );
     if panel.foreign_refresh_device.load(Ordering::SeqCst) {
         reply["device"]["id"] = json!("another-device");
+    }
+    if panel
+        .zero_refreshes
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+    {
+        reply["access_expires_in"] = json!(0);
     }
     Json(reply)
 }
@@ -466,6 +494,10 @@ async fn panel(state: Arc<Panel>) -> (ClientApi, tokio::task::JoinHandle<()>) {
     let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
     let router = Router::new()
         .route("/api/client/v1/auth/refresh", post(refresh))
+        .route(
+            "/api/client/v1/auth/refresh-recoverable",
+            post(recoverable_refresh),
+        )
         .route("/api/client/v1/auth/login", post(login))
         .route("/api/client/v1/auth/logout-runtime", post(logout))
         .route("/api/client/v1/auth/runtime/resume", post(resume))
@@ -476,6 +508,185 @@ async fn panel(state: Arc<Panel>) -> (ClientApi, tokio::task::JoinHandle<()>) {
             axum::serve(listener, router).await.unwrap();
         }),
     )
+}
+
+async fn recoverable_refresh(
+    State(state): State<Arc<Panel>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
+    state.refresh_requests.lock().unwrap().push(body.clone());
+    let id = body["operation_id"].as_str().unwrap().to_owned();
+    if let Some(value) = state.refresh_results.lock().unwrap().get(&id).cloned() {
+        return Ok(Json(value));
+    }
+    let Json(value) = refresh(State(state.clone()), Json(body)).await;
+    state
+        .refresh_results
+        .lock()
+        .unwrap()
+        .insert(id, value.clone());
+    state.result_saved.notify_one();
+    if state.hold_refresh_result.load(Ordering::SeqCst) {
+        std::future::pending::<()>().await;
+    }
+    if state.lose_refresh.swap(false, Ordering::SeqCst) {
+        return Err(axum::http::StatusCode::BAD_GATEWAY);
+    }
+    Ok(Json(value))
+}
+
+#[tokio::test]
+async fn lost_refresh_response_recovers_after_owner_restart_without_login() {
+    let state = Arc::new(Panel::default());
+    state.lose_refresh.store(true, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let stop = Arc::new(Stop::default());
+    let broker = AuthBroker::new(api.clone(), store.clone(), stop.clone()).unwrap();
+    let access = broker.access_token(None).await.unwrap();
+    assert!(broker.access_token(Some(&access)).await.is_err());
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .pending_request
+        .is_some());
+    drop(broker);
+    let broker = AuthBroker::new(api, store.clone(), stop).unwrap();
+    broker.recover_pending_refresh().await.unwrap();
+    let recovered = broker.access_token(None).await.unwrap();
+    assert_ne!(recovered.access_token(), access.access_token());
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    assert!(state.login_requests.lock().unwrap().is_empty());
+    let requests = state.refresh_requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .pending_request
+        .is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn expired_replay_atomically_schedules_next_operation_and_bounds_attempts() {
+    let state = Arc::new(Panel::default());
+    state.zero_refreshes.store(2, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let stop = Arc::new(Stop::default());
+    let broker = AuthBroker::new(api.clone(), store.clone(), stop.clone()).unwrap();
+    let old = broker.access_token(None).await.unwrap();
+    assert!(matches!(
+        broker.access_token(Some(&old)).await,
+        Err(BrokerError::RefreshPending)
+    ));
+    assert_eq!(state.calls.load(Ordering::SeqCst), 2);
+    let saved = store.load().unwrap().unwrap();
+    assert_eq!(saved.refresh_token.as_deref(), Some("successor-refresh"));
+    let pending = saved.broker.unwrap().pending_request.unwrap();
+    assert_eq!(pending.refresh.unwrap().mode, "refresh");
+    {
+        let requests = state.refresh_requests.lock().unwrap();
+        assert_ne!(requests[0]["operation_id"], requests[1]["operation_id"]);
+        assert_ne!(requests[1]["operation_id"], pending.operation_id);
+        assert_eq!(requests[1]["refresh_token"], "successor-refresh");
+    }
+    drop(broker);
+    let broker = AuthBroker::new(api, store.clone(), stop.clone()).unwrap();
+    broker.recover_pending_refresh().await.unwrap();
+    assert_eq!(state.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        state.refresh_requests.lock().unwrap()[2]["operation_id"],
+        pending.operation_id
+    );
+    assert_eq!(stop.0.load(Ordering::SeqCst), 0);
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .pending_request
+        .is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn cancelled_pending_refresh_reuses_uuid_after_restart() {
+    let state = Arc::new(Panel::default());
+    state.hold_refresh_result.store(true, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = auth_store();
+    let broker =
+        Arc::new(AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop::default())).unwrap());
+    let old = broker.access_token(None).await.unwrap();
+    let caller = broker.clone();
+    let task = tokio::spawn(async move { caller.access_token(Some(&old)).await });
+    state.result_saved.notified().await;
+    task.abort();
+    let _ = task.await;
+    let pending = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .pending_request
+        .unwrap();
+    drop(broker);
+    let reopened = AuthBroker::new(api, store, Arc::new(Stop::default())).unwrap();
+    reopened.recover_pending_refresh().await.unwrap();
+    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.refresh_requests.lock().unwrap()[1]["operation_id"],
+        pending.operation_id
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn refresh_rejections_never_downgrade_and_retry_after_cannot_overflow() {
+    for status in [404, 429] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = Router::new().fallback(move || {
+            let calls = observed.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (axum::http::StatusCode::from_u16(status).unwrap(), [("retry-after", u64::MAX.to_string())],
+                    Json(json!({"code":"refresh_rate_limited", "message":"synthetic", "request_id":"test"})))
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let store = auth_store();
+        let broker = AuthBroker::new(api, store.clone(), Arc::new(Stop::default())).unwrap();
+        let old = broker.access_token(None).await.unwrap();
+        let first = broker.access_token(Some(&old)).await;
+        assert!(matches!(
+            first,
+            Err(BrokerError::RefreshPending | BrokerError::RefreshRejected)
+        ));
+        let second = broker.access_token(None).await;
+        assert!(matches!(
+            second,
+            Err(BrokerError::RefreshPending | BrokerError::RefreshRejected)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.load().unwrap().unwrap().refresh_token.as_deref(),
+            Some("initial-refresh")
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -520,7 +731,7 @@ async fn ordinary_refresh_rejects_foreign_device_with_same_runtime_identity() {
     assert!(retained.broker.unwrap().pending_request.is_some());
     assert!(matches!(
         broker.access_token(None).await,
-        Err(BrokerError::RecoveryRequired)
+        Err(BrokerError::RefreshRejected)
     ));
     assert_eq!(state.calls.load(Ordering::SeqCst), 1);
     server.abort();
@@ -1089,7 +1300,10 @@ async fn refresh_timeout_exposes_recovery_instead_of_retrying_old_proof_and_scop
     state.entered.notified().await;
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(10)).await;
-    assert!(matches!(task.await.unwrap(), Err(BrokerError::Timeout)));
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(BrokerError::RefreshPending)
+    ));
     assert_eq!(
         broker.auth_state().await.unwrap(),
         BrokerAuthState::RecoveryRequired
@@ -1253,9 +1467,19 @@ async fn protected_ticket_and_result_write_failures_never_issue_or_reuse_uncerta
                 reopened.auth_state().await.unwrap(),
                 BrokerAuthState::RecoveryRequired
             );
-            assert!(reopened.access_token(Some(&old)).await.is_err());
+            assert_eq!(
+                reopened
+                    .access_token(Some(&old))
+                    .await
+                    .unwrap()
+                    .access_token(),
+                "successor-access"
+            );
         }
-        assert_eq!(state.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(
+            state.calls.load(Ordering::SeqCst),
+            usize::from((write, after) != (1, false))
+        );
         server.abort();
     }
 }

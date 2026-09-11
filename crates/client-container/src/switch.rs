@@ -708,6 +708,14 @@ impl SwitchCoordinator {
         Ok(())
     }
 
+    pub async fn recover_refresh_before_start(&self) -> Result<(), SwitchError> {
+        let _execution = self.execution.lock().await;
+        if let Some(broker) = &self.broker {
+            broker.recover_pending_refresh().await?;
+        }
+        Ok(())
+    }
+
     pub async fn before_tunnel_start(&self) -> Result<(), SwitchError> {
         let _execution = self.execution.lock().await;
         self.before_tunnel_start_locked_for(None).await

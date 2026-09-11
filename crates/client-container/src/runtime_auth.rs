@@ -468,8 +468,12 @@ fn map_error(error: BrokerError) -> CoreError {
         BrokerError::Storage(_) => CoreError::Storage,
         BrokerError::AuthenticationOutcomeUnknown => CoreError::AuthenticationOutcomeUnknown,
         BrokerError::AccessUnavailable => CoreError::AccessExpired,
-        BrokerError::RecoveryRequired => CoreError::AuthRecoveryRequired,
-        BrokerError::Timeout => CoreError::Api(nelomai_client_core::CoreApiError::Retryable),
+        BrokerError::RecoveryRequired | BrokerError::RefreshRejected => {
+            CoreError::AuthRecoveryRequired
+        }
+        BrokerError::Timeout | BrokerError::RefreshPending => {
+            CoreError::Api(nelomai_client_core::CoreApiError::Retryable)
+        }
     }
 }
 #[async_trait]
@@ -538,22 +542,29 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
     async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
         // Reject a replaced runtime before any refresh side effect. Generation
         // can evolve within the bound target; it is not a launch-time pin.
-        let current =
-            self.check_target(self.broker.access_token(None).await.map_err(map_error)?)?;
+        let (_, observation) = self
+            .broker
+            .observe_access_stamped()
+            .await
+            .map_err(map_error)?;
+        let current = self.check_target(match observation.access {
+            Some(access) => access,
+            None => self
+                .broker
+                .pending_refresh_access()
+                .await
+                .map_err(map_error)?,
+        })?;
         self.admission.check(&current)?;
-        match stale {
-            None => Ok(current),
-            Some(stale) => {
-                let access = self.check_target(
-                    self.broker
-                        .access_token(Some(stale))
-                        .await
-                        .map_err(map_error)?,
-                )?;
-                self.admission.check(&access)?;
-                Ok(access)
-            }
-        }
+        let stamp = crate::auth_broker::ScopeStamp::from_access(&current);
+        let access = self.check_target(
+            self.broker
+                .access_token_fenced(&stamp, stale)
+                .await
+                .map_err(map_error)?,
+        )?;
+        self.admission.check(&access)?;
+        Ok(access)
     }
     async fn logout(&self) -> Result<(), CoreError> {
         self.broker.logout().await.map_err(map_error)?;

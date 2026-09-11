@@ -4,6 +4,18 @@ import { StartupRetry } from "./startup-retry";
 describe("startup admission retry", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+  it("deduplicates refresh recovery and disposes its timer", () => {
+    const retry = new StartupRetry();
+    let attempts = 0;
+    retry.schedule("auth_refresh_pending", () => { attempts++; });
+    retry.schedule("auth_refresh_pending", () => { attempts++; });
+    vi.advanceTimersByTime(5000);
+    expect(attempts).toBe(1);
+    retry.schedule("auth_refresh_pending", () => { attempts++; });
+    retry.dispose();
+    vi.runAllTimers();
+    expect(attempts).toBe(1);
+  });
   it("resumes the screen after pending admission without a second click", () => {
     const retry = new StartupRetry();
     let view = "pending";

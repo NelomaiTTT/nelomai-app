@@ -195,6 +195,8 @@ pub struct StoredResumeArgumentsV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerRequestV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<StoredRecoverableRefreshV1>,
     pub kind: BrokerRequestKind,
     pub operation_id: String,
     pub attempt: u64,
@@ -205,6 +207,13 @@ pub struct BrokerRequestV1 {
     #[serde(default)]
     pub prior_login_outcome_unknown: bool,
     pub resume: Option<StoredResumeArgumentsV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredRecoverableRefreshV1 {
+    pub contract_version: u32,
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,6 +489,14 @@ impl AuthStoreV1 {
                 return Err(StorageError::RecoveryRequired("invalid push cleanup epoch"));
             }
             let validate_request = |request: &BrokerRequestV1| -> Result<(), StorageError> {
+                if let Some(refresh) = &request.refresh {
+                    if request.kind != BrokerRequestKind::Refresh
+                        || refresh.contract_version != 1
+                        || !matches!(refresh.mode.as_str(), "refresh" | "recover_legacy_pending")
+                    {
+                        return Err(StorageError::RecoveryRequired("invalid refresh protocol"));
+                    }
+                }
                 if request.operation_id.is_empty()
                     || request.operation_id.len() > 128
                     || request.attempt == 0

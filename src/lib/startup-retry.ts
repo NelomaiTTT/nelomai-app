@@ -4,7 +4,7 @@ export class StartupRetry {
   private disposed = false;
   schedule(code: string | null, retry: () => void) {
     this.cancel();
-    if (this.disposed || code !== "runtime_startup_pending") return;
+    if (this.disposed || (code !== "runtime_startup_pending" && code !== "auth_refresh_pending")) return;
     this.timer = setTimeout(() => {
       this.timer = null;
       retry();

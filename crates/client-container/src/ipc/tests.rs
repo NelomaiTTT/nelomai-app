@@ -1163,7 +1163,7 @@ async fn private_access_during_refresh(stale_request: bool, fail: bool) {
     let observed = calls.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
-    let router = axum::Router::new().route("/api/client/v1/auth/refresh", axum::routing::post(move || {
+    let router = axum::Router::new().route("/api/client/v1/auth/refresh-recoverable", axum::routing::post(move || {
         let incoming = incoming.clone();
         let released = released.clone();
         let observed = observed.clone();
@@ -1218,7 +1218,9 @@ async fn private_access_during_refresh(stale_request: bool, fail: bool) {
         assert!(refreshed.is_err());
         assert!(matches!(
             result,
-            Err(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            Err(nelomai_client_core::CoreError::Api(
+                nelomai_client_core::CoreApiError::Retryable
+            ))
         ));
         assert!(fixture.client.access(None).await.is_err());
         assert!(fixture

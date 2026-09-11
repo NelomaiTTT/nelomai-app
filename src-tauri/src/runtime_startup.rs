@@ -8,7 +8,26 @@ pub(crate) async fn request_ready(
     diagnostics: &crate::diagnostics::AppDiagnostics,
 ) -> Result<(), PrivateError> {
     use nelomai_client_container::host::{HostRequestV1, HostResponseV1};
-    match port.owner_request(HostRequestV1::RuntimeReady).await {
+    let result = port.owner_request(HostRequestV1::RuntimeReady).await;
+    if !matches!(
+        result,
+        Err(PrivateError::Closed | PrivateError::Timeout | PrivateError::Protocol)
+    ) {
+        if let Ok(HostResponseV1::AuthRefreshDiagnostics { events }) = port
+            .owner_request(HostRequestV1::AuthRefreshDiagnostics)
+            .await
+        {
+            for event in events {
+                diagnostics.record_named(
+                    &event.kind,
+                    Some(&event.operation_id),
+                    None,
+                    Some(&event.code),
+                );
+            }
+        }
+    }
+    match result {
         Ok(HostResponseV1::Done) => Ok(()),
         Ok(_) => Err(PrivateError::Protocol),
         Err(error) => {
@@ -20,6 +39,8 @@ pub(crate) async fn request_ready(
                     PrivateError::RecoveryRequired => "runtime_admission_pending",
                     PrivateError::Timeout => "runtime_admission_timeout",
                     PrivateError::Service => "runtime_admission_service_unavailable",
+                    PrivateError::RefreshPending => "auth_refresh_pending",
+                    PrivateError::RefreshRejected => "auth_refresh_rejected",
                     _ => "runtime_admission_rejected",
                 }),
             );
@@ -58,7 +79,10 @@ impl RuntimeStartup {
             match self.ensure_ready(ready()).await {
                 Ok(()) => return Ok(()),
                 Err(
-                    PrivateError::RecoveryRequired | PrivateError::Service | PrivateError::Timeout,
+                    PrivateError::RecoveryRequired
+                    | PrivateError::Service
+                    | PrivateError::Timeout
+                    | PrivateError::RefreshPending,
                 ) => {
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     delay = (delay * 2).min(30);

@@ -120,6 +120,7 @@
   let startupKickoffTimer: number | null = null;
   let startupSlow = $state(false);
   let startupPending = $state(false);
+  let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
   let runtimeStateBusy = false;
   let splitTunnelState = $state<SplitTunnelState | null>(null);
@@ -471,6 +472,7 @@
   async function restore() {
     startupRetry.cancel();
     startupPending = false;
+    refreshPending = false;
     busy = true;
     localStopPendingCleanup = false;
     error = null;
@@ -486,7 +488,8 @@
       await applyBootstrap(response);
     } catch (reason) {
       const code = commandCode(reason);
-      startupPending = code === "runtime_startup_pending";
+      refreshPending = code === "auth_refresh_pending";
+      startupPending = code === "runtime_startup_pending" || refreshPending;
       startupRetry.schedule(code, retryPendingStartup);
       if (code === "signed_out") {
         phase = "signed_out";
@@ -1178,7 +1181,7 @@
     <div class="header-actions">
       <span class="status" data-phase={phase}>
         <span aria-hidden="true"></span>
-        {startupPending ? "Подготовка приложения" : localStopPendingCleanup ? "Туннель выключен" : phaseLabels[phase]}
+        {startupPending ? (refreshPending ? "Восстановление соединения" : "Подготовка приложения") : localStopPendingCleanup ? "Туннель выключен" : phaseLabels[phase]}
       </span>
       {#if bootstrap}
         <button class="quiet-button" type="button" onclick={openChangelog}>
@@ -1783,7 +1786,7 @@
     {:else}
       <div class="panel message-panel">
         <p class="eyebrow">Подключение к панели</p>
-        <h1>{startupPending ? "Завершаем подготовку приложения" : "Сейчас сервис недоступен"}</h1>
+        <h1>{startupPending ? (refreshPending ? "Восстанавливаем соединение с аккаунтом" : "Завершаем подготовку приложения") : "Сейчас сервис недоступен"}</h1>
         {#if error}<p class="error-message">{error}</p>{/if}
         <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
           {busy ? "Проверяем…" : "Повторить"}

@@ -857,6 +857,10 @@ async fn bootstrap_application_for_startup(
         let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
         startup.ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
             .await.map_err(|error| match error {
+                nelomai_client_container::ipc::PrivateError::RefreshPending => CommandError::new(
+                    "auth_refresh_pending",
+                    "Восстанавливаем соединение с аккаунтом. Повторим автоматически; данные входа сохранены",
+                ),
                 nelomai_client_container::ipc::PrivateError::RecoveryRequired
                 | nelomai_client_container::ipc::PrivateError::Timeout
                 | nelomai_client_container::ipc::PrivateError::Service => CommandError::new(

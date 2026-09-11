@@ -62,6 +62,10 @@ pub enum BrokerError {
     IdentityMismatch,
     #[error("authentication request timed out")]
     Timeout,
+    #[error("authentication refresh is pending")]
+    RefreshPending,
+    #[error("authentication refresh was rejected")]
+    RefreshRejected,
     #[error("authentication outcome unknown; explicit reauthentication required")]
     AuthenticationOutcomeUnknown,
     #[error("application access unavailable")]
@@ -358,6 +362,22 @@ pub struct AuthBroker {
     stop: Arc<dyn LocalAuthStop>,
     state: Mutex<()>,
     issuance: Mutex<()>,
+    refresh_retry: std::sync::Mutex<Option<RefreshRetry>>,
+    refresh_events: std::sync::Mutex<std::collections::VecDeque<RefreshDiagnosticV1>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RefreshDiagnosticV1 {
+    pub kind: String,
+    pub operation_id: String,
+    pub code: String,
+}
+
+struct RefreshRetry {
+    operation_id: String,
+    until: tokio::time::Instant,
+    delay: u64,
+    terminal: bool,
 }
 #[cfg(test)]
 pub(crate) async fn hold_test_issuance(broker: &AuthBroker) -> tokio::sync::MutexGuard<'_, ()> {
@@ -408,7 +428,29 @@ impl AuthBroker {
             stop,
             state: Mutex::new(()),
             issuance: Mutex::new(()),
+            refresh_retry: std::sync::Mutex::new(None),
+            refresh_events: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    fn record_refresh(&self, kind: &str, ticket: &BrokerRequestV1, code: &str) {
+        if let Ok(mut events) = self.refresh_events.lock() {
+            if events.len() == 32 {
+                events.pop_front();
+            }
+            events.push_back(RefreshDiagnosticV1 {
+                kind: kind.into(),
+                operation_id: ticket.operation_id.clone(),
+                code: code.into(),
+            });
+        }
+    }
+
+    pub(crate) fn take_refresh_events(&self) -> Vec<RefreshDiagnosticV1> {
+        self.refresh_events
+            .lock()
+            .map(|mut events| events.drain(..).collect())
+            .unwrap_or_default()
     }
 
     fn load(&self) -> Result<AuthStoreV1, BrokerError> {
@@ -1552,6 +1594,25 @@ impl AuthBroker {
         resume: Option<StoredResumeArgumentsV1>,
         prior_login_outcome_unknown: bool,
     ) -> Result<BrokerRequestV1, BrokerError> {
+        self.begin_with_refresh(
+            auth,
+            kind,
+            operation_id,
+            resume,
+            prior_login_outcome_unknown,
+            false,
+        )
+    }
+
+    fn begin_with_refresh(
+        &self,
+        auth: &mut AuthStoreV1,
+        kind: BrokerRequestKind,
+        operation_id: String,
+        resume: Option<StoredResumeArgumentsV1>,
+        prior_login_outcome_unknown: bool,
+        recoverable: bool,
+    ) -> Result<BrokerRequestV1, BrokerError> {
         Self::active(auth)?;
         let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
         meta.next_attempt = meta
@@ -1559,6 +1620,14 @@ impl AuthBroker {
             .checked_add(1)
             .ok_or(BrokerError::RecoveryRequired)?;
         let request = BrokerRequestV1 {
+            refresh: if recoverable && !cfg!(target_os = "android") {
+                Some(nelomai_client_storage::StoredRecoverableRefreshV1 {
+                    contract_version: 1,
+                    mode: "refresh".into(),
+                })
+            } else {
+                None
+            },
             kind,
             operation_id,
             attempt: meta.next_attempt,
@@ -1570,6 +1639,9 @@ impl AuthBroker {
         };
         meta.pending_request = Some(request.clone());
         self.store.save(auth)?;
+        if request.refresh.is_some() {
+            self.record_refresh("auth.refresh.begin", &request, "refresh");
+        }
         Ok(request)
     }
     fn fenced(&self, ticket: &BrokerRequestV1) -> Result<AuthStoreV1, BrokerError> {
@@ -1642,6 +1714,29 @@ impl AuthBroker {
         }
         let _issuance = self.issuance.lock().await;
         self.observe_stamped().await
+    }
+
+    /// Internal preflight only. Never serialize this stale bearer to the child.
+    /// The owner must verify its peer's scope before asking for recovery.
+    pub(crate) async fn pending_refresh_access(&self) -> Result<AccessSnapshot, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        Self::active(&auth)?;
+        Self::ensure_transition_issuance_allowed(&auth, None)?;
+        let meta = auth.broker.as_ref().ok_or(BrokerError::RecoveryRequired)?;
+        let ticket = meta
+            .pending_request
+            .as_ref()
+            .ok_or(BrokerError::RecoveryRequired)?;
+        if cfg!(target_os = "android")
+            || ticket.kind != BrokerRequestKind::Refresh
+            || !Self::owns_ticket(&auth, ticket)
+            || meta.pending_recovery.is_some()
+            || meta.pending_logout.is_some()
+        {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        Self::snapshot(&auth)
     }
 
     fn observed_state(auth: &AuthStoreV1) -> Result<BrokerAuthState, BrokerError> {
@@ -1972,9 +2067,18 @@ impl AuthBroker {
             Self::ensure_transition_issuance_allowed(&auth, None)?;
         }
         let _issuance = self.issuance.lock().await;
-        let (ticket, refresh) = {
+        {
             let _state = self.state.lock().await;
             check_request()?;
+            if let Some(stamp) = stamp {
+                stamp.check(&self.load()?)?;
+            }
+        }
+        if !cfg!(target_os = "android") {
+            self.recover_pending_refresh_locked().await?;
+        }
+        let (ticket, refresh) = {
+            let _state = self.state.lock().await;
             let mut auth = self.load()?;
             if let Some(stamp) = stamp {
                 stamp.check(&auth)?;
@@ -2008,15 +2112,21 @@ impl AuthBroker {
                 .refresh_token
                 .clone()
                 .ok_or(BrokerError::RecoveryRequired)?;
-            let ticket = self.begin(
+            let ticket = self.begin_with_refresh(
                 &mut auth,
                 BrokerRequestKind::Refresh,
                 Uuid::new_v4().to_string(),
                 None,
                 false,
+                true,
             )?;
             (ticket, refresh)
         };
+        if ticket.refresh.is_some() {
+            self.recover_pending_refresh_locked().await?;
+            let _state = self.state.lock().await;
+            return Self::snapshot(&self.load()?);
+        }
         let response = tokio::time::timeout(REQUEST_TIMEOUT, self.api.refresh(refresh))
             .await
             .map_err(|_| BrokerError::Timeout)??;
@@ -2040,6 +2150,200 @@ impl AuthBroker {
             .pending_request = None;
         self.store.save(&auth)?;
         Self::snapshot(&auth)
+    }
+
+    /// Owner-only, before runtime admission; never grants source credentials to a new runtime.
+    pub async fn recover_pending_refresh(&self) -> Result<(), BrokerError> {
+        if cfg!(target_os = "android") {
+            return Ok(());
+        }
+        let _issuance = self.issuance.lock().await;
+        self.recover_pending_refresh_locked().await
+    }
+
+    async fn recover_pending_refresh_locked(&self) -> Result<(), BrokerError> {
+        use nelomai_client_api::{RecoverableRefreshRequest, RefreshModeV1};
+        use nelomai_client_storage::StoredRecoverableRefreshV1;
+        // A replay may contain expired access. At most one further issuance per call.
+        for _ in 0..2 {
+            let (ticket, request) = {
+                let _state = self.state.lock().await;
+                let mut auth = self.load()?;
+                let Some(mut ticket) = auth.broker.as_ref().and_then(|m| m.pending_request.clone())
+                else {
+                    return Ok(());
+                };
+                if ticket.kind != BrokerRequestKind::Refresh {
+                    return Ok(());
+                }
+                Self::active(&auth)?;
+                Self::ensure_transition_issuance_allowed(&auth, None)?;
+                if !Self::owns_ticket(&auth, &ticket) {
+                    return Err(BrokerError::Cancelled);
+                }
+                if auth
+                    .broker
+                    .as_ref()
+                    .is_some_and(|m| m.pending_logout.is_some() || m.pending_recovery.is_some())
+                {
+                    return Err(BrokerError::RecoveryRequired);
+                }
+                if ticket.refresh.is_none() {
+                    ticket.refresh = Some(StoredRecoverableRefreshV1 {
+                        contract_version: 1,
+                        mode: "recover_legacy_pending".into(),
+                    });
+                    auth.broker.as_mut().unwrap().pending_request = Some(ticket.clone());
+                    self.store.save(&auth)?;
+                }
+                let mode = match ticket.refresh.as_ref().unwrap().mode.as_str() {
+                    "refresh" => RefreshModeV1::Refresh,
+                    "recover_legacy_pending" => RefreshModeV1::RecoverLegacyPending,
+                    _ => return Err(BrokerError::RecoveryRequired),
+                };
+                let request = RecoverableRefreshRequest {
+                    contract_version: 1,
+                    operation_id: ticket.operation_id.clone(),
+                    device_id: ticket
+                        .source_device_id
+                        .clone()
+                        .ok_or(BrokerError::RecoveryRequired)?,
+                    source_identity: ticket
+                        .source_identity
+                        .clone()
+                        .ok_or(BrokerError::RecoveryRequired)?,
+                    refresh_token: auth
+                        .refresh_token
+                        .clone()
+                        .ok_or(BrokerError::RecoveryRequired)?,
+                    install_secret: auth.install_secret.clone(),
+                    mode,
+                };
+                (ticket, request)
+            };
+            {
+                let mut retry = self
+                    .refresh_retry
+                    .lock()
+                    .map_err(|_| BrokerError::RecoveryRequired)?;
+                let previous = retry
+                    .as_ref()
+                    .filter(|r| r.operation_id == ticket.operation_id);
+                if previous.is_some_and(|r| r.terminal) {
+                    return Err(BrokerError::RefreshRejected);
+                }
+                if previous.is_some_and(|r| r.until > tokio::time::Instant::now()) {
+                    return Err(BrokerError::RefreshPending);
+                }
+                let delay = previous.map_or(1, |r| (r.delay * 2).min(30));
+                *retry = Some(RefreshRetry {
+                    operation_id: ticket.operation_id.clone(),
+                    until: tokio::time::Instant::now() + Duration::from_secs(delay),
+                    delay,
+                    terminal: false,
+                });
+            }
+            self.record_refresh(
+                "auth.refresh.replay",
+                &ticket,
+                ticket.refresh.as_ref().unwrap().mode.as_str(),
+            );
+            let result =
+                tokio::time::timeout(REQUEST_TIMEOUT, self.api.refresh_recoverable(&request)).await;
+            let response = match result {
+                Ok(Ok(response)) => response,
+                failure => {
+                    let mut retry = self
+                        .refresh_retry
+                        .lock()
+                        .map_err(|_| BrokerError::RecoveryRequired)?;
+                    let state = retry.as_mut().unwrap();
+                    state.until = tokio::time::Instant::now() + Duration::from_secs(state.delay);
+                    if let Ok(Err(error)) = &failure {
+                        state.until = tokio::time::Instant::now()
+                            + Duration::from_secs(
+                                error.retry_after_seconds().unwrap_or(state.delay),
+                            );
+                        state.terminal = match error {
+                            ClientApiError::Api { status, .. }
+                            | ClientApiError::InvalidErrorResponse { status } => {
+                                status.is_client_error()
+                                    && status.as_u16() != 429
+                                    && status.as_u16() != 408
+                            }
+                            ClientApiError::InvalidPayload { .. }
+                            | ClientApiError::PayloadTooLarge { .. } => true,
+                            _ => false,
+                        };
+                    }
+                    self.record_refresh(
+                        if state.terminal {
+                            "auth.refresh.rejected"
+                        } else {
+                            "auth.refresh.pending"
+                        },
+                        &ticket,
+                        if state.terminal {
+                            "rejected"
+                        } else {
+                            "retryable"
+                        },
+                    );
+                    return Err(if state.terminal {
+                        BrokerError::RefreshRejected
+                    } else {
+                        BrokerError::RefreshPending
+                    });
+                }
+            };
+            let _state = self.state.lock().await;
+            let mut auth = self.fenced(&ticket)?;
+            if response.device.confirmed_identity().ok().as_ref() != Some(&request.source_identity)
+                || response.device.id != request.device_id
+                || response.token_type != "Bearer"
+                || response.access_token.is_empty()
+                || response.refresh_token.is_empty()
+                || response.refresh_expires_in == 0
+            {
+                if let Some(retry) = self
+                    .refresh_retry
+                    .lock()
+                    .map_err(|_| BrokerError::RecoveryRequired)?
+                    .as_mut()
+                {
+                    retry.terminal = true;
+                }
+                self.record_refresh("auth.refresh.rejected", &ticket, "identity_mismatch");
+                return Err(BrokerError::IdentityMismatch);
+            }
+            auth.access_token = Some(response.access_token);
+            auth.refresh_token = Some(response.refresh_token);
+            auth.broker.as_mut().unwrap().pending_request = None;
+            if response.access_expires_in == 0 {
+                // begin saves the successor pair and its new pending operation together.
+                self.begin_with_refresh(
+                    &mut auth,
+                    BrokerRequestKind::Refresh,
+                    Uuid::new_v4().to_string(),
+                    None,
+                    false,
+                    true,
+                )?;
+            } else {
+                self.store.save(&auth).inspect_err(|_| {
+                    self.record_refresh("auth.refresh.pending", &ticket, "storage_unavailable")
+                })?;
+            }
+            *self
+                .refresh_retry
+                .lock()
+                .map_err(|_| BrokerError::RecoveryRequired)? = None;
+            self.record_refresh("auth.refresh.complete", &ticket, "saved");
+            if response.access_expires_in > 0 {
+                return Ok(());
+            }
+        }
+        Err(BrokerError::RefreshPending)
     }
 
     /// Cleanup coordinator supplies an accepted clean reconcile operation.

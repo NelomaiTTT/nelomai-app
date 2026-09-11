@@ -199,6 +199,7 @@ impl RuntimeBootstrapV1 {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostRequestV1 {
     RuntimeReady,
+    AuthRefreshDiagnostics,
     PushCleanup,
     RuntimeStatus,
     RuntimeSelect { slot: RuntimeSlot },
@@ -213,6 +214,9 @@ pub enum HostRequestV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HostResponseV1 {
+    AuthRefreshDiagnostics {
+        events: Vec<crate::auth_broker::RefreshDiagnosticV1>,
+    },
     UpdateStatus {
         status: HostUpdateStatusV1,
     },
@@ -249,6 +253,17 @@ impl PrivateOwnerCommands for HostCommands {
             return Err(PrivateError::Cancelled);
         }
         match request {
+            HostRequestV1::AuthRefreshDiagnostics => {
+                let bridge = self.bridge.upgrade().ok_or(PrivateError::Closed)?;
+                let broker = bridge
+                    .broker
+                    .get()
+                    .and_then(std::sync::Weak::upgrade)
+                    .ok_or(PrivateError::Closed)?;
+                return Ok(HostResponseV1::AuthRefreshDiagnostics {
+                    events: broker.take_refresh_events(),
+                });
+            }
             HostRequestV1::PushCleanup => {
                 self.bridge
                     .upgrade()
@@ -268,6 +283,18 @@ impl PrivateOwnerCommands for HostCommands {
                     .ok_or(PrivateError::Closed)?;
                 let peer = bridge.peer().map_err(|_| PrivateError::Closed)?;
                 peer.recover_logout(&broker, &self.coordinator).await?;
+                self.coordinator
+                    .recover_refresh_before_start()
+                    .await
+                    .map_err(|error| match error {
+                        crate::SwitchError::Broker(crate::BrokerError::RefreshPending) => {
+                            PrivateError::RefreshPending
+                        }
+                        crate::SwitchError::Broker(crate::BrokerError::RefreshRejected) => {
+                            PrivateError::RefreshRejected
+                        }
+                        _ => PrivateError::RecoveryRequired,
+                    })?;
                 self.updater.recover().await?;
                 self.coordinator
                     .before_tunnel_start()

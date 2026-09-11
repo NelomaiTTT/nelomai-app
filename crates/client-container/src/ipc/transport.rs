@@ -175,6 +175,8 @@ pub(super) fn broker_error(error: crate::BrokerError) -> PrivateError {
     match error {
         BrokerError::Cancelled | BrokerError::IdentityMismatch => PrivateError::Cancelled,
         BrokerError::Timeout => PrivateError::Timeout,
+        BrokerError::RefreshPending => PrivateError::RefreshPending,
+        BrokerError::RefreshRejected => PrivateError::RefreshRejected,
         BrokerError::AuthenticationOutcomeUnknown => PrivateError::OutcomeUnknown,
         BrokerError::AccessUnavailable => PrivateError::AccessUnavailable,
         BrokerError::Api(_) => PrivateError::Service,
@@ -187,7 +189,11 @@ pub(super) fn core_error(error: PrivateError) -> nelomai_client_core::CoreError 
         PrivateError::Cancelled | PrivateError::Closed => CoreError::StartCancelled,
         PrivateError::OutcomeUnknown => CoreError::AuthenticationOutcomeUnknown,
         PrivateError::AccessUnavailable => CoreError::AccessExpired,
-        PrivateError::Timeout | PrivateError::Service => CoreError::Api(CoreApiError::Retryable),
-        PrivateError::Protocol | PrivateError::RecoveryRequired => CoreError::AuthRecoveryRequired,
+        PrivateError::Timeout | PrivateError::Service | PrivateError::RefreshPending => {
+            CoreError::Api(CoreApiError::Retryable)
+        }
+        PrivateError::Protocol | PrivateError::RecoveryRequired | PrivateError::RefreshRejected => {
+            CoreError::AuthRecoveryRequired
+        }
     }
 }
