@@ -90,11 +90,11 @@ def desktop(args, work, environment):
         shutil.copyfile(tauri / source, payload / "licenses" / name)
     shutil.copytree(ROOT / "build", payload / "webview")
     runtime_output = args.output / "stable"
-    verifier.load_script("build-runtime-manifest.py").package(payload, runtime_output, "0.2.17", args.source_sha,
+    verifier.load_script("build-runtime-manifest.py").package(payload, runtime_output, "0.2.18", args.source_sha,
         args.platform, args.architecture, args.draft_key)
-    prefix = f"nelomai-runtime-0.2.17-{args.platform}-{args.architecture}"
+    prefix = f"nelomai-runtime-0.2.18-{args.platform}-{args.architecture}"
     manifest = verifier.verify(*(runtime_output / (prefix + suffix) for suffix in (".zip", ".manifest.json", ".manifest.sig")),
-        args.draft_public, "0.2.17", args.source_sha, args.platform, args.architecture)
+        args.draft_public, "0.2.18", args.source_sha, args.platform, args.architecture)
     # Both identities consume already finalized native bytes. Synthetic latest
     # changes only its container identity, not the immutable stable package.
     shutil.copytree(runtime_output, args.output / "latest")
@@ -146,10 +146,10 @@ def android(args, work, environment):
         "--stable", work / "stable-stage/collision-input.zip", "--readelf", readelf, env=environment)
     runtime_output = args.output / "stable"
     verifier.load_script("build-runtime-manifest.py").package(work / "stable-stage/payload", runtime_output,
-        "0.2.17", args.source_sha, "android", "aarch64", args.draft_key, readelf)
-    prefix = "nelomai-runtime-0.2.17-android-aarch64"
+        "0.2.18", args.source_sha, "android", "aarch64", args.draft_key, readelf)
+    prefix = "nelomai-runtime-0.2.18-android-aarch64"
     manifest = verifier.verify(*(runtime_output / (prefix + suffix) for suffix in (".zip", ".manifest.json", ".manifest.sig")),
-        args.draft_public, "0.2.17", args.source_sha, "android", "aarch64", readelf=readelf)
+        args.draft_public, "0.2.18", args.source_sha, "android", "aarch64", readelf=readelf)
     latest = args.output / "latest"
     latest.mkdir()
     shutil.copyfile(work / "latest-stage/collision-input.zip", latest / (prefix + ".zip"))
@@ -158,7 +158,7 @@ def android(args, work, environment):
     (latest / (prefix + ".manifest.sig")).write_bytes(
         Ed25519PrivateKey.from_private_bytes(args.draft_key.read_bytes()).sign(b"nelomai-runtime-manifest-v1\0" + raw))
     verifier.verify(*(latest / (prefix + suffix) for suffix in (".zip", ".manifest.json", ".manifest.sig")),
-        args.draft_public, "0.2.17", args.source_sha, "android", "aarch64", inspect_native=False)
+        args.draft_public, "0.2.18", args.source_sha, "android", "aarch64", inspect_native=False)
     shutil.copyfile(ROOT / "target/aarch64-linux-android/release/libnelomai_android_container.so", args.output / "common-host.so")
     source_archive(args.output, work, args.source_sha)
     return manifest
@@ -168,7 +168,7 @@ def source_archive(output, work, source):
     source_tar = work / "source.tar"
     with source_tar.open("xb") as stream:
         subprocess.run(["git", "archive", "--format=tar", source], cwd=ROOT, stdout=stream, check=True)
-    destination = output / "nelomai-0.2.17-amneziawg-android-source.tar.gz"
+    destination = output / "nelomai-0.2.18-amneziawg-android-source.tar.gz"
     with tarfile.open(destination, "w:gz") as result:
         with tarfile.open(source_tar) as archive:
             for member in archive:
@@ -199,7 +199,7 @@ def main():
     policy = gates.mode_policy(args.mode)
     if args.public_key.is_symlink() or args.public_key.stat().st_size != 32:
         raise ValueError("explicit regular raw compile-time public pin required")
-    gates.verify_source(ROOT, args.source_sha, "0.2.17", mode=args.mode)
+    gates.verify_source(ROOT, args.source_sha, "0.2.18", mode=args.mode)
     if (args.platform, args.architecture) not in verifier.TARGETS:
         raise ValueError("unsupported native release target")
     if args.work.exists() or args.output.exists():

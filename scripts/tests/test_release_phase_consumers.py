@@ -34,7 +34,7 @@ class ReleasePhaseConsumersTest(ArtifactFixture):
                 signature = path.with_name(name + ".sig").read_text().strip()
             artifacts.append(dict(platform=platform, asset_name=name, size_bytes=path.stat().st_size,
                 sha256=module("verify-runtime-artifact").digest(path), signature=signature))
-        raw = json.dumps(dict(schema_version=1, version="0.2.17", artifacts=artifacts)).encode()
+        raw = json.dumps(dict(schema_version=1, version="0.2.18", artifacts=artifacts)).encode()
         manifest = candidate / "nelomai-release-manifest.json"
         manifest.write_bytes(raw)
         (candidate / "nelomai-release-manifest.sig").write_bytes(base64.b64encode(self.key.sign(raw)))

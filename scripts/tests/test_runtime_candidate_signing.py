@@ -25,7 +25,7 @@ class RuntimeCandidateSigningTest(ArtifactFixture):
             signer.main()
         digest = stdout.getvalue().strip()
         module("release-candidate-gates").verify_runtime_release(
-            output / "release", "0.2.17", SOURCE, digest, self.public)
+            output / "release", "0.2.18", SOURCE, digest, self.public)
 
     def drafts(self):
         four = fixtures.RuntimeReleaseSetTest.four_candidates(self)
@@ -36,7 +36,7 @@ class RuntimeCandidateSigningTest(ArtifactFixture):
             (folder / "latest").mkdir()
             shutil.copyfile(self.public, folder / "draft-public-key.raw")
             shutil.copyfile(self.public, folder / "runtime-public-key.raw")
-            prefix = f"nelomai-runtime-0.2.17-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
             for suffix in (".zip", ".manifest.json", ".manifest.sig"):
                 for slot in ("stable", "latest"):
                     shutil.copyfile(four / (prefix + suffix), folder / slot / (prefix + suffix))
@@ -55,10 +55,10 @@ class RuntimeCandidateSigningTest(ArtifactFixture):
         before = {str(path.relative_to(drafts)): path.read_bytes() for path in drafts.rglob("*") if path.is_file()}
         output = self.root / "signed"
         digest = module("sign-runtime-candidate").sign(drafts, output, SOURCE, final_private, final_public)
-        module("release-candidate-gates").verify_runtime_release(output / "release", "0.2.17", SOURCE, digest, final_public)
+        module("release-candidate-gates").verify_runtime_release(output / "release", "0.2.18", SOURCE, digest, final_public)
         verifier = module("verify-runtime-artifact")
         for platform, architecture in verifier.TARGETS:
-            prefix = f"nelomai-runtime-0.2.17-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
             self.assertEqual((output / "release" / (prefix + ".zip")).read_bytes(),
                              (drafts / platform / "stable" / (prefix + ".zip")).read_bytes())
             for kind, expected in (("shipping", ["latest"]), ("acceptance", ["latest", "stable"])):
@@ -68,7 +68,7 @@ class RuntimeCandidateSigningTest(ArtifactFixture):
                 self.assertEqual([slot["slot"] for slot in container["slots"]], expected)
                 if kind == "acceptance":
                     self.assertEqual(container["stable_release_set_sha256"], digest)
-                    self.assertEqual(container["slots"][0]["manifest"]["runtime_version"], "0.2.18")
+                    self.assertEqual(container["slots"][0]["manifest"]["runtime_version"], "0.2.19")
             self.assertFalse(any("acceptance" in path.name for path in (output / "release").iterdir()))
         self.assertEqual(before, {str(path.relative_to(drafts)): path.read_bytes() for path in drafts.rglob("*") if path.is_file()})
         with self.assertRaisesRegex(ValueError, "immutable"):

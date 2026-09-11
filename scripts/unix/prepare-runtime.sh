@@ -24,7 +24,7 @@ install -m 0755 "$HELPER" "$OUTPUT/nelomai-unix-service"
 # Task 9 signs this exact versioned tree after adding the common/runtime assets.
 # No key is accepted here and these hash files are not signature substitutes.
 stage_engine_layout() {
-  engine_dir=$OUTPUT/engines/latest/0.2.17
+  engine_dir=$OUTPUT/engines/latest/0.2.18
   dispatcher_dir=$OUTPUT/dispatcher/1
   mkdir -p "$engine_dir" "$dispatcher_dir"
   for runtime_file in "$OUTPUT"/*; do

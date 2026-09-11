@@ -435,6 +435,7 @@ struct Panel {
     refresh_entered: Notify,
     refresh_release: Notify,
     reject_reconcile_access: AtomicUsize,
+    reject_recovery: AtomicUsize,
     fail_reconcile: AtomicUsize,
     return_full_device_snapshot: AtomicUsize,
     return_retry: AtomicUsize,
@@ -500,6 +501,21 @@ async fn reconcile(
     state.reconcile_calls.fetch_add(1, Ordering::SeqCst);
     state.headers.lock().unwrap().push(headers);
     state.reconcile_bodies.lock().unwrap().push(body.clone());
+    if state
+        .headers
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .get("authorization")
+        .is_some_and(|value| value.to_str().unwrap_or_default().starts_with("Refresh "))
+        && state.reject_recovery.load(Ordering::SeqCst) == 1
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"request_id":"r","code":"invalid_refresh_token","message":"revoked"})),
+        ));
+    }
     if state.reject_reconcile_access.swap(0, Ordering::SeqCst) == 1 {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -981,7 +997,69 @@ async fn bound_known_expiry_refreshes_same_source_without_changing_frozen_reconc
 }
 
 #[tokio::test]
-async fn bound_persisted_known_rejection_can_refresh_but_uncertain_dispatch_never_can() {
+async fn uncertain_reconcile_cannot_recover_with_revoked_refresh() {
+    let state = Arc::new(Panel::default());
+    state.reject_recovery.store(1, Ordering::SeqCst);
+    let (api, server) = panel(state.clone()).await;
+    let store = enrolled_store();
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    insert_reconcile_authority(&store, &frozen, TransitionDispatchStateV1::OutcomeUnknown);
+    let before = store.load().unwrap().unwrap();
+    for _ in 0..2 {
+        state.reject_reconcile_access.store(1, Ordering::SeqCst);
+        let reopened = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+        assert!(reopened.reconcile_transition(frozen.clone()).await.is_err());
+        let saved = store.load().unwrap().unwrap();
+        assert_eq!(saved.refresh_token, before.refresh_token);
+        assert!(saved.broker.unwrap().transition_authorities[0]
+            .reconcile_receipt
+            .is_none());
+    }
+    assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.resume_calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn unknown_reconcile_recovers_with_current_refresh_without_rotating_or_changing_body() {
+    for bound in [false, true] {
+        let state = Arc::new(Panel::default());
+        let (api, server) = panel(state.clone()).await;
+        let store = if bound {
+            enrolled_store()
+        } else {
+            legacy_store()
+        };
+        let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+        let source = broker.transition_source().await.unwrap();
+        let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+        insert_reconcile_authority(&store, &frozen, TransitionDispatchStateV1::OutcomeUnknown);
+        let before = store.load().unwrap().unwrap();
+        state.reject_reconcile_access.store(1, Ordering::SeqCst);
+        assert_eq!(
+            broker.reconcile_transition(frozen).await.unwrap().state,
+            RuntimeSwitchState::Clean
+        );
+        let after = store.load().unwrap().unwrap();
+        assert_eq!(after.refresh_token, before.refresh_token);
+        assert_eq!(after.access_token, before.access_token);
+        assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
+        let bodies = state.reconcile_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0], bodies[1]);
+        let headers = state.headers.lock().unwrap();
+        assert_eq!(
+            headers.last().unwrap()["authorization"],
+            format!("Refresh {}", before.refresh_token.unwrap())
+        );
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn bound_uncertain_dispatch_recovers_without_rotating_its_proof() {
     for dispatch in [
         TransitionDispatchStateV1::InvalidAccessRejected,
         TransitionDispatchStateV1::DispatchIntent,
@@ -1007,7 +1085,14 @@ async fn bound_persisted_known_rejection_can_refresh_but_uncertain_dispatch_neve
             for _ in 0..2 {
                 state.reject_reconcile_access.store(1, Ordering::SeqCst);
                 let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
-                assert!(broker.reconcile_transition(frozen.clone()).await.is_err());
+                assert_eq!(
+                    broker
+                        .reconcile_transition(frozen.clone())
+                        .await
+                        .unwrap()
+                        .state,
+                    RuntimeSwitchState::Clean
+                );
                 assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
                 assert_eq!(
                     store
@@ -1018,7 +1103,7 @@ async fn bound_persisted_known_rejection_can_refresh_but_uncertain_dispatch_neve
                         .unwrap()
                         .transition_authorities[0]
                         .dispatch_state,
-                    TransitionDispatchStateV1::OutcomeUnknown
+                    TransitionDispatchStateV1::ResponseKnown
                 );
             }
         }
@@ -1135,9 +1220,12 @@ async fn uncertain_reconcile_replays_before_401_and_never_rotates_the_legacy_pro
     state.reject_reconcile_access.store(1, Ordering::SeqCst);
     drop(broker);
     let reopened = AuthBroker::new(api, store, Arc::new(Stop)).unwrap();
-    assert!(reopened.reconcile_transition(frozen).await.is_err());
+    assert_eq!(
+        reopened.reconcile_transition(frozen).await.unwrap().state,
+        RuntimeSwitchState::Clean
+    );
 
-    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 3);
     assert_eq!(state.refresh_calls.load(Ordering::SeqCst), 0);
     let bodies = state.reconcile_bodies.lock().unwrap();
     assert_eq!(bodies[0], bodies[1]);

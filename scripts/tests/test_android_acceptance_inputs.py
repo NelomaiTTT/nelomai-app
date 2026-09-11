@@ -51,11 +51,11 @@ class AndroidAcceptanceInputsTest(unittest.TestCase):
                         archive.write(path, name)
                         files.append(dict(path=name, size_bytes=len(value), sha256=hashlib.sha256(value).hexdigest(),
                             role="shared_library" if name.endswith(".so") else "license" if name.startswith("licenses/") else "resource"))
-            manifest = dict(format_version=1, runtime_version="0.2.17", source_commit=SOURCE,
+            manifest = dict(format_version=1, runtime_version="0.2.18", source_commit=SOURCE,
                 platform="android", architecture="aarch64", contract_version=1, files=files)
             (root / "runtime-manifest-v1.json").write_text(json.dumps(manifest))
             result = builder.stage_android_latest(payload, root / "extracted", SOURCE, ndk / "llvm-readelf")
-            self.assertEqual(result["runtime_version"], "0.2.18")
+            self.assertEqual(result["runtime_version"], "0.2.19")
             self.assertEqual((root / "extracted/runtime/latest-classes.zip").read_bytes(), library.read_bytes())
             manifest["source_commit"] = "b" * 40
             (root / "runtime-manifest-v1.json").write_text(json.dumps(manifest))

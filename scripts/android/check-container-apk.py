@@ -73,7 +73,7 @@ def verify_manifest(xml, acceptance=False):
         if stable is None or stable.get(ANDROID + 'exported') != 'false' or stable.get(ANDROID + 'process') != ':runtime':
             raise ValueError('acceptance APK stable Activity must be private and isolated')
     elif any(name.startswith('ru.nelomai.runtime.stable.') for name in components):
-        raise ValueError('0.2.17 shipping manifest must be latest-only')
+        raise ValueError('0.2.18 shipping manifest must be latest-only')
 
 
 def verify_classes(classes, acceptance=False):
@@ -94,21 +94,21 @@ def verify_classes(classes, acceptance=False):
         if not stable <= classes:
             raise ValueError('acceptance APK omits compiled stable entrypoints: ' + ', '.join(sorted(stable - classes)))
     elif any(name.startswith('ru.nelomai.runtime.stable.') for name in classes):
-        raise ValueError('0.2.17 container must be latest-only')
+        raise ValueError('0.2.18 container must be latest-only')
 
 
 def verify_slots(manifest, acceptance=False, root_digest=None, stable_digest=None):
     slots = manifest['slots']
     if not acceptance:
         if [slot['slot'] for slot in slots] != ['latest']:
-            raise ValueError('0.2.17 container must index only latest')
+            raise ValueError('0.2.18 container must index only latest')
         return
     if (not all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value)
                 for value in (root_digest, stable_digest))
             or manifest.get('stable_release_set_sha256') != root_digest
             or manifest.get('stable_platform_manifest_sha256') != stable_digest
             or [(slot['slot'], slot['manifest']['runtime_version']) for slot in slots]
-               != [('latest', '0.2.18'), ('stable', '0.2.17')]):
+               != [('latest', '0.2.19'), ('stable', '0.2.18')]):
         raise ValueError('acceptance APK does not bind exact approved stable/root identities')
 
 
@@ -117,7 +117,7 @@ def main():
     parser.add_argument('--apk', type=Path, required=True)
     parser.add_argument('--apkanalyzer', type=Path, required=True)
     parser.add_argument('--public-key', type=Path, required=True, help='Pinned raw 32-byte or base64 Ed25519 public key')
-    parser.add_argument('--acceptance', action='store_true', help='Separate two-slot test package only; never shipping 0.2.17')
+    parser.add_argument('--acceptance', action='store_true', help='Separate two-slot test package only; never shipping 0.2.18')
     parser.add_argument('--release-set-sha256')
     parser.add_argument('--stable-manifest-sha256')
     args = parser.parse_args()

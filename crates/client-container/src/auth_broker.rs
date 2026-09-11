@@ -1022,6 +1022,28 @@ impl AuthBroker {
                     .reconcile_runtime_switch(&authority.cleanup_access_proof, &frozen.request)
                     .await
             };
+            let result = if !may_refresh
+                && matches!(&result,
+                Err(ClientApiError::Api { status, code, .. })
+                    if status.as_u16() == 401 && code == "invalid_access_token")
+            {
+                {
+                    let _state = self.state.lock().await;
+                    Self::match_current_transition_source(&self.load()?, &authority)?;
+                }
+                // A lost reply is not proof of rejection. Preserve operation and
+                // credentials; the panel validates the current refresh without
+                // rotating it and replays (or accepts) the exact same request.
+                let recovered = self
+                    .api
+                    .recover_runtime_switch(&authority.resume_refresh_proof, &frozen.request)
+                    .await;
+                let _state = self.state.lock().await;
+                Self::match_current_transition_source(&self.load()?, &authority)?;
+                recovered
+            } else {
+                result
+            };
             match result {
                 Ok(receipt) => {
                     let _state = self.state.lock().await;

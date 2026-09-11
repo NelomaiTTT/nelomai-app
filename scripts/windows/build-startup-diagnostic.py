@@ -30,11 +30,11 @@ def main():
         features="custom-protocol,startup-diagnostics")
     delivery = output / "delivery"
     delivery.mkdir()
-    destination = delivery / "nelomai-0.2.17-windows-startup-diagnostic.exe"
+    destination = delivery / "nelomai-0.2.18-windows-startup-diagnostic.exe"
     shutil.copyfile(package, destination)
     (delivery / "SHA256SUMS.txt").write_text(container.verifier.digest(destination) + "  " + destination.name + "\n")
     (delivery / "README.txt").write_text(
-        "Диагностическая сборка, не обычный релиз. Установить поверх 0.2.17, не удаляя данные.\n"
+        "Диагностическая сборка, не обычный релиз. Установить поверх 0.2.18, не удаляя данные.\n"
         "Сначала закройте Nelomai. После установки запустите обычным ярлыком.\n"
         "Отправьте %LOCALAPPDATA%\\Nelomai\\startup-diagnostics.log сразу после неудачного запуска.\n"
         "Журнал перезаписывается при каждом запуске. Он содержит этапы запуска и ошибки, не снимок учётных данных.\n"

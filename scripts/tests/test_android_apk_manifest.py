@@ -7,7 +7,7 @@ from scripts.tests.test_android_runtime_collisions import module
 class ApkManifestTest(unittest.TestCase):
     def test_apk_version_code_must_follow_release_version(self):
         check = module('check-container-apk')
-        for version, code in [('0.2.15', '2015'), ('0.2.16', '2016'), ('0.2.17', '2017'), ('0.3.0', '3000'), ('1.0.0', '1000000')]:
+        for version, code in [('0.2.15', '2015'), ('0.2.16', '2016'), ('0.2.17', '2017'), ('0.2.18', '2018'), ('0.3.0', '3000'), ('1.0.0', '1000000')]:
             xml = f'<manifest xmlns:android="http://schemas.android.com/apk/res/android" android:versionName="{version}" android:versionCode="{code}"/>'
             check.verify_version(xml, version)
             with self.assertRaises(ValueError):
@@ -15,11 +15,11 @@ class ApkManifestTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 check.verify_version(xml.replace(f'Name="{version}"', 'Name="0.0.1"'), version)
         with self.assertRaises(ValueError):
-            check.verify_version('<manifest/>', '0.2.17')
+            check.verify_version('<manifest/>', '0.2.18')
 
     def test_unrepresentable_apk_release_versions_are_rejected(self):
         check = module('check-container-apk')
-        for version in ['0.0.0', '0.2.1000', '0.1000.0', '2100.0.1', '0.2.17-beta', '0.2', None]:
+        for version in ['0.0.0', '0.2.1000', '0.1000.0', '2100.0.1', '0.2.18-beta', '0.2', None]:
             with self.subTest(version=version), self.assertRaises(ValueError):
                 check.verify_version('<manifest/>', version)
 
@@ -53,8 +53,8 @@ class ApkManifestTest(unittest.TestCase):
     def test_acceptance_slot_gate_requires_both_exact_approved_digests(self):
         check = module('check-container-apk')
         self.assertTrue(callable(getattr(check, 'verify_slots', None)), 'root-bound acceptance slot gate is missing')
-        value = {'slots': [{'slot':'latest', 'manifest':{'runtime_version':'0.2.18'}},
-                           {'slot':'stable', 'manifest':{'runtime_version':'0.2.17'}}],
+        value = {'slots': [{'slot':'latest', 'manifest':{'runtime_version':'0.2.19'}},
+                           {'slot':'stable', 'manifest':{'runtime_version':'0.2.18'}}],
                  'stable_release_set_sha256':'a'*64, 'stable_platform_manifest_sha256':'b'*64}
         check.verify_slots(value, acceptance=True, root_digest='a'*64, stable_digest='b'*64)
         for root, stable in [('c'*64, 'b'*64), ('a'*64, 'c'*64), (None, None)]:

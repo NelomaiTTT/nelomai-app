@@ -15,13 +15,13 @@ class RuntimeReleaseSetTest(ArtifactFixture):
         folder.mkdir()
         for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"),
                                        ("macos", "aarch64"), ("android", "aarch64")):
-            prefix = f"nelomai-runtime-0.2.17-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
             value = b"authenticated structural fixture only"
             with zipfile.ZipFile(folder / (prefix + ".zip"), "w") as archive:
                 info = zipfile.ZipInfo("fixture")
                 info.external_attr = 0o100644 << 16
                 archive.writestr(info, value)
-            body = dict(format_version=1, runtime_version="0.2.17", source_commit=SOURCE,
+            body = dict(format_version=1, runtime_version="0.2.18", source_commit=SOURCE,
                 platform=platform, architecture=architecture, contract_version=1,
                 files=[dict(path="fixture", size_bytes=len(value), role="resource",
                             sha256=hashlib.sha256(value).hexdigest())])
@@ -33,10 +33,10 @@ class RuntimeReleaseSetTest(ArtifactFixture):
     def test_root_signs_all_four_exact_final_artifacts_and_digest_is_root_bytes(self):
         folder = self.four_candidates()
         result = self.command("build-runtime-release-set", "--input-dir", folder,
-            "--output", self.root / "root", "--version", "0.2.17", "--source-commit", SOURCE,
+            "--output", self.root / "root", "--version", "0.2.18", "--source-commit", SOURCE,
             "--signing-key", self.keyfile, "--public-key", self.public)
         self.assertEqual(result.returncode, 0, result.stderr)
-        name = "nelomai-runtime-0.2.17-release-set.manifest"
+        name = "nelomai-runtime-0.2.18-release-set.manifest"
         raw = (self.root / "root" / (name + ".json")).read_bytes()
         signature = (self.root / "root" / (name + ".sig")).read_bytes()
         self.key.public_key().verify(signature, b"nelomai-runtime-release-set-v1\0" + raw)
@@ -51,7 +51,7 @@ class RuntimeReleaseSetTest(ArtifactFixture):
 
     def test_aggregation_rejects_invalid_signature_source_contract_and_extra_platform(self):
         folder = self.four_candidates()
-        prefix = "nelomai-runtime-0.2.17-linux-x86_64"
+        prefix = "nelomai-runtime-0.2.18-linux-x86_64"
         manifest = folder / (prefix + ".manifest.json")
         signature = folder / (prefix + ".manifest.sig")
         original = manifest.read_bytes()
@@ -61,14 +61,14 @@ class RuntimeReleaseSetTest(ArtifactFixture):
             manifest.write_bytes(raw)
             signature.write_bytes(self.key.sign(b"nelomai-runtime-manifest-v1\0" + raw))
             result = self.command("build-runtime-release-set", "--input-dir", folder,
-                "--output", self.root / "rejected", "--version", "0.2.17", "--source-commit", SOURCE,
+                "--output", self.root / "rejected", "--version", "0.2.18", "--source-commit", SOURCE,
                 "--signing-key", self.keyfile, "--public-key", self.public)
             self.assertNotEqual(result.returncode, 0, str(changes))
             self.assertFalse((self.root / "rejected").exists())
         manifest.write_bytes(original)
         signature.write_bytes(bytes(64))
         result = self.command("build-runtime-release-set", "--input-dir", folder,
-            "--output", self.root / "rejected", "--version", "0.2.17", "--source-commit", SOURCE,
+            "--output", self.root / "rejected", "--version", "0.2.18", "--source-commit", SOURCE,
             "--signing-key", self.keyfile, "--public-key", self.public)
         self.assertNotEqual(result.returncode, 0, "unsigned manifest was aggregated")
         signature.write_bytes(self.key.sign(b"nelomai-runtime-manifest-v1\0" + original))
@@ -76,7 +76,7 @@ class RuntimeReleaseSetTest(ArtifactFixture):
         duplicate.mkdir()
         (duplicate / manifest.name).write_bytes(original)
         result = self.command("build-runtime-release-set", "--input-dir", folder,
-            "--output", self.root / "rejected", "--version", "0.2.17", "--source-commit", SOURCE,
+            "--output", self.root / "rejected", "--version", "0.2.18", "--source-commit", SOURCE,
             "--signing-key", self.keyfile, "--public-key", self.public)
         self.assertNotEqual(result.returncode, 0, "duplicate immutable platform filename was accepted")
 
@@ -84,7 +84,7 @@ class RuntimeReleaseSetTest(ArtifactFixture):
         result = self.build()
         self.assertEqual(result.returncode, 0, result.stderr)
         result = self.command("build-runtime-release-set", "--input-dir", self.root / "candidate",
-            "--output", self.root / "root", "--version", "0.2.17", "--source-commit", SOURCE,
+            "--output", self.root / "root", "--version", "0.2.18", "--source-commit", SOURCE,
             "--signing-key", self.keyfile, "--public-key", self.public)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.root / "root").exists())
@@ -166,8 +166,8 @@ class ReleaseAuthorizationTest(ArtifactFixture):
     def test_publishable_inventory_requires_every_exact_installer_digest(self):
         gates = module("release-candidate-gates")
         assets = {name: "d" * 64 for name in (
-            "nelomai-0.2.17-linux-x86_64.AppImage", "nelomai-0.2.17-windows-x86_64.exe",
-            "nelomai-0.2.17-macos-aarch64.app.tar.gz", "nelomai-0.2.17-android-aarch64.apk")}
+            "nelomai-0.2.18-linux-x86_64.AppImage", "nelomai-0.2.18-windows-x86_64.exe",
+            "nelomai-0.2.18-macos-aarch64.app.tar.gz", "nelomai-0.2.18-android-aarch64.apk")}
         inventory = {"trust": "release", "mode": "sign_candidate", "source_sha": SOURCE,
                      "run_id": "42", "run_attempt": 1, "assets": assets,
                      "environment_ids": {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12,
@@ -176,7 +176,7 @@ class ReleaseAuthorizationTest(ArtifactFixture):
         gates.require_publishable_inventory(inventory, "42", SOURCE, identities)
         with self.assertRaisesRegex(ValueError, "publishable"):
             gates.require_publishable_inventory({**inventory, "assets": {**assets,
-                "nelomai-acceptance-0.2.17-linux-x86_64.AppImage": "e" * 64}}, "42", SOURCE, identities)
+                "nelomai-acceptance-0.2.18-linux-x86_64.AppImage": "e" * 64}}, "42", SOURCE, identities)
         for changes in ({"run_attempt": 2}, {"run_attempt": None}, {"run_attempt": True},
                         {"environment_ids": {gates.SIGNING_ENVIRONMENT: 10, gates.ACCEPTANCE_ENVIRONMENT: 12}}):
             with self.assertRaises(ValueError):
@@ -212,23 +212,23 @@ class ReleaseAuthorizationTest(ArtifactFixture):
     def test_remote_tag_peels_annotated_refs_and_api_errors_never_mean_missing(self):
         gates = module("release-candidate-gates")
         with patch.object(gates, "github_get", return_value=[]):
-            self.assertFalse(gates.check_remote_tag("example/repo", "0.2.17", SOURCE))
-        ref = {"ref": "refs/tags/v0.2.17", "object": {"type": "tag", "sha": "c" * 40}}
+            self.assertFalse(gates.check_remote_tag("example/repo", "0.2.18", SOURCE))
+        ref = {"ref": "refs/tags/v0.2.18", "object": {"type": "tag", "sha": "c" * 40}}
         with patch.object(gates, "github_get", side_effect=[[ref], {"object": {"type": "commit", "sha": SOURCE}}]) as api:
-            self.assertTrue(gates.check_remote_tag("example/repo", "0.2.17", SOURCE))
+            self.assertTrue(gates.check_remote_tag("example/repo", "0.2.18", SOURCE))
             self.assertEqual(api.call_args.args[0], "repos/example/repo/git/tags/" + "c" * 40)
         with patch.object(gates, "github_get", side_effect=[[ref], {"object": {"type": "commit", "sha": "d" * 40}}]):
             with self.assertRaises(ValueError):
-                gates.check_remote_tag("example/repo", "0.2.17", SOURCE)
+                gates.check_remote_tag("example/repo", "0.2.18", SOURCE)
         with patch.object(gates, "github_get", side_effect=RuntimeError("API denied")):
             with self.assertRaises(RuntimeError):
-                gates.check_remote_tag("example/repo", "0.2.17", SOURCE)
+                gates.check_remote_tag("example/repo", "0.2.18", SOURCE)
 
     def test_inventory_rejects_changed_installer_extra_asset_and_missing_retained_bytes(self):
         gates = module("release-candidate-gates")
         assets = self.root / "assets"
         assets.mkdir()
-        package = assets / "nelomai-0.2.17-linux-x86_64.AppImage"
+        package = assets / "nelomai-0.2.18-linux-x86_64.AppImage"
         package.write_bytes(b"exact approved package fixture")
         inventory = assets / "candidate-inventory.json"
         inventory.write_text(json.dumps({"assets": {package.name: hashlib.sha256(package.read_bytes()).hexdigest()}}))
@@ -254,17 +254,17 @@ class ReleaseAuthorizationTest(ArtifactFixture):
         folder = RuntimeReleaseSetTest.four_candidates(self)
         root = self.root / "root"
         result = self.command("build-runtime-release-set", "--input-dir", folder, "--output", root,
-            "--version", "0.2.17", "--source-commit", SOURCE, "--signing-key", self.keyfile, "--public-key", self.public)
+            "--version", "0.2.18", "--source-commit", SOURCE, "--signing-key", self.keyfile, "--public-key", self.public)
         self.assertEqual(result.returncode, 0, result.stderr)
         for path in root.iterdir():
             path.rename(folder / path.name)
         root_sha = json.loads(result.stdout)["stable_manifest_sha256"]
-        gates.verify_runtime_release(folder, "0.2.17", SOURCE, root_sha, self.public)
+        gates.verify_runtime_release(folder, "0.2.18", SOURCE, root_sha, self.public)
         with self.assertRaises((ValueError, subprocess.CalledProcessError)):
-            gates.verify_runtime_release(folder, "0.2.17", SOURCE, "0" * 64, self.public)
+            gates.verify_runtime_release(folder, "0.2.18", SOURCE, "0" * 64, self.public)
         self.public.write_bytes(bytes(32))
         with self.assertRaises((ValueError, subprocess.CalledProcessError)):
-            gates.verify_runtime_release(folder, "0.2.17", SOURCE, root_sha, self.public)
+            gates.verify_runtime_release(folder, "0.2.18", SOURCE, root_sha, self.public)
 
     def test_source_gate_rejects_mutable_ref_wrong_head_and_merge_history(self):
         gates = module("release-candidate-gates")
@@ -282,41 +282,41 @@ class ReleaseAuthorizationTest(ArtifactFixture):
         base = git("rev-parse", "HEAD")
         git("commit", "--allow-empty", "-m", "candidate")
         source = git("rev-parse", "HEAD")
-        gates.verify_source(repo, source, "0.2.17", base=base)
+        gates.verify_source(repo, source, "0.2.18", base=base)
         tracked.write_text("uncommitted source change")
         with self.assertRaises(ValueError):
-            gates.verify_source(repo, source, "0.2.17", base=base)
+            gates.verify_source(repo, source, "0.2.18", base=base)
         tracked.write_text("pinned source")
         for invalid in ("main", source[:12], "A" * 40, base):
             with self.assertRaises(ValueError):
-                gates.verify_source(repo, invalid, "0.2.17", base=base)
-        git("tag", "-a", "v0.2.17", "-m", "candidate", source)
-        gates.verify_source(repo, source, "0.2.17", base=base)
-        git("tag", "-d", "v0.2.17")
-        git("tag", "v0.2.17", base)
+                gates.verify_source(repo, invalid, "0.2.18", base=base)
+        git("tag", "-a", "v0.2.18", "-m", "candidate", source)
+        gates.verify_source(repo, source, "0.2.18", base=base)
+        git("tag", "-d", "v0.2.18")
+        git("tag", "v0.2.18", base)
         with self.assertRaises(ValueError):
-            gates.verify_source(repo, source, "0.2.17", base=base)
-        gates.verify_source(repo, source, "0.2.17", base=base, mode="build_only")
-        self.assertEqual(git("rev-parse", "refs/tags/v0.2.17^{}"), base)
+            gates.verify_source(repo, source, "0.2.18", base=base)
+        gates.verify_source(repo, source, "0.2.18", base=base, mode="build_only")
+        self.assertEqual(git("rev-parse", "refs/tags/v0.2.18^{}"), base)
         for mode in ("sign_candidate", "publish_approved_candidate", "unknown"):
             with self.subTest(mode=mode), self.assertRaises(ValueError):
-                gates.verify_source(repo, source, "0.2.17", base=base, mode=mode)
+                gates.verify_source(repo, source, "0.2.18", base=base, mode=mode)
         tracked.write_text("uncommitted source change")
         with self.assertRaises(ValueError):
-            gates.verify_source(repo, source, "0.2.17", base=base, mode="build_only")
+            gates.verify_source(repo, source, "0.2.18", base=base, mode="build_only")
         tracked.write_text("pinned source")
         for invalid in ("main", source[:12], "A" * 40, base):
             with self.assertRaises(ValueError):
-                gates.verify_source(repo, invalid, "0.2.17", base=base, mode="build_only")
-        git("tag", "-d", "v0.2.17")
+                gates.verify_source(repo, invalid, "0.2.18", base=base, mode="build_only")
+        git("tag", "-d", "v0.2.18")
         git("checkout", "-b", "foreign", base)
         git("commit", "--allow-empty", "-m", "foreign work")
         git("checkout", "maintenance")
         git("merge", "--no-ff", "foreign", "-m", "merge")
         with self.assertRaises(ValueError):
-            gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.17", base=base)
+            gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.18", base=base)
         with self.assertRaises(ValueError):
-            gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.17", base=base, mode="build_only")
+            gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.18", base=base, mode="build_only")
 
     def test_environment_name_without_actual_review_protection_is_rejected(self):
         gates = module("release-candidate-gates")

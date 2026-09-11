@@ -18,7 +18,7 @@ on:
       version:
         description: "Проверяемая версия; исходники не переписываются"
         type: "string"
-        default: "0.2.17"
+        default: "0.2.18"
         required: true
       candidate_run_id:
         description: "Номер успешной sign_candidate сборки; повторные попытки поддерживаются"
@@ -78,8 +78,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.17
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.17 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.2.18
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.18 --mode "$RELEASE_MODE"
       -
         name: "Pinned AmneziaWG source"
         run: |
@@ -151,8 +151,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.17
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.17 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.2.18
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.18 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -196,8 +196,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.17
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.17 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.2.18
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.18 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -277,8 +277,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.17
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.17 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.2.18
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.18 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -341,8 +341,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.17
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.17 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.2.18
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.18 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -393,7 +393,7 @@ jobs:
       -
         uses: "actions/upload-artifact@v4"
         with:
-          name: "candidate-0.2.17"
+          name: "candidate-0.2.18"
           path: "finalized/candidate/"
           if-no-files-found: "error"
           overwrite: true
@@ -426,8 +426,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.17
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.17 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.2.18
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.18 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -455,7 +455,7 @@ jobs:
         run: |
           python scripts/check-publication-inputs.py --directory candidate --source-sha "$SOURCE_SHA" \
             --run-id "$CANDIDATE_RUN"
-          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.2.17 --source-sha "$SOURCE_SHA"
+          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.2.18 --source-sha "$SOURCE_SHA"
           mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
           test "${#assets[@]}" -eq 22
-          gh release create v0.2.17 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.2.17" --notes "$RELEASE_NOTES"
+          gh release create v0.2.18 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.2.18" --notes "$RELEASE_NOTES"

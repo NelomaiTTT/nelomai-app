@@ -36,7 +36,7 @@ class AcceptanceContainerTest(ArtifactFixture):
                 destination = kwargs["cwd"] / "squashfs-root"
                 if Path(command[0]).name == "test.AppImage":
                     shutil.copytree(self.root / "staged", destination / "usr/lib/Nelomai")
-                    (destination / "usr/lib/Nelomai/runtime/engines/latest/0.2.18/nelomai-runtime").write_bytes(b"patched")
+                    (destination / "usr/lib/Nelomai/runtime/engines/latest/0.2.19/nelomai-runtime").write_bytes(b"patched")
                 else:
                     shutil.copytree(output / "linuxdeploy-extracted/squashfs-root", destination)
             else:
@@ -56,7 +56,7 @@ class AcceptanceContainerTest(ArtifactFixture):
         shutil.copytree(self.root / "staged", extracted)
         dependency = extracted.parent / "libexample.so"
         dependency.write_bytes(b"bundled dependency")
-        for relative in ("runtime/engines/stable/0.2.17/nelomai-runtime",
+        for relative in ("runtime/engines/stable/0.2.18/nelomai-runtime",
                          "dispatcher/1/nelomai-unix-service"):
             path = extracted / relative
             path.write_bytes(b"linuxdeploy rewritten ELF")
@@ -107,7 +107,7 @@ class AcceptanceContainerTest(ArtifactFixture):
         for path in (self.root / "candidate").iterdir():
             shutil.copyfile(path, self.candidate / path.name)
         aggregate = module("build-runtime-release-set")
-        self.root_digest = aggregate.build(self.candidate, self.root / "root", "0.2.17", SOURCE, self.keyfile, self.public)
+        self.root_digest = aggregate.build(self.candidate, self.root / "root", "0.2.18", SOURCE, self.keyfile, self.public)
         for path in (self.root / "root").iterdir():
             shutil.copyfile(path, self.candidate / path.name)
 
@@ -129,15 +129,15 @@ class AcceptanceContainerTest(ArtifactFixture):
             synthetic = Version(verified["slots"][0]["manifest"]["runtime_version"])
         except InvalidVersion as error:
             self.fail(f"signed synthetic runtime is rejected by the panel version parser: {error}")
-        self.assertGreater(synthetic, Version("0.2.17"))
+        self.assertGreater(synthetic, Version("0.2.18"))
         self.assertEqual([(slot["slot"], slot["manifest"]["runtime_version"]) for slot in verified["slots"]],
-                         [("latest", "0.2.18"), ("stable", "0.2.17")])
+                         [("latest", "0.2.19"), ("stable", "0.2.18")])
         self.assertEqual(verified["stable_release_set_sha256"], self.root_digest)
         raw = self.candidate / (PREFIX + ".manifest.json")
         self.assertEqual(verified["stable_platform_manifest_sha256"], hashlib.sha256(raw.read_bytes()).hexdigest())
         self.assertEqual(verified["slots"][1]["manifest"], json.loads(raw.read_bytes()))
         for item in verified["slots"][1]["manifest"]["files"]:
-            extracted = resources / "engines/stable/0.2.17" / item["path"]
+            extracted = resources / "engines/stable/0.2.18" / item["path"]
             self.assertEqual(hashlib.sha256(extracted.read_bytes()).hexdigest(), item["sha256"])
             self.assertEqual(extracted.stat().st_mode & 0o777, 0o755 if item["role"] == "executable" else 0o644)
         self.assertEqual(before, {path.name: path.read_bytes() for path in self.candidate.iterdir()})
@@ -166,14 +166,14 @@ class AcceptanceContainerTest(ArtifactFixture):
         extracted = self.root / "extracted/AppDir/usr/lib/Nelomai"
         shutil.copytree(self.root / "staged", extracted)
         builder.verify_packaged_tree(self.root / "extracted", self.root / "staged", self.public, "linux", "x86_64")
-        executable = extracted / "runtime/engines/stable/0.2.17/nelomai-runtime"
+        executable = extracted / "runtime/engines/stable/0.2.18/nelomai-runtime"
         original = executable.read_bytes()
         executable.write_bytes(b"rewritten after final signing")
-        with self.assertRaisesRegex(ValueError, "packaged runtime bytes changed: engines/stable/0.2.17/nelomai-runtime"):
+        with self.assertRaisesRegex(ValueError, "packaged runtime bytes changed: engines/stable/0.2.18/nelomai-runtime"):
             builder.verify_packaged_tree(self.root / "extracted", self.root / "staged", self.public, "linux", "x86_64")
         executable.write_bytes(original)
         executable.chmod(0o644)
-        with self.assertRaisesRegex(ValueError, "packaged runtime mode changed: engines/stable/0.2.17/nelomai-runtime.*0755.*0644"):
+        with self.assertRaisesRegex(ValueError, "packaged runtime mode changed: engines/stable/0.2.18/nelomai-runtime.*0755.*0644"):
             builder.verify_packaged_tree(self.root / "extracted", self.root / "staged", self.public, "linux", "x86_64")
         executable.chmod(0o755)
         (extracted / "runtime/unindexed").write_bytes(b"unexpected")

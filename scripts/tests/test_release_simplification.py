@@ -34,7 +34,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
                 architecture=architecture, packages={"shipping": dict(name=package.name,
                     sha256=consumer.verifier.digest(package), size_bytes=package.stat().st_size)})))
         for suffix in (".tar.gz", ".tar.gz.sha256"):
-            (packages / "android/shipping" / ("nelomai-0.2.17-amneziawg-android-source" + suffix)).write_bytes(b"source fixture")
+            (packages / "android/shipping" / ("nelomai-0.2.18-amneziawg-android-source" + suffix)).write_bytes(b"source fixture")
         output, work = self.root / "finalized", self.root / "finalization"
         arguments = ["finalize-release-candidate", "--packages", str(packages), "--signed", str(signed),
                      "--output", str(output), "--private-key", str(self.keyfile), "--public-key", str(self.public),
@@ -80,7 +80,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
 
         def native_package(staged, work, *_args, **_kwargs):
             work.mkdir(parents=True)
-            package = work / "nelomai-acceptance-0.2.17-linux-x86_64.AppImage"
+            package = work / "nelomai-acceptance-0.2.18-linux-x86_64.AppImage"
             package.write_bytes(b"native package substitute")
             return package
 
@@ -107,11 +107,11 @@ class ReleaseSimplificationTest(ArtifactFixture):
     def test_desktop_wrapper_uses_staged_ui_without_tauri_before_build_hook(self):
         consumer = module("build-runtime-acceptance-container")
         staged = self.root / "staged"
-        ui = staged / "runtime/engines/latest/0.2.17/webview"
+        ui = staged / "runtime/engines/latest/0.2.18/webview"
         ui.mkdir(parents=True)
         (ui / "index.html").write_text("signed UI")
         (staged / "runtime/container-manifest-v1.json").write_text(json.dumps({
-            "slots": [{"slot": "latest", "manifest": {"runtime_version": "0.2.17"}}]}))
+            "slots": [{"slot": "latest", "manifest": {"runtime_version": "0.2.18"}}]}))
         output = self.root / "package"
 
         class NativeBuildReached(Exception):
@@ -130,7 +130,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
         run = dict(id=42, head_sha=SOURCE, path=".github/workflows/release.yml", event="workflow_dispatch",
                    status="completed", conclusion="success", run_attempt=3,
                    repository={"full_name": "owner/repo"}, head_repository={"full_name": "owner/repo"})
-        artifact = dict(id=123, name="candidate-0.2.17", expired=False,
+        artifact = dict(id=123, name="candidate-0.2.18", expired=False,
                         workflow_run={"id": 42, "head_sha": SOURCE})
 
         def fetch(endpoint):
@@ -138,13 +138,13 @@ class ReleaseSimplificationTest(ArtifactFixture):
                 return {"total_count": 1, "artifacts": [artifact]}
             return run
 
-        self.assertEqual(consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.17", fetch), 123)
+        self.assertEqual(consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.18", fetch), 123)
         for changes in ({"head_sha": "b" * 40}, {"conclusion": "failure"}, {"status": "in_progress"},
                         {"path": ".github/workflows/windows-build.yml"}):
             with patch.dict(run, changes), self.assertRaises(ValueError):
-                consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.17", fetch)
+                consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.18", fetch)
         with patch.dict(artifact, {"expired": True}), self.assertRaises(ValueError):
-            consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.17", fetch)
+            consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.18", fetch)
         with self.assertRaises(ValueError):
-            consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.17", lambda endpoint:
+            consumer.select_candidate("owner/repo", "42", SOURCE, "0.2.18", lambda endpoint:
                 {"total_count": 2, "artifacts": [artifact, {**artifact, "id": 124}]} if "/artifacts?" in endpoint else run)

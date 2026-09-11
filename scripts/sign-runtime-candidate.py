@@ -41,11 +41,11 @@ def sign(drafts, output, source, signing_key, public_key):
         folder = drafts / platform
         if (folder / "runtime-public-key.raw").read_bytes() != public_key.read_bytes():
             raise ValueError("native compile-time runtime pin differs from final signer")
-        prefix = f"nelomai-runtime-0.2.17-{platform}-{architecture}"
+        prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
         for slot in ("stable", "latest"):
             paths = [folder / slot / (prefix + suffix) for suffix in (".zip", ".manifest.json", ".manifest.sig")]
             snapshots.update({path: verifier.digest(path) for path in paths})
-            documents[platform, slot] = verifier.verify(*paths, folder / "draft-public-key.raw", "0.2.17",
+            documents[platform, slot] = verifier.verify(*paths, folder / "draft-public-key.raw", "0.2.18",
                 source, platform, architecture, inspect_native=False)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".final-runtime-", dir=output.parent) as temporary:
@@ -53,7 +53,7 @@ def sign(drafts, output, source, signing_key, public_key):
         release = staged / "release"
         release.mkdir(parents=True)
         for platform, architecture in verifier.TARGETS:
-            prefix = f"nelomai-runtime-0.2.17-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
             for slot in ("stable", "latest"):
                 destination = release if slot == "stable" else staged / "latest" / platform
                 destination.mkdir(parents=True, exist_ok=True)
@@ -61,17 +61,17 @@ def sign(drafts, output, source, signing_key, public_key):
                     shutil.copyfile(drafts / platform / slot / (prefix + suffix), destination / (prefix + suffix))
                 body = (destination / (prefix + ".manifest.json")).read_bytes()
                 (destination / (prefix + ".manifest.sig")).write_bytes(key.sign(b"nelomai-runtime-manifest-v1\0" + body))
-        digest = aggregate.build(release, staged / "root", "0.2.17", source, signing_key, public_key)
+        digest = aggregate.build(release, staged / "root", "0.2.18", source, signing_key, public_key)
         for path in (staged / "root").iterdir():
             path.rename(release / path.name)
         (staged / "root").rmdir()
         for platform, architecture in verifier.TARGETS:
-            prefix = f"nelomai-runtime-0.2.17-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
             for kind in ("shipping", "acceptance"):
                 latest = documents[platform, "latest"]
                 if kind == "acceptance":
-                    latest = {**latest, "runtime_version": "0.2.18"}
-                container = dict(format_version=1, container_version="0.2.17",
+                    latest = {**latest, "runtime_version": "0.2.19"}
+                container = dict(format_version=1, container_version="0.2.18",
                     release_set_id=kind + "-" + source, minimum_runtime_contract=1, maximum_runtime_contract=1,
                     slots=[dict(slot="latest", manifest=latest)])
                 if kind == "acceptance":

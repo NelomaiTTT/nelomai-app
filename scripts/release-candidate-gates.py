@@ -29,13 +29,13 @@ PUBLICATION_ENVIRONMENT = "release-publication"
 CANDIDATE_ENVIRONMENTS = (SIGNING_ENVIRONMENT, FINALIZATION_ENVIRONMENT, ACCEPTANCE_ENVIRONMENT)
 ENVIRONMENTS = (*CANDIDATE_ENVIRONMENTS, PUBLICATION_ENVIRONMENT)
 PACKAGE_NAMES = {
-    "linux": "nelomai-0.2.17-linux-x86_64.AppImage", "windows": "nelomai-0.2.17-windows-x86_64.exe",
-    "macos": "nelomai-0.2.17-macos-aarch64.app.tar.gz", "android": "nelomai-0.2.17-android-aarch64.apk"}
+    "linux": "nelomai-0.2.18-linux-x86_64.AppImage", "windows": "nelomai-0.2.18-windows-x86_64.exe",
+    "macos": "nelomai-0.2.18-macos-aarch64.app.tar.gz", "android": "nelomai-0.2.18-android-aarch64.apk"}
 PUBLISH_ASSETS = frozenset(PACKAGE_NAMES.values()) | {
     "nelomai-release-manifest.json", "nelomai-release-manifest.sig",
-    "nelomai-0.2.17-amneziawg-android-source.tar.gz", "nelomai-0.2.17-amneziawg-android-source.tar.gz.sha256",
-    "nelomai-runtime-0.2.17-release-set.manifest.json", "nelomai-runtime-0.2.17-release-set.manifest.sig",
-    *(f"nelomai-runtime-0.2.17-{platform}-{architecture}{suffix}"
+    "nelomai-0.2.18-amneziawg-android-source.tar.gz", "nelomai-0.2.18-amneziawg-android-source.tar.gz.sha256",
+    "nelomai-runtime-0.2.18-release-set.manifest.json", "nelomai-runtime-0.2.18-release-set.manifest.sig",
+    *(f"nelomai-runtime-0.2.18-{platform}-{architecture}{suffix}"
       for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"), ("macos", "aarch64"), ("android", "aarch64"))
       for suffix in (".zip", ".manifest.json", ".manifest.sig"))}
 
@@ -77,8 +77,8 @@ def full_source(source):
 def verify_source(root, source, version, *, base=BASE, mode="sign_candidate"):
     mode_policy(mode)
     full_source(source)
-    if version != "0.2.17":
-        raise ValueError("this maintenance workflow only builds 0.2.17")
+    if version != "0.2.18":
+        raise ValueError("this maintenance workflow only builds 0.2.18")
     if git(root, "rev-parse", "HEAD") != source:
         raise ValueError("checkout HEAD differs from source_sha")
     # Run before generated build inputs/parent-managed vendor patches. Never
@@ -237,7 +237,7 @@ def verify_retained_artifact(metadata, archive, directory, artifact_id, run_id, 
     full_source(source)
     run = metadata.get("workflow_run", {})
     if (str(metadata.get("id")) != str(artifact_id) or not re.fullmatch(r"[1-9][0-9]*", str(artifact_id))
-            or metadata.get("name") != "candidate-0.2.17" or metadata.get("expired") is not False
+            or metadata.get("name") != "candidate-0.2.18" or metadata.get("expired") is not False
             or str(run.get("id")) != str(run_id) or run.get("head_sha") != source
             or type(repository_id) is not int or repository_id <= 0
             or run.get("repository_id") != repository_id or run.get("head_repository_id") != repository_id):
@@ -306,7 +306,7 @@ def verify_updater_release(directory, runtime_public_key, updater_public_key, an
         base64.b64decode(signature.read_bytes().strip(), validate=True), body)
     document = json.loads(body)
     artifacts = document.get("artifacts", [])
-    if (document.get("schema_version") != 1 or document.get("version") != "0.2.17" or len(artifacts) != 4
+    if (document.get("schema_version") != 1 or document.get("version") != "0.2.18" or len(artifacts) != 4
             or {item.get("platform") for item in artifacts} != set(PACKAGE_NAMES)):
         raise ValueError("signed release index must identify all four ordinary packages")
     executable = os.environ.get("NELOMAI_UPDATER_SIGNATURE_VERIFIER", str(Path(__file__).resolve().parents[1]
@@ -389,7 +389,7 @@ def main():
         environment_ids = check_approvals(args.repository, args.run_id, run_attempt=args.run_attempt)
         inventory = verify_inventory(args.directory, args.directory / "candidate-inventory.json", args.inventory_sha256)
         require_publishable_inventory(inventory, args.run_id, args.source_sha, environment_ids, args.run_attempt)
-        verify_runtime_release(args.directory, "0.2.17", args.source_sha, args.release_set_sha256, args.public_key)
+        verify_runtime_release(args.directory, "0.2.18", args.source_sha, args.release_set_sha256, args.public_key)
         verify_updater_release(args.directory, args.public_key, args.updater_public_key, args.android_signer_sha256)
         verify_retained_artifact(github_get(artifact_endpoint), args.artifact_archive, args.directory,
                                  args.artifact_id, args.run_id, args.source_sha, run["repository"]["id"])

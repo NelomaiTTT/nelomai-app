@@ -1409,6 +1409,29 @@ impl ClientApi {
         Ok(response)
     }
 
+    /// Reconcile the same operation using a current, non-rotating refresh proof.
+    pub async fn recover_runtime_switch(
+        &self,
+        refresh_token: &str,
+        request: &RuntimeSwitchReconcileRequest,
+    ) -> Result<RuntimeSwitchReconcileResponse, ClientApiError> {
+        validate_runtime_switch_request(request)?;
+        let client = self.without_identity_context();
+        let mut proof = HeaderValue::from_str(&format!("Refresh {refresh_token}"))?;
+        proof.set_sensitive(true);
+        let response = client
+            .send_json(
+                client
+                    .http
+                    .post(client.endpoint("connections/runtime-switch/reconcile")?)
+                    .header(AUTHORIZATION, proof)
+                    .json(request),
+            )
+            .await?;
+        validate_runtime_switch_response(request, &response)?;
+        Ok(response)
+    }
+
     pub async fn server_candidates(
         &self,
         access_token: &str,

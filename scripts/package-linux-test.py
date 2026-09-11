@@ -28,18 +28,18 @@ def stage(draft, output, source, private_key, public_key):
     if (key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw) != pin
             or (draft / 'runtime-public-key.raw').read_bytes() != pin):
         raise ValueError('test signer differs from compile pin')
-    prefix = 'nelomai-runtime-0.2.17-linux-x86_64'
+    prefix = 'nelomai-runtime-0.2.18-linux-x86_64'
     archive, manifest, signature = [draft / 'latest' / (prefix + suffix)
         for suffix in ('.zip', '.manifest.json', '.manifest.sig')]
     runtime = verifier.verify(archive, manifest, signature, draft / 'draft-public-key.raw',
-        '0.2.17', source, 'linux', 'x86_64')
-    document = dict(format_version=1, container_version='0.2.17',
+        '0.2.18', source, 'linux', 'x86_64')
+    document = dict(format_version=1, container_version='0.2.18',
         release_set_id='linux-test-' + source, minimum_runtime_contract=1, maximum_runtime_contract=1,
         slots=[dict(slot='latest', manifest=runtime)])
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.linux-test-', dir=output.parent) as temporary:
         staged = Path(temporary) / 'resources'
-        payload = staged / 'runtime/engines/latest/0.2.17'
+        payload = staged / 'runtime/engines/latest/0.2.18'
         verifier.extract(archive, runtime, payload)
         dispatcher = staged / 'dispatcher/1/nelomai-unix-service'
         dispatcher.parent.mkdir(parents=True)
@@ -76,7 +76,7 @@ def main():
     package = container.package_desktop(staged, args.work / 'packaged', args.public_key,
         'linux', 'x86_64', environment=env)
     args.output.mkdir(parents=True)
-    destination = args.output / 'nelomai-test-0.2.17-linux-x86_64.AppImage'
+    destination = args.output / 'nelomai-test-0.2.18-linux-x86_64.AppImage'
     shutil.copy2(package, destination)
     shutil.copyfile(args.public_key, args.output / 'runtime-public-key.raw')
     (args.output / 'package-digests.json').write_text(json.dumps(dict(
