@@ -34,7 +34,7 @@ describe("startup admission retry", () => {
     expect(attempts).toBe(0);
   });
   it("success, logout and permanent errors cancel pending work", () => {
-    for (const code of [null, "signed_out", "invalid_refresh_token", "storage_unavailable"]) {
+    for (const code of [null, "signed_out", "auth_recovery_required", "invalid_refresh_token", "storage_unavailable"]) {
       const retry = new StartupRetry();
       let attempts = 0;
       retry.schedule("runtime_startup_pending", () => { attempts++; });

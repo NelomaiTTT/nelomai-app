@@ -1861,6 +1861,25 @@ impl AuthBroker {
         bind()
     }
 
+    /// Revalidate an already admitted scope, without issuing or binding a token.
+    /// A completed same-scope refresh may replace the token during CheckScope.
+    /// Token-bearing operations must keep using with_current_access instead.
+    pub(crate) async fn with_current_access_scope<T>(
+        &self,
+        access: &AccessSnapshot,
+        finish: impl FnOnce() -> Result<T, BrokerError>,
+    ) -> Result<T, BrokerError> {
+        let _state = self.state.lock().await;
+        let auth = self.load()?;
+        // snapshot also rejects logout, unknown auth outcomes and missing access.
+        let current = Self::snapshot(&auth)?;
+        if ScopeStamp::from_access(&current) != ScopeStamp::from_access(access) {
+            return Err(BrokerError::Cancelled);
+        }
+        // No await after validation: logout/replacement cannot interleave finish.
+        finish()
+    }
+
     pub(crate) async fn login_fenced(
         &self,
         request: &LoginRequest,

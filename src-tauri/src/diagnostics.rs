@@ -25,7 +25,7 @@ const MAX_APPLICATION_REPORT_BYTES: usize = 320 * 1024;
 const ANDROID_STARTUP_LOG: &str = "android-startup.jsonl";
 #[cfg(target_os = "android")]
 const MAX_ANDROID_STARTUP_REPORT_BYTES: usize = 16 * 1024;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 const ANDROID_FRONTEND_READY_MARKER: &str = "android-frontend-ready";
 const MAX_HELPER_REPORT_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "android", test))]
@@ -438,10 +438,14 @@ impl AppDiagnostics {
     }
 
     pub fn mark_frontend_ready(&self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", test))]
         {
             let marker = self.directory.join(ANDROID_FRONTEND_READY_MARKER);
-            let _ = fs::write(marker, now_unix().to_string());
+            // Kotlin compares the payload to its launch epoch milliseconds;
+            // Android's File.lastModified() may discard the subsecond part.
+            if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                let _ = fs::write(marker, elapsed.as_millis().to_string());
+            }
         }
     }
 
@@ -1261,6 +1265,32 @@ fn safe_connection_intent_log(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontend_ready_marker_records_milliseconds_for_android_launch_comparison() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        diagnostics.mark_frontend_ready();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let value =
+            fs::read_to_string(directory.path().join(ANDROID_FRONTEND_READY_MARKER)).unwrap();
+        let timestamp = value.parse::<u128>().unwrap();
+        assert!(
+            timestamp >= before && timestamp <= after,
+            "marker must use epoch milliseconds: {timestamp}"
+        );
+    }
 
     #[test]
     fn manual_report_includes_refresh_after_startup_and_after_restart() {

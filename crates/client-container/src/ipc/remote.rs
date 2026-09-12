@@ -529,7 +529,7 @@ impl RemoteOwner {
             {
                 Ok(ControlAckV1::Done) => {
                     return broker
-                        .with_current_access(&current, || {
+                        .with_current_access_scope(&current, || {
                             self.live(deadline).map_err(|_| BrokerError::Cancelled)?;
                             finish().map_err(|_| BrokerError::RecoveryRequired)
                         })

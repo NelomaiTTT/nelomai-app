@@ -12,6 +12,15 @@ import java.io.FileOutputStream
 internal fun startupDiagnosticsDirectory(filesDir: File, slot: String, version: String): File =
   File(filesDir, "runtime/$slot/state/$version/diagnostics")
 
+internal fun frontendMarkerReady(marker: File, launchStartedAtUnixMillis: Long): Boolean =
+  runCatching {
+    // Android can expose mtime at whole-second precision. The Rust writer stores
+    // epoch milliseconds in the marker itself; an old launch must not qualify.
+    if (!marker.isFile || marker.length() !in 1L..19L) return@runCatching false
+    val readyAt = marker.readText().toLongOrNull() ?: return@runCatching false
+    readyAt >= launchStartedAtUnixMillis
+  }.getOrDefault(false)
+
 internal object StartupDiagnostics {
   private const val MAX_LOG_BYTES = 64 * 1024L
   private const val FILE_NAME = "android-startup.jsonl"
@@ -38,7 +47,7 @@ internal object StartupDiagnostics {
 
   fun frontendReady(context: Context): Boolean {
     val marker = File(directory(context), FRONTEND_READY_MARKER)
-    return marker.isFile && marker.lastModified() >= launchStartedAtUnixMillis
+    return frontendMarkerReady(marker, launchStartedAtUnixMillis)
   }
 
   fun record(context: Context, kind: String) = record(context, kind, emptyMap())

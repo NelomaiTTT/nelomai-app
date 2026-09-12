@@ -1142,6 +1142,119 @@ async fn logout_at_prepared_or_committed_ack_prevents_final_grant() {
 }
 
 struct Recover(AtomicUsize);
+
+#[tokio::test]
+async fn readmission_survives_same_scope_refresh_after_scope_check() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().route(
+        "/api/client/v1/auth/refresh-recoverable",
+        axum::routing::post(|| async {
+            axum::Json(serde_json::json!({
+                "api_version":"1", "request_id":"synthetic", "token_type":"Bearer",
+                "access_token":"recovered-access", "access_expires_in":900,
+                "refresh_token":"recovered-refresh", "refresh_expires_in":3600,
+                "access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},
+                "device":{"id":"device","name":"synthetic","platform":"macos",
+                    "container_version":"0.2.16","runtime_version":"0.2.16",
+                    "runtime_contract_version":1,"runtime_slot":"stable","session_generation":1}
+            }))
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, true);
+    let mut initial = fixture.auth.load().unwrap().unwrap();
+    initial.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&initial).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let old = fixture.client.access(None).await.unwrap();
+    let finishes = AtomicUsize::new(0);
+    let ready = fixture.parent.admit_current_after(&fixture.broker, || {
+        finishes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    tokio::pin!(ready);
+    // Capture token A and reach the real CheckScope wait. Do not poll Ready
+    // again until a concurrent access request has completed its HTTP refresh.
+    poll_pending(ready.as_mut()).await;
+    let refreshed = fixture.client.access(Some(&old)).await.unwrap();
+    assert_eq!(refreshed.access_token(), "recovered-access");
+    assert_eq!(refreshed.auth_epoch(), old.auth_epoch());
+    assert_eq!(refreshed.family(), old.family());
+    assert_eq!(refreshed.identity(), old.identity());
+    let result = ready.await;
+    server.abort();
+    assert_eq!(
+        result,
+        Ok(()),
+        "same-scope token rotation is not cancellation"
+    );
+    assert_eq!(finishes.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(
+            fixture.broker.with_current_access(&old, || Ok(())).await,
+            Err(crate::BrokerError::Cancelled)
+        ),
+        "token-bearing operations must still reject the old token snapshot"
+    );
+    assert_eq!(fixture.client.access(None).await.unwrap(), refreshed);
+    assert!(fixture.client.check_start_barrier().is_ok());
+}
+
+#[tokio::test]
+async fn readmission_rejects_changed_authority_after_scope_check() {
+    for change in [
+        "epoch",
+        "family",
+        "generation",
+        "slot",
+        "logout",
+        "unknown",
+        "missing_token",
+    ] {
+        let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+        fixture
+            .parent
+            .admit_empty_current(&fixture.broker)
+            .await
+            .unwrap();
+        let finishes = AtomicUsize::new(0);
+        let ready = fixture.parent.admit_current_after(&fixture.broker, || {
+            finishes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        tokio::pin!(ready);
+        poll_pending(ready.as_mut()).await;
+        // Round trip ensures the child's prior scope ACK was emitted. Change
+        // durable owner authority before the final owner-side validation.
+        fixture.client.access(None).await.unwrap();
+        let mut auth = fixture.auth.load().unwrap().unwrap();
+        match change {
+            "epoch" => auth.auth_epoch += 1,
+            "family" => auth.broker.as_mut().unwrap().family = "replacement-family".into(),
+            "generation" => {
+                auth.confirmed_identity.as_mut().unwrap().session_generation = Some(2);
+                auth.session_generation = Some(2);
+            }
+            "slot" => auth.confirmed_identity.as_mut().unwrap().slot = RuntimeSlot::Latest,
+            "logout" => auth.logout_state = LogoutState::LoggedOut,
+            "unknown" => auth.broker.as_mut().unwrap().authentication_outcome_unknown = true,
+            "missing_token" => auth.access_token = None,
+            _ => unreachable!(),
+        }
+        fixture.auth.save(&auth).unwrap();
+        assert!(
+            ready.await.is_err(),
+            "must reject changed authority: {change}"
+        );
+        assert_eq!(finishes.load(Ordering::SeqCst), 0, "{change}");
+    }
+}
+
 #[tokio::test]
 async fn private_access_waits_for_live_refresh_without_false_recovery() {
     for stale_request in [false, true] {

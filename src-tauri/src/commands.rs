@@ -826,9 +826,7 @@ async fn bootstrap_application_for_startup(
         app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
             .ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
             .await
-            .map_err(|_| {
-                CommandError::from_core(nelomai_client_core::CoreError::AuthRecoveryRequired)
-            })?;
+            .map_err(runtime_readiness_error)?;
         let first_error = match application.bootstrap_without_refresh(now_unix).await {
             Ok(response) => return Ok(response),
             Err(error) => error,
@@ -856,21 +854,28 @@ async fn bootstrap_application_for_startup(
     {
         let startup = app.state::<Arc<crate::runtime_startup::RuntimeStartup>>();
         let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
-        startup.ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
-            .await.map_err(|error| match error {
-                nelomai_client_container::ipc::PrivateError::RefreshPending => CommandError::new(
-                    "auth_refresh_pending",
-                    "Восстанавливаем соединение с аккаунтом. Повторим автоматически; данные входа сохранены",
-                ),
-                nelomai_client_container::ipc::PrivateError::RecoveryRequired
-                | nelomai_client_container::ipc::PrivateError::Timeout
-                | nelomai_client_container::ipc::PrivateError::Service => CommandError::new(
-                    "runtime_startup_pending",
-                    "Завершается подготовка приложения и предыдущего подключения. Повторим автоматически; данные входа сохранены",
-                ),
-                _ => CommandError::from_core(CoreError::AuthRecoveryRequired),
-            })?;
+        startup
+            .ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
+            .await
+            .map_err(runtime_readiness_error)?;
         application.bootstrap(now_unix).await.map_err(Into::into)
+    }
+}
+
+fn runtime_readiness_error(error: nelomai_client_container::ipc::PrivateError) -> CommandError {
+    use nelomai_client_container::ipc::PrivateError;
+    // Only RuntimeReady uses this mapping: an unfinished admission is not an
+    // authentication rejection. Access/refresh errors keep their own fencing.
+    match error {
+        PrivateError::RefreshPending => CommandError::new(
+            "auth_refresh_pending",
+            "Восстанавливаем соединение с аккаунтом. Повторим автоматически; данные входа сохранены",
+        ),
+        PrivateError::RecoveryRequired | PrivateError::Timeout | PrivateError::Service => CommandError::new(
+            "runtime_startup_pending",
+            "Завершается подготовка приложения и предыдущего подключения. Повторим автоматически; данные входа сохранены",
+        ),
+        _ => CommandError::from_core(CoreError::AuthRecoveryRequired),
     }
 }
 
@@ -3913,6 +3918,45 @@ pub(crate) fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_readiness_transients_request_startup_retry_without_relogin() {
+        use nelomai_client_container::ipc::PrivateError;
+        for error in [
+            PrivateError::RecoveryRequired,
+            PrivateError::Timeout,
+            PrivateError::Service,
+        ] {
+            assert_eq!(
+                runtime_readiness_error(error).code,
+                "runtime_startup_pending",
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            runtime_readiness_error(PrivateError::RefreshPending).code,
+            "auth_refresh_pending"
+        );
+    }
+
+    #[test]
+    fn runtime_readiness_does_not_mask_definitive_or_ambiguous_auth_failures() {
+        use nelomai_client_container::ipc::PrivateError;
+        for error in [
+            PrivateError::Closed,
+            PrivateError::RefreshRejected,
+            PrivateError::Protocol,
+            PrivateError::Cancelled,
+            PrivateError::OutcomeUnknown,
+            PrivateError::AccessUnavailable,
+        ] {
+            assert_eq!(
+                runtime_readiness_error(error).code,
+                "auth_recovery_required",
+                "{error:?}"
+            );
+        }
+    }
+
     #[test]
     fn runtime_selection_boolean_maps_only_to_the_verified_slot_enum() {
         assert_eq!(runtime_slot_for_selection(false), RuntimeSlot::Latest);
