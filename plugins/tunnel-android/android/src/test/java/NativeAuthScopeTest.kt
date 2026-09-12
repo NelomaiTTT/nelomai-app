@@ -8,6 +8,57 @@ import javax.net.ssl.HttpsURLConnection
 import java.security.cert.Certificate
 
 class NativeAuthScopeTest {
+    @Test fun provisionAdoptsOnlyMatchingUnscopedLegacyCredentials() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val owner = operation()
+        val legacy = BackgroundCredential(owner.scope.deviceId, "https://synthetic.invalid", "legacy", 1000)
+        val imported = store.importLegacy(legacy).value()
+        val request = BackgroundUiProvisionRequest(imported.revision, owner.scope.deviceId,
+            legacy.panelBase, "bearer", "install", 1, BackgroundCapabilitySnapshot(0, false, 1), owner.scope)
+        assertTrue(store.beginOwnerOperation(imported.revision, owner, false) is CredentialStoreResult.Failure)
+        val adopted = store.beginProvisionOperation(request, owner).value()
+        assertEquals(owner.scope, adopted.ownerScope)
+        assertEquals("legacy", adopted.active?.token)
+        assertEquals(owner, adopted.ownerOperation)
+        assertTrue(store.beginProvisionOperation(request, owner) is CredentialStoreResult.Failure)
+    }
+
+    @Test fun adoptedLegacyTokenIsReissuedEvenIfPreviouslyReportedFreshAndNoop() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val owner = operation()
+        val old = store.configure(0, BackgroundCredentialProvision(owner.scope.deviceId,
+            "https://synthetic.invalid", "old-token", 9999999999, "install", 1,
+            BackgroundCapabilitySnapshot(0, false, 1))).value()
+        val request = BackgroundUiProvisionRequest(old.revision, owner.scope.deviceId,
+            "https://synthetic.invalid", "bearer", "install", 1,
+            BackgroundCapabilitySnapshot(0, false, 1), owner.scope)
+        val begun = store.beginProvisionOperation(request, owner).value()
+        var issued = 0
+        val saved = store.withOwnerOperation(owner) {
+            provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = begun.revision), "noop", 100,
+                provision = { error("disabled capability") }, rotate = { error("old scope must use bearer") },
+                legacy = { issued++; BackgroundCredential(owner.scope.deviceId, request.panelBase, "new-token", 1000) })
+        }
+        assertEquals(1, issued)
+        assertEquals("new-token", saved.active?.token)
+    }
+
+    @Test fun legacyProvisionRejectsOtherDevicePanelAndCancelledOwnerWithoutChangingRecord() {
+        for (variant in 0..3) {
+            val store = BackgroundCredentialStore(MemoryBackend())
+            val owner = operation()
+            var saved = store.importLegacy(BackgroundCredential(owner.scope.deviceId,
+                "https://synthetic.invalid", "legacy", 1000)).value()
+            if (variant == 3) saved = store.fenceOwnerLogout(owner.scope.authEpoch).value()
+            val request = BackgroundUiProvisionRequest(saved.revision,
+                if (variant == 0) "33333333-3333-4333-8333-333333333333" else owner.scope.deviceId,
+                if (variant == 1) "https://other.invalid" else "https://synthetic.invalid",
+                "bearer", "install", 1, BackgroundCapabilitySnapshot(0, false, 1), owner.scope)
+            val ticket = if (variant == 2) owner.copy(expiresAtUnixMs = 1) else owner
+            assertTrue(store.beginProvisionOperation(request, ticket) is CredentialStoreResult.Failure)
+            assertEquals(saved, store.read().value())
+        }
+    }
     @Test fun finalizedLegacyLogoutAdmitsFreshOwnerButNotCancelledOwner() {
         val store = BackgroundCredentialStore(MemoryBackend())
         val owner = operation(1, 5)

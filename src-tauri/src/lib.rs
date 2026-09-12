@@ -29,7 +29,6 @@ mod resource_usage;
 #[cfg(desktop)]
 pub mod runtime;
 mod runtime_control;
-#[cfg(desktop)]
 mod runtime_startup;
 #[path = "updates_remote.rs"]
 mod updates;

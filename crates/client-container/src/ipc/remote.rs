@@ -513,6 +513,33 @@ impl RemoteOwner {
     ) -> Result<(), PrivateError> {
         let deadline = Instant::now() + REQUEST_BUDGET;
         timeout_at(deadline, async {
+            // RuntimeReady is also used by UI retries. Keep an already admitted
+            // exact scope live while schedulers have access requests in flight.
+            let observed = broker.observe().await.map_err(broker_error)?;
+            let current = observed.access.ok_or(PrivateError::RecoveryRequired)?;
+            self.check_target(&current)?;
+            match self
+                .control(
+                    ControlV1::CheckScope {
+                        scope: scope(&current),
+                    },
+                    deadline,
+                )
+                .await
+            {
+                Ok(ControlAckV1::Done) => {
+                    return broker
+                        .with_current_access(&current, || {
+                            self.live(deadline).map_err(|_| BrokerError::Cancelled)?;
+                            finish().map_err(|_| BrokerError::RecoveryRequired)
+                        })
+                        .await
+                        .map_err(broker_error);
+                }
+                Err(PrivateError::RecoveryRequired) => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(PrivateError::Protocol),
+            }
             let lease = self.prepare(deadline).await?;
             let mut held = AdmissionLease {
                 owner: self,

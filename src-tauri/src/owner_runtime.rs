@@ -84,22 +84,19 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     app.manage(push.clone());
     app.manage(metrics.clone());
     let handle = app.handle().clone();
-    tauri::async_runtime::spawn(async move {
-        if port
-            .owner_request(nelomai_client_container::host::HostRequestV1::RuntimeReady)
-            .await
-            .is_err()
-        {
-            diagnostics.record_named("startup.runtime_recovery_required", None, None, None);
-            return;
-        }
+    let startup_diagnostics = diagnostics.clone();
+    let startup = Arc::new(runtime_startup::RuntimeStartup::new(move || {
+        diagnostics.record_named("startup.runtime_ready", None, None, None);
         let dns = application_dns(&handle);
-        let _ = handle
-            .tunnel_android()
-            .update_quick_dns_async(tauri_plugin_tunnel_android::DnsServersRequest {
-                dns_servers: dns,
-            })
-            .await;
+        let dns_handle = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = dns_handle
+                .tunnel_android()
+                .update_quick_dns_async(tauri_plugin_tunnel_android::DnsServersRequest {
+                    dns_servers: dns,
+                })
+                .await;
+        });
         start_split_tunnel_scheduler(application.clone(), split);
         start_physical_network_scheduler(application.clone());
         start_pending_stop_scheduler(application.clone());
@@ -111,6 +108,12 @@ pub fn setup_android(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
             diagnostics,
         );
         start_push_registration_scheduler(handle, application, push);
+    }));
+    app.manage(startup.clone());
+    tauri::async_runtime::spawn(async move {
+        let _ = startup
+            .recover(|| async { runtime_startup::request_ready(&port, &startup_diagnostics).await })
+            .await;
     });
     Ok(())
 }

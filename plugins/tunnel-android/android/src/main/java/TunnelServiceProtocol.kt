@@ -202,13 +202,19 @@ internal object TunnelServiceClient {
         context: Context,
         onSuccess: (ConnectionIntentServiceStatus) -> Unit,
         onError: (String) -> Unit,
-    ) = requestBundle(
-        context,
-        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
-            .setAction(NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS),
-        { onSuccess(it.toConnectionIntentServiceStatus()) },
-        onError,
-    )
+    ) {
+        IdleConnectionIntentProjection.open(context).read()?.let {
+            onSuccess(it)
+            return
+        }
+        requestBundle(
+            context,
+            ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+                .setAction(NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS),
+            { onSuccess(it.toConnectionIntentServiceStatus()) },
+            onError,
+        )
+    }
 
     fun start(
         context: Context,

@@ -376,10 +376,24 @@ internal class BackgroundCredentialStore(
         return try { work() } finally { capturedOwnerOperation.set(previous) }
     }
 
+    fun beginProvisionOperation(
+        request: BackgroundUiProvisionRequest,
+        operation: NativeOwnerOperation,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> =
+        beginOwnerOperation(request.expectedRevision, operation, false, request)
+
     fun beginOwnerOperation(
         expectedRevision: Long,
         operation: NativeOwnerOperation,
         requireExistingScope: Boolean,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> =
+        beginOwnerOperation(expectedRevision, operation, requireExistingScope, null)
+
+    private fun beginOwnerOperation(
+        expectedRevision: Long,
+        operation: NativeOwnerOperation,
+        requireExistingScope: Boolean,
+        provision: BackgroundUiProvisionRequest?,
     ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         mutate(expectedRevision, advancesRevision = true) { current ->
             if (operation.expiresAtUnixMs <= nowMillis() ||
@@ -392,13 +406,29 @@ internal class BackgroundCredentialStore(
                 current.installSecret == null && current.active == null && current.previous == null &&
                 current.pending == null && current.reservation == null && current.cleanupCredential == null &&
                 (current.ownerScope == null || operation.scope.authEpoch > current.ownerScope.authEpoch)
+            // Only the owner-authenticated provisioning path can adopt legacy
+            // records. Recovery/rotation cannot infer ownership from a token.
+            val legacyProvision = provision != null && provision.ownerScope == operation.scope &&
+                provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
+                current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
+                provision.installSecret.isNotBlank() &&
+                (current.installSecret == null || current.installSecret == provision.installSecret) &&
+                current.ownerScope == null && current.ownerOperation == null && current.ownerAttempt == 0L &&
+                current.ownerCancelEpoch == null && current.logoutState == null &&
+                current.previous == null && current.pending == null && current.reservation == null &&
+                current.cleanupCredential == null && current.active?.let {
+                    it.ownerScope == null && it.deviceId == provision.deviceId && it.panelBase == provision.panelBase
+                } == true
             if (current.ownerScope != operation.scope &&
-                (requireExistingScope || (!finalizedClean && (current.ownerScope != null || hasCredentials)))
+                (requireExistingScope || (!finalizedClean && !legacyProvision && (current.ownerScope != null || hasCredentials)))
             ) throw MutationFailure("background_owner_scope_mismatch")
             if (current.ownerOperation == operation) return@mutate current
             if (operation.attempt <= current.ownerAttempt) throw MutationFailure("background_owner_cancelled")
             current.copy(revision = current.revision.incrementRevision(), ownerScope = operation.scope,
-                ownerOperation = operation, ownerAttempt = operation.attempt)
+                ownerOperation = operation, ownerAttempt = operation.attempt,
+                // Retain the proof for owner-checked recovery/cleanup, but force
+                // bearer reprovision instead of treating it as a fresh token.
+                active = if (legacyProvision) current.active?.copy(expiresAtUnix = 1) else current.active)
         }
     }
 

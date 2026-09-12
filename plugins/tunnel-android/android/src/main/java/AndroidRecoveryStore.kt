@@ -680,6 +680,12 @@ internal class AndroidRecoveryStore(
         readLocked()
     }
 
+    fun readObserved(
+        observe: (RecoveryStoreResult<AndroidRecoveryEnvelope>) -> Unit,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        readLocked().also(observe)
+    }
+
     /** Persists only recovery-v2 control state; callers must never pass configuration bytes. */
     fun updateRedundant(
         update: (AndroidRedundantTransaction) -> AndroidRedundantTransaction,

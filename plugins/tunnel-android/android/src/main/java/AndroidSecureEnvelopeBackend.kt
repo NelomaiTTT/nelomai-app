@@ -146,9 +146,11 @@ internal object AndroidRecoveryStores {
     private var instance: AndroidRecoveryStore? = null
 
     fun open(context: Context): AndroidRecoveryStore = instance ?: synchronized(this) {
-        instance ?: AndroidRecoveryStore(
-            backend = AndroidSecureEnvelopeBackend(context.applicationContext),
-            bootIdentity = AndroidBootIdentityProvider(context.applicationContext),
-        ).also { instance = it }
+        instance ?: IdleConnectionIntentProjection.open(context).let { projection ->
+            AndroidRecoveryStore(
+                backend = projection.wrap(AndroidSecureEnvelopeBackend(context.applicationContext)),
+                bootIdentity = AndroidBootIdentityProvider(context.applicationContext),
+            )
+        }.also { instance = it }
     }
 }

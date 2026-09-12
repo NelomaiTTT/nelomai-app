@@ -822,8 +822,9 @@ async fn bootstrap_application_for_startup(
 ) -> Result<Bootstrap, CommandError> {
     #[cfg(target_os = "android")]
     {
-        app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
-            .owner_request(nelomai_client_container::host::HostRequestV1::RuntimeReady)
+        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+            .ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
             .await
             .map_err(|_| {
                 CommandError::from_core(nelomai_client_core::CoreError::AuthRecoveryRequired)
@@ -2226,12 +2227,13 @@ pub async fn app_login(
         .await
         .map_err(CommandError::from)?;
     #[cfg(target_os = "android")]
-    app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
-        .owner_request(nelomai_client_container::host::HostRequestV1::RuntimeReady)
-        .await
-        .map_err(|_| {
-            CommandError::from_core(nelomai_client_core::CoreError::AuthRecoveryRequired)
-        })?;
+    {
+        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+            .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
+            .await
+            .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
+    }
     #[cfg(desktop)]
     diagnostics.set_automatic_device(&response.device.id);
     #[cfg(not(target_os = "android"))]

@@ -2094,9 +2094,32 @@ async fn owner_control_timeout_at_prepare_or_commit_keeps_one_budget_and_closes_
         let broker = fixture.broker.clone();
         let started = Instant::now();
         let admission = tokio::spawn(async move { owner.admit_empty_current(&broker).await });
+        let check = read_frame(&mut peer, started + REQUEST_BUDGET)
+            .await
+            .unwrap();
+        assert!(matches!(
+            check.message,
+            MessageV1::Control(ControlV1::CheckScope { .. })
+        ));
+        write_frame(
+            &mut peer,
+            FrameV1::new(
+                check.id,
+                MessageV1::Ack(ControlAckV1::Error {
+                    error: PrivateError::RecoveryRequired,
+                }),
+            ),
+            started + REQUEST_BUDGET,
+        )
+        .await
+        .unwrap();
         let prepare = read_frame(&mut peer, started + REQUEST_BUDGET)
             .await
             .unwrap();
+        assert!(matches!(
+            prepare.message,
+            MessageV1::Control(ControlV1::Prepare { .. })
+        ));
         if acknowledge_prepare {
             tokio::time::advance(Duration::from_secs(6)).await;
             write_frame(

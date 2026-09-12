@@ -412,6 +412,14 @@ internal fun provisionOwnedBackgroundCredential(
     val scope = requireNotNull(current.ownerScope)
     require(scope == request.ownerScope && scope.deviceId == request.deviceId)
     var selected = if (current.pending != null || current.reservation != null) "two_phase" else mode
+    if (selected in setOf("noop", "rotate") &&
+        (current.active?.expiresAtUnix?.let { it <= nowUnix } != false || current.installSecret == null)) {
+        // The status reply predates admission. Legacy adoption (or expiry while
+        // waiting) requires fresh bearer provisioning, not a stale noop/rotate.
+        selected = if (request.capability.enabled || current.capability?.let {
+            it.enabled && it.expiresAtUnix > nowUnix
+        } == true) "two_phase" else "legacy"
+    }
     if (selected == "noop") return current
     if (selected == "rotate") {
         try {

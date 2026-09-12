@@ -723,6 +723,19 @@ async fn common_host_restart_case(
         Some(7)
     );
     assert!(client.check_start_barrier().is_ok());
+    // A visible UI repeats RuntimeReady while admitted schedulers request access.
+    // Re-admission must not temporarily revoke their scope or close the channel.
+    for iteration in 0..100 {
+        let (access, ready) = tokio::join!(client.access(None), async {
+            for _ in 0..(iteration % 8) {
+                tokio::task::yield_now().await;
+            }
+            client.owner_request(HostRequestV1::RuntimeReady).await
+        });
+        assert!(access.is_ok(), "iteration {iteration}: access={access:?}");
+        assert!(ready.is_ok(), "iteration {iteration}: ready={ready:?}");
+        assert!(client.check_start_barrier().is_ok());
+    }
     assert_eq!(
         refresh_calls.load(Ordering::SeqCst),
         usize::from(pending_refresh)

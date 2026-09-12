@@ -656,12 +656,19 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun handleConnectionIntentStatus(intent: Intent) {
-        when (val result = connectionIntentCoordinator.status()) {
-            is RecoveryStoreResult.Success -> intent.resultReceiver()?.send(
-                SERVICE_RESULT_OK,
-                connectionIntentServiceStatus(result.value).toBundle(),
-            )
-            is RecoveryStoreResult.Failure -> intent.resultReceiver().sendError(result.code)
+        // Publish only from the :vpn authoritative reader, under its store lock.
+        // UI-side SharedPreferences readers may still hold an older snapshot.
+        val projection = IdleConnectionIntentProjection.open(applicationContext)
+        when (val result = AndroidRecoveryStores.open(applicationContext).readObserved(projection::observe)) {
+            is RecoveryStoreResult.Success -> {
+                intent.resultReceiver()?.send(
+                    SERVICE_RESULT_OK,
+                    connectionIntentServiceStatus(result.value).toBundle(),
+                )
+            }
+            is RecoveryStoreResult.Failure -> {
+                intent.resultReceiver().sendError(result.code)
+            }
         }
         stopIfIdle()
     }
@@ -877,7 +884,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             var provisioned = false
             try {
                 val store = AndroidBackgroundCredentialStores.open(applicationContext)
-                val begun = store.beginOwnerOperation(request.expectedRevision, ownerOperation, false).credentialOrThrow()
+                val begun = store.beginProvisionOperation(request, ownerOperation).credentialOrThrow()
                 require(ownerOperation.scope.deviceId == request.deviceId)
                 store.withOwnerOperation(ownerOperation) {
                 provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = begun.revision),
@@ -905,6 +912,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     }
                 receiver.sendSuccess()
             } catch (error: BackgroundConnectionException) {
+                receiver.sendError(error.code)
+            } catch (error: CredentialRotationFailure) {
+                TunnelLog.warning("background.provision_failed", error.code)
                 receiver.sendError(error.code)
             } catch (_: Throwable) {
                 receiver.sendError("background_credential_provision_failed")
