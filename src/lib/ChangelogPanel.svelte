@@ -1,19 +1,30 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import type { ChangelogEntry } from "./changelog";
+  import type { ReleaseHistory, ReleaseHistoryEntry } from "./release-history";
 
   let {
-    entries,
+    history,
     onclose,
   }: {
-    entries: readonly ChangelogEntry[];
+    history: ReleaseHistory;
     onclose: () => void;
   } = $props();
 
   let dialog: HTMLDivElement;
   let closeButton: HTMLButtonElement;
+  let loaded = $state<ReleaseHistoryEntry[] | null>(null);
+  let refreshing = $state(true);
+  let failed = $state(false);
 
   onMount(() => {
+    let disposed = false;
+    void history.refresh().then(entries => {
+      if (!disposed) loaded = entries;
+    }).catch(() => {
+      if (!disposed) failed = true;
+    }).finally(() => {
+      if (!disposed) refreshing = false;
+    });
     const previousFocus =
       document.activeElement instanceof HTMLElement
         ? document.activeElement
@@ -23,6 +34,7 @@
     closeButton.focus();
 
     return () => {
+      disposed = true;
       document.body.style.overflow = previousBodyOverflow;
       previousFocus?.focus();
     };
@@ -89,15 +101,16 @@
     </header>
 
     <div class="version-list">
-      {#each entries as entry (entry.version)}
+      <p class="history-status" role="status">
+        {#if refreshing}Обновляем историю…{:else if failed}Не удалось обновить историю. Показана сохранённая копия.{/if}
+      </p>
+      {#each (loaded ?? history.read()) as entry (entry.version)}
         <article>
           <h3>Версия {entry.version}</h3>
-          <ul>
-            {#each entry.items as item}
-              <li>{item}</li>
-            {/each}
-          </ul>
+          <p class="release-notes">{entry.notes || "Описание изменений не добавлено."}</p>
         </article>
+      {:else}
+        <p>История версий пока пуста.</p>
       {/each}
     </div>
   </div>
@@ -194,17 +207,18 @@
     font-size: 17px;
   }
 
-  ul {
+  .release-notes {
     margin: 0;
-    padding-left: 21px;
-    display: grid;
-    gap: 9px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     color: #c1c8cd;
     line-height: 1.5;
   }
 
-  li {
-    padding-left: 3px;
+  .history-status {
+    margin: 0;
+    color: #c1c8cd;
+    font-size: 13px;
   }
 
   @media (max-width: 620px) {

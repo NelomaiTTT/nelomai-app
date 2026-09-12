@@ -93,6 +93,75 @@ fn token_response() -> Value {
 }
 
 #[tokio::test]
+async fn release_history_is_public_and_keeps_notes_without_authentication() {
+    let (url, requests, handle) = server(json!({"api_version":"1","entries":[
+        {"version":"0.2.18","notes":"Первая строка\n<script>literal</script>"}
+    ]}));
+    let result = ClientApi::new(&url)
+        .unwrap()
+        .release_history()
+        .await
+        .unwrap();
+    assert_eq!(
+        result.entries[0].notes,
+        "Первая строка\n<script>literal</script>"
+    );
+    let request = requests.recv().unwrap().to_lowercase();
+    assert!(request.starts_with("get /api/client/v1/releases/changelog "));
+    assert!(!request.contains("authorization:"));
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn release_history_rejects_invalid_and_excessive_payloads() {
+    for response in [
+        json!({"api_version":"2","entries":[]}),
+        json!({"api_version":"1","entries":[{"version":"", "notes":"text"}]}),
+        json!({"api_version":"1","entries":[{"version":"0.2.18", "notes":"x".repeat(20_001)}]}),
+        json!({"api_version":"1","entries":[{"version":"0.2.18", "notes":"a"},{"version":"0.2.18", "notes":"b"}]}),
+        json!({"api_version":"1","entries":(0..51).map(|i|json!({"version":format!("0.0.{i}"),"notes":"ok"})).collect::<Vec<_>>()}),
+    ] {
+        let (url, _requests, handle) = server(response);
+        assert!(ClientApi::new(&url)
+            .unwrap()
+            .release_history()
+            .await
+            .is_err());
+        handle.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn release_history_rejects_http_errors_before_reading_their_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = [0; 4096];
+        stream.read(&mut request).unwrap();
+        // No body follows. The advertised size must not trigger buffering or a
+        // JSON read: the public command only needs a generic HTTP failure.
+        write!(
+            stream,
+            "HTTP/1.1 503 Unavailable\r\nContent-Length: 100000000\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let error = ClientApi::new(&url)
+        .unwrap()
+        .release_history()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, nelomai_client_api::ClientApiError::Transport(error) if error.is_status())
+    );
+    handle.join().unwrap();
+}
+
+#[tokio::test]
 async fn runtime_login_sends_exact_target_without_client_generation() {
     let (url, requests, handle) = server(token_response());
     let api = ClientApi::new(&url).unwrap();

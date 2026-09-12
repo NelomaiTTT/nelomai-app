@@ -26,6 +26,18 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseHistoryEntry {
+    pub version: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseHistory {
+    pub api_version: ApiVersion,
+    pub entries: Vec<ReleaseHistoryEntry>,
+}
+
 /// Exact panel target DTO: a target never assigns a server generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -895,6 +907,41 @@ impl ClientApi {
 
     pub fn reset_transport(&self) -> Result<(), ClientApiError> {
         self.http.reset()
+    }
+
+    /// Public release metadata is independent of login, refresh and runtime admission.
+    pub async fn release_history(&self) -> Result<ReleaseHistory, ClientApiError> {
+        // Error descriptions are not displayed here; discard non-success bodies
+        // instead of passing potentially huge HTML/JSON errors to api_error.
+        let response = self
+            .send_request(
+                self.http
+                    .get(self.endpoint("releases/changelog")?)
+                    .timeout(Duration::from_secs(8)),
+            )
+            .await?
+            .error_for_status()?;
+        let history: ReleaseHistory = Self::read_limited_json(
+            response,
+            4 * 1024 * 1024,
+            "release_history_too_large",
+            "invalid_release_history",
+        )
+        .await?;
+        let mut versions = HashSet::new();
+        if history.entries.len() > 50
+            || history.entries.iter().any(|entry| {
+                entry.version.trim().is_empty()
+                    || entry.version.chars().count() > 64
+                    || entry.notes.chars().count() > 20_000
+                    || !versions.insert(&entry.version)
+            })
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "invalid_release_history",
+            });
+        }
+        Ok(history)
     }
 
     pub fn with_app_version(mut self, app_version: &str) -> Result<Self, ClientApiError> {
@@ -1973,6 +2020,15 @@ impl ClientApi {
         if !status.is_success() {
             return Err(Self::api_error(response, status).await);
         }
+        Self::read_limited_json(response, limit_bytes, limit_code, invalid_code).await
+    }
+
+    async fn read_limited_json<T: for<'de> Deserialize<'de>>(
+        response: Response,
+        limit_bytes: usize,
+        limit_code: &'static str,
+        invalid_code: &'static str,
+    ) -> Result<T, ClientApiError> {
         if response
             .content_length()
             .is_some_and(|length| length > limit_bytes as u64)

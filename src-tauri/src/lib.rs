@@ -238,6 +238,7 @@ pub(crate) fn run_product(
             commands::app_unpin_stray,
             commands::app_send_diagnostics,
             commands::app_record_startup_stage,
+            commands::app_release_history,
             commands::app_update_status,
             commands::app_update_refresh,
             commands::app_update_set_automatic,

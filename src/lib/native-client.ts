@@ -127,6 +127,7 @@ export function createNativeClient(
   invoke: Invoke = (command, args) => tauriInvoke(command, args),
 ) {
   return {
+    releaseHistory: () => invoke("app_release_history"),
     state: () => invoke("app_state") as Promise<AppState>,
     preferences: () => invoke("app_preferences") as Promise<AppPreferences>,
     setCloseToTray: (enabled: boolean) =>

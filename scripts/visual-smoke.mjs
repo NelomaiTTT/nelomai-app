@@ -201,6 +201,10 @@ async function capture(name, viewport, scenario) {
             }
             return fixture;
           }
+          if (command === "app_release_history") {
+            if (window.__RELEASE_HISTORY_OFFLINE__) throw { code: "release_history_unavailable" };
+            return { api_version: "1", entries: [{ version: "0.2.18", notes: window.__RELEASE_HISTORY_NOTES__ ?? "Текст с панели\n<script>window.changelogInjected = true</script>" }] };
+          }
           if (command === "app_state") {
             return {
               phase: connection ? "connected" : "ready",
@@ -440,11 +444,15 @@ async function capture(name, viewport, scenario) {
 }
 
 async function verifyChangelogLifecycle(page) {
+  if (await lastCall(page, "app_release_history")) throw new Error("history must not load during startup or VPN connection");
   const opener = page.getByRole("button", { name: "Что нового" });
   await opener.click();
 
   const dialog = page.getByRole("dialog", { name: "Что нового" });
   await dialog.waitFor();
+  await dialog.getByText("Версия 0.2.18", { exact: true }).waitFor();
+  await dialog.getByText("Текст с панели", { exact: false }).waitFor();
+  if (await page.evaluate(() => Boolean(window.changelogInjected))) throw new Error("release notes executed HTML");
   const close = page.getByRole("button", { name: "Закрыть" });
   if (!(await close.evaluate((element) => element === document.activeElement))) {
     throw new Error("changelog did not move focus into the modal dialog");
@@ -465,6 +473,19 @@ async function verifyChangelogLifecycle(page) {
   if (!(await opener.evaluate((element) => element === document.activeElement))) {
     throw new Error("changelog did not restore focus to its opener");
   }
+
+  await page.evaluate(() => { window.__RELEASE_HISTORY_NOTES__ = "Исправленный текст без новой сборки"; });
+  await opener.click();
+  await dialog.getByText("Исправленный текст без новой сборки", { exact: true }).waitFor();
+  await page.keyboard.press("Escape");
+  await dialog.waitFor({ state: "hidden" });
+  await page.evaluate(() => { window.__RELEASE_HISTORY_OFFLINE__ = true; });
+  await opener.click();
+  await dialog.getByText("Не удалось обновить историю. Показана сохранённая копия.", { exact: true }).waitFor();
+  await dialog.getByText("Исправленный текст без новой сборки", { exact: true }).waitFor();
+  await page.keyboard.press("Escape");
+  await dialog.waitFor({ state: "hidden" });
+  await page.getByRole("button", { name: /Стоп/ }).waitFor();
 
   await page.getByRole("button", { name: "Выйти" }).click();
   await page.getByRole("heading", { name: "Вход в Nelomai" }).waitFor();

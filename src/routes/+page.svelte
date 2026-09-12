@@ -6,7 +6,7 @@
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
   import RuntimeSelector from "$lib/RuntimeSelector.svelte";
-  import { CHANGELOG } from "$lib/changelog";
+  import { ReleaseHistory } from "$lib/release-history";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
   import {
     clearOwnedConnectionIntentNotice,
@@ -135,6 +135,16 @@
   let notificationHistoryExpanded = $state(false);
   let notificationsOpen = $state(false);
   let changelogOpen = $state(false);
+  let releaseHistory: ReleaseHistory | null = null;
+
+  function getReleaseHistory(): ReleaseHistory {
+    if (!releaseHistory) {
+      let storage: Storage | null = null;
+      try { storage = window.localStorage; } catch { /* private mode */ }
+      releaseHistory = new ReleaseHistory(storage, nativeClient.releaseHistory);
+    }
+    return releaseHistory;
+  }
   let notificationsBusy = $state(false);
   let notificationsError = $state<string | null>(null);
   let appPreferences = $state<AppPreferences | null>(null);
@@ -1825,7 +1835,7 @@
 
 {#if changelogOpen}
   <ChangelogPanel
-    entries={CHANGELOG}
+    history={getReleaseHistory()}
     onclose={() => closeOverlay("changelog")}
   />
 {/if}

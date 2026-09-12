@@ -2377,6 +2377,21 @@ pub fn app_record_startup_stage(diagnostics: State<'_, Arc<AppDiagnostics>>, sta
     diagnostics.record_named(stage.event_name(), None, None, None);
 }
 
+#[tauri::command]
+pub async fn app_release_history() -> Result<nelomai_client_api::ReleaseHistory, CommandError> {
+    let unavailable = |_| {
+        CommandError::new(
+            "release_history_unavailable",
+            "Не удалось обновить историю версий",
+        )
+    };
+    nelomai_client_api::ClientApi::new(crate::PANEL_BASE)
+        .map_err(unavailable)?
+        .release_history()
+        .await
+        .map_err(unavailable)
+}
+
 async fn provision_android_background(
     app: &AppHandle,
     application: &NativeApplication,
