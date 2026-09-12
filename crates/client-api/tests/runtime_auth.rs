@@ -140,8 +140,14 @@ async fn release_history_rejects_http_errors_before_reading_their_body() {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        let mut request = [0; 4096];
-        stream.read(&mut request).unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let mut chunk = [0; 4096];
+            let count = stream.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 16 * 1024, "request headers are too large");
+        }
         // No body follows. The advertised size must not trigger buffering or a
         // JSON read: the public command only needs a generic HTTP failure.
         write!(
