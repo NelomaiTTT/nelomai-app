@@ -28,7 +28,7 @@ class NativeAcceptancePackagerTest(ArtifactFixture):
             (folder / "latest").mkdir()
             shutil.copyfile(self.public, folder / "draft-public-key.raw")
             shutil.copyfile(self.public, folder / "runtime-public-key.raw")
-            prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-0.2.19-{platform}-{architecture}"
             for suffix in (".zip", ".manifest.json", ".manifest.sig"):
                 for slot in ("latest", "stable"):
                     shutil.copyfile(candidates / (prefix + suffix), folder / slot / (prefix + suffix))
@@ -43,11 +43,11 @@ class NativeAcceptancePackagerTest(ArtifactFixture):
 
     def candidates(self, platform, architecture, payload, readelf=None):
         candidates = release_set_fixture.RuntimeReleaseSetTest.four_candidates(self)
-        module("build-runtime-manifest").package(payload, self.root / "native", "0.2.18", SOURCE,
+        module("build-runtime-manifest").package(payload, self.root / "native", "0.2.19", SOURCE,
             platform, architecture, self.keyfile, readelf)
         for path in (self.root / "native").iterdir():
             shutil.copyfile(path, candidates / path.name)
-        digest = module("build-runtime-release-set").build(candidates, self.root / "root", "0.2.18", SOURCE,
+        digest = module("build-runtime-release-set").build(candidates, self.root / "root", "0.2.19", SOURCE,
             self.keyfile, self.public)
         for path in (self.root / "root").iterdir():
             shutil.copyfile(path, candidates / path.name)

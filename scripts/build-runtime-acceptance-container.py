@@ -3,7 +3,7 @@
 
 Staging is not acceptance. Native package extraction and execution are separate
 mandatory gates. The synthetic latest identity is restricted to this builder;
-shipping 0.2.18 continues to use the existing latest-only container stage.
+shipping 0.2.19 continues to use the existing latest-only container stage.
 """
 import argparse
 import importlib.util
@@ -24,7 +24,7 @@ spec = importlib.util.spec_from_file_location("release_set", ROOT / "scripts/bui
 release_set = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release_set)
 verifier = release_set.verifier
-SYNTHETIC_LATEST = "0.2.19"
+SYNTHETIC_LATEST = "0.2.20"
 
 
 def stage_signed(signed, root_digest, output, public_key, platform, architecture, source, kind, readelf=None):
@@ -34,14 +34,14 @@ def stage_signed(signed, root_digest, output, public_key, platform, architecture
     if output.exists() or output.is_symlink():
         raise ValueError("immutable signed staging output exists")
     verifier.load_script("release-candidate-gates.py").verify_runtime_release(
-        signed / "release", "0.2.18", source, root_digest, public_key)
+        signed / "release", "0.2.19", source, root_digest, public_key)
     documents = signed / "containers" / platform / kind
     manifest_path, signature = documents / "container-manifest-v1.json", documents / "container-manifest-v1.sig"
     container = verifier.authenticated("container", manifest_path, signature, public_key, platform, architecture)
     slots = [slot["slot"] for slot in container["slots"]]
     if slots != (["latest", "stable"] if kind == "acceptance" else ["latest"]):
         raise ValueError("container purpose differs from signed slots")
-    prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
+    prefix = f"nelomai-runtime-0.2.19-{platform}-{architecture}"
     if kind == "acceptance" and (container.get("stable_release_set_sha256") != root_digest
             or container.get("stable_platform_manifest_sha256") != verifier.digest(signed / "release" / (prefix + ".manifest.json"))):
         raise ValueError("acceptance container differs from final stable root")
@@ -54,7 +54,7 @@ def stage_signed(signed, root_digest, output, public_key, platform, architecture
             folder = signed / "latest" / platform if latest else signed / "release"
             archive = folder / (prefix + ".zip")
             original = verifier.verify(archive, folder / (prefix + ".manifest.json"),
-                folder / (prefix + ".manifest.sig"), public_key, "0.2.18", source, platform, architecture,
+                folder / (prefix + ".manifest.sig"), public_key, "0.2.19", source, platform, architecture,
                 inspect_native=False)
             expected = {**original, "runtime_version": SYNTHETIC_LATEST} if latest and kind == "acceptance" else original
             if slot["manifest"] != expected:
@@ -93,7 +93,7 @@ def stage_android_latest(payload, output, source, readelf):
     """Consume the existing compiler-stage index/ZIP, never another APK or DEX receipt."""
     manifest = json.loads((payload.parent / "runtime-manifest-v1.json").read_bytes())
     if ({name: manifest.get(name) for name in ("format_version", "runtime_version", "source_commit",
-            "platform", "architecture", "contract_version")} != dict(format_version=1, runtime_version="0.2.18",
+            "platform", "architecture", "contract_version")} != dict(format_version=1, runtime_version="0.2.19",
             source_commit=source, platform="android", architecture="aarch64", contract_version=1)):
         raise ValueError("Android latest compiler-stage identity mismatch")
     packager = verifier.load_script("android/build-runtime-artifact.py")
@@ -117,13 +117,13 @@ def stage(candidate, root_digest, latest_payload, output, signing_key, public_ke
     if output.exists() or output.is_symlink():
         raise ValueError("immutable acceptance staging output already exists")
     gates = verifier.load_script("release-candidate-gates.py")
-    gates.verify_runtime_release(candidate, "0.2.18", source, root_digest, public_key)
+    gates.verify_runtime_release(candidate, "0.2.19", source, root_digest, public_key)
     if signing_key.is_symlink() or signing_key.stat().st_size != 32:
         raise ValueError("explicit regular raw Ed25519 key required")
     key = Ed25519PrivateKey.from_private_bytes(signing_key.read_bytes())
     if key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw) != public_key.read_bytes():
         raise ValueError("acceptance signer differs from candidate trust root")
-    prefix = f"nelomai-runtime-0.2.18-{platform}-{architecture}"
+    prefix = f"nelomai-runtime-0.2.19-{platform}-{architecture}"
     stable_inputs = [candidate / (prefix + suffix) for suffix in (".zip", ".manifest.json", ".manifest.sig")]
     before = [verifier.digest(path) for path in stable_inputs]
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -131,8 +131,8 @@ def stage(candidate, root_digest, latest_payload, output, signing_key, public_ke
         work = Path(temporary)
         staged = work / "resources"
         runtime = staged / "runtime"
-        stable = verifier.verify(*stable_inputs, public_key, "0.2.18", source, platform, architecture,
-                                 readelf=readelf, output=runtime / "engines/stable/0.2.18")
+        stable = verifier.verify(*stable_inputs, public_key, "0.2.19", source, platform, architecture,
+                                 readelf=readelf, output=runtime / "engines/stable/0.2.19")
         if platform == "android":
             latest = stage_android_latest(latest_payload, runtime / "engines/latest" / SYNTHETIC_LATEST, source, readelf)
             check = verifier.load_script("android/check-runtime-collisions.py")
@@ -153,7 +153,7 @@ def stage(candidate, root_digest, latest_payload, output, signing_key, public_ke
             dispatcher = staged / "dispatcher/1" / service
             dispatcher.parent.mkdir(parents=True)
             shutil.copy2(runtime / "engines/latest" / SYNTHETIC_LATEST / service, dispatcher)
-        container = dict(format_version=1, container_version="0.2.18",
+        container = dict(format_version=1, container_version="0.2.19",
             release_set_id="acceptance-" + source, minimum_runtime_contract=1, maximum_runtime_contract=1,
             stable_release_set_sha256=root_digest, stable_platform_manifest_sha256=before[1],
             slots=[dict(slot="latest", manifest=latest), dict(slot="stable", manifest=stable)])
@@ -272,7 +272,7 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
     matches = list((bundle_dir / ("macos" if platform == "macos" else bundle)).glob(suffix))
     if len(matches) != 1:
         raise ValueError("native packager did not emit one acceptance installer")
-    name = f"nelomai-acceptance-0.2.18-{platform}-{architecture}"
+    name = f"nelomai-acceptance-0.2.19-{platform}-{architecture}"
     extracted = output / "extracted"
     extracted.mkdir()
     if platform == "macos":
@@ -296,7 +296,7 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
         # RPATHs again. The installed launcher supplies the trusted library path.
         subprocess.run([str(plugin), "--appimage-extract-and-run", "--appdir", str(intermediate / "squashfs-root")],
             env={**environment, "APPIMAGE_EXTRACT_AND_RUN": "1", "ARCH": architecture,
-                 "OUTPUT": str(package), "VERSION": "0.2.18"}, cwd=output, check=True)
+                 "OUTPUT": str(package), "VERSION": "0.2.19"}, cwd=output, check=True)
         subprocess.run([str(package), "--appimage-extract"], cwd=extracted, check=True, stdout=subprocess.DEVNULL)
     else:
         package = output / (name + ".exe")
@@ -328,14 +328,14 @@ def package_android(staged, output, public_key, readelf, apkanalyzer, common_hos
             shutil.copyfile(library, native / library.name)
     subprocess.run([str(readelf.with_name("llvm-strip")), "--strip-debug", "-o",
         str(native / "libnelomai_android_container.so"), str(common_host)], check=True)
-    stable_aar = runtime / "engines/stable/0.2.18/runtime/runtime.aar"
+    stable_aar = runtime / "engines/stable/0.2.19/runtime/runtime.aar"
     android = root / "src-tauri/gen/android"
     gradle = android / ("gradlew.bat" if os.name == "nt" else "gradlew")
     arguments = (["-PnelomaiAcceptance=true", "-PnelomaiStableRuntimeAar=" + str(stable_aar)] if acceptance else [])
     subprocess.run([str(gradle), ":app:assembleArm64" + variant, "--no-daemon", *( ["--offline"] if offline else []), *arguments,
         "-PnelomaiRuntimeInputs=" + str(inputs), "-x", ":app:rustBuildArm64" + variant],
         cwd=android, env=environment, check=True)
-    package = output / "nelomai-acceptance-0.2.18-android-aarch64.apk"
+    package = output / "nelomai-acceptance-0.2.19-android-aarch64.apk"
     # Candidate release packaging is keyless. apksigner consumes this exact
     # unsigned APK only in the later protected finalization job.
     apk_name = "app-arm64-debug.apk" if variant == "Debug" else "app-arm64-release-unsigned.apk"

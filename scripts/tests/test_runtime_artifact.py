@@ -16,7 +16,7 @@ from scripts.tests.test_desktop_runtime_package import elf
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "scripts"
 SOURCE = "a" * 40
-PREFIX = "nelomai-runtime-0.2.18-linux-x86_64"
+PREFIX = "nelomai-runtime-0.2.19-linux-x86_64"
 
 
 def module(name):
@@ -57,7 +57,7 @@ class ArtifactFixture(unittest.TestCase):
 
     def build(self, output="candidate"):
         return self.command("build-runtime-manifest", "--payload", self.payload,
-                            "--output", self.root / output, "--version", "0.2.18",
+                            "--output", self.root / output, "--version", "0.2.19",
                             "--source-commit", SOURCE, "--platform", "linux",
                             "--architecture", "x86_64", "--signing-key", self.keyfile)
 
@@ -67,7 +67,7 @@ class RuntimeArtifactTest(ArtifactFixture):
         key = self.payload / "innocent-resource"
         key.write_bytes(self.keyfile.read_bytes())
         result = self.command("build-runtime-manifest", "--payload", self.payload, "--output", self.root / "candidate",
-            "--version", "0.2.18", "--source-commit", SOURCE, "--platform", "android",
+            "--version", "0.2.19", "--source-commit", SOURCE, "--platform", "android",
             "--architecture", "aarch64", "--signing-key", key, "--readelf", self.root / "absent-readelf")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("signing key must be outside payload", result.stderr)
@@ -92,7 +92,7 @@ class RuntimeArtifactTest(ArtifactFixture):
             signature.write_bytes(self.key.sign(b"nelomai-runtime-manifest-v1\0" + raw))
             with self.assertRaises((ValueError, subprocess.CalledProcessError), msg=str(changes)):
                 verifier.verify(candidate / (PREFIX + ".zip"), manifest, signature,
-                    self.public, "0.2.18", SOURCE, "linux", "x86_64")
+                    self.public, "0.2.19", SOURCE, "linux", "x86_64")
 
     def test_archive_rejects_tampered_file_symlink_and_mode_changes(self):
         result = self.build()
@@ -114,7 +114,7 @@ class RuntimeArtifactTest(ArtifactFixture):
                     archive.writestr(copy, value)
             with self.assertRaises((ValueError, subprocess.CalledProcessError), msg=change):
                 verifier.verify(archive_path, candidate / (PREFIX + ".manifest.json"),
-                    candidate / (PREFIX + ".manifest.sig"), self.public, "0.2.18", SOURCE, "linux", "x86_64")
+                    candidate / (PREFIX + ".manifest.sig"), self.public, "0.2.19", SOURCE, "linux", "x86_64")
 
     @unittest.skipUnless(sys.platform == "darwin", "actual macOS verifier required")
     def test_macos_reextraction_verifies_final_adhoc_signatures_without_resigning(self):
@@ -128,14 +128,14 @@ class RuntimeArtifactTest(ArtifactFixture):
         self.put("licenses/WIREGUARD-GO-LICENSE.txt", b"fixture attribution")
         candidate = self.root / "candidate"
         result = self.command("build-runtime-manifest", "--payload", self.payload, "--output", candidate,
-            "--version", "0.2.18", "--source-commit", SOURCE, "--platform", "macos",
+            "--version", "0.2.19", "--source-commit", SOURCE, "--platform", "macos",
             "--architecture", "aarch64", "--signing-key", self.keyfile)
         self.assertEqual(result.returncode, 0, result.stderr)
-        prefix = "nelomai-runtime-0.2.18-macos-aarch64"
+        prefix = "nelomai-runtime-0.2.19-macos-aarch64"
         before = {path.name: path.read_bytes() for path in candidate.iterdir()}
         verifier = module("verify-runtime-artifact")
         manifest = verifier.verify(candidate / (prefix + ".zip"), candidate / (prefix + ".manifest.json"),
-            candidate / (prefix + ".manifest.sig"), self.public, "0.2.18", SOURCE, "macos", "aarch64",
+            candidate / (prefix + ".manifest.sig"), self.public, "0.2.19", SOURCE, "macos", "aarch64",
             output=self.root / "extracted")
         self.assertEqual(before, {path.name: path.read_bytes() for path in candidate.iterdir()})
         for item in manifest["files"]:
@@ -146,7 +146,7 @@ class RuntimeArtifactTest(ArtifactFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         candidate = self.root / "candidate"
         module("package-runtime-artifact").package(self.payload, self.root / "original",
-            "0.2.18", SOURCE, "linux", "x86_64", self.keyfile)
+            "0.2.19", SOURCE, "linux", "x86_64", self.keyfile)
         for final, original in ((".zip", "runtime.zip"),
                                 (".manifest.json", "runtime-manifest-v1.json"),
                                 (".manifest.sig", "runtime-manifest-v1.sig")):
@@ -161,7 +161,7 @@ class RuntimeArtifactTest(ArtifactFixture):
         candidate = self.root / "candidate"
         manifest = candidate / (PREFIX + ".manifest.json")
         args = (candidate / (PREFIX + ".zip"), manifest,
-                candidate / (PREFIX + ".manifest.sig"), self.public, "0.2.18", SOURCE,
+                candidate / (PREFIX + ".manifest.sig"), self.public, "0.2.19", SOURCE,
                 "linux", "x86_64")
         verified = verifier.verify(*args)
         self.assertEqual(verified["source_commit"], SOURCE)

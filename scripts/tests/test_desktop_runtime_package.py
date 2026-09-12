@@ -62,7 +62,7 @@ class DesktopPackageTest(unittest.TestCase):
         path.chmod(0o755 if executable else 0o644)
         return path
 
-    def run_package(self, output="output", platform="linux", architecture="x86_64", version="0.2.18", source_commit="a" * 40):
+    def run_package(self, output="output", platform="linux", architecture="x86_64", version="0.2.19", source_commit="a" * 40):
         return subprocess.run([
             sys.executable, str(SCRIPT), "--payload", str(self.payload),
             "--output", str(self.root / output), "--version", version,
@@ -79,7 +79,7 @@ class DesktopPackageTest(unittest.TestCase):
         self.key.public_key().verify((output / "runtime-manifest-v1.sig").read_bytes(),
                                      b"nelomai-runtime-manifest-v1\0" + raw)
         self.assertEqual({key: manifest[key] for key in manifest if key != "files"}, {
-            "format_version": 1, "runtime_version": "0.2.18", "source_commit": "a" * 40,
+            "format_version": 1, "runtime_version": "0.2.19", "source_commit": "a" * 40,
             "platform": "linux", "architecture": "x86_64", "contract_version": 1,
         })
         with zipfile.ZipFile(output / "runtime.zip") as archive:
@@ -152,7 +152,7 @@ class DesktopPackageTest(unittest.TestCase):
         self.assert_rejected()
 
     def test_identity_must_fit_runtime_v1_contract(self):
-        for index, version in enumerate(("0.2.18-" + "x" * 64, "0.2.18-pre+build", "invalid")):
+        for index, version in enumerate(("0.2.19-" + "x" * 64, "0.2.19-pre+build", "invalid")):
             self.assert_rejected(output="version-" + str(index), version=version)
         self.assert_rejected(output="source", source_commit="main")
 

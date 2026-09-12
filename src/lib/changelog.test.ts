@@ -3,8 +3,20 @@ import { describe, expect, it } from "vitest";
 import { CHANGELOG, defineChangelog } from "./changelog";
 
 describe("application changelog", () => {
-  it("starts with the user-facing 0.2.15 entry", () => {
-    expect(CHANGELOG[0]).toEqual({
+  it("includes the current release and intermediate releases in the offline fallback", () => {
+    expect(CHANGELOG.slice(0, 4).map(entry => entry.version)).toEqual(["0.2.19", "0.2.18", "0.2.17", "0.2.16"]);
+    expect(CHANGELOG[0].items).toEqual([
+      "Исправлены ложные ошибки авторизации и подготовки приложения при запуске.",
+      "Android: исправлена ошибка подготовки приложения, которая могла приводить к остановке туннеля.",
+      "Android: исправлен запуск счётчиков трафика и фоновых задач после восстановления приложения.",
+      "Android: устранены лишние запуски VPN-службы при выключенном подключении.",
+      "Android: исправлено восстановление фоновой авторизации.",
+      "Раздел «Что нового» теперь получает актуальные описания версий с панели и сохраняет их локально.",
+    ]);
+  });
+
+  it("keeps the user-facing 0.2.15 entry", () => {
+    expect(CHANGELOG.find(entry => entry.version === "0.2.15")).toEqual({
       version: "0.2.15",
       items: [
         "Улучшили автоматическое восстановление подключения.",
@@ -15,14 +27,14 @@ describe("application changelog", () => {
   });
 
   it("keeps the user-facing 0.2.14 entry", () => {
-    expect(CHANGELOG[1]).toEqual({
+    expect(CHANGELOG.find(entry => entry.version === "0.2.14")).toEqual({
       version: "0.2.14",
       items: ["Исправили запуск VPN-подключения на Android."],
     });
   });
 
   it("keeps the user-facing 0.2.13 entry", () => {
-    expect(CHANGELOG[2]).toEqual({
+    expect(CHANGELOG.find(entry => entry.version === "0.2.13")).toEqual({
       version: "0.2.13",
       items: [
         "Убрали активные ошибки при начале подключения.",

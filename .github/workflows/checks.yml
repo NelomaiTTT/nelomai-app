@@ -29,7 +29,7 @@ jobs:
       - name: Verify exact source and Linux regressions
         shell: bash
         run: |
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.18 --mode build_only
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.19 --mode build_only
           cargo fmt --all --check
           cargo test --locked -p nelomai-unix-service --lib
           cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest

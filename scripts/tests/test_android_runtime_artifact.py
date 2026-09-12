@@ -28,7 +28,7 @@ class ArtifactTest(unittest.TestCase):
     def test_missing_licenses_prevents_any_output(self):
         (self.payload / 'index.html').write_text('runtime UI')
         with self.assertRaisesRegex(ValueError, 'license'):
-            self.builder.package(self.payload, self.output, '0.2.18', 'a' * 40, self.key_path)
+            self.builder.package(self.payload, self.output, '0.2.19', 'a' * 40, self.key_path)
         self.assertFalse(self.output.exists())
 
     def test_shared_validation_rejects_incomplete_payload_before_native_tools(self):
@@ -44,7 +44,7 @@ class ArtifactTest(unittest.TestCase):
     def test_cli_rejects_incomplete_payload_before_native_tools_and_signing(self):
         self.licenses()
         result = subprocess.run([sys.executable, str(Path(self.builder.__file__)),
-            '--payload', str(self.payload), '--output', str(self.output), '--version', '0.2.18',
+            '--payload', str(self.payload), '--output', str(self.output), '--version', '0.2.19',
             '--source-commit', 'a' * 40, '--signing-key', str(self.key_path),
             '--readelf', str(self.root / 'absent-readelf')], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
@@ -55,13 +55,13 @@ class ArtifactTest(unittest.TestCase):
     def test_symlink_cannot_include_external_file(self):
         (self.payload / 'secret').symlink_to(self.key_path)
         with self.assertRaisesRegex(ValueError, 'symlink'):
-            self.builder.package(self.payload, self.output, '0.2.18', 'a' * 40, self.key_path)
+            self.builder.package(self.payload, self.output, '0.2.19', 'a' * 40, self.key_path)
         self.assertFalse(self.output.exists())
 
     def test_missing_runtime_is_rejected_even_with_licenses(self):
         self.licenses()
         with self.assertRaisesRegex(ValueError, 'runtime payload'):
-            self.builder.package(self.payload, self.output, '0.2.18', 'a' * 40, self.key_path)
+            self.builder.package(self.payload, self.output, '0.2.19', 'a' * 40, self.key_path)
         self.assertFalse(self.output.exists())
 
     def licenses(self):
@@ -83,12 +83,12 @@ class ArtifactTest(unittest.TestCase):
             path = self.payload / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
-        self.builder.package(self.payload, self.output, '0.2.18', 'a' * 40, self.key_path)
+        self.builder.package(self.payload, self.output, '0.2.19', 'a' * 40, self.key_path)
         manifest_bytes = (self.output / 'runtime-manifest-v1.json').read_bytes()
         self.key.public_key().verify((self.output / 'runtime-manifest-v1.sig').read_bytes(), b'nelomai-runtime-manifest-v1\0' + manifest_bytes)
         manifest = json.loads(manifest_bytes)
         self.assertEqual(manifest['source_commit'], 'a' * 40)
-        self.assertEqual(manifest['runtime_version'], '0.2.18')
+        self.assertEqual(manifest['runtime_version'], '0.2.19')
         with zipfile.ZipFile(self.output / 'runtime.zip') as archive:
             self.assertEqual(set(archive.namelist()), {item['path'] for item in manifest['files']})
             for item in manifest['files']:
