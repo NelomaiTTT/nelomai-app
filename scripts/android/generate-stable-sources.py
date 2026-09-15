@@ -63,6 +63,7 @@ def generate(root, output):
         for before, after in replacements.items():
             value = value.replace(before, after)
         value = value.replace(NAMESPACE + '.RuntimeSelectionStore', 'ru.nelomai.client.RuntimeSelectionStore')
+        value = value.replace(NAMESPACE + '.RuntimeDispatchGuard', 'ru.nelomai.client.RuntimeDispatchGuard')
         value = value.replace('nelomai_app_lib', 'nelomai_runtime_stable')
         for before, after in [('"wg-go"', '"stable_runtime_wg_go"'), ('"wg"', '"stable_runtime_wg"'), ('"wg-quick"', '"stable_runtime_wg_quick"')]:
             value = value.replace(before, after)
@@ -84,7 +85,8 @@ def generate(root, output):
         imports = [NAMESPACE + '.R', NAMESPACE + '.BuildConfig']
         if file.name == 'RuntimeEntrypoint.kt':
             imports += ['ru.nelomai.client.RuntimeSelectionCodec', 'ru.nelomai.client.RuntimeProcessSelection', 'ru.nelomai.client.RuntimeDispatchPolicy']
-        addition = ''.join('\nimport ' + name + (';' if file.suffix == '.java' else '') for name in imports if 'import ' + name not in value)
+        existing_imports = set(re.findall(r'^import\s+([\w.]+);?\s*$', value, re.MULTILINE))
+        addition = ''.join('\nimport ' + name + (';' if file.suffix == '.java' else '') for name in imports if name not in existing_imports)
         end = value.find('\n', match.end())
         value = value[:end] + '\n' + addition + value[end:]
         target = java / package.replace('.', '/') / file.name
