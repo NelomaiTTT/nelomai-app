@@ -77,6 +77,7 @@
     type SplitTunnelState,
   } from "$lib/split-tunnel";
   import { UpdateOfferRefresher } from "$lib/update-offer-refresher";
+  import { RuntimeStatusRefresher } from "$lib/runtime-status-refresher";
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
@@ -111,6 +112,7 @@
   let diagnosticsStatus = $state<string | null>(null);
   let updateStatus = $state<UpdateStatus | null>(null);
   const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
+  const runtimeStatusRefresher = new RuntimeStatusRefresher<RuntimeStatus>();
   let updateBusy = $state(false);
   let runtimeStatus = $state<RuntimeStatus | null>(null);
   let runtimeSelectionBusy = $state(false);
@@ -118,6 +120,7 @@
   let stateTimer: number | null = null;
   let startupTimer: number | null = null;
   let startupKickoffTimer: number | null = null;
+  let runtimeStatusTimer: number | null = null;
   let startupSlow = $state(false);
   let startupPending = $state(false);
   let refreshPending = $state(false);
@@ -303,6 +306,7 @@
       if (stateTimer !== null) window.clearInterval(stateTimer);
       if (startupTimer !== null) window.clearTimeout(startupTimer);
       if (startupKickoffTimer !== null) window.clearTimeout(startupKickoffTimer);
+      if (runtimeStatusTimer !== null) window.clearTimeout(runtimeStatusTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("popstate", handleHistoryChange);
@@ -399,8 +403,20 @@
   }
 
   async function refreshRuntimeStatus() {
-    const status = await nativeClient.runtimeStatus().catch(() => null);
-    if (status) runtimeStatus = status;
+    await runtimeStatusRefresher.run(nativeClient.runtimeStatus, (status) => {
+      runtimeStatus = status;
+    });
+    if (runtimeStatusTimer !== null) window.clearTimeout(runtimeStatusTimer);
+    runtimeStatusTimer = null;
+    if (
+      runtimeStatus?.phase !== null &&
+      runtimeStatus?.phase !== "complete"
+    ) {
+      runtimeStatusTimer = window.setTimeout(() => {
+        runtimeStatusTimer = null;
+        void refreshRuntimeStatus();
+      }, 1_000);
+    }
   }
 
   async function selectRuntime(useStable: boolean) {
@@ -560,6 +576,7 @@
     connectionMetrics = state.metrics;
     runtimeWarning = state.warning;
     view = viewForAppState(state);
+    await refreshRuntimeStatus();
     await loadSplitTunnel(false);
     if (state.phase === "ready") void refreshProbes();
   }
