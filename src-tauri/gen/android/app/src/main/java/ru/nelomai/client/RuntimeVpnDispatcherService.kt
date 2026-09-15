@@ -20,12 +20,20 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
     private var loaded: RuntimeSelectionV1? = null
     private var engine: RuntimeVpnEngineV1? = null
     private var destroyed = false
+    private var selectionVerificationInFlight = false
     private val handler = Handler(Looper.getMainLooper())
     private val verifySelection = object : Runnable {
         override fun run() {
             if (destroyed) return
-            selection.read { result ->
-                if (loaded != null && RuntimeDispatchPolicy.mustExitProcess(loaded!!, result.getOrNull())) terminateProcess()
+            if (!selectionVerificationInFlight) {
+                selectionVerificationInFlight = true
+                selection.read { result ->
+                    selectionVerificationInFlight = false
+                    if (!destroyed && loaded != null &&
+                        RuntimeDispatchPolicy.mustExitProcessAfterRead(loaded!!, result)) {
+                        terminateProcess()
+                    }
+                }
             }
             if (!destroyed) handler.postDelayed(this, 1000)
         }
@@ -95,6 +103,7 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
     override fun onDestroy() {
         if (destroyed) return
         destroyed = true
+        selectionVerificationInFlight = false
         handler.removeCallbacks(verifySelection)
         engine?.destroy(); engine = null
         selection.close()

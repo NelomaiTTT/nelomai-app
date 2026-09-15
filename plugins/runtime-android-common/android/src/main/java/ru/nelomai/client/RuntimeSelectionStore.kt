@@ -16,7 +16,7 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
     private val handler = Handler(Looper.getMainLooper())
     private var remote: IBinder? = null
     private var bound = false
-    private val pending = ArrayDeque<(Result<RuntimeSelectionV1>) -> Unit>()
+    private val pending = PendingSelectionReads<RuntimeSelectionV1>(8)
     private val timeout = Runnable { complete(Result.failure(IllegalStateException("runtime_owner_unavailable"))) }
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -24,15 +24,27 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
             complete(runCatching { snapshot() })
         }
         override fun onServiceDisconnected(name: ComponentName?) { remote = null }
-        override fun onNullBinding(name: ComponentName?) { complete(Result.failure(IllegalStateException("runtime_owner_unavailable"))) }
-        override fun onBindingDied(name: ComponentName?) { remote = null; complete(Result.failure(IllegalStateException("runtime_owner_unavailable"))) }
+        override fun onNullBinding(name: ComponentName?) {
+            invalidateBinding()
+            complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
+        }
+        override fun onBindingDied(name: ComponentName?) {
+            invalidateBinding()
+            complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
+        }
     }
 
     fun read(callback: (Result<RuntimeSelectionV1>) -> Unit) {
         if (remote != null) { callback(runCatching { snapshot() }); return }
-        check(pending.size < 8) { "runtime_owner_queue_full" }
-        pending.addLast(callback)
-        if (bound) return
+        if (!pending.offer(callback)) {
+            callback(Result.failure(IllegalStateException("runtime_owner_queue_full")))
+            return
+        }
+        if (bound) {
+            handler.removeCallbacks(timeout)
+            handler.postDelayed(timeout, 10_000)
+            return
+        }
         bound = context.bindService(Intent().setClassName(context.packageName, "ru.nelomai.client.RuntimeAuthBrokerService"), connection, Context.BIND_AUTO_CREATE)
         if (!bound) complete(Result.failure(IllegalStateException("runtime_owner_unavailable")))
         else handler.postDelayed(timeout, 10_000)
@@ -77,15 +89,19 @@ class RuntimeSelectionStore(private val context: Context) : AutoCloseable {
 
     private fun complete(result: Result<RuntimeSelectionV1>) {
         handler.removeCallbacks(timeout)
-        while (pending.isNotEmpty()) pending.removeFirst()(result)
+        pending.complete(result)
+    }
+
+    private fun invalidateBinding() {
+        remote = null
+        if (bound) runCatching { context.unbindService(connection) }
+        bound = false
     }
 
     override fun close() {
         handler.removeCallbacks(timeout)
-        pending.clear()
-        remote = null
-        if (bound) context.unbindService(connection)
-        bound = false
+        pending.complete(Result.failure(IllegalStateException("runtime_selection_store_closed")))
+        invalidateBinding()
     }
 
     companion object {

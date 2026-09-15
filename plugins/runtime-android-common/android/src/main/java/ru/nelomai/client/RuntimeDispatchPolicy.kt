@@ -39,6 +39,11 @@ object RuntimeDispatchPolicy {
         active == null || !valid(active) || loaded.slot != active.slot ||
             loaded.runtimeVersion != active.runtimeVersion || loaded.incarnation != active.incarnation
 
+    fun mustExitProcessAfterRead(
+        loaded: RuntimeSelectionV1,
+        result: Result<RuntimeSelectionV1>,
+    ): Boolean = result.getOrNull()?.let { mustExitProcess(loaded, it) } == true
+
     fun library(active: RuntimeSelectionV1): String {
         require(valid(active)) { "Invalid verified runtime selection" }
         return when (active.slot) {

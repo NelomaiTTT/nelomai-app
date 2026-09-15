@@ -39,6 +39,17 @@ class RuntimeDispatcherTest {
         assertTrue(RuntimeDispatchPolicy.mustExitProcess(selected, null))
     }
 
+    @Test fun unavailableOwnerDoesNotProveThatTheRuntimeMustExit() {
+        assertFalse(RuntimeDispatchPolicy.mustExitProcessAfterRead(
+            selected,
+            Result.failure(IllegalStateException("runtime_owner_unavailable")),
+        ))
+        assertTrue(RuntimeDispatchPolicy.mustExitProcessAfterRead(
+            selected,
+            Result.success(selected.copy(incarnation = "launch-2")),
+        ))
+    }
+
     @Test fun runtimeCannotSupplyLibraryName() {
         assertEquals("nelomai_app_lib", RuntimeDispatchPolicy.library(selected))
         assertEquals("nelomai_runtime_stable", RuntimeDispatchPolicy.library(selected.copy(slot = "stable")))
