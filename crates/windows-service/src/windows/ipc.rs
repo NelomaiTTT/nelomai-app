@@ -103,6 +103,7 @@ impl ServiceTransport for NamedPipeTransport {
 pub(crate) struct PipeServer {
     policy: ClientPolicy,
     broker: nelomai_contracts::dispatcher::BrokerPolicy,
+    broker_authorization: std::sync::Mutex<nelomai_contracts::dispatcher::BrokerAuthorizationCache>,
     name: &'static str,
 }
 
@@ -115,6 +116,7 @@ impl PipeServer {
         Self {
             policy,
             broker,
+            broker_authorization: std::sync::Mutex::new(Default::default()),
             name,
         }
     }
@@ -162,12 +164,11 @@ impl PipeServer {
                     self.policy.installed_client_path.display()
                 ))
             })?;
-            if nelomai_contracts::dispatcher::file_digest(&identity.process_path)
+            self.broker_authorization
+                .lock()
                 .map_err(|_| ServiceError::UnauthorizedClient)?
-                != self.broker.sha256
-            {
-                return Err(ServiceError::UnauthorizedClient);
-            }
+                .authorize(&self.broker, &self.broker.owner, &self.broker.executable)
+                .map_err(|_| ServiceError::UnauthorizedClient)?;
             Ok(Some((frame, pipe)))
         })();
 

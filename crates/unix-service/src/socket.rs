@@ -439,9 +439,7 @@ fn serve_dispatcher_stream(
         .try_lock()
         .map_err(|_| ServiceError::Backend("dispatcher_busy".into()))?;
     dispatcher
-        .layout
-        .broker
-        .authorize(&identity.uid.to_string(), &identity.process_path)
+        .authorize_broker(&identity.uid.to_string(), &identity.process_path)
         .map_err(|_| ServiceError::UnauthorizedClient)?;
     let frame = d::read_frame(
         stream,

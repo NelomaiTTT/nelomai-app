@@ -219,13 +219,129 @@ pub fn file_digest(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerPolicy {
     pub owner: String,
     pub executable: PathBuf,
     pub sha256: String,
     pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrokerFileIdentity {
+    length: u64,
+    modified: Option<(u64, u32)>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    owner: (u32, u32),
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+    #[cfg(windows)]
+    attributes: u32,
+}
+
+fn broker_file_identity(file: &File) -> io::Result<BrokerFileIdentity> {
+    let metadata = file.metadata()?;
+    let modified = metadata.modified().ok().and_then(|value| {
+        value
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|value| (value.as_secs(), value.subsec_nanos()))
+    });
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(BrokerFileIdentity {
+            length: metadata.len(),
+            modified,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+            mode: metadata.mode(),
+            owner: (metadata.uid(), metadata.gid()),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(BrokerFileIdentity {
+            length: metadata.len(),
+            modified,
+            volume_serial: information.dwVolumeSerialNumber,
+            file_index: ((information.nFileIndexHigh as u64) << 32)
+                | information.nFileIndexLow as u64,
+            attributes: information.dwFileAttributes,
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct BrokerAuthorizationCache {
+    verified: Option<(BrokerPolicy, BrokerFileIdentity)>,
+    full_digests: u64,
+}
+
+impl BrokerAuthorizationCache {
+    pub fn authorize(
+        &mut self,
+        policy: &BrokerPolicy,
+        owner: &str,
+        kernel_executable: &Path,
+    ) -> io::Result<()> {
+        if owner != policy.owner || kernel_executable != policy.executable {
+            return Err(blocked());
+        }
+        let mut file = open_regular(kernel_executable)?;
+        let before = broker_file_identity(&file)?;
+        if self
+            .verified
+            .as_ref()
+            .is_some_and(|(cached_policy, cached_identity)| {
+                cached_policy == policy && cached_identity == &before
+            })
+        {
+            return Ok(());
+        }
+        self.full_digests = self.full_digests.saturating_add(1);
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 65536];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        let after = broker_file_identity(&file)?;
+        if before != after || format!("{:x}", hash.finalize()) != policy.sha256 {
+            self.verified = None;
+            return Err(blocked());
+        }
+        self.verified = Some((policy.clone(), after));
+        Ok(())
+    }
+
+    pub fn full_digest_count(&self) -> u64 {
+        self.full_digests
+    }
 }
 impl BrokerPolicy {
     pub fn authorize(&self, owner: &str, kernel_executable: &Path) -> io::Result<()> {
@@ -967,6 +1083,7 @@ pub struct ProcessDispatcher {
     #[cfg(unix)]
     tree_owner: Option<std::os::unix::net::UnixStream>,
     channel_failed: bool,
+    broker_authorization: BrokerAuthorizationCache,
 }
 impl ProcessDispatcher {
     pub fn new(installation: Installation) -> io::Result<Self> {
@@ -989,7 +1106,12 @@ impl ProcessDispatcher {
             #[cfg(unix)]
             tree_owner: None,
             channel_failed: false,
+            broker_authorization: BrokerAuthorizationCache::default(),
         })
+    }
+    pub fn authorize_broker(&mut self, owner: &str, executable: &Path) -> io::Result<()> {
+        self.broker_authorization
+            .authorize(&self.layout.broker, owner, executable)
     }
     pub fn handle(
         &mut self,

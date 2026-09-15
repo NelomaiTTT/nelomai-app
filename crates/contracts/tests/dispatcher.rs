@@ -332,6 +332,35 @@ fn broker_policy_rejects_same_hash_at_another_kernel_path_and_changed_installed_
 }
 
 #[test]
+fn broker_authorization_hashes_an_unchanged_file_once_and_rechecks_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let broker = directory.path().join("broker");
+    fs::write(&broker, b"signed broker bytes").unwrap();
+    let policy = BrokerPolicy {
+        owner: "501".into(),
+        executable: broker.clone(),
+        sha256: digest(b"signed broker bytes"),
+        manifest_sha256: "a".repeat(64),
+    };
+    let mut cache = BrokerAuthorizationCache::default();
+
+    cache.authorize(&policy, "501", &broker).unwrap();
+    cache.authorize(&policy, "501", &broker).unwrap();
+    assert_eq!(cache.full_digest_count(), 1);
+
+    let mut changed_policy = policy.clone();
+    changed_policy.manifest_sha256 = "b".repeat(64);
+    cache.authorize(&changed_policy, "501", &broker).unwrap();
+    assert_eq!(cache.full_digest_count(), 2);
+
+    let replacement = directory.path().join("replacement");
+    fs::write(&replacement, b"malicious replacement").unwrap();
+    fs::rename(&replacement, &broker).unwrap();
+    assert!(cache.authorize(&policy, "501", &broker).is_err());
+    assert_eq!(cache.full_digest_count(), 3);
+}
+
+#[test]
 fn inherited_scm_primitive_rejects_paths_and_unknown_operations() {
     for value in [
         serde_json::json!({"engine_primitive":"start_wireguard","executable":"C:/evil.exe"}),
