@@ -87,11 +87,33 @@ fn run_dispatcher(root: &Path) -> std::io::Result<()> {
     let lifecycle = bind_listener(Path::new(DISPATCHER_SOCKET_PATH), uid)?;
     let dispatcher = Arc::new(Mutex::new(dispatcher));
     let private_owner = Arc::clone(&dispatcher);
-    std::thread::spawn(move || loop {
-        let _ = serve_dispatcher_one(&private, &private_owner, true);
+    std::thread::spawn(move || {
+        let mut failures = 0_u64;
+        loop {
+            match serve_dispatcher_one(&private, &private_owner, true) {
+                Ok(()) => failures = 0,
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures % 100 == 0 {
+                        eprintln!("private dispatcher request failed: {}", error.code());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
     });
+    let mut failures = 0_u64;
     loop {
-        let _ = serve_dispatcher_one(&lifecycle, &dispatcher, false);
+        match serve_dispatcher_one(&lifecycle, &dispatcher, false) {
+            Ok(()) => failures = 0,
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                if failures == 1 || failures % 100 == 0 {
+                    eprintln!("lifecycle dispatcher request failed: {}", error.code());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
     }
 }
 fn run_engine(root: &Path) -> std::io::Result<()> {

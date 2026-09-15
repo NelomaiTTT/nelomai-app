@@ -150,10 +150,24 @@ fn manager_service_loop() -> Result<(), ServiceError> {
         }
     }
     let private_owner = Arc::clone(&owner);
-    std::thread::spawn(move || loop {
-        if let Ok(Some((frame, pipe))) = private.accept() {
-            let output = serve_owned_frame(&private_owner, &frame, true);
-            let _ = finish_frame(pipe, &output);
+    std::thread::spawn(move || {
+        let mut failures = 0_u64;
+        loop {
+            match private.accept() {
+                Ok(Some((frame, pipe))) => {
+                    failures = 0;
+                    let output = serve_owned_frame(&private_owner, &frame, true);
+                    let _ = finish_frame(pipe, &output);
+                }
+                Ok(None) => failures = 0,
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 || failures % 100 == 0 {
+                        record_service_diagnostic("accept private pipe request", &error);
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
         }
     });
     set_status(
@@ -162,9 +176,11 @@ fn manager_service_loop() -> Result<(), ServiceError> {
         ServiceControlAccept::STOP,
     )?;
     record_service_message("manager lifecycle", "running");
+    let mut accept_failures = 0_u64;
     while !stopping.load(Ordering::Acquire) {
         match server.accept() {
             Ok(Some((frame, pipe))) => {
+                accept_failures = 0;
                 if stopping.load(Ordering::Acquire) {
                     let _ = finish_frame(
                         pipe,
@@ -178,10 +194,13 @@ fn manager_service_loop() -> Result<(), ServiceError> {
                     record_service_diagnostic("send pipe response", &error);
                 }
             }
-            Ok(None) => {}
+            Ok(None) => accept_failures = 0,
             Err(_) if stopping.load(Ordering::Acquire) => break,
             Err(error) => {
-                record_service_diagnostic("accept pipe request", &error);
+                accept_failures = accept_failures.saturating_add(1);
+                if accept_failures == 1 || accept_failures % 100 == 0 {
+                    record_service_diagnostic("accept pipe request", &error);
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
