@@ -4383,6 +4383,13 @@ class NelomaiVpnServiceTest {
                 desiredActive = true,
             ),
         )
+        assertFalse(
+            shouldRecycleIdleVpnProcess(
+                SessionState.STOPPED,
+                desiredActive = false,
+                pendingRuntimeDispatch = true,
+            ),
+        )
     }
 
     @Test

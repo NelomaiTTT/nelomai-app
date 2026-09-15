@@ -20,6 +20,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import org.amnezia.awg.backend.GoBackend
+import ru.nelomai.client.RuntimeDispatchGuard
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
@@ -1188,9 +1189,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun scheduleIdleProcessRecycle(memory: AutomaticDiagnosticsProcessMemory?) {
-        if (!shouldRecycleIdleVpnProcess(
+            if (!shouldRecycleIdleVpnProcess(
                 TunnelRuntime.state(),
                 QuickTunnelController.desiredActive(applicationContext),
+                RuntimeDispatchGuard.hasPending(),
             )
         ) {
             return
@@ -1213,6 +1215,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 activeService != null ||
                 TunnelRuntime.state() != SessionState.STOPPED ||
                 QuickTunnelController.desiredActive(applicationContext) ||
+                RuntimeDispatchGuard.hasPending() ||
                 runCatching { connectionIntentLifecycle.hasPendingWork() }.getOrDefault(true)
             ) {
                 return@Runnable

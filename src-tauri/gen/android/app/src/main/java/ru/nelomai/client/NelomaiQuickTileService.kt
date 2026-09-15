@@ -2,9 +2,13 @@ package ru.nelomai.client
 
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import android.os.Handler
+import android.os.Looper
 
 class NelomaiQuickTileService : TileService() {
     private val selection by lazy { RuntimeSelectionStore(this) }
+    private val handler = Handler(Looper.getMainLooper())
+    private val pendingDispatches = mutableSetOf<AutoCloseable>()
     override fun onStartListening() {
         super.onStartListening()
         updateTile()
@@ -20,20 +24,29 @@ class NelomaiQuickTileService : TileService() {
     }
 
     private fun dispatchOrOpen() {
+        val dispatch = RuntimeDispatchGuard.begin()
+        pendingDispatches += dispatch
+        handler.postDelayed({ finishDispatch(dispatch) }, 15_000)
         android.util.Log.i("NelomaiTile", "toggle.requested")
         qsTile?.apply {
             state = Tile.STATE_UNAVAILABLE
             updateTile()
         }
-        selection.read { result -> result.onSuccess { selected ->
-            runCatching {
-                if (RuntimeProcessSelection.needsExit(selected)) { android.os.Process.killProcess(android.os.Process.myPid()); return@onSuccess }
-                RuntimeProcessSelection.claim(selected)
-                val quick = RuntimeAdapters.quick(selected)
-                if (RuntimeDispatchPolicy.mayToggle(selected, quick.desiredActive(applicationContext)) && quick.toggle(applicationContext)) return@onSuccess
+        selection.read { result ->
+            try {
+                result.onSuccess { selected ->
+                    runCatching {
+                        if (RuntimeProcessSelection.needsExit(selected)) { android.os.Process.killProcess(android.os.Process.myPid()); return@onSuccess }
+                        RuntimeProcessSelection.claim(selected)
+                        val quick = RuntimeAdapters.quick(selected)
+                        if (RuntimeDispatchPolicy.mayToggle(selected, quick.desiredActive(applicationContext)) && quick.toggle(applicationContext)) return@onSuccess
+                    }
+                    updateTile()
+                }.onFailure { qsTile?.apply { state = Tile.STATE_UNAVAILABLE; updateTile() } }
+            } finally {
+                finishDispatch(dispatch)
             }
-            updateTile()
-        }.onFailure { qsTile?.apply { state = Tile.STATE_UNAVAILABLE; updateTile() } } }
+        }
     }
 
     private fun updateTile() {
@@ -54,5 +67,13 @@ class NelomaiQuickTileService : TileService() {
             updateTile()
         } }
     }
-    override fun onDestroy() { selection.close(); super.onDestroy() }
+    private fun finishDispatch(dispatch: AutoCloseable) {
+        if (pendingDispatches.remove(dispatch)) dispatch.close()
+    }
+
+    override fun onDestroy() {
+        pendingDispatches.toList().forEach(::finishDispatch)
+        selection.close()
+        super.onDestroy()
+    }
 }

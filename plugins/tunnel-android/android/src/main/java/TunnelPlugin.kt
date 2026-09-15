@@ -2563,7 +2563,8 @@ internal fun diagnosticBackendVersion(reported: String?): String = reported
 internal fun shouldRecycleIdleVpnProcess(
     state: SessionState,
     desiredActive: Boolean,
-): Boolean = state == SessionState.STOPPED && !desiredActive
+    pendingRuntimeDispatch: Boolean = false,
+): Boolean = state == SessionState.STOPPED && !desiredActive && !pendingRuntimeDispatch
 
 private class TunnelOperationException(val code: String) : RuntimeException()
 
