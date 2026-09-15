@@ -938,6 +938,9 @@ pub enum StartupStage {
     SignInLoginFailed,
     SignInLogoutCompleted,
     UpdateInstallRequested,
+    UpdateRefreshStarted,
+    UpdateRefreshCompleted,
+    UpdateRefreshFailed,
     UpdateAvailable,
     UpdateDownloading,
     UpdateReadyToRestart,
@@ -955,6 +958,9 @@ impl StartupStage {
             Self::SignInLoginFailed => "ui.sign_in.login_failed",
             Self::SignInLogoutCompleted => "ui.sign_in.logout_completed",
             Self::UpdateInstallRequested => "update.install.requested",
+            Self::UpdateRefreshStarted => "update.refresh.started",
+            Self::UpdateRefreshCompleted => "update.refresh.completed",
+            Self::UpdateRefreshFailed => "update.refresh.failed",
             Self::UpdateAvailable => "update.phase.available",
             Self::UpdateDownloading => "update.phase.downloading",
             Self::UpdateReadyToRestart => "update.phase.ready_to_restart",
@@ -4415,10 +4421,12 @@ mod tests {
     fn update_and_sign_in_diagnostic_stages_are_allowlisted() {
         let update: StartupStage =
             serde_json::from_str("\"update_awaiting_installation\"").unwrap();
+        let refresh: StartupStage = serde_json::from_str("\"update_refresh_failed\"").unwrap();
         let sign_in: StartupStage =
             serde_json::from_str("\"sign_in_bootstrap_signed_out\"").unwrap();
 
         assert_eq!(update.event_name(), "update.phase.awaiting_installation");
+        assert_eq!(refresh.event_name(), "update.refresh.failed");
         assert_eq!(sign_in.event_name(), "ui.sign_in.bootstrap_signed_out");
     }
 

@@ -326,7 +326,7 @@ impl PrivateOwnerCommands for HostCommands {
             }
             HostRequestV1::UpdateRefresh => {
                 return Ok(HostResponseV1::UpdateStatus {
-                    status: self.updater.refresh().await?,
+                    status: self.updater.start_refresh()?,
                 })
             }
             HostRequestV1::UpdateSetAutomatic { enabled } => {
@@ -337,7 +337,6 @@ impl PrivateOwnerCommands for HostCommands {
                 return Ok(HostResponseV1::UpdateStatus { status });
             }
             HostRequestV1::UpdateInstall => {
-                self.updater.refresh().await?;
                 return Ok(HostResponseV1::UpdateStatus {
                     status: self.updater.install(false)?,
                 });

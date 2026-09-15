@@ -78,7 +78,11 @@
   } from "$lib/split-tunnel";
   import { UpdateOfferRefresher } from "$lib/update-offer-refresher";
   import { RuntimeStatusRefresher } from "$lib/runtime-status-refresher";
-  import { updateDiagnosticStage } from "$lib/update-diagnostics";
+  import {
+    updateDiagnosticStage,
+    updateRefreshDiagnosticStage,
+    updateStatusNeedsPolling,
+  } from "$lib/update-diagnostics";
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
@@ -1049,12 +1053,7 @@
     try {
       const status = await nativeClient.updateStatus();
       observeUpdateStatus(status);
-      if (
-        status.phase === "downloading" ||
-        (status.supported &&
-          status.automatic &&
-          status.phase === "available")
-      ) {
+      if (updateStatusNeedsPolling(status)) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 500);
       }
     } catch {
@@ -1063,7 +1062,12 @@
   }
 
   function observeUpdateStatus(status: UpdateStatus) {
+    const refreshStage = updateRefreshDiagnosticStage(
+      updateStatus?.errorCode === "update_refresh_pending",
+      status,
+    );
     updateStatus = status;
+    if (refreshStage) void nativeClient.recordStartupStage(refreshStage);
     const stage = updateDiagnosticStage(status.phase);
     const key = stage ? `${stage}:${status.version ?? "none"}` : null;
     if (stage && key !== lastRecordedUpdateState) {
@@ -1078,10 +1082,7 @@
       () => nativeClient.refreshUpdate(),
       (status) => {
         observeUpdateStatus(status);
-        if (
-          status.phase === "downloading" ||
-          (status.supported && status.automatic && status.phase === "available")
-        ) {
+        if (updateStatusNeedsPolling(status)) {
           clearUpdateTimer();
           updateTimer = window.setTimeout(refreshUpdateStatus, 500);
         }
