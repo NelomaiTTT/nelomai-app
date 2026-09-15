@@ -165,6 +165,9 @@ pub trait LocalAuthStop: Send + Sync {
     /// they must not await I/O or suppress subsequent physical/remote cleanup.
     fn revoke_runtime(&self) {}
     async fn stop_local(&self) -> Result<(), BrokerError>;
+    async fn stop_local_for_transition(&self) -> Result<(), BrokerError> {
+        self.stop_local().await
+    }
     /// Owner-only native cleanup handoff, after durable cancellation and before
     /// revocation HTTP. Must be genuinely asynchronous and preserve late fences.
     async fn prepare_revocation(&self, _cancel_epoch: u64) -> Result<(), BrokerError> {

@@ -518,7 +518,14 @@ impl RuntimeSwitchControl for HostBridge {
         _: &str,
         _: &RuntimeCleanupSnapshotV1,
     ) -> Result<(), BrokerError> {
-        self.stop_local().await
+        // Runtime transition/update stops preserve the authenticated UI state;
+        // logout uses LocalAuthStop::stop_local and remains signed out.
+        let runtime = match self.peer() {
+            Ok(peer) => peer.stop_local_for_transition().await,
+            Err(_) => Ok(()),
+        };
+        let native = self.native.stop.stop_local().await;
+        runtime.and(native)
     }
     async fn force_stop(
         &self,

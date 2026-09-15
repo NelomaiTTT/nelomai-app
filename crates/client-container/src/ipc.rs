@@ -134,6 +134,7 @@ pub enum ControlV1 {
     },
     Revoke,
     Stop,
+    StopForTransition,
     CheckScope {
         scope: RuntimeAuthScope,
     },

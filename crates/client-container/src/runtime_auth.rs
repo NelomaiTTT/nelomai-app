@@ -171,7 +171,7 @@ impl<S: RuntimeStateStore, T: TunnelController> RuntimeSwitchControl
     ) -> Result<(), BrokerError> {
         self.record_for_snapshot(snapshot)?;
         self.local
-            .stop_local()
+            .stop_local_for_transition()
             .await
             .map_err(|_| BrokerError::RecoveryRequired)
     }
@@ -580,6 +580,11 @@ impl RuntimeAuthProvider for OwnerRuntimeAuth {
 impl<T: TunnelController> LocalAuthStop for CoreLocalStop<T> {
     async fn stop_local(&self) -> Result<(), BrokerError> {
         CoreLocalStop::stop_local(self)
+            .await
+            .map_err(|_| BrokerError::RecoveryRequired)
+    }
+    async fn stop_local_for_transition(&self) -> Result<(), BrokerError> {
+        CoreLocalStop::stop_local_for_transition(self)
             .await
             .map_err(|_| BrokerError::RecoveryRequired)
     }

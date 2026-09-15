@@ -98,6 +98,12 @@ impl<T: TunnelController> CoreLocalStop<T> {
         self.writers.clone()
     }
     pub async fn stop_local(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::SignedOut).await
+    }
+    pub async fn stop_local_for_transition(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::Ready).await
+    }
+    async fn stop_local_with_success_phase(&self, success_phase: Phase) -> Result<(), CoreError> {
         self.epoch.fetch_add(1, Ordering::SeqCst);
         self.wake.notify_waiters();
         *self.state.lock().await = CoreState {
@@ -107,7 +113,10 @@ impl<T: TunnelController> CoreLocalStop<T> {
         let result = self.tunnel.stop().await;
         let mut state = self.state.lock().await;
         if result.is_ok() {
-            *state = CoreState::default();
+            *state = CoreState {
+                phase: success_phase,
+                connection: None,
+            };
         } else {
             state.phase = Phase::Error;
         }

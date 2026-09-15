@@ -110,6 +110,27 @@ async fn neutral_access_port_preserves_the_whole_snapshot_and_has_no_credential_
     assert!(!format!("{next:?}").contains("synthetic-access"));
 }
 
+#[tokio::test]
+async fn transition_stop_keeps_an_authenticated_runtime_ready() {
+    let provider = Arc::new(Provider(AtomicUsize::new(0)));
+    let local = CoreLocalStop::new(Arc::new(StoppedTunnel));
+    let core = ClientCore::new(
+        Arc::new(nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap()),
+        Arc::new(ReadOnlyRuntime(
+            RuntimePaths::new("/synthetic-transition-stop", RuntimeSlot::Stable, "0.2.16").unwrap(),
+        )),
+        provider,
+        local.clone(),
+        Arc::new(NoopLogger),
+    );
+
+    local.stop_local_for_transition().await.unwrap();
+
+    let state = core.state().await;
+    assert_eq!(state.phase, nelomai_client_core::Phase::Ready);
+    assert!(state.connection.is_none());
+}
+
 #[test]
 fn runtime_login_cannot_supply_install_secret_or_select_the_runtime_target() {
     for field in [

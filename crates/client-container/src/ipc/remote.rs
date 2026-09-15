@@ -987,6 +987,21 @@ impl LocalAuthStop for RemoteOwner {
     }
 }
 
+impl RemoteOwner {
+    pub(crate) async fn stop_local_for_transition(&self) -> Result<(), BrokerError> {
+        match self
+            .control(
+                ControlV1::StopForTransition,
+                Instant::now() + REQUEST_BUDGET,
+            )
+            .await
+        {
+            Ok(ControlAckV1::Done) => Ok(()),
+            _ => Err(BrokerError::RecoveryRequired),
+        }
+    }
+}
+
 pub struct PrivateRuntimeAuthClient {
     outbox: Arc<Outbox>,
     pending: Arc<Pending<AuthResponseV1>>,
@@ -1151,6 +1166,31 @@ impl PrivateRuntimeAuthClient {
                                 let outbox = client_box.clone();
                                 controls.spawn(async move {
                                     let ack = match timeout_at(deadline, stop.stop_local()).await {
+                                        Ok(Ok(())) => ControlAckV1::Done,
+                                        _ => ControlAckV1::Error {
+                                            error: PrivateError::RecoveryRequired,
+                                        },
+                                    };
+                                    let _ = outbox.enqueue(
+                                        FrameV1::new(frame.id, MessageV1::Ack(ack)),
+                                        deadline,
+                                    );
+                                });
+                                continue;
+                            }
+                            ControlV1::StopForTransition => {
+                                if controls.len() >= MAX_PENDING {
+                                    break;
+                                }
+                                let stop = stop.clone();
+                                let outbox = client_box.clone();
+                                controls.spawn(async move {
+                                    let ack = match timeout_at(
+                                        deadline,
+                                        stop.stop_local_for_transition(),
+                                    )
+                                    .await
+                                    {
                                         Ok(Ok(())) => ControlAckV1::Done,
                                         _ => ControlAckV1::Error {
                                             error: PrivateError::RecoveryRequired,
