@@ -43,6 +43,9 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for prefix in ("actions/setup-java@", "android-actions/setup-android@"):
             step = next(step for step in setup if step.get("uses", "").startswith(prefix))
             self.assertIn("inputs.android-fixtures == 'true'", step["if"])
+            if prefix == "android-actions/setup-android@":
+                self.assertEqual(step.get("with", {}).get("packages"), "",
+                                 "setup-android must not request the retired SDK tools package")
         ndk = next(step for step in setup if "sdkmanager " in step.get("run", ""))
         self.assertIn("inputs.android-fixtures == 'true'", ndk["if"])
         self.assertIn("ndk;28.2.13676358", ndk["run"])

@@ -40,6 +40,8 @@ runs:
         java-version: '17'
     - uses: android-actions/setup-android@v3
       if: inputs.platform == 'android' || inputs.android-fixtures == 'true'
+      with:
+        packages: ''
     - uses: gradle/actions/setup-gradle@v4
       if: inputs.platform == 'android' && (inputs.purpose == 'build' || inputs.purpose == 'packaging')
     - name: Linux build dependencies
