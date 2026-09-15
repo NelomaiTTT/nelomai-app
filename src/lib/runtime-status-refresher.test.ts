@@ -45,4 +45,17 @@ describe("runtime status refresher", () => {
 
     expect(applied).not.toHaveBeenCalled();
   });
+
+  it("does not let an old poll overwrite a direct runtime action result", async () => {
+    const pending = deferred<TestStatus>();
+    const applied: TestStatus[] = [];
+    const refresher = new RuntimeStatusRefresher<TestStatus>();
+
+    const poll = refresher.run(() => pending.promise, (status) => applied.push(status));
+    refresher.commit({ phase: "complete" }, (status) => applied.push(status));
+    pending.resolve({ phase: "auth_resuming" });
+    await poll;
+
+    expect(applied).toEqual([{ phase: "complete" }]);
+  });
 });

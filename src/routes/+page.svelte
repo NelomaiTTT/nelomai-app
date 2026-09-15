@@ -408,6 +408,10 @@
     await runtimeStatusRefresher.run(nativeClient.runtimeStatus, (status) => {
       runtimeStatus = status;
     });
+    scheduleRuntimeStatusRefresh();
+  }
+
+  function scheduleRuntimeStatusRefresh() {
     if (runtimeStatusTimer !== null) window.clearTimeout(runtimeStatusTimer);
     runtimeStatusTimer = null;
     if (
@@ -426,7 +430,11 @@
     runtimeSelectionBusy = true;
     error = null;
     try {
-      runtimeStatus = await nativeClient.runtimeSelect(useStable);
+      runtimeStatusRefresher.commit(
+        await nativeClient.runtimeSelect(useStable),
+        (status) => { runtimeStatus = status; },
+      );
+      scheduleRuntimeStatusRefresh();
     } catch (reason) {
       error = commandMessage(reason, "runtime");
       await refreshRuntimeStatus();
