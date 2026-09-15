@@ -78,6 +78,7 @@
   } from "$lib/split-tunnel";
   import { UpdateOfferRefresher } from "$lib/update-offer-refresher";
   import { RuntimeStatusRefresher } from "$lib/runtime-status-refresher";
+  import { updateDiagnosticStage } from "$lib/update-diagnostics";
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
@@ -111,6 +112,7 @@
   let diagnosticsBusy = $state(false);
   let diagnosticsStatus = $state<string | null>(null);
   let updateStatus = $state<UpdateStatus | null>(null);
+  let lastRecordedUpdateState: string | null = null;
   const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
   const runtimeStatusRefresher = new RuntimeStatusRefresher<RuntimeStatus>();
   let updateBusy = $state(false);
@@ -480,6 +482,9 @@
       phase = current.phase;
       connection = current.connection;
       view = viewForAppState(current);
+      if (view === "sign_in") {
+        void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
+      }
       if (
         (previous === "connected" || previous === "connecting") &&
         current.connectionIntentStatus === "none" &&
@@ -520,6 +525,7 @@
       if (code === "signed_out") {
         phase = "signed_out";
         view = "sign_in";
+        void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
       } else if (code === "access_expired") {
         phase = "access_expired";
         view = "access_expired";
@@ -576,6 +582,9 @@
     connectionMetrics = state.metrics;
     runtimeWarning = state.warning;
     view = viewForAppState(state);
+    if (view === "sign_in") {
+      void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
+    }
     await refreshRuntimeStatus();
     await loadSplitTunnel(false);
     if (state.phase === "ready") void refreshProbes();
@@ -601,6 +610,7 @@
     } catch (reason) {
       phase = "signed_out";
       view = "sign_in";
+      void nativeClient.recordStartupStage("sign_in_login_failed");
       error = commandMessage(reason, "login");
     } finally {
       busy = false;
@@ -917,6 +927,7 @@
       clearUpdateTimer();
       phase = "signed_out";
       view = "sign_in";
+      void nativeClient.recordStartupStage("sign_in_logout_completed");
     } catch (reason) {
       error = commandMessage(reason, "logout");
     } finally {
@@ -1028,12 +1039,13 @@
   async function refreshUpdateStatus() {
     clearUpdateTimer();
     try {
-      updateStatus = await nativeClient.updateStatus();
+      const status = await nativeClient.updateStatus();
+      observeUpdateStatus(status);
       if (
-        updateStatus.phase === "downloading" ||
-        (updateStatus.supported &&
-          updateStatus.automatic &&
-          updateStatus.phase === "available")
+        status.phase === "downloading" ||
+        (status.supported &&
+          status.automatic &&
+          status.phase === "available")
       ) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 500);
       }
@@ -1042,12 +1054,22 @@
     }
   }
 
+  function observeUpdateStatus(status: UpdateStatus) {
+    updateStatus = status;
+    const stage = updateDiagnosticStage(status.phase);
+    const key = stage ? `${stage}:${status.version ?? "none"}` : null;
+    if (stage && key !== lastRecordedUpdateState) {
+      lastRecordedUpdateState = key;
+      void nativeClient.recordStartupStage(stage);
+    }
+  }
+
   async function refreshUpdateOffer() {
     if (!bootstrap) return;
     await updateOfferRefresher.run(
       () => nativeClient.refreshUpdate(),
       (status) => {
-        updateStatus = status;
+        observeUpdateStatus(status);
         if (
           status.phase === "downloading" ||
           (status.supported && status.automatic && status.phase === "available")
@@ -1063,9 +1085,10 @@
     if (updateBusy) return;
     updateBusy = true;
     error = null;
+    void nativeClient.recordStartupStage("update_install_requested");
     updateTimer = window.setTimeout(refreshUpdateStatus, 100);
     try {
-      updateStatus = await nativeClient.installUpdate();
+      observeUpdateStatus(await nativeClient.installUpdate());
     } catch (reason) {
       error = commandMessage(reason, "update");
       await refreshUpdateStatus();
@@ -1077,7 +1100,7 @@
   async function setAutomaticUpdates(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     try {
-      updateStatus = await nativeClient.setAutomaticUpdates(input.checked);
+      observeUpdateStatus(await nativeClient.setAutomaticUpdates(input.checked));
       if (input.checked) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 100);
       }

@@ -5,6 +5,7 @@ import android.app.ApplicationExitInfo
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -22,6 +23,7 @@ internal fun frontendMarkerReady(marker: File, launchStartedAtUnixMillis: Long):
   }.getOrDefault(false)
 
 internal object StartupDiagnostics {
+  private const val LOGCAT_TAG = "NelomaiDiagnostics"
   private const val MAX_LOG_BYTES = 64 * 1024L
   private const val FILE_NAME = "android-startup.jsonl"
   private const val FRONTEND_READY_MARKER = "android-frontend-ready"
@@ -52,7 +54,16 @@ internal object StartupDiagnostics {
 
   fun record(context: Context, kind: String) = record(context, kind, emptyMap())
 
+  fun recordCode(context: Context, kind: String, code: String) {
+    val safeCode = code.takeIf { it.matches(Regex("[a-z0-9_.-]{1,64}")) } ?: "unknown"
+    record(context, kind, mapOf("code" to safeCode))
+  }
+
   private fun record(context: Context, kind: String, details: Map<String, Any?>) {
+    Log.i(
+      LOGCAT_TAG,
+      "kind=${diagnosticToken(kind)} code=${diagnosticToken(details["code"]?.toString())}",
+    )
     runCatching {
       val directory = directory(context)
       if (!directory.exists() && !directory.mkdirs()) return
@@ -63,7 +74,7 @@ internal object StartupDiagnostics {
         .put("kind", kind)
         .put("operation_id", JSONObject.NULL)
         .put("request_id", JSONObject.NULL)
-        .put("code", JSONObject.NULL)
+        .put("code", details["code"] ?: JSONObject.NULL)
       details.forEach { (key, value) ->
         if (value != null) record.put(key, value)
       }
@@ -118,6 +129,9 @@ internal object StartupDiagnostics {
     }
   }
 }
+
+internal fun diagnosticToken(value: String?): String =
+  value?.takeIf { it.matches(Regex("[a-z0-9_.-]{1,64}")) } ?: "unknown"
 
 internal fun startupActivityLifecycleKind(stage: String): String =
   "startup.android.activity_$stage"

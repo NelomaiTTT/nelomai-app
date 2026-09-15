@@ -18,4 +18,15 @@ class RuntimeApkValidationTest {
             assertFalse(RuntimeApkValidation.signers(emptySet(), emptySet(), "a".repeat(64)))
         } finally { root.deleteRecursively() }
     }
+
+    @Test fun installerReturnRequiresDispatchAndPause() {
+        val lifecycle = RuntimeInstallerLifecycle()
+
+        assertFalse(lifecycle.onResume())
+        lifecycle.markDispatched()
+        assertFalse(lifecycle.onResume())
+        lifecycle.onPause()
+        assertTrue(lifecycle.onResume())
+        assertFalse(lifecycle.onResume())
+    }
 }

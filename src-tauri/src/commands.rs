@@ -934,6 +934,15 @@ pub enum StartupStage {
     FrontendMounted,
     FrontendFirstFrame,
     BootstrapSlow,
+    SignInBootstrapSignedOut,
+    SignInLoginFailed,
+    SignInLogoutCompleted,
+    UpdateInstallRequested,
+    UpdateAvailable,
+    UpdateDownloading,
+    UpdateReadyToRestart,
+    UpdateAwaitingInstallation,
+    UpdateFailed,
 }
 
 impl StartupStage {
@@ -942,7 +951,33 @@ impl StartupStage {
             Self::FrontendMounted => "startup.frontend.mounted",
             Self::FrontendFirstFrame => "startup.frontend.first_frame",
             Self::BootstrapSlow => "startup.bootstrap.slow",
+            Self::SignInBootstrapSignedOut => "ui.sign_in.bootstrap_signed_out",
+            Self::SignInLoginFailed => "ui.sign_in.login_failed",
+            Self::SignInLogoutCompleted => "ui.sign_in.logout_completed",
+            Self::UpdateInstallRequested => "update.install.requested",
+            Self::UpdateAvailable => "update.phase.available",
+            Self::UpdateDownloading => "update.phase.downloading",
+            Self::UpdateReadyToRestart => "update.phase.ready_to_restart",
+            Self::UpdateAwaitingInstallation => "update.phase.awaiting_installation",
+            Self::UpdateFailed => "update.phase.failed",
         }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn private_error_code(error: nelomai_client_container::ipc::PrivateError) -> &'static str {
+    use nelomai_client_container::ipc::PrivateError;
+    match error {
+        PrivateError::Closed => "private_closed",
+        PrivateError::Timeout => "private_timeout",
+        PrivateError::RefreshPending => "private_refresh_pending",
+        PrivateError::RefreshRejected => "private_refresh_rejected",
+        PrivateError::Protocol => "private_protocol",
+        PrivateError::Cancelled => "private_cancelled",
+        PrivateError::RecoveryRequired => "private_recovery_required",
+        PrivateError::OutcomeUnknown => "private_outcome_unknown",
+        PrivateError::AccessUnavailable => "private_access_unavailable",
+        PrivateError::Service => "private_service",
     }
 }
 
@@ -2406,8 +2441,11 @@ async fn provision_android_background(
         app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
             .background(nelomai_client_container::ipc::BackgroundAction::Provision)
             .await
-            .map_err(|_| {
-                CommandError::from_core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            .map_err(|error| {
+                CommandError::new(
+                    private_error_code(error),
+                    "Не удалось подготовить фоновое подключение",
+                )
             })?;
     }
     #[cfg(not(target_os = "android"))]
@@ -4371,6 +4409,32 @@ mod tests {
         let stage: StartupStage = serde_json::from_str("\"frontend_first_frame\"").unwrap();
         assert_eq!(stage.event_name(), "startup.frontend.first_frame");
         assert!(serde_json::from_str::<StartupStage>("\"arbitrary_event\"").is_err());
+    }
+
+    #[test]
+    fn update_and_sign_in_diagnostic_stages_are_allowlisted() {
+        let update: StartupStage =
+            serde_json::from_str("\"update_awaiting_installation\"").unwrap();
+        let sign_in: StartupStage =
+            serde_json::from_str("\"sign_in_bootstrap_signed_out\"").unwrap();
+
+        assert_eq!(update.event_name(), "update.phase.awaiting_installation");
+        assert_eq!(sign_in.event_name(), "ui.sign_in.bootstrap_signed_out");
+    }
+
+    #[test]
+    fn private_provision_errors_keep_their_original_diagnostic_code() {
+        use nelomai_client_container::ipc::PrivateError;
+
+        assert_eq!(private_error_code(PrivateError::Timeout), "private_timeout");
+        assert_eq!(
+            private_error_code(PrivateError::RefreshRejected),
+            "private_refresh_rejected"
+        );
+        assert_eq!(
+            private_error_code(PrivateError::RecoveryRequired),
+            "private_recovery_required"
+        );
     }
 
     #[test]

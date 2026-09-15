@@ -58,7 +58,16 @@ export function waitForSettlement(
 export type StartupStage =
   | "frontend_mounted"
   | "frontend_first_frame"
-  | "bootstrap_slow";
+  | "bootstrap_slow"
+  | "sign_in_bootstrap_signed_out"
+  | "sign_in_login_failed"
+  | "sign_in_logout_completed"
+  | "update_install_requested"
+  | "update_available"
+  | "update_downloading"
+  | "update_ready_to_restart"
+  | "update_awaiting_installation"
+  | "update_failed";
 
 export interface LoginRequest {
   login: string;

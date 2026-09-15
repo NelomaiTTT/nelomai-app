@@ -73,4 +73,11 @@ class StartupDiagnosticsTest {
     )
     assertEquals("unknown_999", startupExitReason(999))
   }
+
+  @Test
+  fun adbDiagnosticTokensCannotContainFreeFormData() {
+    assertEquals("update.android.installer_activity_returned", diagnosticToken("update.android.installer_activity_returned"))
+    assertEquals("unknown", diagnosticToken("token=secret value"))
+    assertEquals("unknown", diagnosticToken("x".repeat(65)))
+  }
 }
