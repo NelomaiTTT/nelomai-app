@@ -2,8 +2,9 @@ use crate::{
     ClientCore, CoreApi, CoreApiError, CoreError, CoreLogger, Phase, SplitTunnelWarningKind,
 };
 use futures::{stream, StreamExt};
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_storage::{
-    SecretStore, StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
+    RuntimeStateStore, StoredSplitTunnelDomainResolution, StoredSplitTunnelState,
 };
 use nelomai_client_tunnel::{
     DesktopTunnelOptions, TunnelCapabilities, TunnelOptions, TunnelPlatform,
@@ -688,7 +689,7 @@ impl ConnectedPolicyApplyOutcome {
 impl<A, S, T, L> ClientCore<A, S, T, L>
 where
     A: CoreApi,
-    S: SecretStore,
+    S: RuntimeStateStore,
     T: nelomai_client_tunnel::TunnelController,
     L: CoreLogger,
 {
@@ -740,6 +741,14 @@ where
         &self,
         now_unix: i64,
     ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
+        self.poll_physical_network_guarded(now_unix, || true).await
+    }
+
+    pub async fn poll_physical_network_guarded(
+        &self,
+        now_unix: i64,
+        allowed: impl Fn() -> bool + Send,
+    ) -> Result<PhysicalNetworkPollOutcome, CoreError> {
         let Ok(_split_guard) = self.split_tunnel_gate.try_lock() else {
             return Ok(PhysicalNetworkPollOutcome::Busy);
         };
@@ -763,7 +772,11 @@ where
             self.physical_network_change.lock().await.reset();
             return Ok(PhysicalNetworkPollOutcome::Skipped);
         }
-        let fingerprint = match self.tunnel.physical_network_fingerprint().await {
+        let fingerprint_result = self.tunnel.physical_network_fingerprint().await;
+        if !allowed() {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        }
+        let fingerprint = match fingerprint_result {
             Ok(Some(fingerprint)) => fingerprint,
             Ok(None) => {
                 self.physical_network_change.lock().await.reset();
@@ -808,7 +821,7 @@ where
             PhysicalNetworkObservation::ConfirmedChange(_) => {}
         }
 
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         let configuration = stored
             .saved_connection
             .as_ref()
@@ -837,6 +850,9 @@ where
             }
             return Ok(PhysicalNetworkPollOutcome::ReconnectFailed);
         };
+        if !allowed() {
+            return Ok(PhysicalNetworkPollOutcome::RetryDeferred);
+        }
         if let Err(error) = self.tunnel.stop().await {
             let tunnel_stopped = self
                 .tunnel
@@ -981,7 +997,7 @@ where
             });
         }
 
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         let configuration = stored
             .saved_connection
             .as_ref()
@@ -1152,7 +1168,7 @@ where
             return Ok(SplitTunnelSyncOutcome::Skipped);
         }
 
-        let mut access_token = self.load_auth()?.access_token.ok_or(CoreError::SignedOut)?;
+        let mut access_token = self.access_snapshot().await?;
         self.flush_pending_apply_results(&mut access_token, &mut state)
             .await;
         let revision = match self.request_split_tunnel_revision(&mut access_token).await {
@@ -1287,7 +1303,7 @@ where
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
-        let mut access_token = self.load_auth()?.access_token.ok_or(CoreError::SignedOut)?;
+        let mut access_token = self.access_snapshot().await?;
         self.flush_pending_apply_results(&mut access_token, &mut state)
             .await;
         let policy = self
@@ -1343,7 +1359,7 @@ where
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
-        let mut access_token = self.load_auth()?.access_token.ok_or(CoreError::SignedOut)?;
+        let mut access_token = self.access_snapshot().await?;
         self.flush_pending_apply_results(&mut access_token, &mut state)
             .await;
         let policy = self
@@ -1364,7 +1380,7 @@ where
             .split_tunnel_store
             .load()
             .map_err(|_| CoreError::Storage)?;
-        let mut access_token = self.load_auth()?.access_token.ok_or(CoreError::SignedOut)?;
+        let mut access_token = self.access_snapshot().await?;
         self.flush_pending_apply_results(&mut access_token, &mut state)
             .await;
         let policy = self
@@ -1378,7 +1394,7 @@ where
         &self,
         policy: SplitTunnelPolicy,
         state: &mut StoredSplitTunnelState,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         now_unix: i64,
     ) -> Result<SplitTunnelPolicy, CoreError> {
         validate_split_tunnel_policy(&policy)
@@ -1527,7 +1543,7 @@ where
         policy: &SplitTunnelPolicy,
         options: TunnelOptions,
         applied_physical_network_fingerprint: Option<String>,
-        access_token: Option<&mut String>,
+        access_token: Option<&mut AccessSnapshot>,
         now_unix: i64,
     ) -> Result<(), CoreError> {
         *self.split_tunnel_options.lock().await = options.clone();
@@ -1578,10 +1594,7 @@ where
         if state.pending_apply_results.is_empty() {
             return;
         }
-        let Ok(stored) = self.load_auth() else {
-            return;
-        };
-        let Some(mut access_token) = stored.access_token else {
+        let Ok(mut access_token) = self.access_snapshot().await else {
             return;
         };
         self.flush_pending_apply_results(&mut access_token, &mut state)
@@ -1621,9 +1634,13 @@ where
         &self,
         policy: &SplitTunnelPolicy,
         state: &mut StoredSplitTunnelState,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         now_unix: i64,
     ) -> Result<ConnectedPolicyApplyOutcome, CoreError> {
+        let cancel_epoch = crate::StartCancellationEpoch(
+            self.start_cancel_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         let current = {
             let current_state = self.state.lock().await;
             (current_state.phase == Phase::Connected)
@@ -1633,7 +1650,7 @@ where
         let Some(connection) = current else {
             return Ok(ConnectedPolicyApplyOutcome::Unchanged);
         };
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         let configuration = stored
             .saved_connection
             .as_ref()
@@ -1705,6 +1722,7 @@ where
         let _connection_guard = self.connection_gate.lock().await;
         let connection_is_still_current = {
             let current_state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             current_state.phase == Phase::Connected
                 && current_state
                     .connection
@@ -1759,10 +1777,13 @@ where
                 )
                 | Err(_) => Phase::Connected,
             };
-            *self.state.lock().await = crate::CoreState {
+            let mut current_state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            *current_state = crate::CoreState {
                 phase,
                 connection: Some(connection),
             };
+            drop(current_state);
             self.set_split_tunnel_warning(
                 SplitTunnelWarningKind::Operation,
                 "split_tunnel_stop_failed",
@@ -1789,7 +1810,11 @@ where
                 .await;
             return Ok(ConnectedPolicyApplyOutcome::StopFailed);
         }
-        self.set_phase(Phase::Connecting).await;
+        {
+            let mut current_state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            current_state.phase = Phase::Connecting;
+        }
         let start_new = self
             .tunnel
             .start(nelomai_client_tunnel::TunnelStartRequest {
@@ -1802,6 +1827,9 @@ where
                 redundancy: None,
             })
             .await;
+        // Both success and error can follow a physical start. Never dispatch
+        // rollback with a stale epoch; compensate an already dispatched start.
+        self.ensure_offline_start_current(cancel_epoch).await?;
         let (outcome, status, error_code) = if start_new.is_ok() {
             *self.split_tunnel_options.lock().await = new_options.clone();
             state.applied_physical_network_fingerprint = self
@@ -1813,16 +1841,15 @@ where
                 .await;
             self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
                 .await;
-            *self.state.lock().await = crate::CoreState {
-                phase: Phase::Connected,
-                connection: Some(connection),
-            };
+            self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
+                .await?;
             (
                 ConnectedPolicyApplyOutcome::Applied,
                 SplitTunnelApplyStatus::Applied,
                 None,
             )
         } else {
+            self.ensure_start_not_cancelled(cancel_epoch)?;
             let rollback = self
                 .tunnel
                 .start(nelomai_client_tunnel::TunnelStartRequest {
@@ -1833,16 +1860,15 @@ where
                     redundancy: None,
                 })
                 .await;
+            self.ensure_offline_start_current(cancel_epoch).await?;
             if rollback.is_ok() {
                 mark_policy_failure(state, policy, now_unix);
                 *self.split_tunnel_options.lock().await = previous_options.clone();
                 state.applied_physical_network_fingerprint = self
                     .initialize_physical_network_detector(&previous_options)
                     .await;
-                *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Connected,
-                    connection: Some(connection),
-                };
+                self.publish_local_start_state(cancel_epoch, Phase::Connected, connection)
+                    .await?;
                 self.set_split_tunnel_warning(
                     SplitTunnelWarningKind::Operation,
                     "split_tunnel_apply_failed",
@@ -1858,10 +1884,8 @@ where
                 *self.split_tunnel_options.lock().await = TunnelOptions::default();
                 self.physical_network_change.lock().await.reset();
                 state.applied_physical_network_fingerprint = None;
-                *self.state.lock().await = crate::CoreState {
-                    phase: Phase::Stopping,
-                    connection: Some(connection),
-                };
+                self.publish_local_start_state(cancel_epoch, Phase::Stopping, connection)
+                    .await?;
                 self.set_split_tunnel_warning(
                     SplitTunnelWarningKind::Operation,
                     "split_tunnel_rollback_failed",
@@ -1901,7 +1925,7 @@ where
 
     async fn request_split_tunnel_revision(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
     ) -> Result<SplitTunnelRevision, CoreError> {
         match self.api.split_tunnel_revision(access_token).await {
             Ok(response) => Ok(response),
@@ -1919,6 +1943,7 @@ where
     pub(crate) async fn restore_running_split_tunnel_options(
         &self,
         connection: &nelomai_contracts::Connection,
+        cancel_epoch: crate::StartCancellationEpoch,
     ) {
         let Ok(state) = self.split_tunnel_store.load() else {
             return;
@@ -1936,8 +1961,17 @@ where
             )
             .await
         {
-            *self.split_tunnel_options.lock().await = options.clone();
+            {
+                let mut current = self.split_tunnel_options.lock().await;
+                if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                    return;
+                }
+                *current = options.clone();
+            }
             let mut detector = self.physical_network_change.lock().await;
+            if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                return;
+            }
             detector.reset();
             if physical_network_tracking_active(&options) {
                 if let Some(fingerprint) = state.applied_physical_network_fingerprint {
@@ -1951,7 +1985,7 @@ where
 
     async fn request_split_tunnel_policy(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
     ) -> Result<SplitTunnelPolicy, CoreError> {
         match self.api.split_tunnel_policy(access_token).await {
             Ok(response) => Ok(response),
@@ -1968,7 +2002,7 @@ where
 
     async fn request_split_tunnel_settings(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         request: &SplitTunnelSettingsUpdate,
     ) -> Result<SplitTunnelPolicy, CoreError> {
         match self
@@ -1990,7 +2024,7 @@ where
 
     async fn request_add_split_tunnel_address_rule(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         request: &SplitTunnelAddressRuleUpdate,
     ) -> Result<SplitTunnelPolicy, CoreError> {
         match self
@@ -2012,7 +2046,7 @@ where
 
     async fn request_remove_split_tunnel_address_rule(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         rule_id: i64,
         scope: SplitTunnelAddressRuleScope,
     ) -> Result<SplitTunnelPolicy, CoreError> {
@@ -2035,7 +2069,7 @@ where
 
     async fn send_apply_result(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         result: &SplitTunnelApplyResult,
     ) -> Result<(), CoreError> {
         match self
@@ -2057,7 +2091,7 @@ where
 
     async fn flush_pending_apply_results(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         state: &mut StoredSplitTunnelState,
     ) {
         let pending = std::mem::take(&mut state.pending_apply_results);
@@ -2070,7 +2104,7 @@ where
 
     async fn report_or_queue_apply_result(
         &self,
-        access_token: &mut String,
+        access_token: &mut AccessSnapshot,
         state: &mut StoredSplitTunnelState,
         result: SplitTunnelApplyResult,
     ) {

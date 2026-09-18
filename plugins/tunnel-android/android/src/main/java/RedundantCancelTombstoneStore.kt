@@ -3,7 +3,7 @@ package ru.nelomai.tunnel
 import android.content.Context
 import java.util.UUID
 
-private const val REDUNDANT_CANCEL_PREFERENCES = "nelomai-redundant-cancel"
+internal const val REDUNDANT_CANCEL_PREFERENCES = "nelomai-redundant-cancel"
 private const val REDUNDANT_CANCEL_RECORD = "tombstone"
 private const val REDUNDANT_CANCEL_LEGACY_FORMAT = "1"
 private const val REDUNDANT_CANCEL_FORMAT = "2"
@@ -137,7 +137,7 @@ internal class RedundantCancelTombstoneStore(
 internal class AndroidRedundantCancelTombstoneBackend(context: Context) :
     RedundantCancelTombstoneBackend {
     private val preferences = context.applicationContext.getSharedPreferences(
-        REDUNDANT_CANCEL_PREFERENCES,
+        AndroidRuntimeNamespace.record(REDUNDANT_CANCEL_PREFERENCES),
         Context.MODE_PRIVATE,
     )
 

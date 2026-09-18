@@ -1,6 +1,9 @@
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
+#[cfg(not(windows))]
+use nelomai_client_updater::InstalledUpdate;
 use nelomai_client_updater::{
-    DownloadProgress, InstallResult, InstalledUpdate, UpdateBackend, UpdateBackendError,
+    DownloadProgress, InstallResult, UpdateBackend, UpdateBackendError, UpdateBarrierPhase,
     UpdateEndpointPolicy,
 };
 use std::sync::Arc;
@@ -46,10 +49,12 @@ impl<R: Runtime> DesktopUpdateBackend<R> {
 impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
     async fn install(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         expected_version: &str,
+        barrier: UpdateBarrierPhase,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError> {
+        debug_assert_eq!(barrier, UpdateBarrierPhase::LocalStopped);
         let target = tauri_plugin_updater::target()
             .ok_or_else(|| UpdateBackendError::new("unsupported_update_target"))?;
         let current_version = self.app.package_info().version.to_string();
@@ -57,14 +62,19 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .endpoint_policy
             .manifest_url(&target, &current_version)
             .map_err(|_| UpdateBackendError::new("invalid_update_endpoint"))?;
-        let updater = self
+        let mut builder = self
             .app
             .updater_builder()
             .pubkey(self.public_key.clone())
             .endpoints(vec![endpoint])
-            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?
-            .header("Authorization", format!("Bearer {access_token}"))
-            .map_err(|_| UpdateBackendError::new("updater_authorization_failed"))?
+            .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
+        // The updater carries these same headers into Update.download().
+        for (name, value) in access_token.bearer_headers() {
+            builder = builder
+                .header(name, value)
+                .map_err(|_| UpdateBackendError::new("updater_authorization_failed"))?;
+        }
+        let updater = builder
             .build()
             .map_err(|_| UpdateBackendError::new("updater_configuration_failed"))?;
         let Some(update) = updater
@@ -96,16 +106,88 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             .await
             .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
 
+        let stop_proof = crate::container::begin_installation(&self.app, expected_version)
+            .await
+            .map_err(|_| UpdateBackendError::new("update_stop_proof_unavailable"))?;
         #[cfg(windows)]
-        crate::desktop::set_tray_visible(&self.app, false);
-        let install = update.install(bytes);
-        #[cfg(windows)]
-        if install.is_err() {
+        {
+            crate::desktop::set_tray_visible(&self.app, false);
+            let result = crate::container::handoff_windows_installer(&self.app, stop_proof, || {
+                update
+                    .install(bytes)
+                    .map_err(|_| std::io::Error::other("update install failed"))
+            })
+            .await;
+            // The dependency normally exits without returning. A return (even
+            // Ok) is not replacement evidence and must never enable restart.
             crate::desktop::set_tray_visible(&self.app, true);
+            Err(UpdateBackendError::new(if result.is_err() {
+                "update_install_failed"
+            } else {
+                "update_install_outcome_unknown"
+            }))
         }
-        install.map_err(|_| UpdateBackendError::new("update_install_failed"))?;
-        Ok(InstallResult::Installed(InstalledUpdate {
-            version: update.version,
-        }))
+        #[cfg(not(windows))]
+        {
+            #[cfg(target_os = "linux")]
+            let install = install_linux_common(bytes).await;
+            #[cfg(not(target_os = "linux"))]
+            let install = update
+                .install(bytes)
+                .map_err(|_| UpdateBackendError::new("update_install_failed"));
+            install.map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+            crate::container::installation_succeeded(&self.app, stop_proof)
+                .await
+                .map_err(|_| UpdateBackendError::new("update_stop_proof_changed"))?;
+            Ok(InstallResult::Installed(InstalledUpdate {
+                version: update.version,
+            }))
+        }
     }
+}
+
+/// `Update::download` has already verified the updater signature. The root
+/// installer copies and hashes these exact bytes before extracting/activating
+/// the complete AppImage; auth and stop barriers stay in the common updater.
+#[cfg(target_os = "linux")]
+async fn install_linux_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+    let installer = Path::new("/usr/local/libexec/nelomai/common/install-common-linux.sh");
+    for path in installer.ancestors() {
+        nelomai_contracts::dispatcher::trusted(path, 0)
+            .map_err(|_| UpdateBackendError::new("common_installer_untrusted"))?;
+    }
+    let staging = tempfile::Builder::new()
+        .prefix("nelomai-verified-update-")
+        .tempdir()
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    let image = staging.path().join("Nelomai.AppImage");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&image)
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    drop(file);
+    let sha = nelomai_contracts::dispatcher::digest(&bytes);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _staging = staging;
+        let status = super::unix::installer_status(
+            std::process::Command::new("/usr/bin/pkexec")
+                .arg("/bin/sh")
+                .arg(installer)
+                .arg(image)
+                .arg(sha),
+        )
+        .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+        if !status.success() {
+            return Err(UpdateBackendError::new("update_install_failed"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| UpdateBackendError::new("update_install_failed"))?
 }

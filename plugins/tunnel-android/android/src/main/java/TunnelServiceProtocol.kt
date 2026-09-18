@@ -43,6 +43,10 @@ internal const val EXTRA_CREDENTIAL_REVISION = "credential_revision"
 internal const val EXTRA_INSTALL_SECRET = "install_secret"
 internal const val EXTRA_ACCESS_TOKEN = "access_token"
 internal const val EXTRA_REFRESH_TOKEN = "refresh_token"
+internal const val EXTRA_AUTH_RESPONSE = "auth_response"
+internal const val EXTRA_OWNER_OPERATION = "owner_operation"
+internal const val EXTRA_OWNER_CANCEL_EPOCH = "owner_cancel_epoch"
+internal const val EXTRA_OWNER_PROVISION_MODE = "owner_provision_mode"
 internal const val EXTRA_CAPABILITY_REVISION = "capability_revision"
 internal const val EXTRA_CAPABILITY_ENABLED = "capability_enabled"
 internal const val EXTRA_CAPABILITY_EXPIRES_AT = "capability_expires_at"
@@ -125,7 +129,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_QUICK_TOGGLE),
         { onSuccess(it.toConnectionIntentServiceStatus()) },
         onError,
@@ -139,7 +143,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_BEGIN_CONNECTION_INTENT)
             .putExtra(EXTRA_API_VERSION, args.apiVersion)
             .putExtra(EXTRA_DEVICE_ID, args.template.deviceId)
@@ -189,7 +193,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(request.action)
             .apply { request.generation?.let { putExtra(EXTRA_GENERATION, it) } },
         { onSuccess(it.toConnectionIntentServiceStatus()) },
@@ -200,13 +204,19 @@ internal object TunnelServiceClient {
         context: Context,
         onSuccess: (ConnectionIntentServiceStatus) -> Unit,
         onError: (String) -> Unit,
-    ) = requestBundle(
-        context,
-        Intent(context, NelomaiVpnService::class.java)
-            .setAction(NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS),
-        { onSuccess(it.toConnectionIntentServiceStatus()) },
-        onError,
-    )
+    ) {
+        IdleConnectionIntentProjection.open(context).read()?.let {
+            onSuccess(it)
+            return
+        }
+        requestBundle(
+            context,
+            ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+                .setAction(NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS),
+            { onSuccess(it.toConnectionIntentServiceStatus()) },
+            onError,
+        )
+    }
 
     fun releaseRedundantStandby(
         context: Context,
@@ -214,7 +224,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_RELEASE_REDUNDANT_STANDBY),
         { onSuccess(it.toConnectionIntentServiceStatus()) },
         onError,
@@ -233,7 +243,7 @@ internal object TunnelServiceClient {
         try {
             requestBundle(
                 context,
-                Intent(context, NelomaiVpnService::class.java)
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
                     .setAction(NelomaiVpnService.ACTION_CLIENT_START)
                     .putExtra(EXTRA_API_VERSION, args.apiVersion)
                     .putExtra(EXTRA_CLIENT_OPERATION_ID, clientOperationId)
@@ -271,7 +281,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLIENT_STOP)
             .putExtra(EXTRA_API_VERSION, apiVersion),
         { result ->
@@ -290,7 +300,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLIENT_STATUS)
             .putExtra(EXTRA_API_VERSION, apiVersion),
         { result ->
@@ -310,7 +320,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLIENT_METRICS)
             .putExtra(EXTRA_API_VERSION, apiVersion)
             .putExtra(EXTRA_PROBE, probe),
@@ -334,7 +344,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLIENT_REBIND_UDP)
             .putExtra(EXTRA_API_VERSION, apiVersion),
         { result ->
@@ -354,7 +364,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CONFIGURE_BACKGROUND)
             .putExtra(EXTRA_API_VERSION, args.apiVersion)
             .putExtra(EXTRA_CREDENTIAL_REVISION, args.expectedRevision)
@@ -376,7 +386,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_BACKGROUND_STATUS),
         {
             val configured = it.getBoolean(EXTRA_CONFIGURED)
@@ -404,7 +414,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_ROTATE_BACKGROUND)
             .putExtra(EXTRA_CREDENTIAL_REVISION, expectedRevision),
         { onSuccess() },
@@ -419,13 +429,15 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_PROVISION_BACKGROUND)
             .putExtra(EXTRA_API_VERSION, args.apiVersion)
             .putExtra(EXTRA_CREDENTIAL_REVISION, args.expectedRevision)
             .putExtra(EXTRA_DEVICE_ID, args.deviceId)
             .putExtra(EXTRA_PANEL_BASE, args.panelBase)
             .putExtra(EXTRA_ACCESS_TOKEN, args.accessToken)
+            .putExtra(EXTRA_OWNER_OPERATION, args.ownerOperation)
+            .putExtra(EXTRA_OWNER_PROVISION_MODE, args.mode)
             .putExtra(EXTRA_INSTALL_SECRET, args.installSecret)
             .putExtra(EXTRA_CAPABILITY_REVISION, args.capabilityRevision)
             .putExtra(EXTRA_CAPABILITY_ENABLED, args.capabilityEnabled)
@@ -438,17 +450,18 @@ internal object TunnelServiceClient {
     fun recoverBackgroundSession(
         context: Context,
         installSecret: String,
-        onSuccess: (String, String) -> Unit,
+        ownerOperation: String,
+        onSuccess: (String) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_RECOVER_BACKGROUND_SESSION)
-            .putExtra(EXTRA_INSTALL_SECRET, installSecret),
+            .putExtra(EXTRA_INSTALL_SECRET, installSecret)
+            .putExtra(EXTRA_OWNER_OPERATION, ownerOperation),
         { result ->
             onSuccess(
-                requireNotNull(result.getString(EXTRA_ACCESS_TOKEN)),
-                requireNotNull(result.getString(EXTRA_REFRESH_TOKEN)),
+                requireNotNull(result.getString(EXTRA_AUTH_RESPONSE)),
             )
         },
         onError,
@@ -461,7 +474,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLEAR_BACKGROUND),
         { onSuccess() },
         onError,
@@ -469,12 +482,14 @@ internal object TunnelServiceClient {
 
     fun beginBackgroundLogout(
         context: Context,
+        cancelEpoch: Long,
         onSuccess: (BackgroundLogoutOwnership) -> Unit,
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
-            .setAction(NelomaiVpnService.ACTION_BEGIN_BACKGROUND_LOGOUT),
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+            .setAction(NelomaiVpnService.ACTION_BEGIN_BACKGROUND_LOGOUT)
+            .putExtra(EXTRA_OWNER_CANCEL_EPOCH, cancelEpoch),
         { result ->
             onSuccess(
                 BackgroundLogoutOwnership.fromWireName(
@@ -492,7 +507,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLEAR_QUICK_PLAN),
         { onSuccess() },
         onError,
@@ -505,7 +520,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_UPDATE_QUICK_DNS)
             .putStringArrayListExtra(EXTRA_DNS_SERVERS, dnsServers),
         { onSuccess() },
@@ -519,7 +534,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_TAKE_STATE_CHANGE),
         {
             onSuccess(
@@ -537,7 +552,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
     ) = requestBundle(
         context,
-        Intent(context, NelomaiVpnService::class.java)
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_ACKNOWLEDGE_STATE_CHANGE)
             .putExtra(EXTRA_STATE_CHANGE_REVISION, revision),
         { onSuccess(it.getLong(EXTRA_STATE_CHANGE_REVISION)) },
@@ -594,7 +609,7 @@ internal object TunnelServiceClient {
     private fun cancelClientStart(context: Context, clientOperationId: String) {
         dispatch(
             context,
-            Intent(context, NelomaiVpnService::class.java)
+            ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
                 .setAction(NelomaiVpnService.ACTION_CANCEL_CLIENT_START)
                 .putExtra(EXTRA_CLIENT_OPERATION_ID, clientOperationId),
             { code -> TunnelLog.warning("client_start.cancel_dispatch_failed", code) },
@@ -609,7 +624,8 @@ internal object TunnelServiceClient {
     ) {
         try {
             if (foreground) {
-                ContextCompat.startForegroundService(context.applicationContext, intent)
+                ContextCompat.startForegroundService(context.applicationContext,
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(intent))
             } else {
                 context.applicationContext.startService(intent)
             }

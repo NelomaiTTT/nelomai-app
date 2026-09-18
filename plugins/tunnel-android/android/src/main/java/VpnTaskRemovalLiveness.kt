@@ -6,7 +6,6 @@ import android.app.job.JobScheduler
 import android.app.job.JobService
 import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
 import androidx.core.content.ContextCompat
 
 private const val VPN_TASK_REMOVAL_LIVENESS_JOB_ID = 0x4e56504c
@@ -42,8 +41,10 @@ class VpnTaskRemovalLivenessJobService : JobService() {
         dispatchScheduledTaskRemovalLiveness {
             ContextCompat.startForegroundService(
                 applicationContext,
-                Intent(applicationContext, NelomaiVpnService::class.java)
-                    .setAction(NelomaiVpnService.ACTION_TASK_REMOVAL_LIVENESS),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(applicationContext)
+                        .setAction(NelomaiVpnService.ACTION_TASK_REMOVAL_LIVENESS),
+                ),
             )
         }.onSuccess {
             TunnelLog.info("service.task_removal_liveness_dispatched")

@@ -307,6 +307,20 @@ impl LinuxUserspaceRouteManager {
     }
 
     fn apply_state(&self, state: &UserspaceRouteState) -> Result<(), ServiceError> {
+        // The userspace AWG launcher creates a DOWN TUN device; configuring
+        // addresses/MTU through defguard does not activate it for routing.
+        mutate_ip(
+            &self.ip,
+            &[
+                "link".to_string(),
+                "set".to_string(),
+                "dev".to_string(),
+                state.interface_name.clone(),
+                "up".to_string(),
+            ],
+            false,
+            "interface_up_failed",
+        )?;
         for route in &state.routes {
             mutate_ip(
                 &self.ip,
@@ -427,7 +441,35 @@ fn ensure_ip_query_empty(ip: &Path, arguments: &[&str]) -> Result<(), ServiceErr
 }
 
 fn query_ip(ip: &Path, arguments: &[&str]) -> Result<String, ServiceError> {
-    let output = run(ip, arguments)?;
+    let output = output_with_timeout(
+        Command::new(ip)
+            .args(arguments)
+            .env("LANG", "C")
+            .env("LC_ALL", "C"),
+        COMMAND_TIMEOUT,
+    )
+    .map_err(|_| ServiceError::Backend("route_command_failed".to_string()))?;
+    if !output.status.success() {
+        // A FIB table is created lazily. Before the first AWG start (or after
+        // cleanup), iproute2 reports its absence with exit 2, not empty success.
+        // Only accept this exact read-only query/result; fail closed otherwise.
+        let missing_table_message = match arguments {
+            ["-4", "route", "show", "table", "42761"] => {
+                "Error: ipv4: FIB table does not exist.\nDump terminated"
+            }
+            ["-6", "route", "show", "table", "42761"] => {
+                "Error: ipv6: FIB table does not exist.\nDump terminated"
+            }
+            _ => "",
+        };
+        if output.status.code() != Some(2)
+            || !output.stdout.is_empty()
+            || missing_table_message.is_empty()
+            || String::from_utf8_lossy(&output.stderr).trim() != missing_table_message
+        {
+            return Err(ServiceError::Backend("route_command_failed".to_string()));
+        }
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -696,7 +738,20 @@ fn route_matches_tokens(tokens: &[&str], route: &OwnedRoute) -> bool {
     let Some(expected_metric) = route.metric else {
         return false;
     };
-    tokens.first() == Some(&route.destination.as_str())
+    let Ok(expected_destination) = route.destination.parse::<Ipv4Net>() else {
+        return false;
+    };
+    // iproute2 omits /32 when rendering a host route. Compare the network,
+    // retaining every ownership check before cleanup may remove the route.
+    let destination = tokens.first().and_then(|value| {
+        value.parse::<Ipv4Net>().ok().or_else(|| {
+            value
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .and_then(|address| Ipv4Net::new(address, 32).ok())
+        })
+    });
+    destination == Some(expected_destination)
         && value_after(tokens, "via") == route.gateway.as_deref()
         && value_after(tokens, "dev") == Some(route.interface_identifier.as_str())
         && value_after(tokens, "metric").and_then(|value| value.parse::<u32>().ok())
@@ -828,6 +883,152 @@ mod tests {
     use defguard_wireguard_rs::{key::Key, net::IpAddrMask};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn userspace_link_is_up_before_ipv4_and_ipv6_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let ip = directory.path().join("ip");
+        let calls = directory.path().join("calls");
+        fs::write(
+            &ip,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
+        let manager = LinuxUserspaceRouteManager {
+            ip,
+            state_path: directory.path().join("state.json"),
+            state: None,
+        };
+        let state = UserspaceRouteState {
+            format_version: AWG_ROUTE_STATE_FORMAT,
+            interface_name: "nlm-awg0".into(),
+            default_families: vec![RouteFamily::Ipv4, RouteFamily::Ipv6],
+            routes: vec![UserspaceRoute {
+                family: RouteFamily::Ipv4,
+                destination: "192.0.2.0/24".into(),
+            }],
+        };
+        manager.apply_state(&state).unwrap();
+        let output = fs::read_to_string(calls).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "link set dev nlm-awg0 up");
+        assert!(lines.contains(&"-4 route add 192.0.2.0/24 dev nlm-awg0 proto static"));
+        assert!(lines.contains(&"-4 route add default dev nlm-awg0 table 42761"));
+        assert!(lines.contains(&"-6 route add default dev nlm-awg0 table 42761"));
+    }
+
+    #[test]
+    fn userspace_link_up_failure_aborts_routes_and_clears_saved_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let ip = directory.path().join("ip");
+        let calls = directory.path().join("calls");
+        fs::write(&ip, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n'link set dev nlm-awg0 up') exit 2;;\nesac\nexit 0\n", calls.display()
+        )).unwrap();
+        fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = directory.path().join("state.json");
+        let mut manager = LinuxUserspaceRouteManager {
+            ip,
+            state_path: state_path.clone(),
+            state: None,
+        };
+        let error = manager
+            .apply(
+                "nlm-awg0",
+                &[peer_with_allowed_ips(vec!["192.0.2.0/24".parse().unwrap()])],
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Backend(code) if code == "interface_up_failed"));
+        let output = fs::read_to_string(calls).unwrap();
+        assert!(!output.contains("route add"));
+        assert!(!output.contains("rule add"));
+        assert!(!state_path.exists());
+        assert!(!manager.has_routes());
+    }
+
+    #[test]
+    fn userspace_preflight_accepts_missing_fib_table_but_not_other_query_failures() {
+        // Match iproute2 on SteamOS before the first AWG connection. The real
+        // query/preflight must treat only a missing route table as empty.
+        let directory = tempfile::tempdir().unwrap();
+        let ip = directory.path().join("ip");
+        for (stderr, stdout, exit, accepted) in [
+            (
+                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+                "",
+                2,
+                true,
+            ),
+            ("RTNETLINK answers: Operation not permitted\n", "", 2, false),
+            (
+                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+                "default dev foreign0\n",
+                2,
+                false,
+            ),
+            (
+                "Error: ipv4: FIB table does not exist.\nDump terminated\n",
+                "",
+                1,
+                false,
+            ),
+            ("", "default dev foreign0\n", 0, false),
+        ] {
+            fs::write(
+                &ip,
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {exit}\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&ip, fs::Permissions::from_mode(0o700)).unwrap();
+            let result = ensure_ip_query_empty(&ip, &["-4", "route", "show", "table", "42761"]);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "stderr={stderr:?} stdout={stdout:?} exit={exit}"
+            );
+            if exit != 0 {
+                assert!(query_ip(&ip, &["-4", "rule", "show"]).is_err());
+            }
+        }
+        fs::write(&ip, "#!/bin/sh\nprintf 'Error: ipv6: FIB table does not exist.\\nDump terminated\\n' >&2\nexit 2\n").unwrap();
+        assert!(ensure_ip_query_empty(&ip, &["-6", "route", "show", "table", "42761"]).is_ok());
+    }
+
+    #[test]
+    fn host_route_without_printed_prefix_is_recognized_for_cleanup() {
+        let route = OwnedRoute {
+            destination: "91.221.164.24/32".into(),
+            interface_identifier: "wlan0".into(),
+            gateway: Some("10.60.26.17".into()),
+            metric: Some(42760),
+        };
+        for destination in ["91.221.164.24", "91.221.164.24/32"] {
+            let line = format!("{destination} via 10.60.26.17 dev wlan0 proto static metric 42760");
+            assert!(route_matches_tokens(
+                &line.split_whitespace().collect::<Vec<_>>(),
+                &route
+            ));
+        }
+        for line in [
+            "91.221.164.25 via 10.60.26.17 dev wlan0 proto static metric 42760",
+            "91.221.164.0/24 via 10.60.26.17 dev wlan0 proto static metric 42760",
+            "91.221.164.24 via 10.60.26.18 dev wlan0 proto static metric 42760",
+            "91.221.164.24 via 10.60.26.17 dev wlan1 proto static metric 42760",
+            "91.221.164.24 via 10.60.26.17 dev wlan0 proto dhcp metric 42760",
+            "91.221.164.24 via 10.60.26.17 dev wlan0 proto static metric 600",
+        ] {
+            assert!(!route_matches_tokens(
+                &line.split_whitespace().collect::<Vec<_>>(),
+                &route
+            ));
+        }
+    }
 
     fn peer_with_allowed_ips(allowed_ips: Vec<IpAddrMask>) -> Peer {
         let mut peer = Peer::new(Key::new([7; 32]));

@@ -4,10 +4,35 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
+        android:name=".NelomaiApplication"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
+        android:fullBackupContent="@xml/diagnostics_backup_rules"
+        android:dataExtractionRules="@xml/diagnostics_data_extraction_rules"
         android:theme="@style/Theme.nelomai_app"
         android:usesCleartextTraffic="${usesCleartextTraffic}">
+        <provider android:name=".KeyringPreferencesProvider"
+            android:authorities="${applicationId}.keyring-preferences"
+            android:exported="false" />
+        <!-- Wry observes ProcessLifecycleOwner in :runtime, not in the broker process.
+             Keep AndroidX's eager initialization beside both runtime UI variants. -->
+        <provider android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false" android:process=":runtime" />
+        <service android:name=".RuntimeAuthBrokerService" android:exported="false" />
+        <activity android:name=".RuntimeApkInstallerActivity" android:exported="false" />
+        <service android:name=".RuntimeVpnDispatcherService" android:exported="false"
+            android:foregroundServiceType="systemExempted" android:permission="android.permission.BIND_VPN_SERVICE"
+            android:process=":vpn" android:stopWithTask="false">
+            <intent-filter><action android:name="android.net.VpnService" /></intent-filter>
+        </service>
+        <activity android:name=".RuntimeBootstrapActivity" android:exported="false" android:process=":runtime" />
+        <activity android:name=".RuntimeRestartActivity" android:exported="false"
+            android:excludeFromRecents="true" android:launchMode="singleTask"
+            android:taskAffinity="${applicationId}.runtime_restart" />
+        <activity android:name=".LatestRuntimeActivity" android:exported="false" android:process=":runtime"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode" />
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:launchMode="singleTask"

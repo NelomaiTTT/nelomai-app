@@ -34,6 +34,20 @@ fallbacks are documented in
 The synchronized inbox and Android push setup are documented in
 [`docs/notifications.md`](docs/notifications.md).
 
+## Release history («Что нового»)
+
+Opening the dialog fetches public release notes from the panel's
+`GET /api/client/v1/releases/changelog` endpoint. The response uses
+`{"api_version":"1","entries":[{"version":"…","notes":"…"}]}`.
+The last valid history is cached locally; bundled notes are an offline fallback
+until the first successful fetch. Panel edits replace the cached history without
+an application rebuild. Notes are plain text, never executable HTML.
+
+This request is independent of login, runtime admission and VPN operations, runs
+only when the dialog opens, and is bounded to eight seconds and 4 MiB.
+An unavailable or older panel does not block the application. Deploy panel
+support (including migration `20260912_0059`) before releasing this client.
+
 ## Local checks
 
 Rust installed by Homebrew `rustup` may require this path in a fresh shell:

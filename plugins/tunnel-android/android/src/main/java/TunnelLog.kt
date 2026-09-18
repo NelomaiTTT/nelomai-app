@@ -20,7 +20,7 @@ internal object TunnelLog {
     @Volatile private var directory: File? = null
 
     fun initialize(context: Context) {
-        directory = File(context.applicationInfo.dataDir, LOG_DIRECTORY).apply { mkdirs() }
+        directory = File(AndroidRuntimeNamespace.directory(context), LOG_DIRECTORY).apply { mkdirs() }
     }
 
     fun info(event: String, details: Map<String, Any?> = emptyMap()) {

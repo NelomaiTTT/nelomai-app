@@ -1,4 +1,5 @@
 package ru.nelomai.tunnel
+import org.json.JSONObject
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -23,6 +24,7 @@ import org.amnezia.awg.backend.GoBackend
 import org.amnezia.awg.config.Config
 import java.io.ByteArrayInputStream
 import java.nio.charset.StandardCharsets
+import ru.nelomai.client.RuntimeDispatchGuard
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
@@ -710,7 +712,8 @@ internal fun startRedundantVpnSession(
     return session
 }
 
-class NelomaiVpnService : GoBackend.VpnService() {
+class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVpnHostV1) :
+    GoBackend.VpnService(runtimeHost.service) {
     private val serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.incrementAndGet()
     private val restoreHandler = Handler(Looper.getMainLooper())
     private val credentialExecutor = Executors.newSingleThreadExecutor { task ->
@@ -729,6 +732,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         cancel = restoreHandler::removeCallbacks,
     )
     private var restoreRetryAttempt = 0
+    @Volatile private var lastHandledStartId = 0
     private lateinit var recoveryStore: AndroidRecoveryStore
     private lateinit var redundantCancelTombstones: RedundantCancelTombstoneStore
     private val redundantVpnOwnerSlot = RedundantVpnOwnerSlot()
@@ -793,9 +797,15 @@ class NelomaiVpnService : GoBackend.VpnService() {
     @Volatile
     private var unreadableRecoveryRetriesExhausted = false
 
+    override fun onTunnelDown() {
+        // WG and AWG share this backend. DOWN only closes the transport: the
+        // owner must finish durable cleanup and publish state before stopSelf.
+        // Explicit owner stops and Android's onRevoke retain their semantics.
+    }
+
     override fun getBuilder(): VpnService.Builder =
-        object : VpnService.Builder() {
-            override fun establish(): ParcelFileDescriptor? {
+        runtimeHost.builder { builder ->
+            with(builder) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     val (excludedRoutes, forcedTunnelRoutes) =
                         AndroidSplitTunnel.currentVpnRoutes()
@@ -804,7 +814,6 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     // a panel or local exclusion contains the resolver's parent prefix.
                     forcedTunnelRoutes.forEach(::addRoute)
                 }
-                return super.establish()
             }
         }
 
@@ -948,6 +957,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastHandledStartId = startId
         idleStopDebouncer.cancel()
         if (pendingRedundantStop != null || redundantCancelTombstoneUnreadable) {
             schedulePendingRedundantStopRetry()
@@ -1019,8 +1029,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             }
             intent == null -> {
                 TunnelLog.info("service.idle_restart_stopped")
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf(startId)
+                finishService(startId)
                 return START_NOT_STICKY
             }
         }
@@ -2650,18 +2659,25 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun handleConnectionIntentStatus(intent: Intent) {
-        when (val result = connectionIntentCoordinator.status()) {
-            is RecoveryStoreResult.Success -> intent.resultReceiver()?.send(
-                SERVICE_RESULT_OK,
-                connectionIntentServiceStatus(
-                    result.value,
-                    redundantVpnOwner?.reserveState()?.wireName
-                        ?: result.value.redundantTransaction?.standbyDesired
-                            ?.takeIf { it }
-                            ?.let { RedundantReserveState.WARMING.wireName },
-                ).toBundle(),
-            )
-            is RecoveryStoreResult.Failure -> intent.resultReceiver().sendError(result.code)
+        // Publish only from the :vpn authoritative reader, under its store lock.
+        // UI-side SharedPreferences readers may still hold an older snapshot.
+        val projection = IdleConnectionIntentProjection.open(applicationContext)
+        when (val result = AndroidRecoveryStores.open(applicationContext).readObserved(projection::observe)) {
+            is RecoveryStoreResult.Success -> {
+                intent.resultReceiver()?.send(
+                    SERVICE_RESULT_OK,
+                    connectionIntentServiceStatus(
+                        result.value,
+                        redundantVpnOwner?.reserveState()?.wireName
+                            ?: result.value.redundantTransaction?.standbyDesired
+                                ?.takeIf { it }
+                                ?.let { RedundantReserveState.WARMING.wireName },
+                    ).toBundle(),
+                )
+            }
+            is RecoveryStoreResult.Failure -> {
+                intent.resultReceiver().sendError(result.code)
+            }
         }
         stopIfIdle()
     }
@@ -2718,6 +2734,11 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun handleBeginBackgroundLogout(intent: Intent) {
+        val credentialStore = AndroidBackgroundCredentialStores.open(applicationContext)
+        when (val fenced = credentialStore.fenceOwnerLogout(intent.getLongExtra(EXTRA_OWNER_CANCEL_EPOCH, -1))) {
+            is CredentialStoreResult.Failure -> { intent.resultReceiver().sendError(fenced.code); return }
+            is CredentialStoreResult.Success -> Unit
+        }
         connectionIntentAdmission.invalidate()
         when (val result = beginDispatchedLogout(connectionIntentDispatch) {
             logoutCoordinator.begin()
@@ -2881,6 +2902,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
 
     private fun handleProvisionBackground(intent: Intent) {
         val receiver = intent.resultReceiver()
+        val ownerOperation = try {
+            NativeOwnerOperation.fromJson(JSONObject(requireNotNull(intent.getStringExtra(EXTRA_OWNER_OPERATION))))
+        } catch (_: Throwable) { receiver.sendError("background_owner_scope_mismatch"); return }
         val request = try {
             require(intent.getIntExtra(EXTRA_API_VERSION, 0) == TUNNEL_API_VERSION)
             val store = AndroidBackgroundCredentialStores.open(applicationContext)
@@ -2906,6 +2930,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         requireNotNull(intent.getStringExtra(EXTRA_CAPABILITY_EXPIRES_AT)),
                     ).epochSecond,
                 ),
+                ownerScope = ownerOperation.scope,
             )
         } catch (error: CredentialRotationFailure) {
             receiver.sendError(error.code)
@@ -2920,14 +2945,28 @@ class NelomaiVpnService : GoBackend.VpnService() {
         submitCredentialTask {
             var provisioned = false
             try {
+                val store = AndroidBackgroundCredentialStores.open(applicationContext)
+                val begun = store.beginProvisionOperation(request, ownerOperation).credentialOrThrow()
+                require(ownerOperation.scope.deviceId == request.deviceId)
+                store.withOwnerOperation(ownerOperation) {
+                provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = begun.revision),
+                    requireNotNull(intent.getStringExtra(EXTRA_OWNER_PROVISION_MODE)), System.currentTimeMillis() / 1_000,
+                    provision = { scopedRequest ->
                 provisionBackgroundCredential(
-                    store = AndroidBackgroundCredentialStores.open(applicationContext),
-                    request = request,
+                    store = store,
+                    request = scopedRequest,
                     nowUnix = System.currentTimeMillis() / 1_000,
                     operationIds = { UUID.randomUUID().toString() to UUID.randomUUID().toString() },
                     prepare = BackgroundConnectionClient::prepareTokenWithBearer,
                     activate = BackgroundConnectionClient::activateToken,
                 )
+                    }, rotate = { revision ->
+                        try { rotateBackgroundCredential(revision) } catch (error: CredentialRotationFailure) {
+                            throw BackgroundConnectionException(error.code)
+                        }
+                    }, legacy = BackgroundConnectionClient::legacyTokenWithBearer)
+                store.read().credentialOrThrow()
+                }
                 provisioned = true
                 runCatching { AutomaticDiagnostics.credentialUpdated(applicationContext) }
                     .onFailure {
@@ -2935,6 +2974,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
                     }
                 receiver.sendSuccess()
             } catch (error: BackgroundConnectionException) {
+                receiver.sendError(error.code)
+            } catch (error: CredentialRotationFailure) {
+                TunnelLog.warning("background.provision_failed", error.code)
                 receiver.sendError(error.code)
             } catch (_: Throwable) {
                 receiver.sendError("background_credential_provision_failed")
@@ -3037,6 +3079,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
         submitCredentialTask {
             try {
                 val store = AndroidBackgroundCredentialStores.open(applicationContext)
+                val ownerOperation = NativeOwnerOperation.fromJson(JSONObject(requireNotNull(intent.getStringExtra(EXTRA_OWNER_OPERATION))))
+                admitBackgroundRecovery(store, ownerOperation)
+                val recovered = store.withOwnerOperation(ownerOperation) {
                 val credential = backgroundCredentialForSessionRecovery(store) { envelope ->
                     provisionBackgroundCredential(
                         store = store,
@@ -3049,6 +3094,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                             installGeneration = requireNotNull(envelope.installGeneration),
                             capability = envelope.capability
                                 ?: BackgroundCapabilitySnapshot(0, false, 1),
+                            ownerScope = ownerOperation.scope,
                         ),
                         nowUnix = System.currentTimeMillis() / 1_000,
                         operationIds = { error("pending activation must not mint operation IDs") },
@@ -3058,15 +3104,17 @@ class NelomaiVpnService : GoBackend.VpnService() {
                         activate = BackgroundConnectionClient::activateToken,
                     )
                 }
-                val recovered = BackgroundConnectionClient.recoverSession(
+                val result = BackgroundConnectionClient.recoverSession(
                     credential,
                     installSecret,
                 )
+                store.read().credentialOrThrow()
+                result
+                }
                 receiver?.send(
                     SERVICE_RESULT_OK,
                     Bundle().apply {
-                        putString(EXTRA_ACCESS_TOKEN, recovered.accessToken)
-                        putString(EXTRA_REFRESH_TOKEN, recovered.refreshToken)
+                        putString(EXTRA_AUTH_RESPONSE, recovered.responseJson)
                     },
                 )
             } catch (error: BackgroundConnectionException) {
@@ -3326,6 +3374,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
         if (!shouldRecycleIdleVpnProcess(
                 TunnelRuntime.state(),
                 QuickTunnelController.desiredActive(applicationContext),
+                RuntimeDispatchGuard.hasPending(),
             )
         ) {
             return
@@ -3348,6 +3397,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 activeService != null ||
                 TunnelRuntime.state() != SessionState.STOPPED ||
                 QuickTunnelController.desiredActive(applicationContext) ||
+                RuntimeDispatchGuard.hasPending() ||
                 hasPendingOrUnknownRecoveryWork()
             ) {
                 return@Runnable
@@ -3834,6 +3884,27 @@ class NelomaiVpnService : GoBackend.VpnService() {
     }
 
     private fun handleDataPlaneStall(leaseId: String): Boolean {
+        if (!serviceCallbackGate.isOpen() || redundantStartBlocked() ||
+            backgroundLogoutState() != BackgroundLogoutReadState.NONE
+        ) return false
+        return routeDataPlaneStall(
+            connectionIntentCoordinator.status(),
+            legacyRecovery = { generation ->
+                TunnelRuntime.restartLegacyDataPlane(leaseId) {
+                    serviceCallbackGate.isOpen() && !redundantStartBlocked() &&
+                        backgroundLogoutState() == BackgroundLogoutReadState.NONE &&
+                        routeDataPlaneStall(
+                            connectionIntentCoordinator.status(),
+                            legacyRecovery = { it == generation },
+                            intentRecovery = { false },
+                        )
+                }
+            },
+            intentRecovery = { handleIntentDataPlaneStall(leaseId) },
+        )
+    }
+
+    private fun handleIntentDataPlaneStall(leaseId: String): Boolean {
         return when (val result = connectionIntentCoordinator.dataPlaneStalled(leaseId)) {
             is AndroidCoordinatorResult.Accepted -> {
                 QuickTunnelController.updateState(
@@ -4171,8 +4242,9 @@ class NelomaiVpnService : GoBackend.VpnService() {
         runCatching {
             ContextCompat.startForegroundService(
                 applicationContext,
-                Intent(applicationContext, NelomaiVpnService::class.java)
-                    .setAction(ACTION_ENSURE_RUNNING),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(applicationContext)
+                        .setAction(ACTION_ENSURE_RUNNING)),
             )
         }.onFailure { error ->
             TunnelLog.warning("service.recovery_owner_request_failed", error = error)
@@ -4188,7 +4260,6 @@ class NelomaiVpnService : GoBackend.VpnService() {
         recoveryStore.read() is RecoveryStoreResult.Failure ||
             connectionIntentLifecycle.hasPendingWork()
     }.getOrDefault(true)
-
     private inner class ServiceConnectionIntentPanel : AndroidConnectionIntentPanel {
         override fun reconcile(
             transaction: AndroidLeaseTransaction,
@@ -4376,6 +4447,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
             redundantRevokeLifecycle.hasPendingCleanup()
         ) return
         if (backgroundLogoutLifecycle.onIdleCheck()) return
+        val startId = lastHandledStartId
         applyAndroidVpnServiceIdleLifecycle(
             debouncer = idleStopDebouncer,
             shouldStop = {
@@ -4392,10 +4464,24 @@ class NelomaiVpnService : GoBackend.VpnService() {
                 }
             },
             stop = {
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                finishService(startId)
             },
         )
+    }
+
+    private fun finishService(startId: Int = lastHandledStartId) {
+        val finish = Runnable {
+            if (startId <= 0 || startId != lastHandledStartId) return@Runnable
+            // AMS may already have accepted a new foreground start that has not
+            // reached onStartCommand (or is waiting for runtime selection).
+            // Unconditional stopSelf would kill it before startForeground and
+            // Android would crash this process. Let AMS fence the handled ID.
+            if (systemServiceHost.stopSelfResult(startId)) {
+                ServiceCompat.stopForeground(systemServiceHost, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            }
+        }
+        // Keep foreground removal serialized with command delivery/promotion.
+        if (Looper.myLooper() == mainLooper) finish.run() else restoreHandler.post(finish)
     }
 
     private fun completeBackgroundAction(
@@ -4622,7 +4708,8 @@ class NelomaiVpnService : GoBackend.VpnService() {
             }
             ContextCompat.startForegroundService(
                 context,
-                Intent(context, NelomaiVpnService::class.java).setAction(ACTION_ENSURE_RUNNING),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_ENSURE_RUNNING)),
             )
             return serviceReady
         }
@@ -4630,15 +4717,13 @@ class NelomaiVpnService : GoBackend.VpnService() {
         fun requestToggle(context: Context) {
             ContextCompat.startForegroundService(
                 context,
-                Intent(context, NelomaiVpnService::class.java).setAction(ACTION_QUICK_TOGGLE),
+                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_QUICK_TOGGLE)),
             )
         }
 
         fun stopForegroundService() {
-            activeService?.run {
-                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
+            activeService?.finishService()
         }
 
         fun reportDataPlaneStall(leaseId: String): Boolean =
@@ -4678,7 +4763,7 @@ class NelomaiVpnService : GoBackend.VpnService() {
     private fun promoteToForeground() {
         createNotificationChannel()
         ServiceCompat.startForeground(
-            this,
+            systemServiceHost,
             NOTIFICATION_ID,
             connectionNotification(),
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -5219,7 +5304,8 @@ internal class AndroidLogoutCoordinator(
         } catch (_: Throwable) {
             return AndroidLogoutStep.RETRY
         }
-        if (accepted.code != "device_revoked_cleanup_accepted") {
+        if (accepted.code != "device_revoked_cleanup_accepted" &&
+            !(accepted.code == "background_logout_superseded" && accepted.cleanupJobs == 0)) {
             return AndroidLogoutStep.RETRY
         }
         return when (credentialStore.finalizeLogout(envelope.revision, logout.operationId)) {
@@ -5474,7 +5560,6 @@ internal fun hasDurableConnectionIntentWork(envelope: AndroidRecoveryEnvelope): 
 
 internal fun hasDurableVpnServiceWork(envelope: AndroidRecoveryEnvelope): Boolean =
     envelope.redundantTransaction != null || hasDurableConnectionIntentWork(envelope)
-
 internal fun staleConnectionIntentAction(
     step: AndroidCoordinatorStep,
     envelope: AndroidRecoveryEnvelope?,
@@ -5547,7 +5632,6 @@ internal class BackgroundLogoutServiceLifecycle(
         if (!resume()) stopIfIdle()
     }
 }
-
 internal class ConnectionIntentServiceLifecycle(
     private val coordinator: AndroidConnectionIntentCoordinator,
     private val logoutState: () -> BackgroundLogoutReadState = {

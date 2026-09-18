@@ -188,6 +188,8 @@ class BackgroundCredentialMutationArgs {
 
 @InvokeArg
 class BackgroundUiProvisionArgs {
+    lateinit var ownerOperation: String
+    lateinit var mode: String
     var apiVersion: Int = 0
     var expectedRevision: Long = -1
     lateinit var deviceId: String
@@ -202,7 +204,11 @@ class BackgroundUiProvisionArgs {
 @InvokeArg
 class BackgroundSessionRecoveryArgs {
     lateinit var installSecret: String
+    lateinit var ownerOperation: String
 }
+
+@InvokeArg
+class BackgroundOwnerLogoutArgs { var cancelEpoch: Long = -1 }
 
 @InvokeArg
 class ConnectionIntentTemplateArgs {
@@ -475,6 +481,7 @@ private data class ActiveTunnelSession(
     var lastUdpRecoveryElapsedMillis: Long? = null,
     var udpRecoveryArmed: Boolean = true,
     var udpRecoveryAttempts: Int = 0,
+    val legacyDataPlaneRecovery: LegacyDataPlaneRecovery = LegacyDataPlaneRecovery(),
     var pendingUdpControlProbe: PendingUdpControlProbe? = null,
     var lastDataPlaneSnapshotElapsedMillis: Long = startedAtElapsedMillis,
     var lastTelemetryErrorLoggedElapsedMillis: Long = 0,
@@ -2251,12 +2258,64 @@ internal object TunnelRuntime {
     }
 
     private fun stopAfterUdpRecoveryFailure() {
-        val leaseId = activeSession?.connectionLeaseId
+        val session = activeSession
         handOffDataPlaneStall(
-            leaseId = leaseId,
+            leaseId = session?.connectionLeaseId,
             handoff = NelomaiVpnService::reportDataPlaneStall,
-            fallback = ::stopLocallyAfterUdpRecoveryFailure,
+            fallback = {
+                // An explicit stop may have taken ownership while native recovery was running.
+                if (activeSession === session && stateGate.current() == SessionState.RUNNING) {
+                    stopLocallyAfterUdpRecoveryFailure()
+                }
+            },
         )
+    }
+
+    // Called synchronously by the service from the serialized telemetry executor.
+    // Keep the existing lease, split policy and network monitor; only reopen the native transport.
+    fun restartLegacyDataPlane(leaseId: String, ownerCurrent: () -> Boolean): Boolean {
+        val session = activeSession ?: return false
+        val context = applicationContext ?: return false
+        if (session.connectionLeaseId != leaseId || session.transport != "amneziawg_3") return false
+        val watchdog = armOperationWatchdog(context, "legacy_data_plane_restart")
+        suppressBackendStateChanges.set(true)
+        val restarted = try {
+            val activeBackend = requireBackend()
+            session.legacyDataPlaneRecovery.restart(
+                isCurrent = {
+                    activeSession === session && stateGate.current() == SessionState.RUNNING &&
+                        ownerCurrent()
+                },
+                stop = { requireState(activeBackend.setState(tunnel, Tunnel.State.DOWN, null), Tunnel.State.DOWN) },
+                start = {
+                    requireState(activeBackend.setState(tunnel, Tunnel.State.UP, session.config), Tunnel.State.UP)
+                    val expected = Awg3ProfileSnapshot.fromInterface(session.config.getInterface())
+                    if (!runtimeProfileMatches(expected, runtimeAwg3Profile(activeBackend))) {
+                        throw TunnelOperationException("awg3_profile_apply_failed")
+                    }
+                    session.monitor?.snapshotState()?.let { physical ->
+                        NelomaiVpnService.setPhysicalNetworks(physical.networks, physical.validated)
+                    }
+                },
+            )
+        } finally {
+            suppressBackendStateChanges.set(false)
+            completeOperationWatchdog(watchdog)
+        }
+        if (!restarted) return false
+        val now = SystemClock.elapsedRealtime()
+        session.lastNetworkTelemetry = null
+        session.pendingUdpControlProbe = null
+        session.udpRecoveryAttempts = 0
+        session.udpRecoveryArmed = true
+        session.udpStallStartedElapsedMillis = null
+        session.lastTunActivityElapsedMillis = now
+        session.lastTunWriteActivityElapsedMillis = now
+        session.lastUdpReceiveElapsedMillis = now
+        session.lastUdpRecoveryElapsedMillis = now
+        TunnelLog.info("tunnel.legacy_data_plane_restart_applied")
+        // Native UP is not proof of connectivity: normal telemetry must confirm traffic.
+        return true
     }
 
     private fun stopLocallyAfterUdpRecoveryFailure() {
@@ -2604,7 +2663,8 @@ internal fun diagnosticBackendVersion(reported: String?): String = reported
 internal fun shouldRecycleIdleVpnProcess(
     state: SessionState,
     desiredActive: Boolean,
-): Boolean = state == SessionState.STOPPED && !desiredActive
+    pendingRuntimeDispatch: Boolean = false,
+): Boolean = state == SessionState.STOPPED && !desiredActive && !pendingRuntimeDispatch
 
 private class TunnelOperationException(val code: String) : RuntimeException()
 
@@ -3020,8 +3080,12 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun beginBackgroundLogout(invoke: Invoke) {
+        val args = try { invoke.parseArgs(BackgroundOwnerLogoutArgs::class.java) } catch (_: Throwable) {
+            invoke.reject("invalid_background_logout"); return
+        }
         TunnelServiceClient.beginBackgroundLogout(
             activity.applicationContext,
+            args.cancelEpoch,
             { ownership ->
                 activity.runOnUiThread {
                     invoke.resolve(JSObject().apply {
@@ -3044,11 +3108,11 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         TunnelServiceClient.recoverBackgroundSession(
             activity.applicationContext,
             args.installSecret,
-            { accessToken, refreshToken ->
+            args.ownerOperation,
+            { responseJson ->
                 activity.runOnUiThread {
                     val response = JSObject()
-                    response.put("accessToken", accessToken)
-                    response.put("refreshToken", refreshToken)
+                    response.put("responseJson", responseJson)
                     response.put("errorCode", null)
                     invoke.resolve(response)
                 }
@@ -3056,8 +3120,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             { code ->
                 activity.runOnUiThread {
                     val response = JSObject()
-                    response.put("accessToken", null)
-                    response.put("refreshToken", null)
+                    response.put("responseJson", null)
                     response.put("errorCode", code)
                     invoke.resolve(response)
                 }

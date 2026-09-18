@@ -25,7 +25,7 @@ const MAX_APPLICATION_REPORT_BYTES: usize = 320 * 1024;
 const ANDROID_STARTUP_LOG: &str = "android-startup.jsonl";
 #[cfg(target_os = "android")]
 const MAX_ANDROID_STARTUP_REPORT_BYTES: usize = 16 * 1024;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 const ANDROID_FRONTEND_READY_MARKER: &str = "android-frontend-ready";
 const MAX_HELPER_REPORT_BYTES: usize = 64 * 1024;
 #[cfg(any(target_os = "android", test))]
@@ -281,6 +281,41 @@ struct ConnectionIntentLogRecord {
     delay_seconds: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeActionSource {
+    Status,
+    Selection,
+    Restart,
+}
+
+impl RuntimeActionSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "ui_status",
+            Self::Selection => "ui_select",
+            Self::Restart => "ui_restart",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RuntimeStatusLogRecord<'a> {
+    timestamp_unix: i64,
+    kind: &'static str,
+    container_version: &'a str,
+    selected_slot: nelomai_contracts::RuntimeSlot,
+    active_slot: nelomai_contracts::RuntimeSlot,
+    pending_slot: Option<nelomai_contracts::RuntimeSlot>,
+    latest_version: &'a str,
+    stable_version: Option<&'a str>,
+    runtime_contract_version: u32,
+    manifest_verification: &'static str,
+    switch_id: Option<&'a str>,
+    switch_phase: Option<nelomai_client_container::SwitchPhase>,
+    action_source: &'static str,
+    engine_role: nelomai_client_container::CleanupEngineRoleV1,
+}
+
 impl AppDiagnostics {
     pub fn new(directory: PathBuf, resource_baseline: ResourceSnapshot) -> io::Result<Self> {
         fs::create_dir_all(&directory)?;
@@ -358,6 +393,33 @@ impl AppDiagnostics {
         });
     }
 
+    pub(crate) fn record_runtime_status(
+        &self,
+        status: &nelomai_client_container::RuntimeSwitchStatusV1,
+        source: RuntimeActionSource,
+    ) {
+        self.append_serialized(&RuntimeStatusLogRecord {
+            timestamp_unix: now_unix(),
+            kind: "runtime.status",
+            container_version: &status.container_version,
+            selected_slot: status.selected_slot,
+            active_slot: status.active_slot,
+            pending_slot: status.pending_slot,
+            latest_version: &status.latest_version,
+            stable_version: status.stable_version.as_deref(),
+            runtime_contract_version: status.runtime_contract_version,
+            manifest_verification: if status.manifest_verified {
+                "verified"
+            } else {
+                "rejected"
+            },
+            switch_id: status.switch_id.as_deref(),
+            switch_phase: status.phase,
+            action_source: source.as_str(),
+            engine_role: status.engine_role,
+        });
+    }
+
     pub fn record_timed_named(
         &self,
         kind: &str,
@@ -376,10 +438,14 @@ impl AppDiagnostics {
     }
 
     pub fn mark_frontend_ready(&self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", test))]
         {
             let marker = self.directory.join(ANDROID_FRONTEND_READY_MARKER);
-            let _ = fs::write(marker, now_unix().to_string());
+            // Kotlin compares the payload to its launch epoch milliseconds;
+            // Android's File.lastModified() may discard the subsecond part.
+            if let Ok(elapsed) = SystemTime::now().duration_since(UNIX_EPOCH) {
+                let _ = fs::write(marker, elapsed.as_millis().to_string());
+            }
         }
     }
 
@@ -551,7 +617,7 @@ impl AppDiagnostics {
             format!("{previous}{current}")
         };
         application_log = include_android_startup_log(&self.directory, application_log);
-        application_log = tail_string(&application_log, MAX_APPLICATION_REPORT_BYTES);
+        application_log = include_refresh_log(&self.directory, application_log);
         #[cfg(desktop)]
         let network_incident_device_id = self.network_incidents.current_device_id()?;
         #[cfg(desktop)]
@@ -583,6 +649,10 @@ impl AppDiagnostics {
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
             helper_log: bounded_helper_log(helper_override.or_else(|| helper_log(&self.directory))),
+            #[cfg(target_os = "android")]
+            logcat_log: crate::android_runtime::logcat_snapshot(),
+            #[cfg(not(target_os = "android"))]
+            logcat_log: None,
             network_incidents,
             resource_usage: Some(self.resource_baseline.report(resource_snapshot)),
         })
@@ -681,7 +751,10 @@ impl AppDiagnostics {
             &self.directory.join(CURRENT_LOG),
             MAX_APPLICATION_REPORT_BYTES,
         )?;
-        let application_log = safe_connection_intent_log(&format!("{previous}{current}"));
+        let application_log = include_refresh_log(
+            &self.directory,
+            safe_connection_intent_log(&format!("{previous}{current}")),
+        );
         let report = DiagnosticUploadRequest {
             report_id: Some(Uuid::new_v4().to_string()),
             trigger: trigger.as_str().to_string(),
@@ -697,6 +770,7 @@ impl AppDiagnostics {
             architecture: std::env::consts::ARCH.to_string(),
             application_log,
             helper_log: None,
+            logcat_log: None,
             network_incidents: None,
             resource_usage: None,
         };
@@ -711,7 +785,7 @@ impl AppDiagnostics {
         seal: &PendingSeal,
         resource_snapshot: ResourceSnapshot,
         helper_override: Option<String>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let _guard = self
             .write_gate
             .lock()
@@ -724,13 +798,13 @@ impl AppDiagnostics {
             &self.directory.join(CURRENT_LOG),
             MAX_APPLICATION_REPORT_BYTES,
         )?;
-        let application_log = tail_string(
-            &if previous.is_empty() {
+        let application_log = include_refresh_log(
+            &self.directory,
+            if previous.is_empty() {
                 current
             } else {
                 format!("{previous}{current}")
             },
-            MAX_APPLICATION_REPORT_BYTES,
         );
         let resource_usage = self
             .automatic_resource_baseline
@@ -766,10 +840,13 @@ impl AppDiagnostics {
             network_incidents: network_incident_snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.payload.clone()),
+            logcat_log: None,
             resource_usage,
         };
         drop(_guard);
-        self.automatic.materialize(seal, &report)?;
+        if !self.automatic.materialize(seal, &report)? {
+            return Ok(false);
+        }
         if let (Some(connection_id), Some(snapshot)) = (
             seal.connection_id.as_deref(),
             network_incident_snapshot.as_ref(),
@@ -789,10 +866,28 @@ impl AppDiagnostics {
         if !seal.tunnel_running {
             self.reset_network_incident_detector();
         }
+        self.finish_automatic_resource_interval(seal, resource_snapshot)?;
+        Ok(true)
+    }
+
+    #[cfg(desktop)]
+    fn finish_automatic_resource_interval(
+        &self,
+        seal: &PendingSeal,
+        resource_snapshot: ResourceSnapshot,
+    ) -> io::Result<()> {
         let mut baseline = self
             .automatic_resource_baseline
             .lock()
             .map_err(|_| io::Error::other("automatic resource baseline lock poisoned"))?;
+        // The queue lock has already been released after saving the report.
+        // Compare and update under the baseline lock so a late completion
+        // cannot clear another session or roll back a newer checkpoint.
+        if baseline.as_ref().is_some_and(|current| {
+            current.session_id != seal.session_id || current.interval_started_at != seal.started_at
+        }) {
+            return Ok(());
+        }
         if seal.tunnel_running {
             *baseline = Some(AutomaticResourceBaseline {
                 session_id: seal.session_id.clone(),
@@ -847,6 +942,21 @@ fn counter_delta(previous: Option<u64>, current: u64) -> u64 {
             current
         }
     })
+}
+
+fn include_refresh_log(directory: &Path, application_log: String) -> String {
+    // The common owner writes this separate journal, including while bootstrap
+    // is blocked. Reading it never triggers authentication or stops the tunnel.
+    const BUDGET: usize = 32 * 1024;
+    let previous =
+        read_tail(&directory.join("auth-refresh.previous.jsonl"), BUDGET / 2).unwrap_or_default();
+    let current = read_tail(&directory.join("auth-refresh.jsonl"), BUDGET).unwrap_or_default();
+    let refresh = tail_string(&format!("{previous}{current}"), BUDGET);
+    let application = tail_string(
+        &application_log,
+        MAX_APPLICATION_REPORT_BYTES - refresh.len(),
+    );
+    format!("{application}{refresh}")
 }
 
 #[cfg(target_os = "android")]
@@ -1157,6 +1267,201 @@ mod tests {
     use super::*;
 
     #[test]
+    fn frontend_ready_marker_records_milliseconds_for_android_launch_comparison() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        diagnostics.mark_frontend_ready();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let value =
+            fs::read_to_string(directory.path().join(ANDROID_FRONTEND_READY_MARKER)).unwrap();
+        let timestamp = value.parse::<u128>().unwrap();
+        assert!(
+            timestamp >= before && timestamp <= after,
+            "marker must use epoch milliseconds: {timestamp}"
+        );
+    }
+
+    #[test]
+    fn manual_report_includes_refresh_after_startup_and_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let event = "{\"timestamp_unix\":123,\"kind\":\"auth.refresh.complete\",\"operation_id\":\"11111111-1111-4111-8111-111111111111\",\"code\":\"saved\"}\n";
+        fs::write(directory.path().join("auth-refresh.jsonl"), event).unwrap();
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
+        assert!(
+            report.application_log.contains(event),
+            "report omitted owner refresh journal"
+        );
+        drop(diagnostics);
+        let reopened = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        assert!(reopened
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap()
+            .application_log
+            .contains(event));
+    }
+
+    #[test]
+    fn refresh_journal_is_bounded_and_unreadable_journal_does_not_break_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().into(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("auth-refresh.previous.jsonl"),
+            "old\n".repeat(20_000),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("auth-refresh.jsonl"),
+            format!("{}latest-refresh\n", "fresh\n".repeat(20_000)),
+        )
+        .unwrap();
+        let combined = include_refresh_log(
+            directory.path(),
+            format!(
+                "{}latest-application\n",
+                "я".repeat(MAX_APPLICATION_REPORT_BYTES)
+            ),
+        );
+        assert!(combined.len() <= MAX_APPLICATION_REPORT_BYTES);
+        assert!(combined.contains("latest-application\n"));
+        assert!(combined.ends_with("latest-refresh\n"));
+        fs::remove_file(directory.path().join("auth-refresh.jsonl")).unwrap();
+        fs::create_dir(directory.path().join("auth-refresh.jsonl")).unwrap();
+        assert!(diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .is_ok());
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn automatic_reports_include_owner_refresh_without_startup_collection() {
+        for intent in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let diagnostics = AppDiagnostics::new(
+                directory.path().into(),
+                ResourceSnapshot::capture_for_test(),
+            )
+            .unwrap();
+            diagnostics.set_automatic_device("device-1");
+            let event = "{\"timestamp_unix\":12,\"kind\":\"auth.refresh.pending\",\"operation_id\":\"11111111-1111-4111-8111-111111111111\",\"code\":\"retryable\"}\n";
+            fs::write(directory.path().join("auth-refresh.jsonl"), event).unwrap();
+            if intent {
+                diagnostics
+                    .queue_connection_intent_report(ConnectionIntentReportTrigger::SlowRecovery, 20)
+                    .unwrap();
+            } else {
+                diagnostics
+                    .observe_automatic_tunnel(Some("connection-1"), true, 10)
+                    .unwrap();
+                diagnostics
+                    .observe_automatic_tunnel(None, false, 20)
+                    .unwrap();
+                let seal = diagnostics.pending_automatic_seal().unwrap().unwrap();
+                assert!(diagnostics
+                    .materialize_automatic_report(&seal, ResourceSnapshot::capture_for_test(), None)
+                    .unwrap());
+            }
+            let candidate = diagnostics.automatic_upload_candidate(20).unwrap().unwrap();
+            assert!(candidate.report.application_log.contains(event));
+        }
+    }
+
+    #[test]
+    fn runtime_action_sources_keep_the_diagnostic_wire_strings() {
+        assert_eq!(RuntimeActionSource::Status.as_str(), "ui_status");
+        assert_eq!(RuntimeActionSource::Selection.as_str(), "ui_select");
+        assert_eq!(RuntimeActionSource::Restart.as_str(), "ui_restart");
+    }
+
+    #[test]
+    fn runtime_diagnostics_are_allowlisted_and_exclude_secret_or_tunnel_configuration() {
+        use nelomai_client_container::{CleanupEngineRoleV1, RuntimeSwitchStatusV1, SwitchPhase};
+        use nelomai_contracts::RuntimeSlot;
+
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().to_path_buf(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        let status = RuntimeSwitchStatusV1 {
+            container_version: "0.2.16".into(),
+            selected_slot: RuntimeSlot::Stable,
+            active_slot: RuntimeSlot::Latest,
+            pending_slot: Some(RuntimeSlot::Stable),
+            latest_version: "0.2.16".into(),
+            stable_version: Some("0.2.15".into()),
+            runtime_contract_version: 1,
+            manifest_verified: true,
+            stable_available: true,
+            switch_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            phase: Some(SwitchPhase::ServerReconciling),
+            engine_role: CleanupEngineRoleV1::Primary,
+        };
+
+        diagnostics.record_runtime_status(&status, RuntimeActionSource::Selection);
+
+        let report = diagnostics
+            .build_report(ResourceSnapshot::capture_for_test())
+            .unwrap();
+        let record = report
+            .application_log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|record| record["kind"] == "runtime.status")
+            .unwrap();
+        assert_eq!(record["container_version"], "0.2.16");
+        assert_eq!(record["active_slot"], "latest");
+        assert_eq!(record["pending_slot"], "stable");
+        assert_eq!(record["latest_version"], "0.2.16");
+        assert_eq!(record["stable_version"], "0.2.15");
+        assert_eq!(record["runtime_contract_version"], 1);
+        assert_eq!(record["manifest_verification"], "verified");
+        assert_eq!(record["switch_id"], "11111111-1111-4111-8111-111111111111");
+        assert_eq!(record["switch_phase"], "server_reconciling");
+        assert_eq!(record["action_source"], "ui_select");
+        assert_eq!(record["engine_role"], "primary");
+        let encoded = serde_json::to_string(&record).unwrap();
+        for forbidden in [
+            "install_secret",
+            "access_token",
+            "refresh_token",
+            "password",
+            "private_key",
+            "configuration",
+            "tunnel_config",
+            "wireguard_config",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
     fn connection_intent_diagnostics_reports_and_notifies_once_per_episode() {
         let mut episode = ConnectionIntentDiagnosticsEpisode::default();
 
@@ -1450,6 +1755,152 @@ mod tests {
         assert_eq!(counter_delta(None, 12), 12);
         assert_eq!(counter_delta(Some(10), 14), 4);
         assert_eq!(counter_delta(Some(10), 3), 3);
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn completed_report_preserves_a_newer_resource_interval() {
+        for running in [false, true] {
+            for same_session in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let diagnostics = AppDiagnostics::new(
+                    directory.path().to_path_buf(),
+                    ResourceSnapshot::capture_for_test(),
+                )
+                .unwrap();
+                diagnostics.set_automatic_device("device-1");
+                diagnostics
+                    .observe_automatic_tunnel(Some("connection-1"), true, 10)
+                    .unwrap();
+                if running {
+                    diagnostics
+                        .observe_automatic_tunnel(Some("connection-1"), true, 21610)
+                        .unwrap();
+                } else {
+                    diagnostics
+                        .observe_automatic_tunnel(None, false, 20)
+                        .unwrap();
+                }
+                let old = diagnostics.pending_automatic_seal().unwrap().unwrap();
+                // Interleave begin(new) with the winning writer's post-save
+                // completion, not a duplicate materialize that returns false.
+                let new_session = if same_session {
+                    old.session_id.clone()
+                } else {
+                    "new-session".into()
+                };
+                let observation = AutomaticObservation {
+                    seal_pending: false,
+                    interval_started: Some(crate::automatic_diagnostics::AutomaticInterval {
+                        session_id: new_session.clone(),
+                        started_at: 30000,
+                    }),
+                };
+                diagnostics.begin_automatic_resource_interval(
+                    &observation,
+                    ResourceSnapshot::capture_for_test(),
+                );
+                diagnostics
+                    .finish_automatic_resource_interval(&old, ResourceSnapshot::capture_for_test())
+                    .unwrap();
+                let baseline = diagnostics.automatic_resource_baseline.lock().unwrap();
+                let baseline = baseline
+                    .as_ref()
+                    .expect("old completion must preserve new baseline");
+                assert_eq!(baseline.session_id, new_session);
+                assert_eq!(baseline.interval_started_at, 30000);
+            }
+        }
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn report_completion_advances_matching_or_missing_baseline_and_clears_on_stop() {
+        for missing in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let diagnostics = AppDiagnostics::new(
+                directory.path().to_path_buf(),
+                ResourceSnapshot::capture_for_test(),
+            )
+            .unwrap();
+            diagnostics.set_automatic_device("device-1");
+            let observation = diagnostics
+                .observe_automatic_tunnel(Some("connection-1"), true, 10)
+                .unwrap();
+            if !missing {
+                diagnostics.begin_automatic_resource_interval(
+                    &observation,
+                    ResourceSnapshot::capture_for_test(),
+                );
+            }
+            diagnostics
+                .observe_automatic_tunnel(Some("connection-1"), true, 21610)
+                .unwrap();
+            let checkpoint = diagnostics.pending_automatic_seal().unwrap().unwrap();
+            assert!(diagnostics
+                .materialize_automatic_report(
+                    &checkpoint,
+                    ResourceSnapshot::capture_for_test(),
+                    None
+                )
+                .unwrap());
+            {
+                let baseline = diagnostics.automatic_resource_baseline.lock().unwrap();
+                let baseline = baseline
+                    .as_ref()
+                    .expect("checkpoint must establish next baseline even after restart");
+                assert_eq!(baseline.session_id, checkpoint.session_id);
+                assert_eq!(baseline.interval_started_at, 21610);
+            }
+            diagnostics
+                .observe_automatic_tunnel(None, false, 21620)
+                .unwrap();
+            let stop = diagnostics.pending_automatic_seal().unwrap().unwrap();
+            assert!(diagnostics
+                .materialize_automatic_report(&stop, ResourceSnapshot::capture_for_test(), None)
+                .unwrap());
+            assert!(diagnostics
+                .automatic_resource_baseline
+                .lock()
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[cfg(desktop)]
+    #[test]
+    fn stale_materializer_does_not_clear_new_resource_interval() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = AppDiagnostics::new(
+            directory.path().to_path_buf(),
+            ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        diagnostics.set_automatic_device("device-1");
+        diagnostics
+            .observe_automatic_tunnel(Some("connection-1"), true, 10)
+            .unwrap();
+        diagnostics
+            .observe_automatic_tunnel(None, false, 20)
+            .unwrap();
+        let old = diagnostics.pending_automatic_seal().unwrap().unwrap();
+        assert!(diagnostics
+            .materialize_automatic_report(&old, ResourceSnapshot::capture_for_test(), None)
+            .unwrap());
+        let observation = diagnostics
+            .observe_automatic_tunnel(Some("connection-2"), true, 30)
+            .unwrap();
+        diagnostics
+            .begin_automatic_resource_interval(&observation, ResourceSnapshot::capture_for_test());
+        assert!(!diagnostics
+            .materialize_automatic_report(&old, ResourceSnapshot::capture_for_test(), None)
+            .unwrap());
+        let baseline = diagnostics.automatic_resource_baseline.lock().unwrap();
+        assert_eq!(
+            baseline.as_ref().unwrap().session_id,
+            observation.interval_started.unwrap().session_id
+        );
+        assert_eq!(baseline.as_ref().unwrap().interval_started_at, 30);
     }
 
     #[cfg(desktop)]

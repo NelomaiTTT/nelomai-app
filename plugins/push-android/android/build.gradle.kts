@@ -39,6 +39,7 @@ android {
 }
 
 dependencies {
+    implementation(project(":runtime-android-common"))
     implementation("androidx.core:core:1.16.0")
     implementation("com.google.firebase:firebase-messaging:24.1.1")
     implementation(project(":tauri-android"))

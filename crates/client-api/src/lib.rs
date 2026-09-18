@@ -12,20 +12,479 @@ use nelomai_contracts::{
     SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
     SplitTunnelPolicy, SplitTunnelRevision, SplitTunnelSettingsUpdate, API_PREFIX,
 };
+use nelomai_contracts::{RuntimeIdentity, RuntimeSlot};
 use reqwest::{
     header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     Client as HttpClient, RequestBuilder, Response, StatusCode, Url,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseHistoryEntry {
+    pub version: String,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseHistory {
+    pub api_version: ApiVersion,
+    pub entries: Vec<ReleaseHistoryEntry>,
+}
+
+/// Exact panel target DTO: a target never assigns a server generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTarget {
+    pub container_version: String,
+    pub runtime_version: String,
+    pub runtime_contract_version: u32,
+    pub runtime_slot: RuntimeSlot,
+}
+
+impl RuntimeTarget {
+    pub fn from_identity(identity: &RuntimeIdentity) -> Self {
+        Self {
+            container_version: identity.container_version.clone(),
+            runtime_version: identity.runtime_version.clone(),
+            runtime_contract_version: identity.runtime_contract_version,
+            runtime_slot: identity.slot,
+        }
+    }
+
+    pub fn identity(&self, generation: Option<u64>) -> Result<RuntimeIdentity, ClientApiError> {
+        let identity = RuntimeIdentity {
+            container_version: self.container_version.clone(),
+            runtime_version: self.runtime_version.clone(),
+            runtime_contract_version: self.runtime_contract_version,
+            slot: self.runtime_slot,
+            session_generation: generation,
+        };
+        identity
+            .validate()
+            .map_err(|_| ClientApiError::InvalidPayload {
+                code: "invalid_runtime_identity",
+            })?;
+        Ok(identity)
+    }
+}
+
+/// Runtime password ingress. The trusted owner supplies platform and target
+/// identity, and reads install identity from protected storage.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogin {
+    pub login: String,
+    pub password: String,
+    pub device_name: String,
+}
+impl fmt::Debug for RuntimeLogin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeLogin")
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAuthState {
+    Active,
+    RecoveryRequired,
+    LogoutPending,
+    LoggedOut,
+    AuthenticationOutcomeUnknown,
+}
+
+/// One broker-issued credential/identity pair. Runtime transport may carry this
+/// access-only record, never the protected auth store or refresh token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AccessSnapshotWire", into = "AccessSnapshotWire")]
+pub struct AccessSnapshot {
+    access_token: String,
+    identity: RuntimeIdentity,
+    auth_epoch: u64,
+    family: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccessSnapshotWire {
+    access_token: String,
+    identity: RuntimeIdentity,
+    auth_epoch: u64,
+    family: String,
+}
+impl TryFrom<AccessSnapshotWire> for AccessSnapshot {
+    type Error = ClientApiError;
+    fn try_from(wire: AccessSnapshotWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.access_token,
+            wire.identity,
+            wire.auth_epoch,
+            wire.family,
+        )
+    }
+}
+impl From<AccessSnapshot> for AccessSnapshotWire {
+    fn from(value: AccessSnapshot) -> Self {
+        Self {
+            access_token: value.access_token,
+            identity: value.identity,
+            auth_epoch: value.auth_epoch,
+            family: value.family,
+        }
+    }
+}
+impl AccessSnapshot {
+    pub fn new(
+        access_token: String,
+        identity: RuntimeIdentity,
+        auth_epoch: u64,
+        family: String,
+    ) -> Result<Self, ClientApiError> {
+        identity
+            .validate()
+            .map_err(|_| ClientApiError::InvalidPayload {
+                code: "invalid_runtime_identity",
+            })?;
+        if identity.session_generation.is_none() || access_token.is_empty() || family.is_empty() {
+            return Err(ClientApiError::InvalidPayload {
+                code: "unenrolled_runtime_access",
+            });
+        }
+        Ok(Self {
+            access_token,
+            identity,
+            auth_epoch,
+            family,
+        })
+    }
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+    pub fn identity(&self) -> &RuntimeIdentity {
+        &self.identity
+    }
+    /// Complete immutable Bearer/header pair for owner-authorized transports
+    /// such as the native updater. Never log or persist the returned headers.
+    pub fn bearer_headers(&self) -> [(&'static str, String); 7] {
+        [
+            ("authorization", format!("Bearer {}", self.access_token)),
+            (
+                "x-nelomai-app-version",
+                self.identity.container_version.clone(),
+            ),
+            (
+                "x-nelomai-container-version",
+                self.identity.container_version.clone(),
+            ),
+            (
+                "x-nelomai-runtime-version",
+                self.identity.runtime_version.clone(),
+            ),
+            (
+                "x-nelomai-runtime-contract-version",
+                self.identity.runtime_contract_version.to_string(),
+            ),
+            (
+                "x-nelomai-runtime-slot",
+                match self.identity.slot {
+                    RuntimeSlot::Latest => "latest",
+                    RuntimeSlot::Stable => "stable",
+                }
+                .into(),
+            ),
+            (
+                "x-nelomai-session-generation",
+                self.identity
+                    .session_generation
+                    .expect("validated access snapshot has enrolled identity")
+                    .to_string(),
+            ),
+        ]
+    }
+    pub fn auth_epoch(&self) -> u64 {
+        self.auth_epoch
+    }
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+}
+impl fmt::Debug for AccessSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessSnapshot")
+            .field("access_token", &"<redacted>")
+            .field("identity", &self.identity)
+            .field("auth_epoch", &self.auth_epoch)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeResumeRequest {
+    pub refresh_token: String,
+    pub operation_id: String,
+    pub expected_session_generation: Option<u64>,
+    pub target_identity: RuntimeTarget,
+    pub reconcile_operation_id: String,
+    pub decision: String,
+}
+impl fmt::Debug for RuntimeResumeRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeResumeRequest")
+            .field("refresh_token", &"<redacted>")
+            .field("operation_id", &self.operation_id)
+            .field("target_identity", &self.target_identity)
+            .finish()
+    }
+}
+
+/// The panel calls this field runtime_slot, unlike the internal identity DTO.
+#[derive(Serialize, Deserialize)]
+struct RuntimeIdentityWire {
+    #[serde(flatten)]
+    target: RuntimeTarget,
+    session_generation: Option<u64>,
+}
+fn serialize_identity<S: serde::Serializer>(
+    identity: &RuntimeIdentity,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    RuntimeIdentityWire {
+        target: RuntimeTarget::from_identity(identity),
+        session_generation: identity.session_generation,
+    }
+    .serialize(serializer)
+}
+fn deserialize_identity<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<RuntimeIdentity, D::Error> {
+    let wire = RuntimeIdentityWire::deserialize(de)?;
+    let identity = wire
+        .target
+        .identity(wire.session_generation)
+        .map_err(serde::de::Error::custom)?;
+    if identity.session_generation.is_none() {
+        return Err(serde::de::Error::custom("missing confirmed generation"));
+    }
+    Ok(identity)
+}
+
+#[derive(Clone, Deserialize)]
+pub struct RuntimeResumeResponse {
+    #[serde(deserialize_with = "deserialize_identity")]
+    pub identity: RuntimeIdentity,
+    pub access_token: String,
+    pub token_type: String,
+    pub access_expires_in: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSwitchState {
+    Clean,
+    Retry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSwitchReconcileRequest {
+    pub operation_id: String,
+    pub source_identity: Option<RuntimeIdentity>,
+    pub target_identity: RuntimeTarget,
+    pub expected_session_generation: Option<u64>,
+    pub cleanup_contract_version: u32,
+    pub lease_ids: Vec<String>,
+    pub redundant_session_ids: Vec<String>,
+    pub client_operation_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RuntimeIdentityRequestWire<'a> {
+    container_version: &'a str,
+    runtime_version: &'a str,
+    runtime_contract_version: u32,
+    runtime_slot: RuntimeSlot,
+    session_generation: Option<u64>,
+}
+
+impl Serialize for RuntimeSwitchReconcileRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            operation_id: &'a str,
+            source_identity: Option<RuntimeIdentityRequestWire<'a>>,
+            target_identity: &'a RuntimeTarget,
+            expected_session_generation: Option<u64>,
+            cleanup_contract_version: u32,
+            lease_ids: &'a [String],
+            redundant_session_ids: &'a [String],
+            client_operation_ids: &'a [String],
+        }
+        let source_identity =
+            self.source_identity
+                .as_ref()
+                .map(|identity| RuntimeIdentityRequestWire {
+                    container_version: &identity.container_version,
+                    runtime_version: &identity.runtime_version,
+                    runtime_contract_version: identity.runtime_contract_version,
+                    runtime_slot: identity.slot,
+                    session_generation: identity.session_generation,
+                });
+        Wire {
+            operation_id: &self.operation_id,
+            source_identity,
+            target_identity: &self.target_identity,
+            expected_session_generation: self.expected_session_generation,
+            cleanup_contract_version: self.cleanup_contract_version,
+            lease_ids: &self.lease_ids,
+            redundant_session_ids: &self.redundant_session_ids,
+            client_operation_ids: &self.client_operation_ids,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSwitchReconcileResponse {
+    pub state: RuntimeSwitchState,
+    pub operation_id: String,
+    pub retired_lease_ids: Vec<String>,
+    pub retired_session_ids: Vec<String>,
+    pub retired_operation_ids: Vec<String>,
+    pub retry_after_seconds: Option<u32>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSupersedeRequest {
+    pub refresh_token: String,
+    pub operation_id: String,
+    pub superseded_reconcile_operation_id: String,
+    pub expected_session_generation: Option<u64>,
+    pub target_identity: RuntimeTarget,
+}
+impl fmt::Debug for RuntimeSupersedeRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeSupersedeRequest")
+            .field("operation_id", &self.operation_id)
+            .field(
+                "superseded_reconcile_operation_id",
+                &self.superseded_reconcile_operation_id,
+            )
+            .field("target_identity", &self.target_identity)
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSupersedeResponse {
+    pub state: RuntimeSwitchState,
+    pub reconcile_operation_id: String,
+    pub retry_after_seconds: Option<u32>,
+}
+
+fn canonical_operation_id(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+fn valid_switch_ids(values: &[String]) -> bool {
+    values.len() <= RUNTIME_SWITCH_IDS_LIMIT
+        && values.iter().all(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+        && values.iter().collect::<HashSet<_>>().len() == values.len()
+}
+
+fn validate_runtime_switch_request(
+    request: &RuntimeSwitchReconcileRequest,
+) -> Result<(), ClientApiError> {
+    request.target_identity.identity(None)?;
+    let source_valid = match &request.source_identity {
+        Some(identity) => {
+            identity.validate().is_ok()
+                && identity.session_generation.is_some()
+                && identity.session_generation == request.expected_session_generation
+        }
+        None => request.expected_session_generation.is_none(),
+    };
+    if !canonical_operation_id(&request.operation_id)
+        || !source_valid
+        || request.cleanup_contract_version != 1
+        || !valid_switch_ids(&request.lease_ids)
+        || !valid_switch_ids(&request.redundant_session_ids)
+        || !valid_switch_ids(&request.client_operation_ids)
+    {
+        return Err(ClientApiError::InvalidPayload {
+            code: "invalid_runtime_switch_request",
+        });
+    }
+    Ok(())
+}
+
+fn validate_runtime_switch_response(
+    request: &RuntimeSwitchReconcileRequest,
+    response: &RuntimeSwitchReconcileResponse,
+) -> Result<(), ClientApiError> {
+    if response.operation_id != request.operation_id
+        || !valid_switch_ids(&response.retired_lease_ids)
+        || !valid_switch_ids(&response.retired_session_ids)
+        || !valid_switch_ids(&response.retired_operation_ids)
+        || response
+            .retry_after_seconds
+            .is_some_and(|seconds| !(1..=30).contains(&seconds))
+    {
+        return Err(ClientApiError::InvalidPayload {
+            code: "invalid_runtime_switch_response",
+        });
+    }
+    Ok(())
+}
+impl fmt::Debug for RuntimeResumeResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeResumeResponse")
+            .field("identity", &self.identity)
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeLogoutRequest {
+    pub operation_id: String,
+    pub refresh_token: String,
+}
+impl fmt::Debug for RuntimeLogoutRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeLogoutRequest")
+            .field("operation_id", &self.operation_id)
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeLogoutResponse {
+    pub code: String,
+    pub cleanup_reconcile_operation_id: Option<String>,
+}
 
 const SPLIT_TUNNEL_POLICY_RESPONSE_LIMIT: usize = 1024 * 1024;
 const SPLIT_TUNNEL_SETTINGS_REQUEST_LIMIT: usize = 256 * 1024;
 const SPLIT_TUNNEL_SELECTED_PACKAGES_LIMIT: usize = 512;
+const RUNTIME_SWITCH_IDS_LIMIT: usize = 1024;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -62,6 +521,47 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshModeV1 {
+    Refresh,
+    RecoverLegacyPending,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct RecoverableRefreshRequest {
+    pub contract_version: u32,
+    pub operation_id: String,
+    pub device_id: String,
+    #[serde(serialize_with = "serialize_identity")]
+    pub source_identity: RuntimeIdentity,
+    pub mode: RefreshModeV1,
+    pub refresh_token: String,
+    pub install_secret: String,
+}
+impl fmt::Debug for RecoverableRefreshRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecoverableRefreshRequest")
+            .field("operation_id", &self.operation_id)
+            .field("mode", &self.mode)
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+impl ClientApi {
+    pub async fn refresh_recoverable(
+        &self,
+        request: &RecoverableRefreshRequest,
+    ) -> Result<TokenResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("auth/refresh-recoverable")?)
+                .json(request),
+        )
+        .await
+    }
+}
+
 impl fmt::Debug for RefreshRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -76,6 +576,26 @@ pub struct AuthDevice {
     pub id: String,
     pub name: String,
     pub platform: Platform,
+    pub container_version: Option<String>,
+    pub runtime_version: Option<String>,
+    pub runtime_contract_version: Option<u32>,
+    pub runtime_slot: Option<RuntimeSlot>,
+    pub session_generation: Option<u64>,
+}
+
+impl AuthDevice {
+    pub fn confirmed_identity(&self) -> Result<RuntimeIdentity, ClientApiError> {
+        let missing = || ClientApiError::InvalidPayload {
+            code: "unenrolled_runtime_identity",
+        };
+        RuntimeTarget {
+            container_version: self.container_version.clone().ok_or_else(missing)?,
+            runtime_version: self.runtime_version.clone().ok_or_else(missing)?,
+            runtime_contract_version: self.runtime_contract_version.ok_or_else(missing)?,
+            runtime_slot: self.runtime_slot.ok_or_else(missing)?,
+        }
+        .identity(Some(self.session_generation.ok_or_else(missing)?))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -158,6 +678,8 @@ pub struct DiagnosticUploadRequest {
     pub architecture: String,
     pub application_log: String,
     pub helper_log: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logcat_log: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_incidents: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -219,6 +741,10 @@ impl fmt::Debug for DiagnosticUploadRequest {
             .field(
                 "network_incidents",
                 &self.network_incidents.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "logcat_log",
+                &self.logcat_log.as_ref().map(|_| "<redacted>"),
             )
             .field("resource_usage", &self.resource_usage)
             .finish()
@@ -296,6 +822,8 @@ pub struct ClientApi {
     http: ResettableHttpClient,
     api_base: Url,
     app_version: Option<HeaderValue>,
+    runtime_identity: Option<RuntimeIdentity>,
+    scoped_access: Option<AccessSnapshot>,
 }
 
 #[derive(Clone)]
@@ -372,6 +900,8 @@ impl ClientApi {
             http: ResettableHttpClient::new()?,
             api_base,
             app_version: None,
+            runtime_identity: None,
+            scoped_access: None,
         })
     }
 
@@ -379,9 +909,193 @@ impl ClientApi {
         self.http.reset()
     }
 
+    /// Public release metadata is independent of login, refresh and runtime admission.
+    pub async fn release_history(&self) -> Result<ReleaseHistory, ClientApiError> {
+        // Error descriptions are not displayed here; discard non-success bodies
+        // instead of passing potentially huge HTML/JSON errors to api_error.
+        let response = self
+            .send_request(
+                self.http
+                    .get(self.endpoint("releases/changelog")?)
+                    .timeout(Duration::from_secs(8)),
+            )
+            .await?
+            .error_for_status()?;
+        let history: ReleaseHistory = Self::read_limited_json(
+            response,
+            4 * 1024 * 1024,
+            "release_history_too_large",
+            "invalid_release_history",
+        )
+        .await?;
+        let mut versions = HashSet::new();
+        if history.entries.len() > 50
+            || history.entries.iter().any(|entry| {
+                entry.version.trim().is_empty()
+                    || entry.version.chars().count() > 64
+                    || entry.notes.chars().count() > 20_000
+                    || !versions.insert(&entry.version)
+            })
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "invalid_release_history",
+            });
+        }
+        Ok(history)
+    }
+
     pub fn with_app_version(mut self, app_version: &str) -> Result<Self, ClientApiError> {
+        if self
+            .runtime_identity
+            .as_ref()
+            .is_some_and(|i| i.container_version != app_version)
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "runtime_identity_mismatch",
+            });
+        }
         self.app_version = Some(HeaderValue::from_str(app_version)?);
         Ok(self)
+    }
+
+    pub fn with_runtime_identity(
+        mut self,
+        identity: RuntimeIdentity,
+    ) -> Result<Self, ClientApiError> {
+        identity
+            .validate()
+            .map_err(|_| ClientApiError::InvalidPayload {
+                code: "invalid_runtime_identity",
+            })?;
+        if identity.session_generation.is_none() {
+            return Err(ClientApiError::InvalidPayload {
+                code: "unenrolled_runtime_identity",
+            });
+        }
+        if self
+            .scoped_access
+            .as_ref()
+            .is_some_and(|s| s.identity != identity)
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "runtime_identity_mismatch",
+            });
+        }
+        self.app_version = Some(HeaderValue::from_str(&identity.container_version)?);
+        self.runtime_identity = Some(identity);
+        Ok(self)
+    }
+
+    /// Bind a clone for a single captured credential. Never mutate shared headers
+    /// when the broker changes generation; old clones retain the source pair.
+    pub fn with_access_snapshot(
+        mut self,
+        snapshot: &AccessSnapshot,
+    ) -> Result<Self, ClientApiError> {
+        if self.scoped_access.as_ref().is_some_and(|s| s != snapshot) {
+            return Err(ClientApiError::InvalidPayload {
+                code: "runtime_access_mismatch",
+            });
+        }
+        self = self.with_runtime_identity(snapshot.identity.clone())?;
+        self.scoped_access = Some(snapshot.clone());
+        Ok(self)
+    }
+
+    /// Bind an immutable obsolete source without inheriting the selected
+    /// target's app/runtime headers from the base client.
+    pub fn with_captured_source(
+        mut self,
+        snapshot: &AccessSnapshot,
+    ) -> Result<Self, ClientApiError> {
+        self.app_version = None;
+        self.runtime_identity = None;
+        self.scoped_access = None;
+        self.with_access_snapshot(snapshot)
+    }
+
+    pub async fn login_runtime(
+        &self,
+        request: &LoginRequest,
+        target: &RuntimeTarget,
+    ) -> Result<TokenResponse, ClientApiError> {
+        target.identity(None)?;
+        #[derive(Serialize)]
+        struct Request<'a> {
+            #[serde(flatten)]
+            login: &'a LoginRequest,
+            #[serde(flatten)]
+            target: &'a RuntimeTarget,
+        }
+        let mut login = request.clone();
+        login.app_version = target.container_version.clone();
+        self.send_json(self.http.post(self.endpoint("auth/login")?).json(&Request {
+            login: &login,
+            target,
+        }))
+        .await
+    }
+
+    pub async fn resume_runtime(
+        &self,
+        request: &RuntimeResumeRequest,
+    ) -> Result<RuntimeResumeResponse, ClientApiError> {
+        request
+            .target_identity
+            .identity(request.expected_session_generation)?;
+        self.send_json(
+            self.http
+                .post(self.endpoint("auth/runtime/resume")?)
+                .json(request),
+        )
+        .await
+    }
+
+    pub async fn supersede_runtime(
+        &self,
+        request: &RuntimeSupersedeRequest,
+    ) -> Result<RuntimeSupersedeResponse, ClientApiError> {
+        request.target_identity.identity(None)?;
+        if !canonical_operation_id(&request.operation_id)
+            || !canonical_operation_id(&request.superseded_reconcile_operation_id)
+            || request
+                .expected_session_generation
+                .is_some_and(|generation| generation == 0 || generation > i64::MAX as u64)
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "invalid_runtime_supersede_request",
+            });
+        }
+        let response: RuntimeSupersedeResponse = self
+            .without_identity_context()
+            .send_json(
+                self.http
+                    .post(self.endpoint("auth/runtime/supersede")?)
+                    .json(request),
+            )
+            .await?;
+        if !canonical_operation_id(&response.reconcile_operation_id)
+            || response
+                .retry_after_seconds
+                .is_some_and(|seconds| !(1..=30).contains(&seconds))
+        {
+            return Err(ClientApiError::InvalidPayload {
+                code: "invalid_runtime_supersede_response",
+            });
+        }
+        Ok(response)
+    }
+
+    pub async fn logout_runtime(
+        &self,
+        request: &RuntimeLogoutRequest,
+    ) -> Result<RuntimeLogoutResponse, ClientApiError> {
+        self.send_json(
+            self.http
+                .post(self.endpoint("auth/logout-runtime")?)
+                .json(request),
+        )
+        .await
     }
 
     pub async fn login(&self, request: &LoginRequest) -> Result<TokenResponse, ClientApiError> {
@@ -669,6 +1383,100 @@ impl ClientApi {
 
     pub async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, ClientApiError> {
         self.send_json(self.bootstrap_request(access_token)?).await
+    }
+
+    /// Owner-only legacy observation. This deliberately strips every app and
+    /// runtime binding carried by the base client.
+    pub async fn legacy_bootstrap_device(
+        &self,
+        access_token: &str,
+    ) -> Result<AuthDevice, ClientApiError> {
+        #[derive(Deserialize)]
+        struct Response {
+            device: AuthDevice,
+        }
+        let bare = self.without_identity_context();
+        bare.send_json(
+            bare.http
+                .get(bare.endpoint("bootstrap")?)
+                .bearer_auth(access_token),
+        )
+        .await
+        .map(|response: Response| response.device)
+    }
+
+    /// Owner-only legacy rotation. Unlike ordinary refresh it cannot inherit
+    /// selected-target identity headers.
+    pub async fn legacy_refresh(
+        &self,
+        refresh_token: impl Into<String>,
+    ) -> Result<TokenResponse, ClientApiError> {
+        let bare = self.without_identity_context();
+        bare.send_json(
+            bare.http
+                .post(bare.endpoint("auth/refresh")?)
+                .json(&RefreshRequest {
+                    refresh_token: refresh_token.into(),
+                }),
+        )
+        .await
+    }
+
+    pub async fn reconcile_runtime_switch(
+        &self,
+        access_token: &str,
+        request: &RuntimeSwitchReconcileRequest,
+    ) -> Result<RuntimeSwitchReconcileResponse, ClientApiError> {
+        validate_runtime_switch_request(request)?;
+        let client = if request.source_identity.is_none() {
+            self.without_identity_context()
+        } else {
+            if self.runtime_identity.as_ref() != request.source_identity.as_ref()
+                || self
+                    .scoped_access
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.access_token() != access_token)
+            {
+                return Err(ClientApiError::InvalidPayload {
+                    code: "runtime_access_mismatch",
+                });
+            }
+            self.clone()
+        };
+        let response: RuntimeSwitchReconcileResponse = client
+            .send_json(
+                client
+                    .http
+                    .post(client.endpoint("connections/runtime-switch/reconcile")?)
+                    .bearer_auth(access_token)
+                    .json(request),
+            )
+            .await?;
+        validate_runtime_switch_response(request, &response)?;
+        Ok(response)
+    }
+
+    /// Reconcile the same operation using a current, non-rotating refresh proof.
+    pub async fn recover_runtime_switch(
+        &self,
+        refresh_token: &str,
+        request: &RuntimeSwitchReconcileRequest,
+    ) -> Result<RuntimeSwitchReconcileResponse, ClientApiError> {
+        validate_runtime_switch_request(request)?;
+        let client = self.without_identity_context();
+        let mut proof = HeaderValue::from_str(&format!("Refresh {refresh_token}"))?;
+        proof.set_sensitive(true);
+        let response = client
+            .send_json(
+                client
+                    .http
+                    .post(client.endpoint("connections/runtime-switch/reconcile")?)
+                    .header(AUTHORIZATION, proof)
+                    .json(request),
+            )
+            .await?;
+        validate_runtime_switch_response(request, &response)?;
+        Ok(response)
     }
 
     pub async fn server_candidates(
@@ -1105,6 +1913,14 @@ impl ClientApi {
         request.header(AUTHORIZATION, format!("Device {background_token}"))
     }
 
+    fn without_identity_context(&self) -> Self {
+        let mut bare = self.clone();
+        bare.app_version = None;
+        bare.runtime_identity = None;
+        bare.scoped_access = None;
+        bare
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, ClientApiError> {
         self.api_base
             .join(path)
@@ -1122,11 +1938,69 @@ impl ClientApi {
         })
     }
 
+    async fn send_request(&self, builder: RequestBuilder) -> Result<Response, ClientApiError> {
+        let mut request = builder.build()?;
+        if let Some(token) = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        {
+            if self
+                .scoped_access
+                .as_ref()
+                .is_some_and(|s| s.access_token != token)
+            {
+                return Err(ClientApiError::InvalidPayload {
+                    code: "runtime_access_mismatch",
+                });
+            }
+            if let Some(identity) = &self.runtime_identity {
+                let headers = request.headers_mut();
+                for (name, value) in [
+                    ("x-nelomai-app-version", identity.container_version.clone()),
+                    (
+                        "x-nelomai-container-version",
+                        identity.container_version.clone(),
+                    ),
+                    (
+                        "x-nelomai-runtime-version",
+                        identity.runtime_version.clone(),
+                    ),
+                    (
+                        "x-nelomai-runtime-contract-version",
+                        identity.runtime_contract_version.to_string(),
+                    ),
+                    (
+                        "x-nelomai-runtime-slot",
+                        match identity.slot {
+                            RuntimeSlot::Latest => "latest",
+                            RuntimeSlot::Stable => "stable",
+                        }
+                        .into(),
+                    ),
+                    (
+                        "x-nelomai-session-generation",
+                        identity
+                            .session_generation
+                            .ok_or(ClientApiError::InvalidPayload {
+                                code: "unenrolled_runtime_identity",
+                            })?
+                            .to_string(),
+                    ),
+                ] {
+                    headers.insert(name, HeaderValue::from_str(&value)?);
+                }
+            }
+        }
+        Ok(self.http.client().execute(request).await?)
+    }
+
     async fn send_json<T: for<'de> Deserialize<'de>>(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, ClientApiError> {
-        let response = request.send().await?;
+        let response = self.send_request(request).await?;
         let status = response.status();
         if status.is_success() {
             return Ok(response.json().await?);
@@ -1141,11 +2015,20 @@ impl ClientApi {
         limit_code: &'static str,
         invalid_code: &'static str,
     ) -> Result<T, ClientApiError> {
-        let response = request.send().await?;
+        let response = self.send_request(request).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(Self::api_error(response, status).await);
         }
+        Self::read_limited_json(response, limit_bytes, limit_code, invalid_code).await
+    }
+
+    async fn read_limited_json<T: for<'de> Deserialize<'de>>(
+        response: Response,
+        limit_bytes: usize,
+        limit_code: &'static str,
+        invalid_code: &'static str,
+    ) -> Result<T, ClientApiError> {
         if response
             .content_length()
             .is_some_and(|length| length > limit_bytes as u64)
@@ -1547,6 +2430,11 @@ mod tests {
                 id: "device".to_string(),
                 name: "Mac".to_string(),
                 platform: Platform::Macos,
+                container_version: None,
+                runtime_version: None,
+                runtime_contract_version: None,
+                runtime_slot: None,
+                session_generation: None,
             },
         };
 
@@ -1561,6 +2449,28 @@ mod tests {
             assert!(!debug.contains(secret));
         }
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn diagnostics_optional_logcat_round_trips_and_is_redacted() {
+        let old_payload = serde_json::json!({
+            "trigger": "manual", "generated_at_unix": 1, "app_version": "0.2.16",
+            "platform_version": null, "architecture": "aarch64",
+            "application_log": "application", "helper_log": null
+        });
+        let old: DiagnosticUploadRequest = serde_json::from_value(old_payload.clone()).unwrap();
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("logcat_log")
+            .is_none());
+        let mut payload = old_payload;
+        payload["logcat_log"] = serde_json::json!("logcat-secret\n🦀");
+        let request: DiagnosticUploadRequest = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["logcat_log"],
+            "logcat-secret\n🦀"
+        );
+        assert!(!format!("{request:?}").contains("logcat-secret"));
     }
 
     #[test]
@@ -1580,6 +2490,7 @@ mod tests {
             architecture: "x86_64".to_string(),
             application_log: "application-secret".to_string(),
             helper_log: Some("helper-secret".to_string()),
+            logcat_log: None,
             network_incidents: Some("incident-secret".to_string()),
             resource_usage: None,
         };

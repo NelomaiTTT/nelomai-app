@@ -2,9 +2,13 @@ package ru.nelomai.client
 
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import ru.nelomai.tunnel.QuickTunnelController
+import android.os.Handler
+import android.os.Looper
 
 class NelomaiQuickTileService : TileService() {
+    private val selection by lazy { RuntimeSelectionStore(this) }
+    private val handler = Handler(Looper.getMainLooper())
+    private val pendingDispatches = mutableSetOf<AutoCloseable>()
     override fun onStartListening() {
         super.onStartListening()
         updateTile()
@@ -20,25 +24,56 @@ class NelomaiQuickTileService : TileService() {
     }
 
     private fun dispatchOrOpen() {
+        val dispatch = RuntimeDispatchGuard.begin()
+        pendingDispatches += dispatch
+        handler.postDelayed({ finishDispatch(dispatch) }, 15_000)
+        android.util.Log.i("NelomaiTile", "toggle.requested")
         qsTile?.apply {
             state = Tile.STATE_UNAVAILABLE
             updateTile()
         }
-        if (!QuickTunnelController.requestToggle(applicationContext)) {
-            updateTile()
+        selection.read { result ->
+            try {
+                result.onSuccess { selected ->
+                    runCatching {
+                        if (RuntimeProcessSelection.needsExit(selected)) { android.os.Process.killProcess(android.os.Process.myPid()); return@onSuccess }
+                        RuntimeProcessSelection.claim(selected)
+                        val quick = RuntimeAdapters.quick(selected)
+                        if (RuntimeDispatchPolicy.mayToggle(selected, quick.desiredActive(applicationContext)) && quick.toggle(applicationContext)) return@onSuccess
+                    }
+                    updateTile()
+                }.onFailure { qsTile?.apply { state = Tile.STATE_UNAVAILABLE; updateTile() } }
+            } finally {
+                finishDispatch(dispatch)
+            }
         }
     }
 
     private fun updateTile() {
-        qsTile?.apply {
+        selection.read { result -> qsTile?.apply {
             label = getString(R.string.app_name)
-            state = when (QuickTunnelController.state(applicationContext)) {
+            val selected = result.getOrNull()
+            val engineState = selected?.let { runCatching {
+                if (RuntimeProcessSelection.needsExit(it)) { android.os.Process.killProcess(android.os.Process.myPid()); return@runCatching null }
+                RuntimeProcessSelection.claim(it)
+                RuntimeAdapters.quick(it).state(applicationContext)
+            }.getOrNull() }
+            state = if (selected == null || selected.pendingSlot != null) Tile.STATE_UNAVAILABLE else when (engineState) {
                 "running" -> Tile.STATE_ACTIVE
                 "starting", "stopping" -> Tile.STATE_UNAVAILABLE
                 else -> Tile.STATE_INACTIVE
             }
+            android.util.Log.i("NelomaiTile", "state.updated engine=$engineState tile=$state")
             updateTile()
-        }
+        } }
+    }
+    private fun finishDispatch(dispatch: AutoCloseable) {
+        if (pendingDispatches.remove(dispatch)) dispatch.close()
     }
 
+    override fun onDestroy() {
+        pendingDispatches.toList().forEach(::finishDispatch)
+        selection.close()
+        super.onDestroy()
+    }
 }

@@ -1,0 +1,1 @@
+{"architecture":"x86_64","contract_version":1,"files":[{"path":"bin/nelomai-unix-service","role":"executable","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size_bytes":17}],"format_version":1,"platform":"linux","runtime_version":"0.2.15","source_commit":"89abcdef0123456789abcdef0123456789abcdef"}

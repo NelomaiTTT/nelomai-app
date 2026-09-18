@@ -104,10 +104,16 @@ and claims about functionality that is not yet present in the release branch.
 - Store a separate raw 32-byte Ed25519 seed in
   `NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64`; configure the matching public key
   on the panel as `CLIENT_RELEASE_MANIFEST_PUBLIC_KEY_B64`.
-- The `release` GitHub Actions workflow is started only through guarded manual
-  dispatch. It builds Linux x86_64, Windows x86_64, and macOS aarch64 updater
-  artifacts, plus a signed Android aarch64 APK. Intel macOS builds are not
-  published. It publishes only after every build job succeeds.
+- The `release` workflow is dispatched with an exact maintenance `source_sha`.
+  Default `build_only` uses TEST trust and cannot publish. `sign_candidate`
+  builds Linux x86_64, Windows x86_64, macOS aarch64 and Android aarch64.
+  The shared `sign` and `finalize` jobs produce runtime and installer
+  signatures respectively; only ordinary shipping installers are packaged.
+  Manual approval/full acceptance gates are not part of this workflow.
+- `publish_approved_candidate` publishes retained bytes from the selected
+  successful candidate run, including reruns. It automatically selects the
+  unique nonexpired artifact and checks source/run identity, inventory and
+  all file hashes. It never rebuilds, re-signs, overwrites assets or moves a tag.
 - The workflow publishes a deterministic JSON manifest, its detached Ed25519
   signature, and Tauri-signed packages. Draft and prerelease GitHub releases
   are not consumed by the panel.
@@ -119,6 +125,10 @@ and claims about functionality that is not yet present in the release branch.
 - Exercise a signed update on Windows, macOS, Linux, and a physical Android
   device. Android must show its system confirmation UI; silent installation is
   neither requested nor supported.
+
+Current signing configuration, command boundaries and rerun/retention behavior
+are documented in [`runtime-artifacts.md`](runtime-artifacts.md).
+Build-only artifacts are never eligible for publication.
 
 ## Panel-first release order
 
@@ -132,12 +142,20 @@ For every application release:
 1. Deploy the compatible panel change through the guarded panel updater.
 2. Verify panel health and release-sync readiness without running production
    preflight against the working database.
-3. Start the manual `release` workflow with
+3. Build/sign the exact candidate and inspect the build results. Hardware testing
+   remains distinct from build success; there is no automatic full acceptance gate.
+4. Start the manual `release` workflow in `publish_approved_candidate` mode with
+   the source SHA and successful candidate run ID, and
    `panel_notification_ready=true`. The acknowledgement confirms that the
    notification producer is already deployed; it is not a remote capability
    probe.
-4. Let the guarded workflow create the version tag and GitHub release.
-5. Wait for normal panel release sync and verify the notification audit event.
+5. Let the separately dispatched publication job recheck and create the exact
+   version tag/GitHub release at `source_sha`.
+6. Wait for normal panel release sync and verify the notification audit event.
+
+The panel acknowledgement is required only at publication, not for useful
+nonpublishing `build_only` checks. Nothing here authorizes a panel deployment or
+production probe as part of local build verification.
 
 A pushed `v*` tag no longer starts release publication. This closes the path
 that could publish an application before the panel notification producer was

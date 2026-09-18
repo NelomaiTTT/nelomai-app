@@ -17,6 +17,7 @@ import type {
   StartCommandResponse,
   TicConnectionMode,
   UpdateStatus,
+  RuntimeStatus,
 } from "./app-model";
 import type {
   InstalledApplication,
@@ -57,7 +58,19 @@ export function waitForSettlement(
 export type StartupStage =
   | "frontend_mounted"
   | "frontend_first_frame"
-  | "bootstrap_slow";
+  | "bootstrap_slow"
+  | "sign_in_bootstrap_signed_out"
+  | "sign_in_login_failed"
+  | "sign_in_logout_completed"
+  | "update_install_requested"
+  | "update_refresh_started"
+  | "update_refresh_completed"
+  | "update_refresh_failed"
+  | "update_available"
+  | "update_downloading"
+  | "update_ready_to_restart"
+  | "update_awaiting_installation"
+  | "update_failed";
 
 export interface LoginRequest {
   login: string;
@@ -126,6 +139,7 @@ export function createNativeClient(
   invoke: Invoke = (command, args) => tauriInvoke(command, args),
 ) {
   return {
+    releaseHistory: () => invoke("app_release_history"),
     state: () => invoke("app_state") as Promise<AppState>,
     preferences: () => invoke("app_preferences") as Promise<AppPreferences>,
     setCloseToTray: (enabled: boolean) =>
@@ -193,6 +207,10 @@ export function createNativeClient(
       invoke("app_update_install") as Promise<UpdateStatus>,
     restartForUpdate: () =>
       invoke("app_update_restart") as Promise<void>,
+    runtimeStatus: () => invoke("runtime_status") as Promise<RuntimeStatus>,
+    runtimeSelect: (useStable: boolean) =>
+      invoke("runtime_select", { useStable }) as Promise<RuntimeStatus>,
+    restartRuntime: () => invoke("runtime_restart") as Promise<void>,
     splitTunnelState: () =>
       invoke("app_split_tunnel_state") as Promise<SplitTunnelState>,
     splitTunnelInstalledApplications: () =>
@@ -243,6 +261,7 @@ export type UserErrorContext =
   | "diagnostics"
   | "notifications"
   | "update"
+  | "runtime"
   | "split_tunnel";
 
 export interface UserErrorOptions {
@@ -440,6 +459,8 @@ export function commandMessage(
       return original?.startsWith("Разрешите ") || original?.includes("вручную")
         ? original
         : "Не удалось установить обновление. Проверьте интернет и нажмите «Обновить» ещё раз.";
+    case "runtime_switch_recovery_required":
+      return "Не удалось безопасно переключить runtime. Перезапустите Nelomai и повторите попытку.";
     default:
       return original ?? "Не удалось выполнить действие. Повторите попытку.";
   }

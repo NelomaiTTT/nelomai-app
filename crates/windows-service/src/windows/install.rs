@@ -2,10 +2,11 @@ use super::routes::WindowsRouteManager;
 use super::{platform_error, wide};
 use crate::{
     manager_service_spec, pipe_security_descriptor, private_directory_security_descriptor,
-    tunnel_service_spec, ClientPolicy, ServiceError, ServiceSpec, ServiceStartMode,
+    tunnel_service_spec, ServiceError, ServiceSpec, ServiceStartMode,
     AMNEZIAWG_TUNNEL_SERVICE_NAME, MANAGER_SERVICE_NAME, TUNNEL_SERVICE_NAME,
 };
 use nelomai_client_tunnel::TunnelTransport;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -31,7 +32,6 @@ use windows_sys::Win32::Security::{
     SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
 };
 
-const POLICY_FILE: &str = "client-policy.json";
 const TUNNEL_CONFIG_FILE: &str = "nelomai.conf";
 const DIAGNOSTIC_LOG_FILE: &str = "service-diagnostics.log";
 const MAX_DIAGNOSTIC_LOG_SIZE: u64 = 64 * 1024;
@@ -42,40 +42,145 @@ pub struct InstallOptions {
     pub installed_client_path: PathBuf,
 }
 
+/// Copy hooks receive only already signature/hash-verified source entries.
+/// Prepare exact staging/final DLL exceptions before the first file write;
+/// regular signed-copy validation and activation remain unchanged.
+struct DefenderInstallIo<'a> {
+    root: &'a Path,
+    broker: &'a Path,
+    stages: RefCell<Vec<PathBuf>>,
+    finals: RefCell<Vec<PathBuf>>,
+    published: Cell<bool>,
+}
+impl nelomai_contracts::dispatcher::InstallIo for DefenderInstallIo<'_> {
+    fn copy(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        if let Some((stage, final_path)) =
+            super::defender_layout::copy_exclusion_paths(self.root, destination)?
+        {
+            self.stages.borrow_mut().push(stage.clone());
+            self.finals.borrow_mut().push(final_path.clone());
+            for path in [&stage, &final_path] {
+                if super::defender::managed_exclusion(self.broker, path, "add").is_err() {
+                    // Defender may be disabled/not installed (another AV).
+                    // No signature/hash checks are skipped on this path.
+                    record_service_message("installer", "defender_exclusion_prepare_failed");
+                }
+            }
+        }
+        nelomai_contracts::dispatcher::RealInstallIo.copy(source, destination)
+    }
+    fn publish(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        nelomai_contracts::dispatcher::RealInstallIo.publish(source, destination)
+    }
+}
+impl Drop for DefenderInstallIo<'_> {
+    fn drop(&mut self) {
+        let paths = self.stages.get_mut().iter().chain(
+            self.finals
+                .get_mut()
+                .iter()
+                .filter(|_| !self.published.get()),
+        );
+        for path in paths {
+            if super::defender::managed_exclusion(self.broker, path, "remove").is_err() {
+                record_service_message("installer", "defender_exclusion_cleanup_pending");
+            }
+        }
+    }
+}
+
 pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
     let executable =
         env::current_exe().map_err(|error| platform_error("resolve service executable", error))?;
     let installed_client_path =
         validate_install_location(&executable, &options.installed_client_path)?;
-    validate_wireguard_libraries(&executable)?;
-    pipe_security_descriptor(&options.owner_sid)?;
-    let root = state_directory()?;
-    fs::create_dir_all(&root)
-        .map_err(|error| platform_error("create service state directory", error))?;
-    apply_private_acl(&root)?;
-    let _ = fs::remove_file(root.join(DIAGNOSTIC_LOG_FILE));
-    let policy = ClientPolicy {
-        owner_sid: options.owner_sid,
-        installed_client_path,
+    // Task 9 installs the common container and its signed runtime tree together.
+    // The elevated installer derives the source from that trusted container,
+    // never from a runtime IPC request or an update-supplied verification key.
+    let source = installed_client_path
+        .parent()
+        .ok_or(ServiceError::UnsafePath)?
+        .join("runtime");
+    let install_root = installation_directory()?;
+    fs::create_dir_all(&install_root)
+        .map_err(|error| platform_error("create privileged layout", error))?;
+    apply_private_acl(&install_root)?;
+    let installation = nelomai_contracts::dispatcher::Installation::production(&install_root)
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    let previous =
+        match fs::read_to_string(install_root.join(nelomai_contracts::dispatcher::POINTER_NAME)) {
+            Ok(value) => Some(value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(platform_error("read previous dispatcher pointer", error)),
+        };
+    let operations = DefenderInstallIo {
+        root: &install_root,
+        broker: &installed_client_path,
+        stages: RefCell::new(Vec::new()),
+        finals: RefCell::new(Vec::new()),
+        published: Cell::new(false),
     };
-    let policy_bytes = serde_json::to_vec(&policy)
-        .map_err(|error| platform_error("serialize service policy", error))?;
-    fs::write(root.join(POLICY_FILE), policy_bytes)
-        .map_err(|error| platform_error("write service policy", error))?;
-
-    remove_service(MANAGER_SERVICE_NAME)?;
-    let spec = manager_service_spec(&executable)?;
-    let manager =
-        service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-    let service = create_service(&manager, &spec)?;
-    service
-        .set_description("Controls Nelomai WireGuard tunnels for the installed desktop client.")
-        .map_err(|error| platform_error("set manager service description", error))?;
-    configure_manager_recovery(&service)?;
-    service
-        .start(&[] as &[&str])
-        .map_err(|error| platform_error("start manager service", error))?;
-    wait_until_running(&service)
+    let layout = installation
+        .install(
+            &source,
+            &installed_client_path,
+            &options.owner_sid,
+            &operations,
+        )
+        .map_err(|_| ServiceError::UnauthorizedClient)?;
+    // Published generations stay recoverable on service activation rollback;
+    // their exact owned exceptions are retained until full uninstall.
+    operations.published.set(true);
+    let activation = (|| {
+        pipe_security_descriptor(&options.owner_sid)?;
+        let root = state_directory()?;
+        fs::create_dir_all(&root)
+            .map_err(|error| platform_error("create service state directory", error))?;
+        apply_private_acl(&root)?;
+        let _ = fs::remove_file(root.join(DIAGNOSTIC_LOG_FILE));
+        remove_service(MANAGER_SERVICE_NAME)?;
+        let spec = manager_service_spec(&layout.dispatcher_path())?;
+        let manager =
+            service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+        let service = create_service(&manager, &spec)?;
+        service
+            .set_description("Controls Nelomai WireGuard tunnels for the installed desktop client.")
+            .map_err(|error| platform_error("set manager service description", error))?;
+        configure_manager_recovery(&service)?;
+        service
+            .start(&[] as &[&str])
+            .map_err(|error| platform_error("start manager service", error))?;
+        wait_until_running(&service)
+    })();
+    if let Err(error) = activation {
+        remove_service(MANAGER_SERVICE_NAME)?;
+        let published = layout
+            .directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(ServiceError::UnsafePath)?;
+        installation
+            .rollback_activation(published, previous.as_deref())
+            .map_err(|_| ServiceError::Backend("dispatcher_activation_rollback_failed".into()))?;
+        if let Some(previous) = previous {
+            let executable = install_root
+                .join("releases")
+                .join(previous)
+                .join("dispatcher/1/nelomai-windows-service.exe");
+            let spec = manager_service_spec(&executable)?;
+            let manager = service_manager(
+                ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+            )?;
+            let service = create_service(&manager, &spec)?;
+            configure_manager_recovery(&service)?;
+            service.start(&[] as &[&str]).map_err(|failure| {
+                platform_error("restore previous dispatcher service", failure)
+            })?;
+            wait_until_running(&service)?;
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn configure_manager_recovery(service: &Service) -> Result<(), ServiceError> {
@@ -119,12 +224,6 @@ pub fn uninstall() -> Result<(), ServiceError> {
             .map_err(|error| platform_error("remove service state directory", error))?;
     }
     Ok(())
-}
-
-pub(crate) fn load_policy() -> Result<ClientPolicy, ServiceError> {
-    let bytes = fs::read(state_directory()?.join(POLICY_FILE))
-        .map_err(|error| platform_error("read service policy", error))?;
-    serde_json::from_slice(&bytes).map_err(|error| platform_error("parse service policy", error))
 }
 
 pub(crate) fn tunnel_config_path() -> Result<PathBuf, ServiceError> {
@@ -174,13 +273,12 @@ pub(crate) fn record_service_message(context: &str, message: &str) {
 }
 
 pub(crate) fn create_or_replace_tunnel_service(
+    executable: &Path,
     configuration: &Path,
     transport: TunnelTransport,
 ) -> Result<Service, ServiceError> {
     remove_tunnel_service()?;
-    let executable =
-        env::current_exe().map_err(|error| platform_error("resolve service executable", error))?;
-    let spec = tunnel_service_spec(&executable, configuration, transport)?;
+    let spec = tunnel_service_spec(executable, configuration, transport)?;
     let manager =
         service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     let service = create_service(&manager, &spec)?;
@@ -188,6 +286,49 @@ pub(crate) fn create_or_replace_tunnel_service(
         .set_config_service_sid_info(ServiceSidType::Unrestricted)
         .map_err(|error| platform_error("set WireGuard service SID", error))?;
     Ok(service)
+}
+
+pub(crate) fn engine_primitive(
+    action: nelomai_contracts::dispatcher::EnginePrimitive,
+    engine: &Path,
+) -> std::io::Result<()> {
+    use nelomai_contracts::dispatcher::EnginePrimitive;
+    let result = (|| match action {
+        EnginePrimitive::StartWireguard | EnginePrimitive::StartAmneziawg => {
+            let transport = if matches!(action, EnginePrimitive::StartWireguard) {
+                TunnelTransport::WireGuard
+            } else {
+                TunnelTransport::AmneziaWg3
+            };
+            let service =
+                create_or_replace_tunnel_service(engine, &tunnel_config_path()?, transport)?;
+            service
+                .start(&[] as &[&str])
+                .map_err(|error| platform_error("start versioned tunnel", error))?;
+            wait_until_running(&service)
+        }
+        EnginePrimitive::StopServices => remove_tunnel_service(),
+        EnginePrimitive::RebindService => {
+            let service = open_tunnel_service()?.ok_or(ServiceError::InvalidRequest)?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            service
+                .stop()
+                .map_err(|error| platform_error("stop tunnel for rebind", error))?;
+            wait_until_stopped_until(&service, deadline)?;
+            service
+                .start(&[] as &[&str])
+                .map_err(|error| platform_error("restart tunnel for rebind", error))?;
+            wait_until_running_until(&service, deadline)
+        }
+    })();
+    result.map_err(|_| nelomai_contracts::dispatcher::blocked())
+}
+
+pub(crate) fn installation_directory() -> Result<PathBuf, ServiceError> {
+    let program_files = env::var_os("ProgramFiles").ok_or(ServiceError::UnsafePath)?;
+    Ok(PathBuf::from(program_files)
+        .join("Nelomai")
+        .join("privileged"))
 }
 
 pub(crate) fn open_tunnel_service() -> Result<Option<Service>, ServiceError> {
@@ -390,25 +531,6 @@ pub(crate) fn validate_install_location(
         return Err(ServiceError::UnauthorizedClient);
     }
     Ok(installed_client_path)
-}
-
-fn validate_wireguard_libraries(service_executable: &Path) -> Result<(), ServiceError> {
-    let directory = service_executable
-        .parent()
-        .ok_or(ServiceError::UnsafePath)?;
-    for library in [
-        "tunnel.dll",
-        "wireguard.dll",
-        "amneziawg-tunnel.dll",
-        "wintun.dll",
-    ] {
-        if !directory.join(library).is_file() {
-            return Err(ServiceError::Backend(format!(
-                "required WireGuard library is missing: {library}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn apply_private_acl(path: &Path) -> Result<(), ServiceError> {

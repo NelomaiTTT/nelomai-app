@@ -1,5 +1,6 @@
 mod backend;
 mod defender;
+mod defender_layout;
 mod elevation;
 mod install;
 mod ipc;
@@ -10,8 +11,10 @@ mod service;
 pub use defender::configure_exclusion;
 pub use elevation::{repair_defender_exclusion, repair_installation, RepairError};
 pub use install::{install, uninstall, InstallOptions};
-pub use ipc::NamedPipeTransport;
-pub use service::{run_amneziawg_service, run_manager_service, run_wireguard_service};
+pub use ipc::{dispatcher_exchange, NamedPipeTransport};
+pub use service::{
+    run_amneziawg_service, run_engine_mode, run_manager_service, run_wireguard_service,
+};
 
 use crate::ServiceError;
 use std::ffi::OsStr;

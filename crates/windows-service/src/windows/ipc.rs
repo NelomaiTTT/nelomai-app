@@ -1,8 +1,7 @@
 use super::{platform_error, wide};
 use crate::{
-    authorize_client, decode_request, decode_response, encode_request, encode_response,
-    pipe_security_descriptor, ClientIdentity, ClientPolicy, Request, Response, ServiceError,
-    ServiceTransport, MAX_FRAME_SIZE, PIPE_NAME,
+    authorize_client, decode_response, encode_request, pipe_security_descriptor, ClientIdentity,
+    ClientPolicy, Request, Response, ServiceError, ServiceTransport, MAX_FRAME_SIZE, PIPE_NAME,
 };
 use async_trait::async_trait;
 use std::ffi::c_void;
@@ -40,11 +39,21 @@ const PIPE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 const PIPE_RECREATE_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 const PIPE_EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub struct NamedPipeTransport;
+pub const DISPATCHER_PIPE_NAME: &str = r"\\.\pipe\NelomaiDispatcherV1";
+pub struct NamedPipeTransport {
+    common: Option<nelomai_contracts::dispatcher::CommonEngineBinding>,
+}
 
 impl NamedPipeTransport {
     pub fn new() -> Self {
-        Self
+        Self { common: None }
+    }
+    pub fn for_common(
+        mut self,
+        binding: nelomai_contracts::dispatcher::CommonEngineBinding,
+    ) -> Self {
+        self.common = Some(binding);
+        self
     }
 }
 
@@ -57,9 +66,33 @@ impl Default for NamedPipeTransport {
 #[async_trait]
 impl ServiceTransport for NamedPipeTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
+        let common = self.common.clone();
         tokio::time::timeout(
             PIPE_EXCHANGE_TIMEOUT,
-            tokio::task::spawn_blocking(move || exchange_blocking(request)),
+            tokio::task::spawn_blocking(move || {
+                if let Some(binding) = common {
+                    binding
+                        .with_identity(
+                            matches!(
+                                request,
+                                Request::Stop { .. }
+                                    | Request::Status { .. }
+                                    | Request::Version { .. }
+                            ),
+                            |expected| {
+                                Ok(crate::exchange_selected(
+                                    request,
+                                    expected,
+                                    dispatcher_exchange,
+                                    exchange_private,
+                                ))
+                            },
+                        )
+                        .map_err(|_| ServiceError::UnauthorizedClient)?
+                } else {
+                    exchange_blocking(request)
+                }
+            }),
         )
         .await
         .map_err(|_| ServiceError::Backend("service_timeout".to_string()))?
@@ -69,18 +102,30 @@ impl ServiceTransport for NamedPipeTransport {
 
 pub(crate) struct PipeServer {
     policy: ClientPolicy,
+    broker: nelomai_contracts::dispatcher::BrokerPolicy,
+    broker_authorization: std::sync::Mutex<nelomai_contracts::dispatcher::BrokerAuthorizationCache>,
+    name: &'static str,
 }
 
 impl PipeServer {
-    pub(crate) fn new(policy: ClientPolicy) -> Self {
-        Self { policy }
+    pub(crate) fn new(
+        policy: ClientPolicy,
+        broker: nelomai_contracts::dispatcher::BrokerPolicy,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            policy,
+            broker,
+            broker_authorization: std::sync::Mutex::new(Default::default()),
+            name,
+        }
     }
 
-    pub(crate) fn accept(&self) -> Result<Option<(Request, HANDLE)>, ServiceError> {
+    pub(crate) fn accept(&self) -> Result<Option<(Vec<u8>, HANDLE)>, ServiceError> {
         let descriptor =
             SecurityDescriptor::from_sddl(&pipe_security_descriptor(&self.policy.owner_sid)?)?;
         let attributes = descriptor.attributes();
-        let pipe_name = wide(PIPE_NAME);
+        let pipe_name = wide(self.name);
         let pipe = unsafe {
             CreateNamedPipeW(
                 pipe_name.as_ptr(),
@@ -119,8 +164,12 @@ impl PipeServer {
                     self.policy.installed_client_path.display()
                 ))
             })?;
-            let request = decode_request(&frame)?;
-            Ok(Some((request, pipe)))
+            self.broker_authorization
+                .lock()
+                .map_err(|_| ServiceError::UnauthorizedClient)?
+                .authorize(&self.broker, &self.broker.owner, &self.broker.executable)
+                .map_err(|_| ServiceError::UnauthorizedClient)?;
+            Ok(Some((frame, pipe)))
         })();
 
         if result.is_err() {
@@ -133,9 +182,9 @@ impl PipeServer {
     }
 }
 
-pub(crate) fn finish_request(pipe: HANDLE, response: &Response) -> Result<(), ServiceError> {
+pub(crate) fn finish_frame(pipe: HANDLE, frame: &[u8]) -> Result<(), ServiceError> {
     let result = (|| {
-        write_all(pipe, &encode_response(response)?)?;
+        write_all(pipe, frame)?;
         unsafe {
             FlushFileBuffers(pipe);
         }
@@ -149,7 +198,7 @@ pub(crate) fn finish_request(pipe: HANDLE, response: &Response) -> Result<(), Se
 }
 
 pub(crate) fn wake_server() {
-    let pipe_name = wide(PIPE_NAME);
+    let pipe_name = wide(DISPATCHER_PIPE_NAME);
     let handle = unsafe {
         CreateFileW(
             pipe_name.as_ptr(),
@@ -169,11 +218,38 @@ pub(crate) fn wake_server() {
 }
 
 fn exchange_blocking(request: Request) -> Result<Response, ServiceError> {
+    crate::exchange_selected(request, None, dispatcher_exchange, exchange_private)
+}
+
+fn exchange_private(request: Request) -> Result<Response, ServiceError> {
     let pipe_name = wide(PIPE_NAME);
     let pipe = open_client_pipe(&pipe_name)?;
     let result = (|| {
         write_all(pipe, &encode_request(&request)?)?;
         decode_response(&read_frame(pipe)?)
+    })();
+    unsafe {
+        CloseHandle(pipe);
+    }
+    result
+}
+
+pub fn dispatcher_exchange(
+    request: &nelomai_contracts::dispatcher::DispatcherRequest,
+) -> Result<nelomai_contracts::dispatcher::DispatcherResponse, ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    let pipe = open_client_pipe(&wide(DISPATCHER_PIPE_NAME))?;
+    let result = (|| {
+        write_all(
+            pipe,
+            &d::encode_frame(request).map_err(|_| ServiceError::InvalidRequest)?,
+        )?;
+        let frame = read_frame(pipe)?;
+        serde_json::from_slice(
+            d::frame_body(&frame, d::MAX_DISPATCHER_FRAME)
+                .map_err(|_| ServiceError::InvalidRequest)?,
+        )
+        .map_err(|_| ServiceError::InvalidRequest)
     })();
     unsafe {
         CloseHandle(pipe);
@@ -453,13 +529,30 @@ fn last_error(context: &str) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use super::super::elevation::current_process_sid;
-    use super::{exchange_blocking, finish_request, PipeServer};
+    use super::{exchange_private as exchange_blocking, PipeServer};
     use crate::{ClientPolicy, Request, Response};
     use std::sync::{mpsc, Mutex};
     use std::thread;
     use std::time::Duration;
 
     static PIPE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn pipe_server(policy: ClientPolicy) -> PipeServer {
+        let broker = nelomai_contracts::dispatcher::BrokerPolicy {
+            owner: policy.owner_sid.clone(),
+            executable: policy.installed_client_path.clone(),
+            sha256: nelomai_contracts::dispatcher::file_digest(&policy.installed_client_path)
+                .unwrap(),
+            manifest_sha256: "a".repeat(64),
+        };
+        PipeServer::new(policy, broker, crate::PIPE_NAME)
+    }
+    fn finish_request(
+        pipe: windows_sys::Win32::Foundation::HANDLE,
+        response: &Response,
+    ) -> Result<(), crate::ServiceError> {
+        super::finish_frame(pipe, &crate::encode_response(response)?)
+    }
 
     #[test]
     fn named_pipe_round_trip_reads_before_impersonation() {
@@ -470,13 +563,16 @@ mod tests {
             owner_sid: current_process_sid().expect("read current process SID"),
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
         };
-        let server = PipeServer::new(policy);
+        let server = pipe_server(policy);
         let server_thread = thread::spawn(move || {
             let (request, pipe) = server
                 .accept()
                 .expect("accept pipe request")
                 .expect("receive pipe request");
-            assert!(matches!(request, Request::Version { .. }));
+            assert!(matches!(
+                crate::decode_request(&request).unwrap(),
+                Request::Version { .. }
+            ));
             let mut response = Response::success(None);
             response.service_version = Some("test".to_string());
             finish_request(pipe, &response).expect("send pipe response");
@@ -498,7 +594,7 @@ mod tests {
             owner_sid: current_process_sid().expect("read current process SID"),
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
         };
-        let server = PipeServer::new(policy);
+        let server = pipe_server(policy);
         let (accepted_tx, accepted_rx) = mpsc::channel();
         let server_thread = thread::spawn(move || {
             for index in 0..2 {
@@ -506,7 +602,10 @@ mod tests {
                     .accept()
                     .expect("accept pipe request")
                     .expect("receive pipe request");
-                assert!(matches!(request, Request::Version { .. }));
+                assert!(matches!(
+                    crate::decode_request(&request).unwrap(),
+                    Request::Version { .. }
+                ));
                 if index == 0 {
                     accepted_tx.send(()).expect("signal first request");
                     thread::sleep(Duration::from_millis(250));
@@ -546,14 +645,17 @@ mod tests {
             owner_sid: current_process_sid().expect("read current process SID"),
             installed_client_path: std::env::current_exe().expect("resolve test executable"),
         };
-        let server = PipeServer::new(policy);
+        let server = pipe_server(policy);
         let (gap_tx, gap_rx) = mpsc::channel();
         let server_thread = thread::spawn(move || {
             let (request, pipe) = server
                 .accept()
                 .expect("accept first pipe request")
                 .expect("receive first pipe request");
-            assert!(matches!(request, Request::Version { .. }));
+            assert!(matches!(
+                crate::decode_request(&request).unwrap(),
+                Request::Version { .. }
+            ));
             finish_request(pipe, &Response::success(None)).expect("send first response");
 
             gap_tx.send(()).expect("signal pipe recreation gap");
@@ -563,7 +665,10 @@ mod tests {
                 .accept()
                 .expect("accept second pipe request")
                 .expect("receive second pipe request");
-            assert!(matches!(request, Request::Version { .. }));
+            assert!(matches!(
+                crate::decode_request(&request).unwrap(),
+                Request::Version { .. }
+            ));
             let mut response = Response::success(None);
             response.service_version = Some("recreated".to_string());
             finish_request(pipe, &response).expect("send second response");

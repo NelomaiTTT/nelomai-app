@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(target_os = "linux", test))]
+mod linux_diagnostics;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -44,13 +46,48 @@ const MAX_DIAGNOSTIC_BYTES: usize = 48 * 1024;
 const MAX_USERSPACE_LOG_BYTES: usize = 32 * 1024;
 const USERSPACE_LOG_FILE: &str = "userspace-tunnel.log";
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn persisted_diagnostics(runtime_directory: &Path) -> String {
+    let mut output =
+        String::from("[nelomai.unix_helper.snapshot]\nsource=persisted\nsnapshot=unavailable\n");
+    output.push_str("[nelomai.unix_helper.events]\n");
+    match linux_diagnostics::read_tail(
+        runtime_directory,
+        linux_diagnostics::EVENTS_FILE,
+        linux_diagnostics::MAX_EVENTS_BYTES,
+    ) {
+        Ok(log) => output.push_str(&log),
+        Err(_) => output.push_str("unavailable code=helper_events_unavailable\n"),
+    }
+    append_userspace_log(&mut output, runtime_directory);
+    output
+}
+
 #[derive(Default)]
 pub(crate) struct DiagnosticJournal {
     entries: VecDeque<String>,
     bytes: usize,
+    #[cfg(any(target_os = "linux", test))]
+    directory: Option<PathBuf>,
 }
 
 impl DiagnosticJournal {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn persistent(runtime_directory: &Path) -> Self {
+        let previous = linux_diagnostics::read_tail(
+            runtime_directory,
+            linux_diagnostics::EVENTS_FILE,
+            linux_diagnostics::MAX_EVENTS_BYTES,
+        )
+        .unwrap_or_default();
+        let entries: VecDeque<String> = previous.lines().map(str::to_owned).collect();
+        Self {
+            bytes: entries.iter().map(String::len).sum(),
+            entries,
+            directory: Some(runtime_directory.into()),
+        }
+    }
+
     pub(crate) fn record(&mut self, event: &str, detail: &str) {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -70,6 +107,16 @@ impl DiagnosticJournal {
                 break;
             };
             self.bytes = self.bytes.saturating_sub(removed.len());
+        }
+        #[cfg(any(target_os = "linux", test))]
+        if let Some(directory) = &self.directory {
+            let text = self
+                .entries
+                .iter()
+                .map(|entry| format!("{entry}\n"))
+                .collect::<String>();
+            // A full/unavailable log directory must never prevent VPN cleanup.
+            let _ = linux_diagnostics::persist_events(directory, &text);
         }
     }
 
@@ -195,6 +242,17 @@ pub(crate) fn append_userspace_log(output: &mut String, runtime_directory: &Path
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn read_userspace_log_tail(runtime_directory: &Path) -> Result<String, ServiceError> {
+    linux_diagnostics::read_tail(
+        runtime_directory,
+        USERSPACE_LOG_FILE,
+        MAX_USERSPACE_LOG_BYTES,
+    )
+    .map_err(|_| ServiceError::Backend("userspace_log_unavailable".into()))
+}
+
+#[cfg(all(not(target_os = "linux"), not(test)))]
 fn read_userspace_log_tail(runtime_directory: &Path) -> Result<String, ServiceError> {
     let mut file = File::open(runtime_directory.join(USERSPACE_LOG_FILE))
         .map_err(|_| ServiceError::Backend("userspace_log_unavailable".to_string()))?;
@@ -567,6 +625,87 @@ PersistentKeepalive = 21
         assert!(!rendered.contains("index=0\n"));
         assert!(rendered.contains("index=199\n"));
         assert!(rendered.len() < MAX_DIAGNOSTIC_BYTES + 1024);
+    }
+
+    #[test]
+    fn linux_journal_retains_stop_and_failed_start_after_engine_exit() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut journal = DiagnosticJournal::persistent(runtime.path());
+        journal.record("start_begin", "transport=wireguard");
+        journal.record("stop_ok", "");
+        journal.record("start_begin", "transport=amnezia_wg3");
+        journal.record("start_error", "code=interface_up_failed");
+        drop(journal);
+        let log = persisted_diagnostics(runtime.path());
+        assert!(log.contains("event=stop_ok"), "{log}");
+        assert!(log.contains("event=start_error code=interface_up_failed"));
+        assert!(log.contains("transport=wireguard"));
+        assert!(log.contains("transport=amnezia_wg3"));
+        assert_eq!(
+            std::fs::metadata(runtime.path().join("helper-events.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let mut restarted = DiagnosticJournal::persistent(runtime.path());
+        restarted.record("helper_initialized", "state=stopped transport=none");
+        assert!(
+            persisted_diagnostics(runtime.path())
+                .contains("event=start_error code=interface_up_failed"),
+            "recovery must not erase the failed engine's events"
+        );
+    }
+
+    #[test]
+    fn linux_persisted_logs_reject_symlinks_and_non_private_files() {
+        let runtime = tempfile::tempdir().unwrap();
+        let outside = runtime.path().join("secret");
+        std::fs::write(&outside, "must-not-appear").unwrap();
+        let log = runtime.path().join(USERSPACE_LOG_FILE);
+        std::os::unix::fs::symlink(&outside, &log).unwrap();
+        assert!(!persisted_diagnostics(runtime.path()).contains("must-not-appear"));
+        std::fs::remove_file(&log).unwrap();
+        std::fs::write(&log, "untrusted-data").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!persisted_diagnostics(runtime.path()).contains("untrusted-data"));
+        std::fs::remove_file(&log).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&outside, &log).unwrap();
+        assert!(!persisted_diagnostics(runtime.path()).contains("must-not-appear"));
+        std::fs::remove_file(&log).unwrap();
+        let name = std::ffi::CString::new(log.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(persisted_diagnostics(runtime.path()).contains("userspace_log_unavailable"));
+    }
+
+    #[test]
+    fn linux_persisted_report_is_bounded_and_failed_writes_do_not_block_journal() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut journal = DiagnosticJournal::persistent(runtime.path());
+        for index in 0..200 {
+            journal.record("probe", &format!("index={index} {}", "x".repeat(510)));
+        }
+        let mut log = open_userspace_log(runtime.path()).unwrap();
+        log.write_all(&vec![0xff; 80 * 1024]).unwrap();
+        let report = persisted_diagnostics(runtime.path());
+        assert!(report.len() < 64 * 1024);
+        assert!(report.contains("index=199"));
+        assert!(!report.contains("index=0 "));
+        assert!(
+            std::fs::metadata(runtime.path().join("helper-events.log"))
+                .unwrap()
+                .len()
+                <= 24 * 1024
+        );
+
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::create_dir(blocked.path().join("helper-events.log.tmp")).unwrap();
+        let mut journal = DiagnosticJournal::persistent(blocked.path());
+        journal.record("stop_ok", "");
+        assert!(journal.render("state=stopped").contains("event=stop_ok"));
+        assert!(persisted_diagnostics(blocked.path()).contains("helper_events_unavailable"));
     }
 
     #[test]

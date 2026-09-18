@@ -70,59 +70,19 @@ internal object QuickTunnelPlanStore {
         }
     }
 
-    fun clear(context: Context): Boolean =
-        context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
-            .edit()
-            .clear()
-            .commit()
+    private fun backend(context: Context) = AndroidSecureEnvelopeBackend(context,
+        preferenceName = QUICK_PLAN_PREFERENCES, recordName = "encrypted-envelope-v1", keyAlias = QUICK_PLAN_KEY_ALIAS)
 
-    private fun secretKey(): SecretKey {
-        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (keyStore.getKey(QUICK_PLAN_KEY_ALIAS, null) as? SecretKey)?.let { return it }
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
-            init(
-                KeyGenParameterSpec.Builder(
-                    QUICK_PLAN_KEY_ALIAS,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
-                )
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .build(),
-            )
-            generateKey()
-        }
-    }
+    // A protected tombstone distinguishes legitimate clear from missing migration data.
+    fun clear(context: Context): Boolean = backend(context).write("{\"format\":0}".toByteArray())
 
-    private fun encryptAndSave(context: Context, plaintext: ByteArray): Boolean {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey())
-        val ciphertext = cipher.doFinal(plaintext)
-        return context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
-            .edit()
-            .putString(QUICK_PLAN_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-            .putString(QUICK_PLAN_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-            .commit()
-    }
+    private fun encryptAndSave(context: Context, plaintext: ByteArray): Boolean = backend(context).write(plaintext)
 
     private fun decrypt(context: Context): JSONObject? {
-        val preferences = context.getSharedPreferences(QUICK_PLAN_PREFERENCES, Context.MODE_PRIVATE)
-        val encodedCiphertext = preferences.getString(QUICK_PLAN_CIPHERTEXT, null) ?: return null
-        val encodedIv = preferences.getString(QUICK_PLAN_IV, null) ?: return null
-        var plaintext: ByteArray? = null
+        val plaintext = backend(context).read() ?: return null
         return try {
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(
-                Cipher.DECRYPT_MODE,
-                secretKey(),
-                GCMParameterSpec(128, Base64.decode(encodedIv, Base64.NO_WRAP)),
-            )
-            plaintext = cipher.doFinal(Base64.decode(encodedCiphertext, Base64.NO_WRAP))
-            JSONObject(plaintext.toString(Charsets.UTF_8))
-        } catch (_: Throwable) {
-            null
-        } finally {
-            plaintext?.fill(0)
-        }
+            JSONObject(plaintext.toString(Charsets.UTF_8)).takeIf { it.optInt("format") != 0 }
+        } finally { plaintext.fill(0) }
     }
 }
 

@@ -9,7 +9,7 @@ fn main() {
 #[cfg(windows)]
 fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
     use nelomai_windows_service::windows::{
-        configure_exclusion, install, run_amneziawg_service, run_manager_service,
+        configure_exclusion, install, run_amneziawg_service, run_engine_mode, run_manager_service,
         run_wireguard_service, uninstall, InstallOptions,
     };
     use nelomai_windows_service::ServiceError;
@@ -22,6 +22,16 @@ fn windows_main() -> Result<(), nelomai_windows_service::ServiceError> {
         .as_deref()
     {
         Some("--manager-service") if arguments.next().is_none() => run_manager_service(),
+        Some("--engine-mode") => {
+            let root = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or(ServiceError::InvalidRequest)?;
+            if arguments.next().is_some() {
+                return Err(ServiceError::InvalidRequest);
+            }
+            run_engine_mode(&root)
+        }
         Some("--wireguard-service") => {
             let path = arguments
                 .next()

@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { StartupRetry } from "$lib/startup-retry";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import ChangelogPanel from "$lib/ChangelogPanel.svelte";
   import SplitTunnelSettings from "$lib/SplitTunnelSettings.svelte";
   import NotificationsPanel from "$lib/NotificationsPanel.svelte";
-  import { CHANGELOG } from "$lib/changelog";
+  import RuntimeSelector from "$lib/RuntimeSelector.svelte";
+  import { ReleaseHistory } from "$lib/release-history";
   import { appendNotificationPage, mergeRefreshedNotifications } from "$lib/notifications";
   import {
     clearOwnedConnectionIntentNotice,
@@ -34,6 +36,7 @@
     hasSecondaryStop,
     primaryAction,
     recoveryCopy,
+    runtimeStartBlocked,
     visibleConnectionIntentStatus,
     requiresServerProbes,
     viewForAppState,
@@ -52,6 +55,7 @@
     type Phase,
     type RouteMode,
     type ReserveState,
+    type RuntimeStatus,
     type TicConnectionMode,
     type UpdateStatus,
   } from "$lib/app-model";
@@ -75,9 +79,16 @@
     type SplitTunnelState,
   } from "$lib/split-tunnel";
   import { UpdateOfferRefresher } from "$lib/update-offer-refresher";
+  import { RuntimeStatusRefresher } from "$lib/runtime-status-refresher";
+  import {
+    updateDiagnosticStage,
+    updateRefreshDiagnosticStage,
+    updateStatusNeedsPolling,
+  } from "$lib/update-diagnostics";
 
   let view = $state<AppView>("loading");
   let phase = $state<Phase>("signed_out");
+  let localStopPendingCleanup = $state(false);
   let bootstrap = $state<Bootstrap | null>(null);
   let peers = $state<PeerOption[]>([]);
   let selectedPeerId = $state("");
@@ -109,13 +120,21 @@
   let diagnosticsBusy = $state(false);
   let diagnosticsStatus = $state<string | null>(null);
   let updateStatus = $state<UpdateStatus | null>(null);
+  let lastRecordedUpdateState: string | null = null;
   const updateOfferRefresher = new UpdateOfferRefresher<UpdateStatus>();
+  const runtimeStatusRefresher = new RuntimeStatusRefresher<RuntimeStatus>();
   let updateBusy = $state(false);
+  let runtimeStatus = $state<RuntimeStatus | null>(null);
+  let runtimeSelectionBusy = $state(false);
   let updateTimer: number | null = null;
   let stateTimer: number | null = null;
   let startupTimer: number | null = null;
   let startupKickoffTimer: number | null = null;
+  let runtimeStatusTimer: number | null = null;
   let startupSlow = $state(false);
+  let startupPending = $state(false);
+  let refreshPending = $state(false);
+  const startupRetry = new StartupRetry();
   let runtimeStateBusy = false;
   let splitTunnelState = $state<SplitTunnelState | null>(null);
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
@@ -129,6 +148,16 @@
   let notificationHistoryExpanded = $state(false);
   let notificationsOpen = $state(false);
   let changelogOpen = $state(false);
+  let releaseHistory: ReleaseHistory | null = null;
+
+  function getReleaseHistory(): ReleaseHistory {
+    if (!releaseHistory) {
+      let storage: Storage | null = null;
+      try { storage = window.localStorage; } catch { /* private mode */ }
+      releaseHistory = new ReleaseHistory(storage, nativeClient.releaseHistory);
+    }
+    return releaseHistory;
+  }
   let notificationsBusy = $state(false);
   let notificationsError = $state<string | null>(null);
   let appPreferences = $state<AppPreferences | null>(null);
@@ -200,6 +229,7 @@
         void restore();
         void loadAppPreferences();
         void refreshWindowsDefender();
+        void refreshRuntimeStatus();
       }, 0);
     });
     void listen<NativeConnectionChangedEvent>("native-connection-changed", (event) => {
@@ -257,6 +287,7 @@
         void nativeClient.wakeConnectionIntent();
         void synchronizeRuntimeState();
         void refreshProbes();
+        void refreshRuntimeStatus();
         if (bootstrap) {
           void refreshNotifications(false, true);
           void refreshUpdateOffer();
@@ -279,11 +310,13 @@
     window.addEventListener("popstate", handleHistoryChange);
     return () => {
       disposed = true;
+      startupRetry.dispose();
       window.clearInterval(timer);
       window.clearInterval(notificationTimer);
       if (stateTimer !== null) window.clearInterval(stateTimer);
       if (startupTimer !== null) window.clearTimeout(startupTimer);
       if (startupKickoffTimer !== null) window.clearTimeout(startupKickoffTimer);
+      if (runtimeStatusTimer !== null) window.clearTimeout(runtimeStatusTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("popstate", handleHistoryChange);
@@ -392,6 +425,58 @@
     }
   }
 
+  async function refreshRuntimeStatus() {
+    await runtimeStatusRefresher.run(nativeClient.runtimeStatus, (status) => {
+      runtimeStatus = status;
+    });
+    scheduleRuntimeStatusRefresh();
+  }
+
+  function scheduleRuntimeStatusRefresh() {
+    if (runtimeStatusTimer !== null) window.clearTimeout(runtimeStatusTimer);
+    runtimeStatusTimer = null;
+    if (
+      runtimeStatus?.phase !== null &&
+      runtimeStatus?.phase !== "complete"
+    ) {
+      runtimeStatusTimer = window.setTimeout(() => {
+        runtimeStatusTimer = null;
+        void refreshRuntimeStatus();
+      }, 1_000);
+    }
+  }
+
+  async function selectRuntime(useStable: boolean) {
+    if (runtimeSelectionBusy) return;
+    runtimeSelectionBusy = true;
+    error = null;
+    try {
+      runtimeStatusRefresher.commit(
+        await nativeClient.runtimeSelect(useStable),
+        (status) => { runtimeStatus = status; },
+      );
+      scheduleRuntimeStatusRefresh();
+    } catch (reason) {
+      error = commandMessage(reason, "runtime");
+      await refreshRuntimeStatus();
+    } finally {
+      runtimeSelectionBusy = false;
+    }
+  }
+
+  async function restartRuntime() {
+    if (runtimeSelectionBusy) return;
+    runtimeSelectionBusy = true;
+    error = null;
+    try {
+      await nativeClient.restartRuntime();
+    } catch (reason) {
+      error = commandMessage(reason, "runtime");
+      runtimeSelectionBusy = false;
+      await refreshRuntimeStatus();
+    }
+  }
+
   async function synchronizeRuntimeState() {
     if (
       busy ||
@@ -406,6 +491,7 @@
       const previous = phase;
       const current = await nativeClient.state().catch(() => null);
       if (!current) return;
+      localStopPendingCleanup = current.localStopPendingCleanup === true;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
@@ -426,6 +512,9 @@
       phase = current.phase;
       connection = current.connection;
       view = viewForAppState(current);
+      if (view === "sign_in") {
+        void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
+      }
       if (
         (previous === "connected" || previous === "connecting") &&
         current.connectionIntentStatus === "none" &&
@@ -442,7 +531,11 @@
   }
 
   async function restore() {
+    startupRetry.cancel();
+    startupPending = false;
+    refreshPending = false;
     busy = true;
+    localStopPendingCleanup = false;
     error = null;
     diagnosticsStatus = null;
     startupSlow = false;
@@ -456,10 +549,14 @@
       await applyBootstrap(response);
     } catch (reason) {
       const code = commandCode(reason);
+      refreshPending = code === "auth_refresh_pending";
+      startupPending = code === "runtime_startup_pending" || refreshPending;
+      startupRetry.schedule(code, retryPendingStartup);
       if (code === "signed_out") {
         reserveState = null;
         phase = "signed_out";
         view = "sign_in";
+        void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
       } else if (code === "access_expired") {
         phase = "access_expired";
         view = "access_expired";
@@ -479,6 +576,9 @@
   }
 
   async function applyBootstrap(response: Bootstrap) {
+    startupRetry.cancel();
+    startupPending = false;
+    localStopPendingCleanup = false;
     bootstrap = response;
     pinnedStray = response.pinned_stray;
     selectedLayer = response.defaults.layer;
@@ -506,6 +606,7 @@
 
     const state = await nativeClient.state();
     phase = state.phase;
+    localStopPendingCleanup = state.localStopPendingCleanup === true;
     connection = state.connection;
     connectionIntentStatus = state.connectionIntentStatus;
     nextRetryAtUnix = state.nextRetryAtUnix;
@@ -513,6 +614,10 @@
     reserveState = state.reserveState;
     runtimeWarning = state.warning;
     view = viewForAppState(state);
+    if (view === "sign_in") {
+      void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
+    }
+    await refreshRuntimeStatus();
     await loadSplitTunnel(false);
     if (state.phase === "ready") void refreshProbes();
   }
@@ -537,6 +642,7 @@
     } catch (reason) {
       phase = "signed_out";
       view = "sign_in";
+      void nativeClient.recordStartupStage("sign_in_login_failed");
       error = commandMessage(reason, "login");
     } finally {
       busy = false;
@@ -580,6 +686,15 @@
   }
 
   async function toggleConnection(forceStop = false) {
+    if (localStopPendingCleanup && !forceStop) return;
+    if (
+      !forceStop &&
+      connectionAction !== "stop" &&
+      runtimeStartBlocked(runtimeStatus)
+    ) {
+      error = "Перезапустите Nelomai, чтобы завершить переключение runtime.";
+      return;
+    }
     if (!forceStop && connectionAction === "start" && splitTunnelBlocksStart) {
       showOverlay("split_tunnel");
       return;
@@ -636,6 +751,8 @@
       }
       view = "connection";
       const current = await nativeClient.state();
+      localStopPendingCleanup = current.localStopPendingCleanup === true;
+      phase = current.phase;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
@@ -652,6 +769,7 @@
         );
       }
       const current = await nativeClient.state().catch(() => null);
+      localStopPendingCleanup = current?.localStopPendingCleanup === true;
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
       connectionIntentStatus = current?.connectionIntentStatus ?? connectionIntentStatus;
@@ -816,10 +934,13 @@
 
   async function logout() {
     if (busy) return;
+    startupRetry.cancel();
     busy = true;
     error = null;
     try {
       await nativeClient.logout();
+      startupPending = false;
+      localStopPendingCleanup = false;
       bootstrap = null;
       connection = null;
       pinnedStray = null;
@@ -842,10 +963,21 @@
       clearUpdateTimer();
       phase = "signed_out";
       view = "sign_in";
+      void nativeClient.recordStartupStage("sign_in_logout_completed");
     } catch (reason) {
       error = commandMessage(reason, "logout");
     } finally {
       busy = false;
+      if (startupPending) startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+    }
+  }
+
+  function retryPendingStartup() {
+    if (!startupPending || view !== "unavailable") return;
+    if (busy) {
+      startupRetry.schedule("runtime_startup_pending", retryPendingStartup);
+    } else {
+      void restore();
     }
   }
 
@@ -943,17 +1075,28 @@
   async function refreshUpdateStatus() {
     clearUpdateTimer();
     try {
-      updateStatus = await nativeClient.updateStatus();
-      if (
-        updateStatus.phase === "downloading" ||
-        (updateStatus.supported &&
-          updateStatus.automatic &&
-          updateStatus.phase === "available")
-      ) {
+      const status = await nativeClient.updateStatus();
+      observeUpdateStatus(status);
+      if (updateStatusNeedsPolling(status)) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 500);
       }
     } catch {
       updateStatus = null;
+    }
+  }
+
+  function observeUpdateStatus(status: UpdateStatus) {
+    const refreshStage = updateRefreshDiagnosticStage(
+      updateStatus?.errorCode === "update_refresh_pending",
+      status,
+    );
+    updateStatus = status;
+    if (refreshStage) void nativeClient.recordStartupStage(refreshStage);
+    const stage = updateDiagnosticStage(status.phase);
+    const key = stage ? `${stage}:${status.version ?? "none"}` : null;
+    if (stage && key !== lastRecordedUpdateState) {
+      lastRecordedUpdateState = key;
+      void nativeClient.recordStartupStage(stage);
     }
   }
 
@@ -962,11 +1105,8 @@
     await updateOfferRefresher.run(
       () => nativeClient.refreshUpdate(),
       (status) => {
-        updateStatus = status;
-        if (
-          status.phase === "downloading" ||
-          (status.supported && status.automatic && status.phase === "available")
-        ) {
+        observeUpdateStatus(status);
+        if (updateStatusNeedsPolling(status)) {
           clearUpdateTimer();
           updateTimer = window.setTimeout(refreshUpdateStatus, 500);
         }
@@ -978,9 +1118,10 @@
     if (updateBusy) return;
     updateBusy = true;
     error = null;
+    void nativeClient.recordStartupStage("update_install_requested");
     updateTimer = window.setTimeout(refreshUpdateStatus, 100);
     try {
-      updateStatus = await nativeClient.installUpdate();
+      observeUpdateStatus(await nativeClient.installUpdate());
     } catch (reason) {
       error = commandMessage(reason, "update");
       await refreshUpdateStatus();
@@ -992,7 +1133,7 @@
   async function setAutomaticUpdates(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     try {
-      updateStatus = await nativeClient.setAutomaticUpdates(input.checked);
+      observeUpdateStatus(await nativeClient.setAutomaticUpdates(input.checked));
       if (input.checked) {
         updateTimer = window.setTimeout(refreshUpdateStatus, 100);
       }
@@ -1061,6 +1202,7 @@
       const current = await nativeClient.state().catch(() => null);
       if (current) {
         phase = current.phase;
+        localStopPendingCleanup = current.localStopPendingCleanup === true;
         connection = current.connection;
         connectionIntentStatus = current.connectionIntentStatus;
         nextRetryAtUnix = current.nextRetryAtUnix;
@@ -1122,7 +1264,7 @@
     <div class="header-actions">
       <span class="status" data-phase={phase}>
         <span aria-hidden="true"></span>
-        {phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
+        {startupPending ? (refreshPending ? "Восстановление соединения" : "Подготовка приложения") : localStopPendingCleanup ? "Туннель выключен" : phase === "connected" ? connectionPresentation.statusText : phaseLabels[phase]}
       </span>
       {#if bootstrap}
         <button class="quiet-button" type="button" onclick={openChangelog}>
@@ -1356,7 +1498,9 @@
           <div>
             <p class="eyebrow">Подключение</p>
             <h1>
-              {visibleConnectionIntent === "recovering"
+              {localStopPendingCleanup
+                ? "Туннель выключен"
+                : visibleConnectionIntent === "recovering"
                 ? "Восстанавливаем подключение"
                 : visibleConnectionIntent === "blocked_terminal"
                   ? "Нужно ваше действие"
@@ -1371,27 +1515,30 @@
           </div>
 
           <button
-            class:stop={connectionAction === "stop"}
+            class:stop={connectionAction === "stop" && !localStopPendingCleanup}
             class="connect-button"
             type="button"
             onclick={() => toggleConnection()}
-            disabled={!canBeginConnectionAction(
+            disabled={localStopPendingCleanup || !canBeginConnectionAction(
               connectionActionState,
               busy,
               connectionAction === "stop" || connectionActionState.startBusy,
             ) ||
               (connectionAction === "start" &&
-                (!splitTunnelLoaded || splitTunnelBlocksStart))}
+                (!splitTunnelLoaded || splitTunnelBlocksStart)) ||
+              (connectionAction !== "stop" && runtimeStartBlocked(runtimeStatus))}
           >
             <span>
-              {connectionAction === "stop"
+              {localStopPendingCleanup ? "Выключен" : connectionAction === "stop"
                 ? "Стоп"
                 : connectionAction === "retry"
                   ? "Повторить"
                   : "Старт"}
             </span>
             <small>
-              {busy
+              {localStopPendingCleanup
+                ? "Завершаем очистку на сервере"
+                : busy
                 ? phaseLabels[phase]
                 : connectionAction === "stop"
                   ? "Остановить и отменить повторы"
@@ -1401,7 +1548,18 @@
             </small>
           </button>
 
-          {#if connectionHasSecondaryStop}
+          {#if localStopPendingCleanup}
+            <p role="status">
+              VPN на устройстве выключен. Очистка на сервере выполняется в фоне.
+              {#if connectionIntentStatus === "recovering"}
+                Автоматическое восстановление остаётся включённым.
+              {:else}
+                Повторное подключение станет доступно после её завершения.
+              {/if}
+            </p>
+          {/if}
+
+          {#if connectionHasSecondaryStop || (localStopPendingCleanup && connectionIntentStatus === "recovering")}
             <button
               class="secondary-button blocked-stop-button"
               type="button"
@@ -1626,6 +1784,14 @@
               />
             </label>
           {/if}
+          {#if runtimeStatus}
+            <RuntimeSelector
+              status={runtimeStatus}
+              busy={busy || runtimeSelectionBusy}
+              onselect={selectRuntime}
+              onrestart={restartRuntime}
+            />
+          {/if}
           {#if appPreferences?.closeToTraySupported}
             <label class="update-preference">
               <span>
@@ -1722,7 +1888,7 @@
     {:else}
       <div class="panel message-panel">
         <p class="eyebrow">Подключение к панели</p>
-        <h1>Сейчас сервис недоступен</h1>
+        <h1>{startupPending ? (refreshPending ? "Восстанавливаем соединение с аккаунтом" : "Завершаем подготовку приложения") : "Сейчас сервис недоступен"}</h1>
         {#if error}<p class="error-message">{error}</p>{/if}
         <button class="secondary-button" type="button" onclick={restore} disabled={busy}>
           {busy ? "Проверяем…" : "Повторить"}
@@ -1761,7 +1927,7 @@
 
 {#if changelogOpen}
   <ChangelogPanel
-    entries={CHANGELOG}
+    history={getReleaseHistory()}
     onclose={() => closeOverlay("changelog")}
   />
 {/if}

@@ -20,6 +20,7 @@ internal data class BackgroundCredential(
     val panelBase: String,
     val token: String,
     val expiresAtUnix: Long,
+    val ownerScope: NativeOwnerScope? = null,
 ) {
     override fun toString(): String =
         "BackgroundCredential(deviceId=$deviceId, panelBase=$panelBase, token=<redacted>, expiresAtUnix=$expiresAtUnix)"
@@ -133,6 +134,10 @@ internal data class BackgroundCredentialEnvelope(
     val reservation: BackgroundMutationReservation? = null,
     val cleanupCredential: BackgroundCredential? = null,
     val logoutState: BackgroundLogoutState? = null,
+    val ownerScope: NativeOwnerScope? = null,
+    val ownerOperation: NativeOwnerOperation? = null,
+    val ownerAttempt: Long = 0,
+    val ownerCancelEpoch: Long? = null,
 ) {
     override fun toString(): String =
         "BackgroundCredentialEnvelope(formatVersion=$formatVersion, revision=$revision, deviceId=$deviceId, panelBase=$panelBase, installSecret=${if (installSecret == null) null else "<redacted>"}, installGeneration=$installGeneration, active=${active?.copy(token = "<redacted>")}, previous=${previous?.copy(token = "<redacted>")}, pending=${pending?.copy(token = "<redacted>")}, capability=$capability, reservation=$reservation, cleanupCredential=${cleanupCredential?.copy(token = "<redacted>")}, logoutState=$logoutState)"
@@ -160,6 +165,10 @@ internal object BackgroundCredentialEnvelopeCodec {
             envelope.reservation?.let { put("reservation", reservationToJson(it)) }
             envelope.cleanupCredential?.let { put("cleanupCredential", credentialToJson(it)) }
             envelope.logoutState?.let { put("logoutState", logoutToJson(it)) }
+            envelope.ownerScope?.let { put("ownerScope", it.toJson()) }
+            envelope.ownerOperation?.let { put("ownerOperation", it.toJson()) }
+            put("ownerAttempt", envelope.ownerAttempt)
+            envelope.ownerCancelEpoch?.let { put("ownerCancelEpoch", it) }
         }
         return payload.toString().toByteArray(Charsets.UTF_8)
     }
@@ -182,12 +191,21 @@ internal object BackgroundCredentialEnvelopeCodec {
             reservation = payload.optionalObject("reservation")?.let(::reservationFromJson),
             cleanupCredential = payload.optionalObject("cleanupCredential")?.let(::credentialFromJson),
             logoutState = payload.optionalObject("logoutState")?.let(::logoutFromJson),
+            ownerScope = payload.optionalObject("ownerScope")?.let(NativeOwnerScope::fromJson),
+            ownerOperation = payload.optionalObject("ownerOperation")?.let(NativeOwnerOperation::fromJson),
+            ownerAttempt = payload.optLong("ownerAttempt", 0),
+            ownerCancelEpoch = payload.optionalLong("ownerCancelEpoch"),
         ).also(::validate)
     }
 
     fun validate(envelope: BackgroundCredentialEnvelope) {
         require(envelope.formatVersion == BACKGROUND_CREDENTIAL_FORMAT)
         require(envelope.revision >= 0)
+        require(envelope.ownerAttempt >= 0)
+        envelope.ownerCancelEpoch?.let { require(it >= 0) }
+        envelope.ownerOperation?.let {
+            require(it.scope == envelope.ownerScope && it.attempt == envelope.ownerAttempt)
+        }
         envelope.deviceId?.let { require(normalizeDeviceId(it) == it) }
         envelope.panelBase?.let { require(normalizePanelBase(it) == it) }
         envelope.installSecret?.let(::requireSecret)
@@ -347,8 +365,102 @@ internal object BackgroundCredentialEnvelopeCodec {
         if (has(name) && !isNull(name)) getLong(name) else null
 }
 
-internal class BackgroundCredentialStore(private val backend: EncryptedRecordBackend) {
+internal class BackgroundCredentialStore(
+    private val backend: EncryptedRecordBackend,
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+) {
     private val gate = Any()
+    // The executor captures provenance once; it cannot acquire a newer revision
+    // after a network wait and thereby turn a stale response into a fresh write.
+    private val capturedOwnerOperation = ThreadLocal<NativeOwnerOperation?>()
+
+    fun <T> withOwnerOperation(operation: NativeOwnerOperation, work: () -> T): T {
+        val previous = capturedOwnerOperation.get()
+        capturedOwnerOperation.set(operation)
+        return try { work() } finally { capturedOwnerOperation.set(previous) }
+    }
+
+    fun beginProvisionOperation(
+        request: BackgroundUiProvisionRequest,
+        operation: NativeOwnerOperation,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> =
+        beginOwnerOperation(request.expectedRevision, operation, false, request)
+
+    fun beginOwnerOperation(
+        expectedRevision: Long,
+        operation: NativeOwnerOperation,
+        requireExistingScope: Boolean,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> =
+        beginOwnerOperation(expectedRevision, operation, requireExistingScope, null)
+
+    private fun beginOwnerOperation(
+        expectedRevision: Long,
+        operation: NativeOwnerOperation,
+        requireExistingScope: Boolean,
+        provision: BackgroundUiProvisionRequest?,
+    ): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        mutate(expectedRevision, advancesRevision = true) { current ->
+            if (operation.expiresAtUnixMs <= nowMillis() ||
+                (current.ownerCancelEpoch?.let { operation.scope.authEpoch <= it } == true) ||
+                current.logoutState?.phase == BackgroundLogoutPhase.PENDING
+            ) throw MutationFailure("background_owner_cancelled")
+            val hasCredentials = current.deviceId != null || current.installSecret != null ||
+                current.active != null || current.pending != null || current.cleanupCredential != null
+            val finalizedClean = current.logoutState?.phase == BackgroundLogoutPhase.FINALIZED &&
+                current.installSecret == null && current.active == null && current.previous == null &&
+                current.pending == null && current.reservation == null && current.cleanupCredential == null &&
+                (current.ownerScope == null || operation.scope.authEpoch > current.ownerScope.authEpoch)
+            // Only the owner-authenticated provisioning path can adopt legacy
+            // records. Recovery/rotation cannot infer ownership from a token.
+            val legacyProvision = provision != null && provision.ownerScope == operation.scope &&
+                provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
+                current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
+                provision.installSecret.isNotBlank() &&
+                (current.installSecret == null || current.installSecret == provision.installSecret) &&
+                current.ownerScope == null && current.ownerOperation == null && current.ownerAttempt == 0L &&
+                current.ownerCancelEpoch == null && current.logoutState == null &&
+                current.previous == null && current.pending == null && current.reservation == null &&
+                current.cleanupCredential == null && current.active?.let {
+                    it.ownerScope == null && it.deviceId == provision.deviceId && it.panelBase == provision.panelBase
+                } == true
+            if (current.ownerScope != operation.scope &&
+                (requireExistingScope || (!finalizedClean && !legacyProvision && (current.ownerScope != null || hasCredentials)))
+            ) throw MutationFailure("background_owner_scope_mismatch")
+            if (current.ownerOperation == operation) return@mutate current
+            if (operation.attempt <= current.ownerAttempt) throw MutationFailure("background_owner_cancelled")
+            current.copy(revision = current.revision.incrementRevision(), ownerScope = operation.scope,
+                ownerOperation = operation, ownerAttempt = operation.attempt,
+                // Retain the proof for owner-checked recovery/cleanup, but force
+                // bearer reprovision instead of treating it as a fresh token.
+                active = if (legacyProvision) current.active?.copy(expiresAtUnix = 1) else current.active)
+        }
+    }
+
+    fun cancelOwnerOperation(operation: NativeOwnerOperation): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        when (val result = readLocked()) {
+            is CredentialStoreResult.Failure -> result
+            is CredentialStoreResult.Success -> {
+                val current = result.value
+                if (current.ownerOperation != operation) result
+                else persist(current.copy(revision = current.revision.incrementRevision(), ownerOperation = null))
+            }
+        }
+    }
+
+    fun fenceOwnerLogout(cancelEpoch: Long): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
+        when (val result = readLocked()) {
+            is CredentialStoreResult.Failure -> result
+            is CredentialStoreResult.Success -> {
+                val current = result.value
+                if (cancelEpoch < 0 || current.ownerScope?.let { it.authEpoch >= cancelEpoch } == true ||
+                    current.ownerCancelEpoch?.let { it > cancelEpoch } == true) {
+                    CredentialStoreResult.Failure("background_owner_cancelled")
+                } else if (current.ownerCancelEpoch == cancelEpoch && current.ownerOperation == null) result
+                else persist(current.copy(revision = current.revision.incrementRevision(),
+                    ownerCancelEpoch = cancelEpoch, ownerOperation = null))
+            }
+        }
+    }
 
     fun read(): CredentialStoreResult<BackgroundCredentialEnvelope> = synchronized(gate) {
         readLocked()
@@ -944,9 +1056,17 @@ internal class BackgroundCredentialStore(private val backend: EncryptedRecordBac
             backend.read()
         } catch (_: Throwable) {
             return CredentialStoreResult.Failure("background_credential_read_failed")
-        } ?: return CredentialStoreResult.Success(BackgroundCredentialEnvelope())
+        } ?: return if (capturedOwnerOperation.get() != null) {
+            CredentialStoreResult.Failure("background_owner_cancelled")
+        } else CredentialStoreResult.Success(BackgroundCredentialEnvelope())
         return try {
-            CredentialStoreResult.Success(BackgroundCredentialEnvelopeCodec.decode(plaintext))
+            val current = BackgroundCredentialEnvelopeCodec.decode(plaintext)
+            val captured = capturedOwnerOperation.get()
+            if (captured != null && (current.ownerOperation != captured ||
+                    captured.expiresAtUnixMs <= nowMillis() ||
+                    current.ownerCancelEpoch?.let { captured.scope.authEpoch <= it } == true)) {
+                CredentialStoreResult.Failure("background_owner_cancelled")
+            } else CredentialStoreResult.Success(current)
         } catch (_: Throwable) {
             CredentialStoreResult.Failure("background_credential_corrupt")
         } finally {
@@ -1101,12 +1221,8 @@ internal object AndroidBackgroundCredentialStores {
                 keyAlias = BACKGROUND_KEY_ALIAS,
             ),
         )
-        val current = store.read()
-        if (current is CredentialStoreResult.Success && current.value.revision == 0L) {
-            AndroidLegacyBackgroundCredentialReader(context).read()?.let { legacy ->
-                store.importLegacy(legacy)
-            }
-        }
+        // Legacy import is owned by the locked common migration before any
+        // engine loads; a runtime must never fall back to another namespace.
         return store
     }
 

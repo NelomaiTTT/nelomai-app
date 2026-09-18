@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+mod android_runtime;
 #[cfg(desktop)]
 mod automatic_diagnostics;
 mod commands;
@@ -5,20 +7,43 @@ mod commands;
 mod connection_intent;
 mod connection_metrics;
 #[cfg(desktop)]
+pub mod container;
+#[cfg(desktop)]
 mod desktop;
 mod diagnostics;
+#[cfg(target_os = "macos")]
+mod macos_identity;
+#[cfg(target_os = "macos")]
+mod macos_launch;
+#[cfg(any(target_os = "macos", test))]
+mod macos_power;
+#[cfg(target_os = "macos")]
+mod macos_storage;
 #[cfg(desktop)]
 mod network_incidents;
+#[cfg(target_os = "android")]
+mod owner_runtime;
 mod platform;
 mod preferences;
 mod resource_usage;
+#[cfg(desktop)]
+pub mod runtime;
+mod runtime_control;
+mod runtime_startup;
+#[path = "updates_remote.rs"]
 mod updates;
 
 use nelomai_client_api::ClientApi;
 use nelomai_client_application::{ApplicationError, ClientApplication};
-use nelomai_client_storage::{FileSplitTunnelStore, SystemSecretStore};
+#[cfg(test)]
+use nelomai_client_container::AuthBroker;
+use nelomai_client_core::CoreLocalStop;
+#[cfg(target_os = "android")]
+use nelomai_client_storage::SystemSecretStore;
+use nelomai_client_storage::{ProtectedRuntimeStore, RuntimeOperationalStore, RuntimeRecordOwner};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "android")]
 use tauri_plugin_tunnel_android::TunnelAndroidExt;
 use tokio::sync::Mutex;
 
@@ -32,9 +57,14 @@ const CONNECTION_DIAGNOSTICS_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(desktop)]
 const AUTOMATIC_DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+#[cfg(target_os = "macos")]
+type RuntimeRecordBackend = macos_storage::RemoteRecord;
+#[cfg(not(target_os = "macos"))]
+type RuntimeRecordBackend = nelomai_client_storage::SystemSecretStore;
+
 type NativeApplication = ClientApplication<
     ClientApi,
-    SystemSecretStore,
+    RuntimeOperationalStore<ProtectedRuntimeStore<RuntimeRecordBackend>>,
     platform::PlatformTunnelController,
     diagnostics::AppDiagnostics,
 >;
@@ -79,46 +109,80 @@ impl PushRegistrationScheduler {
         application: &NativeApplication,
     ) {
         let _guard = self.gate.lock().await;
+        #[cfg(target_os = "android")]
+        if replay_push_cleanup(app).await.is_err() {
+            return;
+        }
         register_android_push(app, application).await;
     }
 
-    pub(crate) async fn logout(
+    #[cfg(test)]
+    async fn cleanup_push<F>(
+        &self,
+        broker: &AuthBroker,
+        epoch: u64,
+        disable: F,
+    ) -> Result<bool, nelomai_client_container::BrokerError>
+    where
+        F: std::future::Future<Output = Result<(), nelomai_client_container::BrokerError>>,
+    {
+        let _guard = self.gate.lock().await;
+        Self::cleanup_push_locked(broker, epoch, disable).await
+    }
+
+    /// Caller retains the push gate through native completion.
+    #[cfg(test)]
+    async fn cleanup_push_locked<F>(
+        broker: &AuthBroker,
+        epoch: u64,
+        disable: F,
+    ) -> Result<bool, nelomai_client_container::BrokerError>
+    where
+        F: std::future::Future<Output = Result<(), nelomai_client_container::BrokerError>>,
+    {
+        if !broker.push_cleanup_is_current(epoch).await? {
+            return Ok(false);
+        }
+        // Completion owns the gate, even when the caller no longer waits. A
+        // newer prepare/confirm cannot overtake an in-flight native disable.
+        disable.await?;
+        broker.finish_push_cleanup(epoch).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn register_token(
         &self,
         app: &tauri::AppHandle,
         application: &NativeApplication,
+        token: &str,
     ) -> Result<(), ApplicationError> {
         let _guard = self.gate.lock().await;
         #[cfg(target_os = "android")]
         {
+            replay_push_cleanup(app).await.map_err(|_| {
+                ApplicationError::Core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            })?;
+            let scope = application.current_access_token().await?;
+            application.register_push_token(token).await?;
+            check_push_scope(application, &scope).await?;
             use tauri_plugin_push_android::PushAndroidExt;
-
-            let _ = app.push_android().disable();
+            app.push_android().confirm_async(token).await.map_err(|_| {
+                ApplicationError::Core(nelomai_client_core::CoreError::AuthRecoveryRequired)
+            })
         }
         #[cfg(not(target_os = "android"))]
-        let _ = app;
-        application.logout().await
+        {
+            let _ = app;
+            application.register_push_token(token).await
+        }
     }
 
-    #[cfg(target_os = "android")]
-    pub(crate) async fn logout_remote(
-        &self,
-        application: &NativeApplication,
-    ) -> Result<(), ApplicationError> {
-        let _guard = self.gate.lock().await;
-        application.logout_remote().await
-    }
-
-    #[cfg(target_os = "android")]
-    pub(crate) async fn logout_local(
-        &self,
-        app: &tauri::AppHandle,
-        application: &NativeApplication,
-    ) -> Result<(), ApplicationError> {
-        let _guard = self.gate.lock().await;
-        use tauri_plugin_push_android::PushAndroidExt;
-
-        let _ = app.push_android().disable();
-        application.logout_local().await
+    pub(crate) async fn logout<F>(&self, owner_logout: F) -> Result<(), ApplicationError>
+    where
+        F: std::future::Future<Output = Result<(), ApplicationError>>,
+    {
+        // Never acquire the registration gate before owner cancellation.
+        owner_logout.await
     }
 }
 
@@ -131,117 +195,23 @@ fn current_unix_time() -> i64 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default();
+    #[cfg(target_os = "android")]
+    run_product(owner_runtime::setup_android);
+    #[cfg(desktop)]
+    container::run();
+}
 
-    // Register this before every plugin that performs setup. A secondary
-    // Windows launch must wake the existing window and exit before it can
-    // create another tray icon or initialize a second application runtime.
-    #[cfg(target_os = "windows")]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-        desktop::show_window(app);
-    }));
-
-    let builder = builder
+pub(crate) fn run_product(
+    setup: impl FnOnce(&mut tauri::App) -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
+) {
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_push_android::init())
         .plugin(tauri_plugin_tunnel_android::init())
         .plugin(tauri_plugin_updater_android::init());
-
     #[cfg(desktop)]
-    let builder = builder
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_updater::Builder::new().build());
-
-    let builder = builder.setup(|app| {
-        use tauri::Manager;
-
-        let app_data_directory = app.path().app_data_dir()?;
-        #[cfg(target_os = "linux")]
-        let fallback = Some(app_data_directory.join("credentials"));
-        #[cfg(not(target_os = "linux"))]
-        let fallback = None;
-
-        let api = ClientApi::new(PANEL_BASE)
-            .and_then(|api| api.with_app_version(env!("CARGO_PKG_VERSION")))
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let resource_baseline = resource_usage::ResourceSnapshot::capture(app.handle());
-        let diagnostics = Arc::new(diagnostics::AppDiagnostics::new(
-            app.path().app_data_dir()?.join("diagnostics"),
-            resource_baseline,
-        )?);
-        diagnostics.record_named("startup.rust.setup_ready", None, None, None);
-        let tunnel = Arc::new(platform::tunnel_controller(app.handle().clone()));
-        let preferences = Arc::new(preferences::AppPreferenceStore::new(
-            app_data_directory.join("preferences.json"),
-        ));
-        let application = Arc::new(ClientApplication::with_split_tunnel_store(
-            Arc::new(api),
-            Arc::new(SystemSecretStore::new("primary", fallback)),
-            Arc::new(FileSplitTunnelStore::new(&app_data_directory)),
-            tunnel.clone(),
-            diagnostics.clone(),
-        ));
-        let dns_servers = preferences.get().dns_provider.servers();
-        application.set_dns_servers(dns_servers.clone());
-        let app_handle = app.handle().clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = app_handle
-                .tunnel_android()
-                .update_quick_dns_async(tauri_plugin_tunnel_android::DnsServersRequest {
-                    dns_servers: dns_servers.iter().map(ToString::to_string).collect(),
-                })
-                .await;
-        });
-        let split_tunnel_scheduler = Arc::new(SplitTunnelScheduler::new());
-        let push_registration_scheduler = Arc::new(PushRegistrationScheduler::new());
-        let connection_metrics = Arc::new(connection_metrics::ConnectionMetricsTracker::new());
-        #[cfg(not(target_os = "android"))]
-        let connection_intent = Arc::new(connection_intent::DesktopConnectionIntent::new(
-            app.handle().clone(),
-            application.clone(),
-            diagnostics.clone(),
-        ));
-        app.manage(diagnostics.clone());
-        app.manage(application.clone());
-        app.manage(tunnel.clone());
-        app.manage(split_tunnel_scheduler.clone());
-        app.manage(push_registration_scheduler.clone());
-        app.manage(preferences);
-        app.manage(connection_metrics.clone());
-        #[cfg(not(target_os = "android"))]
-        app.manage(connection_intent.clone());
-        app.manage(Arc::new(updates::NativeUpdater::from_build(app.handle())?));
-        #[cfg(desktop)]
-        desktop::setup_tray(app)?;
-        start_split_tunnel_scheduler(application.clone(), split_tunnel_scheduler);
-        #[cfg(not(target_os = "android"))]
-        start_physical_network_scheduler(application.clone(), connection_intent.clone());
-        #[cfg(target_os = "android")]
-        start_physical_network_scheduler(application.clone());
-        start_pending_stop_scheduler(application.clone());
-        #[cfg(not(target_os = "android"))]
-        connection_intent.spawn();
-        start_connection_metrics_scheduler(
-            app.handle().clone(),
-            application.clone(),
-            tunnel.clone(),
-            connection_metrics,
-            diagnostics.clone(),
-        );
-        #[cfg(desktop)]
-        start_automatic_diagnostics_scheduler(
-            app.handle().clone(),
-            application.clone(),
-            tunnel.clone(),
-            diagnostics,
-        );
-        start_push_registration_scheduler(
-            app.handle().clone(),
-            application,
-            push_registration_scheduler,
-        );
-        Ok(())
-    });
+    let builder = builder.plugin(tauri_plugin_notification::init());
+    let builder = builder.setup(setup);
 
     let app = builder
         .invoke_handler(tauri::generate_handler![
@@ -269,11 +239,18 @@ pub fn run() {
             commands::app_unpin_stray,
             commands::app_send_diagnostics,
             commands::app_record_startup_stage,
+            commands::app_release_history,
             commands::app_update_status,
             commands::app_update_refresh,
             commands::app_update_set_automatic,
             commands::app_update_install,
             commands::app_update_restart,
+            commands::app_runtime_switch_status,
+            commands::app_runtime_switch_request,
+            commands::app_runtime_switch_cancel,
+            commands::runtime_status,
+            commands::runtime_select,
+            commands::runtime_restart,
             commands::app_split_tunnel_state,
             commands::app_split_tunnel_installed_applications,
             commands::app_split_tunnel_save,
@@ -292,24 +269,92 @@ pub fn run() {
                 use tauri::Manager;
 
                 let preferences = _window.state::<Arc<preferences::AppPreferenceStore>>();
-                if preferences.get().close_to_tray {
-                    api.prevent_close();
-                    desktop::hide_window(_window);
-                } else {
-                    api.prevent_close();
-                    desktop::quit_application(_window.app_handle().clone());
-                }
+                api.prevent_close();
+                desktop::close_runtime_window(
+                    preferences.get().close_to_tray,
+                    || desktop::hide_window(_window),
+                    || desktop::quit_application(_window.app_handle().clone()),
+                );
             }
         })
-        .build(tauri::generate_context!())
+        .build({
+            let mut context = app_context();
+            context
+                .config_mut()
+                .app
+                .windows
+                .push(tauri::utils::config::WindowConfig {
+                    title: "Nelomai".into(),
+                    width: 800.0,
+                    height: 600.0,
+                    ..Default::default()
+                });
+            context
+        })
         .expect("error while building tauri application");
 
     app.run(|_app, _event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Ready = _event {
+            macos_identity::install_icon(objc2::MainThreadMarker::new().expect("app main thread"));
+        }
         #[cfg(target_os = "macos")]
         if let tauri::RunEvent::Reopen { .. } = _event {
             desktop::show_window(_app);
         }
     });
+}
+
+pub(crate) fn app_context() -> tauri::Context<tauri::Wry> {
+    let context = tauri::generate_context!();
+    #[cfg(windows)]
+    {
+        // NSIS uses this identifier for shortcuts. Both common and runtime must
+        // register it before Tauri creates windows, regardless of executable path.
+        let app_id: Vec<u16> = context
+            .config()
+            .identifier
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let result = unsafe {
+            windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr())
+        };
+        if result < 0 {
+            // Shell grouping is noncritical: never block VPN startup on its failure.
+            nelomai_client_container::startup_diagnostics::error(
+                "windows.taskbar_identity",
+                &std::io::Error::other(format!("AppUserModelID registration failed: {result:#x}")),
+            );
+        }
+    }
+    context
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn app_context_registers_taskbar_identity_matching_installer_shortcuts() {
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree, UI::Shell::GetCurrentProcessExplicitAppUserModelID,
+    };
+    // Both common and runtime consume this context before Tauri creates windows.
+    // Reading the native process property catches a missing registration, not
+    // merely a changed string constant or a config-to-config comparison.
+    let context = app_context();
+    let mut value = std::ptr::null_mut();
+    let result = unsafe { GetCurrentProcessExplicitAppUserModelID(&mut value) };
+    assert_eq!(result, 0, "the process has no explicit taskbar identity");
+    assert!(!value.is_null());
+    let actual = unsafe {
+        let mut len = 0;
+        while *value.add(len) != 0 {
+            len += 1;
+        }
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(value, len));
+        CoTaskMemFree(value.cast());
+        result
+    };
+    assert_eq!(actual, context.config().identifier);
 }
 
 #[cfg(desktop)]
@@ -360,25 +405,28 @@ fn start_automatic_diagnostics_scheduler(
                 Ok(Some(seal)) => {
                     let helper_log = platform::diagnostic_helper_log(&tunnel).await;
                     let resource_snapshot = resource_usage::ResourceSnapshot::capture(&app);
-                    if let Err(error) = diagnostics.materialize_automatic_report(
+                    match diagnostics.materialize_automatic_report(
                         &seal,
                         resource_snapshot,
                         helper_log,
                     ) {
-                        diagnostics.record_named(
-                            "diagnostics.automatic_report_queue_failed",
+                        Ok(true) => diagnostics.record_named(
+                            "diagnostics.automatic_report_queued",
                             Some(&seal.session_id),
-                            None,
-                            Some(&error.kind().to_string()),
-                        );
-                        continue;
+                            Some(&seal.report_id),
+                            Some(&seal.trigger),
+                        ),
+                        Ok(false) => {}
+                        Err(error) => {
+                            diagnostics.record_named(
+                                "diagnostics.automatic_report_queue_failed",
+                                Some(&seal.session_id),
+                                None,
+                                Some(&error.kind().to_string()),
+                            );
+                            continue;
+                        }
                     }
-                    diagnostics.record_named(
-                        "diagnostics.automatic_report_queued",
-                        Some(&seal.session_id),
-                        Some(&seal.report_id),
-                        Some(&seal.trigger),
-                    );
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -440,7 +488,7 @@ async fn upload_automatic_diagnostics(
     diagnostics: &diagnostics::AppDiagnostics,
     latest: bool,
 ) -> bool {
-    if application.current_access_token().is_err() {
+    if application.current_access_token().await.is_err() {
         return false;
     }
     let now = current_unix_time();
@@ -521,9 +569,12 @@ fn automatic_upload_error_code(error: &ApplicationError) -> String {
 
     match error {
         ApplicationError::Storage => "storage_unavailable".to_string(),
+        ApplicationError::RecoveryDeferred => "recovery_power_deferred".to_string(),
         ApplicationError::Clock => "clock_unavailable".to_string(),
         ApplicationError::Api(error) => api_code(error),
         ApplicationError::Core(error) => match error {
+            CoreError::AuthenticationOutcomeUnknown => "authentication_outcome_unknown".to_string(),
+            CoreError::AuthRecoveryRequired => "auth_recovery_required".to_string(),
             CoreError::SignedOut => "signed_out".to_string(),
             CoreError::AccessExpired => "access_expired".to_string(),
             CoreError::UpdateRequired => "update_required".to_string(),
@@ -545,7 +596,7 @@ fn start_split_tunnel_scheduler(
         interval.tick().await;
         loop {
             interval.tick().await;
-            if application.current_access_token().is_ok() {
+            if application.current_access_token().await.is_ok() {
                 let _ = scheduler.synchronize(&application, false).await;
             }
         }
@@ -574,8 +625,23 @@ fn start_physical_network_scheduler(
         interval.tick().await;
         loop {
             interval.tick().await;
+            #[cfg(target_os = "macos")]
+            if macos_power::defer_reason().is_some() {
+                continue;
+            }
             if matches!(
-                application.poll_physical_network(current_unix_time()).await,
+                application
+                    .poll_physical_network_guarded(current_unix_time(), || {
+                        #[cfg(target_os = "macos")]
+                        {
+                            macos_power::defer_reason().is_none()
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            true
+                        }
+                    })
+                    .await,
                 Ok(nelomai_client_core::PhysicalNetworkPollOutcome::Reconnected)
             ) {
                 connection_intent.wake_for_network_change().await;
@@ -586,11 +652,11 @@ fn start_physical_network_scheduler(
 
 fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
     tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(PENDING_STOP_RETRY_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = tokio::time::sleep(PENDING_STOP_RETRY_INTERVAL) => {},
+                _ = application.wait_for_pending_stop() => {},
+            }
             let _ = application.retry_pending_stop().await;
         }
     });
@@ -618,6 +684,8 @@ fn start_connection_metrics_scheduler(
         let mut stall_recovery_limiter = connection_metrics::StallRecoveryLimiter::default();
         #[cfg(target_os = "macos")]
         let mut macos_stall_recovery = MacosStallRecoveryEpisode::default();
+        #[cfg(target_os = "macos")]
+        let mut last_power_defer = None;
         #[cfg(windows)]
         let mut windows_service_recovery = WindowsServiceRecoveryEpisode::default();
         loop {
@@ -639,6 +707,24 @@ fn start_connection_metrics_scheduler(
                 continue;
             };
             let observed = tracker.is_observed().await;
+            #[cfg(target_os = "macos")]
+            {
+                let reason = macos_power::defer_reason();
+                if reason != last_power_defer {
+                    diagnostics.record_named(
+                        "tunnel.recovery.power_gate",
+                        Some(&context.session_id),
+                        None,
+                        Some(reason.unwrap_or("recovery_resumed")),
+                    );
+                    last_power_defer = reason;
+                }
+                if reason.is_some() {
+                    last_incident_sample = None;
+                    last_diagnostics_sample = None;
+                    continue;
+                }
+            }
             let endpoint_route_guard =
                 cfg!(windows) && context.layer == nelomai_contracts::Layer::Stray;
             let incident_sampling = cfg!(desktop);
@@ -1183,6 +1269,10 @@ async fn diagnose_and_recover_macos_stall(
 ) -> MacosStallRecoveryResult {
     use nelomai_client_core::{StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome};
 
+    if macos_power::defer_reason().is_some() {
+        return MacosStallRecoveryResult::Retry;
+    }
+
     let tunnel_probe_url = format!("{PANEL_BASE}/health");
     let tunnel_probe = application.probe_fresh_connection_latency_ms(&tunnel_probe_url);
     let direct_probe = async {
@@ -1197,6 +1287,9 @@ async fn diagnose_and_recover_macos_stall(
         }
     };
     let (tunnel_latency, direct_succeeded) = tokio::join!(tunnel_probe, direct_probe);
+    if macos_power::defer_reason().is_some() {
+        return MacosStallRecoveryResult::Retry;
+    }
     let classification = classify_desktop_stall_probe(tunnel_latency.is_some(), direct_succeeded);
     let classification_code = match classification {
         DesktopStallClassification::TunnelPathFailed => "tunnel_path_failed_direct_ok",
@@ -1234,6 +1327,9 @@ async fn diagnose_and_recover_macos_stall(
             .inner()
             .clone();
         if runtime.handle_stall(&context.session_id).await {
+            if macos_power::defer_reason().is_some() {
+                return MacosStallRecoveryResult::Retry;
+            }
             return MacosStallRecoveryResult::Complete;
         }
     }
@@ -1252,6 +1348,10 @@ async fn diagnose_and_recover_macos_stall(
         );
     }
 
+    if macos_power::defer_reason().is_some() {
+        limiter.cancel_attempt(&context.session_id, attempt_unix);
+        return MacosStallRecoveryResult::Retry;
+    }
     let rebind = application
         .recover_stalled_data_plane(&context.session_id, StalledDataPlaneRecovery::RebindUdp)
         .await;
@@ -1318,6 +1418,10 @@ async fn diagnose_and_recover_macos_stall(
     }
 
     for restart_attempt in 1..=2 {
+        if macos_power::defer_reason().is_some() {
+            limiter.cancel_attempt(&context.session_id, attempt_unix);
+            return MacosStallRecoveryResult::Retry;
+        }
         if restart_attempt > 1 {
             attempt_unix = current_unix_time();
             if !limiter.begin_attempt(&context.session_id, attempt_unix) {
@@ -1422,6 +1526,9 @@ fn start_push_registration_scheduler(
     scheduler: Arc<PushRegistrationScheduler>,
 ) {
     tauri::async_runtime::spawn(async move {
+        // Replay a durable logout push marker on process startup, before any
+        // new prepare. Periodic attempts also retain/retry it on native failure.
+        scheduler.synchronize(&app, &application).await;
         let mut interval = tokio::time::interval(PUSH_REGISTRATION_INTERVAL);
         interval.tick().await;
         loop {
@@ -1431,14 +1538,47 @@ fn start_push_registration_scheduler(
     });
 }
 
+/// Called only while the push scheduler gate is held.
+#[cfg(target_os = "android")]
+async fn replay_push_cleanup(
+    app: &tauri::AppHandle,
+) -> Result<(), nelomai_client_container::BrokerError> {
+    use tauri::Manager;
+    app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+        .owner_request(nelomai_client_container::host::HostRequestV1::PushCleanup)
+        .await
+        .map(|_| ())
+        .map_err(|_| nelomai_client_container::BrokerError::RecoveryRequired)
+}
+
+#[cfg(target_os = "android")]
+async fn check_push_scope(
+    application: &NativeApplication,
+    scope: &nelomai_client_api::AccessSnapshot,
+) -> Result<(), ApplicationError> {
+    let current = application.current_access_token().await?;
+    if current.auth_epoch() != scope.auth_epoch()
+        || current.family() != scope.family()
+        || current.identity() != scope.identity()
+    {
+        return Err(ApplicationError::Core(
+            nelomai_client_core::CoreError::StartCancelled,
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "android")]
 async fn register_android_push(app: &tauri::AppHandle, application: &NativeApplication) {
     use tauri_plugin_push_android::PushAndroidExt;
 
-    if application.current_access_token().is_err() {
+    let Ok(scope) = application.current_access_token().await else {
         return;
-    }
-    if let Ok(response) = app.push_android().prepare() {
+    };
+    if let Ok(response) = app.push_android().prepare_async().await {
+        if check_push_scope(application, &scope).await.is_err() {
+            return;
+        }
         if !response.permission_granted {
             let _ = application.unregister_push_token().await;
         } else if !response.token.trim().is_empty()
@@ -1446,8 +1586,9 @@ async fn register_android_push(app: &tauri::AppHandle, application: &NativeAppli
                 .register_push_token(&response.token)
                 .await
                 .is_ok()
+            && check_push_scope(application, &scope).await.is_ok()
         {
-            let _ = app.push_android().confirm(&response.token);
+            let _ = app.push_android().confirm_async(&response.token).await;
         }
     }
 }
@@ -1480,6 +1621,461 @@ fn connection_metrics_poll_required(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct PushAuthMemory(std::sync::Mutex<Option<nelomai_client_storage::AuthStoreV1>>);
+    impl nelomai_client_storage::AuthStore for PushAuthMemory {
+        fn load(
+            &self,
+        ) -> Result<Option<nelomai_client_storage::AuthStoreV1>, nelomai_client_storage::StorageError>
+        {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn save(
+            &self,
+            value: &nelomai_client_storage::AuthStoreV1,
+        ) -> Result<(), nelomai_client_storage::StorageError> {
+            *self.0.lock().unwrap() = Some(value.clone());
+            Ok(())
+        }
+    }
+    struct PushStop;
+    #[async_trait::async_trait]
+    impl nelomai_client_container::LocalAuthStop for PushStop {
+        async fn stop_local(&self) -> Result<(), nelomai_client_container::BrokerError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PushAuthRecord(Arc<std::sync::Mutex<Option<Vec<u8>>>>);
+    impl nelomai_client_storage::ProtectedRecordStore for PushAuthRecord {
+        fn load_record(&self) -> Result<Option<Vec<u8>>, nelomai_client_storage::StorageError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn save_record(&self, bytes: &[u8]) -> Result<(), nelomai_client_storage::StorageError> {
+            *self.0.lock().unwrap() = Some(bytes.to_vec());
+            Ok(())
+        }
+        fn delete_record(&self) -> Result<(), nelomai_client_storage::StorageError> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    struct PushLoginStop(std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl nelomai_client_container::LocalAuthStop for PushLoginStop {
+        async fn stop_local(&self) -> Result<(), nelomai_client_container::BrokerError> {
+            if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(nelomai_client_container::BrokerError::RecoveryRequired)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    async fn failed_login_push_replay(outcome: &str) {
+        use nelomai_client_storage::{
+            AuthStore, AuthStoreV1, LogoutState, ProtectedAuthStore, StoredAuth,
+        };
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let local = outcome == "local";
+        let unknown = outcome == "unknown";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            for (index, stream) in listener
+                .incoming()
+                .take(if local { 1 } else { 2 })
+                .enumerate()
+            {
+                let mut stream = stream.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    assert!(header.len() < 16384);
+                }
+                let header = String::from_utf8(header).unwrap();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                stream.read_exact(&mut vec![0; length]).unwrap();
+                let (status, body) = if index == 0 {
+                    assert!(header.starts_with("POST /api/client/v1/auth/logout-runtime "));
+                    (
+                        "200 OK",
+                        r#"{"code":"already_inactive","cleanup_reconcile_operation_id":"synthetic"}"#,
+                    )
+                } else {
+                    assert!(header.starts_with("POST /api/client/v1/auth/login "));
+                    if unknown {
+                        ("502 Bad Gateway", "{}")
+                    } else {
+                        (
+                            "401 Unauthorized",
+                            r#"{"request_id":"synthetic","code":"invalid_credentials","message":"rejected"}"#,
+                        )
+                    }
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let record = PushAuthRecord::default();
+        let store = Arc::new(ProtectedAuthStore::new(record.clone()));
+        let mut auth = AuthStoreV1::from_legacy(&StoredAuth::new_install());
+        auth.refresh_token = Some("synthetic-refresh".into());
+        store.save(&auth).unwrap();
+        let stop = Arc::new(PushLoginStop(AtomicBool::new(false)));
+        let broker = AuthBroker::new(api.clone(), store.clone(), stop.clone()).unwrap();
+        let mut pending = store.load().unwrap().unwrap();
+        pending.auth_epoch = 1;
+        pending.logout_state = LogoutState::Pending;
+        pending.broker.as_mut().unwrap().pending_logout =
+            Some(nelomai_client_storage::PendingLogoutV1 {
+                operation_id: "synthetic-logout".into(),
+                refresh_proof: "synthetic-refresh".into(),
+                source: None,
+            });
+        store.save(&pending).unwrap();
+        broker.stage_push_cleanup(1).await.unwrap();
+        let scheduler = PushRegistrationScheduler::new();
+        let busy = scheduler.gate.lock().await;
+        broker.logout().await.unwrap();
+        assert_eq!(
+            store.load().unwrap().unwrap().logout_state,
+            LogoutState::LoggedOut
+        );
+        stop.0.store(local, Ordering::SeqCst);
+        assert!(broker
+            .login(
+                &nelomai_client_api::LoginRequest {
+                    login: "synthetic".into(),
+                    password: "synthetic".into(),
+                    install_secret: "ignored".into(),
+                    device_name: "test".into(),
+                    platform: nelomai_contracts::Platform::Macos,
+                    platform_version: None,
+                    architecture: "aarch64".into(),
+                    app_version: "0.2.16".into(),
+                },
+                &nelomai_client_api::RuntimeTarget {
+                    container_version: "0.2.16".into(),
+                    runtime_version: "0.2.16".into(),
+                    runtime_contract_version: 1,
+                    runtime_slot: nelomai_contracts::RuntimeSlot::Latest,
+                },
+            )
+            .await
+            .is_err());
+        server.join().unwrap();
+        let after_login = store.load().unwrap().unwrap();
+        assert_eq!(after_login.auth_epoch, 2);
+        assert_eq!(
+            after_login.logout_state,
+            if unknown {
+                LogoutState::Active
+            } else {
+                LogoutState::LoggedOut
+            }
+        );
+        assert_eq!(
+            after_login
+                .broker
+                .as_ref()
+                .unwrap()
+                .authentication_outcome_unknown,
+            unknown
+        );
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(1));
+        drop(busy);
+        drop(broker);
+        drop(store);
+        let store = Arc::new(ProtectedAuthStore::new(record));
+        let broker = AuthBroker::new(api, store.clone(), Arc::new(PushStop)).unwrap();
+        let scheduler = PushRegistrationScheduler::new();
+        let _gate = scheduler.gate.lock().await;
+        let epoch = broker.pending_push_cleanup().await.unwrap().unwrap();
+        let disables = AtomicUsize::new(0);
+        assert!(
+            PushRegistrationScheduler::cleanup_push_locked(&broker, epoch, async {
+                disables.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            "{outcome}: durable cleanup was skipped on restart"
+        );
+        assert_eq!(disables.load(Ordering::SeqCst), 1);
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+        let mut expected = after_login;
+        expected.broker.as_mut().unwrap().pending_push_cleanup_epoch = None;
+        assert_eq!(
+            store.load().unwrap().unwrap(),
+            expected,
+            "cleanup cannot change login provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_login_push_cleanup_executes_after_restart() {
+        failed_login_push_replay("rejected").await;
+    }
+
+    #[tokio::test]
+    async fn locally_unissued_login_push_cleanup_executes_after_restart() {
+        failed_login_push_replay("local").await;
+    }
+
+    #[tokio::test]
+    async fn unknown_login_push_cleanup_executes_after_restart() {
+        failed_login_push_replay("unknown").await;
+    }
+
+    #[tokio::test]
+    async fn late_push_completion_cannot_clear_newer_logout_cleanup() {
+        use nelomai_client_storage::{AuthStore, AuthStoreV1, LogoutState, StoredAuth};
+        let store = Arc::new(PushAuthMemory::default());
+        store
+            .save(&AuthStoreV1::from_legacy(&StoredAuth::new_install()))
+            .unwrap();
+        let broker = Arc::new(
+            AuthBroker::new(
+                ClientApi::new("http://127.0.0.1:1").unwrap(),
+                store.clone(),
+                Arc::new(PushStop),
+            )
+            .unwrap(),
+        );
+        // Synthetic post-ACK record with a durable, unfinished native handoff.
+        let mut auth = store.load().unwrap().unwrap();
+        auth.auth_epoch = 1;
+        auth.logout_state = LogoutState::LoggedOut;
+        auth.broker.as_mut().unwrap().pending_push_cleanup_epoch = Some(1);
+        store.save(&auth).unwrap();
+        let scheduler = Arc::new(PushRegistrationScheduler::new());
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, completion) = tokio::sync::oneshot::channel();
+        let task = {
+            let broker = broker.clone();
+            let scheduler = scheduler.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .cleanup_push(&broker, 1, async {
+                        entered.send(()).unwrap();
+                        completion.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        seen.await.unwrap();
+        broker.logout().await.unwrap();
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(2));
+        assert!(scheduler.gate.try_lock().is_err());
+        release.send(()).unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(nelomai_client_container::BrokerError::Cancelled)
+        ));
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(2));
+        assert!(!scheduler
+            .cleanup_push(&broker, 1, async {
+                panic!("superseded cleanup must not dispatch");
+            })
+            .await
+            .unwrap());
+        assert!(scheduler
+            .cleanup_push(&broker, 2, async { Ok(()) })
+            .await
+            .unwrap());
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn busy_push_cleanup_skips_after_real_owner_login_and_holds_gate_until_completion() {
+        use nelomai_client_storage::{AuthStore, AuthStoreV1, LogoutState, StoredAuth};
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                    assert!(header.len() < 16384);
+                }
+                let header = String::from_utf8(header).unwrap();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                stream.read_exact(&mut vec![0; length]).unwrap();
+                let body = if header.starts_with("POST /api/client/v1/auth/login ") {
+                    r#"{"api_version":"1","request_id":"synthetic","token_type":"Bearer","access_token":"synthetic-access","access_expires_in":900,"refresh_token":"synthetic-refresh","refresh_expires_in":3600,"access":{"state":"active","can_login":true,"can_connect":true,"expires_at":null},"device":{"id":"device","name":"test","platform":"macos","container_version":"0.2.16","runtime_version":"0.2.16","runtime_contract_version":1,"runtime_slot":"latest","session_generation":8}}"#
+                } else {
+                    r#"{"code":"already_inactive","cleanup_reconcile_operation_id":"synthetic"}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let store = Arc::new(PushAuthMemory::default());
+        let mut auth = AuthStoreV1::from_legacy(&StoredAuth::new_install());
+        auth.auth_epoch = 1;
+        auth.logout_state = LogoutState::Active;
+        auth.refresh_token = Some("synthetic-refresh".into());
+        store.save(&auth).unwrap();
+        let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(PushStop)).unwrap());
+        // Synthetic saved handoff state, then the actual owner completes HTTP logout.
+        let mut handoff = store.load().unwrap().unwrap();
+        handoff.logout_state = LogoutState::Pending;
+        handoff.broker.as_mut().unwrap().pending_logout =
+            Some(nelomai_client_storage::PendingLogoutV1 {
+                operation_id: "synthetic-logout".into(),
+                refresh_proof: "synthetic-refresh".into(),
+                source: None,
+            });
+        store.save(&handoff).unwrap();
+        broker.stage_push_cleanup(1).await.unwrap();
+        let scheduler = Arc::new(PushRegistrationScheduler::new());
+        let busy = scheduler.gate.lock().await;
+        let disables = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let scheduler = scheduler.clone();
+            let broker = broker.clone();
+            let disables = disables.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .cleanup_push(&broker, 1, async {
+                        disables.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        broker.logout().await.unwrap();
+        broker
+            .login(
+                &nelomai_client_api::LoginRequest {
+                    login: "synthetic".into(),
+                    password: "synthetic".into(),
+                    install_secret: "ignored".into(),
+                    device_name: "test".into(),
+                    platform: nelomai_contracts::Platform::Macos,
+                    platform_version: None,
+                    architecture: "aarch64".into(),
+                    app_version: "0.2.16".into(),
+                },
+                &nelomai_client_api::RuntimeTarget {
+                    container_version: "0.2.16".into(),
+                    runtime_version: "0.2.16".into(),
+                    runtime_contract_version: 1,
+                    runtime_slot: nelomai_contracts::RuntimeSlot::Latest,
+                },
+            )
+            .await
+            .unwrap();
+        drop(busy);
+        assert!(!task.await.unwrap().unwrap());
+        assert_eq!(disables.load(Ordering::SeqCst), 0);
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+        server.join().unwrap();
+
+        let mut pending = store.load().unwrap().unwrap();
+        pending.logout_state = LogoutState::Pending;
+        let epoch = pending.auth_epoch;
+        store.save(&pending).unwrap();
+        broker.stage_push_cleanup(epoch).await.unwrap();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, completion) = tokio::sync::oneshot::channel();
+        let task = {
+            let scheduler = scheduler.clone();
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                scheduler
+                    .cleanup_push(&broker, epoch, async {
+                        entered.send(()).unwrap();
+                        completion.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        seen.await.unwrap();
+        assert!(
+            scheduler.gate.try_lock().is_err(),
+            "new prepare cannot overtake a native disable still executing"
+        );
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(epoch));
+        release.send(()).unwrap();
+        assert!(task.await.unwrap().unwrap());
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), None);
+        broker.stage_push_cleanup(epoch).await.unwrap();
+        assert!(scheduler
+            .cleanup_push(&broker, epoch, async {
+                Err(nelomai_client_container::BrokerError::Timeout)
+            })
+            .await
+            .is_err());
+        assert_eq!(broker.pending_push_cleanup().await.unwrap(), Some(epoch));
+        drop(broker);
+        drop(scheduler);
+        let reopened = AuthBroker::new(
+            ClientApi::new("http://127.0.0.1:1").unwrap(),
+            store,
+            Arc::new(PushStop),
+        )
+        .unwrap();
+        let restarted = PushRegistrationScheduler::new();
+        let gate = restarted.gate.lock().await;
+        let replay = reopened.pending_push_cleanup().await.unwrap().unwrap();
+        assert!(
+            PushRegistrationScheduler::cleanup_push_locked(&reopened, replay, async { Ok(()) })
+                .await
+                .unwrap()
+        );
+        assert_eq!(reopened.pending_push_cleanup().await.unwrap(), None);
+        drop(gate);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn logout_enters_owner_while_push_scheduler_is_occupied() {
+        let scheduler = PushRegistrationScheduler::new();
+        let _old_push = scheduler.gate.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(30),
+            scheduler.logout(async {
+                Err(ApplicationError::Core(
+                    nelomai_client_core::CoreError::AuthRecoveryRequired,
+                ))
+            }),
+        )
+        .await
+        .expect("push registration must not delay owner cancellation");
+        assert!(matches!(
+            result,
+            Err(ApplicationError::Core(
+                nelomai_client_core::CoreError::AuthRecoveryRequired
+            ))
+        ));
+    }
 
     #[test]
     fn automatic_upload_diagnostics_preserves_the_stable_failure_reason() {

@@ -1,5 +1,12 @@
 # Confirmed Stable Dual Runtime 0.3.0 Implementation Plan
 
+> Актуализация 19.09.2026: пользователь выбрал **опубликованную 0.2.20**
+> в качестве stable вместо указанной ниже исторической 0.2.16. Stable не
+> пересобирать. Текущий согласованный этап — интеграция main и maintenance,
+> минимальное исправление NLM-027 и ревью в `codex/integrate-0.3.0`.
+> Это не команда выполнять все последующие этапы упаковки или публикации.
+> См. `docs/reviews/2026-09-19-app-0.3.0-integration.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Port the reviewed runtime-v1 foundation to current main and ship one 0.3.0 container whose latest code can be manually replaced at next full launch by the exact published 0.2.16 runtime.
