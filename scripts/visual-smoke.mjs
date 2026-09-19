@@ -245,7 +245,7 @@ async function capture(name, viewport, scenario) {
           }
           if (command === "runtime_status") {
             return {
-              containerVersion: "0.2.16",
+              containerVersion: "0.3.0",
               selectedSlot: "latest",
               activeSlot: "latest",
               pendingSlot: null,
@@ -419,6 +419,10 @@ async function capture(name, viewport, scenario) {
   } else {
     const start = page.getByRole("button", { name: /Старт/ });
     await start.waitFor();
+    const installedVersion = page.locator(".settings-panel > :last-child");
+    if ((await installedVersion.textContent()).trim() !== "Версия приложения 0.3.0") {
+      throw new Error(`${name} must show the installed container version at the bottom of settings`);
+    }
     await page.getByText("Stray", { exact: true }).waitFor();
     await start.click();
     await page.getByRole("button", { name: /Стоп/ }).waitFor();

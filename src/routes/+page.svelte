@@ -1833,6 +1833,9 @@
           >
             Выбрать другой пир
           </button>
+          {#if runtimeStatus?.containerVersion}
+            <p class="installed-version">Версия приложения {runtimeStatus.containerVersion}</p>
+          {/if}
         </aside>
       </div>
     {:else if view === "access_expired"}
@@ -2238,6 +2241,12 @@
 
   .binding-action {
     width: 100%;
+  }
+
+  .installed-version {
+    margin: 0;
+    color: #9ca5ad;
+    font-size: 12px;
   }
 
   .error-message {
