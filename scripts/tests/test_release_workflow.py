@@ -8,6 +8,28 @@ from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_checks_android_setup_does_not_request_retired_sdk_tools(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        steps = workflow["jobs"]["android-plugin"]["steps"]
+        setup = next(step for step in steps
+                     if step.get("uses", "").startswith("android-actions/setup-android@"))
+        self.assertEqual(setup.get("with", {}).get("packages"), "",
+                         "SDK packages are installed explicitly in the following sdkmanager step")
+
+    def test_checks_install_yaml_before_running_workflow_validator(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        steps = workflow["jobs"]["contracts-python"]["steps"]
+        gate = next(index for index, step in enumerate(steps)
+                    if "scripts/release-workflow-check.py" in step.get("run", ""))
+        dependencies = []
+        for step in steps[:gate]:
+            command = shlex.split(step.get("run", ""))
+            if command[:4] == ["python", "-m", "pip", "install"]:
+                dependencies.extend(command[4:])
+        self.assertTrue(any(re.split(r"[<>=!~]", value)[0].lower() == "pyyaml"
+                            for value in dependencies),
+                        "release-workflow-check imports yaml on a fresh CI runner")
+
     def test_every_source_gate_receives_the_selected_release_mode(self):
         workflow = self.workflow()
         for name, job in workflow["jobs"].items():
@@ -55,12 +77,16 @@ class ReleaseWorkflowTest(unittest.TestCase):
         return yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
 
     def test_fresh_verify_host_builds_shared_contract_cli_before_python_consumers(self):
-        commands = [step.get("run", "") for step in self.workflow()["jobs"]["verify"]["steps"]]
-        build = next((index for index, command in enumerate(commands)
-                      if "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest" in command), None)
-        self.assertIsNotNone(build, "fresh runner has no shared verifier executable for Python gates")
-        gate = next(index for index, command in enumerate(commands) if "scripts/release-workflow-check.py" in command)
-        self.assertLess(build, gate)
+        checks = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
+        for name, job in (("release", self.workflow()["jobs"]["verify"]),
+                          ("checks", checks["jobs"]["contracts-python"])):
+            with self.subTest(workflow=name):
+                commands = [step.get("run", "") for step in job["steps"]]
+                build = next((index for index, command in enumerate(commands)
+                              if "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest" in command), None)
+                self.assertIsNotNone(build, "fresh runner has no shared verifier executable for Python gates")
+                gate = next(index for index, command in enumerate(commands) if "scripts/release-workflow-check.py" in command)
+                self.assertLess(build, gate)
 
     def test_only_separate_promotion_can_write_and_cannot_build_or_sign(self):
         workflow = self.workflow()
