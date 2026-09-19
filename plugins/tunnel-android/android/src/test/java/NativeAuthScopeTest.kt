@@ -43,6 +43,266 @@ class NativeAuthScopeTest {
         assertEquals("new-token", saved.active?.token)
     }
 
+    @Test fun authenticatedSuccessorRuntimeAdoptsCredentialAndReissuesToken() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val predecessor = operation(epoch = 3)
+        var current = store.beginOwnerOperation(0, predecessor, false).value()
+        current = store.configure(current.revision, BackgroundCredentialProvision(
+            predecessor.scope.deviceId, "https://synthetic.invalid", "predecessor-token",
+            9999999999, "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(0, false, 1),
+        )).value()
+        val successor = operation(attempt = 2, epoch = 3).let { operation ->
+            operation.copy(scope = operation.scope.copy(
+                slot = "latest",
+                containerVersion = "0.3.0",
+                runtimeVersion = "0.3.0",
+                sessionGeneration = 8,
+            ))
+        }
+        val request = BackgroundUiProvisionRequest(
+            current.revision, successor.scope.deviceId, "https://synthetic.invalid",
+            "successor-access", "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(0, false, 1), successor.scope,
+        )
+
+        val begun = store.beginProvisionOperation(request, successor).value()
+        var issued = 0
+        val saved = store.withOwnerOperation(successor) {
+            provisionOwnedBackgroundCredential(
+                store, request.copy(expectedRevision = begun.revision), "noop", 100,
+                provision = { error("disabled capability must use bearer issuance") },
+                rotate = { error("predecessor token must not rotate under successor scope") },
+                legacy = {
+                    issued++
+                    BackgroundCredential(
+                        successor.scope.deviceId,
+                        request.panelBase,
+                        "successor-token",
+                        1000,
+                    )
+                },
+            )
+        }
+
+        assertEquals(1, issued)
+        assertEquals(successor.scope, saved.ownerScope)
+        assertEquals("successor-token", saved.active?.token)
+        assertEquals(1000L, saved.active?.expiresAtUnix)
+    }
+
+    @Test fun successorRuntimeProvisionRemainsUsableByQuickTileRecoveryStart() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val predecessor = operation(epoch = 3)
+        var current = store.beginOwnerOperation(0, predecessor, false).value()
+        current = store.configure(current.revision, BackgroundCredentialProvision(
+            predecessor.scope.deviceId, "https://synthetic.invalid", "predecessor-token",
+            9999999999, "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(0, false, 1),
+        )).value()
+        val successor = operation(attempt = 2, epoch = 3).let { operation ->
+            operation.copy(scope = operation.scope.copy(
+                slot = "latest",
+                containerVersion = "0.3.0",
+                runtimeVersion = "0.3.0",
+                sessionGeneration = 8,
+            ))
+        }
+        val request = BackgroundUiProvisionRequest(
+            current.revision, successor.scope.deviceId, "https://synthetic.invalid",
+            "successor-access", "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(0, false, 1), successor.scope,
+        )
+
+        val begun = store.beginProvisionOperation(request, successor).value()
+        val saved = store.withOwnerOperation(successor) {
+            provisionOwnedBackgroundCredential(
+                store, request.copy(expectedRevision = begun.revision), "noop", 100,
+                provision = { error("disabled capability must use bearer issuance") },
+                rotate = { error("predecessor token must not rotate under successor scope") },
+                legacy = {
+                    BackgroundCredential(
+                        successor.scope.deviceId,
+                        request.panelBase,
+                        "successor-token",
+                        1000,
+                    )
+                },
+            )
+        }
+        assertEquals("successor-token", saved.active?.token)
+
+        val policy = selectQuickStartPolicy(
+            store = store,
+            template = AndroidIntentTemplate(
+                deviceId = successor.scope.deviceId,
+                accountScope = "account-1",
+                layer = "stray",
+                ticConnectionMode = "dynamic",
+                routeMode = "standalone",
+                egressMode = "ipv4",
+                allowAlternate = true,
+            ),
+            nowUnix = 100,
+            fetch = {
+                BackgroundCapabilitySnapshot(
+                    revision = 1,
+                    enabled = true,
+                    expiresAtUnix = 2000,
+                    reserveEnabled = true,
+                )
+            },
+        )
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val selected = dispatch.toggle(
+            expectedGeneration = 0,
+            durableDesiredActive = false,
+        ) as AndroidQuickToggleDispatch.Start
+        var recoveryStarts = 0
+        var legacyStarts = 0
+
+        val result = executeDispatchedQuickStart(
+            dispatch = dispatch,
+            start = selected,
+            selectPolicy = { policy },
+            recoveryStart = {
+                recoveryStarts += 1
+                AndroidCoordinatorResult.Accepted(AndroidRecoveryEnvelope.empty(1))
+            },
+            legacyStart = { legacyStarts += 1 },
+        )
+
+        assertTrue(result is AndroidQuickStartExecution.RecoveryAccepted)
+        assertEquals(1, recoveryStarts)
+        assertEquals(0, legacyStarts)
+    }
+
+    @Test fun successorRuntimeAcceptsACompletedCredentialRotation() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val predecessor = operation(epoch = 3)
+        var current = store.beginOwnerOperation(0, predecessor, false).value()
+        current = store.configure(current.revision, BackgroundCredentialProvision(
+            predecessor.scope.deviceId, "https://synthetic.invalid", "predecessor-token",
+            1000, "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(1, true, 2000),
+        )).value()
+        current = store.reserveMutation(
+            current.revision,
+            "prepare",
+            predecessor.scope.deviceId,
+            1500,
+            100,
+            "activate",
+        ).value()
+        current = store.savePendingToken(
+            current.revision,
+            "prepare",
+            BackgroundPendingToken("rotated-token", 1500, 2, "prepare", "activate", 1),
+            100,
+        ).value()
+        current = store.promotePending(current.revision, "activate", 1500).value()
+        assertNotNull(current.previous)
+
+        val successor = operation(attempt = 2, epoch = 3).let { operation ->
+            operation.copy(scope = operation.scope.copy(
+                slot = "latest",
+                containerVersion = "0.3.0",
+                runtimeVersion = "0.3.0",
+                sessionGeneration = 8,
+            ))
+        }
+        val request = BackgroundUiProvisionRequest(
+            current.revision, successor.scope.deviceId, "https://synthetic.invalid",
+            "successor-access", "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(1, true, 2000), successor.scope,
+        )
+
+        assertTrue(
+            store.beginProvisionOperation(request, successor) is CredentialStoreResult.Success,
+        )
+    }
+
+    @Test fun successorRuntimeAdoptionRejectsDifferentAuthorityOrNonIncreasingGeneration() {
+        val predecessor = operation(epoch = 3)
+        val validSuccessor = operation(attempt = 2, epoch = 3).scope.copy(
+            runtimeVersion = "0.3.0",
+            sessionGeneration = 8,
+        )
+        val variants = listOf(
+            Triple(operation(attempt = 2, epoch = 4).scope.copy(sessionGeneration = 8),
+                "https://synthetic.invalid", "synthetic-install"),
+            Triple(operation(attempt = 2, epoch = 3).scope.copy(
+                family = "other-family", sessionGeneration = 8),
+                "https://synthetic.invalid", "synthetic-install"),
+            Triple(operation(attempt = 2, epoch = 3).scope.copy(
+                deviceId = "33333333-3333-4333-8333-333333333333",
+                sessionGeneration = 8,
+            ), "https://synthetic.invalid", "synthetic-install"),
+            Triple(operation(attempt = 2, epoch = 3).scope.copy(
+                runtimeVersion = "0.3.0",
+                sessionGeneration = 7,
+            ), "https://synthetic.invalid", "synthetic-install"),
+            Triple(operation(attempt = 2, epoch = 3).scope.copy(
+                runtimeVersion = "0.3.0",
+                sessionGeneration = 6,
+            ), "https://synthetic.invalid", "synthetic-install"),
+            Triple(validSuccessor, "https://other.invalid", "synthetic-install"),
+            Triple(validSuccessor, "https://synthetic.invalid", "other-install"),
+        )
+        for ((scope, panelBase, installSecret) in variants) {
+            val store = BackgroundCredentialStore(MemoryBackend())
+            var current = store.beginOwnerOperation(0, predecessor, false).value()
+            current = store.configure(current.revision, BackgroundCredentialProvision(
+                predecessor.scope.deviceId, "https://synthetic.invalid", "predecessor-token",
+                9999999999, "synthetic-install", 1,
+                BackgroundCapabilitySnapshot(0, false, 1),
+            )).value()
+            val successor = operation(attempt = 2, epoch = scope.authEpoch).copy(scope = scope)
+            val request = BackgroundUiProvisionRequest(
+                current.revision, successor.scope.deviceId, panelBase,
+                "successor-access", installSecret, 1,
+                BackgroundCapabilitySnapshot(0, false, 1), successor.scope,
+            )
+
+            assertTrue(store.beginProvisionOperation(request, successor) is CredentialStoreResult.Failure)
+            assertEquals(current, store.read().value())
+        }
+    }
+
+    @Test fun successorRuntimeCannotAdoptAnUnfinishedCredentialMutation() {
+        val store = BackgroundCredentialStore(MemoryBackend())
+        val predecessor = operation(epoch = 3)
+        var current = store.beginOwnerOperation(0, predecessor, false).value()
+        current = store.configure(current.revision, BackgroundCredentialProvision(
+            predecessor.scope.deviceId, "https://synthetic.invalid", "predecessor-token",
+            9999999999, "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(1, true, 9999999999),
+        )).value()
+        current = store.reserveMutation(
+            current.revision,
+            "predecessor-prepare",
+            predecessor.scope.deviceId,
+            1000,
+            100,
+            "predecessor-activate",
+        ).value()
+        val successor = operation(attempt = 2, epoch = 3).let { operation ->
+            operation.copy(scope = operation.scope.copy(
+                containerVersion = "0.3.0",
+                runtimeVersion = "0.3.0",
+                sessionGeneration = 8,
+            ))
+        }
+        val request = BackgroundUiProvisionRequest(
+            current.revision, successor.scope.deviceId, "https://synthetic.invalid",
+            "successor-access", "synthetic-install", 1,
+            BackgroundCapabilitySnapshot(1, true, 9999999999), successor.scope,
+        )
+
+        assertTrue(store.beginProvisionOperation(request, successor) is CredentialStoreResult.Failure)
+        assertEquals(current, store.read().value())
+    }
+
     @Test fun legacyProvisionRejectsOtherDevicePanelAndCancelledOwnerWithoutChangingRecord() {
         for (variant in 0..3) {
             val store = BackgroundCredentialStore(MemoryBackend())

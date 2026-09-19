@@ -17,6 +17,15 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun quickPlanCleanupFailureCannotEscapeSuccessfulTunnelCompletion() {
+        assertFalse(
+            clearQuickPlanAfterSaveFailure {
+                throw IllegalStateException("keystore unavailable")
+            },
+        )
+    }
+
+    @Test
     fun exhaustionDistinguishesUnreadableLogoutFromKnownPendingLogout() {
         val backend = ServiceRecoveryBackend().apply { readFails = true }
         val coordinator = coordinator(recoveryStore(backend))

@@ -65,6 +65,12 @@ internal data class NativeOwnerScope(
     }
 }
 
+internal fun NativeOwnerScope.isSuccessorOf(predecessor: NativeOwnerScope): Boolean =
+    authEpoch == predecessor.authEpoch &&
+        family == predecessor.family &&
+        deviceId == predecessor.deviceId &&
+        sessionGeneration > predecessor.sessionGeneration
+
 internal data class NativeOwnerOperation(
     val scope: NativeOwnerScope,
     val operationId: String,

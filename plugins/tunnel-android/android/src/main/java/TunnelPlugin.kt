@@ -1073,7 +1073,10 @@ internal object TunnelRuntime {
                         QuickTunnelPlanStore.save(applicationContext, quickPlan)
                     } catch (error: Throwable) {
                         TunnelLog.warning("quick_plan.save_failed", error = error)
-                        if (!QuickTunnelPlanStore.clear(applicationContext)) {
+                        if (!clearQuickPlanAfterSaveFailure {
+                                QuickTunnelPlanStore.clear(applicationContext)
+                            }
+                        ) {
                             TunnelLog.warning("quick_plan.clear_failed")
                         }
                     } finally {
@@ -2701,9 +2704,9 @@ internal fun StartTunnelArgs.clearSensitiveConfigurations() {
 }
 
 internal fun StartTunnelArgs.canCacheQuickPlan(): Boolean =
-    cacheQuickAction && configurationInitialized && redundancy == null
+    cacheQuickAction && configurationInitialized && quickConnection != null
 
-private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
+internal fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
     if (!canCacheQuickPlan()) return null
     return StartTunnelArgs().also { copy ->
         copy.apiVersion = apiVersion
@@ -2721,7 +2724,9 @@ private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
         }
         copy.cacheQuickAction = true
         copy.quickActionValidUntilUnix = quickActionValidUntilUnix
-        copy.quickConnection = quickConnection?.copy()
+        copy.quickConnection = quickConnection?.copy()?.also { connection ->
+            if (redundancy != null) connection.leaseId = ""
+        }
     }
 }
 

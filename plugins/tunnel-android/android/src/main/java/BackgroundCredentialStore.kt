@@ -423,8 +423,22 @@ internal class BackgroundCredentialStore(
                 current.cleanupCredential == null && current.active?.let {
                     it.ownerScope == null && it.deviceId == provision.deviceId && it.panelBase == provision.panelBase
                 } == true
+            // Runtime transitions preserve the authenticated family and device
+            // while advancing the server-issued session generation. The
+            // current owner may adopt that exact predecessor only through this
+            // bearer-authenticated provisioning path; unfinished mutations and
+            // logout state remain fenced.
+            val successorProvision = provision != null && provision.ownerScope == operation.scope &&
+                current.ownerScope?.let(operation.scope::isSuccessorOf) == true &&
+                provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
+                current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
+                provision.installSecret.isNotBlank() && current.installSecret == provision.installSecret &&
+                current.ownerCancelEpoch == null && current.logoutState == null &&
+                current.pending == null && current.reservation == null &&
+                current.cleanupCredential == null && current.active != null
             if (current.ownerScope != operation.scope &&
-                (requireExistingScope || (!finalizedClean && !legacyProvision && (current.ownerScope != null || hasCredentials)))
+                (requireExistingScope || (!finalizedClean && !legacyProvision && !successorProvision &&
+                    (current.ownerScope != null || hasCredentials)))
             ) throw MutationFailure("background_owner_scope_mismatch")
             if (current.ownerOperation == operation) return@mutate current
             if (operation.attempt <= current.ownerAttempt) throw MutationFailure("background_owner_cancelled")
@@ -432,7 +446,9 @@ internal class BackgroundCredentialStore(
                 ownerOperation = operation, ownerAttempt = operation.attempt,
                 // Retain the proof for owner-checked recovery/cleanup, but force
                 // bearer reprovision instead of treating it as a fresh token.
-                active = if (legacyProvision) current.active?.copy(expiresAtUnix = 1) else current.active)
+                active = if (legacyProvision || successorProvision) {
+                    current.active?.copy(expiresAtUnix = 1)
+                } else current.active)
         }
     }
 

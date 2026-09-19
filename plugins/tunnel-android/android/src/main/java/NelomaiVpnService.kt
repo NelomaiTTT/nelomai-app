@@ -179,6 +179,9 @@ internal class RedundantStartOperationGate {
     }
 }
 
+internal fun clearQuickPlanAfterSaveFailure(clear: () -> Boolean): Boolean =
+    runCatching(clear).getOrDefault(false)
+
 internal fun cancelPendingRedundantStartForBackgroundLogout(
     gate: RedundantStartOperationGate,
 ): String? = gate.cancelPendingAndComplete()
@@ -1141,6 +1144,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     private fun startRedundantClient(args: StartTunnelArgs, receiver: ResultReceiver?) {
         val startedAt = System.nanoTime()
         val clientOperationId = requireNotNull(args.clientOperationId)
+        val quickPlan = args.copyForQuickPlan()
         var nativeOwner: ServiceRedundantConnectionNative? = null
         var coordinatorOwner: RedundantConnectionCoordinator? = null
         try {
@@ -1184,6 +1188,27 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                             )) {
                                 RedundantPrimaryReadyDisposition.RUNNING -> {
                                     redundantStartOperation.complete(clientOperationId) {
+                                        quickPlan?.let { plan ->
+                                            try {
+                                                QuickTunnelPlanStore.save(
+                                                    applicationContext,
+                                                    plan,
+                                                )
+                                            } catch (error: Throwable) {
+                                                TunnelLog.warning(
+                                                    "quick_plan.save_failed",
+                                                    error = error,
+                                                )
+                                                if (!clearQuickPlanAfterSaveFailure {
+                                                        QuickTunnelPlanStore.clear(
+                                                            applicationContext,
+                                                        )
+                                                    }
+                                                ) {
+                                                    TunnelLog.warning("quick_plan.clear_failed")
+                                                }
+                                            }
+                                        }
                                         QuickTunnelController.updateState(
                                             applicationContext,
                                             SessionState.RUNNING,

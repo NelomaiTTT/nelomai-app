@@ -84,14 +84,25 @@ class RedundantStartArgsTest {
     }
 
     @Test
-    fun `redundant starts cannot enter the legacy quick plan`() {
+    fun `redundant starts retain a quick template for later tile restart`() {
         val args = StartTunnelArgs().also {
             it.configuration = byteArrayOf(1)
             it.cacheQuickAction = true
+            it.quickConnection = QuickConnectionArgs().also { connection ->
+                connection.leaseId = "10000000-0000-4000-8000-000000000001"
+                connection.layer = "stray"
+                connection.ticConnectionMode = "dynamic"
+                connection.routeMode = "standalone"
+                connection.egressMode = "ipv4"
+            }
             it.redundancy = RedundantStartArgs()
         }
 
-        assertFalse(args.canCacheQuickPlan())
+        assertTrue(args.canCacheQuickPlan())
+        val plan = requireNotNull(args.copyForQuickPlan())
+        assertEquals(null, plan.redundancy)
+        assertEquals("", plan.quickConnection?.leaseId)
+        assertEquals("stray", plan.quickConnection?.layer)
     }
 
     @Test
