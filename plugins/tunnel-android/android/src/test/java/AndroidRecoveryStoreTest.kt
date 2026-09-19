@@ -643,6 +643,42 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun legacyDisabledStandbyRecordReplaysReleaseButAcknowledgedRecordDoesNot() {
+        val backend = FakeEncryptedRecordBackend()
+        val disabled = redundantTransaction("v2-start").copy(
+            standbyDesired = false,
+            slotBLeaseId = null,
+        )
+        store(backend).beginRedundant(disabled).success()
+        val payload = org.json.JSONObject(requireNotNull(backend.record).toString(Charsets.UTF_8))
+        payload.getJSONObject("redundantTransaction").getJSONObject("retry")
+            .remove("standbyReleasePending")
+        backend.record = payload.toString().toByteArray(Charsets.UTF_8)
+
+        val restored = requireNotNull(store(backend).read().success().redundantTransaction)
+        assertTrue(restored.retry.standbyReleasePending)
+
+        store(backend).updateRedundant("v2-start") {
+            it.copy(retry = it.retry.copy(standbyReleasePending = false))
+        }.success()
+        assertFalse(requireNotNull(store(backend).read().success().redundantTransaction)
+            .retry.standbyReleasePending)
+    }
+
+    @Test
+    fun legacyEnabledStandbyRecordDoesNotQueueRelease() {
+        val backend = FakeEncryptedRecordBackend()
+        store(backend).beginRedundant(redundantTransaction("v2-start")).success()
+        val payload = org.json.JSONObject(requireNotNull(backend.record).toString(Charsets.UTF_8))
+        payload.getJSONObject("redundantTransaction").getJSONObject("retry")
+            .remove("standbyReleasePending")
+        backend.record = payload.toString().toByteArray(Charsets.UTF_8)
+
+        val restored = requireNotNull(store(backend).read().success().redundantTransaction)
+        assertFalse(restored.retry.standbyReleasePending)
+    }
+
+    @Test
     fun pendingNativeSwitchMustTargetTheRecordedMembershipAndSlot() {
         val invalid = redundantTransaction("v2-start").copy(
             retry = AndroidRedundantRetryState(

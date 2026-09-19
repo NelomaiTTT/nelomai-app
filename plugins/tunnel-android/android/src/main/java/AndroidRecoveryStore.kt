@@ -184,6 +184,7 @@ internal data class AndroidRedundantRetryState(
     val acquirePending: Boolean = false,
     val acquireOperationId: String? = null,
     val acquireReplaceLeaseId: String? = null,
+    val standbyReleasePending: Boolean = false,
     val pendingNativeSourceLeaseId: String? = null,
     val pendingNativeActiveLeaseId: String? = null,
     val pendingNativeActiveSlot: RedundantSlot? = null,
@@ -448,6 +449,7 @@ internal object AndroidRecoveryEnvelopeCodec {
             transaction.retry.pendingRoleLeaseId?.let { put("pendingRoleLeaseId", it) }
             transaction.retry.pendingRoleReason?.let { put("pendingRoleReason", it) }
             put("acquirePending", transaction.retry.acquirePending)
+            put("standbyReleasePending", transaction.retry.standbyReleasePending)
             transaction.retry.acquireOperationId?.let { put("acquireOperationId", it) }
             if (transaction.retry.acquirePending) {
                 put("acquireReplaceLeaseId", transaction.retry.acquireReplaceLeaseId ?: JSONObject.NULL)
@@ -528,6 +530,11 @@ internal object AndroidRecoveryEnvelopeCodec {
                 acquirePending = retry.optBoolean("acquirePending", false),
                 acquireOperationId = retry.optionalString("acquireOperationId"),
                 acquireReplaceLeaseId = retry.optionalString("acquireReplaceLeaseId"),
+                // Legacy disabled checkpoints did not distinguish pending release from its ACK.
+                // Replay once when upgrading; new checkpoints persist the distinction.
+                standbyReleasePending = retry.optBoolean(
+                    "standbyReleasePending", !payload.getBoolean("standbyDesired"),
+                ),
                 pendingNativeSourceLeaseId = retry.optionalString("pendingNativeSourceLeaseId"),
                 pendingNativeActiveLeaseId = retry.optionalString("pendingNativeActiveLeaseId"),
                 pendingNativeActiveSlot = retry.optionalString("pendingNativeActiveSlot")
@@ -1030,6 +1037,7 @@ internal class AndroidRecoveryStore(
                     acquirePending = false,
                     acquireOperationId = null,
                     acquireReplaceLeaseId = null,
+                    standbyReleasePending = false,
                     pendingNativeSourceLeaseId = null,
                     pendingNativeActiveLeaseId = null,
                     pendingNativeActiveSlot = null,

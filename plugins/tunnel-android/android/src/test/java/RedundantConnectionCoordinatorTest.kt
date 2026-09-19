@@ -1464,14 +1464,19 @@ class RedundantConnectionCoordinatorTest {
 
     @Test
     fun recoveryDrainsPendingAcquireWithItsOriginalOperationAndInactiveReplaceLease() {
+        var nowMs = 1_000_000L
         val store = store(transaction())
         val panel = FakePanel(acquireFailures = ArrayDeque(listOf(true, false)))
-        val first = RedundantConnectionCoordinator(store, panel, FakeNative())
+        val first = RedundantConnectionCoordinator(store, panel, FakeNative(), epochNowMs = { nowMs })
 
         assertFalse(first.acquireAndCommitStandby("acquire-1", replaceLeaseId = "lease-b"))
         assertEquals("lease-b", requireNotNull(first.status()).retry.acquireReplaceLeaseId)
 
-        assertTrue(RedundantConnectionCoordinator(store, panel, FakeNative()).recover())
+        val reconstructed = RedundantConnectionCoordinator(store, panel, FakeNative(), epochNowMs = { nowMs })
+        assertTrue(reconstructed.recover())
+        assertEquals(listOf("acquire-1"), panel.acquireOperationIds)
+        nowMs += 300_000L
+        assertTrue(reconstructed.tick())
         assertEquals(listOf("acquire-1", "acquire-1"), panel.acquireOperationIds)
         assertEquals(listOf("lease-b", "lease-b"), panel.acquireReplaceLeaseIds)
     }
