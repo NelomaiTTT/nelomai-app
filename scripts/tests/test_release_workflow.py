@@ -8,6 +8,11 @@ from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_linux_diagnostic_source_gate_tracks_current_version(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())
+        commands = '\n'.join(step.get('run', '') for step in workflow['jobs']['linux-package-diagnostic']['steps'])
+        self.assertIn('--version 0.3.0 --mode build_only', commands)
+
     def test_030_signing_downloads_pinned_stable_before_signing_containers(self):
         workflow = self.workflow()
         self.assertEqual(workflow[True]["workflow_dispatch"]["inputs"]["version"]["default"], "0.3.0")

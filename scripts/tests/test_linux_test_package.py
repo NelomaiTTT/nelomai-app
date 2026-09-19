@@ -6,6 +6,18 @@ from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, PREFIX,
 
 
 class LinuxTestPackageTest(ArtifactFixture):
+    def test_current_linux_diagnostic_consumes_030_native_drafts(self):
+        builder = module('package-linux-test')
+        draft = self.root / 'draft'
+        module('build-runtime-manifest').package(self.payload, draft / 'latest', '0.3.0', SOURCE,
+            'linux', 'x86_64', self.keyfile)
+        for name in ('draft-public-key.raw', 'runtime-public-key.raw'):
+            shutil.copyfile(self.public, draft / name)
+        result = builder.stage(draft, self.root / 'staged', SOURCE, self.keyfile, self.public, version='0.3.0')
+        self.assertEqual(result['container_version'], '0.3.0')
+        self.assertEqual((self.root / 'staged/runtime/engines/latest/0.3.0/nelomai-runtime').read_bytes(),
+                         (self.payload / 'nelomai-runtime').read_bytes())
+
     def stage(self, source=SOURCE):
         self.assertTrue((SCRIPTS / 'package-linux-test.py').is_file(), 'Linux-only packaging is missing')
         return module('package-linux-test').stage(
