@@ -586,7 +586,9 @@ internal class RedundantConnectionCoordinator(
         }
         val activeIndex = transaction.slotIndex(transaction.localActiveLeaseId)
             ?: return@synchronized false
-        val bounded = observations.map { it.copy(active = it.index == activeIndex) }
+        val bounded = observations
+            .filter { transaction.standbyDesired || it.index == activeIndex }
+            .map { it.copy(active = it.index == activeIndex) }
         val replacingIndex = transaction.slotIndex(transaction.retry.acquireReplaceLeaseId)
         if (transaction.retry.acquirePending && transaction.candidateLeaseId == null &&
             replacingIndex != null && bounded.firstOrNull { it.index == replacingIndex }?.let {
@@ -605,6 +607,25 @@ internal class RedundantConnectionCoordinator(
         val decision = healthMonitor.evaluateHealth(elapsedNow(), bounded)
         val switchIndex = decision.switchTo
         if (switchIndex != null) {
+            val candidate = transaction.candidateLeaseId
+            val candidateIndex = transaction.candidateSlot?.let {
+                if (it == RedundantSlot.A) 0 else 1
+            }
+            if (candidate != null && switchIndex == candidateIndex) {
+                // Native already replaced the old member at this index. Commit its new
+                // identity before switching; never activate the stale canonical lease.
+                val committed = advanceCandidateLocked(transaction, bounded, forFailover = true)
+                val current = status() ?: return@synchronized false
+                if (!committed || current.candidateLeaseId != null ||
+                    current.leaseIdAt(switchIndex) != candidate
+                ) {
+                    emitTotalLossCommandLocked(current)
+                    return@synchronized false
+                }
+                return@synchronized switchActiveLocked(
+                    current, candidate, requireNotNull(current.localActiveLeaseId), HEALTH_FAILOVER_REASON,
+                )
+            }
             val target = transaction.leaseIdAt(switchIndex) ?: return@synchronized false
             val failed = transaction.localActiveLeaseId ?: return@synchronized false
             if (target == failed) return@synchronized false
@@ -618,6 +639,18 @@ internal class RedundantConnectionCoordinator(
         if (decision.sessionStalled) {
             emitTotalLossCommandLocked(transaction)
             return@synchronized false
+        }
+        if (transaction.standbyDesired && !transaction.retry.acquirePending &&
+            transaction.candidateLeaseId == null && bounded.singleOrNull { it.active }?.let {
+                healthMonitor.ready(elapsedNow(), it)
+            } == true
+        ) {
+            val inactive = listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
+                .firstOrNull { it != transaction.localActiveLeaseId }
+            val observation = bounded.singleOrNull { it.index == transaction.slotIndex(inactive) }
+            if (inactive == null || observation == null || healthMonitor.failed(elapsedNow(), observation)) {
+                if (!persist(scheduleReplacement(transaction, inactive))) return@synchronized false
+            }
         }
         publishReserveStateLocked(status() ?: transaction, bounded)
         true
@@ -641,13 +674,13 @@ internal class RedundantConnectionCoordinator(
         if (transaction.retry.hasPendingNativeSwitch()) {
             return@synchronized drainPendingNativeSwitchLocked(transaction)
         }
-        if (!transaction.standbyDesired) {
-            return@synchronized drainStandbyReleaseLocked(transaction)
-        }
         val observations = try {
             native.healthObservations()
         } catch (_: Throwable) {
-            return@synchronized false
+            // Cleanup must remain replayable even if native telemetry is unavailable.
+            return@synchronized if (!transaction.standbyDesired) {
+                drainStandbyReleaseLocked(transaction)
+            } else false
         }
         if (observations.isNotEmpty() && !onHealthObservations(observations)) {
             return@synchronized false
@@ -776,10 +809,11 @@ internal class RedundantConnectionCoordinator(
         if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (transaction.retry.hasPendingNativeSwitch()) return@synchronized false
+        if (!transaction.standbyDesired) return@synchronized drainStandbyReleaseLocked(transaction)
         // Fence future acquire/commit before the panel release can be retried.
         val fenced = transaction.copy(
             standbyDesired = false,
-            retry = transaction.retry.cancelAcquire(),
+            retry = transaction.retry.cancelAcquire().copy(standbyReleasePending = true),
         )
         candidateWarmupLeaseId = null
         failoverActive = false
@@ -793,6 +827,9 @@ internal class RedundantConnectionCoordinator(
         val inactive = listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
             .firstOrNull { it != transaction.localActiveLeaseId }
         val candidate = transaction.candidateLeaseId
+        if (!transaction.retry.standbyReleasePending && inactive == null && candidate == null) {
+            return true
+        }
         if (candidate != null && candidate != inactive) {
             if (nativeDataplaneStartedLocked() && !native.stopSlot(candidate)) return false
             transaction = transaction.copy(candidateLeaseId = null, candidateSlot = null)
@@ -805,19 +842,21 @@ internal class RedundantConnectionCoordinator(
             panel.releaseStandby(transaction, inactive)
         } catch (error: Throwable) {
             return if (error is BackgroundConnectionException &&
-                error.code in REDUNDANT_RELEASE_REBASE_CODES
+                error.code in REDUNDANT_GENERATION_CONFLICT_CODES
             ) {
                 rebaseStandbyReleaseLocked(transaction)
             } else {
                 false
             }
         }
-        return persist(transaction.withCanonical(session).copy(
+        val released = transaction.withCanonical(session)
+        return persist(released.copy(
             standbyDesired = false,
             candidateLeaseId = null,
             candidateSlot = null,
-        )).also { released ->
-            if (released) publishReserveStateLocked(null, emptyList())
+            retry = released.retry.copy(standbyReleasePending = false),
+        )).also { persisted ->
+            if (persisted) publishReserveStateLocked(null, emptyList())
         }
     }
 
@@ -881,7 +920,8 @@ internal class RedundantConnectionCoordinator(
                 requireNotNull(staged.retry.acquireOperationId),
                 staged.retry.acquireReplaceLeaseId,
             )
-        } catch (_: Throwable) {
+        } catch (error: Throwable) {
+            deferAcquireRetryLocked(staged, error)
             return@synchronized false
         }
         try {
@@ -926,6 +966,7 @@ internal class RedundantConnectionCoordinator(
     private fun advanceCandidateLocked(
         transaction: AndroidRedundantTransaction,
         observations: List<SlotObservation>?,
+        forFailover: Boolean = false,
     ): Boolean {
         val candidateLeaseId = transaction.candidateLeaseId ?: return false
         val candidateSlot = transaction.candidateSlot ?: return false
@@ -937,6 +978,14 @@ internal class RedundantConnectionCoordinator(
                 retry = transaction.retry.cancelAcquire(),
             ))
         }
+        val dueAtUnix = transaction.retry.nextRetryAtUnix
+        if (dueAtUnix != null && currentUnixSeconds() < dueAtUnix) {
+            if (!forFailover) return true
+            // A failed active member cannot wait for background retry. Only confirm
+            // an already committed candidate; do not replay acquire/commit early.
+            val session = reconcileCandidateCommitLocked(transaction) ?: return false
+            return completeCandidateCommitLocked(transaction, session, observations.orEmpty())
+        }
         if (candidateWarmupLeaseId != candidateLeaseId) {
             val replayed = try {
                 panel.acquireStandby(
@@ -944,7 +993,13 @@ internal class RedundantConnectionCoordinator(
                     requireNotNull(transaction.retry.acquireOperationId),
                     transaction.retry.acquireReplaceLeaseId,
                 )
-            } catch (_: Throwable) {
+            } catch (error: Throwable) {
+                if (error is BackgroundConnectionException && error.code in REDUNDANT_GENERATION_CONFLICT_CODES) {
+                    reconcileCandidateCommitLocked(transaction)?.let { session ->
+                        return completeCandidateCommitLocked(transaction, session, observations.orEmpty())
+                    }
+                }
+                deferAcquireRetryLocked(transaction, error)
                 return false
             }
             try {
@@ -989,9 +1044,42 @@ internal class RedundantConnectionCoordinator(
         if (!healthMonitor.ready(elapsedNow(), observation)) return true
         val session = try {
             panel.commitCandidate(transaction, candidateLeaseId)
-        } catch (_: Throwable) {
-            return false
+        } catch (error: Throwable) {
+            reconcileCandidateCommitLocked(transaction, error) ?: run {
+                deferAcquireRetryLocked(transaction, error)
+                return false
+            }
         }
+        return completeCandidateCommitLocked(transaction, session, listOf(observation))
+    }
+
+    private fun reconcileCandidateCommitLocked(
+        transaction: AndroidRedundantTransaction,
+        commitError: Throwable? = null,
+    ): BackgroundRedundantSession? {
+        val candidate = transaction.candidateLeaseId ?: return null
+        val session = canonicalStandbySessionLocked(transaction) ?: return null
+        val canonical = transaction.withCanonical(session)
+        if (session.containsCurrentLease(candidate) &&
+            canonical.slot(candidate) == transaction.candidateSlot
+        ) return session
+        // A rejected commit at unchanged generations is not a lost successful commit:
+        // with the same valid active member, the candidate is no longer committable.
+        // In particular TTL cleanup leaves canonical generations unchanged.
+        if (commitError is BackgroundConnectionException &&
+            commitError.code == REDUNDANT_ROLE_MEMBERSHIP_CONFLICT &&
+            session.standbyDesired && !session.containsCurrentLease(candidate) &&
+            session.roleGeneration == transaction.roleGeneration &&
+            session.membershipGeneration == transaction.membershipGeneration
+        ) discardConsumedCandidateLocked(transaction, session)
+        return null
+    }
+
+    private fun completeCandidateCommitLocked(
+        transaction: AndroidRedundantTransaction,
+        session: BackgroundRedundantSession,
+        observations: List<SlotObservation>,
+    ): Boolean {
         val canonical = transaction.withCanonical(session)
         val committed = canonical.copy(
             candidateLeaseId = null,
@@ -1003,10 +1091,10 @@ internal class RedundantConnectionCoordinator(
                 acquireReplaceLeaseId = null,
             ),
         )
-        if (!persist(committed)) return false
+        if (!persistExactTransaction(transaction, committed)) return false
         candidateWarmupLeaseId = null
         failoverActive = false
-        publishReserveStateLocked(committed, listOf(observation))
+        publishReserveStateLocked(committed, observations)
         if (transaction.retry.acquireReplaceLeaseId != null) {
             onDiagnosticEvent(RedundantDiagnosticEvent.REPLACEMENT)
         }
@@ -1246,11 +1334,11 @@ internal class RedundantConnectionCoordinator(
 
     private fun scheduleReplacement(
         transaction: AndroidRedundantTransaction,
-        failedLeaseId: String,
+        failedLeaseId: String?,
     ): AndroidRedundantTransaction {
         if (!transaction.standbyDesired || transaction.retry.acquirePending) return transaction
         return transaction.copy(retry = transaction.retry.copy(
-            nextRetryAtUnix = replacementDeadlineUnix(),
+            nextRetryAtUnix = retryDeadlineUnix(REPLACEMENT_DELAY_SECONDS),
             acquirePending = true,
             acquireOperationId = operationId(),
             acquireReplaceLeaseId = failedLeaseId,
@@ -1259,11 +1347,69 @@ internal class RedundantConnectionCoordinator(
 
     private fun currentUnixSeconds(): Long = epochNowMs().coerceAtLeast(0L) / 1_000L
 
-    private fun replacementDeadlineUnix(): Long {
+    private fun deferAcquireRetryLocked(transaction: AndroidRedundantTransaction, error: Throwable) {
+        if (error is BackgroundConnectionException && error.code == "operation_id_conflict" &&
+            rebaseConsumedAcquireLocked(transaction)
+        ) return
+        val delaySeconds = ConnectionIntentErrorPolicy().retryAfterSeconds(
+            (error as? BackgroundConnectionException)?.retryAfterHeader,
+        )
+        persistExactTransaction(transaction, transaction.copy(retry = transaction.retry.copy(
+            nextRetryAtUnix = retryDeadlineUnix(delaySeconds),
+        )))
+    }
+
+    private fun canonicalStandbySessionLocked(
+        transaction: AndroidRedundantTransaction,
+    ): BackgroundRedundantSession? {
+        val response = try {
+            // Role acknowledgement returns canonical membership without reissuing
+            // configurations through the (possibly unavailable) old standby server.
+            panel.reportRole(transaction, "standby_reconcile")
+        } catch (_: Throwable) {
+            return null
+        }
+        val active = transaction.localActiveLeaseId ?: return null
+        val session = response.session
+        if (session.sessionId != transaction.sessionId ||
+            session.state !in setOf("allocating", "connected", "degraded") ||
+            response.localActiveLeaseId != active || session.activeLeaseId != active ||
+            !session.containsCurrentLease(active) || status() != transaction
+        ) return null
+        if (transaction.withCanonical(session).slot(active) != transaction.slot(active)) return null
+        return session
+    }
+
+    private fun rebaseConsumedAcquireLocked(transaction: AndroidRedundantTransaction): Boolean {
+        val session = canonicalStandbySessionLocked(transaction) ?: return false
+        return discardConsumedCandidateLocked(transaction, session)
+    }
+
+    private fun discardConsumedCandidateLocked(
+        transaction: AndroidRedundantTransaction,
+        session: BackgroundRedundantSession,
+    ): Boolean {
+        val canonical = transaction.withRecoveredCanonical(session)
+        // A consumed acquire ID cannot be replayed after candidate TTL cleanup.
+        // Reconcile first: the lease could also have become a current member.
+        val obsolete = transaction.candidateLeaseId?.takeUnless(session::containsCurrentLease)
+        if (obsolete != null && !mutateNative(transaction) { native.stopSlot(obsolete) }) return false
+        val cleared = canonical.copy(
+            candidateLeaseId = null,
+            candidateSlot = null,
+            retry = canonical.retry.cancelAcquire(),
+        )
+        if (!persistExactTransaction(transaction, cleared)) return false
+        candidateWarmupLeaseId = null
+        // Normal health ticks schedule a new operation if reserve is still missing/failed.
+        return true
+    }
+
+    private fun retryDeadlineUnix(delaySeconds: Long): Long {
         val currentMs = epochNowMs().coerceAtLeast(0L)
         val current = currentMs / 1_000L + if (currentMs % 1_000L == 0L) 0L else 1L
-        return if (current > Long.MAX_VALUE - REPLACEMENT_DELAY_SECONDS) Long.MAX_VALUE
-        else current + REPLACEMENT_DELAY_SECONDS
+        return if (current > Long.MAX_VALUE - delaySeconds) Long.MAX_VALUE
+        else current + delaySeconds
     }
 
     private companion object {
@@ -1272,7 +1418,7 @@ internal class RedundantConnectionCoordinator(
         const val MAX_PENDING_NATIVE_SWITCH_ATTEMPTS = 3
         const val PRIMARY_READINESS_TIMEOUT_MILLIS = 30_000L
         const val REPLACEMENT_DELAY_SECONDS = 60L
-        private val REDUNDANT_RELEASE_REBASE_CODES = setOf(
+        private val REDUNDANT_GENERATION_CONFLICT_CODES = setOf(
             "role_generation_conflict",
             "session_membership_conflict",
         )

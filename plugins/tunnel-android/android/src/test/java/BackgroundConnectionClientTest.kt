@@ -391,7 +391,7 @@ class BackgroundConnectionClientTest {
 
     @Test
     fun recoveredSessionDebugOutputRedactsBothTokens() {
-        val result = BackgroundSessionRecoveryResult("secret-access", "secret-refresh")
+        val result = BackgroundSessionRecoveryResult("{\"access_token\":\"secret-access\",\"refresh_token\":\"secret-refresh\"}")
 
         assertFalse(result.toString().contains("secret-access"))
         assertFalse(result.toString().contains("secret-refresh"))
@@ -1109,6 +1109,31 @@ class BackgroundConnectionClientTest {
                 BackgroundOperationClient(transport).capabilities(credential())
                 fail("enabled capability with revision $revision must fail closed")
             } catch (error: BackgroundConnectionException) {
+                assertEquals("invalid_background_response", error.code)
+            }
+        }
+    }
+
+    @Test
+    fun logoutSupersededIsExplicitAndCannotClaimCleanupWork() {
+        for ((code, jobs, valid) in listOf(
+            Triple("background_logout_superseded", 0, true),
+            Triple("background_logout_superseded", 1, false),
+            Triple("unknown_logout_result", 0, false),
+        )) {
+            val transport = RecordingBackgroundTransport(JSONObject().apply {
+                put("code", code)
+                put("cleanup_jobs", jobs)
+            })
+            try {
+                val result = BackgroundOperationClient(transport).finalizeLogout(
+                    credential(), DEVICE_ID, 4, LOGOUT_ID, INSTALL_SECRET,
+                )
+                assertTrue(valid)
+                assertEquals("background_logout_superseded", result.code)
+                assertEquals(0, result.cleanupJobs)
+            } catch (error: BackgroundConnectionException) {
+                if (valid) throw error
                 assertEquals("invalid_background_response", error.code)
             }
         }

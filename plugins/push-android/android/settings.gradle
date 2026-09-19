@@ -27,6 +27,8 @@ dependencyResolutionManagement {
 }
 
 include ':tauri-android'
+include ':runtime-android-common'
+project(':runtime-android-common').projectDir = new File(rootDir, '../../runtime-android-common/android')
 def tauriAndroidProjectDir = System.getenv('TAURI_ANDROID_PROJECT_DIR')
 project(':tauri-android').projectDir = tauriAndroidProjectDir
     ? new File(tauriAndroidProjectDir)

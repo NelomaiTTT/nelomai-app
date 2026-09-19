@@ -26,6 +26,27 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct PushAndroid<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> PushAndroid<R> {
+    pub async fn prepare_async(&self) -> crate::Result<PushTokenResponse> {
+        self.0
+            .run_mobile_plugin_async("prepare", EmptyRequest {})
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn confirm_async(&self, token: &str) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin_async("confirm", TokenRequest { token })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn disable_async(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin_async("disable", EmptyRequest {})
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn prepare(&self) -> crate::Result<PushTokenResponse> {
         self.0
             .run_mobile_plugin("prepare", EmptyRequest {})

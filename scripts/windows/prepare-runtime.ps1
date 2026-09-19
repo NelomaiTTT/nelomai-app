@@ -1,8 +1,21 @@
 param(
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [string]$ServiceExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
+# Upstream build.bat extracts verified ZIP files with tar. Git Bash prepends
+# GNU tar, which cannot read ZIP; use Windows' ZIP-capable bsdtar explicitly.
+$systemToolDirectory = [System.Environment]::SystemDirectory
+$nativeTar = Join-Path $systemToolDirectory "tar.exe"
+if (-not (Test-Path -LiteralPath $nativeTar -PathType Leaf)) {
+    throw "Windows system tar.exe is required to extract the pinned toolchain ZIP archives"
+}
+$env:PATH = "$systemToolDirectory;$env:PATH"
+& $nativeTar --version
+if ($LASTEXITCODE -ne 0) {
+    throw "Windows system tar.exe is unavailable"
+}
 $WireGuardWindowsCommit = "4e6726c23ae9c5cb58e0c9910f3b7515621d133d"
 $WireGuardNtVersion = "1.1"
 $WireGuardNtArchiveSha256 = "dceb30a9bc4be48cce0f74160fc88a585a2c2627366e8f846fc6658f9038dace"
@@ -29,6 +42,11 @@ git init $source
 git -C $source remote add origin https://github.com/WireGuard/wireguard-windows.git
 git -C $source fetch --depth 1 origin $WireGuardWindowsCommit
 git -C $source checkout --detach FETCH_HEAD
+$downloadPatch = Join-Path $root "patches/wireguard-windows-toolchain-download.patch"
+git -C $source apply --check --unidiff-zero $downloadPatch
+if ($LASTEXITCODE -ne 0) { throw "Pinned WireGuard download patch no longer applies" }
+git -C $source apply --unidiff-zero $downloadPatch
+if ($LASTEXITCODE -ne 0) { throw "Failed to apply pinned WireGuard download patch" }
 $wireGuardBuild = Join-Path $source "embeddable-dll-service/build.bat"
 $WireGuardBuildMaximumAttempts = 3
 for ($wireGuardBuildAttempt = 1; $wireGuardBuildAttempt -le $WireGuardBuildMaximumAttempts; $wireGuardBuildAttempt++) {
@@ -138,3 +156,20 @@ $metadata = [ordered]@{
     wintun_dll_sha256 = (Get-FileHash -Algorithm SHA256 (Join-Path $OutputDirectory "wintun.dll")).Hash.ToLowerInvariant()
 }
 $metadata | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $OutputDirectory "windows-runtime.json")
+
+# Task 9 must build the service first and sign the complete versioned manifest.
+# Keep the existing metadata as diagnostics; it is not an authentication source.
+if (-not $ServiceExecutable) {
+    $ServiceExecutable = Join-Path $root "target/x86_64-pc-windows-msvc/release/nelomai-windows-service.exe"
+}
+if (-not (Test-Path -LiteralPath $ServiceExecutable -PathType Leaf)) {
+    throw "Versioned Windows service executable is required: $ServiceExecutable"
+}
+Copy-Item -LiteralPath $ServiceExecutable -Destination (Join-Path $OutputDirectory "nelomai-windows-service.exe") -Force
+$engineDirectory = Join-Path $OutputDirectory "engines/latest/0.2.20"
+$dispatcherDirectory = Join-Path $OutputDirectory "dispatcher/1"
+New-Item -ItemType Directory -Force $engineDirectory, $dispatcherDirectory | Out-Null
+Get-ChildItem -LiteralPath $OutputDirectory -File | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $engineDirectory -Force
+}
+Copy-Item -LiteralPath $ServiceExecutable -Destination (Join-Path $dispatcherDirectory "nelomai-windows-service.exe") -Force

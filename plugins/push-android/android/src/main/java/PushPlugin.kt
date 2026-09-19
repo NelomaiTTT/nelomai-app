@@ -25,8 +25,10 @@ private const val NOTIFICATION_PERMISSION_ALIAS = "notifications"
     ],
 )
 class PushPlugin(private val activity: Activity) : Plugin(activity) {
+    private var preparationEpoch: Long? = null
     @Command
     fun prepare(invoke: Invoke) {
+        preparationEpoch = FirebaseRuntime.epoch(activity)
         val firebase = FirebaseRuntime.initialize(activity)
         if (firebase == null) {
             invoke.reject("push_not_configured")
@@ -65,7 +67,8 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun confirm(invoke: Invoke) {
         val token = invoke.getArgs().getString("token", "") ?: ""
-        FirebaseRuntime.confirmToken(activity, token)
+        val epoch = preparationEpoch
+        if (epoch == null || !FirebaseRuntime.confirmToken(activity, token, epoch)) { invoke.reject("push_operation_cancelled"); return }
         invoke.resolve()
     }
 
@@ -81,12 +84,14 @@ class PushPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     private fun resolveToken(invoke: Invoke) {
-        FirebaseRuntime.setDeliveryEnabled(activity, true)
+        val epoch = preparationEpoch
+        if (epoch == null || !FirebaseRuntime.setDeliveryEnabled(activity, true, epoch)) { invoke.reject("push_operation_cancelled"); return }
         FirebaseRuntime.pendingToken(activity)?.let { token ->
             resolve(invoke, token, true)
             return
         }
         FirebaseMessaging.getInstance().token.addOnCompleteListener { task ->
+            if (FirebaseRuntime.epoch(activity) != epoch) { invoke.reject("push_operation_cancelled"); return@addOnCompleteListener }
             if (!task.isSuccessful || task.result.isNullOrBlank()) {
                 invoke.reject("push_token_unavailable")
                 return@addOnCompleteListener

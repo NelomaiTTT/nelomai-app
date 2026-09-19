@@ -1,8 +1,15 @@
+mod support;
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_api::{LoginRequest, TokenResponse};
 use nelomai_client_application::{ApplicationApi, ApplicationError, ClientApplication};
-use nelomai_client_core::{ConnectOptions, CoreApi, CoreApiError, CoreError, NoopLogger};
-use nelomai_client_storage::{SecretStore, StorageError, StoredAuth, StoredCompatibility};
+use nelomai_client_core::{
+    ConnectOptions, CoreApi, CoreApiError, CoreError, CoreLocalStop, NoopLogger,
+    RuntimeStartPreflight,
+};
+use nelomai_client_storage::{
+    MemorySplitTunnelStore, SecretStore, StorageError, StoredAuth, StoredCompatibility,
+};
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     ApiVersion, BindPeerRequest, Bootstrap, Connection, ConnectionOperationRequest,
@@ -25,17 +32,13 @@ struct ProbeApi {
 
 #[async_trait]
 impl CoreApi for ProbeApi {
-    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
-        unreachable!("refresh is not used by this test")
-    }
-
-    async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
+    async fn bootstrap(&self, _access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
         unreachable!("bootstrap is not used by this test")
     }
 
     async fn start_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         *self.start_request.lock().unwrap() = Some(request.clone());
@@ -64,7 +67,7 @@ impl CoreApi for ProbeApi {
 
     async fn stop_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("stop is not used by this test")
@@ -72,7 +75,7 @@ impl CoreApi for ProbeApi {
 
     async fn pin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("pin is not used by this test")
@@ -80,7 +83,7 @@ impl CoreApi for ProbeApi {
 
     async fn unpin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         unreachable!("unpin is not used by this test")
@@ -89,29 +92,31 @@ impl CoreApi for ProbeApi {
 
 #[async_trait]
 impl ApplicationApi for ProbeApi {
-    async fn login(&self, _request: &LoginRequest) -> Result<TokenResponse, CoreApiError> {
-        unreachable!("login is not used by this test")
-    }
-
-    async fn peer_options(&self, _access_token: &str) -> Result<PeerOptions, CoreApiError> {
+    async fn peer_options(
+        &self,
+        _access_token: &AccessSnapshot,
+    ) -> Result<PeerOptions, CoreApiError> {
         unreachable!("peer options are not used by this test")
     }
 
     async fn bind_peer(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &BindPeerRequest,
     ) -> Result<PeerBindingResponse, CoreApiError> {
         unreachable!("peer binding is not used by this test")
     }
 
-    async fn unbind_peer(&self, _access_token: &str) -> Result<PeerBindingResponse, CoreApiError> {
+    async fn unbind_peer(
+        &self,
+        _access_token: &AccessSnapshot,
+    ) -> Result<PeerBindingResponse, CoreApiError> {
         unreachable!("peer unbinding is not used by this test")
     }
 
     async fn server_candidates(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         layer: Layer,
         egress_mode: EgressMode,
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
@@ -130,10 +135,6 @@ impl ApplicationApi for ProbeApi {
     async fn probe_latency_ms(&self, probe_url: &str) -> Option<f64> {
         self.probe_calls.fetch_add(1, Ordering::SeqCst);
         (!self.all_probes_fail.load(Ordering::SeqCst) && probe_url.contains("fast")).then_some(24.5)
-    }
-
-    async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
-        Ok(())
     }
 }
 
@@ -155,6 +156,44 @@ async fn probe_cache_is_separate_for_ipv4_and_ipv6_pools() {
         *api.candidate_modes.lock().unwrap(),
         vec![EgressMode::Ipv4, EgressMode::PreferIpv6]
     );
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn automatic_attempts_defer_when_power_changes_during_probes() {
+    for (replacement, probes_fail) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (application, api) = application();
+        api.all_probes_fail.store(probes_fail, Ordering::SeqCst);
+        let options = ConnectOptions {
+            layer: Layer::Stray,
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::Standalone,
+            egress_mode: EgressMode::Ipv4,
+            probes: Vec::new(),
+            allow_alternate: true,
+        };
+        // Initially allowed; the actual probe phase crosses into a deferred state.
+        let allowed = || api.probe_calls.load(Ordering::SeqCst) == 0;
+        assert!(allowed());
+        let result = if replacement {
+            application
+                .replace_stalled_connection_guarded(options.clone(), 1_800_000_000, allowed)
+                .await
+        } else {
+            application
+                .connection_intent_attempt_guarded(options.clone(), 1_800_000_000, allowed)
+                .await
+        };
+        assert!(
+            matches!(result, Err(ApplicationError::RecoveryDeferred)),
+            "{result:?}"
+        );
+        assert!(api.start_request.lock().unwrap().is_none());
+        // Manual starts keep their existing path, even while the automatic guard denies.
+        api.all_probes_fail.store(false, Ordering::SeqCst);
+        assert!(application.start(options, 1_800_000_001).await.is_ok());
+        assert!(api.start_request.lock().unwrap().is_some());
+    }
 }
 
 #[derive(Default)]
@@ -414,7 +453,16 @@ async fn probe_tokens_are_not_reused_after_logout() {
 }
 
 fn application() -> (
-    ClientApplication<ProbeApi, MemoryStore, StoppedTunnel, NoopLogger>,
+    ClientApplication<ProbeApi, support::LegacyRuntime<MemoryStore>, StoppedTunnel, NoopLogger>,
+    Arc<ProbeApi>,
+) {
+    application_with_preflight(Arc::new(nelomai_client_core::AllowRuntimeStart))
+}
+
+fn application_with_preflight(
+    preflight: Arc<dyn RuntimeStartPreflight>,
+) -> (
+    ClientApplication<ProbeApi, support::LegacyRuntime<MemoryStore>, StoppedTunnel, NoopLogger>,
     Arc<ProbeApi>,
 ) {
     let api = Arc::new(ProbeApi {
@@ -433,15 +481,154 @@ fn application() -> (
         observed_at_unix: 1_800_000_000,
     });
     *store.0.lock().unwrap() = Some(auth);
-    (
-        ClientApplication::new(
-            api.clone(),
-            store,
-            Arc::new(StoppedTunnel),
-            Arc::new(NoopLogger),
-        ),
-        api,
-    )
+    let local = CoreLocalStop::new(Arc::new(StoppedTunnel));
+    let auth = Arc::new(support::TestOwner::new(
+        api.clone(),
+        store.clone(),
+        local.clone(),
+    ));
+    let application = ClientApplication::with_split_tunnel_store_and_preflight(
+        api.clone(),
+        Arc::new(support::LegacyRuntime::new(store)),
+        Arc::new(MemorySplitTunnelStore::default()),
+        auth,
+        local,
+        Arc::new(NoopLogger),
+        preflight,
+    );
+    (application, api)
+}
+
+struct RejectStart {
+    preflight_calls: AtomicUsize,
+    reject_in_preflight: bool,
+}
+
+#[derive(Default)]
+struct PausedPreflight {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl RuntimeStartPreflight for PausedPreflight {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+    fn check_start_barrier(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn recovery_v2_keeps_user_cancellation_across_preflight() {
+    let preflight = Arc::new(PausedPreflight::default());
+    let (application, api) = application_with_preflight(preflight.clone());
+    let application = Arc::new(application);
+    let task_application = application.clone();
+    let start = tokio::spawn(async move {
+        task_application
+            .start_recovery_v2(
+                ConnectOptions {
+                    layer: Layer::Stray,
+                    tic_connection_mode: TicConnectionMode::Dynamic,
+                    route_mode: RouteMode::Standalone,
+                    egress_mode: EgressMode::Ipv4,
+                    probes: Vec::new(),
+                    allow_alternate: true,
+                },
+                1_800_000_000,
+                true,
+            )
+            .await
+    });
+    preflight.entered.notified().await;
+    assert!(application.signal_start_cancellation());
+    preflight.release.notify_one();
+    assert!(matches!(
+        start.await.unwrap(),
+        Err(ApplicationError::Core(CoreError::StartCancelled))
+    ));
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 0);
+    assert!(api.start_request.lock().unwrap().is_none());
+}
+
+#[async_trait]
+impl RuntimeStartPreflight for RejectStart {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        self.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        if self.reject_in_preflight {
+            Err(CoreError::AuthRecoveryRequired)
+        } else {
+            Ok(())
+        }
+    }
+    fn check_start_barrier(&self) -> Result<(), CoreError> {
+        Err(CoreError::AuthRecoveryRequired)
+    }
+}
+
+#[tokio::test]
+async fn every_application_start_path_runs_transition_preflight_before_network_or_tunnel_work() {
+    for reject_in_preflight in [true, false] {
+        assert_all_start_paths_reject(Arc::new(RejectStart {
+            preflight_calls: AtomicUsize::new(0),
+            reject_in_preflight,
+        }))
+        .await;
+    }
+}
+
+async fn assert_all_start_paths_reject(preflight: Arc<RejectStart>) {
+    let (application, api) = application_with_preflight(preflight.clone());
+    let options = ConnectOptions {
+        layer: Layer::Stray,
+        tic_connection_mode: TicConnectionMode::Dynamic,
+        route_mode: RouteMode::Standalone,
+        egress_mode: EgressMode::Ipv4,
+        probes: Vec::new(),
+        allow_alternate: true,
+    };
+    assert!(matches!(
+        application.start(options.clone(), 1_800_000_000).await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    assert!(matches!(
+        application
+            .start_recovery_v2(options.clone(), 1_800_000_000, true)
+            .await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    assert!(matches!(
+        application
+            .start_without_probe_refresh(options.clone(), 1_800_000_000)
+            .await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    #[cfg(not(target_os = "android"))]
+    assert!(matches!(
+        application
+            .connection_intent_attempt(options.clone(), 1_800_000_000)
+            .await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    #[cfg(not(target_os = "android"))]
+    assert!(matches!(
+        application
+            .replace_stalled_connection(options, 1_800_000_000)
+            .await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    assert!(matches!(
+        application.start_saved_stray_offline(1_800_000_000).await,
+        Err(ApplicationError::Core(CoreError::AuthRecoveryRequired))
+    ));
+    #[cfg(not(target_os = "android"))]
+    assert_eq!(preflight.preflight_calls.load(Ordering::SeqCst), 6);
+    assert!(api.start_request.lock().unwrap().is_none());
+    assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 0);
 }
 
 fn candidate(id: &str, layer: Layer, probe_url: &str) -> ServerCandidate {
@@ -451,5 +638,20 @@ fn candidate(id: &str, layer: Layer, probe_url: &str) -> ServerCandidate {
         region_label: "Тест".to_string(),
         probe_url: probe_url.to_string(),
         expires_at: "2030-01-01T00:00:00Z".to_string(),
+    }
+}
+
+#[async_trait]
+impl support::TestAuthApi for ProbeApi {
+    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
+        unreachable!("refresh is not used by this test")
+    }
+
+    async fn login(&self, _request: &LoginRequest) -> Result<TokenResponse, CoreApiError> {
+        unreachable!("login is not used by this test")
+    }
+
+    async fn logout(&self, _access_token: &str) -> Result<(), CoreApiError> {
+        Ok(())
     }
 }

@@ -1,10 +1,11 @@
 [package]
 name = "nelomai-app"
-version = "0.1.7"
+version = "0.2.20"
 description = "Native Nelomai client"
 authors = ["Nelomai"]
 edition = "2021"
 rust-version = "1.88"
+default-run = "nelomai-app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,8 +19,23 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+desktop-runtime = ["custom-protocol"]
+startup-diagnostics = ["nelomai-client-container/startup-diagnostics"]
+
+[[bin]]
+name = "nelomai-runtime"
+path = "src/bin/nelomai-runtime.rs"
+required-features = ["desktop-runtime"]
+
+[dev-dependencies]
+ed25519-dalek = "2.2"
+
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
+nelomai-client-container = { path = "../crates/client-container" }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-tunnel-android = { path = "../plugins/tunnel-android" }
@@ -40,14 +56,21 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSRunningApplication"] }
+
 [target.'cfg(windows)'.dependencies]
 nelomai-windows-service = { path = "../crates/windows-service" }
 tauri-plugin-single-instance = "=2.4.3"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 nelomai-unix-service = { path = "../crates/unix-service" }

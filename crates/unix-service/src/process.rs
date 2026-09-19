@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::ExitStatus;
 use std::process::{Command, Output, Stdio};
@@ -12,6 +12,7 @@ pub(crate) fn output_with_timeout(command: &mut Command, timeout: Duration) -> i
         .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let _tree_owner = nelomai_contracts::dispatcher::own_process_group(command)?;
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -73,11 +74,17 @@ pub(crate) fn status_with_timeout(
     timeout: Duration,
 ) -> io::Result<ExitStatus> {
     command.process_group(0);
+    let mut tree_owner = nelomai_contracts::dispatcher::own_process_group(command)?;
     let mut child = command.spawn()?;
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => {
+                // Go daemon startup intentionally outlives this short command.
+                // Its existing persisted-state backend handles later cleanup.
+                tree_owner.write_all(&[1])?;
+                return Ok(status);
+            }
             Ok(None) => {}
             Err(error) => {
                 terminate_process_group(&mut child);
@@ -110,6 +117,46 @@ fn join_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_death_fixture_entry() {
+        let Some(root) = std::env::var_os("NELOMAI_TEST_RUNNER_ROOT") else {
+            return;
+        };
+        let _ = status_with_timeout(Command::new("/usr/bin/python3").args(["-c", "import sys,fcntl,signal,time,os; signal.alarm(10); f=open(sys.argv[1]+'/lease','w'); fcntl.flock(f,fcntl.LOCK_EX); open(sys.argv[1]+'/ready','w').close(); time.sleep(60)"]).arg(root), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn runner_death_terminates_its_separate_hung_command_group() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process::tests::runner_death_fixture_entry"])
+            .env("NELOMAI_TEST_RUNNER_ROOT", root.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !root.path().join("ready").exists() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let lease_path = root.path().join("lease");
+        assert!(nelomai_contracts::dispatcher::MutationGuard::at(&lease_path).is_err());
+        runner.kill().unwrap();
+        runner.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(lease) = nelomai_contracts::dispatcher::MutationGuard::at(&lease_path) {
+                drop(lease);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "command group survived its exact runner parent's death"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn returns_completed_command_output() {

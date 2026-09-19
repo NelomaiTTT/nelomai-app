@@ -1,9 +1,12 @@
 use async_trait::async_trait;
-use nelomai_client_api::{BackgroundTokenResponse, ClientApi, ClientApiError, TokenResponse};
+use nelomai_client_api::{
+    AccessSnapshot, BackgroundTokenResponse, ClientApi, ClientApiError, RuntimeAuthState,
+    RuntimeLogin,
+};
 use nelomai_client_storage::{
-    MemorySplitTunnelStore, SecretStore, SplitTunnelStore, StoredCompatibility, StoredConnection,
-    StoredConnectionKind, StoredPendingCompensationStop, StoredPendingStalledStop,
-    StoredPendingStart,
+    MemorySplitTunnelStore, RuntimeStateStore, SplitTunnelStore, StoredCompatibility,
+    StoredConnection, StoredConnectionKind, StoredPendingCompensationStop,
+    StoredPendingStalledStop, StoredPendingStart,
 };
 use nelomai_client_tunnel::{
     QuickConnection, QuickReconnect, RedundantTunnelMemberStart, RedundantTunnelStandbyStart,
@@ -33,6 +36,95 @@ use uuid::Uuid;
 
 mod connection_intent;
 mod split_tunnel;
+
+/// Access-only runtime port. Implementations live in the common credential
+/// owner or an authenticated private-channel client, never in a runtime store.
+#[async_trait]
+pub trait RuntimeAuthProvider: Send + Sync {
+    async fn state(&self) -> Result<RuntimeAuthState, CoreError>;
+    async fn login(&self, request: RuntimeLogin) -> Result<AccessSnapshot, CoreError>;
+    async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError>;
+    async fn logout(&self) -> Result<(), CoreError>;
+}
+
+/// The actual Core writer gates, shared with the common owner before Core is
+/// constructed. This is not a cross-process lock or a logout prerequisite.
+#[derive(Default)]
+pub struct RuntimeWriterGates {
+    lifecycle: Arc<Mutex<()>>,
+    intent: Arc<Mutex<()>>,
+    split: Arc<Mutex<()>>,
+    connection: Arc<Mutex<()>>,
+}
+pub struct RuntimeWriterQuiescence {
+    _lifecycle: tokio::sync::OwnedMutexGuard<()>,
+    _intent: tokio::sync::OwnedMutexGuard<()>,
+    _split: tokio::sync::OwnedMutexGuard<()>,
+    _connection: tokio::sync::OwnedMutexGuard<()>,
+}
+impl RuntimeWriterGates {
+    pub async fn quiesce(&self) -> RuntimeWriterQuiescence {
+        RuntimeWriterQuiescence {
+            _lifecycle: self.lifecycle.clone().lock_owned().await,
+            _intent: self.intent.clone().lock_owned().await,
+            _split: self.split.clone().lock_owned().await,
+            _connection: self.connection.clone().lock_owned().await,
+        }
+    }
+    pub fn lifecycle(&self) -> Arc<Mutex<()>> {
+        self.lifecycle.clone()
+    }
+}
+
+/// Construct before the broker and Core. It owns only local cancellation and
+/// presentation, and never waits for authentication or lifecycle gates. It does
+/// not erase operational cleanup references or assert remote cleanup success.
+pub struct CoreLocalStop<T> {
+    tunnel: Arc<T>,
+    state: Arc<Mutex<CoreState>>,
+    epoch: Arc<AtomicU64>,
+    wake: Arc<Notify>,
+    writers: Arc<RuntimeWriterGates>,
+}
+impl<T: TunnelController> CoreLocalStop<T> {
+    pub fn new(tunnel: Arc<T>) -> Arc<Self> {
+        Arc::new(Self {
+            tunnel,
+            state: Arc::new(Mutex::new(CoreState::default())),
+            epoch: Arc::new(AtomicU64::new(0)),
+            wake: Arc::new(Notify::new()),
+            writers: Arc::new(RuntimeWriterGates::default()),
+        })
+    }
+    pub fn runtime_writer_gates(&self) -> Arc<RuntimeWriterGates> {
+        self.writers.clone()
+    }
+    pub async fn stop_local(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::SignedOut).await
+    }
+    pub async fn stop_local_for_transition(&self) -> Result<(), CoreError> {
+        self.stop_local_with_success_phase(Phase::Ready).await
+    }
+    async fn stop_local_with_success_phase(&self, success_phase: Phase) -> Result<(), CoreError> {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.wake.notify_waiters();
+        *self.state.lock().await = CoreState {
+            phase: Phase::Stopping,
+            connection: None,
+        };
+        let result = self.tunnel.stop().await;
+        let mut state = self.state.lock().await;
+        if result.is_ok() {
+            *state = CoreState {
+                phase: success_phase,
+                connection: None,
+            };
+        } else {
+            state.phase = Phase::Error;
+        }
+        result.map_err(Into::into)
+    }
+}
 
 pub use connection_intent::{
     classify_recovery, stall_recovery_plan, ConnectionIntentStatus, IntentGeneration,
@@ -591,66 +683,65 @@ pub trait CoreApi: Send + Sync {
         Ok(())
     }
 
-    async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, CoreApiError>;
-    async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, CoreApiError>;
+    async fn bootstrap(&self, access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError>;
     async fn start_connection(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError>;
     async fn stop_connection(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError>;
     async fn report_redundant_role(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &RedundantRoleRequest,
     ) -> Result<RedundantRoleResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn release_redundant_standby(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &RedundantStandbyReleaseRequest,
     ) -> Result<RedundantSessionResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn acquire_redundant_standby(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &RedundantStandbyAcquireRequest,
     ) -> Result<RedundantStandbyAcquireResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn commit_redundant_candidate(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &RedundantCandidateCommitRequest,
     ) -> Result<RedundantSessionResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn stop_redundant_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &RedundantStopRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn pin_stray(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError>;
     async fn unpin_stray(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError>;
     async fn background_token(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<BackgroundTokenResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
@@ -705,33 +796,33 @@ pub trait CoreApi: Send + Sync {
     }
     async fn split_tunnel_revision(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelRevision, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn split_tunnel_policy(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn update_split_tunnel_settings(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &SplitTunnelSettingsUpdate,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn add_split_tunnel_address_rule(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &SplitTunnelAddressRuleUpdate,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         Err(CoreApiError::Retryable)
     }
     async fn remove_split_tunnel_address_rule(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _rule_id: i64,
         _scope: SplitTunnelAddressRuleScope,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
@@ -739,7 +830,7 @@ pub trait CoreApi: Send + Sync {
     }
     async fn report_split_tunnel_apply_result(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &SplitTunnelApplyResult,
     ) -> Result<(), CoreApiError> {
         Err(CoreApiError::Retryable)
@@ -752,115 +843,151 @@ impl CoreApi for ClientApi {
         ClientApi::reset_transport(self).map_err(Into::into)
     }
 
-    async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
-        ClientApi::refresh(self, refresh_token.to_string())
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn bootstrap(&self, access_token: &str) -> Result<Bootstrap, CoreApiError> {
-        ClientApi::bootstrap(self, access_token)
-            .await
-            .map_err(Into::into)
+    async fn bootstrap(&self, access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
+        ClientApi::bootstrap(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn start_connection(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
-        ClientApi::start_connection(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::start_connection(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn stop_connection(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
-        ClientApi::stop_connection(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::stop_connection(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn report_redundant_role(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &RedundantRoleRequest,
     ) -> Result<RedundantRoleResponse, CoreApiError> {
-        ClientApi::report_redundant_role(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::report_redundant_role(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn release_redundant_standby(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &RedundantStandbyReleaseRequest,
     ) -> Result<RedundantSessionResponse, CoreApiError> {
-        ClientApi::release_redundant_standby(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::release_redundant_standby(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn acquire_redundant_standby(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &RedundantStandbyAcquireRequest,
     ) -> Result<RedundantStandbyAcquireResponse, CoreApiError> {
-        ClientApi::acquire_redundant_standby(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::acquire_redundant_standby(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn commit_redundant_candidate(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &RedundantCandidateCommitRequest,
     ) -> Result<RedundantSessionResponse, CoreApiError> {
-        ClientApi::commit_redundant_candidate(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::commit_redundant_candidate(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn stop_redundant_connection(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &RedundantStopRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
-        ClientApi::stop_redundant_connection(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::stop_redundant_connection(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn pin_stray(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
-        ClientApi::pin_stray(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::pin_stray(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn unpin_stray(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
-        ClientApi::unpin_stray(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::unpin_stray(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn background_token(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
     ) -> Result<BackgroundTokenResponse, CoreApiError> {
-        ClientApi::background_token(self, access_token)
-            .await
-            .map_err(Into::into)
+        ClientApi::background_token(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn reconcile_background_operation(
@@ -935,62 +1062,85 @@ impl CoreApi for ClientApi {
 
     async fn split_tunnel_revision(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelRevision, CoreApiError> {
-        ClientApi::split_tunnel_revision(self, access_token)
-            .await
-            .map_err(Into::into)
+        ClientApi::split_tunnel_revision(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn split_tunnel_policy(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
-        ClientApi::split_tunnel_policy(self, access_token)
-            .await
-            .map_err(Into::into)
+        ClientApi::split_tunnel_policy(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn update_split_tunnel_settings(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &SplitTunnelSettingsUpdate,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
-        ClientApi::update_split_tunnel_settings(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::update_split_tunnel_settings(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn add_split_tunnel_address_rule(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &SplitTunnelAddressRuleUpdate,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
-        ClientApi::add_split_tunnel_address_rule(self, access_token, request)
-            .await
-            .map_err(Into::into)
+        ClientApi::add_split_tunnel_address_rule(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn remove_split_tunnel_address_rule(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         rule_id: i64,
         scope: SplitTunnelAddressRuleScope,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
-        ClientApi::remove_split_tunnel_address_rule(self, access_token, rule_id, scope)
-            .await
-            .map_err(Into::into)
+        ClientApi::remove_split_tunnel_address_rule(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            rule_id,
+            scope,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn report_split_tunnel_apply_result(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &SplitTunnelApplyResult,
     ) -> Result<(), CoreApiError> {
-        ClientApi::report_split_tunnel_apply_result(self, access_token, request)
-            .await
-            .map(|_| ())
-            .map_err(Into::into)
+        ClientApi::report_split_tunnel_apply_result(
+            &self.clone().with_access_snapshot(access_token)?,
+            access_token.access_token(),
+            request,
+        )
+        .await
+        .map(|_| ())
+        .map_err(Into::into)
     }
 }
 
@@ -1010,7 +1160,7 @@ enum FailedStartStage {
 
 #[derive(Clone, Copy)]
 struct FailedStartContext<'a> {
-    access_token: &'a str,
+    access_token: &'a AccessSnapshot,
     connection: &'a Connection,
     request_id: &'a str,
     operation_id: &'a str,
@@ -1033,6 +1183,10 @@ impl FailedStartStage {
 
 #[derive(Debug, Error)]
 pub enum CoreError {
+    #[error("исход авторизации неизвестен; требуется явный повторный вход")]
+    AuthenticationOutcomeUnknown,
+    #[error("требуется восстановление авторизации контейнером")]
+    AuthRecoveryRequired,
     #[error("требуется вход в приложение")]
     SignedOut,
     #[error("срок доступа истёк")]
@@ -1051,6 +1205,27 @@ pub enum CoreError {
     Tunnel(String),
     #[error("не удалось применить политику split-tunnel: {0}")]
     SplitTunnel(String),
+}
+
+#[async_trait]
+pub trait RuntimeStartPreflight: Send + Sync {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError>;
+    /// Recheck admission while holding the actual lifecycle writer gate.
+    /// This must not recover, wait for coordinator execution, or acquire writer
+    /// quiescence: a transition may already be waiting for this same gate.
+    fn check_start_barrier(&self) -> Result<(), CoreError>;
+}
+
+pub struct AllowRuntimeStart;
+
+#[async_trait]
+impl RuntimeStartPreflight for AllowRuntimeStart {
+    async fn before_tunnel_start(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+    fn check_start_barrier(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
 }
 
 impl From<TunnelError> for CoreError {
@@ -1080,17 +1255,18 @@ pub struct ClientCore<A, S, T, L> {
     store: Arc<S>,
     tunnel: Arc<T>,
     logger: Arc<L>,
-    state: Mutex<CoreState>,
-    intent_recovery_gate: Mutex<()>,
-    start_cancel_epoch: AtomicU64,
+    auth: Arc<dyn RuntimeAuthProvider>,
+    state: Arc<Mutex<CoreState>>,
+    intent_recovery_gate: Arc<Mutex<()>>,
+    runtime_writers: Arc<RuntimeWriterGates>,
+    start_cancel_epoch: Arc<AtomicU64>,
     start_in_progress: AtomicBool,
     pending_start_active: AtomicBool,
-    start_retry_wake: Notify,
+    start_retry_wake: Arc<Notify>,
     active_recovery_episode: Mutex<Option<ActiveRecoveryEpisode>>,
-    refresh_gate: Mutex<()>,
-    connection_gate: Mutex<()>,
+    connection_gate: Arc<Mutex<()>>,
     split_tunnel_store: Arc<dyn SplitTunnelStore>,
-    split_tunnel_gate: Mutex<()>,
+    split_tunnel_gate: Arc<Mutex<()>>,
     split_tunnel_packages: RwLock<Vec<SplitTunnelSelectedPackage>>,
     split_tunnel_options: Mutex<TunnelOptions>,
     dns_servers: RwLock<Vec<IpAddr>>,
@@ -1103,16 +1279,23 @@ pub struct ClientCore<A, S, T, L> {
 impl<A, S, T, L> ClientCore<A, S, T, L>
 where
     A: CoreApi,
-    S: SecretStore,
+    S: RuntimeStateStore,
     T: TunnelController,
     L: CoreLogger,
 {
-    pub fn new(api: Arc<A>, store: Arc<S>, tunnel: Arc<T>, logger: Arc<L>) -> Self {
+    pub fn new(
+        api: Arc<A>,
+        store: Arc<S>,
+        auth: Arc<dyn RuntimeAuthProvider>,
+        local: Arc<CoreLocalStop<T>>,
+        logger: Arc<L>,
+    ) -> Self {
         Self::with_split_tunnel_store(
             api,
             store,
             Arc::new(MemorySplitTunnelStore::default()),
-            tunnel,
+            auth,
+            local,
             logger,
         )
     }
@@ -1121,7 +1304,8 @@ where
         api: Arc<A>,
         store: Arc<S>,
         split_tunnel_store: Arc<dyn SplitTunnelStore>,
-        tunnel: Arc<T>,
+        auth: Arc<dyn RuntimeAuthProvider>,
+        local: Arc<CoreLocalStop<T>>,
         logger: Arc<L>,
     ) -> Self {
         let pending_start_active = store
@@ -1132,19 +1316,20 @@ where
         Self {
             api,
             store,
-            tunnel,
+            tunnel: local.tunnel.clone(),
             logger,
-            state: Mutex::new(CoreState::default()),
-            intent_recovery_gate: Mutex::new(()),
-            start_cancel_epoch: AtomicU64::new(0),
+            auth,
+            state: local.state.clone(),
+            intent_recovery_gate: local.writers.intent.clone(),
+            runtime_writers: local.writers.clone(),
+            start_cancel_epoch: local.epoch.clone(),
             start_in_progress: AtomicBool::new(false),
             pending_start_active: AtomicBool::new(pending_start_active),
-            start_retry_wake: Notify::new(),
+            start_retry_wake: local.wake.clone(),
             active_recovery_episode: Mutex::new(None),
-            refresh_gate: Mutex::new(()),
-            connection_gate: Mutex::new(()),
+            connection_gate: local.writers.connection.clone(),
             split_tunnel_store,
-            split_tunnel_gate: Mutex::new(()),
+            split_tunnel_gate: local.writers.split.clone(),
             split_tunnel_packages: RwLock::new(Vec::new()),
             split_tunnel_options: Mutex::new(TunnelOptions::default()),
             dns_servers: RwLock::new(Vec::new()),
@@ -1160,6 +1345,9 @@ where
     pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
         self
+    }
+    pub fn runtime_writer_gates(&self) -> Arc<RuntimeWriterGates> {
+        self.runtime_writers.clone()
     }
 
     pub fn set_dns_servers(&self, servers: Vec<IpAddr>) {
@@ -1273,7 +1461,7 @@ where
                     probe_url: connection.probe_url,
                 });
             }
-            let stored = self.load_auth().ok()?;
+            let stored = self.load_runtime().ok()?;
             let connection = stored.saved_connection.or(stored.pinned_connection)?;
             return Some(ConnectionMetricsContext {
                 session_id: connection.lease_id,
@@ -1301,7 +1489,7 @@ where
         &self,
         lease_id: &str,
     ) -> Result<RecoveryTransport, CoreError> {
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         let saved = stored
             .saved_connection
             .as_ref()
@@ -1321,12 +1509,17 @@ where
     }
 
     pub async fn reconcile_external_tunnel_state(&self) -> CoreState {
+        let epoch = self.start_cancel_epoch.load(Ordering::SeqCst);
+        let active = matches!(self.auth.state().await, Ok(RuntimeAuthState::Active));
         let status = match self.tunnel.status().await {
             Ok(status) => status,
             Err(_) => return self.state.lock().await.clone(),
         };
         let mut state = self.state.lock().await;
-        if state.connection.is_some() {
+        if active
+            && self.start_cancel_epoch.load(Ordering::SeqCst) == epoch
+            && state.connection.is_some()
+        {
             state.phase = match status {
                 TunnelStatus::Running | TunnelStatus::Starting => Phase::Connected,
                 TunnelStatus::Stopped => Phase::Ready,
@@ -1356,99 +1549,37 @@ where
     }
 
     pub async fn sign_out(&self) -> Result<(), CoreError> {
-        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
-        let _split_guard = self.split_tunnel_gate.lock().await;
-        let _connection_guard = self.connection_gate.lock().await;
-        let _refresh_guard = self.refresh_gate.lock().await;
-        let tunnel_result = self.tunnel.stop().await;
-        let stored = self
-            .store
-            .load()
-            .map_err(|_| CoreError::Storage)?
-            .unwrap_or_else(nelomai_client_storage::StoredAuth::new_install);
-        self.store
-            .save(&nelomai_client_storage::StoredAuth {
-                install_secret: stored.install_secret,
-                access_token: None,
-                refresh_token: None,
-                saved_connection: None,
-                pinned_connection: None,
-                pending_start: None,
-                pending_stalled_stop: None,
-                pending_compensation_stop: None,
-                compatibility: None,
-            })
-            .map_err(|_| CoreError::Storage)?;
-        self.split_tunnel_store
-            .delete()
-            .map_err(|_| CoreError::Storage)?;
-        if let Ok(mut packages) = self.split_tunnel_packages.write() {
-            packages.clear();
-        }
-        *self.split_tunnel_options.lock().await = TunnelOptions::default();
-        self.clear_all_split_tunnel_warnings().await;
-        self.physical_network_change.lock().await.reset();
-        self.clear_all_offline_connection_quarantines();
-        *self.active_recovery_episode.lock().await = None;
-        *self.state.lock().await = CoreState::default();
-        self.logger.record(CoreLogEvent {
-            kind: "auth.signed_out",
-            operation_id: None,
-            request_id: None,
-            code: None,
-        });
-        tunnel_result.map_err(Into::into)
+        self.signal_start_cancellation();
+        // The owner durably fences auth before its neutral local-stop callback;
+        // it must not wait for Core's issuance, split or lifecycle gates.
+        self.auth.logout().await
     }
 
-    pub async fn refresh_access_token(&self, stale_access: &str) -> Result<String, CoreError> {
-        let _guard = self.refresh_gate.lock().await;
-        let mut stored = self.load_auth()?;
-        if let Some(current) = &stored.access_token {
-            if current != stale_access {
-                return Ok(current.clone());
-            }
-        }
-        let refresh_token = stored.refresh_token.clone().ok_or(CoreError::SignedOut)?;
-        let response = self.api.refresh(&refresh_token).await?;
-        stored.access_token = Some(response.access_token.clone());
-        stored.refresh_token = Some(response.refresh_token);
-        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
-        self.logger.record(CoreLogEvent {
-            kind: "auth.refreshed",
-            operation_id: None,
-            request_id: Some(response.request_id),
-            code: None,
-        });
-        Ok(response.access_token)
+    pub async fn access_snapshot(&self) -> Result<AccessSnapshot, CoreError> {
+        self.load_runtime()?;
+        self.auth.access(None).await
     }
 
-    pub async fn replace_session_tokens(
+    pub async fn refresh_access_token(
         &self,
-        access_token: &str,
-        refresh_token: &str,
-    ) -> Result<(), CoreError> {
-        let _guard = self.refresh_gate.lock().await;
-        let mut stored = self.load_auth()?;
-        stored.access_token = Some(access_token.to_string());
-        stored.refresh_token = Some(refresh_token.to_string());
-        self.store.save(&stored).map_err(|_| CoreError::Storage)?;
-        self.logger.record(CoreLogEvent {
-            kind: "auth.background_recovered",
-            operation_id: None,
-            request_id: None,
-            code: None,
-        });
-        Ok(())
+        stale_access: &AccessSnapshot,
+    ) -> Result<AccessSnapshot, CoreError> {
+        self.auth.access(Some(stale_access)).await
     }
 
     pub async fn bootstrap(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {
-        let stored = self.load_auth()?;
-        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
-        let response = match self.api.bootstrap(&access_token).await {
+        let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
+        let access_token = self.access_snapshot().await?;
+        let response = self.api.bootstrap(&access_token).await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        let response = match response {
             Ok(response) => response,
             Err(CoreApiError::Unauthorized) => {
                 let access_token = self.refresh_access_token(&access_token).await?;
-                match self.api.bootstrap(&access_token).await {
+                self.ensure_start_not_cancelled(cancel_epoch)?;
+                let response = self.api.bootstrap(&access_token).await;
+                self.ensure_start_not_cancelled(cancel_epoch)?;
+                match response {
                     Ok(response) => response,
                     Err(error) => {
                         self.set_phase(phase_for_api_error(&error)).await;
@@ -1461,28 +1592,34 @@ where
                 return Err(error.into());
             }
         };
-        self.complete_bootstrap(response, now_unix).await
+        self.complete_bootstrap(response, now_unix, cancel_epoch)
+            .await
     }
 
     pub async fn bootstrap_without_refresh(&self, now_unix: i64) -> Result<Bootstrap, CoreError> {
-        let stored = self.load_auth()?;
-        let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
-        let response = match self.api.bootstrap(&access_token).await {
+        let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
+        let access_token = self.access_snapshot().await?;
+        let response = self.api.bootstrap(&access_token).await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        let response = match response {
             Ok(response) => response,
             Err(error) => {
                 self.set_phase(phase_for_api_error(&error)).await;
                 return Err(error.into());
             }
         };
-        self.complete_bootstrap(response, now_unix).await
+        self.complete_bootstrap(response, now_unix, cancel_epoch)
+            .await
     }
 
     async fn complete_bootstrap(
         &self,
         response: Bootstrap,
         now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
     ) -> Result<Bootstrap, CoreError> {
-        let mut current_stored = self.load_auth()?;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        let mut current_stored = self.load_runtime()?;
         current_stored.compatibility = Some(StoredCompatibility {
             update_required: response.update.required,
             observed_at_unix: now_unix,
@@ -1539,15 +1676,22 @@ where
                 tunnel_status,
             },
         );
-        *self.state.lock().await = CoreState {
-            phase,
-            connection: response.connection.clone(),
-        };
+        {
+            let mut state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            *state = CoreState {
+                phase,
+                connection: response.connection.clone(),
+            };
+        }
         if phase == Phase::Connected {
             if let Some(connection) = &response.connection {
-                self.restore_running_connection_configuration(connection, now_unix)
+                self.restore_running_connection_configuration(connection, now_unix, cancel_epoch)
                     .await;
-                self.restore_running_split_tunnel_options(connection).await;
+                self.ensure_start_not_cancelled(cancel_epoch)?;
+                self.restore_running_split_tunnel_options(connection, cancel_epoch)
+                    .await;
+                self.ensure_start_not_cancelled(cancel_epoch)?;
             }
         }
         self.logger.record(CoreLogEvent {
@@ -1557,6 +1701,7 @@ where
             code: None,
         });
         self.retry_pending_split_tunnel_results().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         Ok(response)
     }
 
@@ -1564,8 +1709,9 @@ where
         &self,
         connection: &Connection,
         now_unix: i64,
+        cancel_epoch: StartCancellationEpoch,
     ) {
-        let Ok(stored) = self.load_auth() else {
+        let Ok(stored) = self.load_runtime() else {
             return;
         };
         let already_saved = stored
@@ -1577,7 +1723,7 @@ where
         if already_saved {
             return;
         }
-        let Some(mut access_token) = stored.access_token else {
+        let Ok(mut access_token) = self.access_snapshot().await else {
             return;
         };
         let request = ConnectionStartRequest {
@@ -1595,6 +1741,9 @@ where
             request_fingerprint: None,
         };
         let mut recovered = self.api.start_connection(&access_token, &request).await;
+        if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+            return;
+        }
         if matches!(recovered, Err(CoreApiError::Unauthorized)) {
             recovered = match self.refresh_access_token(&access_token).await {
                 Ok(refreshed) => {
@@ -1640,9 +1789,12 @@ where
                 StoredConnectionKind::Fixed | StoredConnectionKind::Pinned => None,
             },
         };
-        let Ok(mut current_stored) = self.load_auth() else {
+        let Ok(mut current_stored) = self.load_runtime() else {
             return;
         };
+        if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+            return;
+        }
         if kind == StoredConnectionKind::Pinned {
             current_stored.pinned_connection = Some(saved_connection);
             current_stored.saved_connection = None;
@@ -1705,17 +1857,72 @@ where
     ) -> Result<Connection, CoreError> {
         let cancel_epoch = self.begin_start_attempt();
         let result = self
-            .start_internal(
+            .start_recovery_v2_with_cancellation_epoch(
                 options,
                 now_unix,
-                true,
-                ConnectionStartContract::RecoveryV2,
                 reserve_enabled,
                 cancel_epoch,
             )
             .await;
         self.finish_start_attempt();
         result
+    }
+
+    pub async fn start_recovery_v2_with_cancellation_epoch(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        reserve_enabled: bool,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<Connection, CoreError> {
+        let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        self.start_internal(
+            options,
+            now_unix,
+            true,
+            ConnectionStartContract::RecoveryV2,
+            reserve_enabled,
+            cancel_epoch,
+        )
+        .await
+    }
+
+    /// A new user request may supersede an old unresolved intent, but only
+    /// after its exact replay/reconciliation and cleanup have completed.
+    /// Automatic retries continue to use start_internal's strict replay fence.
+    pub async fn prepare_explicit_start(
+        &self,
+        options: &ConnectOptions,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<(), CoreError> {
+        let _intent_guard = self.intent_recovery_gate.lock().await;
+        let _split_guard = self.split_tunnel_gate.lock().await;
+        let _connection_guard = self.connection_gate.lock().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        let stored = self.load_runtime()?;
+        let Some(pending) = stored.pending_start.as_ref() else {
+            return Ok(());
+        };
+        let options = options.clone().normalized_for_layer();
+        if pending.cancel_operation_id.is_none() && pending_start_matches_options(pending, &options)
+        {
+            return Ok(());
+        }
+        // The UI can lag behind a tunnel started by the tile. Never retire its
+        // lease on the strength of the cached UI phase alone.
+        if self.connected_connection().await.is_some()
+            || self.tunnel.status().await? != TunnelStatus::Stopped
+        {
+            return Err(unresolved_start_operation_error());
+        }
+        self.logger.record(CoreLogEvent {
+            kind: "connection.explicit_retry_cleanup",
+            operation_id: Some(pending.operation_id.clone()),
+            request_id: None,
+            code: None,
+        });
+        self.cancel_unknown_pending_start().await?;
+        self.ensure_start_not_cancelled(cancel_epoch)
     }
 
     #[cfg(not(target_os = "android"))]
@@ -1763,14 +1970,14 @@ where
         let options = options.normalized_for_layer();
         let total_started = Instant::now();
         self.ensure_start_not_cancelled(cancel_epoch)?;
-        if let Some(pending) = self.load_auth()?.pending_compensation_stop {
+        if let Some(pending) = self.load_runtime()?.pending_compensation_stop {
             self.set_phase(Phase::Stopping).await;
             self.resume_pending_compensation_stop(pending).await?;
             self.ensure_start_not_cancelled(cancel_epoch)?;
         }
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         if let Some(connection) = self.connected_connection().await {
             return Ok(connection);
         }
@@ -1796,7 +2003,7 @@ where
         self.release_stale_panel_connection_before_start(&stored)
             .await?;
         self.ensure_start_not_cancelled(cancel_epoch)?;
-        stored = self.load_auth()?;
+        stored = self.load_runtime()?;
         if let Some(pending) = stored.pending_start.as_ref() {
             if pending.cancel_operation_id.is_some() {
                 self.set_phase(Phase::Stopping).await;
@@ -1822,7 +2029,7 @@ where
             None => None,
         };
         self.ensure_start_not_cancelled(cancel_epoch)?;
-        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let access_token = self.access_snapshot().await?;
         let (
             contract,
             operation_id,
@@ -1910,7 +2117,7 @@ where
         });
         let pending_start_created_for_dispatch = stored.pending_start.is_none();
         if pending_start_created_for_dispatch {
-            let mut pending_stored = self.load_auth()?;
+            let mut pending_stored = self.load_runtime()?;
             pending_stored.pending_start = Some(StoredPendingStart {
                 operation_id: operation_id.clone(),
                 layer: options.layer,
@@ -2112,7 +2319,7 @@ where
         // The start request may rotate the tokens after an unauthorized response.
         // Reload before persisting the connection so stale credentials cannot
         // overwrite the freshly rotated session.
-        let mut current_stored = self.load_auth()?;
+        let mut current_stored = self.load_runtime()?;
         if let Some(saved_connection) = saved_connection {
             if kind == StoredConnectionKind::Pinned {
                 current_stored.pinned_connection = Some(saved_connection);
@@ -2289,7 +2496,7 @@ where
 
     pub async fn prepare_binding_change(&self) -> Result<(), CoreError> {
         let _guard = self.connection_gate.lock().await;
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         self.release_stale_panel_connection_before_start(&stored)
             .await
     }
@@ -2319,6 +2526,89 @@ where
             Ok(())
         } else {
             Err(CoreError::StartCancelled)
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn stop_locally(&self) -> Result<Connection, CoreError> {
+        self.signal_start_cancellation();
+        let intent_guard = self.intent_recovery_gate.lock().await;
+        let split_guard = self.split_tunnel_gate.lock().await;
+        let connection_guard = self.connection_gate.lock().await;
+        let current = self.state.lock().await.connection.clone();
+        let stored = self.load_runtime();
+        // Unknown starts and stalled recovery retain their existing reconciliation path.
+        let Some(current) = current.filter(|_| {
+            !stored
+                .as_ref()
+                .is_ok_and(|stored| stored.pending_stalled_stop.is_some())
+        }) else {
+            drop(connection_guard);
+            drop(split_guard);
+            drop(intent_guard);
+            return self.stop().await;
+        };
+        let journal_result = match stored {
+            Ok(stored) => {
+                if let Some(pending) = stored.pending_compensation_stop {
+                    if pending.lease_id != current.lease_id {
+                        return Err(CoreError::Storage);
+                    }
+                    Ok(())
+                } else if !compensation_stop_confirms_finished(None, true, current.status) {
+                    self.pending_compensation_stop_identity(&current.lease_id, true, None, None)
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        };
+        *self.active_recovery_episode.lock().await = None;
+        self.set_phase(Phase::Stopping).await;
+        if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
+            self.tunnel.stop().await?;
+        }
+        // Storage failure must not leave the user's local tunnel running.
+        // No panel request is sent until a cleanup identity has been persisted.
+        journal_result?;
+        // The panel owns the lease status. Only the local tunnel is confirmed here.
+        self.physical_network_change.lock().await.reset();
+        self.clear_applied_physical_network_fingerprint();
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
+            .await;
+        self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
+            .await;
+        if !self.has_pending_stop_cleanup()? {
+            self.set_phase(Phase::Ready).await;
+        }
+        Ok(current)
+    }
+
+    pub async fn local_stop_pending_cleanup(&self) -> bool {
+        if !matches!(self.auth.state().await, Ok(RuntimeAuthState::Active)) {
+            return false;
+        }
+        let Ok(stored) = self.load_runtime() else {
+            return false;
+        };
+        let Some(pending) = stored.pending_compensation_stop else {
+            return false;
+        };
+        let state = self.state.lock().await;
+        matches!(state.phase, Phase::Stopping | Phase::Ready)
+            && state
+                .connection
+                .as_ref()
+                .is_none_or(|current| current.lease_id == pending.lease_id)
+            && matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
+    }
+
+    pub fn has_pending_stop_cleanup(&self) -> Result<bool, CoreError> {
+        match self.load_runtime() {
+            Ok(stored) => Ok(stored.pending_compensation_stop.is_some()),
+            Err(CoreError::SignedOut) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -2411,7 +2701,7 @@ where
     #[cfg(not(target_os = "android"))]
     pub async fn reconcile_pending_operation_for_retry(&self) -> Result<(), CoreError> {
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         if let Some(pending) = stored.pending_compensation_stop.clone() {
             return self.resume_pending_compensation_stop(pending).await;
         }
@@ -2494,7 +2784,7 @@ where
     #[cfg(not(target_os = "android"))]
     async fn reconcile_pending_stalled_stop_for_retry(
         &self,
-        stored: &nelomai_client_storage::StoredAuth,
+        stored: &nelomai_client_storage::RuntimeStateV1,
         pending: StoredPendingStalledStop,
     ) -> Result<(), CoreError> {
         if pending.contract_version != 1
@@ -2622,14 +2912,18 @@ where
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
             .await;
 
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         if stored.pending_compensation_stop.as_ref() != Some(&pending) {
             return Err(CoreError::Storage);
         }
-        let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let access_token = self.access_snapshot().await?;
         let response = match self.retry_compensation_stop(&access_token, &pending).await {
             Ok(response) => response,
             Err(error) => {
+                // A transient panel outage does not undo the confirmed local stop.
+                if self.state.lock().await.phase == Phase::ServerUnavailable {
+                    self.set_phase(Phase::Stopping).await;
+                }
                 self.logger.record(CoreLogEvent {
                     kind: "connection.stop_failed",
                     operation_id: Some(pending.operation_id.clone()),
@@ -2666,10 +2960,10 @@ where
     #[cfg(not(target_os = "android"))]
     async fn reconcile_background_operation(
         &self,
-        stored: &nelomai_client_storage::StoredAuth,
+        _stored: &nelomai_client_storage::RuntimeStateV1,
         request: OperationReconcileRequest,
-    ) -> Result<(String, OperationReconcileResponse), CoreError> {
-        let mut access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+    ) -> Result<(AccessSnapshot, OperationReconcileResponse), CoreError> {
+        let mut access_token = self.access_snapshot().await?;
         let background = match self.api.background_token(&access_token).await {
             Ok(response) => response,
             Err(CoreApiError::Unauthorized) => {
@@ -2703,7 +2997,7 @@ where
     }
 
     async fn cancel_unknown_pending_start(&self) -> Result<Option<Connection>, CoreError> {
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         let Some(pending) = stored.pending_start.clone() else {
             return Ok(None);
         };
@@ -2720,7 +3014,7 @@ where
             }
             _ => return Err(CoreError::Storage),
         };
-        let mut access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let mut access_token = self.access_snapshot().await?;
         let background = match self.api.background_token(&access_token).await {
             Ok(response) => response,
             Err(CoreApiError::Unauthorized) => {
@@ -2797,10 +3091,10 @@ where
 
     async fn cancel_unknown_legacy_start(
         &self,
-        stored: nelomai_client_storage::StoredAuth,
+        _stored: nelomai_client_storage::RuntimeStateV1,
         pending: StoredPendingStart,
     ) -> Result<Option<Connection>, CoreError> {
-        let mut access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let mut access_token = self.access_snapshot().await?;
         let request = ConnectionStartRequest {
             operation_id: pending.operation_id.clone(),
             layer: pending.layer,
@@ -2852,11 +3146,16 @@ where
 
     async fn stop_unknown_pending_lease(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         pending_operation_id: &str,
         lease_id: &str,
     ) -> Result<Connection, CoreError> {
         let stop_operation_id = self.pending_cancel_operation_id(pending_operation_id)?;
+        let pending = self
+            .load_runtime()?
+            .pending_start
+            .filter(|pending| pending.operation_id == pending_operation_id)
+            .ok_or(CoreError::Storage)?;
         let response = match self
             .retry_operation(
                 access_token,
@@ -2875,6 +3174,13 @@ where
                 return Err(error);
             }
         };
+        if response.connection.lease_id != lease_id {
+            return Err(invalid_operation_reconcile_response());
+        }
+        let accept_warm = response.connection.pinned
+            || pending.layer != Layer::Tic
+            || pending.tic_connection_mode != TicConnectionMode::Personal;
+        require_compensation_stop_finished(None, accept_warm, response.connection.status)?;
         self.clear_pending_start(pending_operation_id)?;
         *self.state.lock().await = CoreState {
             phase: Phase::Ready,
@@ -2939,8 +3245,8 @@ where
             };
             return Ok(current);
         }
-        let stored = self.load_auth()?;
-        let access_token = stored.access_token.ok_or(CoreError::SignedOut)?;
+        let stored = self.load_runtime()?;
+        let access_token = self.access_snapshot().await?;
         let request = ConnectionOperationRequest {
             operation_id: operation_id
                 .map(str::to_string)
@@ -3068,7 +3374,7 @@ where
             .connection
             .clone()
             .ok_or(CoreError::SavedConnectionUnavailable)?;
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
         let saved = stored
             .saved_connection
             .as_ref()
@@ -3155,6 +3461,7 @@ where
     }
 
     pub async fn pin_stray(&self) -> Result<Connection, CoreError> {
+        let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
         let _guard = self.connection_gate.lock().await;
         let current_state = self.state.lock().await.clone();
         let current = current_state
@@ -3165,13 +3472,13 @@ where
                     && !connection.pinned
             })
             .ok_or(CoreError::SavedConnectionUnavailable)?;
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         let saved = stored
             .saved_connection
             .take()
             .filter(|saved| saved.lease_id == current.lease_id)
             .ok_or(CoreError::SavedConnectionUnavailable)?;
-        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let access_token = self.access_snapshot().await?;
         let request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: current.lease_id,
@@ -3180,6 +3487,10 @@ where
         let response = self
             .retry_operation(&access_token, &request, ConnectionOperation::PinStray)
             .await?;
+        // Logout keeps the original lease/configuration as cleanup authority.
+        // A late pin acknowledgement must not replace that operational snapshot.
+        let mut state = self.state.lock().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         stored.pinned_connection = Some(StoredConnection {
             kind: StoredConnectionKind::Pinned,
             valid_until_unix: None,
@@ -3187,7 +3498,8 @@ where
         });
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         self.clear_offline_connection_quarantine(&response.connection.lease_id);
-        *self.state.lock().await = CoreState {
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        *state = CoreState {
             phase: Phase::Connected,
             connection: Some(response.connection.clone()),
         };
@@ -3206,13 +3518,13 @@ where
         now_unix: i64,
     ) -> Result<Connection, CoreError> {
         let _guard = self.connection_gate.lock().await;
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         let saved = stored
             .pinned_connection
             .take()
             .filter(|saved| saved.lease_id == lease_id)
             .ok_or(CoreError::SavedConnectionUnavailable)?;
-        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let access_token = self.access_snapshot().await?;
         let request = ConnectionOperationRequest {
             operation_id: Uuid::new_v4().to_string(),
             lease_id: lease_id.to_string(),
@@ -3249,7 +3561,7 @@ where
     pub async fn complete_unbind(&self) -> Result<(), CoreError> {
         let _guard = self.connection_gate.lock().await;
         self.tunnel.stop().await?;
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         stored.saved_connection = None;
         stored.pinned_connection = None;
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
@@ -3268,9 +3580,16 @@ where
     }
 
     pub async fn start_saved_stray_offline(&self, now_unix: i64) -> Result<String, CoreError> {
+        let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
+        if self.auth.state().await? != RuntimeAuthState::Active {
+            return Err(CoreError::SignedOut);
+        }
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
-        let stored = self.load_auth()?;
+        let stored = self.load_runtime()?;
+        if stored.pending_compensation_stop.is_some() {
+            return Err(CoreError::SavedConnectionUnavailable);
+        }
         if stored
             .compatibility
             .as_ref()
@@ -3346,10 +3665,14 @@ where
             pinned: saved.kind == StoredConnectionKind::Pinned,
             stopped_at: None,
         };
-        *self.state.lock().await = CoreState {
-            phase: Phase::Connecting,
-            connection: Some(connection.clone()),
-        };
+        {
+            let mut state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            *state = CoreState {
+                phase: Phase::Connecting,
+                connection: Some(connection.clone()),
+            };
+        }
         if let Err(error) = self
             .tunnel
             .start(TunnelStartRequest {
@@ -3373,20 +3696,35 @@ where
             })
             .await
         {
-            *self.state.lock().await = CoreState {
+            // Even an error may follow a partially dispatched platform start.
+            self.ensure_offline_start_current(cancel_epoch).await?;
+            let mut state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            *state = CoreState {
                 phase: Phase::Ready,
                 connection: None,
             };
             return Err(error.into());
         }
+        self.ensure_offline_start_current(cancel_epoch).await?;
         if transport == TunnelTransport::AmneziaWg3 {
             if let Err(error) = self
-                .ensure_awg3_handshake(&saved.lease_id, None, None)
+                .ensure_awg3_handshake(&saved.lease_id, None, Some(cancel_epoch))
                 .await
             {
                 if let Err(stop_error) = self.tunnel.stop().await {
                     let stop_error = CoreError::from(stop_error);
-                    *self.state.lock().await = CoreState {
+                    let mut state = self.state.lock().await;
+                    if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+                        // Cleanup failed, but logout still owns admission/presentation.
+                        // Durable runtime references remain available for a later stop.
+                        *state = CoreState {
+                            phase: Phase::Error,
+                            connection: None,
+                        };
+                        return Err(stop_error);
+                    }
+                    *state = CoreState {
                         phase: Phase::Stopping,
                         connection: Some(Connection {
                             lease_id: saved.lease_id.clone(),
@@ -3417,7 +3755,9 @@ where
                     });
                     return Err(stop_error);
                 }
-                *self.state.lock().await = CoreState {
+                let mut state = self.state.lock().await;
+                self.ensure_start_not_cancelled(cancel_epoch)?;
+                *state = CoreState {
                     phase: Phase::Ready,
                     connection: None,
                 };
@@ -3450,10 +3790,15 @@ where
         let applied_physical_network_fingerprint = self
             .initialize_physical_network_detector(&tunnel_options)
             .await;
-        *self.state.lock().await = CoreState {
-            phase: Phase::Connected,
-            connection: Some(connection),
-        };
+        self.ensure_offline_start_current(cancel_epoch).await?;
+        {
+            let mut state = self.state.lock().await;
+            self.ensure_start_not_cancelled(cancel_epoch)?;
+            *state = CoreState {
+                phase: Phase::Connected,
+                connection: Some(connection),
+            };
+        }
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Operation)
             .await;
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
@@ -3501,12 +3846,55 @@ where
         Ok(saved.lease_id)
     }
 
-    fn load_auth(&self) -> Result<nelomai_client_storage::StoredAuth, CoreError> {
+    async fn ensure_offline_start_current(
+        &self,
+        epoch: StartCancellationEpoch,
+    ) -> Result<(), CoreError> {
+        if self.ensure_start_not_cancelled(epoch).is_ok() {
+            return Ok(());
+        }
+        // A late platform start may have physically started after logout's stop.
+        // The connection gate still excludes another start while we stop it.
+        let result = self.tunnel.stop().await;
+        // Successful compensation must not overwrite an in-progress logout's
+        // Stopping/Error presentation or imply remote acknowledgement.
+        if result.is_err() {
+            *self.state.lock().await = CoreState {
+                phase: Phase::Error,
+                connection: None,
+            };
+        }
+        result.map_err(CoreError::from)?;
+        Err(CoreError::StartCancelled)
+    }
+
+    async fn publish_local_start_state(
+        &self,
+        epoch: StartCancellationEpoch,
+        phase: Phase,
+        connection: Connection,
+    ) -> Result<(), CoreError> {
+        let mut state = self.state.lock().await;
+        if self.ensure_start_not_cancelled(epoch).is_err() {
+            drop(state);
+            return self.ensure_offline_start_current(epoch).await;
+        }
+        *state = CoreState {
+            phase,
+            connection: Some(connection),
+        };
+        Ok(())
+    }
+
+    fn load_runtime(&self) -> Result<nelomai_client_storage::RuntimeStateV1, CoreError> {
         let mut stored = self
             .store
             .load()
             .map_err(|_| CoreError::Storage)?
             .ok_or(CoreError::SignedOut)?;
+        if !stored.start_or_recovery_allowed() {
+            return Err(CoreError::Storage);
+        }
         if stored.pinned_connection.is_none()
             && stored
                 .saved_connection
@@ -3530,7 +3918,7 @@ where
 
     async fn release_stale_panel_connection_before_start(
         &self,
-        stored: &nelomai_client_storage::StoredAuth,
+        stored: &nelomai_client_storage::RuntimeStateV1,
     ) -> Result<(), CoreError> {
         let stale = {
             let state = self.state.lock().await;
@@ -3560,7 +3948,7 @@ where
         ) {
             return Ok(());
         }
-        let access_token = stored.access_token.clone().ok_or(CoreError::SignedOut)?;
+        let access_token = self.access_snapshot().await?;
         let accept_warm = stored_connection_accepts_warm(&connection);
         let pending_compensation = stored
             .pending_start
@@ -3638,7 +4026,7 @@ where
     }
 
     fn pending_cancel_operation_id(&self, operation_id: &str) -> Result<String, CoreError> {
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         let pending = stored
             .pending_start
             .as_mut()
@@ -3658,7 +4046,7 @@ where
         &self,
         lease_id: &str,
     ) -> Result<StoredPendingStalledStop, CoreError> {
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         if let Some(pending) = stored.pending_stalled_stop.as_ref() {
             let expected_fingerprint =
                 connection_intent::stalled_stop_request_fingerprint_v1(lease_id);
@@ -3692,7 +4080,7 @@ where
             return Err(CoreError::Storage);
         }
         let recovery_contract_version = redundant_session_id.map(|_| 2);
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         if let Some(pending) = stored.pending_compensation_stop.as_ref() {
             if pending.lease_id != lease_id
                 || pending.recovery_contract_version != recovery_contract_version
@@ -3730,7 +4118,7 @@ where
         {
             return Ok(pending);
         }
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         let accepts_warm = current
             .map(stored_connection_accepts_warm)
             .unwrap_or_else(|| {
@@ -3765,7 +4153,7 @@ where
         operation_id: &str,
         lease_id: &str,
     ) -> Result<(), CoreError> {
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         if stored
             .pending_compensation_stop
             .as_ref()
@@ -3781,7 +4169,7 @@ where
 
     #[cfg(not(target_os = "android"))]
     fn clear_pending_compensation_stop_if_absent(&self) -> Result<(), CoreError> {
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         if stored.pending_compensation_stop.take().is_some() {
             self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         }
@@ -3794,7 +4182,7 @@ where
         operation_id: &str,
         lease_id: &str,
     ) -> Result<(), CoreError> {
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         if stored.pending_stalled_stop.as_ref().is_some_and(|pending| {
             pending.operation_id == operation_id && pending.lease_id == lease_id
         }) {
@@ -3828,7 +4216,7 @@ where
 
     #[cfg(not(target_os = "android"))]
     fn remove_dynamic_recovery_cache(&self, lease_id: &str) -> Result<(), CoreError> {
-        let mut stored = self.load_auth()?;
+        let mut stored = self.load_runtime()?;
         if stored.saved_connection.as_ref().is_some_and(|saved| {
             saved.lease_id == lease_id && saved.kind == StoredConnectionKind::DynamicWarm
         }) {
@@ -3892,7 +4280,7 @@ where
         connection: &Connection,
     ) -> Result<(), CoreError> {
         let pending_operation_id = self
-            .load_auth()?
+            .load_runtime()?
             .pending_start
             .map(|pending| pending.operation_id)
             .unwrap_or_default();
@@ -4324,9 +4712,14 @@ where
                     request_id: None,
                     code: Some(compensation_error.to_string()),
                 });
+                let phase = phase_for_start_error(&compensation_error);
                 (
                     connection.clone(),
-                    phase_for_start_error(&compensation_error),
+                    if phase == Phase::ServerUnavailable {
+                        Phase::Stopping
+                    } else {
+                        phase
+                    },
                 )
             }
         };
@@ -4372,7 +4765,7 @@ where
 
     async fn retry_start(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &mut ConnectionStartRequest,
         allow_internal_retry: bool,
         cancel_epoch: StartCancellationEpoch,
@@ -4384,7 +4777,7 @@ where
             Vec::new()
         };
         let mut retry_index = 0;
-        let mut access_token = access_token.to_string();
+        let mut access_token = access_token.clone();
         let mut refreshed = false;
         let mut replaced_finished_operation = false;
         let mut dispatched = false;
@@ -4472,13 +4865,13 @@ where
 
     async fn retry_operation(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
         operation: ConnectionOperation,
     ) -> Result<ConnectionOperationResponse, CoreError> {
         let delays = self.retry_policy.delays_millis();
         let mut retry_index = 0;
-        let mut access_token = access_token.to_string();
+        let mut access_token = access_token.clone();
         let mut refreshed = false;
         loop {
             let result = match operation {
@@ -4513,7 +4906,7 @@ where
 
     async fn retry_compensation_stop(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         pending: &StoredPendingCompensationStop,
     ) -> Result<ConnectionOperationResponse, CoreError> {
         let Some(session_id) = pending_compensation_redundant_session(pending)? else {
@@ -4537,7 +4930,7 @@ where
         };
         let delays = self.retry_policy.delays_millis();
         let mut retry_index = 0;
-        let mut access_token = access_token.to_string();
+        let mut access_token = access_token.clone();
         let mut refreshed = false;
         loop {
             match self
@@ -4567,7 +4960,7 @@ where
 }
 
 fn reusable_operation_id(
-    stored: &nelomai_client_storage::StoredAuth,
+    stored: &nelomai_client_storage::RuntimeStateV1,
     options: &ConnectOptions,
     now_unix: i64,
 ) -> Option<String> {
@@ -4784,7 +5177,10 @@ fn phase_for_api_error(error: &CoreApiError) -> Phase {
 
 fn phase_for_start_error(error: &CoreError) -> Phase {
     match error {
-        CoreError::SignedOut | CoreError::Api(CoreApiError::Unauthorized) => Phase::SignedOut,
+        CoreError::SignedOut
+        | CoreError::AuthenticationOutcomeUnknown
+        | CoreError::AuthRecoveryRequired
+        | CoreError::Api(CoreApiError::Unauthorized) => Phase::SignedOut,
         CoreError::AccessExpired | CoreError::Api(CoreApiError::AccessExpired) => {
             Phase::AccessExpired
         }

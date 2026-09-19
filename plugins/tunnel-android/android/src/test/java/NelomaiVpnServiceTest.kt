@@ -5309,9 +5309,11 @@ class NelomaiVpnServiceTest {
             coordinator.runOnce(firstPanel, ServiceRuntimeFake()),
         )
 
-        val handoff = coordinator.dataPlaneStalled("lease-stalled")
-
-        assertTrue(handoff is AndroidCoordinatorResult.Accepted)
+        assertTrue(routeDataPlaneStall(
+            coordinator.status(),
+            legacyRecovery = { error("measured intent must keep its durable recovery path") },
+            intentRecovery = { coordinator.dataPlaneStalled("lease-stalled") is AndroidCoordinatorResult.Accepted },
+        ))
         val durable = recoveryStore(backend).load()
         assertTrue(durable.intent.desiredActive)
         assertTrue(durable.intent.armedHistory)
@@ -5858,6 +5860,29 @@ class NelomaiVpnServiceTest {
         )
         assertEquals(0, operationIds.get())
         assertEquals(before, store.load())
+    }
+
+    @Test
+    fun supersededLogoutCompletesLocallyOnlyOnExplicitAcknowledgement() {
+        for (code in listOf("background_logout_superseded", "unknown_logout_result")) {
+            val credentials = configuredCredentialStore()
+            val logout = AndroidLogoutCoordinator(credentials, coordinator(recoveryStore(ServiceRecoveryBackend())))
+            logout.begin()
+            val step = logout.runOnce(ServicePanelFake(), ServiceRuntimeFake(),
+                activate = { _, _, _ -> error("no staged activation") },
+                finalize = { _, _, _, _, _ -> BackgroundLogoutFinalizeResult(code, 0) })
+            val after = credentials.read().credentialSuccess()
+            if (code == "background_logout_superseded") {
+                assertEquals(AndroidLogoutStep.COMPLETE, step)
+                assertEquals(BackgroundLogoutPhase.FINALIZED, after.logoutState?.phase)
+                assertNull(after.cleanupCredential)
+                assertNull(after.installSecret)
+            } else {
+                assertEquals(AndroidLogoutStep.RETRY, step)
+                assertEquals(BackgroundLogoutPhase.PENDING, after.logoutState?.phase)
+                assertTrue(after.cleanupCredential != null)
+            }
+        }
     }
 
     @Test
@@ -6580,6 +6605,13 @@ class NelomaiVpnServiceTest {
             shouldRecycleIdleVpnProcess(
                 SessionState.STOPPED,
                 desiredActive = true,
+            ),
+        )
+        assertFalse(
+            shouldRecycleIdleVpnProcess(
+                SessionState.STOPPED,
+                desiredActive = false,
+                pendingRuntimeDispatch = true,
             ),
         )
     }

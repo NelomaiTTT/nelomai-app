@@ -1,3 +1,4 @@
+mod support;
 use async_trait::async_trait;
 use axum::{
     extract::{Path, Query, State},
@@ -6,15 +7,15 @@ use axum::{
     Json, Router,
 };
 use nelomai_client_api::ClientApi;
-use nelomai_client_application::{ClientApplication, LoginParameters};
+use nelomai_client_application::LoginParameters;
 use nelomai_client_core::{ConnectOptions, NoopLogger, Phase};
 use nelomai_client_storage::{SecretStore, StorageError, StoredAuth};
 use nelomai_client_tunnel::{TunnelController, TunnelError, TunnelStartRequest, TunnelStatus};
 use nelomai_contracts::{
     BindPeerRequest, EgressMode, Layer, OperationKind, OperationReconcileRequest, OperationState,
-    Platform, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelApplyResult, SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelSelectedPackage,
-    SplitTunnelSettingsUpdate, TicConnectionMode,
+    RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate, SplitTunnelApplyResult,
+    SplitTunnelApplyStatus, SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate,
+    TicConnectionMode,
 };
 use serde_json::{json, Value};
 use std::{
@@ -118,7 +119,8 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     let store = Arc::new(MemoryStore::default());
     let tunnel = Arc::new(RecordingTunnel::default());
     let application =
-        ClientApplication::new(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
+        support::application(api, store.clone(), tunnel.clone(), Arc::new(NoopLogger));
+    assert!(application.stop_for_shutdown().await.unwrap().is_none());
 
     let initial = application
         .login(
@@ -126,10 +128,6 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
                 login: "test".to_string(),
                 password: "password".to_string(),
                 device_name: "Test Mac".to_string(),
-                platform: Platform::Macos,
-                platform_version: Some("15.5".to_string()),
-                architecture: "aarch64".to_string(),
-                app_version: "0.1.0".to_string(),
             },
             NOW,
         )
@@ -176,6 +174,32 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     assert_eq!(application.state().await.phase, Phase::Ready);
     assert!(application.stop_for_shutdown().await.unwrap().is_none());
 
+    application.start(options.clone(), NOW + 1).await.unwrap();
+    application.stop().await.unwrap();
+    assert!(application.local_stop_pending_cleanup().await);
+    assert_eq!(application.state().await.phase, Phase::Stopping);
+    // A local stop must wake cleanup even before the scheduler starts waiting.
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        application.wait_for_pending_stop(),
+    )
+    .await
+    .expect("local stop did not wake background cleanup");
+    // Bootstrap may reset the phase to Ready while the durable cleanup remains.
+    application.bootstrap(NOW + 2).await.unwrap();
+    assert!(application.retry_pending_stop().await.unwrap().is_some());
+    assert!(!application.local_stop_pending_cleanup().await);
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            application.wait_for_pending_stop(),
+        )
+        .await
+        .is_err(),
+        "cleanup must not wake itself in a busy retry loop"
+    );
+
     let second = application.start(options, NOW + 30).await.unwrap();
     assert_eq!(second.lease_id, LEASE_ID);
     assert!(second.pinned);
@@ -183,7 +207,7 @@ async fn real_http_client_completes_dynamic_stray_warm_reconnect_flow() {
     assert!(!unpinned.pinned);
     assert_eq!(
         tunnel.configurations.lock().unwrap().as_slice(),
-        [CONFIGURATION, CONFIGURATION]
+        [CONFIGURATION, CONFIGURATION, CONFIGURATION]
     );
     assert_eq!(panel_state.candidate_requests.load(Ordering::SeqCst), 1);
     assert_eq!(panel_state.probe_requests.load(Ordering::SeqCst), 1);

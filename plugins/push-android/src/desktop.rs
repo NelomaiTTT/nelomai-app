@@ -13,6 +13,18 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct PushAndroid<R: Runtime>(#[allow(dead_code)] AppHandle<R>);
 
 impl<R: Runtime> PushAndroid<R> {
+    pub async fn prepare_async(&self) -> crate::Result<PushTokenResponse> {
+        self.prepare()
+    }
+
+    pub async fn confirm_async(&self, token: &str) -> crate::Result<()> {
+        self.confirm(token)
+    }
+
+    pub async fn disable_async(&self) -> crate::Result<()> {
+        self.disable()
+    }
+
     pub fn prepare(&self) -> crate::Result<PushTokenResponse> {
         Err(crate::Error::Unsupported)
     }

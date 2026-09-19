@@ -66,10 +66,7 @@ internal class RedundantHealthMonitor(
         }
         val bounded = slots
         val active = bounded.singleOrNull(SlotObservation::active) ?: return NONE
-        val activeHealth = classify(nowMs, active)
-        val failed = active.hardFailure || activeHealth == BackendHealth.UNHEALTHY
-        val softFailureConfirmed = softFailureConfirmed(nowMs, active)
-        if (!failed && !softFailureConfirmed) return NONE
+        if (!failed(nowMs, active)) return NONE
 
         val candidate = bounded
             .asSequence()
@@ -91,6 +88,11 @@ internal class RedundantHealthMonitor(
     fun ready(nowMs: Long, observation: SlotObservation): Boolean =
         networkValidated && nowMs >= suppressFailoverUntilMs &&
             classify(nowMs, observation) == BackendHealth.READY
+
+    fun failed(nowMs: Long, observation: SlotObservation): Boolean =
+        networkValidated && nowMs >= suppressFailoverUntilMs &&
+            (classify(nowMs, observation) == BackendHealth.UNHEALTHY ||
+                softFailureConfirmed(nowMs, observation))
 
     private fun softFailureConfirmed(nowMs: Long, active: SlotObservation): Boolean {
         val startedAt = active.softFailureStartedAtMs

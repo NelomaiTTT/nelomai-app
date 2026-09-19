@@ -1,5 +1,6 @@
 use crate::connection_metrics::{ConnectionMetricsResponse, ConnectionMetricsTracker};
-use crate::diagnostics::AppDiagnostics;
+use crate::diagnostics::{AppDiagnostics, RuntimeActionSource};
+use crate::runtime_control::RuntimeControls;
 use crate::updates::{NativeUpdater, UpdateStatusResponse};
 use crate::{
     preferences::{AppPreferenceStore, DnsProvider},
@@ -7,6 +8,7 @@ use crate::{
 };
 use nelomai_client_api::DiagnosticUploadResponse;
 use nelomai_client_application::{ApplicationError, LoginParameters};
+use nelomai_client_container::RuntimeSwitchStatusV1;
 use nelomai_client_core::{
     split_tunnel_active, ConnectOptions, CoreApiError, CoreError, CoreState, Phase,
     SplitTunnelContext,
@@ -15,8 +17,9 @@ use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
     ConnectionIntentCapability, EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
-    Platform, ProbeResults, RouteMode, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
-    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
+    Platform, ProbeResults, RouteMode, RuntimeSlot, SplitTunnelAddressRuleScope,
+    SplitTunnelAddressRuleUpdate, SplitTunnelMode, SplitTunnelSelectedPackage,
+    SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "android")]
@@ -26,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_tunnel_android::TunnelAndroidExt;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 static ANDROID_BACKGROUND_PROVISION_GATE: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
@@ -718,23 +721,6 @@ const ANDROID_QUICK_RECONCILE_RETRY_SECONDS: i64 = 15;
 const STARTUP_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[cfg(any(target_os = "android", test))]
-fn should_attempt_android_background_recovery(
-    error: &ApplicationError,
-    background_configured: bool,
-) -> bool {
-    background_configured && matches!(error, ApplicationError::Core(CoreError::SignedOut))
-}
-
-#[cfg(any(target_os = "android", test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AndroidBackgroundRecoveryFailure {
-    AccessExpired,
-    ClearAndFallbackRefresh,
-    FallbackRefresh,
-    Retryable,
-}
-
-#[cfg(any(target_os = "android", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AndroidBackgroundProvisionMode {
     Noop,
@@ -828,57 +814,6 @@ fn android_background_provision_mode(
     }
 }
 
-#[cfg(any(target_os = "android", test))]
-fn android_background_rotation_fallback() -> Option<AndroidBackgroundProvisionMode> {
-    Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase)
-}
-
-#[cfg(any(target_os = "android", test))]
-fn android_background_legacy_fallback_after_ui_failure(
-    failure_code: Option<&str>,
-    latest_status: &tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse,
-    now: i64,
-) -> bool {
-    if latest_status.mutation_pending {
-        return false;
-    }
-    let latest_capability_unavailable = !latest_status.capability_enabled
-        || latest_status
-            .capability_expires_at_unix
-            .is_none_or(|expires_at| expires_at <= now);
-    failure_code == Some("background_credential_capability_unavailable")
-        && latest_capability_unavailable
-}
-
-#[cfg(target_os = "android")]
-struct AndroidBackgroundProvisionFailure {
-    command_error: CommandError,
-    rejection_code: Option<String>,
-}
-
-#[cfg(any(target_os = "android", test))]
-fn classify_android_background_recovery_error(code: &str) -> AndroidBackgroundRecoveryFailure {
-    match code {
-        "invalid_background_token" | "invalid_background_recovery" => {
-            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh
-        }
-        "activation_not_applied" | "background_recovery_unsupported" => {
-            AndroidBackgroundRecoveryFailure::FallbackRefresh
-        }
-        "app_access_unavailable" => AndroidBackgroundRecoveryFailure::AccessExpired,
-        _ => AndroidBackgroundRecoveryFailure::Retryable,
-    }
-}
-
-#[cfg(any(target_os = "android", test))]
-async fn await_detached_on_cancellation<F, T>(future: F) -> Result<T, tokio::task::JoinError>
-where
-    F: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::spawn(future).await
-}
-
 async fn bootstrap_application_for_startup(
     app: &AppHandle,
     application: &NativeApplication,
@@ -887,102 +822,80 @@ async fn bootstrap_application_for_startup(
 ) -> Result<Bootstrap, CommandError> {
     #[cfg(target_os = "android")]
     {
+        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+            .ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
+            .await
+            .map_err(runtime_readiness_error)?;
         let first_error = match application.bootstrap_without_refresh(now_unix).await {
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
-        if !matches!(first_error, ApplicationError::Core(CoreError::SignedOut)) {
-            return Err(first_error.into());
-        }
-        let background_configured = app
-            .tunnel_android()
-            .background_credential_status()
-            .map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
-                    "Не удалось проверить сохранённую сессию. Повторите запуск приложения",
-                )
-            })?
-            .configured;
-        if !should_attempt_android_background_recovery(&first_error, background_configured) {
-            return application.bootstrap(now_unix).await.map_err(Into::into);
-        }
-
         diagnostics.record_named("startup.auth_recovery.begin", None, None, None);
-        let install_secret = application.install_secret().map_err(CommandError::from)?;
-        let recovery_app = app.clone();
-        let recovered = await_detached_on_cancellation(async move {
-            recovery_app
-                .tunnel_android()
-                .recover_background_session(
-                    tauri_plugin_tunnel_android::BackgroundSessionRecoveryRequest {
-                        install_secret,
-                    },
-                )
-                .await
-        })
+        // Eligibility comes from the owner and exact runtime admission, not the
+        // presentation error. No error callback clears native protected state.
+        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+        let recovery = owner.background(nelomai_client_container::ipc::BackgroundAction::Recover);
+        // Only a known-not-issued recovery clears its own ticket. A genuinely
+        // lost refresh/recovery stays fenced, so this cannot retry its old proof.
+        route_android_startup_recovery(
+            first_error,
+            async {
+                recovery
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| nelomai_client_core::CoreError::AuthRecoveryRequired)
+            },
+            application.bootstrap(now_unix),
+        )
         .await
-        .map_err(|_| {
-            CommandError::new(
-                "session_recovery_failed",
-                "Не удалось завершить восстановление сессии. Повторите запуск приложения",
-            )
-        })?
-        .map_err(|_| {
-            CommandError::new(
-                "session_recovery_failed",
-                "Не удалось восстановить сессию. Проверьте сеть и повторите запуск приложения",
-            )
-        })?;
-        if let Some(code) = recovered.error_code.as_deref() {
-            return match classify_android_background_recovery_error(code) {
-                AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh => {
-                    app.tunnel_android().clear_background().map_err(|_| {
-                        CommandError::new(
-                            "background_storage_unavailable",
-                            "Не удалось очистить недействительную сессию. Повторите запуск приложения",
-                        )
-                    })?;
-                    application.bootstrap(now_unix).await.map_err(Into::into)
-                }
-                AndroidBackgroundRecoveryFailure::FallbackRefresh => {
-                    application.bootstrap(now_unix).await.map_err(Into::into)
-                }
-                AndroidBackgroundRecoveryFailure::AccessExpired => {
-                    Err(CommandError::from_core(CoreError::AccessExpired))
-                }
-                AndroidBackgroundRecoveryFailure::Retryable => Err(CommandError::new(
-                    code,
-                    "Не удалось восстановить сессию. Проверьте сеть и повторите запуск приложения",
-                )),
-            };
-        }
-        let access_token = recovered.access_token.as_deref().ok_or_else(|| {
-            CommandError::new(
-                "invalid_background_recovery_response",
-                "Панель вернула неполный ответ. Повторите запуск приложения",
-            )
-        })?;
-        let refresh_token = recovered.refresh_token.as_deref().ok_or_else(|| {
-            CommandError::new(
-                "invalid_background_recovery_response",
-                "Панель вернула неполный ответ. Повторите запуск приложения",
-            )
-        })?;
-        application
-            .replace_session_tokens(access_token, refresh_token)
-            .await
-            .map_err(CommandError::from)?;
-        diagnostics.record_named("startup.auth_recovery.completed", None, None, None);
-        application
-            .bootstrap_without_refresh(now_unix)
-            .await
-            .map_err(Into::into)
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = (app, diagnostics);
+        let startup = app.state::<Arc<crate::runtime_startup::RuntimeStartup>>();
+        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+        startup
+            .ensure_ready(crate::runtime_startup::request_ready(&owner, diagnostics))
+            .await
+            .map_err(runtime_readiness_error)?;
         application.bootstrap(now_unix).await.map_err(Into::into)
+    }
+}
+
+fn runtime_readiness_error(error: nelomai_client_container::ipc::PrivateError) -> CommandError {
+    use nelomai_client_container::ipc::PrivateError;
+    // Only RuntimeReady uses this mapping: an unfinished admission is not an
+    // authentication rejection. Access/refresh errors keep their own fencing.
+    match error {
+        PrivateError::RefreshPending => CommandError::new(
+            "auth_refresh_pending",
+            "Восстанавливаем соединение с аккаунтом. Повторим автоматически; данные входа сохранены",
+        ),
+        PrivateError::RecoveryRequired | PrivateError::Timeout | PrivateError::Service => CommandError::new(
+            "runtime_startup_pending",
+            "Завершается подготовка приложения и предыдущего подключения. Повторим автоматически; данные входа сохранены",
+        ),
+        _ => CommandError::from_core(CoreError::AuthRecoveryRequired),
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn route_android_startup_recovery<T>(
+    first_error: ApplicationError,
+    recovery: impl std::future::Future<Output = Result<(), CoreError>>,
+    ordinary_bootstrap: impl std::future::Future<Output = Result<T, ApplicationError>>,
+) -> Result<T, CommandError> {
+    if !matches!(
+        first_error,
+        ApplicationError::Core(CoreError::SignedOut | CoreError::AuthRecoveryRequired)
+    ) {
+        return Err(first_error.into());
+    }
+    match recovery.await {
+        Ok(()) | Err(CoreError::AuthRecoveryRequired) => {
+            ordinary_bootstrap.await.map_err(Into::into)
+        }
+        Err(error) => Err(CommandError::from_core(error)),
     }
 }
 
@@ -1021,6 +934,18 @@ pub enum StartupStage {
     FrontendMounted,
     FrontendFirstFrame,
     BootstrapSlow,
+    SignInBootstrapSignedOut,
+    SignInLoginFailed,
+    SignInLogoutCompleted,
+    UpdateInstallRequested,
+    UpdateRefreshStarted,
+    UpdateRefreshCompleted,
+    UpdateRefreshFailed,
+    UpdateAvailable,
+    UpdateDownloading,
+    UpdateReadyToRestart,
+    UpdateAwaitingInstallation,
+    UpdateFailed,
 }
 
 impl StartupStage {
@@ -1029,7 +954,36 @@ impl StartupStage {
             Self::FrontendMounted => "startup.frontend.mounted",
             Self::FrontendFirstFrame => "startup.frontend.first_frame",
             Self::BootstrapSlow => "startup.bootstrap.slow",
+            Self::SignInBootstrapSignedOut => "ui.sign_in.bootstrap_signed_out",
+            Self::SignInLoginFailed => "ui.sign_in.login_failed",
+            Self::SignInLogoutCompleted => "ui.sign_in.logout_completed",
+            Self::UpdateInstallRequested => "update.install.requested",
+            Self::UpdateRefreshStarted => "update.refresh.started",
+            Self::UpdateRefreshCompleted => "update.refresh.completed",
+            Self::UpdateRefreshFailed => "update.refresh.failed",
+            Self::UpdateAvailable => "update.phase.available",
+            Self::UpdateDownloading => "update.phase.downloading",
+            Self::UpdateReadyToRestart => "update.phase.ready_to_restart",
+            Self::UpdateAwaitingInstallation => "update.phase.awaiting_installation",
+            Self::UpdateFailed => "update.phase.failed",
         }
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn private_error_code(error: nelomai_client_container::ipc::PrivateError) -> &'static str {
+    use nelomai_client_container::ipc::PrivateError;
+    match error {
+        PrivateError::Closed => "private_closed",
+        PrivateError::Timeout => "private_timeout",
+        PrivateError::RefreshPending => "private_refresh_pending",
+        PrivateError::RefreshRejected => "private_refresh_rejected",
+        PrivateError::Protocol => "private_protocol",
+        PrivateError::Cancelled => "private_cancelled",
+        PrivateError::RecoveryRequired => "private_recovery_required",
+        PrivateError::OutcomeUnknown => "private_outcome_unknown",
+        PrivateError::AccessUnavailable => "private_access_unavailable",
+        PrivateError::Service => "private_service",
     }
 }
 
@@ -1043,6 +997,10 @@ impl From<ApplicationError> for CommandError {
             ApplicationError::Clock => {
                 Self::new("clock_unavailable", "Не удалось определить текущее время")
             }
+            ApplicationError::RecoveryDeferred => Self::new(
+                "recovery_power_deferred",
+                "Восстановление продолжится после пробуждения",
+            ),
             ApplicationError::Api(error) => Self::from_api(error),
             ApplicationError::Core(error) => Self::from_core(error),
         }
@@ -1074,6 +1032,8 @@ impl CommandError {
 
     fn from_core(error: CoreError) -> Self {
         match error {
+            CoreError::AuthenticationOutcomeUnknown => Self::new("authentication_outcome_unknown", "Исход входа неизвестен; требуется явный повторный вход"),
+            CoreError::AuthRecoveryRequired => Self::new("auth_recovery_required", "Требуется восстановление авторизации и безопасное завершение старого подключения"),
             CoreError::SignedOut => Self::new("signed_out", "Нужно снова войти в приложение"),
             CoreError::AccessExpired => Self::new("access_expired", "Срок доступа уже истёк"),
             CoreError::UpdateRequired => Self::new(
@@ -1492,12 +1452,13 @@ async fn queue_desktop_tunnel_stopped(app: &AppHandle) {
     let helper_log = crate::platform::diagnostic_helper_log(&tunnel).await;
     let resource_snapshot = crate::resource_usage::ResourceSnapshot::capture(app);
     match diagnostics.materialize_automatic_report(&seal, resource_snapshot, helper_log) {
-        Ok(()) => diagnostics.record_named(
+        Ok(true) => diagnostics.record_named(
             "diagnostics.automatic_report_queued",
             Some(&seal.session_id),
             Some(&seal.report_id),
             Some(&seal.trigger),
         ),
+        Ok(false) => {}
         Err(error) => diagnostics.record_named(
             "diagnostics.automatic_report_queue_failed",
             Some(&seal.session_id),
@@ -1567,6 +1528,7 @@ async fn prepare_desktop_logout(
 #[serde(rename_all = "camelCase")]
 pub struct AppStateResponse {
     phase: &'static str,
+    local_stop_pending_cleanup: bool,
     connection: Option<Connection>,
     connection_intent_status: &'static str,
     next_retry_at_unix: Option<i64>,
@@ -1680,28 +1642,13 @@ fn should_use_android_recovery_v2(
 }
 
 #[cfg(any(target_os = "android", test))]
-async fn route_android_logout<B, L, LFut, R, RFut>(
-    begin_native_logout: B,
-    local_sign_out: L,
-    legacy_remote_logout: R,
-) -> Result<(), CommandError>
-where
-    B: FnOnce() -> Result<
-        tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse,
-        CommandError,
-    >,
-    L: FnOnce() -> LFut,
-    LFut: std::future::Future<Output = Result<(), CommandError>>,
-    R: FnOnce() -> RFut,
-    RFut: std::future::Future<Output = Result<(), CommandError>>,
-{
-    let ownership = begin_native_logout()?;
-    if ownership.ownership == tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned {
-        legacy_remote_logout().await?;
-    }
-    local_sign_out().await
+async fn route_android_logout<E>(
+    owner_logout: impl std::future::Future<Output = Result<(), E>>,
+) -> Result<(), E> {
+    // The broker owns stop/native-handoff/HTTP ordering. Neither the native
+    // ownership response nor a scheduler can replace its durable result.
+    owner_logout.await
 }
-
 #[cfg(any(target_os = "android", test))]
 fn android_start_acknowledgement_is_durable(
     acknowledged: &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse,
@@ -1772,6 +1719,7 @@ impl AppStateResponse {
         };
         Self {
             phase,
+            local_stop_pending_cleanup: false,
             connection: state.connection,
             connection_intent_status: connection_intent_status_name(connection_intent_status),
             next_retry_at_unix,
@@ -1779,6 +1727,16 @@ impl AppStateResponse {
             metrics,
             reserve_state,
         }
+    }
+
+    fn with_local_stop_pending_cleanup(mut self, confirmed: bool) -> Self {
+        self.local_stop_pending_cleanup = confirmed
+            && (matches!(self.phase, "stopping" | "ready")
+                || (self.phase == "connecting" && self.connection_intent_status == "recovering"));
+        if self.local_stop_pending_cleanup {
+            self.metrics = None;
+        }
+        self
     }
 }
 
@@ -1910,7 +1868,8 @@ pub struct LoginCommandRequest {
     login: String,
     password: String,
     device_name: String,
-    platform_version: Option<String>,
+    #[serde(rename = "platformVersion")]
+    _platform_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2021,6 +1980,10 @@ pub async fn app_state(
     let status_unavailable_fallback = android_status_unavailable_fallback();
     let (intent_status, next_retry_at_unix, reserve_state) =
         current_connection_intent(&app, status_unavailable_fallback).await;
+    #[cfg(not(target_os = "android"))]
+    let local_cleanup = application.local_stop_pending_cleanup().await;
+    #[cfg(target_os = "android")]
+    let local_cleanup = false;
     Ok(AppStateResponse::new(
         state,
         warning,
@@ -2028,7 +1991,8 @@ pub async fn app_state(
         intent_status,
         next_retry_at_unix,
         reserve_state,
-    ))
+    )
+    .with_local_stop_pending_cleanup(local_cleanup))
 }
 
 #[cfg(target_os = "android")]
@@ -2358,6 +2322,10 @@ pub(crate) async fn quick_toggle(
     let (intent_status, next_retry_at_unix, reserve_state) =
         current_connection_intent(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
             .await;
+    #[cfg(not(target_os = "android"))]
+    let local_cleanup = application.local_stop_pending_cleanup().await;
+    #[cfg(target_os = "android")]
+    let local_cleanup = false;
     Ok(AppStateResponse::new(
         state,
         warning,
@@ -2365,7 +2333,8 @@ pub(crate) async fn quick_toggle(
         intent_status,
         next_retry_at_unix,
         reserve_state,
-    ))
+    )
+    .with_local_stop_pending_cleanup(local_cleanup))
 }
 
 #[tauri::command]
@@ -2384,15 +2353,19 @@ pub async fn app_login(
                 login: request.login,
                 password: request.password,
                 device_name: request.device_name,
-                platform: current_platform(),
-                platform_version: request.platform_version,
-                architecture: std::env::consts::ARCH.to_string(),
-                app_version: env!("CARGO_PKG_VERSION").to_string(),
             },
             now_unix(),
         )
         .await
         .map_err(CommandError::from)?;
+    #[cfg(target_os = "android")]
+    {
+        let owner = app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>();
+        app.state::<Arc<crate::runtime_startup::RuntimeStartup>>()
+            .ensure_ready(crate::runtime_startup::request_ready(&owner, &diagnostics))
+            .await
+            .map_err(|_| CommandError::from_core(CoreError::AuthRecoveryRequired))?;
+    }
     #[cfg(desktop)]
     diagnostics.set_automatic_device(&response.device.id);
     #[cfg(not(target_os = "android"))]
@@ -2531,6 +2504,21 @@ pub fn app_record_startup_stage(diagnostics: State<'_, Arc<AppDiagnostics>>, sta
     diagnostics.record_named(stage.event_name(), None, None, None);
 }
 
+#[tauri::command]
+pub async fn app_release_history() -> Result<nelomai_client_api::ReleaseHistory, CommandError> {
+    let unavailable = |_| {
+        CommandError::new(
+            "release_history_unavailable",
+            "Не удалось обновить историю версий",
+        )
+    };
+    nelomai_client_api::ClientApi::new(crate::PANEL_BASE)
+        .map_err(unavailable)?
+        .release_history()
+        .await
+        .map_err(unavailable)
+}
+
 async fn provision_android_background(
     app: &AppHandle,
     application: &NativeApplication,
@@ -2539,144 +2527,15 @@ async fn provision_android_background(
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     {
-        let now = now_unix();
-        let mut status = app
-            .tunnel_android()
-            .background_credential_status()
-            .map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
-                    "Не удалось проверить фоновое подключение",
-                )
-            })?;
-        let desired_capability = android_background_capability_snapshot(capability, now);
-        let provision_with_ui_authentication =
-            |expected_revision: i64| -> Result<(), AndroidBackgroundProvisionFailure> {
-                let access_token = application.current_access_token().map_err(|error| {
-                    AndroidBackgroundProvisionFailure {
-                        command_error: CommandError::from(error),
-                        rejection_code: None,
-                    }
-                })?;
-                let install_secret = application.install_secret().map_err(|error| {
-                    AndroidBackgroundProvisionFailure {
-                        command_error: CommandError::from(error),
-                        rejection_code: None,
-                    }
-                })?;
-                let result = app.tunnel_android().provision_background(
-                    tauri_plugin_tunnel_android::BackgroundUiProvisionRequest {
-                        api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
-                        expected_revision,
-                        device_id: device_id.to_string(),
-                        panel_base: crate::PANEL_BASE.to_string(),
-                        access_token,
-                        install_secret,
-                        capability_revision: desired_capability.revision,
-                        capability_enabled: desired_capability.enabled,
-                        capability_expires_at: desired_capability.expires_at.clone(),
-                    },
-                );
-                result.map_err(|error| AndroidBackgroundProvisionFailure {
-                    rejection_code: error.rejection_code().map(str::to_owned),
-                    command_error: CommandError::new(
-                        "background_credential_provision_failed",
-                        "Не удалось безопасно подготовить фоновое подключение",
-                    ),
-                })
-            };
-        let legacy_status_after_ui_failure =
-            |failure: AndroidBackgroundProvisionFailure| -> Result<_, CommandError> {
-                let latest_status = app
-                    .tunnel_android()
-                    .background_credential_status()
-                    .map_err(|_| {
-                        CommandError::new(
-                            "background_storage_unavailable",
-                            "Не удалось повторно проверить фоновое подключение",
-                        )
-                    })?;
-                if android_background_legacy_fallback_after_ui_failure(
-                    failure.rejection_code.as_deref(),
-                    &latest_status,
-                    now,
-                ) {
-                    Ok(latest_status)
-                } else {
-                    Err(failure.command_error)
-                }
-            };
-        match android_background_provision_mode(&status, device_id, &desired_capability, now) {
-            AndroidBackgroundProvisionMode::Noop => return Ok(()),
-            AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase => {
-                let failure = match provision_with_ui_authentication(status.credential_revision) {
-                    Ok(()) => return Ok(()),
-                    Err(failure) => failure,
-                };
-                status = legacy_status_after_ui_failure(failure)?;
-            }
-            AndroidBackgroundProvisionMode::RefreshStoredCapability => {
-                let refresh = app.tunnel_android().rotate_background(
-                    tauri_plugin_tunnel_android::BackgroundCredentialMutationRequest {
-                        expected_revision: status.credential_revision,
-                    },
-                );
-                if refresh.is_ok() {
-                    return Ok(());
-                }
-                if android_background_rotation_fallback().is_some() {
-                    let latest_revision = app
-                        .tunnel_android()
-                        .background_credential_status()
-                        .map_err(|_| {
-                            CommandError::new(
-                                "background_storage_unavailable",
-                                "Не удалось повторно проверить фоновое подключение",
-                            )
-                        })?
-                        .credential_revision;
-                    let failure = match provision_with_ui_authentication(latest_revision) {
-                        Ok(()) => return Ok(()),
-                        Err(failure) => failure,
-                    };
-                    status = legacy_status_after_ui_failure(failure)?;
-                } else {
-                    return Err(CommandError::new(
-                        "background_credential_rotation_failed",
-                        "Не удалось обновить фоновое подключение",
-                    ));
-                }
-            }
-            AndroidBackgroundProvisionMode::Legacy => {}
-        }
-        let token = application
-            .background_token_for_device(device_id, now)
+        // The common owner obtains device/capability from its own admitted
+        // bootstrap, never from UI-provided install-secret or refresh material.
+        let _ = (application, device_id, capability);
+        app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+            .background(nelomai_client_container::ipc::BackgroundAction::Provision)
             .await
-            .map_err(CommandError::from)?
-            .ok_or_else(|| {
+            .map_err(|error| {
                 CommandError::new(
-                    "background_device_changed",
-                    "Учётная запись устройства изменилась",
-                )
-            })?;
-        let expires_at_unix = now.saturating_add(token.expires_in.min(i64::MAX as u64) as i64);
-        let install_secret = application.install_secret().map_err(CommandError::from)?;
-        app.tunnel_android()
-            .configure_background(tauri_plugin_tunnel_android::BackgroundCredentialRequest {
-                api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
-                expected_revision: status.credential_revision,
-                device_id: device_id.to_string(),
-                panel_base: crate::PANEL_BASE.to_string(),
-                token: token.token,
-                expires_at_unix,
-                install_secret,
-                capability_revision: desired_capability.revision,
-                capability_enabled: desired_capability.enabled,
-                capability_expires_at: desired_capability.expires_at,
-            })
-            .map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
+                    private_error_code(error),
                     "Не удалось подготовить фоновое подключение",
                 )
             })?;
@@ -2868,7 +2727,7 @@ pub async fn app_windows_defender_status(
 ) -> Result<WindowsDefenderStatusResponse, CommandError> {
     #[cfg(windows)]
     {
-        let status = crate::platform::windows::refresh_defender_status()
+        let status = crate::platform::defender_status(true)
             .await
             .map_err(CommandError::from_tunnel)?;
         record_defender_status(&diagnostics, "windows.defender.checked", &status);
@@ -2895,7 +2754,7 @@ pub async fn app_windows_defender_repair(
 ) -> Result<WindowsDefenderStatusResponse, CommandError> {
     #[cfg(windows)]
     {
-        let status = match crate::platform::windows::repair_defender_exclusion().await {
+        let status = match crate::platform::repair_defender_exclusion().await {
             Ok(status) => status,
             Err(error) => {
                 let error = CommandError::from_tunnel(error);
@@ -3009,7 +2868,7 @@ fn defender_state_name(state: nelomai_windows_service::DefenderExclusionState) -
 pub(crate) async fn ensure_defender_ready_for_awg(
     diagnostics: &AppDiagnostics,
 ) -> Result<(), ApplicationError> {
-    let defender = crate::platform::windows::defender_status()
+    let defender = crate::platform::defender_status(false)
         .await
         .map_err(CoreError::from)?;
     record_defender_status(diagnostics, "windows.defender.before_awg_start", &defender);
@@ -3476,81 +3335,191 @@ fn stable_diagnostics_connection_lease(
 }
 
 #[tauri::command]
-pub fn app_update_status(
+pub async fn app_update_status(
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    updater.status().map_err(update_command_error)
+    updater.status().await.map_err(update_command_error)
 }
-
 #[tauri::command]
 pub async fn app_update_refresh(
-    application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    let Some(_refresh_guard) = updater.try_begin_refresh() else {
-        return updater.status().map_err(update_command_error);
-    };
-    let update = application
-        .refresh_update_state()
-        .await
-        .map_err(CommandError::from)?;
-    updater.observe(&update).map_err(update_command_error)?;
-    if updater.automatic_enabled().map_err(update_command_error)? {
-        schedule_automatic_update(application.inner().clone(), updater.inner().clone());
-    }
-    updater.status().map_err(update_command_error)
+    updater.refresh().await.map_err(update_command_error)
 }
-
 #[tauri::command]
-pub fn app_update_set_automatic(
-    application: State<'_, Arc<NativeApplication>>,
+pub async fn app_update_set_automatic(
     updater: State<'_, Arc<NativeUpdater>>,
     enabled: bool,
 ) -> Result<UpdateStatusResponse, CommandError> {
-    let response = updater
+    updater
         .set_automatic(enabled)
-        .map_err(update_command_error)?;
-    if enabled {
-        schedule_automatic_update(application.inner().clone(), updater.inner().clone());
-    }
-    Ok(response)
-}
-
-#[tauri::command]
-pub async fn app_update_install(
-    application: State<'_, Arc<NativeApplication>>,
-    updater: State<'_, Arc<NativeUpdater>>,
-) -> Result<UpdateStatusResponse, CommandError> {
-    let bootstrap = application
-        .bootstrap(now_unix())
-        .await
-        .map_err(CommandError::from)?;
-    updater
-        .observe(&bootstrap.update)
-        .map_err(update_command_error)?;
-    let access_token = application
-        .current_access_token()
-        .map_err(CommandError::from)?;
-    updater
-        .install_now(&access_token)
         .await
         .map_err(update_command_error)
 }
-
+#[tauri::command]
+pub async fn app_update_install(
+    updater: State<'_, Arc<NativeUpdater>>,
+) -> Result<UpdateStatusResponse, CommandError> {
+    updater.install().await.map_err(update_command_error)
+}
 #[tauri::command]
 pub async fn app_update_restart(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
     updater: State<'_, Arc<NativeUpdater>>,
 ) -> Result<(), CommandError> {
-    if !updater.ready_to_restart() {
+    if updater.status().await.map_err(update_command_error)?.phase != "ready_to_restart" {
         return Err(CommandError::new(
             "update_not_ready",
             "Обновление ещё не готово к перезапуску",
         ));
     }
-    stop_for_shutdown(&app, &application).await?;
-    app.restart();
+    #[cfg(desktop)]
+    {
+        // Common's verified update barrier already stopped this runtime and the
+        // helper before replacing its executable. Re-contacting the old broker
+        // hash after replacement cannot provide a new stop acknowledgement.
+        let _ = application;
+        crate::runtime::native()
+            .map_err(|_| update_command_error("common runtime unavailable".into()))?
+            .control(crate::runtime::NativeControl::Exit {
+                reason: crate::runtime::NativeExitReason::Update,
+            })
+            .await
+            .map_err(|_| update_command_error("common restart failed".into()))?;
+        app.exit(0);
+        Ok(())
+    }
+    #[cfg(not(desktop))]
+    {
+        stop_for_shutdown(&app, &application).await?;
+        let _ = app;
+        Err(update_command_error("common restart unavailable".into()))
+    }
+}
+
+fn runtime_switch_error() -> CommandError {
+    CommandError::new(
+        "runtime_switch_recovery_required",
+        "Переключение runtime требует безопасного восстановления",
+    )
+}
+
+fn runtime_slot_for_selection(use_stable: bool) -> RuntimeSlot {
+    if use_stable {
+        RuntimeSlot::Stable
+    } else {
+        RuntimeSlot::Latest
+    }
+}
+
+#[tauri::command]
+pub async fn runtime_status(
+    coordinator: State<'_, Arc<RuntimeControls>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    let status = coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::Status);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn runtime_select(
+    coordinator: State<'_, Arc<RuntimeControls>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+    use_stable: bool,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    let current = coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    let desired = runtime_slot_for_selection(use_stable);
+    if desired == current.active_slot && current.restart_required() {
+        coordinator
+            .cancel_pending()
+            .await
+            .map_err(|_| runtime_switch_error())?;
+    } else if desired != current.selected_slot || current.pending_slot.is_some() {
+        coordinator
+            .request(desired)
+            .await
+            .map_err(|_| runtime_switch_error())?;
+    }
+    let status = coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::Selection);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn runtime_restart(
+    app: AppHandle,
+    coordinator: State<'_, Arc<RuntimeControls>>,
+    diagnostics: State<'_, Arc<AppDiagnostics>>,
+) -> Result<(), CommandError> {
+    let status = coordinator
+        .prepare_restart()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    diagnostics.record_runtime_status(&status, RuntimeActionSource::Restart);
+    #[cfg(desktop)]
+    crate::runtime::native()
+        .map_err(|_| runtime_switch_error())?
+        .control(crate::runtime::NativeControl::Exit {
+            reason: crate::runtime::NativeExitReason::RuntimeSwitch,
+        })
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    // Android's common-owner handoff kills the admitted :runtime PID before
+    // releasing the fresh bootstrap gate, so a successful reply is normally
+    // unreachable. This is only a post-proof fallback for an unusually late
+    // Binder/socket delivery.
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn app_runtime_switch_status(
+    coordinator: State<'_, Arc<RuntimeControls>>,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())
+}
+
+#[tauri::command]
+pub async fn app_runtime_switch_request(
+    coordinator: State<'_, Arc<RuntimeControls>>,
+    slot: RuntimeSlot,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    coordinator
+        .request(slot)
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())
+}
+
+#[tauri::command]
+pub async fn app_runtime_switch_cancel(
+    coordinator: State<'_, Arc<RuntimeControls>>,
+) -> Result<RuntimeSwitchStatusV1, CommandError> {
+    coordinator
+        .cancel_pending()
+        .await
+        .map_err(|_| runtime_switch_error())?;
+    coordinator
+        .status()
+        .await
+        .map_err(|_| runtime_switch_error())
 }
 
 #[derive(Clone, Serialize)]
@@ -3769,21 +3738,13 @@ pub async fn app_notifications_read_all(
 pub async fn app_register_push_token(
     app: AppHandle,
     application: State<'_, Arc<NativeApplication>>,
+    push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
     token: String,
 ) -> Result<(), CommandError> {
-    let result = application
-        .register_push_token(&token)
+    push_registration_scheduler
+        .register_token(&app, &application, &token)
         .await
-        .map_err(Into::into);
-    #[cfg(target_os = "android")]
-    if result.is_ok() {
-        use tauri_plugin_push_android::PushAndroidExt;
-
-        let _ = app.push_android().confirm(&token);
-    }
-    #[cfg(not(target_os = "android"))]
-    let _ = app;
-    result
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -3793,37 +3754,20 @@ pub async fn app_logout(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     push_registration_scheduler: State<'_, Arc<PushRegistrationScheduler>>,
 ) -> Result<(), CommandError> {
-    cancel_desktop_connection_intent(&app).await;
     #[cfg(target_os = "android")]
-    let _background_provision_guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
-    #[cfg(target_os = "android")]
-    let logout_result = route_android_logout(
-        || {
-            app.tunnel_android().begin_background_logout().map_err(|_| {
-                CommandError::new(
-                    "background_storage_unavailable",
-                    "Не удалось сохранить безопасное завершение фонового подключения",
-                )
-            })
-        },
-        || async {
-            push_registration_scheduler
-                .logout_local(&app, &application)
-                .await
-                .map_err(CommandError::from)
-        },
-        || async {
-            push_registration_scheduler
-                .logout_remote(&application)
-                .await
-                .map_err(CommandError::from)
-        },
+    let logout_result =
+        route_android_logout(push_registration_scheduler.logout(application.logout())).await;
+    #[cfg(desktop)]
+    let logout_result = route_desktop_logout(
+        push_registration_scheduler.logout(application.logout()),
+        cancel_desktop_connection_intent(&app),
+        prepare_desktop_logout(&app, &application, &diagnostics),
     )
     .await;
-    #[cfg(desktop)]
-    prepare_desktop_logout(&app, &application, &diagnostics).await;
-    #[cfg(not(target_os = "android"))]
-    let logout_result = push_registration_scheduler.logout(&app, &application).await;
+    #[cfg(all(not(desktop), not(target_os = "android")))]
+    let logout_result = push_registration_scheduler
+        .logout(application.logout())
+        .await;
     #[cfg(target_os = "android")]
     let (quick_clear_ticket, quick_plan_result) = ANDROID_UI_START_STOP_COORDINATOR
         .dispatch_projected_clear(|| app.tunnel_android().clear_quick_plan());
@@ -3865,22 +3809,28 @@ pub async fn app_logout(
     Ok(())
 }
 
+#[cfg(desktop)]
+async fn route_desktop_logout<E>(
+    owner: impl std::future::Future<Output = Result<(), E>>,
+    cancel: impl std::future::Future<Output = bool>,
+    prepare: impl std::future::Future<Output = ()>,
+) -> Result<(), E> {
+    // Enter the protected owner before any scheduler/native/diagnostic waits.
+    // A later helper retry cannot turn an owner physical-stop error into ACK.
+    let result = owner.await;
+    cancel.await;
+    prepare.await;
+    result
+}
+
 fn observe_and_schedule_update(
     application: Arc<NativeApplication>,
     updater: Arc<NativeUpdater>,
     bootstrap: &Bootstrap,
 ) {
-    if updater.observe(&bootstrap.update).is_ok() {
-        schedule_automatic_update(application, updater);
-    }
-}
-
-fn schedule_automatic_update(application: Arc<NativeApplication>, updater: Arc<NativeUpdater>) {
+    let _ = (application, bootstrap);
     tauri::async_runtime::spawn(async move {
-        let Ok(access_token) = application.current_access_token() else {
-            return;
-        };
-        let _ = updater.install_automatically(&access_token).await;
+        let _ = updater.refresh().await;
     });
 }
 
@@ -4122,29 +4072,137 @@ fn now_unix() -> i64 {
 }
 
 #[cfg(target_os = "android")]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Android
 }
 
 #[cfg(windows)]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Windows
 }
 
 #[cfg(target_os = "macos")]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Macos
 }
 
 #[cfg(target_os = "linux")]
-fn current_platform() -> Platform {
+pub(crate) fn current_platform() -> Platform {
     Platform::Linux
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_readiness_transients_request_startup_retry_without_relogin() {
+        use nelomai_client_container::ipc::PrivateError;
+        for error in [
+            PrivateError::RecoveryRequired,
+            PrivateError::Timeout,
+            PrivateError::Service,
+        ] {
+            assert_eq!(
+                runtime_readiness_error(error).code,
+                "runtime_startup_pending",
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            runtime_readiness_error(PrivateError::RefreshPending).code,
+            "auth_refresh_pending"
+        );
+    }
+
+    #[test]
+    fn runtime_readiness_does_not_mask_definitive_or_ambiguous_auth_failures() {
+        use nelomai_client_container::ipc::PrivateError;
+        for error in [
+            PrivateError::Closed,
+            PrivateError::RefreshRejected,
+            PrivateError::Protocol,
+            PrivateError::Cancelled,
+            PrivateError::OutcomeUnknown,
+            PrivateError::AccessUnavailable,
+        ] {
+            assert_eq!(
+                runtime_readiness_error(error).code,
+                "auth_recovery_required",
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_selection_boolean_maps_only_to_the_verified_slot_enum() {
+        assert_eq!(runtime_slot_for_selection(false), RuntimeSlot::Latest);
+        assert_eq!(runtime_slot_for_selection(true), RuntimeSlot::Stable);
+    }
+
+    #[tokio::test]
+    async fn android_startup_owner_rejection_never_falls_through_after_logout_or_access_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for rejection in [CoreError::StartCancelled, CoreError::AccessExpired] {
+            let fallbacks = AtomicUsize::new(0);
+            let result = route_android_startup_recovery(
+                ApplicationError::Core(CoreError::AuthRecoveryRequired),
+                async { Err(rejection) },
+                async {
+                    fallbacks.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ApplicationError>(42)
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(fallbacks.load(Ordering::SeqCst), 0);
+        }
+        let entered = AtomicUsize::new(0);
+        let result = route_android_startup_recovery(
+            ApplicationError::Core(CoreError::Api(CoreApiError::Retryable)),
+            async {
+                entered.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            async {
+                entered.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ApplicationError>(42)
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+    }
     use super::*;
     use nelomai_contracts::{ApiVersion, LeaseStatus, PeerBinding};
+
+    #[cfg(desktop)]
+    #[tokio::test]
+    async fn desktop_logout_enters_owner_before_native_prelude_and_retains_stop_error() {
+        let entered = std::sync::atomic::AtomicBool::new(false);
+        let release = tokio::sync::Notify::new();
+        let result = route_desktop_logout(
+            async {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>("physical_stop_failed")
+            },
+            async {
+                assert!(
+                    entered.load(std::sync::atomic::Ordering::SeqCst),
+                    "native cancel must follow owner cancellation"
+                );
+                false
+            },
+            async {
+                release.notified().await;
+            },
+        );
+        tokio::pin!(result);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut result)
+            .await
+            .is_err());
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        release.notify_one();
+        assert_eq!(result.await, Err("physical_stop_failed"));
+    }
 
     fn background_capability_snapshot(
         revision: i64,
@@ -4238,6 +4296,50 @@ mod tests {
         assert_eq!(value["phase"], "error");
         assert_eq!(value["connectionIntentStatus"], "blocked_terminal");
         assert!(value["nextRetryAtUnix"].is_null());
+        assert_eq!(value["localStopPendingCleanup"], false);
+    }
+
+    #[test]
+    fn local_stop_projection_preserves_cleanup_and_recovery_intent() {
+        use nelomai_client_core::ConnectionIntentStatus;
+        for (phase, intent, confirmed, expected) in [
+            (Phase::Stopping, ConnectionIntentStatus::None, true, true),
+            (Phase::Ready, ConnectionIntentStatus::None, true, true),
+            (Phase::Stopping, ConnectionIntentStatus::None, false, false),
+            (Phase::Connected, ConnectionIntentStatus::None, true, false),
+            (Phase::SignedOut, ConnectionIntentStatus::None, true, false),
+            (
+                Phase::Stopping,
+                ConnectionIntentStatus::Recovering,
+                true,
+                true,
+            ),
+        ] {
+            let response = AppStateResponse::new(
+                CoreState {
+                    phase,
+                    connection: None,
+                },
+                None,
+                None,
+                intent,
+                None,
+                None,
+            )
+            .with_local_stop_pending_cleanup(confirmed);
+            assert_eq!(response.local_stop_pending_cleanup, expected);
+            assert_eq!(
+                response.connection_intent_status,
+                connection_intent_status_name(intent)
+            );
+            if expected {
+                assert!(matches!(
+                    response.phase,
+                    "stopping" | "ready" | "connecting"
+                ));
+                assert!(response.metrics.is_none());
+            }
+        }
     }
 
     #[test]
@@ -4443,50 +4545,30 @@ mod tests {
     }
 
     #[test]
-    fn background_recovery_is_limited_to_a_configured_signed_out_android_session() {
-        assert!(should_attempt_android_background_recovery(
-            &ApplicationError::Core(CoreError::SignedOut),
-            true,
-        ));
-        assert!(!should_attempt_android_background_recovery(
-            &ApplicationError::Core(CoreError::SignedOut),
-            false,
-        ));
-        assert!(!should_attempt_android_background_recovery(
-            &ApplicationError::Core(CoreError::Api(CoreApiError::Retryable)),
-            true,
-        ));
+    fn update_and_sign_in_diagnostic_stages_are_allowlisted() {
+        let update: StartupStage =
+            serde_json::from_str("\"update_awaiting_installation\"").unwrap();
+        let refresh: StartupStage = serde_json::from_str("\"update_refresh_failed\"").unwrap();
+        let sign_in: StartupStage =
+            serde_json::from_str("\"sign_in_bootstrap_signed_out\"").unwrap();
+
+        assert_eq!(update.event_name(), "update.phase.awaiting_installation");
+        assert_eq!(refresh.event_name(), "update.refresh.failed");
+        assert_eq!(sign_in.event_name(), "ui.sign_in.bootstrap_signed_out");
     }
 
     #[test]
-    fn invalid_background_recovery_falls_back_but_missing_route_keeps_the_credential() {
-        assert_eq!(
-            classify_android_background_recovery_error("invalid_background_token"),
-            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("invalid_background_recovery"),
-            AndroidBackgroundRecoveryFailure::ClearAndFallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("background_recovery_unsupported"),
-            AndroidBackgroundRecoveryFailure::FallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("activation_not_applied"),
-            AndroidBackgroundRecoveryFailure::FallbackRefresh,
-        );
-        assert_eq!(
-            classify_android_background_recovery_error("background_transport_unavailable"),
-            AndroidBackgroundRecoveryFailure::Retryable,
-        );
-    }
+    fn private_provision_errors_keep_their_original_diagnostic_code() {
+        use nelomai_client_container::ipc::PrivateError;
 
-    #[test]
-    fn unavailable_application_access_is_terminal_instead_of_a_network_retry() {
+        assert_eq!(private_error_code(PrivateError::Timeout), "private_timeout");
         assert_eq!(
-            classify_android_background_recovery_error("app_access_unavailable"),
-            AndroidBackgroundRecoveryFailure::AccessExpired,
+            private_error_code(PrivateError::RefreshRejected),
+            "private_refresh_rejected"
+        );
+        assert_eq!(
+            private_error_code(PrivateError::RecoveryRequired),
+            "private_recovery_required"
         );
     }
 
@@ -4687,89 +4769,6 @@ mod tests {
         assert_eq!(snapshot.revision, 0);
         assert!(!snapshot.enabled);
         assert_eq!(snapshot.expires_at, ANDROID_DISABLED_CAPABILITY_EXPIRES_AT);
-    }
-
-    #[test]
-    fn failed_device_refresh_uses_ui_authentication_to_persist_disabled_recovery() {
-        assert_eq!(
-            android_background_rotation_fallback(),
-            Some(AndroidBackgroundProvisionMode::UiAuthenticatedTwoPhase),
-        );
-    }
-
-    #[test]
-    fn legacy_fallback_requires_an_authoritative_capability_rejection() {
-        let mut status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
-            mutation_pending: true,
-            ..Default::default()
-        };
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-
-        status.mutation_pending = false;
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            None, &status, 100,
-        ));
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_transport_unavailable"),
-            &status,
-            100,
-        ));
-        assert!(android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-
-        status.capability_enabled = true;
-        status.capability_expires_at_unix = Some(500);
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-    }
-
-    #[test]
-    fn authoritative_newer_capability_downgrade_allows_legacy_fallback() {
-        let status = tauri_plugin_tunnel_android::BackgroundCredentialStatusResponse {
-            mutation_pending: false,
-            capability_enabled: false,
-            capability_expires_at_unix: Some(500),
-            ..Default::default()
-        };
-
-        assert!(android_background_legacy_fallback_after_ui_failure(
-            Some("background_credential_capability_unavailable"),
-            &status,
-            100,
-        ));
-        assert!(!android_background_legacy_fallback_after_ui_failure(
-            Some("background_transport_unavailable"),
-            &status,
-            100,
-        ));
-    }
-
-    #[tokio::test]
-    async fn outer_timeout_does_not_cancel_a_detached_mobile_operation() {
-        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
-        let operation = await_detached_on_cancellation(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let _ = completed_tx.send(());
-            42
-        });
-
-        assert!(tokio::time::timeout(Duration::from_millis(1), operation)
-            .await
-            .is_err());
-        tokio::time::timeout(Duration::from_secs(1), completed_rx)
-            .await
-            .unwrap()
-            .unwrap();
     }
 
     #[tokio::test]
@@ -5749,150 +5748,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn android_logout_durably_hands_off_before_local_sign_out_without_legacy_revoke() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let result = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_handoff");
-                Ok(
-                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
-                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::Native,
-                    },
-                )
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Ok(())
-            },
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &["native_handoff", "local_sign_out"]
-        );
-    }
-
-    #[tokio::test]
-    async fn android_logout_without_native_credential_revokes_legacy_before_local_sign_out() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let result = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_not_owned");
-                Ok(
-                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
-                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned,
-                    },
-                )
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Ok(())
-            },
-        )
-        .await;
-
-        assert!(result.is_ok());
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &["native_not_owned", "legacy_remote_revoke", "local_sign_out"]
-        );
-    }
-
-    #[tokio::test]
-    async fn android_legacy_revoke_failure_preserves_local_session_for_retry() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let error = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_not_owned");
-                Ok(
-                    tauri_plugin_tunnel_android::BackgroundLogoutOwnershipResponse {
-                        ownership: tauri_plugin_tunnel_android::BackgroundLogoutOwnership::NotOwned,
-                    },
-                )
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Err(CommandError::new(
-                    "logout_remote_failed",
-                    "remote logout failed",
+    async fn android_logout_bypasses_busy_native_provision_and_preserves_owner_failure() {
+        let _busy = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
+        let entered = std::sync::atomic::AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            route_android_logout(async {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err::<(), _>(CommandError::new(
+                    "physical_stop_failed",
+                    "synthetic failure",
                 ))
-            },
+            }),
         )
         .await
-        .expect_err("failed remote revoke must abort local sign out");
-
-        assert_eq!(error.code(), "logout_remote_failed");
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &["native_not_owned", "legacy_remote_revoke"]
-        );
+        .expect("owner cancellation must not wait for native provision");
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(result.unwrap_err().code(), "physical_stop_failed");
     }
-
-    #[tokio::test]
-    async fn android_ambiguous_native_handoff_error_never_duplicates_with_legacy_revoke() {
-        use std::sync::{Arc, Mutex};
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let native_events = events.clone();
-        let local_events = events.clone();
-        let remote_events = events.clone();
-
-        let error = route_android_logout(
-            move || {
-                native_events.lock().unwrap().push("native_handoff_lost");
-                Err(CommandError::new(
-                    "android_service_dispatch_unavailable",
-                    "lost response",
-                ))
-            },
-            move || async move {
-                local_events.lock().unwrap().push("local_sign_out");
-                Ok(())
-            },
-            move || async move {
-                remote_events.lock().unwrap().push("legacy_remote_revoke");
-                Ok(())
-            },
-        )
-        .await
-        .expect_err("ambiguous native response must fail closed");
-
-        assert_eq!(error.code(), "android_service_dispatch_unavailable");
-        assert_eq!(events.lock().unwrap().as_slice(), &["native_handoff_lost"]);
-    }
-
     fn android_begin_request() -> tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
         tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
             api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,

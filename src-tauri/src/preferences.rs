@@ -80,6 +80,51 @@ pub struct AppPreferenceStore {
 }
 
 impl AppPreferenceStore {
+    /// Locked host startup only. Legacy settings are copied, never moved, and
+    /// an existing exact-runtime destination always wins (including on retry).
+    pub fn open_runtime(path: &Path, legacy: &Path) -> io::Result<Self> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(io::Error::other(
+                    "runtime preferences are not a regular file",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::read(legacy) {
+                    Ok(bytes) => {
+                        // Invalid legacy settings must not become a silently
+                        // defaulted destination that hides a recoverable source.
+                        serde_json::from_slice::<AppPreferences>(&bytes)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                        let parent = path
+                            .parent()
+                            .ok_or_else(|| io::Error::other("missing preference parent"))?;
+                        fs::create_dir_all(parent)?;
+                        let mut temporary = NamedTempFile::new_in(parent)?;
+                        temporary.write_all(&bytes)?;
+                        temporary.as_file().sync_all()?;
+                        match temporary.persist_noclobber(path) {
+                            Ok(_) => {}
+                            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(error) => return Err(error.error),
+                        }
+                        #[cfg(unix)]
+                        fs::File::open(parent)?.sync_all()?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(Self {
+            path: path.into(),
+            current: Mutex::new(load(path)?),
+        })
+    }
+
+    #[cfg(test)]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let current = load(&path).unwrap_or_default();
@@ -197,13 +242,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_preferences_import_legacy_once_and_preserve_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("preferences.json");
+        let destination = root
+            .path()
+            .join("runtime/stable/state/0.2.16/preferences-v1.json");
+        let old = AppPreferenceStore::new(&legacy);
+        old.set_close_to_tray(false).unwrap();
+        old.set_dns_provider(DnsProvider::Quad9).unwrap();
+        old.set_tic_egress_mode(TicConnectionMode::Dynamic, EgressMode::PreferIpv6)
+            .unwrap();
+        let original = fs::read(&legacy).unwrap();
+        let imported = AppPreferenceStore::open_runtime(&destination, &legacy).unwrap();
+        assert!(!imported.get().close_to_tray);
+        assert_eq!(imported.get().dns_provider, DnsProvider::Quad9);
+        assert_eq!(
+            imported.get().dynamic_tic_egress_mode,
+            EgressMode::PreferIpv6
+        );
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+        imported.set_dns_provider(DnsProvider::Google).unwrap();
+        let existing = fs::read(&destination).unwrap();
+        let restarted = AppPreferenceStore::open_runtime(&destination, &legacy).unwrap();
+        assert_eq!(restarted.get().dns_provider, DnsProvider::Google);
+        assert_eq!(fs::read(&destination).unwrap(), existing);
+        assert_eq!(fs::read(&legacy).unwrap(), original);
+    }
+
+    #[test]
+    fn interrupted_preferences_import_retries_without_replacing_source_or_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("preferences.json");
+        AppPreferenceStore::new(&legacy)
+            .set_close_to_tray(false)
+            .unwrap();
+        let parent = root.path().join("runtime");
+        fs::write(&parent, b"synthetic interruption").unwrap();
+        let destination = parent.join("preferences-v1.json");
+        assert!(AppPreferenceStore::open_runtime(&destination, &legacy).is_err());
+        assert!(!AppPreferenceStore::new(&legacy).get().close_to_tray);
+        fs::remove_file(&parent).unwrap();
+        assert!(
+            !AppPreferenceStore::open_runtime(&destination, &legacy)
+                .unwrap()
+                .get()
+                .close_to_tray
+        );
+        // An invalid existing destination must not be overwritten from legacy.
+        fs::write(&destination, b"existing invalid settings").unwrap();
+        assert!(AppPreferenceStore::open_runtime(&destination, &legacy).is_err());
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"existing invalid settings"
+        );
+    }
+
+    #[test]
     fn preferences_default_and_persist_independently() {
-        let directory = std::env::temp_dir().join(format!(
-            "nelomai-preferences-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let path = directory.join("preferences.json");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
         let store = AppPreferenceStore::new(&path);
         assert!(store.get().close_to_tray);
         assert_eq!(store.get().dns_provider, DnsProvider::Auto);
@@ -222,19 +320,12 @@ mod tests {
 
         store.set_close_to_tray(true).unwrap();
         assert_eq!(store.get().dns_provider, DnsProvider::Quad9);
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn legacy_preferences_default_to_automatic_dns() {
-        let directory = std::env::temp_dir().join(format!(
-            "nelomai-legacy-preferences-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("preferences.json");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
         fs::write(&path, br#"{"close_to_tray":false}"#).unwrap();
 
         let restored = AppPreferenceStore::new(&path).get();
@@ -250,17 +341,12 @@ mod tests {
             nelomai_contracts::EgressMode::Ipv4
         );
         assert_eq!(restored.use_reserve_connection, cfg!(target_os = "android"));
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
     fn personal_and_dynamic_tic_egress_modes_persist_independently() {
-        let directory = std::env::temp_dir().join(format!(
-            "nelomai-egress-preferences-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let path = directory.join("preferences.json");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("preferences.json");
         let store = AppPreferenceStore::new(&path);
 
         store
@@ -293,8 +379,6 @@ mod tests {
             restored.dynamic_tic_egress_mode,
             nelomai_contracts::EgressMode::PreferIpv6
         );
-
-        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

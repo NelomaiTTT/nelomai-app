@@ -1,5 +1,5 @@
+use nelomai_contracts::dispatcher::{DispatcherRequest, EngineIdentity, Installation};
 use nelomai_unix_service::{UnixSocketTransport, UnixTunnelController, DEFAULT_SOCKET_PATH};
-use semver::Version;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -12,30 +12,31 @@ const HELPER_INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub type PlatformTunnelController = UnixTunnelController<UnixSocketTransport>;
 
-pub fn tunnel_controller() -> PlatformTunnelController {
-    UnixTunnelController::new(UnixSocketTransport::new(DEFAULT_SOCKET_PATH))
+pub fn common_tunnel_controller(
+    binding: nelomai_contracts::dispatcher::CommonEngineBinding,
+) -> PlatformTunnelController {
+    UnixTunnelController::new(UnixSocketTransport::new(DEFAULT_SOCKET_PATH).for_common(binding))
 }
 
 pub async fn prepare_tunnel(
     app: tauri::AppHandle<tauri::Wry>,
 ) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    let controller = tunnel_controller();
-    let current = Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| tunnel_error("invalid_app_version"))?;
-    if helper_is_current(&controller, &current).await {
-        return Ok(());
-    }
-
     let resources = app
         .path()
         .resource_dir()
         .map_err(|_| tunnel_error("helper_resources_unavailable"))?;
+    let expected = Installation::production(Path::new("/unused"))
+        .and_then(|trust| trust.manifest_identity(&resources.join("runtime")))
+        .map_err(|_| tunnel_error("verified_helper_identity_unavailable"))?;
+    if helper_is_current(&expected).await {
+        return Ok(());
+    }
     tauri::async_runtime::spawn_blocking(move || install_helper(&resources))
         .await
         .map_err(|_| tunnel_error("helper_installer_failed"))??;
 
     for _ in 0..30 {
-        if helper_is_current(&controller, &current).await {
+        if helper_is_current(&expected).await {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
@@ -43,15 +44,40 @@ pub async fn prepare_tunnel(
     Err(tunnel_error("service_unavailable"))
 }
 
-async fn helper_is_current(controller: &PlatformTunnelController, current: &Version) -> bool {
-    let Ok(installed) = controller.service_version().await else {
-        return false;
-    };
-    Version::parse(&installed).is_ok_and(|installed| installed >= *current)
+async fn helper_is_current(expected: &EngineIdentity) -> bool {
+    let expected = expected.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        nelomai_unix_service::dispatcher_exchange(&DispatcherRequest::Version {
+            contract_version: 1,
+        })
+        .is_ok_and(|response| {
+            response.ok
+                && response.contract_version == 1
+                && response.identity.as_ref().is_some_and(|actual| {
+                    actual.manifest_sha256 == expected.manifest_sha256
+                        && actual.container_version == expected.container_version
+                })
+        })
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelError> {
-    let helper = required_resource(resources, "nelomai-unix-service")?;
+    let helper = required_resource(resources, "dispatcher/1/nelomai-unix-service")?;
+    let layout = resources.join("runtime");
+    let broker = std::fs::canonicalize(
+        std::env::current_exe().map_err(|_| tunnel_error("common_broker_unavailable"))?,
+    )
+    .map_err(|_| tunnel_error("common_broker_unavailable"))?;
+    // AppImage's per-launch FUSE path is not the installed common broker.
+    // Task 9's launcher must hand off here before auth initialization.
+    #[cfg(target_os = "linux")]
+    if broker != Path::new("/usr/local/libexec/nelomai/common/AppDir/usr/bin/nelomai-app") {
+        return Err(tunnel_error("installed_common_broker_required"));
+    }
+    nelomai_contracts::dispatcher::trusted(&broker, 0)
+        .map_err(|_| tunnel_error("installed_common_broker_required"))?;
     let uid = unsafe { libc::getuid() }.to_string();
     if uid == "0" {
         return Err(tunnel_error("helper_owner_is_root"));
@@ -60,14 +86,14 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
     #[cfg(target_os = "linux")]
     {
         let installer = required_resource(resources, "install-linux.sh")?;
-        let amneziawg_go = required_resource(resources, "amneziawg-go")?;
         let status = installer_status(
             Command::new("/usr/bin/pkexec")
                 .arg("/bin/sh")
                 .arg(installer)
                 .arg(uid)
                 .arg(helper)
-                .arg(amneziawg_go),
+                .arg(layout)
+                .arg(broker),
         )?;
         if status.success() {
             Ok(())
@@ -80,16 +106,14 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
     {
         let installer = required_resource(resources, "install-macos.sh")?;
         let apple_script = required_resource(resources, "install-macos.applescript")?;
-        let wireguard_go = required_resource(resources, "wireguard-go")?;
-        let amneziawg_go = required_resource(resources, "amneziawg-go")?;
         let status = installer_status(
             Command::new("/usr/bin/osascript")
                 .arg(apple_script)
                 .arg(installer)
                 .arg(uid)
                 .arg(helper)
-                .arg(wireguard_go)
-                .arg(amneziawg_go),
+                .arg(layout)
+                .arg(broker),
         )?;
         if status.success() {
             Ok(())
@@ -99,7 +123,7 @@ fn install_helper(resources: &Path) -> Result<(), nelomai_client_tunnel::TunnelE
     }
 }
 
-fn installer_status(
+pub(crate) fn installer_status(
     command: &mut Command,
 ) -> Result<ExitStatus, nelomai_client_tunnel::TunnelError> {
     installer_status_with_timeout(command, HELPER_INSTALL_TIMEOUT)

@@ -9,8 +9,12 @@ android {
 
     defaultConfig {
         minSdk = 24
+        val version = (groovy.json.JsonSlurper().parse(file("../../../src-tauri/tauri.conf.json")) as Map<*, *>)["version"] as String
+        buildConfigField("String", "RUNTIME_SLOT", "\"latest\"")
+        buildConfigField("String", "RUNTIME_VERSION", "\"$version\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+    buildFeatures { buildConfig = true }
 
     buildTypes {
         release {
@@ -32,11 +36,13 @@ android {
 }
 
 dependencies {
+    implementation(project(":runtime-android-common"))
     implementation("androidx.activity:activity:1.10.1")
     implementation("androidx.core:core-ktx:1.16.0")
     implementation(project(":amneziawg-tunnel"))
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
     testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test:runner:1.5.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")

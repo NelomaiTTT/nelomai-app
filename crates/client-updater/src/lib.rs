@@ -1,4 +1,7 @@
 use async_trait::async_trait;
+mod android;
+pub use android::{AndroidApkInstaller, AndroidUpdateBackend};
+use nelomai_client_api::AccessSnapshot;
 use nelomai_contracts::UpdateState;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -254,29 +257,63 @@ impl UpdateBackendError {
 pub trait UpdateBackend: Send + Sync {
     async fn install(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         expected_version: &str,
+        barrier: UpdateBarrierPhase,
         progress: Arc<dyn Fn(DownloadProgress) + Send + Sync>,
     ) -> Result<InstallResult, UpdateBackendError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateBarrierPhase {
+    LocalStopped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("update barrier failed: {code}")]
+pub struct UpdateBarrierError {
+    code: String,
+}
+
+impl UpdateBarrierError {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self { code: code.into() }
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+}
+
+#[async_trait]
+pub trait UpdateInstallBarrier: Send + Sync {
+    async fn prepare(&self, target_version: &str)
+        -> Result<UpdateBarrierPhase, UpdateBarrierError>;
+    async fn installer_opened(&self) -> Result<(), UpdateBarrierError>;
+    async fn installer_failed(&self) -> Result<(), UpdateBarrierError>;
 }
 
 #[derive(Debug, Error)]
 pub enum UpdateError {
     #[error(transparent)]
     Backend(#[from] UpdateBackendError),
+    #[error(transparent)]
+    Barrier(#[from] UpdateBarrierError),
 }
 
 pub struct UpdateCoordinator<B> {
     backend: Arc<B>,
+    barrier: Arc<dyn UpdateInstallBarrier>,
     phase: Arc<Mutex<UpdatePhase>>,
     offer: Mutex<Option<UpdateOffer>>,
     install_gate: AsyncMutex<()>,
 }
 
 impl<B: UpdateBackend> UpdateCoordinator<B> {
-    pub fn new(backend: Arc<B>) -> Self {
+    pub fn new(backend: Arc<B>, barrier: Arc<dyn UpdateInstallBarrier>) -> Self {
         Self {
             backend,
+            barrier,
             phase: Arc::new(Mutex::new(UpdatePhase::Idle)),
             offer: Mutex::new(None),
             install_gate: AsyncMutex::new(()),
@@ -307,7 +344,7 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
 
     pub async fn install_automatically(
         &self,
-        access_token: &str,
+        access_token: &AccessSnapshot,
         preferences: UpdatePreferences,
     ) -> Result<UpdatePhase, UpdateError> {
         if !preferences.automatic {
@@ -323,7 +360,10 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
         self.install_locked(access_token).await
     }
 
-    pub async fn install_now(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
+    pub async fn install_now(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<UpdatePhase, UpdateError> {
         let _guard = self.install_gate.lock().await;
         if matches!(self.phase(), UpdatePhase::ReadyToRestart { .. }) {
             return Ok(self.phase());
@@ -331,7 +371,10 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
         self.install_locked(access_token).await
     }
 
-    async fn install_locked(&self, access_token: &str) -> Result<UpdatePhase, UpdateError> {
+    async fn install_locked(
+        &self,
+        access_token: &AccessSnapshot,
+    ) -> Result<UpdatePhase, UpdateError> {
         let Some(offer) = self
             .offer
             .lock()
@@ -339,6 +382,17 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
             .clone()
         else {
             return Ok(UpdatePhase::Idle);
+        };
+
+        let stopped = match self.barrier.prepare(&offer.version).await {
+            Ok(stopped @ UpdateBarrierPhase::LocalStopped) => stopped,
+            Err(error) => {
+                *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
+                    version: offer.version,
+                    code: error.code().to_string(),
+                };
+                return Err(error.into());
+            }
         };
 
         *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Downloading {
@@ -358,10 +412,14 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
 
         match self
             .backend
-            .install(access_token, &offer.version, progress)
+            .install(access_token, &offer.version, stopped, progress)
             .await
         {
             Ok(InstallResult::NoUpdate) => {
+                if let Err(error) = self.barrier.installer_failed().await {
+                    self.set_barrier_failure(&offer.version, &error);
+                    return Err(error.into());
+                }
                 *self.offer.lock().expect("update offer lock poisoned") = None;
                 *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Idle;
                 Ok(UpdatePhase::Idle)
@@ -369,10 +427,18 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
             Ok(InstallResult::Installed(installed)) => {
                 if installed.version != offer.version {
                     let error = UpdateBackendError::new("installed_update_version_mismatch");
+                    if let Err(barrier_error) = self.barrier.installer_failed().await {
+                        self.set_barrier_failure(&offer.version, &barrier_error);
+                        return Err(barrier_error.into());
+                    }
                     *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
                         version: offer.version,
                         code: error.code().to_string(),
                     };
+                    return Err(error.into());
+                }
+                if let Err(error) = self.barrier.installer_opened().await {
+                    self.set_barrier_failure(&offer.version, &error);
                     return Err(error.into());
                 }
                 let phase = UpdatePhase::ReadyToRestart {
@@ -384,10 +450,18 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
             Ok(InstallResult::InstallerOpened(installed)) => {
                 if installed.version != offer.version {
                     let error = UpdateBackendError::new("installed_update_version_mismatch");
+                    if let Err(barrier_error) = self.barrier.installer_failed().await {
+                        self.set_barrier_failure(&offer.version, &barrier_error);
+                        return Err(barrier_error.into());
+                    }
                     *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
                         version: offer.version,
                         code: error.code().to_string(),
                     };
+                    return Err(error.into());
+                }
+                if let Err(error) = self.barrier.installer_opened().await {
+                    self.set_barrier_failure(&offer.version, &error);
                     return Err(error.into());
                 }
                 let phase = UpdatePhase::AwaitingInstallation {
@@ -397,6 +471,10 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
                 Ok(phase)
             }
             Err(error) => {
+                if let Err(barrier_error) = self.barrier.installer_failed().await {
+                    self.set_barrier_failure(&offer.version, &barrier_error);
+                    return Err(barrier_error.into());
+                }
                 let phase = UpdatePhase::Failed {
                     version: offer.version,
                     code: error.code().to_string(),
@@ -405,6 +483,13 @@ impl<B: UpdateBackend> UpdateCoordinator<B> {
                 Err(error.into())
             }
         }
+    }
+
+    fn set_barrier_failure(&self, version: &str, error: &UpdateBarrierError) {
+        *self.phase.lock().expect("update phase lock poisoned") = UpdatePhase::Failed {
+            version: version.to_owned(),
+            code: error.code().to_string(),
+        };
     }
 }
 

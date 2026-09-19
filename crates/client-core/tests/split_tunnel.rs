@@ -1,4 +1,6 @@
+mod support;
 use async_trait::async_trait;
+use nelomai_client_api::AccessSnapshot;
 use nelomai_client_api::TokenResponse;
 use nelomai_client_core::{
     split_tunnel_active, ClientCore, ConnectOptions, CoreApi, CoreApiError, CoreError,
@@ -1066,6 +1068,78 @@ async fn settings_save_reports_apply_and_rollback_failures() {
 }
 
 #[tokio::test]
+async fn logout_fences_failed_policy_stop_without_restoring_connection() {
+    let fixture = Arc::new(coordinator_fixture(android_35_capabilities()));
+    fixture
+        .core
+        .synchronize_split_tunnel(1000, false)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .start(ConnectOptions::android_default(), 1010)
+        .await
+        .unwrap();
+    let mut changed = policy(SplitTunnelMode::ExcludeSelected);
+    changed.revision = 8;
+    changed.policy_hash = format!("sha256:{}", "f".repeat(64));
+    changed.selected_packages = vec!["com.example.chat".into()];
+    fixture.api.set_policy(changed);
+    fixture.tunnel.block_stop.store(true, Ordering::SeqCst);
+    let worker = fixture.clone();
+    let pending = tokio::spawn(async move {
+        worker
+            .core
+            .save_split_tunnel_settings(
+                &SplitTunnelSettingsUpdate {
+                    mode: SplitTunnelMode::ExcludeSelected,
+                    exclude_local_networks: true,
+                    selected_packages: vec![SplitTunnelSelectedPackage {
+                        package_id: "com.example.chat".into(),
+                        display_name: "Chat".into(),
+                    }],
+                },
+                1100,
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while fixture.tunnel.stops.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let gates = fixture.core.runtime_writer_gates();
+    let mut admission = Box::pin(gates.quiesce());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut admission)
+            .await
+            .is_err(),
+        "admission must drain the real held split writer"
+    );
+    fixture.tunnel.block_stop.store(false, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(2), fixture.core.sign_out())
+        .await
+        .expect("logout does not wait for admission")
+        .unwrap();
+    let cleanup = fixture.secret_store.load().unwrap().unwrap();
+    fixture.tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    fixture.tunnel.stop_release.notify_one();
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(CoreError::StartCancelled)
+    ));
+    let _quiescence = tokio::time::timeout(std::time::Duration::from_secs(2), admission)
+        .await
+        .unwrap();
+    assert_eq!(fixture.core.state().await.phase, Phase::SignedOut);
+    assert!(fixture.core.state().await.connection.is_none());
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.secret_store.load().unwrap().unwrap(), cleanup);
+}
+
+#[tokio::test]
 async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
     let api = Arc::new(CoordinatorApi::new());
     let secret_store = Arc::new(TestSecretStore::new(StoredAuth {
@@ -1085,7 +1159,7 @@ async fn started_tunnel_remains_connected_when_split_state_persistence_fails() {
     });
     let split_store = Arc::new(FailingSplitTunnelStore::default());
     let logger = Arc::new(TestLogger::default());
-    let core = ClientCore::with_split_tunnel_store(
+    let core = support::core_with_split(
         api,
         secret_store,
         split_store.clone(),
@@ -1627,7 +1701,7 @@ async fn detector_cancellation_journals_compensation_before_local_stop_and_recon
     fixture.core.finish_start_attempt();
     fixture.tunnel.block_stop.store(false, Ordering::SeqCst);
     fixture.tunnel.stop_release.notify_waiters();
-    let reconstructed = ClientCore::with_split_tunnel_store(
+    let reconstructed = support::core_with_split(
         fixture.api.clone(),
         fixture.secret_store.clone(),
         fixture.split_store.clone(),
@@ -1773,7 +1847,7 @@ async fn confirmed_desktop_network_change_restarts_only_the_local_tunnel() {
         .unwrap();
     fixture
         .tunnel
-        .set_fingerprints(["network-a", "network-b", "network-b"]);
+        .set_fingerprints(["network-a", "network-b", "network-b", "network-b"]);
     fixture
         .core
         .start(
@@ -1799,11 +1873,32 @@ async fn confirmed_desktop_network_change_restarts_only_the_local_tunnel() {
         Some("network-a")
     );
 
+    fixture
+        .tunnel
+        .fail_next_fingerprint
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .core
+            .poll_physical_network_guarded(1_099, || false)
+            .await
+            .unwrap(),
+        PhysicalNetworkPollOutcome::RetryDeferred
+    );
     assert_eq!(
         fixture.core.poll_physical_network(1_100).await.unwrap(),
         PhysicalNetworkPollOutcome::ChangePending
     );
     assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .core
+            .poll_physical_network_guarded(1_129, || false)
+            .await
+            .unwrap(),
+        PhysicalNetworkPollOutcome::RetryDeferred
+    );
     assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
     assert_eq!(
         fixture.core.poll_physical_network(1_130).await.unwrap(),
@@ -2182,7 +2277,12 @@ async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy(
 }
 
 struct CoordinatorFixture {
-    core: ClientCore<CoordinatorApi, TestSecretStore, CoordinatorTunnel, TestLogger>,
+    core: ClientCore<
+        CoordinatorApi,
+        support::LegacyRuntime<TestSecretStore>,
+        CoordinatorTunnel,
+        TestLogger,
+    >,
     api: Arc<CoordinatorApi>,
     tunnel: Arc<CoordinatorTunnel>,
     split_store: Arc<MemorySplitTunnelStore>,
@@ -2209,7 +2309,7 @@ fn coordinator_fixture(capabilities: TunnelCapabilities) -> CoordinatorFixture {
     });
     let split_store = Arc::new(MemorySplitTunnelStore::default());
     let logger = Arc::new(TestLogger::default());
-    let core = ClientCore::with_split_tunnel_store(
+    let core = support::core_with_split(
         api.clone(),
         secret_store.clone(),
         split_store.clone(),
@@ -2333,6 +2433,7 @@ struct CoordinatorTunnel {
     status: Mutex<TunnelStatus>,
     fingerprints: Mutex<VecDeque<String>>,
     fingerprint_calls: AtomicUsize,
+    fail_next_fingerprint: AtomicBool,
     block_fingerprint: AtomicBool,
     fingerprint_release: Notify,
     capability_calls: AtomicUsize,
@@ -2401,6 +2502,11 @@ impl TunnelController for CoordinatorTunnel {
 
     async fn physical_network_fingerprint(&self) -> Result<Option<String>, TunnelError> {
         self.fingerprint_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_next_fingerprint.swap(false, Ordering::SeqCst) {
+            return Err(TunnelError::Backend(
+                "physical_egress_unavailable".to_string(),
+            ));
+        }
         if self.block_fingerprint.load(Ordering::SeqCst) {
             self.fingerprint_release.notified().await;
         }
@@ -2493,11 +2599,7 @@ impl CoordinatorApi {
 
 #[async_trait]
 impl CoreApi for CoordinatorApi {
-    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
-        Err(CoreApiError::Retryable)
-    }
-
-    async fn bootstrap(&self, _access_token: &str) -> Result<Bootstrap, CoreApiError> {
+    async fn bootstrap(&self, _access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
         self.available()?;
         let connection = self.bootstrap_connection.lock().unwrap().clone();
         Ok(Bootstrap {
@@ -2545,7 +2647,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn start_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &ConnectionStartRequest,
     ) -> Result<ConnectionStartResponse, CoreApiError> {
         self.available()?;
@@ -2575,7 +2677,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn stop_connection(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         self.stop_calls.fetch_add(1, Ordering::SeqCst);
@@ -2610,7 +2712,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn pin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
@@ -2618,7 +2720,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn unpin_stray(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &ConnectionOperationRequest,
     ) -> Result<ConnectionOperationResponse, CoreApiError> {
         Err(CoreApiError::Retryable)
@@ -2626,7 +2728,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn split_tunnel_revision(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelRevision, CoreApiError> {
         self.available()?;
         self.revision_calls.fetch_add(1, Ordering::SeqCst);
@@ -2635,7 +2737,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn split_tunnel_policy(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         self.available()?;
         if !self.policy_online.load(Ordering::SeqCst) {
@@ -2647,7 +2749,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn update_split_tunnel_settings(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         _request: &SplitTunnelSettingsUpdate,
     ) -> Result<SplitTunnelPolicy, CoreApiError> {
         self.available()?;
@@ -2657,7 +2759,7 @@ impl CoreApi for CoordinatorApi {
 
     async fn report_split_tunnel_apply_result(
         &self,
-        _access_token: &str,
+        _access_token: &AccessSnapshot,
         request: &SplitTunnelApplyResult,
     ) -> Result<(), CoreApiError> {
         self.available()?;
@@ -2672,5 +2774,12 @@ impl CoreApi for CoordinatorApi {
         }
         self.apply_results.lock().unwrap().push(request.clone());
         Ok(())
+    }
+}
+
+#[async_trait]
+impl support::TestAuthApi for CoordinatorApi {
+    async fn refresh(&self, _refresh_token: &str) -> Result<TokenResponse, CoreApiError> {
+        Err(CoreApiError::Retryable)
     }
 }

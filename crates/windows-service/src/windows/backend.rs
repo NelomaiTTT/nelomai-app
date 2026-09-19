@@ -1,24 +1,23 @@
 use super::install::{
-    create_or_replace_tunnel_service, open_tunnel_service, read_service_diagnostics,
-    record_service_diagnostic, record_service_message, remove_tunnel_service, tunnel_config_path,
-    wait_until_running_until, wait_until_stopped_until,
+    open_tunnel_service, read_service_diagnostics, record_service_diagnostic,
+    record_service_message, tunnel_config_path,
 };
 use super::routes::WindowsRouteManager;
+use super::service::request_primitive;
 use crate::{DefenderStatus, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use nelomai_client_tunnel::{
     detect_configuration_transport, DesktopTunnelOptions, TunnelMetrics, TunnelTransport,
 };
+use nelomai_contracts::dispatcher::EnginePrimitive;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
-use std::time::{Duration, Instant};
 use windows_service::service::ServiceState;
 use windows_sys::Win32::Foundation::NO_ERROR;
 use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
 
 const TUNNEL_INTERFACE_NAME: &str = "nelomai";
-const UDP_REBIND_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) struct WindowsServiceBackend {
     routes: WindowsRouteManager,
@@ -114,25 +113,10 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         let result = (|| {
             let config_path = tunnel_config_path()?;
             write_configuration_atomically(&config_path, configuration)?;
-            let service = create_or_replace_tunnel_service(&config_path, transport)?;
-            service
-                .start(&[] as &[&str])
-                .map_err(|error| match transport {
-                    TunnelTransport::WireGuard => {
-                        ServiceError::Backend(format!("start WireGuard tunnel service: {error}"))
-                    }
-                    TunnelTransport::AmneziaWg3 => {
-                        ServiceError::Backend("amneziawg_service_start_failed".to_string())
-                    }
-                })?;
-            if let Err(error) = super::install::wait_until_running(&service) {
-                return Err(match transport {
-                    TunnelTransport::WireGuard => error,
-                    TunnelTransport::AmneziaWg3 => {
-                        ServiceError::Backend("amneziawg_service_start_failed".to_string())
-                    }
-                });
-            }
+            request_primitive(match transport {
+                TunnelTransport::WireGuard => EnginePrimitive::StartWireguard,
+                TunnelTransport::AmneziaWg3 => EnginePrimitive::StartAmneziawg,
+            })?;
             self.routes
                 .verify_protected_endpoint(self.protected_endpoint())?;
             Ok::<_, ServiceError>(())
@@ -143,7 +127,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
             self.transport = None;
             self.started_at_epoch_millis = None;
             let config_path = tunnel_config_path().ok();
-            let _ = remove_tunnel_service();
+            let _ = request_primitive(EnginePrimitive::StopServices);
             if let Some(config_path) = config_path {
                 let _ = fs::remove_file(config_path);
             }
@@ -164,7 +148,7 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
         self.endpoint = None;
         self.transport = None;
         self.started_at_epoch_millis = None;
-        let mut first_error = remove_tunnel_service().err();
+        let mut first_error = request_primitive(EnginePrimitive::StopServices).err();
         match tunnel_config_path() {
             Ok(path) => {
                 if let Err(error) = fs::remove_file(path) {
@@ -277,18 +261,8 @@ impl ServiceTunnelBackend for WindowsServiceBackend {
             return Err(ServiceError::Backend("udp_rebind_unsupported".to_string()));
         }
         let result = (|| {
-            let deadline = Instant::now() + UDP_REBIND_TIMEOUT;
-            let service = open_tunnel_service()?
-                .ok_or_else(|| ServiceError::Backend("tunnel_not_running".to_string()))?;
-            service.stop().map_err(|error| {
-                ServiceError::Backend(format!("stop tunnel for UDP rebind: {error}"))
-            })?;
-            wait_until_stopped_until(&service, deadline)?;
             let started_at_epoch_millis = unix_now_epoch_millis();
-            service.start(&[] as &[&str]).map_err(|error| {
-                ServiceError::Backend(format!("start tunnel after UDP rebind: {error}"))
-            })?;
-            wait_until_running_until(&service, deadline)?;
+            request_primitive(EnginePrimitive::RebindService)?;
             self.started_at_epoch_millis = Some(started_at_epoch_millis);
             self.routes
                 .verify_protected_endpoint(self.protected_endpoint())
