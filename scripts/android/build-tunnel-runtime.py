@@ -32,6 +32,11 @@ def vendor(root, name, output, patches):
         subprocess.run(['git', 'apply', str(root / 'patches' / patch)], cwd=output, check=True, capture_output=True)
 
 
+def stable_jni_source(source):
+    return source.replace('Java_org_amnezia_awg_', 'Java_ru_nelomai_runtime_stable_awg_').replace(
+        'Java_ru_nelomai_tunnel_', 'Java_ru_nelomai_runtime_stable_tunnel_')
+
+
 def build(root, output, ndk, go_archive, slot):
     if output.exists(): raise ValueError('native build output already exists')
     compiler = ndk_compiler(ndk)
@@ -48,7 +53,7 @@ def build(root, output, ndk, go_archive, slot):
     name = 'libstable_runtime_wg_go.so' if slot == 'stable' else 'libwg-go.so'
     if slot == 'stable':
         jni = bridge / 'jni.c'
-        jni.write_text(jni.read_text().replace('Java_org_amnezia_awg_', 'Java_ru_nelomai_runtime_stable_awg_'))
+        jni.write_text(stable_jni_source(jni.read_text()))
     module = bridge / 'go.mod'
     module.write_text(module.read_text() + '\nreplace github.com/amnezia-vpn/amneziawg-go/v3 => ../../../../amneziawg-go\n')
     environment = os.environ.copy()
