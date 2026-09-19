@@ -1,4 +1,22 @@
-# Immutable 0.2.16 runtime artifacts
+# Runtime artifacts — current 0.3.0 packaging (2026-09-20)
+
+Current release workflow produces latest **0.3.0** plus the already published
+stable **0.2.20**. It downloads stable from `NelomaiTTT/nelomai-app` release
+`v0.2.20`; `scripts/release-candidate-gates.py` pins its source and root SHA-256.
+Signing and native staging independently verify that root and preserve its
+archives, manifests, signatures and extracted payload bytes. Android links the
+archived stable AAR instead of rebuilding it for the installed stable slot.
+
+New namespaced 0.3.0 runtime artifacts are still built for the existing release
+asset set (possible future stable); they are **not** the installed stable slot.
+The historical synthetic 0.2.21 acceptance path remains a fixture, not the 0.3.0
+shipping path. Build-only uses test trust; installation over production requires
+`sign_candidate` and the existing Android certificate. Publication is separate.
+
+The sections below describe the original artifact mechanism and historical
+0.2.16 examples; they do not override the current stable/source pins above.
+
+## Historical: immutable 0.2.16 runtime artifacts
 
 This maintenance line ships **latest-only 0.2.16**. The separate synthetic
 two-slot packages are test inputs, not public installers. Packaging, native

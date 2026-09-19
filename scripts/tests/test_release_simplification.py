@@ -11,14 +11,19 @@ from unittest.mock import patch
 
 from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, ROOT, module
 import scripts.tests.test_runtime_candidate_signing as candidate_fixtures
+import scripts.tests.test_runtime_release_set as release_fixtures
 
 
 class ReleaseSimplificationTest(ArtifactFixture):
     def test_shipping_only_finalizer_produces_complete_publishable_file_set(self):
-        drafts = candidate_fixtures.RuntimeCandidateSigningTest.drafts(self)
         signed = self.root / "signed"
-        digest = module("sign-runtime-candidate").sign(drafts, signed, SOURCE, self.keyfile, self.public)
         consumer = module("finalize-release-candidate")
+        release = release_fixtures.RuntimeReleaseSetTest.four_candidates(self, version=consumer.gates.VERSION)
+        shutil.copytree(release, signed / "release")
+        digest = module("build-runtime-release-set").build(signed / "release", self.root / "root-index",
+            consumer.gates.VERSION, SOURCE, self.keyfile, self.public)
+        for path in (self.root / "root-index").iterdir():
+            shutil.copyfile(path, signed / "release" / path.name)
         packages = self.root / "packages"
         for platform, architecture in consumer.verifier.TARGETS:
             folder = packages / platform
@@ -34,7 +39,7 @@ class ReleaseSimplificationTest(ArtifactFixture):
                 architecture=architecture, packages={"shipping": dict(name=package.name,
                     sha256=consumer.verifier.digest(package), size_bytes=package.stat().st_size)})))
         for suffix in (".tar.gz", ".tar.gz.sha256"):
-            (packages / "android/shipping" / ("nelomai-0.2.20-amneziawg-android-source" + suffix)).write_bytes(b"source fixture")
+            (packages / "android/shipping" / (f"nelomai-{consumer.gates.VERSION}-amneziawg-android-source" + suffix)).write_bytes(b"source fixture")
         output, work = self.root / "finalized", self.root / "finalization"
         arguments = ["finalize-release-candidate", "--packages", str(packages), "--signed", str(signed),
                      "--output", str(output), "--private-key", str(self.keyfile), "--public-key", str(self.public),

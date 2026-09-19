@@ -8,6 +8,16 @@ from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_030_signing_downloads_pinned_stable_before_signing_containers(self):
+        workflow = self.workflow()
+        self.assertEqual(workflow[True]["workflow_dispatch"]["inputs"]["version"]["default"], "0.3.0")
+        commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["sign"]["steps"])
+        self.assertLess(commands.index("scripts/download-confirmed-stable.py"),
+                        commands.index("scripts/sign-runtime-candidate.py"))
+        signing = commands[commands.index("scripts/sign-runtime-candidate.py"):]
+        for argument in ("--confirmed-stable", "--stable-public-key", '--version "$RELEASE_VERSION"'):
+            self.assertIn(argument, signing)
+
     def test_checks_android_setup_does_not_request_retired_sdk_tools(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
         steps = workflow["jobs"]["android-plugin"]["steps"]

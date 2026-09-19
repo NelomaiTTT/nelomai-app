@@ -10,18 +10,18 @@ from scripts.tests.test_runtime_artifact import ArtifactFixture, SOURCE, module
 
 
 class RuntimeReleaseSetTest(ArtifactFixture):
-    def four_candidates(self):
+    def four_candidates(self, version="0.2.20"):
         folder = self.root / "four"
         folder.mkdir()
         for platform, architecture in (("linux", "x86_64"), ("windows", "x86_64"),
                                        ("macos", "aarch64"), ("android", "aarch64")):
-            prefix = f"nelomai-runtime-0.2.20-{platform}-{architecture}"
+            prefix = f"nelomai-runtime-{version}-{platform}-{architecture}"
             value = b"authenticated structural fixture only"
             with zipfile.ZipFile(folder / (prefix + ".zip"), "w") as archive:
                 info = zipfile.ZipInfo("fixture")
                 info.external_attr = 0o100644 << 16
                 archive.writestr(info, value)
-            body = dict(format_version=1, runtime_version="0.2.20", source_commit=SOURCE,
+            body = dict(format_version=1, runtime_version=version, source_commit=SOURCE,
                 platform=platform, architecture=architecture, contract_version=1,
                 files=[dict(path="fixture", size_bytes=len(value), role="resource",
                             sha256=hashlib.sha256(value).hexdigest())])
@@ -165,9 +165,7 @@ class ReleaseAuthorizationTest(ArtifactFixture):
 
     def test_publishable_inventory_requires_every_exact_installer_digest(self):
         gates = module("release-candidate-gates")
-        assets = {name: "d" * 64 for name in (
-            "nelomai-0.2.20-linux-x86_64.AppImage", "nelomai-0.2.20-windows-x86_64.exe",
-            "nelomai-0.2.20-macos-aarch64.app.tar.gz", "nelomai-0.2.20-android-aarch64.apk")}
+        assets = {name: "d" * 64 for name in gates.PACKAGE_NAMES.values()}
         inventory = {"trust": "release", "mode": "sign_candidate", "source_sha": SOURCE,
                      "run_id": "42", "run_attempt": 1, "assets": assets,
                      "environment_ids": {gates.SIGNING_ENVIRONMENT: 11, gates.ACCEPTANCE_ENVIRONMENT: 12,
@@ -317,6 +315,13 @@ class ReleaseAuthorizationTest(ArtifactFixture):
             gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.20", base=base)
         with self.assertRaises(ValueError):
             gates.verify_source(repo, git("rev-parse", "HEAD"), "0.2.20", base=base, mode="build_only")
+        # Current main intentionally integrates maintenance via merges, but
+        # exact source, clean tree and existing-tag checks remain in force.
+        merged = git("rev-parse", "HEAD")
+        gates.verify_source(repo, merged, gates.VERSION, base=base)
+        git("tag", "v" + gates.VERSION, base)
+        with self.assertRaises(ValueError):
+            gates.verify_source(repo, merged, gates.VERSION, base=base)
 
     def test_environment_name_without_actual_review_protection_is_rejected(self):
         gates = module("release-candidate-gates")
