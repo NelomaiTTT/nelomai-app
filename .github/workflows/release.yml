@@ -105,7 +105,7 @@ jobs:
       -
         run: "python -m unittest discover -s scripts/tests"
   native_drafts:
-    needs: "verify"
+    if: "inputs.mode != 'publish_approved_candidate'"
     strategy:
       fail-fast: false
       matrix:
@@ -173,7 +173,9 @@ jobs:
           overwrite: true
           retention-days: 14
   sign:
-    needs: "native_drafts"
+    needs:
+      - "verify"
+      - "native_drafts"
     environment: "release-candidate-signing"
     runs-on: "ubuntu-22.04"
     outputs:

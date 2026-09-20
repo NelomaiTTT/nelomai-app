@@ -107,6 +107,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         workflow = self.workflow()
         self.assertEqual(workflow["permissions"].get("contents"), "read", "default workflow is not read-only")
         jobs = workflow["jobs"]
+        self.assertEqual(jobs["native_drafts"].get("if"), "inputs.mode != 'publish_approved_candidate'",
+                         "publication-only runs must not start native builds")
         writers = [name for name, job in jobs.items() if job.get("permissions", {}).get("contents") == "write"]
         self.assertEqual(writers, ["publish"])
         publish = jobs["publish"]
@@ -137,7 +139,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(jobs["finalize"]["environment"], "release-candidate-finalization")
         for name in ("native_drafts", "native_packages"):
             self.assertNotIn("environment", jobs[name])
-        self.assertEqual(jobs["sign"]["needs"], "native_drafts")
+        self.assertNotIn("needs", jobs["native_drafts"])
+        self.assertEqual(set(jobs["sign"]["needs"]), {"verify", "native_drafts"})
         self.assertIn("sign", jobs["native_packages"]["needs"])
         self.assertIn("native_packages", jobs["finalize"]["needs"])
         self.assertIn("build-runtime-release-set.py", yaml.safe_dump(jobs["sign"]))
@@ -165,7 +168,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
                         self.assertTrue("inputs.mode == 'sign_candidate'" in str(value)
                                         or step.get("if") == "inputs.mode == 'sign_candidate'",
                                         "test signing step receives a production credential")
-        self.assertEqual(jobs["sign"]["needs"], "native_drafts")
+        self.assertNotIn("needs", jobs["native_drafts"])
+        self.assertEqual(set(jobs["sign"]["needs"]), {"verify", "native_drafts"})
         self.assertEqual(set(jobs["native_packages"]["needs"]), {"native_drafts", "sign"})
         self.assertEqual(set(jobs["finalize"]["needs"]), {"native_packages", "sign"})
 
