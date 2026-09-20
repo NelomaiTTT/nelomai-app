@@ -1026,28 +1026,30 @@ class NelomaiVpnServiceTest {
     @Test
     fun delayedPhysicalNetworkCallbackCannotMutateAReplacementServiceOrOwner() {
         val mutationFence = RedundantOperationMutationFence()
+        val owner = ServiceRedundantOwner()
         val callback = RedundantPhysicalNetworkCallbackIdentity(
             serviceGeneration = 7,
             startOperationId = "start-a",
+            owner = owner,
         )
         var mutations = 0
 
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(8, "start-a", false, false)
+                RedundantPhysicalNetworkCallbackState(8, "start-a", owner, false, false)
             },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-b", false, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-b", owner, false, false)
             },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-a", true, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-a", owner, true, false)
             },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
@@ -1056,6 +1058,7 @@ class NelomaiVpnServiceTest {
                 RedundantPhysicalNetworkCallbackState(
                     7,
                     "start-a",
+                    owner,
                     pendingStop = false,
                     tombstoneUnreadable = false,
                     stopLookupPending = true,
@@ -1068,6 +1071,7 @@ class NelomaiVpnServiceTest {
                 RedundantPhysicalNetworkCallbackState(
                     7,
                     "start-a",
+                    owner,
                     pendingStop = false,
                     tombstoneUnreadable = false,
                     retainedOwnerCleanupPending = true,
@@ -1077,14 +1081,14 @@ class NelomaiVpnServiceTest {
         assertTrue(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-a", false, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-a", owner, false, false)
             },
         ) { mutations += 1 })
         mutationFence.cancel("start-a")
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-a", false, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-a", owner, false, false)
             },
         ) { mutations += 1 })
 
@@ -1094,7 +1098,8 @@ class NelomaiVpnServiceTest {
     @Test
     fun physicalNetworkCallbackReadsReplacementIdentityInsideSerializedFence() {
         val mutationFence = RedundantOperationMutationFence()
-        val callback = RedundantPhysicalNetworkCallbackIdentity(7, "start-a")
+        val owner = ServiceRedundantOwner()
+        val callback = RedundantPhysicalNetworkCallbackIdentity(7, "start-a", owner)
         val gateEntered = CountDownLatch(1)
         val releaseGate = CountDownLatch(1)
         val blocker = Thread {
@@ -1106,7 +1111,7 @@ class NelomaiVpnServiceTest {
         }.apply { start() }
         assertTrue(gateEntered.await(2, TimeUnit.SECONDS))
         val currentGeneration = AtomicLong(7)
-        val installedOwner = AtomicReference<String?>("start-a")
+        val installedOperation = AtomicReference<String?>("start-a")
         val callbackStarted = CountDownLatch(1)
         val callbackResult = AtomicReference<Boolean>()
         val mutations = AtomicInteger(0)
@@ -1117,7 +1122,8 @@ class NelomaiVpnServiceTest {
                 current = {
                     RedundantPhysicalNetworkCallbackState(
                         currentGeneration.get(),
-                        installedOwner.get(),
+                        installedOperation.get(),
+                        owner,
                         pendingStop = false,
                         tombstoneUnreadable = false,
                     )
@@ -1127,7 +1133,7 @@ class NelomaiVpnServiceTest {
         assertTrue(callbackStarted.await(2, TimeUnit.SECONDS))
 
         currentGeneration.set(8)
-        installedOwner.set("start-b")
+        installedOperation.set("start-b")
         releaseGate.countDown()
         blocker.join(2_000L)
         delayed.join(2_000L)

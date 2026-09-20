@@ -324,7 +324,36 @@ class RedundantProductionAdaptersTest {
     }
 
     @Test
-    fun productionNativePublishesBoundedSessionMetricsAcrossSlotSwitches() {
+    fun productionNativeUsesDispatcherTunCountersAndActiveSlotProbeTarget() {
+        val backend = RecordingSessionBackend()
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = { configuration ->
+                preparedWithEndpoint(
+                    configuration,
+                    if (configuration.single() == 1.toByte()) "127.0.0.1" else "127.0.0.2",
+                )
+            },
+            probeSourceIpv4 = "10.200.0.2/32",
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        assertTrue(native.start("lease-b", RedundantSlot.B, byteArrayOf(2), probe()))
+        assertTrue(native.activate("lease-b"))
+        backend.metricsOverride = {
+            """{"dispatcher":{"OutboundBytes":14,"InboundBytes":22,"ProbePacketsInjected":9000},"slots":[{"slot":0,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":999999,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_packets":500,"udp_receive_packets":400}},{"slot":1,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":0,"tun_write_bytes":0,"udp_send_packets":700,"udp_receive_packets":600}}]}"""
+        }
+
+        val metrics = requireNotNull(native.metrics(includeProbeTarget = true))
+
+        assertEquals(22L, metrics.receivedBytes)
+        assertEquals(14L, metrics.sentBytes)
+        assertEquals(1_000_000L, metrics.latestHandshakeEpochMillis)
+        assertEquals("127.0.0.2", metrics.probeTarget)
+    }
+
+    @Test
+    fun productionNativeDoesNotSumPerSlotOrProbeTraffic() {
         val backend = RecordingSessionBackend()
         val native = ServiceRedundantConnectionNative(
             backend = backend,
@@ -334,14 +363,62 @@ class RedundantProductionAdaptersTest {
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
         assertTrue(native.start("lease-b", RedundantSlot.B, byteArrayOf(2), probe()))
-        assertTrue(native.activate("lease-b"))
+        backend.metricsOverride = {
+            """{"dispatcher":{"OutboundBytes":17,"InboundBytes":19,"ProbePacketsInjected":1000,"ProbeRepliesConsumed":900},"slots":[{"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":101,"tun_write_bytes":201,"udp_send_bytes":301,"udp_receive_bytes":401}},{"latest_handshake_at_unix_ms":999999,"telemetry":{"tun_read_bytes":103,"tun_write_bytes":203,"udp_send_bytes":303,"udp_receive_bytes":403}}]}"""
+        }
 
-        val metrics = requireNotNull(native.metrics(includeProbeTarget = true))
+        val metrics = requireNotNull(native.metrics(includeProbeTarget = false))
 
-        assertEquals(22L, metrics.receivedBytes)
-        assertEquals(14L, metrics.sentBytes)
-        assertEquals(1_000_000L, metrics.latestHandshakeEpochMillis)
-        assertEquals("127.0.0.1", metrics.probeTarget)
+        assertEquals(19L, metrics.receivedBytes)
+        assertEquals(17L, metrics.sentBytes)
+    }
+
+    @Test
+    fun productionNativeScansHandshakeWithoutSlotTelemetry() {
+        val backend = RecordingSessionBackend()
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        backend.metricsOverride = {
+            """{"dispatcher":{"OutboundBytes":1,"InboundBytes":2},"slots":[{"latest_handshake_at_unix_ms":1234567}]}"""
+        }
+
+        val metrics = requireNotNull(native.metrics(includeProbeTarget = false))
+
+        assertEquals(1_234_567L, metrics.latestHandshakeEpochMillis)
+    }
+
+    @Test
+    fun productionNativeTreatsMissingAndNegativeDispatcherCountersAsZero() {
+        val backend = RecordingSessionBackend()
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        backend.metricsOverride = {
+            """{"dispatcher":{},"slots":[{"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11}}]}"""
+        }
+
+        val missing = requireNotNull(native.metrics(includeProbeTarget = false))
+
+        assertEquals(0L, missing.receivedBytes)
+        assertEquals(0L, missing.sentBytes)
+
+        backend.metricsOverride = {
+            """{"dispatcher":{"OutboundBytes":-7,"InboundBytes":-11},"slots":[]}"""
+        }
+
+        val negative = requireNotNull(native.metrics(includeProbeTarget = false))
+
+        assertEquals(0L, negative.receivedBytes)
+        assertEquals(0L, negative.sentBytes)
     }
 
     @Test
@@ -434,6 +511,18 @@ class RedundantProductionAdaptersTest {
             config = Config.parse(ByteArrayInputStream(TEST_CONFIG.toByteArray())),
             userspace = "private_key=redacted-for-fake".toByteArray(),
         )
+
+    private fun preparedWithEndpoint(
+        @Suppress("UNUSED_PARAMETER") configuration: ByteArray,
+        endpoint: String,
+    ): PreparedRedundantConfiguration = PreparedRedundantConfiguration(
+        config = Config.parse(
+            ByteArrayInputStream(
+                TEST_CONFIG.replace("127.0.0.1", endpoint).toByteArray(),
+            ),
+        ),
+        userspace = "private_key=redacted-for-fake".toByteArray(),
+    )
 
     private companion object {
         val TEST_CONFIG = """

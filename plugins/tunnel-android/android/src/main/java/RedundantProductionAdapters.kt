@@ -308,14 +308,12 @@ internal class ServiceRedundantConnectionNative(
         val payload = runCatching { backend.metrics(nativeSession)?.let(::JSONObject) }.getOrNull()
             ?: return@synchronized null
         val array = payload.optJSONArray("slots") ?: return@synchronized null
-        var received = 0L
-        var sent = 0L
+        val dispatcher = payload.optJSONObject("dispatcher")
+        val sent = dispatcher?.optLong("OutboundBytes", 0L)?.coerceAtLeast(0L) ?: 0L
+        val received = dispatcher?.optLong("InboundBytes", 0L)?.coerceAtLeast(0L) ?: 0L
         var latestHandshake: Long? = null
         for (index in 0 until array.length()) {
             val value = array.optJSONObject(index) ?: continue
-            val telemetry = value.optJSONObject("telemetry") ?: continue
-            received = saturatingAddPositive(received, telemetry.optLong("tun_write_bytes", 0L))
-            sent = saturatingAddPositive(sent, telemetry.optLong("tun_read_bytes", 0L))
             value.optLong("latest_handshake_at_unix_ms", 0L).takeIf { it > 0L }?.let {
                 latestHandshake = maxOf(latestHandshake ?: 0L, it)
             }

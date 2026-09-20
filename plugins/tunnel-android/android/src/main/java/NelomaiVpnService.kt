@@ -235,6 +235,7 @@ internal data class RedundantRevokeResult(
 internal data class InstalledRedundantVpnOwner(
     val owner: RedundantVpnProcessOwner,
     val startOperationId: String,
+    val routeBaseline: RedundantVpnRouteBaseline? = null,
 )
 
 internal class RedundantVpnOwnerSlot {
@@ -247,12 +248,18 @@ internal class RedundantVpnOwnerSlot {
     fun install(
         owner: RedundantVpnProcessOwner?,
         startOperationId: String?,
+        routeBaseline: RedundantVpnRouteBaseline? = null,
     ): InstalledRedundantVpnOwner? {
         require(owner == null || !startOperationId.isNullOrBlank())
         require(owner != null || startOperationId == null)
+        require(owner != null || routeBaseline == null)
         val previous = installed
         installed = owner?.let {
-            InstalledRedundantVpnOwner(it, requireNotNull(startOperationId))
+            InstalledRedundantVpnOwner(
+                it,
+                requireNotNull(startOperationId),
+                routeBaseline,
+            )
         }
         return previous
     }
@@ -295,13 +302,14 @@ internal fun installRedundantVpnOwnerSafely(
     slot: RedundantVpnOwnerSlot,
     owner: RedundantVpnProcessOwner,
     startOperationId: String,
+    routeBaseline: RedundantVpnRouteBaseline? = null,
     closeOwner: (RedundantVpnProcessOwner) -> Boolean,
     initializeAuxiliaryState: () -> Unit,
 ): Boolean {
     var previous: InstalledRedundantVpnOwner? = null
     var swapped = false
     val accepted = mutationFence.runSerializedIfActive(startOperationId) {
-        previous = slot.install(owner, startOperationId)
+        previous = slot.install(owner, startOperationId, routeBaseline)
         swapped = true
         true
     }
@@ -1355,6 +1363,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         } else {
             emptyList()
         }
+        val routeBaseline = redundantVpnRouteBaseline(options, localRoutes)
         val native = ServiceRedundantConnectionNative(
             backend = RedundantNativeBackend(
                 JniRedundantNativeApi(applicationContext),
@@ -1420,6 +1429,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         val callbackIdentity = RedundantPhysicalNetworkCallbackIdentity(
             serviceGeneration = serviceGeneration,
             startOperationId = transaction.startOperationId,
+            owner = coordinator,
         )
         restoreHandler.removeCallbacks(redundantHealthTick)
         val installed = installRedundantVpnOwnerSafely(
@@ -1427,6 +1437,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             slot = redundantVpnOwnerSlot,
             owner = coordinator,
             startOperationId = transaction.startOperationId,
+            routeBaseline = routeBaseline,
             closeOwner = ::closeOrRetainRedundantOwner,
         ) {
             AndroidSplitTunnel.replaceVpnRoutes(
@@ -1440,7 +1451,12 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             val monitor = PhysicalNetworks(applicationContext)
             try {
                 monitor.start { state ->
-                    applyRedundantPhysicalNetworks(callbackIdentity, state)
+                    applyRedundantPhysicalNetworks(
+                        callbackIdentity,
+                        options,
+                        coordinator,
+                        state,
+                    )
                 }
                 redundantPhysicalNetworks = monitor
             } catch (error: Throwable) {
@@ -1526,12 +1542,25 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
     private fun applyRedundantPhysicalNetworks(
         identity: RedundantPhysicalNetworkCallbackIdentity,
+        options: EffectiveAndroidTunnelOptions,
+        owner: RedundantConnectionCoordinator,
         state: PhysicalNetworkState,
     ) {
+        var routeRefreshRequired = false
         identity.applyIfCurrent(
             mutationFence = redundantMutationFence,
             current = ::currentRedundantPhysicalNetworkCallbackState,
         ) {
+            val installed = redundantVpnOwnerSlot.snapshot()
+            if (redundantLocalRouteRefreshRequired(
+                    installed?.routeBaseline,
+                    options,
+                    state.localRoutes,
+                )
+            ) {
+                routeRefreshRequired = true
+                return@applyIfCurrent
+            }
             candidateProbeCache.invalidateNetwork()
             setUnderlyingNetworks(state.networks.toTypedArray().takeIf { it.isNotEmpty() })
             redundantWork.network(state.validated) { latestValidated ->
@@ -1549,6 +1578,13 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     TunnelLog.warning("redundant.network_change_failed")
                 }
             }
+        }
+        if (routeRefreshRequired) {
+            handleRedundantTotalLoss(
+                ownerServiceGeneration = identity.serviceGeneration,
+                startOperationId = identity.startOperationId,
+                owner = owner,
+            )
         }
     }
 
@@ -2071,15 +2107,18 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         retainedOwnerCleanupPending = retainedRedundantOwnerCleanup.hasPending(),
     )
 
-    private fun currentRedundantPhysicalNetworkCallbackState() =
-        RedundantPhysicalNetworkCallbackState(
+    private fun currentRedundantPhysicalNetworkCallbackState(): RedundantPhysicalNetworkCallbackState {
+        val installed = redundantVpnOwnerSlot.snapshot()
+        return RedundantPhysicalNetworkCallbackState(
             serviceGeneration = VPN_PROCESS_SERVICE_GENERATION.get(),
-            installedStartOperationId = redundantVpnOwnerSlot.snapshot()?.startOperationId,
+            installedStartOperationId = installed?.startOperationId,
+            installedOwner = installed?.owner,
             pendingStop = pendingRedundantStop != null,
             tombstoneUnreadable = redundantCancelTombstoneUnreadable,
             stopLookupPending = redundantStopLookupBarrier.hasPending(),
             retainedOwnerCleanupPending = retainedRedundantOwnerCleanup.hasPending(),
         )
+    }
 
     private fun shouldApplyConnectionIntentStepNow(
         envelope: AndroidRecoveryEnvelope?,

@@ -199,6 +199,69 @@ index 1e13f9dc4296cbcdaa5b9743ddcd3c51c305d3b0..1a4245953c61dff0a62143e40227bda8
  // TestConcurrencySafety does other things concurrently with tunnel use.
  // It is intended to be used with the race detector to catch data races.
  func TestConcurrencySafety(t *testing.T) {
+diff --git a/device/first_packet_padding_test.go b/device/first_packet_padding_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e950fcede6b7046aa9b1d9c31bb3e09d8fc2bb0
+--- /dev/null
++++ b/device/first_packet_padding_test.go
+@@ -0,0 +1,57 @@
++package device
++
++import (
++	"fmt"
++	"net/netip"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn/bindtest"
++	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
++	"github.com/amnezia-vpn/amneziawg-go/v3/tun/tuntest"
++)
++
++type firstReadObservedTUN struct {
++	tun.Device
++	first chan struct{}
++	once  sync.Once
++}
++
++func (t *firstReadObservedTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	t.once.Do(func() { close(t.first) })
++	return t.Device.Read(bufs, sizes, offset)
++}
++
++// NewDevice starts the reader before IpcSet. The first data packet must use
++// configured S4 even when Read was already waiting with the default offset.
++func TestFirstAWGDataPacketAfterBlockedReadConfiguration(t *testing.T) {
++	configs, endpoints := genConfigs(t, "s1", "32", "s2", "40", "s3", "48", "s4", "56",
++		"h1", "123456-123500", "h2", "223456-223500", "h3", "323456-323500", "h4", "423456-423500",
++		"header_protection_key", strings.Repeat("7b", 32), "content_padding_addition", "0-64")
++	binds := bindtest.NewChannelBinds()
++	var pair testPair
++	for i := range pair {
++		p := &pair[i]
++		p.tun = tuntest.NewChannelTUN()
++		p.ip = netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)})
++		observed := &firstReadObservedTUN{Device: p.tun.TUN(), first: make(chan struct{})}
++		p.dev = NewDevice(observed, binds[i], NewLogger(LogLevelError, fmt.Sprintf("first-packet-%d: ", i)))
++		t.Cleanup(p.dev.Close)
++		<-observed.first
++		if err := p.dev.IpcSet(configs[i]); err != nil {
++			t.Fatal(err)
++		}
++		if err := p.dev.Up(); err != nil {
++			t.Fatal(err)
++		}
++		endpoints[i^1] = fmt.Sprintf(endpoints[i^1], p.dev.net.port)
++	}
++	for i := range pair {
++		if err := pair[i].dev.IpcSet(endpoints[i]); err != nil {
++			t.Fatal(err)
++		}
++	}
++	t.Run("first request", func(t *testing.T) { pair.Send(t, Ping, nil) })
++	t.Run("first response", func(t *testing.T) { pair.Send(t, Pong, nil) })
++}
 diff --git a/device/handshake_snapshot.go b/device/handshake_snapshot.go
 new file mode 100644
 index 0000000000000000000000000000000000000000..95d861e24ea9a4cb6079b3bf939e1bfca7a51cb6
@@ -323,7 +386,7 @@ index fc2e2da303d2c264423ba4a47990f28dbf03169f..d6bc92cce65e08b73d7ef144211b5da3
  			peer.SendKeepalive()
  		}
 diff --git a/device/send.go b/device/send.go
-index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..c6748d95e3b960c72efa39360963797192458324 100644
+index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..238c0cf1d4897ef7b62e5c20db21d27d71bb0a8c 100644
 --- a/device/send.go
 +++ b/device/send.go
 @@ -104,6 +104,21 @@ func (peer *Peer) SendKeepalive() {
@@ -358,6 +421,31 @@ index 5c22d9779e4a2b354c1a4d7b96a1ed5553487158..c6748d95e3b960c72efa393609637971
  
  	var sendBuffer [][]byte
  
+@@ -318,13 +336,22 @@ func (device *Device) RoutineReadFromTUN() {
+ 
+ 		// read packets
+ 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
++		// The first Read can already be blocked when IpcSet configures S4.
++		// Keep its input offset, but frame returned packets using the current
++		// padding. copy supports overlap in both directions.
++		padding = device.paddings.transport.Load()
++		packetOffset := MessageTransportHeaderSize + int(padding)
+ 		for i := 0; i < count; i++ {
+-			if sizes[i] < 1 {
++			if sizes[i] < 1 || sizes[i] > len(bufs[i])-offset ||
++				sizes[i] > len(bufs[i])-packetOffset {
+ 				continue
+ 			}
++			if packetOffset != offset {
++				copy(bufs[i][packetOffset:packetOffset+sizes[i]], bufs[i][offset:offset+sizes[i]])
++			}
+ 
+ 			elem := elems[i]
+-			elem.packet = bufs[i][offset : offset+sizes[i]]
++			elem.packet = bufs[i][packetOffset : packetOffset+sizes[i]]
+ 			elem.padding = padding
+ 
+ 			// lookup peer
 diff --git a/device/uapi.go b/device/uapi.go
 index f28994ccb7faff2b50062e3bc63641856c199215..453ecbbfa12ce9d0f25542aa5811c940b00b8269 100644
 --- a/device/uapi.go
