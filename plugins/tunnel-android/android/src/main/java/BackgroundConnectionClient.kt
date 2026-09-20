@@ -411,14 +411,27 @@ internal fun provisionOwnedBackgroundCredential(
     var current = store.read().provisionEnvelopeOrThrow()
     val scope = requireNotNull(current.ownerScope)
     require(scope == request.ownerScope && scope.deviceId == request.deviceId)
+    if (current.requiresFreshProvision && (current.pending != null || current.reservation != null)) {
+        // Settle the predecessor's operation without treating its APPLIED reply
+        // as a current-session token. The durable flag survives a crash here.
+        try {
+            provision(request.copy(expectedRevision = current.revision))
+        } catch (error: BackgroundConnectionException) {
+            current = store.read().provisionEnvelopeOrThrow()
+            if (error.code != "background_credential_capability_unavailable" || current.pending != null ||
+                current.reservation != null) throw error
+        }
+        current = store.read().provisionEnvelopeOrThrow()
+    }
     var selected = if (current.pending != null || current.reservation != null) "two_phase" else mode
-    if (selected in setOf("noop", "rotate") &&
-        (current.active?.expiresAtUnix?.let { it <= nowUnix } != false || current.installSecret == null)) {
+    if (current.requiresFreshProvision || (selected in setOf("noop", "rotate") &&
+        (current.active?.expiresAtUnix?.let { it <= nowUnix } != false || current.installSecret == null))) {
         // The status reply predates admission. Legacy adoption (or expiry while
         // waiting) requires fresh bearer provisioning, not a stale noop/rotate.
-        selected = if (request.capability.enabled || current.capability?.let {
-            it.enabled && it.expiresAtUnix > nowUnix
-        } == true) "two_phase" else "legacy"
+        // Use the same revision/expiry rules as provisioning: an older enabled
+        // snapshot must not override a newer disable and turn issuance into a noop.
+        val capability = conservativeBackgroundCapability(current.capability, request.capability)
+        selected = if (capability.enabled && capability.expiresAtUnix > nowUnix) "two_phase" else "legacy"
     }
     if (selected == "noop") return current
     if (selected == "rotate") {

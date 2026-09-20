@@ -65,9 +65,12 @@ internal data class NativeOwnerScope(
     }
 }
 
-internal fun NativeOwnerScope.isSuccessorOf(predecessor: NativeOwnerScope): Boolean =
+internal fun NativeOwnerScope.isSuccessorOf(
+    predecessor: NativeOwnerScope,
+    provisionPredecessor: NativeOwnerScope? = null,
+): Boolean =
     authEpoch == predecessor.authEpoch &&
-        family == predecessor.family &&
+        (family == predecessor.family || provisionPredecessor == predecessor) &&
         deviceId == predecessor.deviceId &&
         sessionGeneration > predecessor.sessionGeneration
 
@@ -76,6 +79,7 @@ internal data class NativeOwnerOperation(
     val operationId: String,
     val attempt: Long,
     val expiresAtUnixMs: Long,
+    val provisionPredecessor: NativeOwnerScope? = null,
 ) {
     init {
         require(UUID.fromString(operationId).toString() == operationId && attempt > 0)
@@ -85,13 +89,15 @@ internal data class NativeOwnerOperation(
     fun toJson(): JSONObject = JSONObject().apply {
         put("ticket", scope.toJson().apply { put("operation_id", operationId); put("attempt", attempt) })
         put("expires_at_unix_ms", expiresAtUnixMs)
+        provisionPredecessor?.let { put("provision_predecessor", it.toJson()) }
     }
 
     companion object {
         fun fromJson(value: JSONObject): NativeOwnerOperation {
             val ticket = value.getJSONObject("ticket")
             return NativeOwnerOperation(NativeOwnerScope.fromJson(ticket), ticket.getString("operation_id"),
-                ticket.getLong("attempt"), value.getLong("expires_at_unix_ms"))
+                ticket.getLong("attempt"), value.getLong("expires_at_unix_ms"),
+                value.optJSONObject("provision_predecessor")?.let(NativeOwnerScope::fromJson))
         }
     }
 }

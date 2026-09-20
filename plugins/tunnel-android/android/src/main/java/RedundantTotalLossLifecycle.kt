@@ -212,6 +212,11 @@ internal class RedundantTotalLossLifecycle(
                 resume()
             } else if (envelope.intent.desiredActive && envelope.leaseTransaction != null) {
                 retryCleanup()
+            } else if (!envelope.intent.desiredActive && hasDurableConnectionIntentWork(envelope)) {
+                // Quick Off persists cancellation while the lookup barrier is
+                // still held. Resume that work after release, including a
+                // lease-less legacy runtime stop; stopIfIdle cannot execute it.
+                resume()
             } else {
                 stopIfIdle()
             }

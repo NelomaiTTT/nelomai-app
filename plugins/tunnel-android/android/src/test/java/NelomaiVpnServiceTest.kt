@@ -2143,6 +2143,60 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun quickOffAfterLookupBarrierExecutesAndClearsTheRealDurableStop() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        store.setDesiredActive(0, true).successEnvelope()
+        val coordinator = coordinator(store)
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val barrier = RedundantStopLookupBarrier()
+        var running = true
+        var stops = 0
+        val runtime = ServiceConnectionIntentRuntimeBoundary(
+            startTransport = { _, _, _, _ -> error("stop must never start") },
+            stopTransport = { success, _ -> stops++; running = false; success(true) },
+            running = { running }, timeoutMillis = 100,
+        )
+        fun schedule() {
+            if (shouldApplyConnectionIntentStep(false, false, store.load(),
+                    stopLookupPending = barrier.hasPending())) {
+                coordinator.runOnce(ServicePanelFake(), runtime)
+            }
+        }
+        val connectionLifecycle = ConnectionIntentServiceLifecycle(coordinator, schedule = ::schedule)
+        val lifecycle = RedundantTotalLossLifecycle(
+            currentServiceGeneration = { 1L }, serviceActive = { true },
+            barrierPending = barrier::hasPending, logoutState = { BackgroundLogoutReadState.NONE },
+            recovery = { RecoveryStoreResult.Success(store.load()) }, post = { it() },
+            retryCleanup = { error("no redundant cleanup") }, publishRestartStarting = {},
+            resume = {
+                assertFalse(barrier.hasPending())
+                connectionLifecycle.onEnsureRunning()
+            }, scheduleLogout = { error("no logout") },
+            scheduleStateReadRetry = { error("readable store") }, stopIfIdle = {},
+        )
+        val worker = RedundantVpnWorkDispatcher(Executor { it.run() })
+        dispatchWithRedundantStopLookupBarrier(
+            worker, worker, barrier, resolveInMemory = { null },
+            resolveDurable = { coordinator.quickToggle(dispatch).quickDispatch() },
+            postToCaller = { it() }, complete = { selected ->
+                assertTrue(selected is AndroidQuickToggleDispatch.Stop)
+                assertTrue(coordinator.cancelCurrentForQuickToggle() is AndroidCoordinatorResult.Accepted)
+                assertEquals("legacy_runtime_stop", store.load().intent.retry.pendingAction)
+                schedule()
+                assertEquals(0, stops)
+            }, onRejected = { error("unexpected rejection") },
+            afterComplete = { lifecycle.onCleanupAcknowledged(1) },
+        )
+        assertFalse(barrier.hasPending())
+        assertEquals(1, stops)
+        assertFalse(running)
+        assertNull(store.load().intent.retry.pendingAction)
+        assertFalse(store.load().intent.desiredActive)
+        lifecycle.onCleanupAcknowledged(1)
+        assertEquals(1, stops)
+    }
+
+    @Test
     fun quickOffStopsLeaseLessLegacyRuntimeAndClearsItsDurableStopMarker() {
         val store = recoveryStore(ServiceRecoveryBackend())
         store.setDesiredActive(0, true).successEnvelope()

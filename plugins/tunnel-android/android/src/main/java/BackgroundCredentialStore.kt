@@ -138,6 +138,9 @@ internal data class BackgroundCredentialEnvelope(
     val ownerOperation: NativeOwnerOperation? = null,
     val ownerAttempt: Long = 0,
     val ownerCancelEpoch: Long? = null,
+    // A pending activation may belong to a pre-resume session, even when its
+    // idempotent server receipt says APPLIED. Keep fresh issuance durable.
+    val requiresFreshProvision: Boolean = false,
 ) {
     override fun toString(): String =
         "BackgroundCredentialEnvelope(formatVersion=$formatVersion, revision=$revision, deviceId=$deviceId, panelBase=$panelBase, installSecret=${if (installSecret == null) null else "<redacted>"}, installGeneration=$installGeneration, active=${active?.copy(token = "<redacted>")}, previous=${previous?.copy(token = "<redacted>")}, pending=${pending?.copy(token = "<redacted>")}, capability=$capability, reservation=$reservation, cleanupCredential=${cleanupCredential?.copy(token = "<redacted>")}, logoutState=$logoutState)"
@@ -169,6 +172,7 @@ internal object BackgroundCredentialEnvelopeCodec {
             envelope.ownerOperation?.let { put("ownerOperation", it.toJson()) }
             put("ownerAttempt", envelope.ownerAttempt)
             envelope.ownerCancelEpoch?.let { put("ownerCancelEpoch", it) }
+            put("requiresFreshProvision", envelope.requiresFreshProvision)
         }
         return payload.toString().toByteArray(Charsets.UTF_8)
     }
@@ -195,6 +199,7 @@ internal object BackgroundCredentialEnvelopeCodec {
             ownerOperation = payload.optionalObject("ownerOperation")?.let(NativeOwnerOperation::fromJson),
             ownerAttempt = payload.optLong("ownerAttempt", 0),
             ownerCancelEpoch = payload.optionalLong("ownerCancelEpoch"),
+            requiresFreshProvision = payload.optBoolean("requiresFreshProvision", false),
         ).also(::validate)
     }
 
@@ -423,14 +428,15 @@ internal class BackgroundCredentialStore(
                 current.cleanupCredential == null && current.active?.let {
                     it.ownerScope == null && it.deviceId == provision.deviceId && it.panelBase == provision.panelBase
                 } == true
-            // Runtime transitions preserve the authenticated family and device
-            // while advancing the server-issued session generation. The
-            // current owner may adopt that exact predecessor only through this
-            // bearer-authenticated provisioning path. An unfinished credential
-            // mutation remains durable and is resumed by the provision dispatcher;
+            // Older containers rotated family on resume. The common owner may
+            // authorize that exact persisted predecessor from a completed runtime
+            // transition, only through this bearer-authenticated provisioning
+            // path. Unfinished mutations remain durable for the provision dispatcher;
             // logout and cleanup state remain fenced.
             val successorProvision = provision != null && provision.ownerScope == operation.scope &&
-                current.ownerScope?.let(operation.scope::isSuccessorOf) == true &&
+                current.ownerScope?.let {
+                    operation.scope.isSuccessorOf(it, operation.provisionPredecessor)
+                } == true &&
                 provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
                 current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
                 provision.installSecret.isNotBlank() && current.installSecret == provision.installSecret &&
@@ -444,6 +450,7 @@ internal class BackgroundCredentialStore(
             if (operation.attempt <= current.ownerAttempt) throw MutationFailure("background_owner_cancelled")
             current.copy(revision = current.revision.incrementRevision(), ownerScope = operation.scope,
                 ownerOperation = operation, ownerAttempt = operation.attempt,
+                requiresFreshProvision = current.requiresFreshProvision || legacyProvision || successorProvision,
                 // Retain the proof for owner-checked recovery/cleanup, but force
                 // bearer reprovision instead of treating it as a fresh token.
                 active = if (legacyProvision || successorProvision) {
@@ -508,6 +515,7 @@ internal class BackgroundCredentialStore(
                 active = BackgroundCredential(
                     deviceId, panelBase, provision.token, provision.expiresAtUnix,
                 ),
+                requiresFreshProvision = false,
                 previous = null,
                 pending = null,
                 capability = capability,
@@ -597,6 +605,9 @@ internal class BackgroundCredentialStore(
                 installGeneration = provision.installGeneration,
                 active = current.active.takeUnless { replacesDevice },
                 previous = current.previous.takeUnless { replacesDevice },
+                // This is a new bearer-issued mutation under the admitted owner.
+                // Resuming an old reservation does not enter reserveProvision.
+                requiresFreshProvision = false,
                 capability = capability,
                 reservation = BackgroundMutationReservation(
                     mutationId,
@@ -847,7 +858,7 @@ internal class BackgroundCredentialStore(
                     deviceId = deviceId,
                     panelBase = panelBase,
                     token = pending.token,
-                    expiresAtUnix = activeExpiresAtUnix,
+                    expiresAtUnix = if (current.requiresFreshProvision) 1 else activeExpiresAtUnix,
                 ),
                 previous = active,
                 pending = null,
