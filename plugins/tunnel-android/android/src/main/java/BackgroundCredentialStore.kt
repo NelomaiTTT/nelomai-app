@@ -426,15 +426,15 @@ internal class BackgroundCredentialStore(
             // Runtime transitions preserve the authenticated family and device
             // while advancing the server-issued session generation. The
             // current owner may adopt that exact predecessor only through this
-            // bearer-authenticated provisioning path; unfinished mutations and
-            // logout state remain fenced.
+            // bearer-authenticated provisioning path. An unfinished credential
+            // mutation remains durable and is resumed by the provision dispatcher;
+            // logout and cleanup state remain fenced.
             val successorProvision = provision != null && provision.ownerScope == operation.scope &&
                 current.ownerScope?.let(operation.scope::isSuccessorOf) == true &&
                 provision.deviceId == operation.scope.deviceId && current.deviceId == provision.deviceId &&
                 current.panelBase == provision.panelBase && provision.accessToken.isNotBlank() &&
                 provision.installSecret.isNotBlank() && current.installSecret == provision.installSecret &&
                 current.ownerCancelEpoch == null && current.logoutState == null &&
-                current.pending == null && current.reservation == null &&
                 current.cleanupCredential == null && current.active != null
             if (current.ownerScope != operation.scope &&
                 (requireExistingScope || (!finalizedClean && !legacyProvision && !successorProvision &&
