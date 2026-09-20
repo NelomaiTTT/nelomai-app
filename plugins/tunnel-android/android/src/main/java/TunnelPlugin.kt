@@ -2704,7 +2704,9 @@ internal fun StartTunnelArgs.clearSensitiveConfigurations() {
 }
 
 internal fun StartTunnelArgs.canCacheQuickPlan(): Boolean =
-    cacheQuickAction && configurationInitialized && quickConnection != null
+    // Redundancy disables offline reconnect, not a fresh start from the tile.
+    // copyForQuickPlan strips both configurations and the redundant lease ID.
+    (cacheQuickAction || redundancy != null) && configurationInitialized && quickConnection != null
 
 internal fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
     if (!canCacheQuickPlan()) return null

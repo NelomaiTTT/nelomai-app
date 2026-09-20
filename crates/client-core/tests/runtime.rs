@@ -14,7 +14,8 @@ use nelomai_client_storage::{
     StoredPendingStart,
 };
 use nelomai_client_tunnel::{
-    TunnelController, TunnelError, TunnelMetrics, TunnelOptions, TunnelStartRequest, TunnelStatus,
+    QuickConnection, QuickReconnect, TunnelController, TunnelError, TunnelMetrics, TunnelOptions,
+    TunnelStartRequest, TunnelStatus,
 };
 use nelomai_contracts::{
     Access, AccessState, ApiVersion, Bootstrap, BootstrapDefaults, Connection,
@@ -225,6 +226,8 @@ struct MemoryTunnel {
     configuration: Mutex<Option<String>>,
     redundant_session_id: Mutex<Option<String>>,
     standby_configuration: Mutex<Option<String>>,
+    quick_connection: Mutex<Option<QuickConnection>>,
+    quick_reconnect: Mutex<QuickReconnect>,
     options: Mutex<Option<TunnelOptions>>,
     status: Mutex<TunnelStatus>,
     operation_events: Mutex<Option<Arc<Mutex<Vec<&'static str>>>>>,
@@ -234,6 +237,8 @@ struct MemoryTunnel {
 impl TunnelController for MemoryTunnel {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
+        *self.quick_connection.lock().unwrap() = request.quick_connection.clone();
+        *self.quick_reconnect.lock().unwrap() = request.quick_reconnect;
         if let Some(redundancy) = request.redundancy.as_ref() {
             *self.redundant_session_id.lock().unwrap() = Some(redundancy.session_id.clone());
             *self.standby_configuration.lock().unwrap() = redundancy
@@ -920,6 +925,22 @@ async fn recovery_v2_passes_both_configs_without_persisting_them() {
     assert_eq!(request.recovery_contract_version, Some(2));
     assert_eq!(request.redundancy_contract_version, Some(1));
     assert_eq!(request.reserve_enabled, Some(true));
+    let metadata = tunnel
+        .quick_connection
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("Android redundancy requires connection metadata even without quick reconnect");
+    assert_eq!(metadata.lease_id, "20000000-0000-4000-8000-000000000002");
+    assert_eq!(metadata.layer, options().layer);
+    assert_eq!(metadata.tic_connection_mode, options().tic_connection_mode);
+    assert_eq!(metadata.route_mode, options().route_mode);
+    assert_eq!(metadata.egress_mode, options().egress_mode);
+    assert_eq!(metadata.allow_alternate, options().allow_alternate);
+    assert_eq!(
+        *tunnel.quick_reconnect.lock().unwrap(),
+        QuickReconnect::Disabled
+    );
     assert_eq!(
         request.request_fingerprint.as_deref(),
         Some("03bf9fabd0f53c63b5ae673eeb6d8230126aa89ec3cc998ea419d74c1cf0c2d3")

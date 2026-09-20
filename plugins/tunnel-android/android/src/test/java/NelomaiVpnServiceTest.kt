@@ -3516,6 +3516,71 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun stoppedRedundantSessionCanStartFreshFromItsMetadataOnlyQuickTemplate() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
+        val args = StartTunnelArgs().apply {
+            configuration = byteArrayOf(1, 2, 3)
+            cacheQuickAction = false
+            quickConnection = QuickConnectionArgs().apply {
+                leaseId = requireNotNull(transaction.localActiveLeaseId)
+                layer = "stray"
+                ticConnectionMode = "dynamic"
+                routeMode = "standalone"
+                egressMode = "ipv4"
+                allowAlternate = false
+            }
+            options.splitActive = true
+            options.policyHash = "current-split-policy"
+            options.excludeLocalNetworks = true
+            redundancy = RedundantStartArgs()
+        }
+        store.beginRedundant(transaction).successEnvelope()
+        val plan = requireNotNull(args.copyForQuickPlan()) { "missing tile template after redundant start" }
+        assertEquals(0, plan.configuration.size)
+        assertEquals("", plan.quickConnection?.leaseId)
+        assertNull(plan.redundancy)
+        args.clearSensitiveConfigurations()
+
+        // Model acknowledged native/panel stop; the recovery store removes its
+        // transient template, so the next tap needs the separate quick template.
+        store.deferRedundantStop("v2-stop", transaction.startOperationId).successEnvelope()
+        store.updateRedundant(transaction.startOperationId) { current ->
+            current.copy(retry = current.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+        }.successEnvelope()
+        store.completeRedundantStop("v2-stop", transaction.startOperationId).successEnvelope()
+        assertNull(store.load().intent.template)
+        assertNull(store.load().redundantTransaction)
+        val quickTemplate = quickConnectionIntentTemplate(transaction.template.deviceId,
+            QuickTunnelTemplate(plan.options, requireNotNull(plan.quickConnection)), 36)
+        val coordinator = coordinator(store)
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val selected = coordinator.quickToggle(dispatch).quickDispatch() as AndroidQuickToggleDispatch.Start
+        val result = executeDispatchedQuickStart(
+            dispatch = dispatch,
+            start = selected,
+            selectPolicy = {
+                selectQuickStartPolicy(configuredCredentialStore(), quickTemplate, 1_000,
+                    fetch = { BackgroundCapabilitySnapshot(2, true, 2_000, reserveEnabled = true) })
+            },
+            recoveryStart = {
+                coordinator.beginDispatched(quickTemplate, selected.ticket.expectedGeneration,
+                    { dispatch.isCurrent(selected.ticket) })
+            },
+            legacyStart = { error("a new recovery start is required") },
+        )
+        assertTrue(result is AndroidQuickStartExecution.RecoveryAccepted)
+        val restarted = store.load()
+        assertEquals("stray", restarted.intent.template?.layer)
+        assertEquals(false, restarted.intent.template?.allowAlternate)
+        assertEquals("current-split-policy", restarted.intent.template?.options?.policyHash)
+        assertEquals(true, restarted.intent.template?.options?.excludeLocalNetworks)
+        assertEquals(LeasePhase.START_PENDING, restarted.leaseTransaction?.phase)
+        assertNull(restarted.leaseTransaction?.leaseId)
+        assertTrue(restarted.leaseTransaction?.startOperationId != transaction.startOperationId)
+    }
+
+    @Test
     fun promotedTotalLossReplayResumesAsRealConnectionIntentWork() {
         val store = recoveryStore(ServiceRecoveryBackend())
         val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)

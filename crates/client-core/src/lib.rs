@@ -2351,7 +2351,9 @@ where
                     (false, Some(valid_until_unix)) => QuickReconnect::Until(valid_until_unix),
                     (false, None) => QuickReconnect::Persistent,
                 },
-                quick_connection: (!is_redundant).then(|| QuickConnection {
+                // Android also needs these metadata for its redundant transaction
+                // and metadata-only tile template; offline reconnect stays disabled.
+                quick_connection: Some(QuickConnection {
                     lease_id: response.connection.lease_id.clone(),
                     layer: response.connection.layer,
                     tic_connection_mode: response.connection.tic_connection_mode,

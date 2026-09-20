@@ -78,8 +78,109 @@ class NativeAuthScopeTest {
         assertEquals(1L, admitted.value().active?.expiresAtUnix)
     }
 
+    @Test fun historicalRoundtripReissuesRetainedTokenWithCurrentBearerAfterRestart() {
+        for ((recoveryEnabled, currentFamily) in listOf(false to "current-family", true to "stable-family")) {
+            val backend = MemoryBackend()
+            var store = BackgroundCredentialStore(backend)
+            val old = operation().let { it.copy(scope = it.scope.copy(
+                slot = "latest", runtimeVersion = "0.3.0", sessionGeneration = 8)) }
+            val capability = BackgroundCapabilitySnapshot(1, recoveryEnabled, 9999999999)
+            var current = store.beginOwnerOperation(0, old, false).value()
+            current = store.configure(current.revision, BackgroundCredentialProvision(old.scope.deviceId,
+                "https://synthetic.invalid", "revoked-latest-token", 9999999999, "install", 1, capability)).value()
+            // The retained latest namespace predates the immediate stable predecessor.
+            val stable = old.scope.copy(family = "stable-family", slot = "stable",
+                runtimeVersion = "0.2.20", sessionGeneration = 9)
+            val next = NativeOwnerOperation.fromJson(old.copy(attempt = 3,
+                scope = old.scope.copy(family = currentFamily, sessionGeneration = 10),
+                provisionPredecessor = stable).toJson())
+            val request = BackgroundUiProvisionRequest(current.revision, old.scope.deviceId,
+                "https://synthetic.invalid", "current-bearer", "install", 1, capability, next.scope)
+            val admitted = store.beginProvisionOperation(request, next)
+            assertTrue("historical roundtrip rejected: $admitted", admitted is CredentialStoreResult.Success)
+            assertEquals(1L, admitted.value().active?.expiresAtUnix)
+            store = BackgroundCredentialStore(backend)
+            assertTrue(store.read().value().requiresFreshProvision)
+            // An issuance failure must leave the old token expired and a retry
+            // must still issue with the bearer, not rotate/adopt the old token.
+            try {
+                store.withOwnerOperation(next) {
+                    provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = admitted.value().revision),
+                        "noop", 100, provision = { throw BackgroundConnectionException("test_network_error") },
+                        rotate = { error("revoked token cannot rotate") },
+                        legacy = { throw BackgroundConnectionException("test_network_error") })
+                }
+                fail("issuance failure swallowed")
+            } catch (error: BackgroundConnectionException) {
+                assertEquals("test_network_error", error.code)
+            }
+            assertEquals(admitted.value(), store.read().value())
+            var issued = 0
+            val saved = store.withOwnerOperation(next) {
+                provisionOwnedBackgroundCredential(store, request.copy(expectedRevision = admitted.value().revision),
+                    "noop", 100, provision = { scoped ->
+                        provisionBackgroundCredential(store, scoped, 100,
+                            operationIds = { "prepare-current" to "activate-current" },
+                            prepare = { credential, prepareId, activateId, _ ->
+                                issued++
+                                assertEquals("current-bearer", credential.token)
+                                assertEquals(next.scope, credential.ownerScope)
+                                BackgroundPendingToken("new-token", 3000, 2, prepareId, activateId, 1)
+                            }, activate = { _, token, _ -> BackgroundActivationResult(token.tokenGeneration, 2000) })
+                    }, rotate = { error("revoked token cannot rotate") }, legacy = { credential ->
+                        issued++
+                        assertEquals("current-bearer", credential.token)
+                        assertEquals(next.scope, credential.ownerScope)
+                        BackgroundCredential(old.scope.deviceId, request.panelBase, "new-token", 2000)
+                    })
+            }
+            assertEquals(1, issued)
+            assertEquals("new-token", saved.active?.token)
+            assertEquals(next.scope, saved.ownerScope)
+            assertFalse(saved.requiresFreshProvision)
+            assertTrue(store.beginOwnerOperation(saved.revision, old, true) is CredentialStoreResult.Failure)
+            assertEquals(saved, store.read().value())
+        }
+    }
+
+    @Test fun retainedRoundtripCannotBypassProvisionOrOwnerFences() {
+        for (boundary in listOf("no_proof", "proof_epoch", "proof_device", "proof_old", "proof_future", "proof_gap",
+                "same_slot", "other_runtime", "other_contract", "epoch", "device", "generation",
+                "install", "panel", "logout", "recovery", "expired", "old_attempt", "no_bearer")) {
+            val store = BackgroundCredentialStore(MemoryBackend(), nowMillis = { 1000L })
+            val old = operation().let { it.copy(scope = it.scope.copy(
+                slot = "latest", runtimeVersion = "0.3.0", sessionGeneration = 8)) }
+            var current = store.beginOwnerOperation(0, old, false).value()
+            current = store.configure(current.revision, BackgroundCredentialProvision(old.scope.deviceId,
+                "https://synthetic.invalid", "old-token", 9999999999, "install", 1,
+                BackgroundCapabilitySnapshot(0, false, 1))).value()
+            if (boundary == "logout") current = store.fenceOwnerLogout(4).value()
+            val otherDevice = "99999999-9999-4999-8999-999999999999"
+            val proof = old.scope.copy(family = "stable-family", slot = if (boundary == "same_slot") "latest" else "stable",
+                runtimeVersion = "0.2.20", authEpoch = if (boundary == "proof_epoch") 4 else 3,
+                deviceId = if (boundary == "proof_device") otherDevice else old.scope.deviceId,
+                sessionGeneration = when (boundary) { "proof_old" -> 8; "proof_future" -> 10; else -> 9 })
+            val next = old.copy(attempt = if (boundary == "old_attempt") 1 else 3,
+                expiresAtUnixMs = if (boundary == "expired") 1000 else 999999,
+                scope = old.scope.copy(family = "current-family", authEpoch = if (boundary == "epoch") 4 else 3,
+                    deviceId = if (boundary == "device") otherDevice else old.scope.deviceId,
+                    runtimeVersion = if (boundary == "other_runtime") "0.4.0" else "0.3.0",
+                    runtimeContractVersion = if (boundary == "other_contract") 2 else old.scope.runtimeContractVersion,
+                    sessionGeneration = when (boundary) { "generation" -> 8; "proof_gap" -> 11; else -> 10 }),
+                provisionPredecessor = if (boundary == "no_proof") null else proof)
+            val request = BackgroundUiProvisionRequest(current.revision, next.scope.deviceId,
+                if (boundary == "panel") "https://other.invalid" else "https://synthetic.invalid",
+                if (boundary == "no_bearer") "" else "bearer", if (boundary == "install") "other" else "install",
+                1, BackgroundCapabilitySnapshot(0, false, 1), next.scope)
+            val result = if (boundary == "recovery") store.beginOwnerOperation(current.revision, next, true)
+                else store.beginProvisionOperation(request, next)
+            assertTrue("admitted $boundary", result is CredentialStoreResult.Failure)
+            assertEquals("mutated $boundary", current, store.read().value())
+        }
+    }
+
     @Test fun appliedOldActivationMustBeSettledThenReissuedForSuccessorEvenAfterRestart() {
-        for (restartAfterOldAck in listOf(false, true)) {
+        for ((restartAfterOldAck, historicalRoundtrip) in listOf(false to false, true to false, false to true, true to true)) {
             val backend = MemoryBackend()
             var store = BackgroundCredentialStore(backend)
             val old = operation(epoch = 3)
@@ -91,7 +192,10 @@ class NativeAuthScopeTest {
                 1000, 100, "old-activate").value()
             current = store.savePendingToken(current.revision, "old-prepare",
                 BackgroundPendingToken("old-applied", 2000, 2, "old-prepare", "old-activate", 1), 100).value()
-            val next = old.copy(attempt = 2, scope = old.scope.copy(sessionGeneration = 8))
+            val next = if (historicalRoundtrip) old.copy(attempt = 3,
+                scope = old.scope.copy(family = "current-family", sessionGeneration = 9),
+                provisionPredecessor = old.scope.copy(slot = "latest", family = "other-slot-family", sessionGeneration = 8))
+            else old.copy(attempt = 2, scope = old.scope.copy(sessionGeneration = 8))
             val request = BackgroundUiProvisionRequest(current.revision, old.scope.deviceId,
                 "https://synthetic.invalid", "new-bearer", "install", 1,
                 BackgroundCapabilitySnapshot(1, true, 9999999999), next.scope)

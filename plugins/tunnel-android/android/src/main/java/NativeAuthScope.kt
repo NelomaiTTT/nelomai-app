@@ -70,9 +70,27 @@ internal fun NativeOwnerScope.isSuccessorOf(
     provisionPredecessor: NativeOwnerScope? = null,
 ): Boolean =
     authEpoch == predecessor.authEpoch &&
-        (family == predecessor.family || provisionPredecessor == predecessor) &&
+        (family == predecessor.family || provisionPredecessor == predecessor ||
+            canReprovisionRetainedScope(predecessor, provisionPredecessor)) &&
         deviceId == predecessor.deviceId &&
         sessionGeneration > predecessor.sessionGeneration
+
+/** An old container could rotate family during latest -> stable -> latest.
+ * The owner proves only the last completed hop; older receipts can be retired.
+ * Admit the retained target namespace only within that same login/device and
+ * strictly before the confirmed other-slot source. This grants fresh bearer
+ * provisioning, never recovery/rotation with the retained token. The store
+ * additionally fences installation, panel, cancellation and unfinished logout.
+ */
+private fun NativeOwnerScope.canReprovisionRetainedScope(
+    retained: NativeOwnerScope,
+    confirmedSource: NativeOwnerScope?,
+): Boolean = confirmedSource != null &&
+    confirmedSource.authEpoch == authEpoch && confirmedSource.deviceId == deviceId &&
+    retained.slot == slot && retained.runtimeVersion == runtimeVersion &&
+    retained.runtimeContractVersion == runtimeContractVersion && confirmedSource.slot != slot &&
+    retained.sessionGeneration < confirmedSource.sessionGeneration &&
+    confirmedSource.sessionGeneration == sessionGeneration - 1
 
 internal data class NativeOwnerOperation(
     val scope: NativeOwnerScope,

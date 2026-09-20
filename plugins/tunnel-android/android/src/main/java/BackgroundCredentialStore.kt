@@ -429,9 +429,9 @@ internal class BackgroundCredentialStore(
                     it.ownerScope == null && it.deviceId == provision.deviceId && it.panelBase == provision.panelBase
                 } == true
             // Older containers rotated family on resume. The common owner may
-            // authorize that exact persisted predecessor from a completed runtime
-            // transition, only through this bearer-authenticated provisioning
-            // path. Unfinished mutations remain durable for the provision dispatcher;
+            // authorize its exact predecessor or a retained target namespace
+            // before the completed other-slot hop, only through bearer provisioning.
+            // Unfinished mutations remain durable for the provision dispatcher;
             // logout and cleanup state remain fenced.
             val successorProvision = provision != null && provision.ownerScope == operation.scope &&
                 current.ownerScope?.let {

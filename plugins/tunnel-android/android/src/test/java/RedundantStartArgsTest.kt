@@ -46,6 +46,12 @@ class RedundantStartArgsTest {
         assertFalse(transaction.standbyDesired)
         assertEquals(null, transaction.slotBLeaseId)
         assertTrue(redundantHealthProbesFromStart(requireNotNull(args.redundancy)).isEmpty())
+        // Even a disabled/single-member redundant session needs a safe template
+        // for a fresh server-authorized start from the tile after stopping.
+        val plan = requireNotNull(args.copyForQuickPlan())
+        assertEquals(0, plan.configuration.size)
+        assertEquals("", plan.quickConnection?.leaseId)
+        assertEquals(null, plan.redundancy)
     }
 
     @Test
@@ -87,7 +93,8 @@ class RedundantStartArgsTest {
     fun `redundant starts retain a quick template for later tile restart`() {
         val args = StartTunnelArgs().also {
             it.configuration = byteArrayOf(1)
-            it.cacheQuickAction = true
+            // The core deliberately disables offline reconnect for redundancy.
+            it.cacheQuickAction = false
             it.quickConnection = QuickConnectionArgs().also { connection ->
                 connection.leaseId = "10000000-0000-4000-8000-000000000001"
                 connection.layer = "stray"
@@ -100,9 +107,26 @@ class RedundantStartArgsTest {
 
         assertTrue(args.canCacheQuickPlan())
         val plan = requireNotNull(args.copyForQuickPlan())
+        assertTrue(plan.cacheQuickAction)
+        assertEquals(0, plan.configuration.size)
         assertEquals(null, plan.redundancy)
         assertEquals("", plan.quickConnection?.leaseId)
         assertEquals("stray", plan.quickConnection?.layer)
+        assertEquals("10000000-0000-4000-8000-000000000001", args.quickConnection?.leaseId)
+    }
+
+    @Test
+    fun `ordinary starts still require quick action permission`() {
+        val args = StartTunnelArgs().also {
+            it.configuration = byteArrayOf(1)
+            it.quickConnection = QuickConnectionArgs()
+        }
+        assertFalse(args.canCacheQuickPlan())
+        assertEquals(null, args.copyForQuickPlan())
+        args.redundancy = RedundantStartArgs()
+        args.quickConnection = null
+        assertFalse(args.canCacheQuickPlan())
+        assertEquals(null, args.copyForQuickPlan())
     }
 
     @Test
