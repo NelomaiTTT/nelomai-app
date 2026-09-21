@@ -108,10 +108,14 @@ class RedundantConnectionCoordinatorTest {
             store.beginRedundant(transaction())
             val events = mutableListOf<Boolean>()
             val native = FakeNative().apply {
-                healthSnapshots += listOf(healthSlot(0, active = true,
-                    health = if (healthy) BackendHealth.READY else BackendHealth.UNHEALTHY,
-                    handshakeFresh = healthy, consecutiveProbeSuccesses = if (healthy) 3 else 0,
-                    stableSinceMs = 0))
+                healthSnapshots += listOfNotNull(
+                    healthSlot(0, active = true,
+                        health = if (healthy) BackendHealth.READY else BackendHealth.UNHEALTHY,
+                        handshakeFresh = healthy,
+                        consecutiveProbeSuccesses = if (healthy) 3 else 0,
+                        stableSinceMs = 0),
+                    healthSlot(1, health = BackendHealth.UNHEALTHY).takeUnless { healthy },
+                )
             }
             val coordinator = RedundantConnectionCoordinator(store,
                 FakePanel(recoveryHealthProbes = mapOf("lease-a" to probe())), native,
@@ -388,6 +392,211 @@ class RedundantConnectionCoordinatorTest {
         assertFalse(coordinator.tick())
         assertFalse(coordinator.isRunning())
         assertEquals(1, failures)
+        assertEquals(1, native.stopCalls)
+    }
+
+    @Test
+    fun primaryReadinessFailureStartsThroughFreshStandbyExactlyOnce() {
+        val failedPrimaryObservations = listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 0, active = true, health = BackendHealth.UNHEALTHY),
+        )
+        for (failedPrimary in failedPrimaryObservations) {
+            var ready = 0
+            var failed = 0
+            val native = FakeNative()
+            val coordinator = RedundantConnectionCoordinator(
+                emptyStore(),
+                FakePanel(),
+                native,
+                epochNowMs = { 20_000L },
+                monotonicMs = { 20_000L },
+            )
+            assertTrue(coordinator.start(
+                transaction(),
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                mapOf("lease-a" to probe()),
+                onPrimaryStarted = { ready += 1 },
+                onPrimaryFailed = { failed += 1 },
+            ))
+
+            assertTrue(coordinator.onHealthObservations(listOf(
+                failedPrimary,
+                healthSlot(
+                    index = 1,
+                    health = BackendHealth.READY,
+                    handshakeFresh = true,
+                    consecutiveProbeSuccesses = 3,
+                    stableSinceMs = 0,
+                ),
+            )))
+
+            assertTrue(coordinator.isRunning())
+            assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+            assertEquals(listOf("lease-a", "lease-b"), native.activated)
+            assertEquals(1, ready)
+            assertEquals(0, failed)
+            assertEquals(0, native.stopCalls)
+
+            assertTrue(coordinator.onHealthObservations(listOf(
+                healthSlot(index = 1, active = true, health = BackendHealth.READY),
+            )))
+            assertEquals(1, ready)
+            assertEquals(0, failed)
+        }
+    }
+
+    @Test
+    fun primaryReadinessDeadlineStartsThroughFreshStandbyWithoutExtendingDeadline() {
+        var elapsedMs = 0L
+        var ready = 0
+        var failed = 0
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            emptyStore(),
+            FakePanel(),
+            native,
+            epochNowMs = { elapsedMs },
+            monotonicMs = { elapsedMs },
+        )
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryStarted = { ready += 1 },
+            onPrimaryFailed = { failed += 1 },
+        ))
+
+        elapsedMs = 30_000L
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.WARMING),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = 0,
+            ),
+        )))
+
+        assertTrue(coordinator.isRunning())
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-a", "lease-b"), native.activated)
+        assertEquals(1, ready)
+        assertEquals(0, failed)
+    }
+
+    @Test
+    fun earlyPrimaryHardFailureWaitsForStandbyOnlyUntilOriginalDeadline() {
+        var elapsedMs = 0L
+        var ready = 0
+        var failed = 0
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            emptyStore(),
+            FakePanel(),
+            native,
+            epochNowMs = { elapsedMs },
+            monotonicMs = { elapsedMs },
+        )
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryStarted = { ready += 1 },
+            onPrimaryFailed = { failed += 1 },
+        ))
+
+        elapsedMs = 5_000L
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(index = 1, health = BackendHealth.WARMING),
+        )))
+        assertFalse(coordinator.isRunning())
+        assertEquals(0, ready)
+        assertEquals(0, failed)
+        assertEquals(0, native.stopCalls)
+
+        elapsedMs = 20_000L
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = 5_000L,
+            ),
+        )))
+        assertTrue(coordinator.isRunning())
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(1, ready)
+        assertEquals(0, failed)
+    }
+
+    @Test
+    fun primaryReadinessStillFailsExactlyOnceWhenBothMembersAreUnhealthy() {
+        var ready = 0
+        var failed = 0
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), FakePanel(), native)
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryStarted = { ready += 1 },
+            onPrimaryFailed = { failed += 1 },
+        ))
+
+        assertFalse(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.UNHEALTHY),
+            healthSlot(index = 1, health = BackendHealth.UNHEALTHY),
+        )))
+        assertFalse(coordinator.onHealthObservations(emptyList()))
+
+        assertFalse(coordinator.isRunning())
+        assertEquals(0, ready)
+        assertEquals(1, failed)
+        assertEquals(1, native.stopCalls)
+    }
+
+    @Test
+    fun disabledStandbyCannotSatisfyPrimaryReadinessFromAStaleReadySlot() {
+        var ready = 0
+        var failed = 0
+        val store = emptyStore()
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store, FakePanel(), native)
+        assertTrue(coordinator.start(
+            transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()),
+            onPrimaryStarted = { ready += 1 },
+            onPrimaryFailed = { failed += 1 },
+        ))
+        assertTrue(store.updateRedundant("start-operation") { current ->
+            current.copy(
+                standbyDesired = false,
+                retry = current.retry.copy(standbyReleasePending = true),
+            )
+        } is RecoveryStoreResult.Success)
+
+        assertFalse(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = 0,
+            ),
+        )))
+
+        assertFalse(coordinator.isRunning())
+        assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-a"), native.activated)
+        assertEquals(0, ready)
+        assertEquals(1, failed)
         assertEquals(1, native.stopCalls)
     }
 
@@ -1755,6 +1964,73 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun stagedEmptySlotCandidateReplaysAfterRestartWithoutStoppingAMember() {
+        var nowMs = 1_000_000L
+        val store = store(transaction().copy(slotBLeaseId = null))
+        val panel = FakePanel(acquiredSession = session(
+            activeLeaseId = "lease-a",
+            roleGeneration = 1,
+            membershipGeneration = 1,
+            slotBLeaseId = null,
+        ))
+        assertTrue(RedundantConnectionCoordinator(
+            store,
+            panel,
+            FakeNative(),
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
+        ).acquireAndCommitStandby("fill-empty"))
+
+        val replayNative = FakeNative(usable = setOf("lease-a", "candidate"))
+        val replayed = RedundantConnectionCoordinator(
+            store,
+            panel,
+            replayNative,
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
+        )
+
+        assertTrue(replayed.tick())
+        assertEquals(listOf("start:candidate"), replayNative.events)
+        assertEquals("candidate", replayed.status()?.candidateLeaseId)
+        assertEquals(null, replayed.status()?.retry?.acquireReplaceLeaseId)
+        assertEquals(0, panel.commitCalls)
+
+        nowMs += 15_000L
+        replayNative.healthSnapshots += listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+        )
+        assertTrue(replayed.tick())
+        assertEquals(1, panel.commitCalls)
+        assertEquals("candidate", replayed.status()?.slotBLeaseId)
+        assertFalse(requireNotNull(replayed.status()).retry.acquirePending)
+    }
+
+    @Test
+    fun initialAcquireRejectsCandidateThatAliasesTheActiveCurrentMember() {
+        val panel = FakePanel(acquiredCandidateLeaseId = "lease-a")
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), panel, native)
+
+        assertFalse(coordinator.acquireAndCommitStandby(
+            "malicious-alias",
+            replaceLeaseId = "lease-b",
+        ))
+
+        assertTrue(native.events.isEmpty())
+        assertEquals(null, coordinator.status()?.candidateLeaseId)
+        assertTrue(requireNotNull(coordinator.status()).retry.acquirePending)
+        assertEquals("lease-b", coordinator.status()?.retry?.acquireReplaceLeaseId)
+    }
+
+    @Test
     fun replacementCommitUsesCanonicalActiveAndGenerationsReturnedByAcquire() {
         var nowMs = 1_000_000L
         val acquired = session(
@@ -1790,6 +2066,476 @@ class RedundantConnectionCoordinatorTest {
         assertEquals("lease-b", committed.localActiveLeaseId)
         assertEquals(8, committed.roleGeneration)
         assertEquals(4, committed.membershipGeneration)
+    }
+
+    @Test
+    fun replacementCanReissueExactInactiveCurrentMemberBeforeFreshCommit() {
+        var nowMs = 1_000_000L
+        val current = session(
+            activeLeaseId = "lease-a",
+            roleGeneration = 1,
+            membershipGeneration = 1,
+        )
+        val panel = FakePanel(
+            acquiredSession = current,
+            acquiredCandidateLeaseId = "lease-b",
+            committedSession = current,
+        )
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(
+            store(transaction()),
+            panel,
+            native,
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
+        )
+
+        assertTrue(coordinator.acquireAndCommitStandby(
+            "reissue-inactive",
+            replaceLeaseId = "lease-b",
+        ))
+        val staged = requireNotNull(coordinator.status())
+        assertEquals("lease-b", staged.candidateLeaseId)
+        assertEquals("lease-b", staged.retry.acquireReplaceLeaseId)
+        assertEquals(listOf("stop:lease-b", "start:lease-b"), native.events)
+        assertEquals(0, panel.commitCalls)
+
+        nowMs += 15_000L
+        native.healthSnapshots += listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+        )
+        assertTrue(coordinator.tick())
+
+        val committed = requireNotNull(coordinator.status())
+        assertEquals(1, panel.commitCalls)
+        assertEquals("lease-b", panel.commitCandidateLeaseIds.single())
+        assertEquals(1, committed.roleGeneration)
+        assertEquals(1, committed.membershipGeneration)
+        assertEquals(null, committed.candidateLeaseId)
+        assertFalse(committed.retry.acquirePending)
+        assertEquals(RedundantReserveState.READY, coordinator.reserveState())
+    }
+
+    @Test
+    fun replayedExactInactiveMemberSurvivesCanonicalRefreshAndRequiresFreshHealth() {
+        var nowMs = 1_000_000L
+        val current = session(
+            activeLeaseId = "lease-a",
+            roleGeneration = 1,
+            membershipGeneration = 1,
+        )
+        val store = store(transaction())
+        val panel = FakePanel(
+            acquiredSession = current,
+            acquiredCandidateLeaseId = "lease-b",
+            committedSession = current,
+        )
+        assertTrue(RedundantConnectionCoordinator(
+            store,
+            panel,
+            FakeNative(),
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
+        ).acquireAndCommitStandby("reissue-inactive", replaceLeaseId = "lease-b"))
+
+        val replayNative = FakeNative()
+        val replayed = RedundantConnectionCoordinator(
+            store,
+            panel,
+            replayNative,
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
+        )
+        val staleReady = listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+        )
+
+        replayNative.healthSnapshots += staleReady
+        assertTrue(replayed.tick())
+        assertEquals(0, panel.commitCalls)
+        assertEquals("lease-b", replayed.status()?.candidateLeaseId)
+        assertEquals(listOf("stop:lease-b", "start:lease-b"), replayNative.events)
+
+        nowMs += 15_000L
+        replayNative.healthSnapshots += listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+        )
+        assertTrue(replayed.tick())
+        assertEquals(1, panel.commitCalls)
+        assertEquals(null, replayed.status()?.candidateLeaseId)
+        assertFalse(requireNotNull(replayed.status()).retry.acquirePending)
+        assertEquals(RedundantReserveState.READY, replayed.reserveState())
+    }
+
+    @Test
+    fun replayedExactInactiveFallbackSafelyRestagesAChangedServerCandidate() {
+        var nowMs = 1_000_000L
+        val current = session(
+            activeLeaseId = "lease-a",
+            roleGeneration = 1,
+            membershipGeneration = 1,
+        )
+        val store = store(transaction())
+        val panel = FakePanel(
+            acquiredSession = current,
+            acquiredCandidateLeaseIds = ArrayDeque(listOf("lease-b", "candidate-new")),
+        )
+        assertTrue(RedundantConnectionCoordinator(
+            store,
+            panel,
+            FakeNative(),
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
+        ).acquireAndCommitStandby("reissue-inactive", replaceLeaseId = "lease-b"))
+
+        val replayNative = FakeNative(usable = setOf("lease-a", "lease-b", "candidate-new"))
+        val replayed = RedundantConnectionCoordinator(
+            store,
+            panel,
+            replayNative,
+            epochNowMs = { nowMs },
+            monotonicMs = { nowMs },
+        )
+        val staleReady = listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+        )
+
+        replayNative.healthSnapshots += staleReady
+        assertTrue(replayed.tick())
+        assertEquals(0, panel.commitCalls)
+        assertEquals("candidate-new", replayed.status()?.candidateLeaseId)
+        assertEquals(listOf("stop:lease-b", "start:candidate-new"), replayNative.events)
+
+        nowMs += 15_000L
+        replayNative.healthSnapshots += listOf(
+            healthSlot(index = 0, active = true, health = BackendHealth.READY),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = nowMs - 15_000L,
+            ),
+        )
+        assertTrue(replayed.tick())
+        assertEquals(1, panel.commitCalls)
+        assertEquals("candidate-new", panel.commitCandidateLeaseIds.single())
+        assertEquals("candidate-new", replayed.status()?.slotBLeaseId)
+        assertEquals(null, replayed.status()?.candidateLeaseId)
+        assertFalse(requireNotNull(replayed.status()).retry.acquirePending)
+    }
+
+    @Test
+    fun startupStandbyWaitsForFailureEpisodeProbeBeforeSwitching() {
+        for (recovering in listOf(false, true)) {
+            var now = 20_000L
+            val original = transaction().let { it.copy(retry = it.retry.copy(
+                acquirePending = true, acquireOperationId = "repair", acquireReplaceLeaseId = "lease-b",
+            )) }
+            val readiness = mutableListOf<Boolean>()
+            val native = FakeNative()
+            val panel = FakePanel(recoveredSession = session("lease-a", 1, 1),
+                recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()),
+                role = RedundantRoleResponse("accepted", "lease-b", session("lease-b", 2, 1)))
+            val coordinator = RedundantConnectionCoordinator(if (recovering) store(original) else emptyStore(),
+                panel, native, epochNowMs = { now }, monotonicMs = { now },
+                onRecoveryReadiness = { readiness += it })
+            if (recovering) assertTrue(coordinator.recover()) else assertTrue(coordinator.start(original,
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                mapOf("lease-a" to probe(), "lease-b" to probe()),
+                onPrimaryStarted = { readiness += true }, onPrimaryFailed = { readiness += false }))
+            val primary = healthSlot(0, active = true, hardFailure = true)
+            val standby = healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0)
+
+            assertTrue(coordinator.onHealthObservations(listOf(primary,
+                standby.copy(standbyProbeState = StandbyProbeState.PENDING))))
+            assertEquals(listOf("lease-a"), native.activated)
+            assertTrue(readiness.isEmpty())
+            assertEquals("lease-b", coordinator.status()?.retry?.acquireReplaceLeaseId)
+            assertEquals(0, panel.roleCalls)
+            assertEquals(0, native.stopCalls)
+
+            now += 1_000L
+            assertTrue(coordinator.onHealthObservations(listOf(primary,
+                standby.copy(standbyProbeState = StandbyProbeState.SUCCEEDED))))
+            assertEquals(listOf("lease-a", "lease-b"), native.activated)
+            assertEquals(listOf(true), readiness)
+            assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+            assertEquals(0, native.stopCalls)
+        }
+    }
+
+    @Test
+    fun startupRejectsFailedEpisodeProbeDespiteEarlierReadyHealth() {
+        val native = FakeNative()
+        val readiness = mutableListOf<Boolean>()
+        val panel = FakePanel()
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), panel, native,
+            epochNowMs = { 20_000L }, monotonicMs = { 20_000L })
+        assertTrue(coordinator.start(transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe(), "lease-b" to probe()),
+            onPrimaryStarted = { readiness += true }, onPrimaryFailed = { readiness += false }))
+
+        assertFalse(coordinator.onHealthObservations(listOf(
+            healthSlot(0, active = true, hardFailure = true),
+            healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0)
+                .copy(standbyProbeState = StandbyProbeState.FAILED),
+        )))
+        assertEquals(listOf("lease-a"), native.activated)
+        assertEquals(listOf(false), readiness)
+        assertEquals(1, native.stopCalls)
+        assertEquals(0, panel.roleCalls)
+        assertFalse(coordinator.isRunning())
+    }
+
+    @Test
+    fun pendingStandbyEpisodeProbeCannotExtendPrimaryReadinessDeadline() {
+        var now = 20_000L
+        val native = FakeNative()
+        val readiness = mutableListOf<Boolean>()
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), FakePanel(), native,
+            epochNowMs = { now }, monotonicMs = { now })
+        assertTrue(coordinator.start(transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe(), "lease-b" to probe()),
+            onPrimaryStarted = { readiness += true }, onPrimaryFailed = { readiness += false }))
+        val observations = listOf(
+            healthSlot(0, active = true, hardFailure = true),
+            healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0)
+                .copy(standbyProbeState = StandbyProbeState.PENDING),
+        )
+        now = 49_999L
+        assertTrue(coordinator.onHealthObservations(observations))
+        assertEquals(listOf("lease-a"), native.activated)
+        assertTrue(readiness.isEmpty())
+        now = 50_000L
+        assertFalse(coordinator.onHealthObservations(observations))
+        assertEquals(listOf("lease-a"), native.activated)
+        assertEquals(listOf(false), readiness)
+        assertEquals(1, native.stopCalls)
+    }
+
+    @Test
+    fun recoveredScheduledRepairDoesNotBlockFreshHealthyStandby() {
+        val original = transaction().let { it.copy(retry = it.retry.copy(
+            acquirePending = true,
+            acquireOperationId = "repair",
+            acquireReplaceLeaseId = "lease-b",
+        )) }
+        val native = FakeNative()
+        val readiness = mutableListOf<Boolean>()
+        val panel = FakePanel(
+            recoveredSession = session("lease-a", 1, 1),
+            recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()),
+            role = RedundantRoleResponse("accepted", "lease-b", session("lease-b", 2, 1)),
+        )
+        val coordinator = RedundantConnectionCoordinator(store(original), panel, native,
+            epochNowMs = { 20_000L }, monotonicMs = { 20_000L },
+            onRecoveryReadiness = { readiness += it })
+
+        assertTrue(coordinator.recover())
+        assertTrue(coordinator.onHealthObservations(listOf(
+            healthSlot(0, active = true, health = BackendHealth.UNHEALTHY, hardFailure = true),
+            healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0),
+        )))
+
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(listOf("lease-a", "lease-b"), native.activated)
+        assertEquals(listOf(true), readiness)
+        assertEquals(0, native.stopCalls)
+        assertTrue(coordinator.isRunning())
+        assertFalse(panel.acquireReplaceLeaseIds.contains("lease-b"))
+    }
+
+    @Test
+    fun freshlyReusedCurrentStandbyFailsOverDespiteLostCommitResponse() {
+        // Reconciliation succeeding or failing must not change local failover.
+        for (panelOffline in listOf(false, true)) {
+            val current = session("lease-a", 1, 1)
+            val panel = FakePanel(
+                acquiredSession = current,
+                acquiredCandidateLeaseId = "lease-b",
+                commitFailures = ArrayDeque(listOf(true)),
+                role = RedundantRoleResponse("accepted", "lease-a", current),
+                roleFailures = ArrayDeque(listOf(panelOffline, true)),
+            )
+            val native = FakeNative()
+            var totalLoss = 0
+            val coordinator = RedundantConnectionCoordinator(emptyStore(), panel, native,
+                epochNowMs = { 20_000L }, monotonicMs = { 20_000L },
+                onAllSlotsStalled = { totalLoss++ })
+            assertTrue(coordinator.start(transaction(),
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2))))
+            assertTrue(coordinator.acquireAndCommitStandby("repair", "lease-b"))
+            val readyStandby = healthSlot(1, health = BackendHealth.READY,
+                handshakeFresh = true, consecutiveProbeSuccesses = 3, stableSinceMs = 0)
+            native.healthSnapshots += listOf(
+                healthSlot(0, active = true, health = BackendHealth.READY,
+                    handshakeFresh = true, consecutiveProbeSuccesses = 3, stableSinceMs = 0),
+                readyStandby,
+            )
+            assertFalse(coordinator.tick())
+            assertEquals(1, panel.commitCalls)
+            assertTrue(requireNotNull(coordinator.status()?.retry?.nextRetryAtUnix) > 20L)
+            val roleCalls = panel.roleCalls
+
+            assertTrue(coordinator.onHealthObservations(listOf(
+                healthSlot(0, active = true, health = BackendHealth.UNHEALTHY, hardFailure = true),
+                readyStandby,
+            )))
+
+            assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+            assertEquals(null, coordinator.status()?.candidateLeaseId)
+            assertEquals("lease-a", coordinator.status()?.retry?.acquireReplaceLeaseId)
+            assertTrue(requireNotNull(coordinator.status()).retry.roleObservationPending)
+            assertEquals(1L, coordinator.status()?.membershipGeneration)
+            assertEquals(listOf("lease-a", "lease-b"), native.activated)
+            assertEquals(0, totalLoss)
+            assertEquals(1, panel.commitCalls)
+            assertEquals(roleCalls + 1, panel.roleCalls)
+        }
+    }
+
+    @Test
+    fun startupRepairRecoveryKeepsCandidateAndPersistenceBarriers() {
+        for (stagedCandidate in listOf(false, true)) {
+            val original = transaction().copy(
+                candidateLeaseId = "candidate".takeIf { stagedCandidate },
+                candidateSlot = RedundantSlot.B.takeIf { stagedCandidate },
+                retry = AndroidRedundantRetryState(acquirePending = true,
+                    acquireOperationId = "repair", acquireReplaceLeaseId = "lease-b"),
+            )
+            val backend = CoordinatorRecordBackend()
+            val native = FakeNative()
+            val panel = FakePanel(recoveredSession = session("lease-a", 1, 1),
+                recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()))
+            val readiness = mutableListOf<Boolean>()
+            val coordinator = RedundantConnectionCoordinator(store(original, backend), panel, native,
+                epochNowMs = { 20_000L }, monotonicMs = { 20_000L },
+                onRecoveryReadiness = { readiness += it })
+            assertTrue(coordinator.recover())
+            if (!stagedCandidate) backend.failOnWriteNumber = backend.writeCount + 1
+
+            assertFalse(coordinator.onHealthObservations(listOf(
+                healthSlot(0, active = true, hardFailure = true),
+                healthSlot(1, health = BackendHealth.READY, handshakeFresh = true,
+                    consecutiveProbeSuccesses = 3, stableSinceMs = 0),
+            )))
+
+            assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+            assertEquals("lease-b", coordinator.status()?.retry?.acquireReplaceLeaseId)
+            assertEquals(original.candidateLeaseId, coordinator.status()?.candidateLeaseId)
+            assertEquals(listOf("lease-a"), native.activated)
+            assertEquals(listOf(false), readiness)
+            assertEquals(1, native.stopCalls)
+            assertEquals(0, panel.roleCalls)
+        }
+    }
+
+    @Test
+    fun reusedCurrentFailoverKeepsFreshHealthStartStopAndPersistenceBarriers() {
+        for (barrier in listOf("warming", "failed_start", "failed_write", "stop", "disabled")) {
+            val backend = CoordinatorRecordBackend()
+            val recoveryStore = store(transaction(), backend)
+            val native = FakeNative(startFailures = if (barrier == "failed_start") setOf("lease-b") else emptySet())
+            val current = session("lease-a", 1, 1)
+            val panel = FakePanel(acquiredSession = current, acquiredCandidateLeaseId = "lease-b",
+                role = RedundantRoleResponse("accepted", "lease-a", current))
+            val coordinator = RedundantConnectionCoordinator(recoveryStore, panel, native,
+                epochNowMs = { 20_000L }, monotonicMs = { 20_000L })
+            assertEquals(barrier != "failed_start",
+                coordinator.acquireAndCommitStandby("repair", "lease-b"))
+            when (barrier) {
+                "failed_write" -> backend.failOnWriteNumber = backend.writeCount + 1
+                "stop" -> assertTrue(coordinator.fenceRevoke())
+                "disabled" -> assertTrue(coordinator.releaseStandby())
+            }
+
+            coordinator.onHealthObservations(listOf(
+                healthSlot(0, active = true, hardFailure = true),
+                healthSlot(1, health = if (barrier == "warming") BackendHealth.WARMING else BackendHealth.READY,
+                    handshakeFresh = barrier != "warming",
+                    consecutiveProbeSuccesses = if (barrier == "warming") 0 else 3, stableSinceMs = 0),
+            ))
+
+            assertEquals(barrier, "lease-a", coordinator.status()?.localActiveLeaseId)
+            assertTrue(barrier, native.activationAttempts.isEmpty())
+            assertEquals(0, panel.commitCalls)
+        }
+    }
+
+    @Test
+    fun currentMemberCandidateIsNotInferredCommittedFromMembershipDuringFailover() {
+        val pending = transaction().copy(
+            candidateLeaseId = "lease-b",
+            candidateSlot = RedundantSlot.B,
+            retry = AndroidRedundantRetryState(
+                nextRetryAtUnix = 2_100L,
+                acquirePending = true,
+                acquireOperationId = "reissue-inactive",
+                acquireReplaceLeaseId = "lease-b",
+            ),
+        )
+        val native = FakeNative()
+        val panel = FakePanel()
+        val coordinator = RedundantConnectionCoordinator(
+            store(pending),
+            panel,
+            native,
+            epochNowMs = { 2_000_000L },
+            monotonicMs = { 2_000_000L },
+        )
+
+        assertFalse(coordinator.onHealthObservations(listOf(
+            healthSlot(index = 0, active = true, hardFailure = true),
+            healthSlot(
+                index = 1,
+                health = BackendHealth.READY,
+                handshakeFresh = true,
+                consecutiveProbeSuccesses = 3,
+                stableSinceMs = 0L,
+            ),
+        )))
+
+        val retained = requireNotNull(coordinator.status())
+        assertEquals("lease-a", retained.localActiveLeaseId)
+        assertEquals("lease-b", retained.candidateLeaseId)
+        assertTrue(retained.retry.acquirePending)
+        assertEquals(0, panel.commitCalls)
+        assertTrue(native.activationAttempts.isEmpty())
     }
 
     @Test
@@ -2020,7 +2766,7 @@ class RedundantConnectionCoordinatorTest {
         activeLeaseId: String,
         roleGeneration: Long,
         membershipGeneration: Long,
-        slotBLeaseId: String = "lease-b",
+        slotBLeaseId: String? = "lease-b",
         standbyDesired: Boolean = true,
     ) = BackgroundRedundantSession(
         sessionId = "22222222-2222-4222-8222-222222222222",
@@ -2151,6 +2897,9 @@ private class FakePanel(
     private val configurations: Map<String, ByteArray>? = null,
     private val recoveredSession: BackgroundRedundantSession? = null,
     private val acquiredSession: BackgroundRedundantSession? = null,
+    private val acquiredCandidateLeaseId: String = "candidate",
+    private val acquiredCandidateLeaseIds: ArrayDeque<String> = ArrayDeque(),
+    private val committedSession: BackgroundRedundantSession? = null,
     private val stopResults: ArrayDeque<Boolean> = ArrayDeque(),
     private val roleFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val roleFailureCodes: ArrayDeque<String> = ArrayDeque(),
@@ -2172,6 +2921,7 @@ private class FakePanel(
     var commitCalls = 0
     val acquireOperationIds = mutableListOf<String>()
     val acquireReplaceLeaseIds = mutableListOf<String?>()
+    val commitCandidateLeaseIds = mutableListOf<String>()
     val commitTransactions = mutableListOf<AndroidRedundantTransaction>()
     val candidateConfigurations = mutableListOf<ByteArray>()
     val releasedLeaseIds = mutableListOf<String>()
@@ -2246,8 +2996,14 @@ private class FakePanel(
         if (acquireFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
         val configuration = "candidate-config".toByteArray().also(candidateConfigurations::add)
         return BackgroundRedundantCandidate(
-            acquiredSession ?: session(activeLeaseId = transaction.localActiveLeaseId!!),
-            "candidate",
+            acquiredSession ?: session(
+                activeLeaseId = transaction.localActiveLeaseId!!,
+                roleGeneration = transaction.roleGeneration,
+                membershipGeneration = transaction.membershipGeneration,
+                slotALeaseId = transaction.slotALeaseId,
+                slotBLeaseId = transaction.slotBLeaseId,
+            ),
+            acquiredCandidateLeaseIds.removeFirstOrNull() ?: acquiredCandidateLeaseId,
             if (replaceLeaseId == transaction.slotALeaseId) RedundantSlot.A else RedundantSlot.B,
             QuickConnectionArgs(),
             configuration,
@@ -2260,8 +3016,9 @@ private class FakePanel(
     ): BackgroundRedundantSession {
         commitCalls += 1
         commitTransactions += transaction
+        commitCandidateLeaseIds += candidateLeaseId
         if (commitFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
-        return session(
+        return committedSession ?: session(
             activeLeaseId = transaction.localActiveLeaseId!!,
             roleGeneration = transaction.roleGeneration,
             membershipGeneration = transaction.membershipGeneration + 1,

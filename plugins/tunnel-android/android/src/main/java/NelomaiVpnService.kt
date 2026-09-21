@@ -2726,6 +2726,14 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         }) {
             is AndroidCoordinatorResult.Accepted -> {
                 connectionIntentRuntimeFence.cancelActive()
+                val redundant = cancelled.envelope.redundantTransaction
+                if (redundant != null) {
+                    redundantStartOperation.cancel(redundant.startOperationId)
+                    beginFailClosedRedundantStop(
+                        redundant.startOperationId,
+                        redundantOwnerForOperation(redundant.startOperationId),
+                    )
+                }
                 runCatching {
                     AutomaticDiagnostics.onConnectionIntentCancelled(
                         applicationContext,
@@ -2747,7 +2755,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                     SERVICE_RESULT_OK,
                     connectionIntentServiceStatus(cancelled.envelope).toBundle(),
                 )
-                scheduleConnectionIntentAttempt()
+                if (redundant == null) scheduleConnectionIntentAttempt()
             }
             is AndroidCoordinatorResult.Failure -> receiver.sendError(cancelled.code)
         }
