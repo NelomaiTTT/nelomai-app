@@ -1002,10 +1002,16 @@ impl RemoteOwner {
     }
 }
 
+#[derive(Default)]
+struct CachedScopeStamp {
+    value: Option<ScopeStamp>,
+    logout_generation: u64,
+}
+
 pub struct PrivateRuntimeAuthClient {
     outbox: Arc<Outbox>,
     pending: Arc<Pending<AuthResponseV1>>,
-    stamp: Mutex<Option<ScopeStamp>>,
+    stamp: Mutex<CachedScopeStamp>,
     send_gate: Mutex<()>,
     pub(super) pending_login: Mutex<Option<u64>>,
     child: Arc<ChildAdmission>,
@@ -1227,7 +1233,7 @@ impl PrivateRuntimeAuthClient {
         Self {
             outbox,
             pending,
-            stamp: Mutex::new(None),
+            stamp: Mutex::new(CachedScopeStamp::default()),
             send_gate: Mutex::new(()),
             pending_login: Mutex::new(None),
             child,
@@ -1238,6 +1244,15 @@ impl PrivateRuntimeAuthClient {
         request: AuthRequestV1,
         deadline: Instant,
     ) -> Result<AuthResponseV1, PrivateError> {
+        let logout_stamp = match &request {
+            AuthRequestV1::Logout { stamp, .. } => Some(stamp.clone()),
+            _ => None,
+        };
+        let cache_generation = self
+            .stamp
+            .lock()
+            .map_err(|_| PrivateError::Closed)?
+            .logout_generation;
         let mut lifetime = RequestLifetime {
             outbox: self.outbox.clone(),
             complete: false,
@@ -1279,19 +1294,55 @@ impl PrivateRuntimeAuthClient {
                 if let AuthResponseV1::State { stamp, .. } | AuthResponseV1::Access { stamp, .. } =
                     &response
                 {
-                    *self.stamp.lock().map_err(|_| PrivateError::Closed)? = Some(stamp.clone());
+                    let mut cache = self.stamp.lock().map_err(|_| PrivateError::Closed)?;
+                    // A newly admitted login may complete after an older
+                    // logout's Done. Its live writer grant is authoritative;
+                    // a delayed State alone must never reopen the old scope.
+                    let live_access = match &response {
+                        AuthResponseV1::Access { access, .. } => {
+                            self.child.check(&scope(access)).is_ok()
+                        }
+                        _ => false,
+                    };
+                    if cache.logout_generation == cache_generation || live_access {
+                        cache.value = Some(stamp.clone());
+                    }
+                }
+                if matches!(response, AuthResponseV1::Done) {
+                    if let Some(logout_stamp) = logout_stamp {
+                        let mut cache = self.stamp.lock().map_err(|_| PrivateError::Closed)?;
+                        // Fence replies already in flight, but preserve a newer
+                        // login which completed before this logout response.
+                        cache.logout_generation = cache
+                            .logout_generation
+                            .checked_add(1)
+                            .ok_or(PrivateError::Protocol)?;
+                        if cache.value == logout_stamp {
+                            cache.value = None;
+                        }
+                    }
                 }
                 Ok(response)
             }
         }
     }
     async fn stamp(&self, deadline: Instant) -> Result<Option<ScopeStamp>, PrivateError> {
-        let current = self.stamp.lock().map_err(|_| PrivateError::Closed)?.clone();
+        let current = self
+            .stamp
+            .lock()
+            .map_err(|_| PrivateError::Closed)?
+            .value
+            .clone();
         if current.is_some() {
             return Ok(current);
         }
         self.request(AuthRequestV1::State, deadline).await?;
-        Ok(self.stamp.lock().map_err(|_| PrivateError::Closed)?.clone())
+        Ok(self
+            .stamp
+            .lock()
+            .map_err(|_| PrivateError::Closed)?
+            .value
+            .clone())
     }
 }
 #[async_trait]
@@ -1313,6 +1364,7 @@ impl nelomai_client_core::RuntimeStartPreflight for PrivateRuntimeAuthClient {
             .lock()
             .map_err(|_| CoreError::AuthRecoveryRequired)?;
         let scope = stamp
+            .value
             .as_ref()
             .ok_or(CoreError::AuthRecoveryRequired)?
             .runtime_scope()

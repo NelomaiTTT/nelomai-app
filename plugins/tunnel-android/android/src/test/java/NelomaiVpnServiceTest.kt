@@ -17,6 +17,144 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun v2QuickPlanCannotSilentlyFallBackToLegacyWhenRecoveryIsDisabled() {
+        val disabled = BackgroundCapabilitySnapshot(9, false, 2_000_000_000)
+        try {
+            selectQuickStartPolicy(configuredCredentialStore(disabled),
+                template().copy(reserveEnabled = true), 1_000, fetch = { disabled })
+            throw AssertionError("v2 plan accepted without recovery support")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_credential_capability_unavailable", error.code)
+        }
+    }
+
+    @Test
+    fun pendingV2ReplaySurvivesProcessDeathAndHandsOffWithoutSingleLeaseRuntime() {
+        val backend = ServiceRecoveryBackend()
+        val store = recoveryStore(backend)
+        coordinator(store).begin(template().copy(reserveEnabled = true))
+        val pending = requireNotNull(store.load().leaseTransaction)
+        val restored = recoveryStore(backend)
+        val response = redundantResult(restored.load())
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("applied", response.connection.leaseId))
+            startResults.add(Result.success(response))
+        }
+        val runtime = ServiceRuntimeFake()
+        coordinator(restored).runOnce(panel, runtime)
+        val checkpoint = recoveryStore(backend).load()
+        assertNull(checkpoint.leaseTransaction)
+        assertEquals(pending.startOperationId, checkpoint.redundantTransaction?.startOperationId)
+        assertEquals(pending.replay.requestFingerprint,
+            checkpoint.redundantTransaction?.startRequestFingerprint)
+        assertEquals("primary", checkpoint.redundantTransaction?.localActiveLeaseId)
+        assertEquals("standby", checkpoint.redundantTransaction?.slotBLeaseId)
+        assertEquals(0, runtime.startCalls)
+        assertTrue(response.configuration.all { it == 0.toByte() })
+        assertEquals(listOf(pending.startOperationId), panel.startOperationIds)
+    }
+
+    @Test
+    fun cancellationDuringV2AllocationReconcilesEntireSession() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        val response = redundantResult(store.load())
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("not_found"))
+            reconcileResults.add(reconcile("compensating", "primary", cancelRequested = true))
+            reconcileResults.add(reconcile("cancelled", "primary", cancelRequested = true))
+            startResults.add(Result.success(response))
+            onStart = { coordinator.cancelCurrent() }
+        }
+        val runtime = ServiceRuntimeFake()
+        assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().redundantTransaction)
+        assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().leaseTransaction)
+        assertEquals(0, runtime.startCalls)
+        assertTrue(panel.stopLeaseIds.isEmpty())
+        assertTrue(response.configuration.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun v2PendingAfterRebootCancelsWithoutAllocatingNewLease() {
+        val backend = ServiceRecoveryBackend()
+        coordinator(recoveryStore(backend)).begin(template().copy(reserveEnabled = true))
+        val rebooted = recoveryStore(backend, bootCount = 8)
+        val panel = ServicePanelFake().apply { reconcileResults.add(reconcile("cancelled")) }
+        assertEquals(AndroidCoordinatorStep.IDLE,
+            coordinator(rebooted).runOnce(panel, ServiceRuntimeFake()))
+        assertNull(rebooted.load().leaseTransaction)
+        assertTrue(panel.startOperationIds.isEmpty())
+        assertEquals(listOf(true), panel.cancelIfAbsent)
+    }
+
+    private fun redundantResult(envelope: AndroidRecoveryEnvelope): BackgroundStartResult {
+        val pending = requireNotNull(envelope.leaseTransaction)
+        return startResult("primary").copy(redundantTransaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = requireNotNull(envelope.intent.template),
+            sessionId = "22222222-2222-4222-8222-222222222222",
+            slotALeaseId = "primary",
+            slotBLeaseId = "standby",
+            localActiveLeaseId = "primary",
+            standbyDesired = true,
+            roleGeneration = 1,
+            membershipGeneration = 1,
+            startOperationId = pending.startOperationId,
+            startRequestFingerprint = pending.replay.requestFingerprint,
+            startReserveEnabled = true,
+        ))
+    }
+
+    @Test
+    fun cancelledV2StartWaitsForSessionCompensationWithoutSingleLeaseStop() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        coordinator.cancelCurrent()
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("applied", "primary", cancelRequested = true))
+            reconcileResults.add(reconcile("compensating", "primary", cancelRequested = true))
+            reconcileResults.add(reconcile("cancelled", "primary", cancelRequested = true))
+            stopResults.add(Result.success(Unit))
+        }
+        val runtime = ServiceRuntimeFake()
+        assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().leaseTransaction?.leaseId)
+        assertTrue(panel.stopLeaseIds.isEmpty())
+        assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
+        assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().leaseTransaction)
+        assertEquals(0, runtime.startCalls)
+        assertEquals(listOf(true, true, true), panel.cancelIfAbsent)
+    }
+
+    @Test
+    fun redundantQuickPlanAllocatesDurableV2OperationForBothReserveChoices() {
+        for (reserve in listOf(false, true)) {
+            val args = StartTunnelArgs().apply {
+                configuration = byteArrayOf(1)
+                quickConnection = startResult("old-lease").connection
+                redundancy = RedundantStartArgs().apply { reserveEnabled = reserve }
+            }
+            val plan = requireNotNull(args.copyForQuickPlan())
+            val template = quickConnectionIntentTemplate(
+                template().deviceId,
+                QuickTunnelTemplate(plan.options, requireNotNull(plan.quickConnection)),
+                36,
+            )
+            val backend = ServiceRecoveryBackend()
+            coordinator(recoveryStore(backend)).begin(template)
+            val restored = recoveryStore(backend).load()
+            assertEquals(2, restored.leaseTransaction?.replay?.contractVersion)
+            assertNull(restored.leaseTransaction?.leaseId)
+            assertEquals(template, restored.intent.template)
+        }
+    }
+
+    @Test
     fun quickPlanCleanupFailureCannotEscapeSuccessfulTunnelCompletion() {
         assertFalse(
             clearQuickPlanAfterSaveFailure {
@@ -2004,7 +2142,23 @@ class NelomaiVpnServiceTest {
         assertEquals(before.intent.generation, status.generation)
         assertFalse(status.desiredActive)
         assertEquals("stopping", status.status)
+        assertEquals("cleanup_pending", status.leasePhase)
         assertEquals(serviceV2Envelope(), before)
+    }
+
+    @Test
+    fun cancelledRedundantSessionStillProjectsServiceOwnedCleanup() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        recovery.beginRedundant(requireNotNull(serviceV2Envelope().redundantTransaction))
+            .successEnvelope()
+        val cancelled = recovery.cancelCurrentIntent().successEnvelope()
+
+        val status = connectionIntentServiceStatus(cancelled)
+
+        // A null lease phase tells Rust to send a legacy per-lease stop as well.
+        assertFalse(status.desiredActive)
+        assertEquals("stopping", status.status)
+        assertEquals("cleanup_pending", status.leasePhase)
     }
 
     @Test

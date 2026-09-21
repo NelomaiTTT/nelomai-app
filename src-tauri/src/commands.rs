@@ -2127,14 +2127,14 @@ pub async fn app_set_use_reserve_connection(
             )
         })?;
     #[cfg(target_os = "android")]
-    if !enabled {
+    {
         app.tunnel_android()
-            .release_redundant_standby()
+            .set_reserve_preference(enabled)
             .await
             .map_err(|_| {
                 CommandError::new(
-                    "redundant_standby_release_failed",
-                    "Настройка сохранена, но резерв пока не удалось освободить",
+                    "reserve_preference_sync_failed",
+                    "Настройка сохранена, но применить её к фоновому подключению пока не удалось",
                 )
             })?;
     }

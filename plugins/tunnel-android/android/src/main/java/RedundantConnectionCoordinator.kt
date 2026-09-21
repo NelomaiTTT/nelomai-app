@@ -217,6 +217,7 @@ internal class RedundantConnectionCoordinator(
     expectedStartOperationId: String? = null,
     private val mutationFence: RedundantOperationMutationFence = RedundantOperationMutationFence(),
     private val onAllSlotsStalled: () -> Unit = {},
+    private val onRecoveryReadiness: (Boolean) -> Unit = {},
 ) : RedundantVpnProcessOwner {
     private val gate = Any()
     @Volatile private var recoveryStarted = false
@@ -226,6 +227,8 @@ internal class RedundantConnectionCoordinator(
     private var totalLossCommandEmitted = false
     private var pendingPrimaryReadiness: PendingPrimaryReadiness? = null
     private var primaryReadinessFailed = false
+    private var recoveryRetryAtUnix: Long? = null
+    private var recoveryRetryAttempt = 0
     private var boundStartOperationId: String? = expectedStartOperationId
 
     fun status(): AndroidRedundantTransaction? = synchronized(gate) {
@@ -308,106 +311,152 @@ internal class RedundantConnectionCoordinator(
             return@synchronized false
         }
         if (recoveryStarted || pendingPrimaryReadiness != null) return@synchronized true
-        primaryReadinessFailed = false
-        val response = panel.recover(transaction)
+        if (primaryReadinessFailed) return@synchronized false
+        if (recoveryRetryAtUnix?.let { currentUnixSeconds() < it } == true) return@synchronized false
+        // Retryable control-plane errors retain the exact session. Native readiness
+        // failure remains terminal; a durable switch has its own bounded retries.
+        val response = try {
+            panel.recover(transaction)
+        } catch (error: Throwable) {
+            val policy = ConnectionIntentErrorPolicy()
+            val decision = policy.classify((error as? BackgroundConnectionException)?.code.orEmpty())
+            if (decision == ConnectionIntentDecision.RETRY_SAME_OPERATION ||
+                decision == ConnectionIntentDecision.RETRY_AFTER || error is java.io.IOException
+            ) {
+                val delay = if ((error as? BackgroundConnectionException)?.retryAfterHeader != null ||
+                    decision == ConnectionIntentDecision.RETRY_AFTER
+                ) policy.retryAfterSeconds((error as? BackgroundConnectionException)?.retryAfterHeader)
+                else RECOVERY_RETRY_DELAYS_SECONDS[recoveryRetryAttempt]
+                recoveryRetryAttempt = (recoveryRetryAttempt + 1).coerceAtMost(RECOVERY_RETRY_DELAYS_SECONDS.lastIndex)
+                recoveryRetryAtUnix = retryDeadlineUnix(delay)
+                return@synchronized false
+            }
+            primaryReadinessFailed = true
+            onRecoveryReadiness(false)
+            throw error
+        }
+        recoveryRetryAtUnix = null
+        recoveryRetryAttempt = 0
         try {
-            if (transaction.retry.hasPendingNativeSwitch() &&
-                !transaction.matchesPendingNativeMembership(response.session)
-            ) {
-                revoke()
-                return@synchronized false
-            }
-            val refreshed = transaction.withRecoveredCanonical(response.session)
-            val pendingTarget = refreshed.retry.pendingNativeActiveLeaseId
-            val active = pendingTarget ?: transaction.localActiveLeaseId
-                .takeIf(response.session::containsCurrentLease)
-                ?: response.session.activeLeaseId ?: return@synchronized false
-            val activeConfiguration = response.configurations[active] ?: return@synchronized false
-            val activeSlot = refreshed.slot(active) ?: return@synchronized false
-            if (pendingTarget != null && refreshed != transaction &&
-                !persistExactTransaction(transaction, refreshed)
-            ) {
-                return@synchronized false
-            }
-            if (!mutateNative(transaction) {
-                    response.virtualAddressV4?.let(native::setProbeSourceIpv4)
-                    true
-                }
-            ) return@synchronized false
-            if (!mutateNative(transaction) {
-                    native.start(
-                        active,
-                        activeSlot,
-                        activeConfiguration,
-                        response.healthProbes[active],
-                    )
-                }
-            ) return@synchronized false
-            if (pendingTarget != null) {
-                val source = requireNotNull(refreshed.retry.pendingNativeSourceLeaseId)
-                if (source != active &&
-                    refreshed.retry.pendingNativeSwitchAttempt >=
-                    MAX_PENDING_NATIVE_SWITCH_ATTEMPTS - 1
+            primaryReadinessFailed = false
+            try {
+                if (transaction.retry.hasPendingNativeSwitch() &&
+                    !transaction.matchesPendingNativeMembership(response.session)
                 ) {
-                    response.configurations[source]?.let { configuration ->
-                        refreshed.slot(source)?.let { slot ->
-                            mutateNative(refreshed) {
-                                native.start(
-                                    source,
-                                    slot,
-                                    configuration,
-                                    response.healthProbes[source],
-                                )
+                    revoke()
+                    return@synchronized false
+                }
+                val refreshed = transaction.withRecoveredCanonical(response.session)
+                val pendingTarget = refreshed.retry.pendingNativeActiveLeaseId
+                val active = pendingTarget ?: transaction.localActiveLeaseId
+                    .takeIf(response.session::containsCurrentLease)
+                    ?: response.session.activeLeaseId ?: return@synchronized false
+                val activeConfiguration = response.configurations[active] ?: return@synchronized false
+                val activeSlot = refreshed.slot(active) ?: return@synchronized false
+                if (pendingTarget != null && refreshed != transaction &&
+                    !persistExactTransaction(transaction, refreshed)
+                ) {
+                    return@synchronized false
+                }
+                if (!mutateNative(transaction) {
+                        response.virtualAddressV4?.let(native::setProbeSourceIpv4)
+                        true
+                    }
+                ) return@synchronized false
+                if (!mutateNative(transaction) {
+                        native.start(
+                            active,
+                            activeSlot,
+                            activeConfiguration,
+                            response.healthProbes[active],
+                        )
+                    }
+                ) return@synchronized false
+                if (pendingTarget != null) {
+                    val source = requireNotNull(refreshed.retry.pendingNativeSourceLeaseId)
+                    if (source != active &&
+                        refreshed.retry.pendingNativeSwitchAttempt >=
+                        MAX_PENDING_NATIVE_SWITCH_ATTEMPTS - 1
+                    ) {
+                        response.configurations[source]?.let { configuration ->
+                            refreshed.slot(source)?.let { slot ->
+                                mutateNative(refreshed) {
+                                    native.start(
+                                        source,
+                                        slot,
+                                        configuration,
+                                        response.healthProbes[source],
+                                    )
+                                }
                             }
                         }
                     }
+                    if (!drainPendingNativeSwitchLocked(refreshed)) {
+                        val current = status()
+                        if (!totalLossCommandEmitted && current != null && current.desiredActive &&
+                            current.retry.stopState == RedundantStopState.NONE &&
+                            (current.retry.hasPendingNativeSwitch() || current.localActiveLeaseId == source)
+                        ) {
+                            // Continue full recovery on the next existing health tick,
+                            // including readiness after activation or source fallback.
+                            // Configurations are wiped below and refetched by exact replay.
+                            recoveryRetryAtUnix = currentUnixSeconds()
+                        }
+                        return@synchronized false
+                    }
+                } else if (!mutateNative(refreshed) { native.activate(active) }) {
+                    return@synchronized false
                 }
-                if (!drainPendingNativeSwitchLocked(refreshed)) return@synchronized false
-            } else if (!mutateNative(refreshed) { native.activate(active) }) {
-                return@synchronized false
-            }
-            val committed = if (pendingTarget != null) {
-                status() ?: return@synchronized false
-            } else {
-                refreshed
-            }
-            val standby = listOfNotNull(
-                response.session.slotALeaseId,
-                response.session.slotBLeaseId,
-            ).filter { committed.standbyDesired && it != active }.distinct()
-            for (leaseId in standby) {
-                val configuration = response.configurations[leaseId] ?: continue
-                committed.slot(leaseId)?.let { slot ->
-                    mutateNative(committed) {
-                        native.start(leaseId, slot, configuration, response.healthProbes[leaseId])
+                val committed = if (pendingTarget != null) {
+                    status() ?: return@synchronized false
+                } else {
+                    refreshed
+                }
+                val standby = listOfNotNull(
+                    response.session.slotALeaseId,
+                    response.session.slotBLeaseId,
+                ).filter { committed.standbyDesired && it != active }.distinct()
+                for (leaseId in standby) {
+                    val configuration = response.configurations[leaseId] ?: continue
+                    committed.slot(leaseId)?.let { slot ->
+                        mutateNative(committed) {
+                            native.start(leaseId, slot, configuration, response.healthProbes[leaseId])
+                        }
                     }
                 }
+                // The local active identity wins over a stale canonical role until its observation is sent.
+                val recovered = committed.copy(localActiveLeaseId = active)
+                val persisted = if (pendingTarget != null) {
+                    recovered == committed || persistExactTransaction(committed, recovered)
+                } else {
+                    persistExactTransaction(transaction, recovered)
+                }
+                if (!persisted) {
+                    native.stop()
+                    return@synchronized false
+                }
+                beginPrimaryReadinessLocked(
+                    transaction = recovered,
+                    activeLeaseId = active,
+                    activeSlot = activeSlot,
+                    healthProbe = response.healthProbes[active],
+                    shouldCancel = { false },
+                    freshStart = false,
+                    drainPendingWork = true,
+                    onReady = { onRecoveryReadiness(true) },
+                    onFailed = { onRecoveryReadiness(false) },
+                    onCancelled = {},
+                )
+            } finally {
+                response.configurations.values.forEach { it.fill(0) }
             }
-            // The local active identity wins over a stale canonical role until its observation is sent.
-            val recovered = committed.copy(localActiveLeaseId = active)
-            val persisted = if (pendingTarget != null) {
-                recovered == committed || persistExactTransaction(committed, recovered)
-            } else {
-                persistExactTransaction(transaction, recovered)
-            }
-            if (!persisted) {
-                native.stop()
-                return@synchronized false
-            }
-            beginPrimaryReadinessLocked(
-                transaction = recovered,
-                activeLeaseId = active,
-                activeSlot = activeSlot,
-                healthProbe = response.healthProbes[active],
-                shouldCancel = { false },
-                freshStart = false,
-                drainPendingWork = true,
-                onReady = {},
-                onFailed = {},
-                onCancelled = {},
-            )
         } finally {
-            response.configurations.values.forEach { it.fill(0) }
+            if (!recoveryStarted && pendingPrimaryReadiness == null && !primaryReadinessFailed &&
+                recoveryRetryAtUnix == null && !totalLossCommandEmitted
+            ) {
+                primaryReadinessFailed = true
+                onRecoveryReadiness(false)
+            }
         }
     }
 
@@ -499,9 +548,15 @@ internal class RedundantConnectionCoordinator(
             return failPrimaryReadinessLocked(pending)
         }
         if (observation != null && healthMonitor.ready(elapsedNow(), observation)) {
+            val ready = transaction.copy(retry = transaction.retry.copy(
+                roleObservationPending = true,
+                pendingRoleLeaseId = transaction.localActiveLeaseId,
+                pendingRoleReason = "primary_ready",
+            ))
+            if (!persist(ready)) return failPrimaryReadinessLocked(pending)
             pendingPrimaryReadiness = null
             return completePrimaryReadinessLocked(
-                transaction,
+                ready,
                 pending.drainPendingWork,
                 pending.onReady,
             )
@@ -533,7 +588,7 @@ internal class RedundantConnectionCoordinator(
         primaryReadinessFailed = true
         runCatching(native::stop)
         publishReserveStateLocked(null, emptyList())
-        if (pending.freshStart) pending.onFailed()
+        pending.onFailed()
         return false
     }
 
@@ -555,7 +610,10 @@ internal class RedundantConnectionCoordinator(
         if (transaction.retry.hasPendingNativeSwitch()) {
             return drainPendingNativeSwitchLocked(transaction)
         }
-        if (!transaction.standbyDesired) return drainStandbyReleaseLocked(transaction)
+        if (!transaction.standbyDesired) {
+            if (!drainStandbyReleaseLocked(transaction)) return false
+            return status()?.retry?.roleObservationPending != true || flushRoleObservationLocked()
+        }
         if (transaction.retry.roleObservationPending && !flushRoleObservationLocked()) return false
         val current = status() ?: return false
         val pendingAcquire = current.retry
@@ -581,6 +639,7 @@ internal class RedundantConnectionCoordinator(
             return@synchronized advancePrimaryReadinessLocked(observations)
         }
         if (primaryReadinessFailed) return@synchronized false
+        if (recoveryRetryAtUnix != null) return@synchronized recover()
         if (transaction.retry.hasPendingNativeSwitch()) {
             return@synchronized drainPendingNativeSwitchLocked(transaction)
         }
@@ -671,6 +730,7 @@ internal class RedundantConnectionCoordinator(
             return@synchronized false
         }
         if (primaryReadinessFailed) return@synchronized false
+        if (recoveryRetryAtUnix != null) return@synchronized recover()
         if (transaction.retry.hasPendingNativeSwitch()) {
             return@synchronized drainPendingNativeSwitchLocked(transaction)
         }
@@ -1418,6 +1478,7 @@ internal class RedundantConnectionCoordinator(
         const val MAX_PENDING_NATIVE_SWITCH_ATTEMPTS = 3
         const val PRIMARY_READINESS_TIMEOUT_MILLIS = 30_000L
         const val REPLACEMENT_DELAY_SECONDS = 60L
+        val RECOVERY_RETRY_DELAYS_SECONDS = longArrayOf(2, 5, 15, 30, 60, 300)
         private val REDUNDANT_GENERATION_CONFLICT_CODES = setOf(
             "role_generation_conflict",
             "session_membership_conflict",

@@ -118,7 +118,7 @@ internal fun redundantTransactionFromStart(
 private fun setOfNotNullCompat(first: String?, second: String?): Set<String> =
     listOfNotNull(first, second).toSet()
 
-private fun canonicalRedundantIpv4(value: String): Boolean {
+internal fun canonicalRedundantIpv4(value: String): Boolean {
     val octets = value.split('.')
     return octets.size == 4 && octets.all { octet ->
         octet.isNotEmpty() && octet.length <= 3 &&
@@ -393,7 +393,9 @@ internal class ServiceRedundantConnectionNative(
                 ?: return null
             val telemetry = value.optJSONObject("telemetry") ?: return null
             val txPackets = telemetry.exactNonNegativeLong("udp_send_packets") ?: return null
-            val rxPackets = telemetry.exactNonNegativeLong("udp_receive_packets") ?: return null
+            // Handshakes, keepalives and junk can arrive on a broken return path.
+            // Only decrypted IP packets prove inbound data-plane progress.
+            val rxPackets = telemetry.exactNonNegativeLong("tun_write_packets") ?: return null
             result[slot] = NativeSlotHealthMetrics(
                 admitted = admitted,
                 closed = closed,

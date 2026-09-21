@@ -34,6 +34,7 @@ internal data class AndroidIntentTemplate(
     val allowAlternate: Boolean,
     val syncBindingPreferences: Boolean = false,
     val options: AndroidTunnelOptions = AndroidTunnelOptions(),
+    val reserveEnabled: Boolean? = null,
 )
 
 internal data class AndroidTunnelOptions(
@@ -301,6 +302,7 @@ internal object AndroidRecoveryEnvelopeCodec {
         put("egressMode", template.egressMode)
         put("allowAlternate", template.allowAlternate)
         put("syncBindingPreferences", template.syncBindingPreferences)
+        template.reserveEnabled?.let { put("reserveEnabled", it) }
         put("options", optionsToJson(template.options))
     }
 
@@ -319,6 +321,9 @@ internal object AndroidRecoveryEnvelopeCodec {
         },
         allowAlternate = payload.getBoolean("allowAlternate"),
         syncBindingPreferences = payload.optBoolean("syncBindingPreferences", false),
+        reserveEnabled = if (payload.has("reserveEnabled") && !payload.isNull("reserveEnabled")) {
+            payload.getBoolean("reserveEnabled")
+        } else null,
         options = payload.optionalObject("options")?.let(::optionsFromJson) ?: AndroidTunnelOptions(),
     )
 
@@ -849,6 +854,30 @@ internal class AndroidRecoveryStore(
         } catch (_: Throwable) {
             RecoveryStoreResult.Failure("redundant_recovery_invalid")
         }
+    }
+
+    /** Transfer a fresh v2 allocation to the existing session owner in one durable write. */
+    fun promotePendingRedundant(
+        pending: AndroidLeaseTransaction,
+        transaction: AndroidRedundantTransaction,
+    ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
+        val result = readLocked()
+        if (result is RecoveryStoreResult.Failure) return@synchronized result
+        val current = (result as RecoveryStoreResult.Success).value
+        if (!current.intent.desiredActive || current.intent.generation != pending.generation ||
+            current.leaseTransaction != pending || current.redundantTransaction != null ||
+            pending.phase != LeasePhase.START_PENDING || pending.leaseId != null ||
+            pending.replay.contractVersion != 2 || !transaction.desiredActive ||
+            current.intent.template != transaction.template ||
+            transaction.startOperationId != pending.startOperationId ||
+            transaction.startRequestFingerprint != pending.replay.requestFingerprint ||
+            transaction.template.reserveEnabled != transaction.startReserveEnabled
+        ) return@synchronized RecoveryStoreResult.Failure("connection_intent_generation_conflict")
+        persist(current.copy(
+            intent = current.intent.copy(retry = AndroidRetryState()),
+            leaseTransaction = null,
+            redundantTransaction = transaction,
+        ))
     }
 
     fun beginRedundant(

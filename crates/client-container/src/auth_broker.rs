@@ -1838,6 +1838,7 @@ impl AuthBroker {
         Ok(match auth.logout_state {
             LogoutState::Pending => BrokerAuthState::LogoutPending,
             LogoutState::LoggedOut => BrokerAuthState::LoggedOut,
+            LogoutState::Active if Self::is_pristine_auth(auth, meta) => BrokerAuthState::LoggedOut,
             // A persisted password attempt has an unknown outcome until commit,
             // including when its caller future was dropped in this process.
             LogoutState::Active
@@ -1858,6 +1859,28 @@ impl AuthBroker {
             }
             LogoutState::Active => BrokerAuthState::Active,
         })
+    }
+
+    fn is_pristine_auth(auth: &AuthStoreV1, meta: &BrokerMetadataV1) -> bool {
+        auth.auth_epoch == 0
+            && auth.access_token.is_none()
+            && auth.refresh_token.is_none()
+            && auth.session_generation.is_none()
+            && auth.confirmed_identity.is_none()
+            && auth.pending_resume.is_none()
+            && auth.completed_runtime_logout.is_none()
+            && auth.pending_runtime_supersede.is_none()
+            && meta.next_attempt == 0
+            && meta.pending_request.is_none()
+            && meta.completed_resume.is_none()
+            && meta.pending_logout.is_none()
+            && meta.pending_recovery.is_none()
+            && meta.cancelled_login.is_none()
+            && !meta.authentication_outcome_unknown
+            && meta.pending_login_account.is_none()
+            && meta.confirmed_device_id.is_none()
+            && meta.pending_push_cleanup_epoch.is_none()
+            && meta.transition_authorities.is_empty()
     }
 
     /// Container-only password ingress. Install identity is read from protected

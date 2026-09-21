@@ -26,6 +26,7 @@ internal const val EXTRA_CACHE_QUICK_ACTION = "cache_quick_action"
 internal const val EXTRA_QUICK_ACTION_VALID_UNTIL = "quick_action_valid_until"
 internal const val EXTRA_QUICK_CONNECTION = "quick_connection"
 internal const val EXTRA_REDUNDANCY = "redundancy"
+internal const val EXTRA_RESERVE_PREFERENCE = "reserve_preference"
 internal const val EXTRA_PROBE = "probe"
 internal const val EXTRA_STATE = "state"
 internal const val EXTRA_DURATION_MILLIS = "duration_millis"
@@ -133,7 +134,7 @@ internal object TunnelServiceClient {
             .setAction(NelomaiVpnService.ACTION_QUICK_TOGGLE),
         { onSuccess(it.toConnectionIntentServiceStatus()) },
         onError,
-        foreground = true,
+        foreground = !QuickTunnelController.desiredActive(context.applicationContext),
     )
 
     fun beginConnectionIntent(
@@ -222,13 +223,14 @@ internal object TunnelServiceClient {
         context: Context,
         onSuccess: (ConnectionIntentServiceStatus) -> Unit,
         onError: (String) -> Unit,
+        reservePreference: Boolean? = null,
     ) = requestBundle(
         context,
         ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
-            .setAction(NelomaiVpnService.ACTION_RELEASE_REDUNDANT_STANDBY),
+            .setAction(NelomaiVpnService.ACTION_RELEASE_REDUNDANT_STANDBY)
+            .apply { reservePreference?.let { putExtra(EXTRA_RESERVE_PREFERENCE, it) } },
         { onSuccess(it.toConnectionIntentServiceStatus()) },
         onError,
-        foreground = true,
     )
 
     fun start(
@@ -498,7 +500,6 @@ internal object TunnelServiceClient {
             )
         },
         onError,
-        foreground = true,
     )
 
     fun clearQuickPlan(
@@ -694,6 +695,7 @@ internal fun QuickConnectionArgs.toBundle(): Bundle = Bundle().apply {
     putString("route_mode", routeMode)
     putString("egress_mode", egressMode)
     putBoolean("allow_alternate", allowAlternate)
+    reserveEnabled?.let { putBoolean("reserve_enabled", it) }
 }
 
 internal fun Bundle.toQuickConnection(): QuickConnectionArgs = QuickConnectionArgs().also {
@@ -703,6 +705,7 @@ internal fun Bundle.toQuickConnection(): QuickConnectionArgs = QuickConnectionAr
     it.routeMode = requireNotNull(getString("route_mode"))
     it.egressMode = getString("egress_mode") ?: "ipv4"
     it.allowAlternate = getBoolean("allow_alternate")
+    it.reserveEnabled = if (containsKey("reserve_enabled")) getBoolean("reserve_enabled") else null
 }
 
 private fun RedundantHealthProbeArgs.toBundle(): Bundle = Bundle().apply {

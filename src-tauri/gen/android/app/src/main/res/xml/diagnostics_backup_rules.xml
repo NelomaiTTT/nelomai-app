@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Runtime operational state and frozen diagnostic attachments are device-local.
-     Preferences live outside these state directories and remain backup-eligible. -->
+<!-- Shared preferences and runtime/common state are device-bound operational data.
+     User preferences are file-based and remain backup-eligible. -->
 <full-backup-content>
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="file" path="common" />
+    <exclude domain="file" path="runtime-container" />
     <exclude domain="file" path="diagnostics/automatic" />
     <exclude domain="file" path="runtime/latest/state" />
     <exclude domain="file" path="runtime/stable/state" />

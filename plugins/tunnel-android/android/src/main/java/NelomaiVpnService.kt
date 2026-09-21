@@ -973,7 +973,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         if (pendingRedundantStop != null || redundantCancelTombstoneUnreadable) {
             schedulePendingRedundantStopRetry()
         }
-        if (intent == null || intent.action in FOREGROUND_ACTIONS) {
+        if ((intent == null || intent.action in FOREGROUND_ACTIONS) &&
+            requiresVpnStartAdmission(applicationContext, intent)
+        ) {
             promoteToForeground()
         }
         if (intent == null) {
@@ -1421,6 +1423,11 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             onDiagnosticEvent = { event ->
                 AutomaticDiagnostics.onRedundantEvent(event, native.diagnosticMetrics())
             },
+            onRecoveryReadiness = { ready ->
+                coordinatorOwner?.let { owner ->
+                    publishRedundantRecoveryReadiness(transaction.startOperationId, owner, ready)
+                }
+            },
             expectedStartOperationId = transaction.startOperationId,
             mutationFence = redundantMutationFence,
         )
@@ -1698,6 +1705,30 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 .onFailure { TunnelLog.warning("redundant.resume_failed") }
         }
         return true
+    }
+
+    private fun publishRedundantRecoveryReadiness(
+        operationId: String,
+        owner: RedundantVpnProcessOwner,
+        ready: Boolean,
+    ) {
+        restoreHandler.post {
+            if (!serviceCallbackGate.isOpen() || serviceDestroyed || redundantStartBlocked() ||
+                redundantOwnerForOperation(operationId) !== owner
+            ) return@post
+            val transaction = (recoveryStore.read() as? RecoveryStoreResult.Success)
+                ?.value?.redundantTransaction ?: return@post
+            if (transaction.startOperationId != operationId || !transaction.desiredActive ||
+                transaction.retry.stopState != RedundantStopState.NONE
+            ) return@post
+            if (ready && owner.isRunning()) {
+                QuickTunnelController.updateState(applicationContext, SessionState.RUNNING,
+                    desiredActive = null, changed = true)
+            } else if (!ready && !owner.isRunning()) {
+                // A failed first handshake must not leave a tile stuck at STARTING.
+                beginFailClosedRedundantStop(operationId, owner)
+            }
+        }
     }
 
     private fun finishRedundantStart(operationId: String) {
@@ -2748,10 +2779,22 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
     private fun handleReleaseRedundantStandby(intent: Intent) {
         val receiver = intent.resultReceiver()
+        val preference = if (intent.hasExtra(EXTRA_RESERVE_PREFERENCE)) {
+            intent.getBooleanExtra(EXTRA_RESERVE_PREFERENCE, false)
+        } else null
+        // Keep all v2 quick-plan writes in the VPN process, alongside plan publication.
+        if (preference != null && !runCatching {
+                QuickTunnelPlanStore.updateReservePreference(applicationContext, preference)
+            }.getOrDefault(false)
+        ) {
+            receiver.sendError("quick_plan_write_failed")
+            stopIfIdle()
+            return
+        }
         val recovery = recoveryStore.read()
         val envelope = (recovery as? RecoveryStoreResult.Success)?.value
         val transaction = envelope?.redundantTransaction
-        if (transaction == null) {
+        if (transaction == null || preference == true) {
             if (envelope == null) receiver.sendError("redundant_recovery_unavailable")
             else receiver?.send(
                 SERVICE_RESULT_OK,
@@ -4094,6 +4137,12 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
 
     private fun completeConnectionIntentStep(step: AndroidCoordinatorStep) {
         val envelope = (connectionIntentCoordinator.status() as? RecoveryStoreResult.Success)?.value
+        if (envelope?.redundantTransaction != null) {
+            // A background v2 allocation has durably transferred ownership. The existing
+            // recovery path also covers a process death between this write and this callback.
+            handleEnsureRunning()
+            return
+        }
         if (!shouldApplyConnectionIntentStepNow(envelope)) {
             if (pendingRedundantStop != null || redundantCancelTombstoneUnreadable) {
                 schedulePendingRedundantStopRetry()
@@ -4336,7 +4385,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 serviceCredential(),
                 stalledLeaseId?.let { requireNotNull(transaction.stopOperationId) }
                     ?: transaction.startOperationId,
-                if (stalledLeaseId == null) "start" else "stalled_stop",
+                if (stalledLeaseId != null) "stalled_stop"
+                else if (transaction.replay.contractVersion == 2) "redundant_start" else "start",
                 transaction.replay.contractVersion,
                 stalledLeaseId?.let(::androidStalledStopFingerprint)
                     ?: transaction.replay.requestFingerprint,
@@ -4779,11 +4829,16 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         }
 
         fun requestToggle(context: Context) {
-            ContextCompat.startForegroundService(
-                context,
-                ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(
-                    ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context).setAction(ACTION_QUICK_TOGGLE)),
-            )
+            val intent = ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+                .setAction(ACTION_QUICK_TOGGLE)
+            if (requiresVpnStartAdmission(context, intent)) {
+                ContextCompat.startForegroundService(
+                    context,
+                    ru.nelomai.runtime.v1.RuntimeServiceIntents.foreground(intent),
+                )
+            } else {
+                context.startService(intent)
+            }
         }
 
         fun stopForegroundService() {
@@ -5198,6 +5253,9 @@ internal fun selectQuickStartPolicy(
     ) {
         throw BackgroundConnectionException("background_credential_provision_pending")
     } else {
+        if (template.reserveEnabled != null) {
+            throw BackgroundConnectionException("background_credential_capability_unavailable")
+        }
         return AndroidQuickStartPolicy.LEGACY
     }
     val refreshed = refreshBackgroundCapability(before.capability, nowUnix) {
@@ -5217,6 +5275,9 @@ internal fun selectQuickStartPolicy(
     return if (capability.enabled && capability.expiresAtUnix > nowUnix) {
         AndroidQuickStartPolicy.RECOVERY
     } else {
+        if (template.reserveEnabled != null) {
+            throw BackgroundConnectionException("background_credential_capability_unavailable")
+        }
         AndroidQuickStartPolicy.LEGACY
     }
 }
@@ -5804,6 +5865,11 @@ internal fun connectionIntentServiceStatus(
     envelope: AndroidRecoveryEnvelope,
     reserveState: String? = null,
 ): ConnectionIntentServiceStatus {
+    // The UI must not fall back to a per-lease stop while the service owns
+    // cleanup of a whole redundant session (which has no v1 leaseTransaction).
+    if (envelope.redundantTransaction != null && !envelope.intent.desiredActive) {
+        return redundantStoppingConnectionIntentStatus(envelope)
+    }
     val transaction = envelope.leaseTransaction
     val status = when {
         transaction?.phase == LeasePhase.CLEANUP_PENDING ||
@@ -5834,7 +5900,7 @@ internal fun redundantStoppingConnectionIntentStatus(
     generation = envelope.intent.generation,
     desiredActive = false,
     status = "stopping",
-    leasePhase = null,
+    leasePhase = LeasePhase.CLEANUP_PENDING.wireName,
     nextRetryAtUnix = null,
     lastErrorCode = null,
 )
@@ -5889,6 +5955,7 @@ internal fun quickConnectionIntentTemplate(
         egressMode = selected.egressMode,
         allowAlternate = selected.allowAlternate,
         options = normalizeAndroidTunnelOptions(androidApiLevel, quick.options),
+        reserveEnabled = selected.reserveEnabled,
     )
 }
 
@@ -5975,8 +6042,10 @@ internal class AndroidConnectionIntentCoordinator(
         )
         val replay = AndroidStartReplay(
             startOperationId = operationId(),
-            contractVersion = 1,
-            requestFingerprint = androidConnectionIntentFingerprint(template, measured),
+            contractVersion = if (template.reserveEnabled == null) 1 else 2,
+            requestFingerprint = androidConnectionIntentFingerprint(
+                template, measured, template.reserveEnabled,
+            ),
         )
         if (current.isTerminalConnectionIntent()) {
             return when (val result = store.restartTerminal(
@@ -6136,6 +6205,9 @@ internal class AndroidConnectionIntentCoordinator(
                 !canStart()
             ) {
                 return AndroidCoordinatorStep.BUSY
+            }
+            if (transaction.replay.contractVersion == 2) {
+                return runPendingRedundantStart(envelope, transaction, panel, runtime, canStart)
             }
             resumePendingAction(
                 envelope,
@@ -6568,6 +6640,51 @@ internal class AndroidConnectionIntentCoordinator(
         val RETRY_DELAYS_SECONDS = longArrayOf(2, 5, 15, 30, 60, 300)
     }
 
+    private fun runPendingRedundantStart(
+        envelope: AndroidRecoveryEnvelope,
+        transaction: AndroidLeaseTransaction,
+        panel: AndroidConnectionIntentPanel,
+        runtime: AndroidConnectionIntentRuntime,
+        canStart: () -> Boolean,
+    ): AndroidCoordinatorStep {
+        require(transaction.leaseId == null)
+        if (!envelope.intent.desiredActive) return cleanup(panel, runtime)
+        val reconciled = panel.reconcile(transaction, cancelIfAbsent = false)
+        fun stillDesired(): Boolean {
+            val current = store.read().coordinatorEnvelopeOrThrow()
+            return current.intent.desiredActive && current.intent.generation == transaction.generation
+        }
+        if (!stillDesired()) return cleanup(panel, runtime)
+        if (!canStart()) return AndroidCoordinatorStep.BUSY
+        when (reconciled.state) {
+            "pending", "applying", "compensating" ->
+                return recordDirectRetry("operation_reconcile_pending")
+            "terminal", "cancelled" -> return closeAuthoritativePendingStartAndRetry(
+                envelope, transaction, "operation_reconcile_${reconciled.state}",
+            )
+            "not_found", "applied" -> Unit
+            else -> return recordTerminalFailure("invalid_background_response")
+        }
+        val template = requireNotNull(envelope.intent.template)
+        if (reconciled.state == "not_found" && template.syncBindingPreferences) {
+            panel.syncBindingPreferences(template)
+            if (!stillDesired()) return cleanup(panel, runtime)
+            if (!canStart()) return AndroidCoordinatorStep.BUSY
+        }
+        val result = panel.start(template, transaction)
+        try {
+            if (!stillDesired()) return cleanup(panel, runtime)
+            if (!canStart()) return AndroidCoordinatorStep.BUSY
+            val redundant = result.redundantTransaction
+                ?: throw BackgroundConnectionException("invalid_background_response")
+            store.promotePendingRedundant(transaction, redundant).coordinatorEnvelopeOrThrow()
+            // The service resumes the durable v2 owner, never the single-lease runtime.
+            return AndroidCoordinatorStep.BUSY
+        } finally {
+            result.configuration.fill(0)
+        }
+    }
+
     private fun runPendingStart(
         envelope: AndroidRecoveryEnvelope,
         transaction: AndroidLeaseTransaction,
@@ -6900,6 +7017,11 @@ internal class AndroidConnectionIntentCoordinator(
                     AndroidCoordinatorStep.IDLE
                 }
                 "applied" -> {
+                    if (transaction.replay.contractVersion == 2) {
+                        // Reconcile cancels the whole session on the panel. Never turn its
+                        // primary lease into a v1 stop while the standby may still exist.
+                        return recordDirectRetry("operation_reconcile_pending")
+                    }
                     val leaseId = reconciled.leaseId
                         ?: throw BackgroundConnectionException("invalid_background_response")
                     store.requireCleanup(envelope.intent.generation, leaseId, operationId())
@@ -6984,14 +7106,23 @@ private fun RecoveryStoreResult<AndroidRecoveryEnvelope>.coordinatorEnvelopeOrTh
 internal fun androidConnectionIntentFingerprint(
     template: AndroidIntentTemplate,
     requireMeasuredSelection: Boolean,
+    reserveEnabled: Boolean? = null,
 ): String {
     val canonical = buildString {
         append("{\"egress_mode\":\"")
         append(template.egressMode)
-        append("\",\"kind\":\"start\",\"layer\":\"")
+        append("\",\"kind\":\"")
+        append(if (reserveEnabled == null) "start" else "redundant_start")
+        append("\",\"layer\":\"")
         append(template.layer)
-        append("\",\"require_measured_selection\":")
+        append('"')
+        if (reserveEnabled != null) append(",\"redundancy_contract_version\":1")
+        append(",\"require_measured_selection\":")
         append(requireMeasuredSelection)
+        if (reserveEnabled != null) {
+            append(",\"reserve_enabled\":")
+            append(reserveEnabled)
+        }
         append(",\"route_mode\":\"")
         append(template.routeMode)
         append("\",\"tic_connection_mode\":\"")

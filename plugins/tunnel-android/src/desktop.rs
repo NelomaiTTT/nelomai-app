@@ -116,6 +116,13 @@ impl<R: Runtime> TunnelAndroid<R> {
         Ok(ConnectionIntentStatusResponse::default())
     }
 
+    pub async fn set_reserve_preference(
+        &self,
+        _enabled: bool,
+    ) -> crate::Result<ConnectionIntentStatusResponse> {
+        Ok(ConnectionIntentStatusResponse::default())
+    }
+
     pub fn clear_background(&self) -> crate::Result<()> {
         Ok(())
     }

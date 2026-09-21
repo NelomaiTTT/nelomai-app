@@ -20,6 +20,7 @@
     finishConnectionStop,
     initialConnectionActionState,
     isCurrentConnectionAction,
+    prepareConnectionStartForPlatform,
   } from "$lib/connection-action";
   import {
     historyStateForOverlay,
@@ -703,6 +704,7 @@
       forceStop || connectionAction === "stop" || connectionActionState.startBusy;
     if (!canBeginConnectionAction(connectionActionState, busy, stopping)) return;
     const startDeviceId = bootstrap?.device.id;
+    const startPlatform = bootstrap?.device.platform;
     if (!stopping && !startDeviceId) return;
     const action = stopping
       ? beginConnectionStop(connectionActionState)
@@ -723,6 +725,12 @@
         if (!startDeviceId) return;
         phase = "connecting";
         connectionMetrics = null;
+        if (!await prepareConnectionStartForPlatform(
+          startPlatform ?? "unknown",
+          startDeviceId,
+          nativeClient.prepareTunnel,
+          () => isCurrentConnectionAction(connectionActionState, action.token),
+        )) return;
         const effectiveTicConnectionMode =
           selectedLayer === "stray" ? "dynamic" : ticConnectionMode;
         const startResult = await nativeClient.start({

@@ -101,12 +101,26 @@ class RedundantProductionAdaptersTest {
     fun receiveProgressClearsRetainedFailureEvidence() {
         val fixture = suspectedFixture()
         fixture.backend.setUdpPackets(sent = 10, received = 1)
+        fixture.backend.decryptedReceivePackets = 1
 
         val recovered = fixture.native.healthObservations().single()
 
         assertFalse(recovered.probeFailed)
         assertFalse(recovered.independentFailureSignal)
         assertEquals(null, recovered.softFailureStartedAtMs)
+    }
+
+    @Test
+    fun handshakeOnlyReceiveProgressDoesNotHideBrokenDataPlane() {
+        val fixture = suspectedFixture()
+        // The server can retransmit handshakes while every client datagram is lost.
+        // No authenticated IP packet or DNS reply has returned through this slot.
+        fixture.backend.setUdpPackets(sent = 10, received = 6)
+
+        val observation = fixture.native.healthObservations().single()
+
+        assertTrue(observation.probeFailed)
+        assertTrue(observation.independentFailureSignal)
     }
 
     @Test
@@ -448,7 +462,7 @@ class RedundantProductionAdaptersTest {
         )
         assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
         backend.metricsOverride = {
-            """{"slots":[{"slot":0,"admitted":true,"closed":true,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"udp_send_packets":0,"udp_receive_packets":0}}]}"""
+            """{"slots":[{"slot":0,"admitted":true,"closed":true,"latest_handshake_at_unix_ms":1000000,"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":0,"udp_send_packets":0,"udp_receive_packets":0}}]}"""
         }
 
         val observation = native.healthObservations().single()
@@ -558,6 +572,7 @@ private class RecordingSessionBackend(
     val rebindFailures = mutableSetOf<Int>()
     var latestProbeToken: Long? = null
     var countProbeSend = true
+    var decryptedReceivePackets = 0L
     var metricsOverride: (() -> String?)? = null
     private val admitted = mutableSetOf<Int>()
     private var nextToken = 1L
@@ -619,7 +634,7 @@ private class RecordingSessionBackend(
             prefix = "{\"slots\":[",
             postfix = "]}",
         ) { slot ->
-            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"udp_send_packets":$udpSendPackets,"udp_receive_packets":$udpReceivePackets}}"""
+            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$udpSendPackets,"udp_receive_packets":$udpReceivePackets}}"""
         }
     }
 

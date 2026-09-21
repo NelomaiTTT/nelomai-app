@@ -406,7 +406,7 @@ async fn common_owner_is_ready_without_loading_product_runtime_and_rejects_forei
         .is_err());
     assert_eq!(
         host.broker().observe().await.unwrap().state,
-        nelomai_client_container::BrokerAuthState::RecoveryRequired
+        nelomai_client_container::BrokerAuthState::LoggedOut
     );
     let (stream, mut accepted_peer) = tokio::io::duplex(1024);
     assert!(host

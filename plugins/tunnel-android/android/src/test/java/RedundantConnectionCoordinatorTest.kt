@@ -10,6 +10,121 @@ import java.util.concurrent.atomic.AtomicReference
 
 class RedundantConnectionCoordinatorTest {
     @Test
+    fun recoveryTransportFailureRetriesSameSessionWithoutCancellingDesiredIntent() {
+        for (code in listOf("background_transport_unavailable", "http_5xx", "operation_in_progress")) {
+            val store = emptyStore()
+            store.beginRedundant(transaction())
+            val original = transaction()
+            var now = 0L
+            val readiness = mutableListOf<Boolean>()
+            val panel = FakePanel(recoverErrors = ArrayDeque(listOf(
+                BackgroundConnectionException(code, retryAfterHeader = "2"))))
+            val native = FakeNative()
+            val coordinator = RedundantConnectionCoordinator(store, panel, native,
+                epochNowMs = { now },
+                onRecoveryReadiness = { readiness += it })
+            assertFalse(coordinator.recover())
+            assertTrue(readiness.isEmpty())
+            assertFalse(coordinator.isRunning())
+            assertTrue(native.started.isEmpty())
+            assertEquals(original, coordinator.status())
+            now = 1_999
+            assertFalse(coordinator.tick())
+            assertFalse(coordinator.resume())
+            assertEquals(1, panel.recoverCalls)
+            now = 2_000
+            assertTrue(coordinator.tick())
+            assertTrue(coordinator.isRunning())
+            assertEquals(listOf(true), readiness)
+            assertEquals(listOf(original.startOperationId, original.startOperationId), panel.recoveredOperations)
+            assertTrue(requireNotNull(coordinator.status()).desiredActive)
+        }
+    }
+
+    @Test
+    fun recoveryUsesBackoffAndProcessRecreationKeepsTheSameOperation() {
+        val store = store(transaction())
+        var now = 0L
+        val panel = FakePanel(recoverErrors = ArrayDeque(List(2) {
+            BackgroundConnectionException("background_transport_unavailable")
+        }))
+        val coordinator = RedundantConnectionCoordinator(store, panel, FakeNative(), epochNowMs = { now })
+        assertFalse(coordinator.resume())
+        now = 2_000
+        assertFalse(coordinator.tick())
+        now = 6_999
+        assertFalse(coordinator.tick())
+        assertEquals(2, panel.recoverCalls)
+        // A recreated process replays the durable session, not a new start operation.
+        val recreated = RedundantConnectionCoordinator(store, panel, FakeNative())
+        assertTrue(recreated.resume())
+        assertEquals(List(3) { transaction().startOperationId }, panel.recoveredOperations)
+        assertEquals(transaction().startRequestFingerprint, recreated.status()?.startRequestFingerprint)
+    }
+
+    @Test
+    fun nativeRecoveryFailureIsTerminalAndDoesNotEnterControlPlaneRetry() {
+        val panel = FakePanel()
+        val readiness = mutableListOf<Boolean>()
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), panel,
+            FakeNative(startFailures = setOf("lease-a")), onRecoveryReadiness = { readiness += it })
+        assertFalse(coordinator.recover())
+        assertEquals(listOf(false), readiness)
+        assertFalse(coordinator.tick())
+        assertFalse(coordinator.resume())
+        assertEquals(1, panel.recoverCalls)
+    }
+
+    @Test
+    fun cancelledRecoveryDoesNotRetryAndTerminalFailureStillPublishesFailure() {
+        val store = emptyStore()
+        store.beginRedundant(transaction())
+        var now = 0L
+        val panel = FakePanel(recoverErrors = ArrayDeque(listOf(
+            BackgroundConnectionException("http_5xx", "1"))))
+        val native = FakeNative()
+        val coordinator = RedundantConnectionCoordinator(store, panel, native, epochNowMs = { now })
+        assertFalse(coordinator.recover())
+        store.cancelRedundantIntentAndDeferStop("stop-op", transaction().startOperationId)
+        now = 2_000
+        assertFalse(coordinator.tick())
+        assertEquals(1, panel.recoverCalls)
+        assertTrue(native.started.isEmpty())
+
+        val terminalStore = emptyStore()
+        terminalStore.beginRedundant(transaction())
+        val readiness = mutableListOf<Boolean>()
+        val terminal = RedundantConnectionCoordinator(terminalStore,
+            FakePanel(recoverErrors = ArrayDeque(listOf(BackgroundConnectionException("invalid_background_token")))),
+            FakeNative(), onRecoveryReadiness = { readiness += it })
+        runCatching { terminal.recover() }
+        assertEquals(listOf(false), readiness)
+    }
+
+    @Test
+    fun recoveredBackgroundSessionPublishesReadinessOnlyAfterProbeAndPublishesFailure() {
+        for (healthy in listOf(true, false)) {
+            val store = emptyStore()
+            store.beginRedundant(transaction())
+            val events = mutableListOf<Boolean>()
+            val native = FakeNative().apply {
+                healthSnapshots += listOf(healthSlot(0, active = true,
+                    health = if (healthy) BackendHealth.READY else BackendHealth.UNHEALTHY,
+                    handshakeFresh = healthy, consecutiveProbeSuccesses = if (healthy) 3 else 0,
+                    stableSinceMs = 0))
+            }
+            val coordinator = RedundantConnectionCoordinator(store,
+                FakePanel(recoveryHealthProbes = mapOf("lease-a" to probe())), native,
+                onRecoveryReadiness = { events += it })
+            assertTrue(coordinator.recover())
+            assertTrue(events.isEmpty())
+            coordinator.tick()
+            assertEquals(listOf(healthy), events)
+            assertEquals(healthy, coordinator.isRunning())
+        }
+    }
+
+    @Test
     fun primaryIsReportedOnlyAfterItsDataplaneBecomesReady() {
         val native = FakeNative().apply {
             healthSnapshots += listOf(
@@ -27,9 +142,10 @@ class RedundantConnectionCoordinatorTest {
             )
         }
         var reports = 0
+        val panel = FakePanel()
         val coordinator = RedundantConnectionCoordinator(
             emptyStore(),
-            FakePanel(),
+            panel,
             native,
         )
 
@@ -61,6 +177,29 @@ class RedundantConnectionCoordinatorTest {
         assertTrue(coordinator.isRunning())
         assertEquals(1, reports)
         assertTrue(native.healthSnapshots.isEmpty())
+        assertTrue(coordinator.tick())
+        assertEquals(listOf("primary_ready"), panel.roleReasons)
+    }
+
+    @Test
+    fun initialReadyReportRetriesWithoutReserveAndWithoutRestartingNative() {
+        val native = FakeNative().apply {
+            healthSnapshots += listOf(healthSlot(0, active = true,
+                health = BackendHealth.READY, handshakeFresh = true,
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0))
+        }
+        val panel = FakePanel(roleFailures = ArrayDeque(listOf(true, false)))
+        val coordinator = RedundantConnectionCoordinator(emptyStore(), panel, native)
+        assertTrue(coordinator.start(transaction().copy(standbyDesired = false),
+            mapOf("lease-a" to byteArrayOf(1)), mapOf("lease-a" to probe())))
+        assertTrue(coordinator.tick())
+        assertTrue(coordinator.isRunning())
+        assertFalse(coordinator.tick())
+        assertTrue(requireNotNull(coordinator.status()).retry.roleObservationPending)
+        assertTrue(coordinator.tick())
+        assertFalse(requireNotNull(coordinator.status()).retry.roleObservationPending)
+        assertEquals(listOf("primary_ready", "primary_ready"), panel.roleReasons)
+        assertEquals(listOf("lease-a"), native.started)
     }
 
     @Test
@@ -77,6 +216,32 @@ class RedundantConnectionCoordinatorTest {
 
         assertTrue(coordinator.onUnderlyingNetworkChanged(validated = false))
         assertEquals(listOf("lease-a", "lease-b"), native.rebound)
+    }
+
+    @Test
+    fun failedReadyPersistFailsStartWithoutLeavingNativeRunning() {
+        val backend = CoordinatorRecordBackend()
+        backend.write(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1)))
+        val store = AndroidRecoveryStore(backend, CoordinatorBootIdentity())
+        val native = FakeNative().apply {
+            healthSnapshots += listOf(healthSlot(0, active = true,
+                health = BackendHealth.READY, handshakeFresh = true,
+                consecutiveProbeSuccesses = 3, stableSinceMs = 0))
+        }
+        val panel = FakePanel()
+        var failed = 0
+        var ready = 0
+        val coordinator = RedundantConnectionCoordinator(store, panel, native)
+        assertTrue(coordinator.start(transaction(),
+            mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+            mapOf("lease-a" to probe()), onPrimaryStarted = { ready++ },
+            onPrimaryFailed = { failed++ }))
+        backend.failOnWriteNumber = backend.writeCount + 1
+        assertFalse(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+        assertEquals(0, ready)
+        assertEquals(1, failed)
+        assertEquals(0, panel.roleCalls)
     }
 
     @Test
@@ -1001,6 +1166,92 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun processRecoveryRetriesPendingActivationBeforePublishingReadiness() {
+        val panel = FakePanel(
+            recoveredSession = session("lease-a", 2, 1),
+            recoveryHealthProbes = mapOf("lease-b" to probe()),
+        )
+        val native = FakeNative(activateResults = ArrayDeque(listOf(false, true))).apply {
+            healthSnapshots += listOf(healthSlot(1, active = true, health = BackendHealth.READY,
+                handshakeFresh = true, consecutiveProbeSuccesses = 3, stableSinceMs = 0))
+        }
+        val readiness = mutableListOf<Boolean>()
+        val coordinator = RedundantConnectionCoordinator(store(pendingNativeSwitch()), panel, native,
+            onRecoveryReadiness = { readiness += it })
+
+        assertFalse(coordinator.recover())
+        assertTrue(readiness.isEmpty())
+        assertTrue(requireNotNull(coordinator.status()).desiredActive)
+        assertEquals(1, coordinator.status()?.retry?.pendingNativeSwitchAttempt)
+        assertTrue(coordinator.tick())
+        assertFalse(coordinator.isRunning())
+        assertTrue(readiness.isEmpty())
+        assertTrue(coordinator.tick())
+        assertTrue(coordinator.isRunning())
+        assertEquals(listOf(true), readiness)
+        assertEquals("lease-b", coordinator.status()?.localActiveLeaseId)
+        assertEquals(null, coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+        assertEquals(listOf("lease-b", "lease-b"), native.activationAttempts)
+        assertEquals(listOf("start-operation", "start-operation"), panel.recoveredOperations)
+    }
+
+    @Test
+    fun processRecoveryExhaustsSwitchRetriesBeforeRestoringSourceOrRequestingRestart() {
+        for (sourceUsable in listOf(true, false)) {
+            val panel = FakePanel(recoveredSession = session("lease-a", 2, 1),
+                recoveryHealthProbes = mapOf("lease-a" to probe(), "lease-b" to probe()))
+            val native = FakeNative(
+                usable = if (sourceUsable) setOf("lease-a", "lease-b") else setOf("lease-b"),
+                activateResults = ArrayDeque(listOf(false, false, false, true)),
+            ).apply {
+                healthSnapshots += listOf(healthSlot(0, active = true, health = BackendHealth.READY,
+                    handshakeFresh = true, consecutiveProbeSuccesses = 3, stableSinceMs = 0))
+            }
+            val readiness = mutableListOf<Boolean>()
+            var restarts = 0
+            val coordinator = RedundantConnectionCoordinator(store(pendingNativeSwitch()), panel, native,
+                onRecoveryReadiness = { readiness += it }, onAllSlotsStalled = { restarts += 1 })
+            assertFalse(coordinator.recover())
+            assertTrue(readiness.isEmpty())
+            assertFalse(coordinator.tick())
+            assertFalse(coordinator.tick())
+            assertTrue(readiness.isEmpty())
+            assertEquals(3, native.activationAttempts.count { it == "lease-b" })
+            assertEquals(if (sourceUsable) 0 else 1, restarts)
+            if (sourceUsable) {
+                assertEquals("lease-a", coordinator.status()?.localActiveLeaseId)
+                assertEquals(null, coordinator.status()?.retry?.pendingNativeActiveLeaseId)
+                assertTrue(coordinator.tick())
+                assertFalse(coordinator.isRunning())
+                assertTrue(coordinator.tick())
+                assertTrue(coordinator.isRunning())
+                assertEquals(listOf(true), readiness)
+            } else {
+                assertFalse(coordinator.tick())
+                assertFalse(coordinator.resume())
+                assertEquals(1, restarts)
+            }
+        }
+    }
+
+    @Test
+    fun cancellationBetweenRecoveredSwitchAttemptsPreventsAnotherActivation() {
+        val store = store(pendingNativeSwitch())
+        val native = FakeNative(activateResults = ArrayDeque(listOf(false, true)))
+        val readiness = mutableListOf<Boolean>()
+        val coordinator = RedundantConnectionCoordinator(store,
+            FakePanel(recoveredSession = session("lease-a", 2, 1)), native,
+            onRecoveryReadiness = { readiness += it })
+        assertFalse(coordinator.recover())
+        assertTrue(readiness.isEmpty())
+        store.cancelRedundantIntentAndDeferStop("stop-operation", "start-operation")
+        assertFalse(coordinator.tick())
+        assertEquals(listOf("lease-b"), native.activationAttempts)
+        assertTrue(readiness.isEmpty())
+        assertFalse(requireNotNull(coordinator.status()).desiredActive)
+    }
+
+    @Test
     fun missingPendingTargetConfigurationRetainsWalWithoutStartingTheSource() {
         val pending = pendingNativeSwitch()
         val panel = FakePanel(
@@ -1214,6 +1465,8 @@ class RedundantConnectionCoordinatorTest {
         assertTrue(coordinator.releaseStandby())
         val released = requireNotNull(coordinator.status())
         assertFalse(released.standbyDesired)
+        assertEquals(transaction().startReserveEnabled, released.startReserveEnabled)
+        assertEquals(transaction().startRequestFingerprint, released.startRequestFingerprint)
         assertFalse(released.retry.acquirePending)
         assertEquals(null, released.retry.nextRetryAtUnix)
 
@@ -1899,6 +2152,7 @@ private class FakePanel(
     private val roleFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val roleFailureCodes: ArrayDeque<String> = ArrayDeque(),
     private val recoverFailures: ArrayDeque<Boolean> = ArrayDeque(),
+    private val recoverErrors: ArrayDeque<BackgroundConnectionException> = ArrayDeque(),
     private val acquireFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val commitFailures: ArrayDeque<Boolean> = ArrayDeque(),
     private val releaseFailures: ArrayDeque<Boolean> = ArrayDeque(),
@@ -1909,7 +2163,9 @@ private class FakePanel(
 ) : RedundantConnectionPanel {
     var stopCalls = 0
     var roleCalls = 0
+    val roleReasons = mutableListOf<String>()
     var recoverCalls = 0
+    val recoveredOperations = mutableListOf<String>()
     var commitCalls = 0
     val acquireOperationIds = mutableListOf<String>()
     val acquireReplaceLeaseIds = mutableListOf<String?>()
@@ -1919,6 +2175,8 @@ private class FakePanel(
     val releaseAttempts = mutableListOf<String?>()
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
         recoverCalls += 1
+        recoveredOperations += transaction.startOperationId
+        recoverErrors.removeFirstOrNull()?.let { throw it }
         if (recoverFailures.removeFirstOrNull() == true) {
             throw BackgroundConnectionException("offline")
         }
@@ -1945,6 +2203,7 @@ private class FakePanel(
     }
     override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
         roleCalls += 1
+        roleReasons += reason
         roleFailureCodes.removeFirstOrNull()?.let { throw BackgroundConnectionException(it) }
         if (roleFailures.removeFirstOrNull() == true) throw BackgroundConnectionException("offline")
         return if (role?.action == "rebase" && roleCalls > 1) {

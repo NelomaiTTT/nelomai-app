@@ -31,7 +31,9 @@ class RuntimeV2DispatchTest {
             intent.component,
         )
         assertEquals(NelomaiVpnService.ACTION_RELEASE_REDUNDANT_STANDBY, intent.action)
-        assertTrue(intent.getBooleanExtra(RuntimeServiceIntents.EXTRA_FOREGROUND_START, false))
+        // Preference/cleanup dispatch does not establish VPN and must not require
+        // foreground VPN admission while the tunnel is stopped.
+        assertFalse(intent.getBooleanExtra(RuntimeServiceIntents.EXTRA_FOREGROUND_START, false))
     }
 
     @Test fun taskRemovalLivenessTargetsRuntimeDispatcher() {

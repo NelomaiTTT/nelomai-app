@@ -1039,6 +1039,43 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn fresh_install_reports_logged_out() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::LoggedOut
+    );
+}
+
+#[tokio::test]
+async fn migrated_credentials_without_confirmed_identity_still_require_recovery() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.access_token = Some("legacy-access".into());
+    auth.refresh_token = Some("legacy-refresh".into());
+    fixture.auth.save(&auth).unwrap();
+
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::RecoveryRequired
+    );
+}
+
+#[tokio::test]
+async fn pending_auth_cleanup_is_not_mislabeled_as_pristine_logout() {
+    let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+    let mut auth = fixture.auth.load().unwrap().unwrap();
+    auth.broker.as_mut().unwrap().pending_push_cleanup_epoch = Some(0);
+    fixture.auth.save(&auth).unwrap();
+
+    assert_eq!(
+        fixture.client.state().await.unwrap(),
+        RuntimeAuthState::RecoveryRequired
+    );
+}
+
 struct AdmissionPause {
     after_commit: bool,
     entered: tokio::sync::Notify,
@@ -1830,6 +1867,303 @@ async fn same_client_logout_cancels_its_login_after_ticket_and_real_http_started
         LogoutState::LoggedOut
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn logout_then_login_refreshes_scope_before_reaching_http() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = ClientApi::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let router = axum::Router::new().fallback(move || {
+        let counted = counted.clone();
+        async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            axum::http::StatusCode::BAD_REQUEST
+        }
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let fixture = Fixture::new(api, false);
+    fixture.client.state().await.unwrap();
+    fixture.client.logout().await.unwrap();
+
+    let result = fixture
+        .client
+        .login(RuntimeLogin {
+            login: "synthetic".into(),
+            password: "synthetic".into(),
+            device_name: "fixture".into(),
+        })
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the next login must refresh the post-logout scope and reach HTTP"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn pre_logout_state_reply_cannot_restore_invalidated_cached_scope() {
+    for logout_reply_first in [false, true] {
+        let stamp_fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), false);
+        let (old_stamp, _) = stamp_fixture.broker.observe_stamped().await.unwrap();
+        let new_stamp_fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+        let (new_stamp, new_observation) =
+            new_stamp_fixture.broker.observe_stamped().await.unwrap();
+        let new_access = new_observation.access.unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let legacy = StoredAuth::new_install();
+        let paths = RuntimePaths::new(root.path(), RuntimeSlot::Stable, "0.2.16").unwrap();
+        let store = ProtectedRuntimeStore::new(Record::default(), paths);
+        let mut initial = RuntimeStateV1::import_legacy(
+            &legacy,
+            StoredSplitTunnelState::default(),
+            store.paths(),
+        );
+        initial.cleanup_only = false;
+        store.save(&initial).unwrap();
+        let record = RuntimeRecordOwner::new(store);
+        let stop = CoreLocalStop::new(Arc::new(Tunnel::default()));
+        let child = Arc::new(ChildAdmission::new(
+            "cache-race-child".into(),
+            stop.runtime_writer_gates(),
+            Arc::new(RuntimeRecordInventory::new(record, vec![])),
+        ));
+        let (mut owner_socket, child_socket) = private_socketpair().unwrap();
+        let client = Arc::new(PrivateRuntimeAuthClient::new(
+            child_socket,
+            child.clone(),
+            stop,
+        ));
+        let deadline = || Instant::now() + REQUEST_BUDGET;
+
+        let initial_client = client.clone();
+        let initial_state = tokio::spawn(async move { initial_client.state().await });
+        let initial_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(matches!(
+            initial_request.message,
+            MessageV1::Request(AuthRequestV1::State)
+        ));
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(
+                initial_request.id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp: old_stamp.clone(),
+                    state: RuntimeAuthState::LoggedOut,
+                }),
+            ),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            initial_state.await.unwrap().unwrap(),
+            RuntimeAuthState::LoggedOut
+        );
+
+        let delayed_client = client.clone();
+        let delayed_state = tokio::spawn(async move { delayed_client.state().await });
+        let delayed_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(matches!(
+            delayed_request.message,
+            MessageV1::Request(AuthRequestV1::State)
+        ));
+
+        let logout_client = client.clone();
+        let logout = tokio::spawn(async move { logout_client.logout().await });
+        let logout_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(matches!(
+            logout_request.message,
+            MessageV1::Request(AuthRequestV1::Logout { .. })
+        ));
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(logout_request.id, MessageV1::Response(AuthResponseV1::Done)),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        logout.await.unwrap().unwrap();
+
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(
+                delayed_request.id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp: old_stamp.clone(),
+                    state: RuntimeAuthState::LoggedOut,
+                }),
+            ),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            delayed_state.await.unwrap().unwrap(),
+            RuntimeAuthState::LoggedOut
+        );
+
+        let login_client = client.clone();
+        let login = tokio::spawn(async move {
+            login_client
+                .login(RuntimeLogin {
+                    login: "synthetic".into(),
+                    password: "synthetic".into(),
+                    device_name: "fixture".into(),
+                })
+                .await
+        });
+        let refresh_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(
+            matches!(
+                refresh_request.message,
+                MessageV1::Request(AuthRequestV1::State)
+            ),
+            "a late pre-logout reply must not let login reuse the invalidated scope"
+        );
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(
+                refresh_request.id,
+                MessageV1::Response(AuthResponseV1::State {
+                    stamp: old_stamp.clone(),
+                    state: RuntimeAuthState::LoggedOut,
+                }),
+            ),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        let login_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(matches!(
+            login_request.message,
+            MessageV1::Request(AuthRequestV1::Login { .. })
+        ));
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(
+                login_request.id,
+                MessageV1::Response(AuthResponseV1::Error {
+                    error: PrivateError::Cancelled,
+                }),
+            ),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        assert!(login.await.unwrap().is_err());
+
+        let second_logout_client = client.clone();
+        let second_logout = tokio::spawn(async move { second_logout_client.logout().await });
+        let second_logout_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(matches!(
+            second_logout_request.message,
+            MessageV1::Request(AuthRequestV1::Logout { .. })
+        ));
+
+        let concurrent_login_client = client.clone();
+        let concurrent_login = tokio::spawn(async move {
+            concurrent_login_client
+                .login(RuntimeLogin {
+                    login: "synthetic".into(),
+                    password: "synthetic".into(),
+                    device_name: "fixture".into(),
+                })
+                .await
+        });
+        let concurrent_login_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(matches!(
+            concurrent_login_request.message,
+            MessageV1::Request(AuthRequestV1::Login { .. })
+        ));
+        let new_scope = transport::scope(&new_access);
+        let lease = child
+            .prepare(concurrent_login_request.id, "cache-race-child", deadline())
+            .await
+            .unwrap();
+        child.commit(&lease, &new_scope).unwrap();
+        child.grant(&lease, &new_scope).unwrap();
+        if logout_reply_first {
+            write_frame(
+                &mut owner_socket,
+                FrameV1::new(
+                    second_logout_request.id,
+                    MessageV1::Response(AuthResponseV1::Done),
+                ),
+                deadline(),
+            )
+            .await
+            .unwrap();
+            while !second_logout.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        }
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(
+                concurrent_login_request.id,
+                MessageV1::Response(AuthResponseV1::Access {
+                    stamp: new_stamp,
+                    access: new_access.clone(),
+                }),
+            ),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(concurrent_login.await.unwrap().unwrap(), new_access);
+
+        if !logout_reply_first {
+            write_frame(
+                &mut owner_socket,
+                FrameV1::new(
+                    second_logout_request.id,
+                    MessageV1::Response(AuthResponseV1::Done),
+                ),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        }
+        second_logout.await.unwrap().unwrap();
+
+        let next_login_client = client.clone();
+        let next_login = tokio::spawn(async move {
+            next_login_client
+                .login(RuntimeLogin {
+                    login: "synthetic".into(),
+                    password: "synthetic".into(),
+                    device_name: "fixture".into(),
+                })
+                .await
+        });
+        let next_login_request = read_frame(&mut owner_socket, deadline()).await.unwrap();
+        assert!(
+            matches!(
+                next_login_request.message,
+                MessageV1::Request(AuthRequestV1::Login { .. })
+            ),
+            "late logout completion must not clear a newer login scope"
+        );
+        write_frame(
+            &mut owner_socket,
+            FrameV1::new(
+                next_login_request.id,
+                MessageV1::Response(AuthResponseV1::Error {
+                    error: PrivateError::Cancelled,
+                }),
+            ),
+            deadline(),
+        )
+        .await
+        .unwrap();
+        assert!(next_login.await.unwrap().is_err());
+    }
 }
 
 #[tokio::test]

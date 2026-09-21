@@ -1030,7 +1030,7 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..81794465362628d8a200cdc62dd780fb
 +		return &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
 +	})
 +	backend := device.NewDevice(
-+		virtualTun,
++		&diagnosticTun{Device: virtualTun, telemetry: telemetry},
 +		bind,
 +		redundantNativeLogger(handle, uint32(slot)),
 +	)
