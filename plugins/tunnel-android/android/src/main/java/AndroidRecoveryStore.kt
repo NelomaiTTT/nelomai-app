@@ -938,13 +938,18 @@ internal class AndroidRecoveryStore(
         ) ?: return@synchronized RecoveryStoreResult.Failure(
             "connection_diagnostics_episode_exhausted",
         )
+        // This operation has not been sent: dispatch waits for acknowledged cleanup.
+        // Rebuild old v1 prepared replays too, without changing their operation ID.
+        val restartReplay = redundantTotalLossRestartReplay(
+            transaction, requireNotNull(replay).startOperationId,
+        )
         persist(current.copy(
             intent = current.intent.copy(
                 generation = nextGeneration,
                 diagnosticsEpisodeId = nextDiagnosticsEpisodeId,
                 desiredActive = true,
                 armedHistory = false,
-                template = transaction.template,
+                template = transaction.template.copy(reserveEnabled = transaction.standbyDesired),
                 retry = AndroidRetryState(
                     pendingAction = "redundant_total_loss_restart",
                     redundantTotalLossSourceStartOperationId = transaction.startOperationId,
@@ -956,7 +961,7 @@ internal class AndroidRecoveryStore(
                 phase = LeasePhase.START_PENDING,
                 leaseId = null,
                 stopOperationId = null,
-                replay = normalizeReplay(requireNotNull(replay)),
+                replay = normalizeReplay(restartReplay),
             ),
             redundantTransaction = null,
         ))

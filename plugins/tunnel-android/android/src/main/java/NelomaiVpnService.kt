@@ -1515,17 +1515,8 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 )
                 val prepared = recoveryStore.prepareRedundantTotalLoss(
                     expectedStartOperationId = accepted.startOperationId,
-                    replay = AndroidStartReplay(
-                        startOperationId = UUID.randomUUID().toString(),
-                        contractVersion = 1,
-                        requestFingerprint = androidConnectionIntentFingerprint(
-                            transaction.template,
-                            requiresMeasuredCandidateSelection(
-                                transaction.template.layer,
-                                transaction.template.ticConnectionMode,
-                                transaction.template.allowAlternate,
-                            ),
-                        ),
+                    replay = redundantTotalLossRestartReplay(
+                        transaction, UUID.randomUUID().toString(),
                     ),
                 )
                 val restartPrepared = (prepared as? RecoveryStoreResult.Success)
