@@ -14,6 +14,9 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 ANDROID = '{http://schemas.android.com/apk/res/android}'
+spec = importlib.util.spec_from_file_location('release_gates', Path(__file__).resolve().parents[1] / 'release-candidate-gates.py')
+gates = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gates)
 
 
 def verify_signature(value, signature, public_key):
@@ -99,6 +102,16 @@ def verify_classes(classes, acceptance=False):
 
 def verify_slots(manifest, acceptance=False, root_digest=None, stable_digest=None):
     slots = manifest['slots']
+    if manifest.get('container_version') == gates.VERSION:
+        if (acceptance or root_digest != gates.STABLE_ROOT_SHA256
+                or manifest.get('stable_release_set_sha256') != root_digest
+                or not isinstance(stable_digest, str) or not re.fullmatch(r'[0-9a-f]{64}', stable_digest)
+                or manifest.get('stable_platform_manifest_sha256') != stable_digest
+                or [(s['slot'], s['manifest']['runtime_version']) for s in slots]
+                   != [('latest', gates.VERSION), ('stable', gates.STABLE_VERSION)]
+                or slots[1]['manifest'].get('source_commit') != gates.STABLE_SOURCE):
+            raise ValueError('shipping APK does not bind confirmed stable and current latest')
+        return
     if not acceptance:
         if [slot['slot'] for slot in slots] != ['latest']:
             raise ValueError('0.2.20 container must index only latest')
@@ -122,7 +135,6 @@ def main():
     parser.add_argument('--stable-manifest-sha256')
     args = parser.parse_args()
     xml = subprocess.run([str(args.apkanalyzer), 'manifest', 'print', str(args.apk)], check=True, capture_output=True, text=True).stdout
-    verify_manifest(xml, args.acceptance)
     # Called from Rust/JNI, invisible to R8's Java reachability analysis.
     # Inspect the final DEX, not merely the presence of a ProGuard source rule.
     subprocess.run([str(args.apkanalyzer), 'dex', 'code', '--class',
@@ -138,7 +150,6 @@ def main():
                 for value in check.dex_classes(apk.read(name)):
                     if value in classes: raise ValueError('duplicate APK DEX class')
                     classes.add(value)
-        verify_classes(classes, args.acceptance)
         value = apk.read('assets/runtime/container-manifest-v1.json')
         public = args.public_key.read_bytes()
         if len(public) != 32: public = base64.b64decode(public.strip(), validate=True)
@@ -146,6 +157,9 @@ def main():
         manifest = json.loads(value)
         verify_version(xml, manifest['container_version'])
         verify_slots(manifest, args.acceptance, args.release_set_sha256, args.stable_manifest_sha256)
+        two_slots = len(manifest['slots']) == 2
+        verify_manifest(xml, two_slots)
+        verify_classes(classes, two_slots)
         for slot in manifest['slots']:
             prefix = 'assets/runtime/engines/' + slot['slot'] + '/' + slot['manifest']['runtime_version'] + '/'
             for item in slot['manifest']['files']:
@@ -157,7 +171,7 @@ def main():
         if 'lib/arm64-v8a/libnelomai_android_container.so' not in apk.namelist():
             raise ValueError('APK common native host is missing')
     print(json.dumps({'dex_classes': len(classes), 'vpn_services': 1,
-        'runtime_slots': ['latest', 'stable'] if args.acceptance else ['latest'], 'payload_hashes': 'verified'}, sort_keys=True))
+        'runtime_slots': [slot['slot'] for slot in manifest['slots']], 'payload_hashes': 'verified'}, sort_keys=True))
 
 
 if __name__ == '__main__': main()

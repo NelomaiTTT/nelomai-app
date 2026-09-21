@@ -1,12 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Match diagnostics_backup_rules.xml for Android 12+ backup and device transfer. -->
+<!-- Shared preferences and runtime/common state are device-bound operational data.
+     User preferences are file-based and remain backup-eligible. -->
 <data-extraction-rules>
     <cloud-backup>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="common" />
+        <exclude domain="file" path="runtime-container" />
         <exclude domain="file" path="diagnostics/automatic" />
         <exclude domain="file" path="runtime/latest/state" />
         <exclude domain="file" path="runtime/stable/state" />
     </cloud-backup>
     <device-transfer>
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="common" />
+        <exclude domain="file" path="runtime-container" />
         <exclude domain="file" path="diagnostics/automatic" />
         <exclude domain="file" path="runtime/latest/state" />
         <exclude domain="file" path="runtime/stable/state" />

@@ -1560,6 +1560,11 @@ async fn resume_retires_background_ticket_and_completed_replay_does_not_bypass_p
     let broker = AuthBroker::new(api, store, Arc::new(Stop::default())).unwrap();
     let old_ticket = broker.begin_background_recovery().await.unwrap();
     let resumed = broker.resume(resume_args()).await.unwrap();
+    assert_eq!(
+        resumed.family(),
+        old_ticket.family,
+        "runtime resume must preserve the login family for retained native namespaces"
+    );
     assert_eq!(broker.access_token(None).await.unwrap(), resumed);
     let old_response = serde_json::from_value(response(7, "old-background")).unwrap();
     assert!(broker

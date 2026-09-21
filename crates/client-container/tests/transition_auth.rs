@@ -576,6 +576,179 @@ async fn supersede(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> 
 }
 
 #[tokio::test]
+async fn repeated_slot_roundtrips_keep_login_family_but_advance_session_identity() {
+    let (api, server) = panel(Arc::new(Panel::default())).await;
+    let store = enrolled_store();
+    let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+    let original = broker.access_token(None).await.unwrap();
+    drop(broker);
+    for step in 0..6 {
+        let broker = AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap();
+        let source = broker.transition_source().await.unwrap();
+        let target = if step % 2 == 0 {
+            stable_target()
+        } else {
+            target()
+        };
+        let mut request = reconcile_request(&source);
+        request.operation_id = uuid::Uuid::new_v4().to_string();
+        request.target_identity = target.clone();
+        let frozen = FrozenReconcileRequest::new(request, &source).unwrap();
+        broker.reconcile_transition(frozen.clone()).await.unwrap();
+        broker
+            .resume_transition(ResumeArguments {
+                operation_id: uuid::Uuid::new_v4().to_string(),
+                reconcile_operation_id: frozen.request().operation_id.clone(),
+                decision: "apply".into(),
+                target,
+                expected_session_generation: Some(7 + step),
+            })
+            .await
+            .unwrap();
+        let current = broker.access_token(None).await.unwrap();
+        assert_eq!(current.family(), original.family());
+        assert_eq!(current.identity().session_generation, Some(8 + step));
+        assert_ne!(current.identity(), original.identity());
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn resumed_native_provision_carries_only_the_owner_confirmed_predecessor() {
+    use nelomai_client_container::{
+        NativeAuthFailure, OwnerRuntimeAuth, RuntimeCacheAdmission, RuntimeClientProfile,
+    };
+    fn port(
+        broker: Arc<AuthBroker>,
+        store: &Arc<dyn AuthStore>,
+        root: &std::path::Path,
+    ) -> OwnerRuntimeAuth {
+        let backend = ProtectedRuntimeStore::new(
+            Record::default(),
+            RuntimePaths::new(root, RuntimeSlot::Latest, "0.2.16").unwrap(),
+        );
+        let auth = store.load().unwrap().unwrap();
+        let mut runtime = RuntimeStateV1::empty(backend.paths(), false);
+        runtime.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: auth.auth_epoch,
+            family: auth.broker.unwrap().family,
+            identity: auth.confirmed_identity.unwrap(),
+        });
+        backend.save(&runtime).unwrap();
+        OwnerRuntimeAuth::new(
+            broker,
+            target(),
+            RuntimeClientProfile {
+                platform: Platform::Android,
+                platform_version: None,
+                architecture: "aarch64".into(),
+            },
+            Arc::new(RuntimeCacheAdmission::new(RuntimeRecordOwner::new(backend))),
+            Arc::new(RuntimeWriterGates::default()),
+        )
+        .unwrap()
+    }
+    let (api, server) = panel(Arc::new(Panel::default())).await;
+    let store = enrolled_store();
+    let broker = Arc::new(AuthBroker::new(api.clone(), store.clone(), Arc::new(Stop)).unwrap());
+    let root = tempfile::tempdir().unwrap();
+    port(broker.clone(), &store, root.path())
+        .provision_background(|request| async move {
+            let wire: Value = serde_json::from_str(&request.operation_json().unwrap()).unwrap();
+            assert!(wire.get("provision_predecessor").is_none());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let source = broker.transition_source().await.unwrap();
+    let frozen = FrozenReconcileRequest::new(reconcile_request(&source), &source).unwrap();
+    broker.reconcile_transition(frozen.clone()).await.unwrap();
+    broker
+        .resume_transition(ResumeArguments {
+            operation_id: "22222222-2222-4222-8222-222222222222".into(),
+            reconcile_operation_id: frozen.request().operation_id.clone(),
+            decision: "apply".into(),
+            target: target(),
+            expected_session_generation: Some(7),
+        })
+        .await
+        .unwrap();
+    // Reopen the actual protected owner: no in-memory permission may be needed.
+    drop(broker);
+    let broker = Arc::new(AuthBroker::new(api, store.clone(), Arc::new(Stop)).unwrap());
+    let expected = json!({"auth_epoch":source.auth_epoch(), "family":source.family(),
+        "device_id":source.device_id(), "identity":source.identity()});
+    let resumed_port = port(broker.clone(), &store, root.path());
+    for _ in 0..2 {
+        resumed_port
+            .provision_background(|request| {
+                let expected = expected.clone();
+                async move {
+                    let wire: Value =
+                        serde_json::from_str(&request.operation_json().unwrap()).unwrap();
+                    assert_eq!(wire["provision_predecessor"], expected);
+                    assert_eq!(wire["ticket"]["family"], expected["family"]);
+                    assert_eq!(wire["ticket"]["identity"]["session_generation"], 8);
+                    Ok(())
+                }
+            })
+            .await
+            .unwrap();
+    }
+    // Recovery is not a bearer-authenticated transfer and must never get this authority.
+    assert!(resumed_port
+        .recover_background(|request| async move {
+            let wire: Value = serde_json::from_str(&request.operation_json().unwrap()).unwrap();
+            assert!(wire.get("provision_predecessor").is_none());
+            Err(NativeAuthFailure::NotIssued)
+        })
+        .await
+        .is_err());
+    let confirmed = store.load().unwrap().unwrap();
+    for boundary in [
+        "new_login",
+        "other_device",
+        "new_generation",
+        "no_resume",
+        "no_authority",
+    ] {
+        let mut changed = confirmed.clone();
+        let meta = changed.broker.as_mut().unwrap();
+        match boundary {
+            "new_login" => {
+                changed.auth_epoch += 1;
+                meta.family = "new-login-family".into();
+            }
+            "other_device" => meta.confirmed_device_id = Some("other-device".into()),
+            "new_generation" => {
+                changed.session_generation = Some(9);
+                changed
+                    .confirmed_identity
+                    .as_mut()
+                    .unwrap()
+                    .session_generation = Some(9);
+            }
+            "no_resume" => meta.completed_resume = None,
+            "no_authority" => meta.transition_authorities.clear(),
+            _ => unreachable!(),
+        }
+        store.save(&changed).unwrap();
+        port(broker.clone(), &store, root.path())
+            .provision_background(|request| async move {
+                let wire: Value = serde_json::from_str(&request.operation_json().unwrap()).unwrap();
+                assert!(
+                    wire.get("provision_predecessor").is_none(),
+                    "stale authority at {boundary}"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn retry_receipt_replays_the_exact_frozen_request_until_clean() {
     let state = Arc::new(Panel::default());
     state.return_retry.store(1, Ordering::SeqCst);

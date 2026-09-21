@@ -24,6 +24,7 @@ internal data class BackgroundStartResult(
     val configuration: ByteArray,
     val connection: QuickConnectionArgs,
     val options: TunnelOptionsArgs,
+    val redundantTransaction: AndroidRedundantTransaction? = null,
 )
 
 internal data class BackgroundSessionRecoveryResult(
@@ -411,14 +412,27 @@ internal fun provisionOwnedBackgroundCredential(
     var current = store.read().provisionEnvelopeOrThrow()
     val scope = requireNotNull(current.ownerScope)
     require(scope == request.ownerScope && scope.deviceId == request.deviceId)
+    if (current.requiresFreshProvision && (current.pending != null || current.reservation != null)) {
+        // Settle the predecessor's operation without treating its APPLIED reply
+        // as a current-session token. The durable flag survives a crash here.
+        try {
+            provision(request.copy(expectedRevision = current.revision))
+        } catch (error: BackgroundConnectionException) {
+            current = store.read().provisionEnvelopeOrThrow()
+            if (error.code != "background_credential_capability_unavailable" || current.pending != null ||
+                current.reservation != null) throw error
+        }
+        current = store.read().provisionEnvelopeOrThrow()
+    }
     var selected = if (current.pending != null || current.reservation != null) "two_phase" else mode
-    if (selected in setOf("noop", "rotate") &&
-        (current.active?.expiresAtUnix?.let { it <= nowUnix } != false || current.installSecret == null)) {
+    if (current.requiresFreshProvision || (selected in setOf("noop", "rotate") &&
+        (current.active?.expiresAtUnix?.let { it <= nowUnix } != false || current.installSecret == null))) {
         // The status reply predates admission. Legacy adoption (or expiry while
         // waiting) requires fresh bearer provisioning, not a stale noop/rotate.
-        selected = if (request.capability.enabled || current.capability?.let {
-            it.enabled && it.expiresAtUnix > nowUnix
-        } == true) "two_phase" else "legacy"
+        // Use the same revision/expiry rules as provisioning: an older enabled
+        // snapshot must not override a newer disable and turn issuance into a noop.
+        val capability = conservativeBackgroundCapability(current.capability, request.capability)
+        selected = if (capability.enabled && capability.expiresAtUnix > nowUnix) "two_phase" else "legacy"
     }
     if (selected == "noop") return current
     if (selected == "rotate") {
@@ -609,7 +623,7 @@ internal class BackgroundOperationClient(
         cancelIfAbsent: Boolean,
     ): BackgroundReconcileResult {
         requireUuid(operationId)
-        require(kind in setOf("start", "stalled_stop"))
+        require(kind in setOf("start", "redundant_start", "stalled_stop"))
         require(contractVersion in 1..32)
         require(requestFingerprint.matches(Regex("[0-9a-f]{64}")))
         val payload = transport.execute(
@@ -999,18 +1013,6 @@ internal object BackgroundConnectionClient {
         probeCache: BackgroundCandidateProbeCache,
         networkIdentity: String,
     ): BackgroundStartResult {
-        val connection = QuickConnectionArgs().apply {
-            leaseId = ""
-            layer = template.layer
-            ticConnectionMode = template.ticConnectionMode
-            routeMode = template.routeMode
-            egressMode = template.egressMode
-            allowAlternate = template.allowAlternate
-        }
-        val quickTemplate = QuickTunnelTemplate(
-            options = template.options.toTunnelOptionsArgs(),
-            connection = connection,
-        )
         val measured = requiresMeasuredCandidateSelection(
             template.layer,
             template.ticConnectionMode,
@@ -1026,25 +1028,9 @@ internal object BackgroundConnectionClient {
         } else {
             emptyList()
         }
-        val request = backgroundStartPayload(
-            quickTemplate,
-            transaction.startOperationId,
-            probes,
-            transaction.replay.contractVersion,
-            transaction.replay.requestFingerprint,
-            measured,
-        )
+        val request = backgroundExactStartPayload(template, transaction, probes)
         val payload = execute(credential, "background/connections/start", request)
-        val selected = payload.getJSONObject("connection").toQuickConnection().also {
-            it.allowAlternate = template.allowAlternate
-        }
-        val options = template.options.toTunnelOptionsArgs()
-        val configuration = payload.getString("configuration").toByteArray(StandardCharsets.UTF_8)
-        if (configuration.isEmpty() || configuration.size > BACKGROUND_MAX_RESPONSE_BYTES) {
-            configuration.fill(0)
-            throw BackgroundConnectionException("invalid_background_configuration")
-        }
-        return BackgroundStartResult(configuration, selected, options)
+        return backgroundExactStartResult(payload, template, transaction)
     }
 
     fun stop(
@@ -1514,6 +1500,88 @@ internal fun validateBackgroundBindingSyncResponse(response: JSONObject) {
     }
 }
 
+internal fun backgroundExactStartResult(
+    payload: JSONObject,
+    template: AndroidIntentTemplate,
+    transaction: AndroidLeaseTransaction,
+): BackgroundStartResult {
+    if (transaction.replay.contractVersion == 2) {
+        try {
+            val selected = payload.getJSONObject("connection").toQuickConnection().also {
+                it.allowAlternate = template.allowAlternate
+                it.reserveEnabled = requireNotNull(template.reserveEnabled)
+            }
+            val view = payload.getJSONObject("redundancy")
+            val primary = UUID.fromString(selected.leaseId).toString()
+            require(primary == selected.leaseId)
+            val standby = view.optJSONObject("standby")?.getJSONObject("connection")
+                ?.getString("lease_id")?.also { require(UUID.fromString(it).toString() == it) }
+            require(standby != primary)
+            val address = view.getString("virtual_address_v4")
+            require(address.endsWith("/32") && canonicalRedundantIpv4(address.removeSuffix("/32")))
+            val redundant = AndroidRedundantTransaction(
+                desiredActive = true,
+                template = template,
+                sessionId = view.getString("session_id").also {
+                    require(UUID.fromString(it).toString() == it)
+                },
+                slotALeaseId = primary,
+                slotBLeaseId = standby,
+                localActiveLeaseId = primary,
+                standbyDesired = view.getBoolean("standby_desired"),
+                roleGeneration = view.getLong("role_generation").also { require(it >= 0) },
+                membershipGeneration = view.getLong("membership_generation").also { require(it >= 0) },
+                startOperationId = transaction.startOperationId,
+                startRequestFingerprint = transaction.replay.requestFingerprint,
+                startReserveEnabled = requireNotNull(template.reserveEnabled),
+            )
+            require(redundant.startReserveEnabled || !redundant.standbyDesired)
+            // Reuse the same validation as recovery, including disabled sessions and probes.
+            // Only safe ownership metadata survives: recovery obtains exact configs again.
+            val transport = redundantRecoveryTransportFromJson(payload, redundant)
+            transport.configurations.values.forEach { it.fill(0) }
+            return BackgroundStartResult(
+                byteArrayOf(), selected, template.options.toTunnelOptionsArgs(), redundant,
+            )
+        } catch (_: Throwable) {
+            throw BackgroundConnectionException("invalid_background_response")
+        }
+    }
+    val selected = payload.getJSONObject("connection").toQuickConnection().also {
+        it.allowAlternate = template.allowAlternate
+    }
+    val configuration = payload.getString("configuration").toByteArray(StandardCharsets.UTF_8)
+    if (configuration.isEmpty() || configuration.size > BACKGROUND_MAX_RESPONSE_BYTES) {
+        configuration.fill(0)
+        throw BackgroundConnectionException("invalid_background_configuration")
+    }
+    return BackgroundStartResult(configuration, selected, template.options.toTunnelOptionsArgs())
+}
+
+internal fun backgroundExactStartPayload(
+    template: AndroidIntentTemplate,
+    transaction: AndroidLeaseTransaction,
+    probes: List<BackgroundProbeResult>,
+): JSONObject = backgroundStartPayload(
+    QuickTunnelTemplate(template.options.toTunnelOptionsArgs(), QuickConnectionArgs().apply {
+        leaseId = ""
+        layer = template.layer
+        ticConnectionMode = template.ticConnectionMode
+        routeMode = template.routeMode
+        egressMode = template.egressMode
+        allowAlternate = template.allowAlternate
+    }),
+    transaction.startOperationId,
+    probes,
+    transaction.replay.contractVersion,
+    transaction.replay.requestFingerprint,
+    requiresMeasuredCandidateSelection(template.layer, template.ticConnectionMode, template.allowAlternate),
+    redundancyContractVersion = if (transaction.replay.contractVersion == 2) 1 else null,
+    reserveEnabled = if (transaction.replay.contractVersion == 2) {
+        requireNotNull(template.reserveEnabled)
+    } else null,
+)
+
 internal fun backgroundStartPayload(
     template: QuickTunnelTemplate,
     operationId: String,
@@ -1568,6 +1636,14 @@ internal fun backgroundRedundantStartPayload(
     probes = probes,
     contractVersion = 2,
     requestFingerprint = transaction.startRequestFingerprint,
+    // UI v2 starts use measured selection independently of allowAlternate. Fresh
+    // background templates retain their own predicate in the durable request signature.
+    requireMeasuredSelection = if (transaction.template.reserveEnabled != null) {
+        requiresMeasuredCandidateSelection(template.connection.layer,
+            template.connection.ticConnectionMode, template.connection.allowAlternate)
+    } else {
+        template.connection.layer != "tic" || template.connection.ticConnectionMode == "dynamic"
+    },
     redundancyContractVersion = 1,
     reserveEnabled = transaction.startReserveEnabled,
 )

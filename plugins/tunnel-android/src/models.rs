@@ -12,6 +12,12 @@ use zeroize::Zeroizing;
 #[serde(rename_all = "camelCase")]
 pub struct ProbeRequest {}
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReservePreferenceRequest {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbeResponse {
@@ -600,6 +606,16 @@ mod tests {
 
         assert!(!debug.contains("never-log-this"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn reserve_preference_serializes_both_choices_for_the_android_bridge() {
+        for enabled in [false, true] {
+            assert_eq!(
+                serde_json::to_value(ReservePreferenceRequest { enabled }).unwrap(),
+                serde_json::json!({"enabled": enabled}),
+            );
+        }
     }
 
     #[test]

@@ -61,3 +61,13 @@ export function isCurrentConnectionAction(
 ): boolean {
   return state.epoch === token;
 }
+
+export async function prepareConnectionStartForPlatform(
+  platform: string,
+  deviceId: string,
+  prepareTunnel: (deviceId: string) => Promise<void>,
+  isCurrent: () => boolean,
+): Promise<boolean> {
+  if (platform === "android") await prepareTunnel(deviceId);
+  return isCurrent();
+}

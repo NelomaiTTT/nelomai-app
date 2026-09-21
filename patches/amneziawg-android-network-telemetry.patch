@@ -177,10 +177,10 @@ index 9b9c081f236a1e0c2a5f16becad6b2357e60da52..ca9d7b5c84f1cdc2ac9fa864e9bb7e20
  .DELETE_ON_ERROR:
 diff --git a/tunnel/tools/libwg-go/admission_bind.go b/tunnel/tools/libwg-go/admission_bind.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182887260b4
+index 0000000000000000000000000000000000000000..19092dd65253493d3d984f8e43e2d89dd24d1849
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/admission_bind.go
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,351 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -221,12 +221,13 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +	factory func() conn.Bind
 +	parser  conn.Bind
 +
-+	active      *admissionBindGeneration
-+	pending     *admissionBindGeneration
-+	next        uint64
-+	receiveSize int
-+	mark        uint32
-+	closed      bool
++	active         *admissionBindGeneration
++	pending        *admissionBindGeneration
++	next           uint64
++	receiveSize    int
++	mark           uint32
++	closed         bool
++	openGeneration uint64
 +
 +	endpointGenerations sync.Map
 +}
@@ -243,9 +244,6 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +func (a *admissionBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 +	a.mu.Lock()
 +	defer a.mu.Unlock()
-+	if a.closed {
-+		return nil, 0, errAdmissionBindClosed
-+	}
 +	if a.active != nil || a.pending != nil || a.receiveSize != 0 {
 +		return nil, 0, conn.ErrBindAlreadyOpen
 +	}
@@ -253,6 +251,11 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +	if err != nil {
 +		return nil, 0, err
 +	}
++	// conn.Bind.Close ends an Open cycle, not the lifetime of the Bind.
++	// Device.BindUpdate calls Close even before the first Open.
++	a.closed = false
++	a.openGeneration = generation.generation
++	openGeneration := a.openGeneration
 +	a.receiveSize = len(generation.receive)
 +	stable := make([]conn.ReceiveFunc, a.receiveSize)
 +	for index := range stable {
@@ -262,7 +265,7 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +			sizes []int,
 +			endpoints []conn.Endpoint,
 +		) (int, error) {
-+			return a.receive(index, packets, sizes, endpoints)
++			return a.receive(openGeneration, index, packets, sizes, endpoints)
 +		}
 +	}
 +	return stable, actualPort, nil
@@ -412,6 +415,7 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +}
 +
 +func (a *admissionBind) receive(
++	openGeneration uint64,
 +	index int,
 +	packets [][]byte,
 +	sizes []int,
@@ -419,10 +423,10 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +) (int, error) {
 +	for {
 +		a.mu.Lock()
-+		for a.active == nil && !a.closed {
++		for a.active == nil && !a.closed && a.openGeneration == openGeneration {
 +			a.changed.Wait()
 +		}
-+		if a.closed {
++		if a.closed || a.openGeneration != openGeneration {
 +			a.mu.Unlock()
 +			return 0, net.ErrClosed
 +		}
@@ -435,15 +439,15 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +		a.mu.Unlock()
 +
 +		n, err := receive(packets, sizes, endpoints)
-+		if !errors.Is(err, net.ErrClosed) {
-+			return n, err
-+		}
 +		a.mu.Lock()
-+		closed := a.closed
++		closed := a.closed || a.openGeneration != openGeneration
 +		replaced := a.active != generation
 +		a.mu.Unlock()
 +		if closed {
 +			return 0, net.ErrClosed
++		}
++		if !errors.Is(err, net.ErrClosed) {
++			return n, err
 +		}
 +		if replaced {
 +			continue
@@ -463,6 +467,8 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +	pending := a.pending
 +	a.active = nil
 +	a.pending = nil
++	a.receiveSize = 0
++	a.openGeneration = 0
 +	a.changed.Broadcast()
 +	a.mu.Unlock()
 +
@@ -526,6 +532,123 @@ index 0000000000000000000000000000000000000000..41d0650a68f39668e6d2b412704fe182
 +}
 +
 +func (a *admissionBind) BatchSize() int { return a.parser.BatchSize() }
+diff --git a/tunnel/tools/libwg-go/admission_bind_lifecycle_test.go b/tunnel/tools/libwg-go/admission_bind_lifecycle_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..85eb08339eb05e64d609348b978dc07e3bf72a04
+--- /dev/null
++++ b/tunnel/tools/libwg-go/admission_bind_lifecycle_test.go
+@@ -0,0 +1,111 @@
++package main
++
++import (
++	"errors"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
++	"github.com/amnezia-vpn/amneziawg-go/v3/device"
++)
++
++// Device.Up itself closes the bind before opening it, including the first Up.
++func TestAdmissionBindRealDeviceUpDownUp(t *testing.T) {
++	bind := newAdmissionBind(conn.NewStdNetBind)
++	backend := device.NewDevice(newFakeRealTUN(), bind, device.NewLogger(device.LogLevelError, "test: "))
++	defer backend.Close()
++	var previous uint64
++	for cycle := 0; cycle < 2; cycle++ {
++		if err := backend.Up(); err != nil {
++			t.Fatalf("Up %d: %v", cycle, err)
++		}
++		// Socket descriptor discovery is Android-only; exercise the real UDP
++		// lifecycle here without claiming to test platform socket protection.
++		bind.mu.Lock()
++		if bind.pending == nil {
++			bind.mu.Unlock()
++			t.Fatal("Up did not prepare a bind")
++		}
++		token := bind.pending.generation
++		bind.mu.Unlock()
++		if previous != 0 {
++			if token == previous {
++				t.Fatal("preparation token reused after Down")
++			}
++			if err := bind.AdmitPreparedToken(previous); !errors.Is(err, errAdmissionBindGeneration) {
++				t.Fatalf("stale admit: %v", err)
++			}
++		}
++		if err := bind.AdmitPreparedToken(token); err != nil {
++			t.Fatal(err)
++		}
++		previous = token
++		down := make(chan error, 1)
++		go func() { down <- backend.Down() }()
++		select {
++		case err := <-down:
++			if err != nil {
++				t.Fatal(err)
++			}
++		case <-time.After(time.Second):
++			t.Fatal("Down did not stop bind receivers")
++		}
++	}
++}
++
++func TestAdmissionBindOldReceiveCannotEnterReopenedCycle(t *testing.T) {
++	bind := newAdmissionBind(func() conn.Bind { return &fakeAdmissionBind{fds: [2]int{101, 102}} })
++	old, _, err := bind.Open(0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	first := requirePreparedSockets(t, bind)
++	if err := bind.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if _, _, err := bind.Open(0); err != nil {
++		t.Fatal(err)
++	}
++	defer bind.Close()
++	current := requirePreparedSockets(t, bind)
++	if err := bind.AbortPreparedToken(first.Token); !errors.Is(err, errAdmissionBindGeneration) {
++		t.Fatalf("stale abort: %v", err)
++	}
++	// Old callback must terminate even while the NEW cycle waits for protection.
++	stopped := make(chan error, 1)
++	go func() { _, err := old[0](make([][]byte, 1), make([]int, 1), make([]conn.Endpoint, 1)); stopped <- err }()
++	select {
++	case err := <-stopped:
++		if !errors.Is(err, net.ErrClosed) {
++			t.Fatalf("old receive: %v", err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("old receive entered new pending cycle")
++	}
++	if err := bind.AdmitPreparedToken(current.Token); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestAdmissionBindCloseWakesUnadmittedReceive(t *testing.T) {
++	bind := newAdmissionBind(func() conn.Bind { return &fakeAdmissionBind{fds: [2]int{101, 102}} })
++	receive, _, err := bind.Open(0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	stopped := make(chan error, 1)
++	go func() {
++		_, err := receive[0](make([][]byte, 1), make([]int, 1), make([]conn.Endpoint, 1))
++		stopped <- err
++	}()
++	bind.Close()
++	select {
++	case err := <-stopped:
++		if !errors.Is(err, net.ErrClosed) {
++			t.Fatal(err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("pending receiver blocked Close")
++	}
++}
 diff --git a/tunnel/tools/libwg-go/api-android.go b/tunnel/tools/libwg-go/api-android.go
 index 3af343d17d35120cd29f7610281f0d26b77087c8..81794465362628d8a200cdc62dd780fb1466083d 100644
 --- a/tunnel/tools/libwg-go/api-android.go
@@ -907,7 +1030,7 @@ index 3af343d17d35120cd29f7610281f0d26b77087c8..81794465362628d8a200cdc62dd780fb
 +		return &diagnosticBind{Bind: conn.NewStdNetBind(), telemetry: telemetry}
 +	})
 +	backend := device.NewDevice(
-+		virtualTun,
++		&diagnosticTun{Device: virtualTun, telemetry: telemetry},
 +		bind,
 +		redundantNativeLogger(handle, uint32(slot)),
 +	)
@@ -1650,6 +1773,192 @@ index 237043e561625a6d8bbdec7f215bb323cf1b75cd..607d6a7bcf1f67af1b7b403dbdbb51e7
 +	JNIEnv *env, jobject self, jlong handle)
 +{
 +	awgRedundantClose((long long)handle);
++}
+diff --git a/tunnel/tools/libwg-go/redundant_dataplane_integration_test.go b/tunnel/tools/libwg-go/redundant_dataplane_integration_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f1a18f51efe49f22e1396e2fa5fdc2bd6ac2b45
+--- /dev/null
++++ b/tunnel/tools/libwg-go/redundant_dataplane_integration_test.go
+@@ -0,0 +1,180 @@
++package main
++
++import (
++	"bytes"
++	"crypto/rand"
++	"encoding/hex"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
++	"github.com/amnezia-vpn/amneziawg-go/v3/device"
++	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
++	"golang.org/x/crypto/curve25519"
++)
++
++type integrationReadTun struct {
++	tun.Device
++	first chan int
++}
++
++func (r *integrationReadTun) Read(b [][]byte, s []int, o int) (int, error) {
++	select {
++	case r.first <- o:
++	default:
++	}
++	return r.Device.Read(b, s, o)
++}
++
++func integrationKeys(t *testing.T) (string, string) {
++	var private [32]byte
++	if _, err := rand.Read(private[:]); err != nil {
++		t.Fatal(err)
++	}
++	pub, err := curve25519.X25519(private[:], curve25519.Basepoint)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return hex.EncodeToString(private[:]), hex.EncodeToString(pub)
++}
++func integrationPort(t *testing.T, d *device.Device) string {
++	config, err := d.IpcGet()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, line := range strings.Split(config, "\n") {
++		if strings.HasPrefix(line, "listen_port=") {
++			return strings.TrimPrefix(line, "listen_port=")
++		}
++	}
++	t.Fatal("missing bound port")
++	return ""
++}
++func integrationReceive(t *testing.T, packets <-chan []byte, want []byte) {
++	t.Helper()
++	select {
++	case got := <-packets:
++		if !bytes.Equal(got, want) {
++			t.Fatal("packet corrupted")
++		}
++	case <-time.After(8 * time.Second):
++		t.Fatal("encrypted data path timed out")
++	}
++}
++func integrationLogger(t *testing.T, name string) *device.Logger {
++	return &device.Logger{Errorf: func(f string, a ...any) { t.Logf(name+f, a...) },
++		Verbosef: func(f string, a ...any) {
++			if strings.Contains(f, "unknown type") {
++				t.Logf(name+f, a...)
++			}
++		}}
++}
++
++// Real encrypted UDP loopback through both dispatcher slots and admission Bind.
++// This tests native dataplane, not Android JNI/protect or production routing.
++func TestRedundantEncryptedDataplaneWithAdmission(t *testing.T) {
++	for _, profile := range []string{"wireguard", "awg3"} {
++		t.Run(profile, func(t *testing.T) {
++			real := newFakeRealTUN()
++			tunnel, err := NewRedundantTunnel(real)
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer tunnel.Close()
++			var serverTuns [2]*fakeRealTUN
++			var clients [2]*device.Device
++			var binds [2]*admissionBind
++			var servers [2]*device.Device
++			extras := ""
++			if profile == "awg3" {
++				extras = "s1=32\ns2=40\ns3=48\ns4=56\nh1=123456-123500\nh2=223456-223500\nh3=323456-323500\nh4=423456-423500\nheader_protection_key=" + strings.Repeat("7b", 32) + "\ncontent_padding_addition=0-64\n"
++			}
++			for slot := 0; slot < 2; slot++ {
++				cpriv, cpub := integrationKeys(t)
++				spriv, spub := integrationKeys(t)
++				serverTuns[slot] = newFakeRealTUN()
++				serverRead := &integrationReadTun{serverTuns[slot], make(chan int, 1)}
++				servers[slot] = device.NewDevice(serverRead, conn.NewStdNetBind(), integrationLogger(t, fmt.Sprintf("server%d: ", slot)))
++				t.Logf("server first Read offset before config=%d", <-serverRead.first)
++				defer servers[slot].Close()
++				if err := servers[slot].IpcSet(extras + fmt.Sprintf("private_key=%s\nlisten_port=0\npublic_key=%s\nallowed_ip=10.0.0.2/32\n", spriv, cpub)); err != nil {
++					t.Fatal(err)
++				}
++				if err := servers[slot].Up(); err != nil {
++					t.Fatal(err)
++				}
++				attached, err := tunnel.AttachSlot(uint32(slot))
++				if err != nil {
++					t.Fatal(err)
++				}
++				// Isolate data path from the automatic-up/config ordering of the JNI caller.
++				<-attached.Events()
++				clientRead := &integrationReadTun{attached, make(chan int, 1)}
++				binds[slot] = newAdmissionBind(conn.NewStdNetBind)
++				clients[slot] = device.NewDevice(clientRead, binds[slot], integrationLogger(t, fmt.Sprintf("client%d: ", slot)))
++				t.Logf("client first Read offset before config=%d", <-clientRead.first)
++				defer clients[slot].Close()
++				if err := clients[slot].IpcSet(extras + fmt.Sprintf("private_key=%s\nlisten_port=0\npublic_key=%s\nendpoint=127.0.0.1:%s\nallowed_ip=0.0.0.0/0\n", cpriv, spub, integrationPort(t, servers[slot]))); err != nil {
++					t.Fatal(err)
++				}
++				if err := clients[slot].Up(); err != nil {
++					t.Fatal(err)
++				}
++				admitIntegrationBind(t, binds[slot])
++			}
++			request := fakeDNSPacket(40001, 53, 101, false)
++			reply := fakeDNSPacket(53, 40001, 101, true)
++			for _, slot := range []uint32{0, 1, 0} {
++				if err := tunnel.SwitchActive(slot); err != nil {
++					t.Fatal(err)
++				}
++				t.Logf("outbound slot %d", slot)
++				real.injectOutbound(t, request)
++				integrationReceive(t, serverTuns[slot].inbound, request)
++				t.Logf("inbound slot %d", slot)
++				serverTuns[slot].injectOutbound(t, reply)
++				integrationReceive(t, real.inbound, reply)
++			}
++			// A reply from the inactive backend must not enter the Android-facing TUN.
++			serverTuns[1].injectOutbound(t, reply)
++			select {
++			case <-real.inbound:
++				t.Fatal("inactive packet leaked")
++			case <-time.After(50 * time.Millisecond):
++			}
++			// UDP rebind below an unchanged TUN: existing source/IP and data path survive.
++			if err := clients[0].BindUpdate(); err != nil {
++				t.Fatal(err)
++			}
++			admitIntegrationBind(t, binds[0])
++			real.injectOutbound(t, request)
++			integrationReceive(t, serverTuns[0].inbound, request)
++			serverTuns[0].injectOutbound(t, reply)
++			integrationReceive(t, real.inbound, reply)
++			// The production in-place rebind keeps the receive callbacks alive.
++			if err := binds[0].PrepareRebind(0); err != nil {
++				t.Fatal(err)
++			}
++			admitIntegrationBind(t, binds[0])
++			real.injectOutbound(t, request)
++			integrationReceive(t, serverTuns[0].inbound, request)
++			serverTuns[0].injectOutbound(t, reply)
++			integrationReceive(t, real.inbound, reply)
++		})
++	}
++}
++
++func admitIntegrationBind(t *testing.T, bind *admissionBind) {
++	t.Helper()
++	bind.mu.Lock()
++	pending := bind.pending
++	bind.mu.Unlock()
++	if pending == nil {
++		t.Fatal("missing prepared bind")
++	}
++	if err := bind.AdmitPreparedToken(pending.generation); err != nil {
++		t.Fatal(err)
++	}
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_metrics_test.go b/tunnel/tools/libwg-go/redundant_metrics_test.go
 new file mode 100644
@@ -2658,12 +2967,61 @@ index 0000000000000000000000000000000000000000..b5e14312c40c3384263ccafbcf991c59
 +	}
 +	t.Fatal("runtime watcher did not reach the expected terminal state")
 +}
+diff --git a/tunnel/tools/libwg-go/redundant_traffic_test.go b/tunnel/tools/libwg-go/redundant_traffic_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..b5b30252de92f078071e0bf46bad1ef55fe2665d
+--- /dev/null
++++ b/tunnel/tools/libwg-go/redundant_traffic_test.go
+@@ -0,0 +1,43 @@
++package main
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++)
++
++func TestDispatcherTrafficBytesFollowRealTUNAcrossSwitch(t *testing.T) {
++	real, a, b, tunnel := newFakeRedundantTunnel(t)
++	real.injectOutbound(t, []byte{1, 2, 3})
++	readDevicePacket(t, a)
++	writeDevicePacket(t, a, []byte{4, 5})
++	<-real.inbound
++	if err := tunnel.SwitchActive(1); err != nil {
++		t.Fatal(err)
++	}
++	real.injectOutbound(t, []byte{6, 7, 8, 9})
++	readDevicePacket(t, b)
++	writeDevicePacket(t, b, []byte{10, 11, 12})
++	<-real.inbound
++	writeDevicePacket(t, a, []byte{13, 14, 15})
++	requireNoFakeRealTUNPacket(t, real)
++	deadline := time.Now().Add(time.Second)
++	for {
++		// Assert the serialized contract consumed by Kotlin, too.
++		payload, err := json.Marshal(tunnel.Counters())
++		if err != nil {
++			t.Fatal(err)
++		}
++		var counters map[string]uint64
++		if err := json.Unmarshal(payload, &counters); err != nil {
++			t.Fatal(err)
++		}
++		if counters["OutboundBytes"] == 7 && counters["InboundBytes"] == 5 {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatalf("incorrect user traffic counters: %s", payload)
++		}
++		time.Sleep(time.Millisecond)
++	}
++}
 diff --git a/tunnel/tools/libwg-go/redundant_tun.go b/tunnel/tools/libwg-go/redundant_tun.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..1c04fe05d05520f94f62f392595ecd809bab3fd5
+index 0000000000000000000000000000000000000000..25f0bd11c100c23941484dd40a35a36c90f49784
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun.go
-@@ -0,0 +1,1033 @@
+@@ -0,0 +1,1041 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -2753,8 +3111,10 @@ index 0000000000000000000000000000000000000000..1c04fe05d05520f94f62f392595ecd80
 +// RedundantTunnelCounters is a compact, non-secret dispatcher snapshot.
 +type RedundantTunnelCounters struct {
 +	OutboundPackets       uint64
++	OutboundBytes         uint64
 +	OutboundDropped       uint64
 +	InboundPackets        uint64
++	InboundBytes          uint64
 +	InactiveInboundDrops  uint64
 +	ProbePacketsInjected  uint64
 +	ProbeRepliesConsumed  uint64
@@ -2766,8 +3126,10 @@ index 0000000000000000000000000000000000000000..1c04fe05d05520f94f62f392595ecd80
 +
 +type redundantTunnelCounters struct {
 +	outboundPackets       atomic.Uint64
++	outboundBytes         atomic.Uint64
 +	outboundDropped       atomic.Uint64
 +	inboundPackets        atomic.Uint64
++	inboundBytes          atomic.Uint64
 +	inactiveInboundDrops  atomic.Uint64
 +	probePacketsInjected  atomic.Uint64
 +	probeRepliesConsumed  atomic.Uint64
@@ -3139,8 +3501,10 @@ index 0000000000000000000000000000000000000000..1c04fe05d05520f94f62f392595ecd80
 +func (r *RedundantTunnel) Counters() RedundantTunnelCounters {
 +	return RedundantTunnelCounters{
 +		OutboundPackets:       r.counters.outboundPackets.Load(),
++		OutboundBytes:         r.counters.outboundBytes.Load(),
 +		OutboundDropped:       r.counters.outboundDropped.Load(),
 +		InboundPackets:        r.counters.inboundPackets.Load(),
++		InboundBytes:          r.counters.inboundBytes.Load(),
 +		InactiveInboundDrops:  r.counters.inactiveInboundDrops.Load(),
 +		ProbePacketsInjected:  r.counters.probePacketsInjected.Load(),
 +		ProbeRepliesConsumed:  r.counters.probeRepliesConsumed.Load(),
@@ -3227,6 +3591,7 @@ index 0000000000000000000000000000000000000000..1c04fe05d05520f94f62f392595ecd80
 +			r.routeMu.RUnlock()
 +			if enqueued {
 +				r.counters.outboundPackets.Add(1)
++				r.counters.outboundBytes.Add(uint64(sizes[index]))
 +			} else {
 +				r.counters.outboundDropped.Add(1)
 +			}
@@ -3283,6 +3648,7 @@ index 0000000000000000000000000000000000000000..1c04fe05d05520f94f62f392595ecd80
 +	err := normalizeRedundantWriterError(r.writer.WritePacket(packet))
 +	if err == nil {
 +		r.counters.inboundPackets.Add(1)
++		r.counters.inboundBytes.Add(uint64(len(packet)))
 +		return
 +	}
 +	if errors.Is(err, ErrRedundantWriterWouldBlock) {
@@ -3787,10 +4153,10 @@ index 0000000000000000000000000000000000000000..38ee324365e666f96989e873925aa434
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_test.go b/tunnel/tools/libwg-go/redundant_tun_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..c841f5ac5d03b3a7da1f9e3ed30bd022c2406f15
+index 0000000000000000000000000000000000000000..ea9c0f3262c37700bd77deb95b32fec23287a65c
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_test.go
-@@ -0,0 +1,1507 @@
+@@ -0,0 +1,1510 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -4349,6 +4715,9 @@ index 0000000000000000000000000000000000000000..c841f5ac5d03b3a7da1f9e3ed30bd022
 +	requireNoFakeRealTUNPacket(t, real)
 +	if tunnel.ProbeSucceeded(token) {
 +		t.Fatal("duplicate probe reply was reported twice")
++	}
++	if counters := tunnel.Counters(); counters.OutboundBytes != 0 || counters.InboundBytes != 0 {
++		t.Fatalf("probe bytes counted as user traffic: %+v", counters)
 +	}
 +}
 +

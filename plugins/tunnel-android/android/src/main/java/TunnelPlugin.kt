@@ -101,6 +101,9 @@ class DnsServersArgs {
 }
 
 @InvokeArg
+class ReservePreferenceArgs { var enabled: Boolean? = null }
+
+@InvokeArg
 class StartFailureDiagnosticsArgs {
     lateinit var deviceId: String
     var errorCode: String = "connection_start_failed"
@@ -165,6 +168,8 @@ class QuickConnectionArgs {
     lateinit var routeMode: String
     var egressMode: String = "ipv4"
     var allowAlternate: Boolean = false
+    // Null identifies a legacy single-lease template, not reserve=false.
+    var reserveEnabled: Boolean? = null
 }
 
 @InvokeArg
@@ -1073,7 +1078,10 @@ internal object TunnelRuntime {
                         QuickTunnelPlanStore.save(applicationContext, quickPlan)
                     } catch (error: Throwable) {
                         TunnelLog.warning("quick_plan.save_failed", error = error)
-                        if (!QuickTunnelPlanStore.clear(applicationContext)) {
+                        if (!clearQuickPlanAfterSaveFailure {
+                                QuickTunnelPlanStore.clear(applicationContext)
+                            }
+                        ) {
                             TunnelLog.warning("quick_plan.clear_failed")
                         }
                     } finally {
@@ -2701,9 +2709,11 @@ internal fun StartTunnelArgs.clearSensitiveConfigurations() {
 }
 
 internal fun StartTunnelArgs.canCacheQuickPlan(): Boolean =
-    cacheQuickAction && configurationInitialized && redundancy == null
+    // Redundancy disables offline reconnect, not a fresh start from the tile.
+    // copyForQuickPlan strips both configurations and the redundant lease ID.
+    (cacheQuickAction || redundancy != null) && configurationInitialized && quickConnection != null
 
-private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
+internal fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
     if (!canCacheQuickPlan()) return null
     return StartTunnelArgs().also { copy ->
         copy.apiVersion = apiVersion
@@ -2721,7 +2731,12 @@ private fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
         }
         copy.cacheQuickAction = true
         copy.quickActionValidUntilUnix = quickActionValidUntilUnix
-        copy.quickConnection = quickConnection?.copy()
+        copy.quickConnection = quickConnection?.copy()?.also { connection ->
+            redundancy?.let {
+                connection.leaseId = ""
+                connection.reserveEnabled = it.reserveEnabled
+            }
+        }
     }
 }
 
@@ -2732,6 +2747,7 @@ private fun QuickConnectionArgs.copy(): QuickConnectionArgs = QuickConnectionArg
     copy.routeMode = routeMode
     copy.egressMode = egressMode
     copy.allowAlternate = allowAlternate
+    copy.reserveEnabled = reserveEnabled
 }
 
 private fun HealthStats.measurement(key: Int): Long? =
@@ -3066,6 +3082,18 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             activity.applicationContext,
             { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
+        )
+    }
+
+    @Command
+    fun setReservePreference(invoke: Invoke) {
+        val enabled = try { invoke.parseArgs(ReservePreferenceArgs::class.java).enabled } catch (_: Throwable) { null }
+        if (enabled == null) { invoke.reject("invalid_reserve_preference"); return }
+        TunnelServiceClient.releaseRedundantStandby(
+            activity.applicationContext,
+            { status -> activity.runOnUiThread { invoke.resolve(status.toJsObject()) } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } },
+            reservePreference = enabled,
         )
     }
 

@@ -29,6 +29,49 @@ pub struct NativeAuthRequest {
     pub access: AccessSnapshot,
     pub install_secret: String,
     pub expires_at_unix_ms: u64,
+    provision_predecessor: Option<NativeProvisionPredecessor>,
+}
+
+/// Exact source of a completed owner-controlled runtime transition. This is
+/// native-only authority, never accepted from runtime IPC or used for recovery.
+#[derive(serde::Serialize)]
+struct NativeProvisionPredecessor {
+    auth_epoch: u64,
+    family: String,
+    device_id: String,
+    identity: nelomai_contracts::RuntimeIdentity,
+}
+
+impl NativeProvisionPredecessor {
+    fn from_completed_transition(auth: &AuthStoreV1) -> Option<Self> {
+        let meta = auth.broker.as_ref()?;
+        let done = meta.completed_resume.as_ref()?;
+        let resume = done.request.resume.as_ref()?;
+        let authority = meta
+            .transition_authorities
+            .iter()
+            .find(|entry| entry.reconcile_operation_id == resume.reconcile_operation_id)?;
+        let source = authority.source_identity.as_ref()?;
+        // All records were validated by the protected store. Additionally bind
+        // the retained receipt to this current login, device and exact resume.
+        if done.request.auth_epoch != auth.auth_epoch
+            || authority.source_auth_epoch != auth.auth_epoch
+            || meta.confirmed_device_id.as_deref() != Some(authority.source_device_id.as_str())
+            || auth.confirmed_identity.as_ref() != Some(&done.identity)
+            || authority.resume_ticket.as_ref() != Some(&done.request)
+            || authority.resume_evidence.as_ref()?.identity != done.identity
+            || authority.superseded_by.is_some()
+            || source.session_generation? >= done.identity.session_generation?
+        {
+            return None;
+        }
+        Some(Self {
+            auth_epoch: authority.source_auth_epoch,
+            family: authority.source_family.clone(),
+            device_id: authority.source_device_id.clone(),
+            identity: source.clone(),
+        })
+    }
 }
 impl std::fmt::Debug for NativeAuthRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -40,8 +83,12 @@ impl std::fmt::Debug for NativeAuthRequest {
 }
 impl NativeAuthRequest {
     pub fn operation_json(&self) -> Result<String, BrokerError> {
-        serde_json::to_string(&serde_json::json!({"ticket": self.ticket, "expires_at_unix_ms": self.expires_at_unix_ms}))
-            .map_err(|_| BrokerError::RecoveryRequired)
+        let mut operation = serde_json::json!({"ticket": self.ticket, "expires_at_unix_ms": self.expires_at_unix_ms});
+        if let Some(predecessor) = &self.provision_predecessor {
+            operation["provision_predecessor"] =
+                serde_json::to_value(predecessor).map_err(|_| BrokerError::RecoveryRequired)?;
+        }
+        serde_json::to_string(&operation).map_err(|_| BrokerError::RecoveryRequired)
     }
 }
 #[derive(Debug)]
@@ -1791,6 +1838,7 @@ impl AuthBroker {
         Ok(match auth.logout_state {
             LogoutState::Pending => BrokerAuthState::LogoutPending,
             LogoutState::LoggedOut => BrokerAuthState::LoggedOut,
+            LogoutState::Active if Self::is_pristine_auth(auth, meta) => BrokerAuthState::LoggedOut,
             // A persisted password attempt has an unknown outcome until commit,
             // including when its caller future was dropped in this process.
             LogoutState::Active
@@ -1811,6 +1859,28 @@ impl AuthBroker {
             }
             LogoutState::Active => BrokerAuthState::Active,
         })
+    }
+
+    fn is_pristine_auth(auth: &AuthStoreV1, meta: &BrokerMetadataV1) -> bool {
+        auth.auth_epoch == 0
+            && auth.access_token.is_none()
+            && auth.refresh_token.is_none()
+            && auth.session_generation.is_none()
+            && auth.confirmed_identity.is_none()
+            && auth.pending_resume.is_none()
+            && auth.completed_runtime_logout.is_none()
+            && auth.pending_runtime_supersede.is_none()
+            && meta.next_attempt == 0
+            && meta.pending_request.is_none()
+            && meta.completed_resume.is_none()
+            && meta.pending_logout.is_none()
+            && meta.pending_recovery.is_none()
+            && meta.cancelled_login.is_none()
+            && !meta.authentication_outcome_unknown
+            && meta.pending_login_account.is_none()
+            && meta.confirmed_device_id.is_none()
+            && meta.pending_push_cleanup_epoch.is_none()
+            && meta.transition_authorities.is_empty()
     }
 
     /// Container-only password ingress. Install identity is read from protected
@@ -2504,8 +2574,10 @@ impl AuthBroker {
         auth.confirmed_identity = Some(response.identity.clone());
         auth.access_token = Some(response.access_token.clone());
         let meta = auth.broker.as_mut().ok_or(BrokerError::RecoveryRequired)?;
-        // Resume invalidates ordinary background scope, unlike ordinary refresh.
-        meta.family = Uuid::new_v4().to_string();
+        // A runtime switch stays in the same login family. Its new server
+        // identity/generation and retired tickets fence old operations; rotating
+        // family here would strand each inactive runtime's native credentials.
+        // Login still creates a new family and advances auth_epoch.
         meta.pending_recovery = None;
         meta.completed_resume = Some(CompletedResumeV1 {
             request: ticket.clone(),
@@ -3226,9 +3298,15 @@ impl AuthBroker {
                     return Err(BrokerError::RecoveryRequired);
                 }
                 let ticket = self.begin_native_locked(&mut auth)?;
+                let provision_predecessor = if recover {
+                    None
+                } else {
+                    NativeProvisionPredecessor::from_completed_transition(&auth)
+                };
                 NativeAuthRequest {
                     ticket,
                     access,
+                    provision_predecessor,
                     install_secret: auth.install_secret,
                     expires_at_unix_ms: u64::try_from(expires_at_unix_ms)
                         .map_err(|_| BrokerError::RecoveryRequired)?,

@@ -514,6 +514,20 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
+    fun cancelledLeaseWorkAlsoResumesAfterBarrierRelease() {
+        val cancelled = restartEnvelope().let {
+            it.copy(intent = it.intent.copy(desiredActive = false))
+        }
+        val fixture = Fixture(recovery = RecoveryStoreResult.Success(cancelled))
+        fixture.lifecycle.onCleanupAcknowledged(7)
+        fixture.runPosted()
+        assertEquals(1, fixture.resumes)
+        assertEquals(0, fixture.startingPublications)
+        assertEquals(0, fixture.cleanupRetries)
+        assertEquals(0, fixture.stops)
+    }
+
+    @Test
     fun logoutWinsOverPromotedRestart() {
         val fixture = Fixture(
             recovery = RecoveryStoreResult.Success(restartEnvelope()),

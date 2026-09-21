@@ -1,13 +1,38 @@
 """NDK host selection must not send Linux builders to the macOS toolchain."""
 from pathlib import Path
+import re
+import subprocess
 import tempfile
 import unittest
 
-from scripts.tests.test_runtime_artifact import module
+from scripts.tests.test_runtime_artifact import ROOT, module
 from scripts.tests import test_android_runtime_collisions as fixtures
 
 
 class TunnelHostTest(unittest.TestCase):
+    def test_stable_tunnel_namespaces_every_redundant_jni_export(self):
+        builder = module("android/build-tunnel-runtime")
+        patch = (ROOT / "patches/amneziawg-android-network-telemetry.patch").read_text()
+        names = sorted(set(re.findall(r'Java_ru_nelomai_tunnel_JniRedundantNativeApi_\w+', patch)))
+        self.assertEqual(len(names), 12)
+        names.append('Java_org_amnezia_awg_GoBackend_awgTurnOn')
+        source = '\n'.join('void ' + name + '(void) {}' for name in names)
+        rewritten = builder.stable_jni_source(source)
+        ndk, _ = fixtures.native_tools()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / 'stable.so'
+            subprocess.run([str(ndk / 'aarch64-linux-android24-clang'), '-shared', '-nostdlib',
+                '-x', 'c', '-', '-o', str(library)], input=rewritten, text=True, check=True, capture_output=True)
+            symbols = subprocess.run([str(ndk / 'llvm-readelf'), '--dyn-syms', '--wide', str(library)],
+                check=True, capture_output=True, text=True).stdout
+            self.assertNotIn('Java_ru_nelomai_tunnel_', symbols)
+            self.assertNotIn('Java_org_amnezia_awg_', symbols)
+            for name in names:
+                expected = name.replace('Java_ru_nelomai_tunnel_', 'Java_ru_nelomai_runtime_stable_tunnel_').replace(
+                    'Java_org_amnezia_awg_', 'Java_ru_nelomai_runtime_stable_awg_')
+                self.assertIn(expected, symbols)
+
     def test_native_fixtures_resolve_explicit_jdk_and_ndk_for_both_hosts(self):
         resolve = getattr(fixtures, "native_tools", None)
         self.assertTrue(callable(resolve), "compiled fixture toolchain still assumes a Homebrew host")

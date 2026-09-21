@@ -12,13 +12,13 @@ on:
         default: "build_only"
         required: true
       source_sha:
-        description: "Полный immutable maintenance SHA; dispatch ref должен совпадать"
+        description: "Полный immutable source SHA; dispatch ref должен совпадать"
         type: "string"
         required: true
       version:
         description: "Проверяемая версия; исходники не переписываются"
         type: "string"
-        default: "0.2.20"
+        default: "0.3.0"
         required: true
       candidate_run_id:
         description: "Номер успешной sign_candidate сборки; повторные попытки поддерживаются"
@@ -78,8 +78,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.20
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.20 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.0
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.0 --mode "$RELEASE_MODE"
       -
         name: "Pinned AmneziaWG source"
         run: |
@@ -105,7 +105,7 @@ jobs:
       -
         run: "python -m unittest discover -s scripts/tests"
   native_drafts:
-    needs: "verify"
+    if: "inputs.mode != 'publish_approved_candidate'"
     strategy:
       fail-fast: false
       matrix:
@@ -151,8 +151,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.20
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.20 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.0
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.0 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -173,7 +173,9 @@ jobs:
           overwrite: true
           retention-days: 14
   sign:
-    needs: "native_drafts"
+    needs:
+      - "verify"
+      - "native_drafts"
     environment: "release-candidate-signing"
     runs-on: "ubuntu-22.04"
     outputs:
@@ -196,8 +198,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.20
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.20 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.0
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.0 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -214,7 +216,10 @@ jobs:
       -
         name: "Final runtime/root/container documents via build-runtime-release-set.py"
         run: |
+          python scripts/prepare-release-trust.py --mode sign_candidate --public-key "$RUNNER_TEMP/stable-public.raw"
+          python scripts/download-confirmed-stable.py --output "$RUNNER_TEMP/confirmed-stable" --public-key "$RUNNER_TEMP/stable-public.raw"
           root_sha=$(python scripts/sign-runtime-candidate.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --version "$RELEASE_VERSION" --confirmed-stable "$RUNNER_TEMP/confirmed-stable" --stable-public-key "$RUNNER_TEMP/stable-public.raw" \
             --drafts drafts --output signed --signing-key "$RUNNER_TEMP/runtime-private.raw" --public-key "$RUNNER_TEMP/runtime-public.raw")
           echo "root_sha256=$root_sha" >> "$GITHUB_OUTPUT"
         id: "sign"
@@ -277,8 +282,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.20
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.20 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.0
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.0 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -341,8 +346,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.20
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.20 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.0
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.0 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -393,7 +398,7 @@ jobs:
       -
         uses: "actions/upload-artifact@v4"
         with:
-          name: "candidate-0.2.20"
+          name: "candidate-0.3.0"
           path: "finalized/candidate/"
           if-no-files-found: "error"
           overwrite: true
@@ -426,8 +431,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.2.20
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.2.20 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.0
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.0 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -455,7 +460,7 @@ jobs:
         run: |
           python scripts/check-publication-inputs.py --directory candidate --source-sha "$SOURCE_SHA" \
             --run-id "$CANDIDATE_RUN"
-          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.2.20 --source-sha "$SOURCE_SHA"
+          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.3.0 --source-sha "$SOURCE_SHA"
           mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
           test "${#assets[@]}" -eq 22
-          gh release create v0.2.20 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.2.20" --notes "$RELEASE_NOTES"
+          gh release create v0.3.0 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.3.0" --notes "$RELEASE_NOTES"

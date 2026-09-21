@@ -118,32 +118,69 @@ fn join_reader(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Ve
 mod tests {
     use super::*;
 
+    struct TestRunner(std::process::Child);
+
+    impl Drop for TestRunner {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn hung_command_fixture_entry() {
+        let Some(root) = std::env::var_os("NELOMAI_TEST_HUNG_COMMAND_ROOT") else {
+            return;
+        };
+        // Bound an orphan even if the process-group guardian regresses.
+        unsafe { libc::alarm(10) };
+        let root = std::path::PathBuf::from(root);
+        let _lease = nelomai_contracts::dispatcher::MutationGuard::at(&root.join("lease"))
+            .expect("fixture lease");
+        std::fs::write(root.join("ready"), b"").unwrap();
+        thread::sleep(Duration::from_secs(60));
+    }
+
     #[test]
     fn runner_death_fixture_entry() {
         let Some(root) = std::env::var_os("NELOMAI_TEST_RUNNER_ROOT") else {
             return;
         };
-        let _ = status_with_timeout(Command::new("/usr/bin/python3").args(["-c", "import sys,fcntl,signal,time,os; signal.alarm(10); f=open(sys.argv[1]+'/lease','w'); fcntl.flock(f,fcntl.LOCK_EX); open(sys.argv[1]+'/ready','w').close(); time.sleep(60)"]).arg(root), Duration::from_secs(30));
+        let _ = status_with_timeout(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process::tests::hung_command_fixture_entry"])
+                .env("NELOMAI_TEST_HUNG_COMMAND_ROOT", root),
+            Duration::from_secs(30),
+        );
     }
 
     #[test]
     fn runner_death_terminates_its_separate_hung_command_group() {
         let root = tempfile::tempdir().unwrap();
-        let mut runner = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "process::tests::runner_death_fixture_entry"])
-            .env("NELOMAI_TEST_RUNNER_ROOT", root.path())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut runner = TestRunner(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process::tests::runner_death_fixture_entry"])
+                .env("NELOMAI_TEST_RUNNER_ROOT", root.path())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while !root.path().join("ready").exists() {
-            assert!(Instant::now() < deadline);
+            assert!(
+                runner.0.try_wait().unwrap().is_none(),
+                "fixture runner exited before readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fixture command did not become ready"
+            );
             thread::sleep(Duration::from_millis(10));
         }
         let lease_path = root.path().join("lease");
         assert!(nelomai_contracts::dispatcher::MutationGuard::at(&lease_path).is_err());
-        runner.kill().unwrap();
-        runner.wait().unwrap();
+        runner.0.kill().unwrap();
+        runner.0.wait().unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok(lease) = nelomai_contracts::dispatcher::MutationGuard::at(&lease_path) {

@@ -17,6 +17,153 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun v2QuickPlanCannotSilentlyFallBackToLegacyWhenRecoveryIsDisabled() {
+        val disabled = BackgroundCapabilitySnapshot(9, false, 2_000_000_000)
+        try {
+            selectQuickStartPolicy(configuredCredentialStore(disabled),
+                template().copy(reserveEnabled = true), 1_000, fetch = { disabled })
+            throw AssertionError("v2 plan accepted without recovery support")
+        } catch (error: BackgroundConnectionException) {
+            assertEquals("background_credential_capability_unavailable", error.code)
+        }
+    }
+
+    @Test
+    fun pendingV2ReplaySurvivesProcessDeathAndHandsOffWithoutSingleLeaseRuntime() {
+        val backend = ServiceRecoveryBackend()
+        val store = recoveryStore(backend)
+        coordinator(store).begin(template().copy(reserveEnabled = true))
+        val pending = requireNotNull(store.load().leaseTransaction)
+        val restored = recoveryStore(backend)
+        val response = redundantResult(restored.load())
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("applied", response.connection.leaseId))
+            startResults.add(Result.success(response))
+        }
+        val runtime = ServiceRuntimeFake()
+        coordinator(restored).runOnce(panel, runtime)
+        val checkpoint = recoveryStore(backend).load()
+        assertNull(checkpoint.leaseTransaction)
+        assertEquals(pending.startOperationId, checkpoint.redundantTransaction?.startOperationId)
+        assertEquals(pending.replay.requestFingerprint,
+            checkpoint.redundantTransaction?.startRequestFingerprint)
+        assertEquals("primary", checkpoint.redundantTransaction?.localActiveLeaseId)
+        assertEquals("standby", checkpoint.redundantTransaction?.slotBLeaseId)
+        assertEquals(0, runtime.startCalls)
+        assertTrue(response.configuration.all { it == 0.toByte() })
+        assertEquals(listOf(pending.startOperationId), panel.startOperationIds)
+    }
+
+    @Test
+    fun cancellationDuringV2AllocationReconcilesEntireSession() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        val response = redundantResult(store.load())
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("not_found"))
+            reconcileResults.add(reconcile("compensating", "primary", cancelRequested = true))
+            reconcileResults.add(reconcile("cancelled", "primary", cancelRequested = true))
+            startResults.add(Result.success(response))
+            onStart = { coordinator.cancelCurrent() }
+        }
+        val runtime = ServiceRuntimeFake()
+        assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().redundantTransaction)
+        assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().leaseTransaction)
+        assertEquals(0, runtime.startCalls)
+        assertTrue(panel.stopLeaseIds.isEmpty())
+        assertTrue(response.configuration.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun v2PendingAfterRebootCancelsWithoutAllocatingNewLease() {
+        val backend = ServiceRecoveryBackend()
+        coordinator(recoveryStore(backend)).begin(template().copy(reserveEnabled = true))
+        val rebooted = recoveryStore(backend, bootCount = 8)
+        val panel = ServicePanelFake().apply { reconcileResults.add(reconcile("cancelled")) }
+        assertEquals(AndroidCoordinatorStep.IDLE,
+            coordinator(rebooted).runOnce(panel, ServiceRuntimeFake()))
+        assertNull(rebooted.load().leaseTransaction)
+        assertTrue(panel.startOperationIds.isEmpty())
+        assertEquals(listOf(true), panel.cancelIfAbsent)
+    }
+
+    private fun redundantResult(envelope: AndroidRecoveryEnvelope): BackgroundStartResult {
+        val pending = requireNotNull(envelope.leaseTransaction)
+        return startResult("primary").copy(redundantTransaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = requireNotNull(envelope.intent.template),
+            sessionId = "22222222-2222-4222-8222-222222222222",
+            slotALeaseId = "primary",
+            slotBLeaseId = "standby",
+            localActiveLeaseId = "primary",
+            standbyDesired = true,
+            roleGeneration = 1,
+            membershipGeneration = 1,
+            startOperationId = pending.startOperationId,
+            startRequestFingerprint = pending.replay.requestFingerprint,
+            startReserveEnabled = true,
+        ))
+    }
+
+    @Test
+    fun cancelledV2StartWaitsForSessionCompensationWithoutSingleLeaseStop() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val coordinator = coordinator(store)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        coordinator.cancelCurrent()
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("applied", "primary", cancelRequested = true))
+            reconcileResults.add(reconcile("compensating", "primary", cancelRequested = true))
+            reconcileResults.add(reconcile("cancelled", "primary", cancelRequested = true))
+            stopResults.add(Result.success(Unit))
+        }
+        val runtime = ServiceRuntimeFake()
+        assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().leaseTransaction?.leaseId)
+        assertTrue(panel.stopLeaseIds.isEmpty())
+        assertEquals(AndroidCoordinatorStep.RETRY, coordinator.runOnce(panel, runtime))
+        assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
+        assertNull(store.load().leaseTransaction)
+        assertEquals(0, runtime.startCalls)
+        assertEquals(listOf(true, true, true), panel.cancelIfAbsent)
+    }
+
+    @Test
+    fun redundantQuickPlanAllocatesDurableV2OperationForBothReserveChoices() {
+        for (reserve in listOf(false, true)) {
+            val args = StartTunnelArgs().apply {
+                configuration = byteArrayOf(1)
+                quickConnection = startResult("old-lease").connection
+                redundancy = RedundantStartArgs().apply { reserveEnabled = reserve }
+            }
+            val plan = requireNotNull(args.copyForQuickPlan())
+            val template = quickConnectionIntentTemplate(
+                template().deviceId,
+                QuickTunnelTemplate(plan.options, requireNotNull(plan.quickConnection)),
+                36,
+            )
+            val backend = ServiceRecoveryBackend()
+            coordinator(recoveryStore(backend)).begin(template)
+            val restored = recoveryStore(backend).load()
+            assertEquals(2, restored.leaseTransaction?.replay?.contractVersion)
+            assertNull(restored.leaseTransaction?.leaseId)
+            assertEquals(template, restored.intent.template)
+        }
+    }
+
+    @Test
+    fun quickPlanCleanupFailureCannotEscapeSuccessfulTunnelCompletion() {
+        assertFalse(
+            clearQuickPlanAfterSaveFailure {
+                throw IllegalStateException("keystore unavailable")
+            },
+        )
+    }
+
+    @Test
     fun exhaustionDistinguishesUnreadableLogoutFromKnownPendingLogout() {
         val backend = ServiceRecoveryBackend().apply { readFails = true }
         val coordinator = coordinator(recoveryStore(backend))
@@ -1017,28 +1164,30 @@ class NelomaiVpnServiceTest {
     @Test
     fun delayedPhysicalNetworkCallbackCannotMutateAReplacementServiceOrOwner() {
         val mutationFence = RedundantOperationMutationFence()
+        val owner = ServiceRedundantOwner()
         val callback = RedundantPhysicalNetworkCallbackIdentity(
             serviceGeneration = 7,
             startOperationId = "start-a",
+            owner = owner,
         )
         var mutations = 0
 
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(8, "start-a", false, false)
+                RedundantPhysicalNetworkCallbackState(8, "start-a", owner, false, false)
             },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-b", false, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-b", owner, false, false)
             },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-a", true, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-a", owner, true, false)
             },
         ) { mutations += 1 })
         assertFalse(callback.applyIfCurrent(
@@ -1047,6 +1196,7 @@ class NelomaiVpnServiceTest {
                 RedundantPhysicalNetworkCallbackState(
                     7,
                     "start-a",
+                    owner,
                     pendingStop = false,
                     tombstoneUnreadable = false,
                     stopLookupPending = true,
@@ -1059,6 +1209,7 @@ class NelomaiVpnServiceTest {
                 RedundantPhysicalNetworkCallbackState(
                     7,
                     "start-a",
+                    owner,
                     pendingStop = false,
                     tombstoneUnreadable = false,
                     retainedOwnerCleanupPending = true,
@@ -1068,14 +1219,14 @@ class NelomaiVpnServiceTest {
         assertTrue(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-a", false, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-a", owner, false, false)
             },
         ) { mutations += 1 })
         mutationFence.cancel("start-a")
         assertFalse(callback.applyIfCurrent(
             mutationFence = mutationFence,
             current = {
-                RedundantPhysicalNetworkCallbackState(7, "start-a", false, false)
+                RedundantPhysicalNetworkCallbackState(7, "start-a", owner, false, false)
             },
         ) { mutations += 1 })
 
@@ -1085,7 +1236,8 @@ class NelomaiVpnServiceTest {
     @Test
     fun physicalNetworkCallbackReadsReplacementIdentityInsideSerializedFence() {
         val mutationFence = RedundantOperationMutationFence()
-        val callback = RedundantPhysicalNetworkCallbackIdentity(7, "start-a")
+        val owner = ServiceRedundantOwner()
+        val callback = RedundantPhysicalNetworkCallbackIdentity(7, "start-a", owner)
         val gateEntered = CountDownLatch(1)
         val releaseGate = CountDownLatch(1)
         val blocker = Thread {
@@ -1097,7 +1249,7 @@ class NelomaiVpnServiceTest {
         }.apply { start() }
         assertTrue(gateEntered.await(2, TimeUnit.SECONDS))
         val currentGeneration = AtomicLong(7)
-        val installedOwner = AtomicReference<String?>("start-a")
+        val installedOperation = AtomicReference<String?>("start-a")
         val callbackStarted = CountDownLatch(1)
         val callbackResult = AtomicReference<Boolean>()
         val mutations = AtomicInteger(0)
@@ -1108,7 +1260,8 @@ class NelomaiVpnServiceTest {
                 current = {
                     RedundantPhysicalNetworkCallbackState(
                         currentGeneration.get(),
-                        installedOwner.get(),
+                        installedOperation.get(),
+                        owner,
                         pendingStop = false,
                         tombstoneUnreadable = false,
                     )
@@ -1118,7 +1271,7 @@ class NelomaiVpnServiceTest {
         assertTrue(callbackStarted.await(2, TimeUnit.SECONDS))
 
         currentGeneration.set(8)
-        installedOwner.set("start-b")
+        installedOperation.set("start-b")
         releaseGate.countDown()
         blocker.join(2_000L)
         delayed.join(2_000L)
@@ -1989,7 +2142,23 @@ class NelomaiVpnServiceTest {
         assertEquals(before.intent.generation, status.generation)
         assertFalse(status.desiredActive)
         assertEquals("stopping", status.status)
+        assertEquals("cleanup_pending", status.leasePhase)
         assertEquals(serviceV2Envelope(), before)
+    }
+
+    @Test
+    fun cancelledRedundantSessionStillProjectsServiceOwnedCleanup() {
+        val recovery = recoveryStore(ServiceRecoveryBackend())
+        recovery.beginRedundant(requireNotNull(serviceV2Envelope().redundantTransaction))
+            .successEnvelope()
+        val cancelled = recovery.cancelCurrentIntent().successEnvelope()
+
+        val status = connectionIntentServiceStatus(cancelled)
+
+        // A null lease phase tells Rust to send a legacy per-lease stop as well.
+        assertFalse(status.desiredActive)
+        assertEquals("stopping", status.status)
+        assertEquals("cleanup_pending", status.leasePhase)
     }
 
     @Test
@@ -2131,6 +2300,60 @@ class NelomaiVpnServiceTest {
         assertEquals(readsBefore + 1, backend.readCount)
         val ticket = (selection as AndroidQuickToggleDispatch.Start).ticket
         assertEquals(0L, ticket.expectedGeneration)
+    }
+
+    @Test
+    fun quickOffAfterLookupBarrierExecutesAndClearsTheRealDurableStop() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        store.setDesiredActive(0, true).successEnvelope()
+        val coordinator = coordinator(store)
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val barrier = RedundantStopLookupBarrier()
+        var running = true
+        var stops = 0
+        val runtime = ServiceConnectionIntentRuntimeBoundary(
+            startTransport = { _, _, _, _ -> error("stop must never start") },
+            stopTransport = { success, _ -> stops++; running = false; success(true) },
+            running = { running }, timeoutMillis = 100,
+        )
+        fun schedule() {
+            if (shouldApplyConnectionIntentStep(false, false, store.load(),
+                    stopLookupPending = barrier.hasPending())) {
+                coordinator.runOnce(ServicePanelFake(), runtime)
+            }
+        }
+        val connectionLifecycle = ConnectionIntentServiceLifecycle(coordinator, schedule = ::schedule)
+        val lifecycle = RedundantTotalLossLifecycle(
+            currentServiceGeneration = { 1L }, serviceActive = { true },
+            barrierPending = barrier::hasPending, logoutState = { BackgroundLogoutReadState.NONE },
+            recovery = { RecoveryStoreResult.Success(store.load()) }, post = { it() },
+            retryCleanup = { error("no redundant cleanup") }, publishRestartStarting = {},
+            resume = {
+                assertFalse(barrier.hasPending())
+                connectionLifecycle.onEnsureRunning()
+            }, scheduleLogout = { error("no logout") },
+            scheduleStateReadRetry = { error("readable store") }, stopIfIdle = {},
+        )
+        val worker = RedundantVpnWorkDispatcher(Executor { it.run() })
+        dispatchWithRedundantStopLookupBarrier(
+            worker, worker, barrier, resolveInMemory = { null },
+            resolveDurable = { coordinator.quickToggle(dispatch).quickDispatch() },
+            postToCaller = { it() }, complete = { selected ->
+                assertTrue(selected is AndroidQuickToggleDispatch.Stop)
+                assertTrue(coordinator.cancelCurrentForQuickToggle() is AndroidCoordinatorResult.Accepted)
+                assertEquals("legacy_runtime_stop", store.load().intent.retry.pendingAction)
+                schedule()
+                assertEquals(0, stops)
+            }, onRejected = { error("unexpected rejection") },
+            afterComplete = { lifecycle.onCleanupAcknowledged(1) },
+        )
+        assertFalse(barrier.hasPending())
+        assertEquals(1, stops)
+        assertFalse(running)
+        assertNull(store.load().intent.retry.pendingAction)
+        assertFalse(store.load().intent.desiredActive)
+        lifecycle.onCleanupAcknowledged(1)
+        assertEquals(1, stops)
     }
 
     @Test
@@ -3450,6 +3673,71 @@ class NelomaiVpnServiceTest {
 
         assertFalse(lifecycle.onEnsureRunning())
         assertEquals(0, schedules)
+    }
+
+    @Test
+    fun stoppedRedundantSessionCanStartFreshFromItsMetadataOnlyQuickTemplate() {
+        val store = recoveryStore(ServiceRecoveryBackend())
+        val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
+        val args = StartTunnelArgs().apply {
+            configuration = byteArrayOf(1, 2, 3)
+            cacheQuickAction = false
+            quickConnection = QuickConnectionArgs().apply {
+                leaseId = requireNotNull(transaction.localActiveLeaseId)
+                layer = "stray"
+                ticConnectionMode = "dynamic"
+                routeMode = "standalone"
+                egressMode = "ipv4"
+                allowAlternate = false
+            }
+            options.splitActive = true
+            options.policyHash = "current-split-policy"
+            options.excludeLocalNetworks = true
+            redundancy = RedundantStartArgs()
+        }
+        store.beginRedundant(transaction).successEnvelope()
+        val plan = requireNotNull(args.copyForQuickPlan()) { "missing tile template after redundant start" }
+        assertEquals(0, plan.configuration.size)
+        assertEquals("", plan.quickConnection?.leaseId)
+        assertNull(plan.redundancy)
+        args.clearSensitiveConfigurations()
+
+        // Model acknowledged native/panel stop; the recovery store removes its
+        // transient template, so the next tap needs the separate quick template.
+        store.deferRedundantStop("v2-stop", transaction.startOperationId).successEnvelope()
+        store.updateRedundant(transaction.startOperationId) { current ->
+            current.copy(retry = current.retry.copy(stopState = RedundantStopState.ACKNOWLEDGED))
+        }.successEnvelope()
+        store.completeRedundantStop("v2-stop", transaction.startOperationId).successEnvelope()
+        assertNull(store.load().intent.template)
+        assertNull(store.load().redundantTransaction)
+        val quickTemplate = quickConnectionIntentTemplate(transaction.template.deviceId,
+            QuickTunnelTemplate(plan.options, requireNotNull(plan.quickConnection)), 36)
+        val coordinator = coordinator(store)
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val selected = coordinator.quickToggle(dispatch).quickDispatch() as AndroidQuickToggleDispatch.Start
+        val result = executeDispatchedQuickStart(
+            dispatch = dispatch,
+            start = selected,
+            selectPolicy = {
+                selectQuickStartPolicy(configuredCredentialStore(), quickTemplate, 1_000,
+                    fetch = { BackgroundCapabilitySnapshot(2, true, 2_000, reserveEnabled = true) })
+            },
+            recoveryStart = {
+                coordinator.beginDispatched(quickTemplate, selected.ticket.expectedGeneration,
+                    { dispatch.isCurrent(selected.ticket) })
+            },
+            legacyStart = { error("a new recovery start is required") },
+        )
+        assertTrue(result is AndroidQuickStartExecution.RecoveryAccepted)
+        val restarted = store.load()
+        assertEquals("stray", restarted.intent.template?.layer)
+        assertEquals(false, restarted.intent.template?.allowAlternate)
+        assertEquals("current-split-policy", restarted.intent.template?.options?.policyHash)
+        assertEquals(true, restarted.intent.template?.options?.excludeLocalNetworks)
+        assertEquals(LeasePhase.START_PENDING, restarted.leaseTransaction?.phase)
+        assertNull(restarted.leaseTransaction?.leaseId)
+        assertTrue(restarted.leaseTransaction?.startOperationId != transaction.startOperationId)
     }
 
     @Test

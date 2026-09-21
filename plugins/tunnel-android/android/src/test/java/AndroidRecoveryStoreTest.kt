@@ -9,6 +9,28 @@ import org.junit.Test
 
 class AndroidRecoveryStoreTest {
     @Test
+    fun pendingV2HandoffRejectsForeignOperationCancellationAndWriteFailure() {
+        val backend = FakeEncryptedRecordBackend()
+        val store = store(backend)
+        val selected = template().copy(reserveEnabled = true)
+        val replay = replay().copy(contractVersion = 2, requestFingerprint = "v2-fingerprint")
+        val pending = requireNotNull(store.beginStart(0, selected, replay).success().leaseTransaction)
+        val target = redundantTransaction(replay.startOperationId).copy(template = selected)
+        assertTrue(store.promotePendingRedundant(pending,
+            target.copy(startOperationId = "foreign")) is RecoveryStoreResult.Failure)
+        assertTrue(store.promotePendingRedundant(pending,
+            target.copy(startReserveEnabled = false)) is RecoveryStoreResult.Failure)
+        backend.failWrites = true
+        assertTrue(store.promotePendingRedundant(pending, target) is RecoveryStoreResult.Failure)
+        backend.failWrites = false
+        assertEquals(pending, store.read().success().leaseTransaction)
+        assertNull(store.read().success().redundantTransaction)
+        store.cancelCurrentIntent().success()
+        assertTrue(store.promotePendingRedundant(pending, target) is RecoveryStoreResult.Failure)
+        assertFalse(store.read().success().intent.desiredActive)
+    }
+
+    @Test
     fun activeCheckpointPersistsArmedHistoryAcrossProcessDeath() {
         val backend = FakeEncryptedRecordBackend()
         var store = store(backend)

@@ -24,6 +24,7 @@ spec = importlib.util.spec_from_file_location("release_set", ROOT / "scripts/bui
 release_set = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release_set)
 verifier = release_set.verifier
+gates = verifier.load_script("release-candidate-gates.py")
 SYNTHETIC_LATEST = "0.2.21"
 
 
@@ -33,18 +34,29 @@ def stage_signed(signed, root_digest, output, public_key, platform, architecture
         raise ValueError("unknown container purpose")
     if output.exists() or output.is_symlink():
         raise ValueError("immutable signed staging output exists")
-    verifier.load_script("release-candidate-gates.py").verify_runtime_release(
-        signed / "release", "0.2.20", source, root_digest, public_key)
     documents = signed / "containers" / platform / kind
     manifest_path, signature = documents / "container-manifest-v1.json", documents / "container-manifest-v1.sig"
     container = verifier.authenticated("container", manifest_path, signature, public_key, platform, architecture)
+    version = container["container_version"]
+    if version not in ("0.2.20", gates.VERSION) or (version == gates.VERSION and kind != "shipping"):
+        raise ValueError("unsupported container version/purpose")
+    confirmed = version == gates.VERSION
+    gates.verify_runtime_release(signed / "release", version, source, root_digest, public_key)
+    if confirmed:
+        gates.verify_runtime_release(signed / "confirmed-stable", gates.STABLE_VERSION, gates.STABLE_SOURCE,
+                                     gates.STABLE_ROOT_SHA256, signed / "stable-public-key.raw")
     slots = [slot["slot"] for slot in container["slots"]]
-    if slots != (["latest", "stable"] if kind == "acceptance" else ["latest"]):
+    if slots != (["latest", "stable"] if kind == "acceptance" or confirmed else ["latest"]):
         raise ValueError("container purpose differs from signed slots")
-    prefix = f"nelomai-runtime-0.2.20-{platform}-{architecture}"
+    prefix = f"nelomai-runtime-{version}-{platform}-{architecture}"
     if kind == "acceptance" and (container.get("stable_release_set_sha256") != root_digest
             or container.get("stable_platform_manifest_sha256") != verifier.digest(signed / "release" / (prefix + ".manifest.json"))):
         raise ValueError("acceptance container differs from final stable root")
+    stable_prefix = f"nelomai-runtime-{gates.STABLE_VERSION}-{platform}-{architecture}"
+    if confirmed and (container.get("stable_release_set_sha256") != gates.STABLE_ROOT_SHA256
+            or container.get("stable_platform_manifest_sha256") != verifier.digest(
+                signed / "confirmed-stable" / (stable_prefix + ".manifest.json"))):
+        raise ValueError("shipping container differs from confirmed stable root")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".keyless-stage-", dir=output.parent) as temporary:
         staged = Path(temporary) / "resources"
@@ -52,9 +64,14 @@ def stage_signed(signed, root_digest, output, public_key, platform, architecture
         for slot in container["slots"]:
             latest = slot["slot"] == "latest"
             folder = signed / "latest" / platform if latest else signed / "release"
-            archive = folder / (prefix + ".zip")
-            original = verifier.verify(archive, folder / (prefix + ".manifest.json"),
-                folder / (prefix + ".manifest.sig"), public_key, "0.2.20", source, platform, architecture,
+            slot_prefix, slot_version, slot_source, slot_key = prefix, version, source, public_key
+            if not latest and confirmed:
+                folder = signed / "confirmed-stable"
+                slot_prefix, slot_version, slot_source, slot_key = (
+                    stable_prefix, gates.STABLE_VERSION, gates.STABLE_SOURCE, signed / "stable-public-key.raw")
+            archive = folder / (slot_prefix + ".zip")
+            original = verifier.verify(archive, folder / (slot_prefix + ".manifest.json"),
+                folder / (slot_prefix + ".manifest.sig"), slot_key, slot_version, slot_source, platform, architecture,
                 inspect_native=False)
             expected = {**original, "runtime_version": SYNTHETIC_LATEST} if latest and kind == "acceptance" else original
             if slot["manifest"] != expected:
@@ -72,7 +89,7 @@ def stage_signed(signed, root_digest, output, public_key, platform, architecture
             else:
                 verifier.inspect(payload, expected, readelf)
             archives[slot["slot"]] = archive
-        if platform == "android" and kind == "acceptance":
+        if platform == "android" and "stable" in slots:
             check = verifier.load_script("android/check-runtime-collisions.py")
             conflicts = check.collisions(*(check.inspect_archive(archives[slot].read_bytes(), readelf=readelf)
                                           for slot in ("latest", "stable")))
@@ -272,7 +289,7 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
     matches = list((bundle_dir / ("macos" if platform == "macos" else bundle)).glob(suffix))
     if len(matches) != 1:
         raise ValueError("native packager did not emit one acceptance installer")
-    name = f"nelomai-acceptance-0.2.20-{platform}-{architecture}"
+    name = f"nelomai-acceptance-{manifest['container_version']}-{platform}-{architecture}"
     extracted = output / "extracted"
     extracted.mkdir()
     if platform == "macos":
@@ -296,7 +313,7 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
         # RPATHs again. The installed launcher supplies the trusted library path.
         subprocess.run([str(plugin), "--appimage-extract-and-run", "--appdir", str(intermediate / "squashfs-root")],
             env={**environment, "APPIMAGE_EXTRACT_AND_RUN": "1", "ARCH": architecture,
-                 "OUTPUT": str(package), "VERSION": "0.2.20"}, cwd=output, check=True)
+                 "OUTPUT": str(package), "VERSION": manifest['container_version']}, cwd=output, check=True)
         subprocess.run([str(package), "--appimage-extract"], cwd=extracted, check=True, stdout=subprocess.DEVNULL)
     else:
         package = output / (name + ".exe")
@@ -315,7 +332,8 @@ def package_android(staged, output, public_key, readelf, apkanalyzer, common_hos
     runtime = staged / "runtime"
     manifest = verifier.authenticated("container", runtime / "container-manifest-v1.json",
         runtime / "container-manifest-v1.sig", public_key, "android", "aarch64")
-    if variant not in ("Debug", "Release") or len(manifest["slots"]) != (2 if acceptance else 1):
+    confirmed = manifest["container_version"] == gates.VERSION
+    if variant not in ("Debug", "Release") or len(manifest["slots"]) != (2 if acceptance or confirmed else 1):
         raise ValueError("APK purpose or build variant mismatch")
     inputs = output / "inputs"
     shutil.copytree(runtime, inputs / "assets/runtime")
@@ -328,14 +346,17 @@ def package_android(staged, output, public_key, readelf, apkanalyzer, common_hos
             shutil.copyfile(library, native / library.name)
     subprocess.run([str(readelf.with_name("llvm-strip")), "--strip-debug", "-o",
         str(native / "libnelomai_android_container.so"), str(common_host)], check=True)
-    stable_aar = runtime / "engines/stable/0.2.20/runtime/runtime.aar"
+    stable = next((slot for slot in manifest["slots"] if slot["slot"] == "stable"), None)
     android = root / "src-tauri/gen/android"
     gradle = android / ("gradlew.bat" if os.name == "nt" else "gradlew")
-    arguments = (["-PnelomaiAcceptance=true", "-PnelomaiStableRuntimeAar=" + str(stable_aar)] if acceptance else [])
+    arguments = ["-PnelomaiAcceptance=true"] if acceptance else []
+    if stable is not None:
+        stable_aar = runtime / "engines/stable" / stable["manifest"]["runtime_version"] / "runtime/runtime.aar"
+        arguments.append("-PnelomaiStableRuntimeAar=" + str(stable_aar))
     subprocess.run([str(gradle), ":app:assembleArm64" + variant, "--no-daemon", *( ["--offline"] if offline else []), *arguments,
         "-PnelomaiRuntimeInputs=" + str(inputs), "-x", ":app:rustBuildArm64" + variant],
         cwd=android, env=environment, check=True)
-    package = output / "nelomai-acceptance-0.2.20-android-aarch64.apk"
+    package = output / f"nelomai-acceptance-{manifest['container_version']}-android-aarch64.apk"
     # Candidate release packaging is keyless. apksigner consumes this exact
     # unsigned APK only in the later protected finalization job.
     apk_name = "app-arm64-debug.apk" if variant == "Debug" else "app-arm64-release-unsigned.apk"
@@ -344,8 +365,10 @@ def package_android(staged, output, public_key, readelf, apkanalyzer, common_hos
     # WebView bytes must remain exact, and actual compiled DEX entrypoints are
     # required independently by the acceptance-only APK checker.
     import sys
-    arguments = (["--acceptance", "--release-set-sha256", manifest["stable_release_set_sha256"],
-                  "--stable-manifest-sha256", manifest["stable_platform_manifest_sha256"]] if acceptance else [])
+    arguments = ["--acceptance"] if acceptance else []
+    if stable is not None:
+        arguments += ["--release-set-sha256", manifest["stable_release_set_sha256"],
+                      "--stable-manifest-sha256", manifest["stable_platform_manifest_sha256"]]
     subprocess.run([sys.executable, str(root / "scripts/android/check-container-apk.py"),
         "--apk", str(package), "--apkanalyzer", str(apkanalyzer), "--public-key", str(public_key), *arguments],
         env=environment, check=True)

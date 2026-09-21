@@ -43,7 +43,7 @@ class RedundantHealthMonitorTest {
     }
 
     @Test
-    fun softFailureRequiresProbeFailureAndIndependentSignalForFiveSeconds() {
+    fun softFailureRequiresProbeFailureAndTwoIndependentConfirmations() {
         val monitor = RedundantHealthMonitor(softFailureConfirmationMs = 5_000)
         val readyStandby = slot(index = 1, health = BackendHealth.READY)
 
@@ -70,7 +70,7 @@ class RedundantHealthMonitorTest {
                     probeFailed = true,
                     independentFailureSignal = true,
                     softFailureStartedAtMs = 3_000,
-                    corroboratedProbeFailures = 2,
+                    corroboratedProbeFailures = 1,
                 ),
                 readyStandby,
             ),
@@ -89,6 +89,22 @@ class RedundantHealthMonitorTest {
                 readyStandby,
             ),
         ).switchTo)
+    }
+
+    @Test
+    fun activeSwitchesAfterConfirmationsWithoutExtraWaitButStandbyKeepsDwell() {
+        val monitor = RedundantHealthMonitor()
+        val confirmed = slot(
+            index = 0, active = true, probeFailed = true,
+            independentFailureSignal = true, softFailureStartedAtMs = 2_000,
+            corroboratedProbeFailures = 2,
+        )
+        assertFalse(monitor.failed(1_999, confirmed))
+        assertEquals(1, monitor.evaluateHealth(6_000, listOf(
+            confirmed, slot(index = 1, health = BackendHealth.READY),
+        )).switchTo)
+        assertFalse(monitor.failed(6_000, confirmed.copy(active = false)))
+        assertTrue(monitor.failed(7_000, confirmed.copy(active = false)))
     }
 
     @Test

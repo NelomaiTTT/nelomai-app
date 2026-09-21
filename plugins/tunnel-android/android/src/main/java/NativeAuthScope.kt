@@ -65,11 +65,39 @@ internal data class NativeOwnerScope(
     }
 }
 
+internal fun NativeOwnerScope.isSuccessorOf(
+    predecessor: NativeOwnerScope,
+    provisionPredecessor: NativeOwnerScope? = null,
+): Boolean =
+    authEpoch == predecessor.authEpoch &&
+        (family == predecessor.family || provisionPredecessor == predecessor ||
+            canReprovisionRetainedScope(predecessor, provisionPredecessor)) &&
+        deviceId == predecessor.deviceId &&
+        sessionGeneration > predecessor.sessionGeneration
+
+/** An old container could rotate family during latest -> stable -> latest.
+ * The owner proves only the last completed hop; older receipts can be retired.
+ * Admit the retained target namespace only within that same login/device and
+ * strictly before the confirmed other-slot source. This grants fresh bearer
+ * provisioning, never recovery/rotation with the retained token. The store
+ * additionally fences installation, panel, cancellation and unfinished logout.
+ */
+private fun NativeOwnerScope.canReprovisionRetainedScope(
+    retained: NativeOwnerScope,
+    confirmedSource: NativeOwnerScope?,
+): Boolean = confirmedSource != null &&
+    confirmedSource.authEpoch == authEpoch && confirmedSource.deviceId == deviceId &&
+    retained.slot == slot && retained.runtimeVersion == runtimeVersion &&
+    retained.runtimeContractVersion == runtimeContractVersion && confirmedSource.slot != slot &&
+    retained.sessionGeneration < confirmedSource.sessionGeneration &&
+    confirmedSource.sessionGeneration == sessionGeneration - 1
+
 internal data class NativeOwnerOperation(
     val scope: NativeOwnerScope,
     val operationId: String,
     val attempt: Long,
     val expiresAtUnixMs: Long,
+    val provisionPredecessor: NativeOwnerScope? = null,
 ) {
     init {
         require(UUID.fromString(operationId).toString() == operationId && attempt > 0)
@@ -79,13 +107,15 @@ internal data class NativeOwnerOperation(
     fun toJson(): JSONObject = JSONObject().apply {
         put("ticket", scope.toJson().apply { put("operation_id", operationId); put("attempt", attempt) })
         put("expires_at_unix_ms", expiresAtUnixMs)
+        provisionPredecessor?.let { put("provision_predecessor", it.toJson()) }
     }
 
     companion object {
         fun fromJson(value: JSONObject): NativeOwnerOperation {
             val ticket = value.getJSONObject("ticket")
             return NativeOwnerOperation(NativeOwnerScope.fromJson(ticket), ticket.getString("operation_id"),
-                ticket.getLong("attempt"), value.getLong("expires_at_unix_ms"))
+                ticket.getLong("attempt"), value.getLong("expires_at_unix_ms"),
+                value.optJSONObject("provision_predecessor")?.let(NativeOwnerScope::fromJson))
         }
     }
 }

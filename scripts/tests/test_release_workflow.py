@@ -8,6 +8,21 @@ from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def test_linux_diagnostic_source_gate_tracks_current_version(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())
+        commands = '\n'.join(step.get('run', '') for step in workflow['jobs']['linux-package-diagnostic']['steps'])
+        self.assertIn('--version 0.3.0 --mode build_only', commands)
+
+    def test_030_signing_downloads_pinned_stable_before_signing_containers(self):
+        workflow = self.workflow()
+        self.assertEqual(workflow[True]["workflow_dispatch"]["inputs"]["version"]["default"], "0.3.0")
+        commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["sign"]["steps"])
+        self.assertLess(commands.index("scripts/download-confirmed-stable.py"),
+                        commands.index("scripts/sign-runtime-candidate.py"))
+        signing = commands[commands.index("scripts/sign-runtime-candidate.py"):]
+        for argument in ("--confirmed-stable", "--stable-public-key", '--version "$RELEASE_VERSION"'):
+            self.assertIn(argument, signing)
+
     def test_checks_android_setup_does_not_request_retired_sdk_tools(self):
         workflow = yaml.safe_load((ROOT / ".github/workflows/checks.yml").read_text())
         steps = workflow["jobs"]["android-plugin"]["steps"]
@@ -92,6 +107,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         workflow = self.workflow()
         self.assertEqual(workflow["permissions"].get("contents"), "read", "default workflow is not read-only")
         jobs = workflow["jobs"]
+        self.assertEqual(jobs["native_drafts"].get("if"), "inputs.mode != 'publish_approved_candidate'",
+                         "publication-only runs must not start native builds")
         writers = [name for name, job in jobs.items() if job.get("permissions", {}).get("contents") == "write"]
         self.assertEqual(writers, ["publish"])
         publish = jobs["publish"]
@@ -122,7 +139,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(jobs["finalize"]["environment"], "release-candidate-finalization")
         for name in ("native_drafts", "native_packages"):
             self.assertNotIn("environment", jobs[name])
-        self.assertEqual(jobs["sign"]["needs"], "native_drafts")
+        self.assertNotIn("needs", jobs["native_drafts"])
+        self.assertEqual(set(jobs["sign"]["needs"]), {"verify", "native_drafts"})
         self.assertIn("sign", jobs["native_packages"]["needs"])
         self.assertIn("native_packages", jobs["finalize"]["needs"])
         self.assertIn("build-runtime-release-set.py", yaml.safe_dump(jobs["sign"]))
@@ -150,7 +168,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
                         self.assertTrue("inputs.mode == 'sign_candidate'" in str(value)
                                         or step.get("if") == "inputs.mode == 'sign_candidate'",
                                         "test signing step receives a production credential")
-        self.assertEqual(jobs["sign"]["needs"], "native_drafts")
+        self.assertNotIn("needs", jobs["native_drafts"])
+        self.assertEqual(set(jobs["sign"]["needs"]), {"verify", "native_drafts"})
         self.assertEqual(set(jobs["native_packages"]["needs"]), {"native_drafts", "sign"})
         self.assertEqual(set(jobs["finalize"]["needs"]), {"native_packages", "sign"})
 

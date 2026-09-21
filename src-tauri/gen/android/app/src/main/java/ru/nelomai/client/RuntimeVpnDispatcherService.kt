@@ -56,9 +56,23 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // A status/read request is not a foreground-service launch. Real FGS
         // launches must be acknowledged before waiting for the owner Binder.
-        if (intent == null || intent.getBooleanExtra(
-                ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_FOREGROUND_START, false)) {
-            promoteToForeground()
+        val foregroundRequested = intent == null || intent.getBooleanExtra(
+            ru.nelomai.runtime.v1.RuntimeServiceIntents.EXTRA_FOREGROUND_START,
+            false,
+        )
+        val foregroundPromotionFailed = foregroundRequested && (
+            VpnService.prepare(this) != null ||
+                try {
+                    promoteToForeground()
+                    false
+                } catch (_: SecurityException) {
+                    true
+                }
+        )
+        if (foregroundPromotionFailed && definitelyStartsVpn(intent)) {
+            rejectStart(intent, "vpn_permission_required")
+            stopSelf(startId)
+            return START_NOT_STICKY
         }
         selection.read { result ->
             if (destroyed) return@read
@@ -72,20 +86,38 @@ class RuntimeVpnDispatcherService : VpnService(), RuntimeVpnHostV1 {
                 val selectedEngine = engine ?: RuntimeAdapters.engine(active, this).also {
                     loaded = active; engine = it; it.create()
                 }
-                if (selectedEngine.requiresStartAdmission(intent) && !RuntimeDispatchPolicy.mayStart(active)) {
+                val requiresStartAdmission = selectedEngine.requiresStartAdmission(intent)
+                if (foregroundPromotionFailed && requiresStartAdmission) {
+                    rejectStart(intent, "vpn_permission_required")
+                    stopSelf(startId)
+                    return@read
+                }
+                if (requiresStartAdmission && !RuntimeDispatchPolicy.mayStart(active)) {
                     rejectStart(intent)
                     return@read
                 }
                 selectedEngine.start(intent, flags, startId)
+            } catch (_: SecurityException) {
+                rejectStart(intent, "vpn_permission_required")
+                stopSelf(startId)
             } catch (_: Exception) { stopSelf(startId) }
         }
-        return START_STICKY
+        return if (foregroundPromotionFailed) START_NOT_STICKY else START_STICKY
     }
 
-    private fun rejectStart(intent: Intent?) {
+    private fun definitelyStartsVpn(intent: Intent?): Boolean = when (intent?.action) {
+        null,
+        "ru.nelomai.tunnel.BEGIN_CONNECTION_INTENT",
+        "ru.nelomai.tunnel.CLIENT_START",
+        "ru.nelomai.tunnel.ENSURE_RUNNING",
+        "ru.nelomai.tunnel.TASK_REMOVAL_LIVENESS" -> true
+        else -> false
+    }
+
+    private fun rejectStart(intent: Intent?, errorCode: String = "runtime_switch_pending") {
         @Suppress("DEPRECATION")
         intent?.getParcelableExtra<android.os.ResultReceiver>("result_receiver")?.send(2,
-            android.os.Bundle().apply { putString("error_code", "runtime_switch_pending") })
+            android.os.Bundle().apply { putString("error_code", errorCode) })
     }
 
     override fun builder(beforeEstablish: (Builder) -> Unit): Builder = object : Builder() {

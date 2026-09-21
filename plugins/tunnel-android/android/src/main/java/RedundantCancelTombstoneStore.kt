@@ -280,6 +280,7 @@ internal fun activeRedundantTransactionForWork(
 internal data class RedundantPhysicalNetworkCallbackState(
     val serviceGeneration: Long,
     val installedStartOperationId: String?,
+    val installedOwner: RedundantVpnProcessOwner?,
     val pendingStop: Boolean,
     val tombstoneUnreadable: Boolean,
     val stopLookupPending: Boolean = false,
@@ -289,10 +290,12 @@ internal data class RedundantPhysicalNetworkCallbackState(
 internal data class RedundantPhysicalNetworkCallbackIdentity(
     val serviceGeneration: Long,
     val startOperationId: String,
+    val owner: RedundantVpnProcessOwner,
 ) {
     fun isCurrent(current: RedundantPhysicalNetworkCallbackState): Boolean =
         serviceGeneration == current.serviceGeneration &&
             startOperationId == current.installedStartOperationId &&
+            owner === current.installedOwner &&
             !redundantCleanupBlocksNewStarts(
                 current.pendingStop,
                 current.tombstoneUnreadable,

@@ -16,9 +16,8 @@ val tauriProperties = Properties().apply {
 val runtimeInputs = providers.gradleProperty("nelomaiRuntimeInputs").orNull?.let { file(it) }
 val acceptancePackage = providers.gradleProperty("nelomaiAcceptance").orNull == "true"
 val stableRuntimeAar = providers.gradleProperty("nelomaiStableRuntimeAar").orNull?.let { file(it) }
-check(acceptancePackage || stableRuntimeAar == null) { "Stable AAR linking is restricted to the separate acceptance package" }
-if (acceptancePackage) {
-    check(stableRuntimeAar?.isFile == true) { "Acceptance packaging requires the exact final stable runtime AAR" }
+if (acceptancePackage || stableRuntimeAar != null) {
+    check(stableRuntimeAar?.isFile == true) { "Two-slot packaging requires the exact final stable runtime AAR" }
 }
 val verifyRuntimeBuildInputs by tasks.registering {
     doLast {
@@ -27,7 +26,7 @@ val verifyRuntimeBuildInputs by tasks.registering {
             "jniLibs/arm64-v8a/libnelomai_android_container.so", "jniLibs/arm64-v8a/libnelomai_app_lib.so", "jniLibs/arm64-v8a/libwg-go.so")) {
             check(inputs.resolve(name).isFile) { "Missing compiled runtime input: $name" }
         }
-        if (acceptancePackage) {
+        if (stableRuntimeAar != null) {
             for (name in listOf("libnelomai_runtime_stable.so", "libstable_runtime_wg_go.so")) {
                 check(inputs.resolve("jniLibs/arm64-v8a/$name").isFile) { "Missing exact stable native input: $name" }
             }
@@ -145,7 +144,7 @@ rust {
 }
 
 dependencies {
-    if (acceptancePackage) {
+    if (stableRuntimeAar != null) {
         // Link final candidate classes/resources; never rebuild the stable AAR.
         implementation(files(stableRuntimeAar!!))
     }
