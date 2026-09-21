@@ -3742,7 +3742,8 @@ class NelomaiVpnServiceTest {
 
     @Test
     fun promotedTotalLossReplayResumesAsRealConnectionIntentWork() {
-        val store = recoveryStore(ServiceRecoveryBackend())
+        val backend = ServiceRecoveryBackend()
+        val store = recoveryStore(backend)
         val transaction = requireNotNull(serviceV2Envelope().redundantTransaction)
         store.beginRedundant(transaction).successEnvelope()
         store.prepareRedundantTotalLoss(
@@ -3770,6 +3771,24 @@ class NelomaiVpnServiceTest {
         assertTrue(lifecycle.onEnsureRunning())
         assertEquals(0, redundantSchedules)
         assertEquals(1, connectionSchedules)
+
+        // Resume after process death through the real dispatcher, not just its timer.
+        val restored = recoveryStore(backend)
+        val response = redundantResult(restored.load())
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("not_found"))
+            startResults.add(Result.success(response))
+        }
+        val runtime = ServiceRuntimeFake()
+        assertEquals(AndroidCoordinatorStep.BUSY,
+            coordinator(restored).runOnce(panel, runtime))
+        val restarted = recoveryStore(backend).load()
+        assertNull(restarted.leaseTransaction)
+        assertEquals("replacement-start", restarted.redundantTransaction?.startOperationId)
+        assertEquals("standby", restarted.redundantTransaction?.slotBLeaseId)
+        assertEquals(true, restarted.redundantTransaction?.standbyDesired)
+        assertEquals(0, runtime.startCalls)
+        assertTrue(response.configuration.all { it == 0.toByte() })
     }
 
     @Test

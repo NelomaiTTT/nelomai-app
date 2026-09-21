@@ -1,5 +1,22 @@
 package ru.nelomai.tunnel
 
+internal fun redundantTotalLossRestartReplay(
+    transaction: AndroidRedundantTransaction,
+    operationId: String,
+): AndroidStartReplay = AndroidStartReplay(
+    startOperationId = operationId,
+    contractVersion = 2,
+    requestFingerprint = androidConnectionIntentFingerprint(
+        transaction.template,
+        requiresMeasuredCandidateSelection(
+            transaction.template.layer,
+            transaction.template.ticConnectionMode,
+            transaction.template.allowAlternate,
+        ),
+        transaction.standbyDesired,
+    ),
+)
+
 internal enum class RedundantTotalLossCommandDisposition {
     IGNORE,
     DEFER_UNTIL_BARRIER_RELEASE,

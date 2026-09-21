@@ -740,6 +740,53 @@ class AndroidRecoveryStoreTest {
     }
 
     @Test
+    fun totalLossRestartRetainsV2ReserveChoiceAcrossProcessDeath() {
+        for (reserve in listOf(true, false)) {
+            val backend = FakeEncryptedRecordBackend()
+            var recovery = store(backend)
+            // Foreground sessions may have no reserve flag in their old template;
+            // standbyDesired is authoritative after an in-session reserve change.
+            recovery.beginRedundant(redundantTransaction("v2-start").copy(
+                standbyDesired = reserve,
+            )).success()
+            recovery.prepareRedundantTotalLoss(
+                "v2-start", AndroidStartReplay("replacement-start", 1, "old-fingerprint"),
+            ).success()
+            recovery.deferRedundantStop("v2-stop", "v2-start").success()
+            assertTrue(recovery.completeRedundantStop("v2-stop", "v2-start")
+                is RecoveryStoreResult.Failure)
+            assertNull(recovery.read().success().leaseTransaction)
+            recovery = store(backend)
+            recovery.updateRedundant("v2-start") { transaction ->
+                transaction.copy(retry = transaction.retry.copy(
+                    stopState = RedundantStopState.ACKNOWLEDGED,
+                ))
+            }.success()
+            backend.failWrites = true
+            assertTrue(recovery.completeRedundantStop("v2-stop", "v2-start")
+                is RecoveryStoreResult.Failure)
+            backend.failWrites = false
+            assertNotNull(store(backend).read().success().redundantTransaction)
+            assertNull(store(backend).read().success().leaseTransaction)
+            recovery.completeRedundantStop("v2-stop", "v2-start").success()
+            val restored = store(backend).read().success()
+            val selected = requireNotNull(restored.intent.template)
+            val pending = requireNotNull(restored.leaseTransaction)
+            val request = backgroundExactStartPayload(selected, pending, emptyList())
+            assertEquals(2, request.getInt("recovery_contract_version"))
+            assertEquals(1, request.getInt("redundancy_contract_version"))
+            assertEquals(reserve, request.getBoolean("reserve_enabled"))
+            assertEquals(reserve, selected.reserveEnabled)
+            assertEquals("replacement-start", request.getString("operation_id"))
+            assertTrue(request.getBoolean("require_measured_selection"))
+            assertEquals(if (reserve)
+                "03bf9fabd0f53c63b5ae673eeb6d8230126aa89ec3cc998ea419d74c1cf0c2d3"
+            else "a476f93c67f4f7c4c0c8a5a6fa316b871ab11e653c5ec63d64d7d61543daf281",
+                request.getString("request_fingerprint"))
+        }
+    }
+
+    @Test
     fun totalLossReplayIsPersistedOnceAndPromotedOnlyAfterAcknowledgedCleanup() {
         val store = store(FakeEncryptedRecordBackend())
         store.beginRedundant(redundantTransaction("v2-start")).success()
@@ -767,7 +814,9 @@ class AndroidRecoveryStoreTest {
         assertTrue(promoted.intent.desiredActive)
         assertEquals(1L, promoted.intent.generation)
         assertEquals(LeasePhase.START_PENDING, promoted.leaseTransaction?.phase)
-        assertEquals(replay, promoted.leaseTransaction?.replay)
+        assertEquals(replay.startOperationId, promoted.leaseTransaction?.startOperationId)
+        assertEquals(2, promoted.leaseTransaction?.replay?.contractVersion)
+        assertEquals(true, promoted.intent.template?.reserveEnabled)
         assertEquals("redundant_total_loss_restart", promoted.intent.retry.pendingAction)
         assertEquals(
             "v2-start",
