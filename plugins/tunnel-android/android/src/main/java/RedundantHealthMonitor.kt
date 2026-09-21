@@ -8,6 +8,8 @@ internal enum class BackendHealth {
     RECOVERING,
 }
 
+internal enum class StandbyProbeState { NOT_REQUIRED, PENDING, SUCCEEDED, FAILED }
+
 internal data class SlotObservation(
     val index: Int,
     val active: Boolean,
@@ -20,6 +22,7 @@ internal data class SlotObservation(
     val handshakeFresh: Boolean = false,
     val consecutiveProbeSuccesses: Int = 0,
     val stableSinceMs: Long? = null,
+    val standbyProbeState: StandbyProbeState = StandbyProbeState.NOT_REQUIRED,
 )
 
 internal data class FailoverDecision(
@@ -78,6 +81,10 @@ internal class RedundantHealthMonitor(
         if (candidate != null) {
             return FailoverDecision(switchTo = candidate.index, sessionStalled = false)
         }
+        if (bounded.any { !it.active && !it.hardFailure &&
+                it.health != BackendHealth.UNHEALTHY &&
+                it.standbyProbeState == StandbyProbeState.PENDING
+            }) return NONE
         sessionStalledEmitted = true
         return FailoverDecision(switchTo = null, sessionStalled = true)
     }
@@ -100,7 +107,10 @@ internal class RedundantHealthMonitor(
             active.corroboratedProbeFailures < REQUIRED_CORROBORATED_PROBE_FAILURES ||
             startedAt == null
         ) return false
-        return nowMs >= startedAt && nowMs - startedAt >= softFailureConfirmationMs
+        // Active traffic switches after the initial failed probe and two corroborated
+        // retries. Keep the existing dwell for background standby replacement only.
+        return nowMs >= startedAt &&
+            (active.active || nowMs - startedAt >= softFailureConfirmationMs)
     }
 
     private fun classify(nowMs: Long, slot: SlotObservation): BackendHealth {
@@ -117,6 +127,8 @@ internal class RedundantHealthMonitor(
     }
 
     private fun usableCandidate(nowMs: Long, slot: SlotObservation): Boolean =
+        (slot.standbyProbeState == StandbyProbeState.NOT_REQUIRED ||
+            slot.standbyProbeState == StandbyProbeState.SUCCEEDED) &&
         when (classify(nowMs, slot)) {
             BackendHealth.READY -> true
             BackendHealth.WARMING, BackendHealth.RECOVERING ->

@@ -10,12 +10,310 @@ import org.junit.Test
 
 class RedundantProductionAdaptersTest {
     @Test
+    fun dnsOnlyFailureDoesNotStopOrdinaryStandbyProbes() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            for (now in 30_000L..65_000L step 1_000L) {
+                fixture.backend.decryptedReceivePackets = now - 29_000L
+                val decision = fixture.tick(now) { slot, _ -> slot != primary }
+                assertEquals(null, decision.switchTo)
+                assertFalse(decision.sessionStalled)
+            }
+            assertTrue("Reserve checks stopped during DNS-only failure", fixture.backend.probeLaunches
+                .any { (started, slot) -> slot != primary && started >= 45_000L })
+        }
+    }
+
+    @Test
+    fun realLossAfterDnsOnlyFailureStillChecksAndSelectsHealthyStandby() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            for (now in 30_000L..56_000L step 1_000L) {
+                if (now < 50_000L) fixture.backend.decryptedReceivePackets = now - 29_000L
+                val decision = fixture.tick(now) { slot, _ -> slot != primary }
+                assertFalse("Unexpected restart at $now", decision.sessionStalled)
+                assertEquals(if (now == 56_000L) 1 - primary else null, decision.switchTo)
+            }
+            assertTrue(fixture.backend.probeLaunches
+                .any { (started, slot) -> slot != primary && started >= 52_000L })
+        }
+    }
+
+    @Test
+    fun realLossAfterDnsOnlyFailureCannotSelectNowDeadStandby() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            var stalledAt: Long? = null
+            for (now in 30_000L..60_000L step 1_000L) {
+                if (now < 50_000L) fixture.backend.decryptedReceivePackets = now - 29_000L
+                val decision = fixture.tick(now) { slot, _ -> slot != primary && now < 50_000L }
+                assertEquals(null, decision.switchTo)
+                if (decision.sessionStalled) {
+                    stalledAt = now
+                    break
+                }
+            }
+            assertEquals(57_000L, stalledAt)
+        }
+    }
+
+    @Test
+    fun timelyStandbyReplySurvivesPollingJitterInBothSlotOrders() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            var switchedAt: Long? = null
+            for (now in 30_000L..39_000L step 1_001L) {
+                val decision = fixture.tick(now) { slot, started ->
+                    slot != primary && now - started >= 1_500L
+                }
+                assertFalse(decision.sessionStalled)
+                if (decision.switchTo != null) {
+                    assertEquals(1 - primary, decision.switchTo)
+                    switchedAt = now
+                    break
+                }
+            }
+            assertEquals(37_007L, switchedAt)
+        }
+    }
+
+    @Test
+    fun repeatedlyExpiredRepliesCannotRenewTheStandbyCheckBudget() {
+        val fixture = pairFixture(0)
+        var stalledAt: Long? = null
+        for (now in 30_000L..45_000L step 3_001L) {
+            val decision = fixture.tick(now) { slot, started ->
+                slot == 1 && now - started >= 1_500L
+            }
+            assertEquals(null, decision.switchTo)
+            if (decision.sessionStalled) {
+                stalledAt = now
+                break
+            }
+        }
+        assertEquals(42_004L, stalledAt)
+        assertFalse(fixture.backend.probeLaunches.any { it.first == stalledAt && it.second == 1 })
+    }
+
+    @Test
+    fun activeStartsEveryTwoSecondsRegardlessOfResponseCompletion() {
+        val fixture = timingFixture(active = true)
+        for (now in 0L..6_000L step 1_000L) fixture.observe(now, healthy = true)
+        assertEquals(listOf(0L, 2_000L, 4_000L, 6_000L),
+            fixture.backend.probeLaunches.map { it.first })
+    }
+
+    @Test
+    fun suspectedPrimaryInterleavesFreshStandbyProbesInBothSlotOrders() {
+        for (primary in listOf(0, 1)) {
+            val fixture = pairFixture(primary)
+            for (now in 30_000L..36_000L step 1_000L) {
+                val decision = fixture.tick(now) { slot, _ -> slot != primary }
+                if (now < 36_000) assertEquals(null, decision.switchTo)
+                else assertEquals(1 - primary, decision.switchTo)
+                assertFalse(decision.sessionStalled)
+            }
+            assertEquals(listOf(
+                30_000L to primary, 32_000L to primary, 33_000L to (1 - primary),
+                34_000L to primary, 35_000L to (1 - primary), 36_000L to primary,
+            ), fixture.backend.probeLaunches.filter { it.first >= 30_000L })
+        }
+    }
+
+    @Test
+    fun staleReadyStandbyCannotReceiveTrafficWhenBothPathsFail() {
+        val fixture = pairFixture(0)
+        var decision = FailoverDecision(null, false)
+        for (now in 30_000L..37_000L step 1_000L) {
+            decision = fixture.tick(now) { _, _ -> false }
+            assertEquals(null, decision.switchTo)
+            if (now < 37_000L) assertFalse(decision.sessionStalled)
+        }
+        assertTrue(decision.sessionStalled)
+    }
+
+    @Test
+    fun pendingLatestStandbyCheckWaitsThenSwitchesWithoutStarvation() {
+        val fixture = pairFixture(0)
+        for (now in 30_000L..37_000L step 1_000L) {
+            val decision = fixture.tick(now) { slot, started ->
+                slot == 1 && (started != 35_000L || now >= 37_000L)
+            }
+            assertFalse(decision.sessionStalled)
+            if (now < 37_000L) assertEquals(null, decision.switchTo)
+            else assertEquals(1, decision.switchTo)
+        }
+    }
+
+    @Test
+    fun failedLatestStandbyCheckOverridesEarlierSuccess() {
+        val fixture = pairFixture(0)
+        for (now in 30_000L..37_000L step 1_000L) {
+            val decision = fixture.tick(now) { slot, started -> slot == 1 && started < 35_000L }
+            assertEquals(null, decision.switchTo)
+            assertEquals(now == 37_000L, decision.sessionStalled)
+        }
+    }
+
+    @Test
+    fun recoveryOfPrimaryEndsAcceleratedStandbyChecks() {
+        val fixture = pairFixture(0)
+        for (now in 30_000L..40_000L step 1_000L) {
+            val decision = fixture.tick(now) { slot, _ -> slot == 1 || now >= 34_000L }
+            assertEquals(null, decision.switchTo)
+            assertFalse(decision.sessionStalled)
+        }
+        assertEquals(listOf(33_000L), fixture.backend.probeLaunches
+            .filter { it.second == 1 && it.first >= 30_000L }.map { it.first })
+    }
+
+    @Test
+    fun pausedHealthTickExpiresTheCheckInsteadOfReusingSuccessOrRestartingItsBudget() {
+        val fixture = pairFixture(0)
+        for (now in 30_000L..36_000L step 1_000L) {
+            fixture.observe(now) { slot, _ -> slot == 1 }
+        }
+        val afterPause = fixture.tick(60_000) { _, _ -> false }
+        assertEquals(null, afterPause.switchTo)
+        assertTrue(afterPause.sessionStalled)
+        assertFalse(fixture.backend.probeLaunches.any { it.first == 60_000L && it.second == 1 })
+        assertFalse(fixture.tick(61_000) { slot, _ -> slot == 1 }.sessionStalled)
+    }
+
+    @Test
+    fun responseToProbeSentBeforeSuspicionCannotValidateStandby() {
+        val fixture = pairFixture(0, warmUntil = 27_000)
+        fixture.tick(28_000) { _, _ -> false }
+        fixture.tick(29_000) { _, _ -> false }
+        val oldToken = fixture.backend.probeDetails.entries.single {
+            it.value == (28_000L to 1)
+        }.key
+        val observations = fixture.observe(30_000) { slot, _ -> slot == 1 }
+        assertFalse(fixture.backend.probeStatuses.containsKey(oldToken))
+        assertEquals(StandbyProbeState.PENDING, observations.single { it.index == 1 }.standbyProbeState)
+        assertFalse(fixture.backend.probeLaunches.any { it == (30_000L to 1) })
+        fixture.tick(31_000) { _, _ -> false }
+        assertTrue(fixture.backend.probeLaunches.contains(31_000L to 1))
+    }
+
+    @Test
+    fun hardFailureAlsoWaitsForFreshStandbyResponse() {
+        val fixture = pairFixture(0)
+        fixture.backend.rebindFailures += 0
+        assertFalse(fixture.native.rebind("lease-a"))
+        for (now in 30_000L..32_000L step 1_000L) {
+            val decision = fixture.tick(now) { slot, _ -> slot == 1 }
+            assertFalse(decision.sessionStalled)
+            assertEquals(if (now == 32_000L) 1 else null, decision.switchTo)
+        }
+    }
+
+    @Test
+    fun silentActiveLossReachesFailoverWithinEightSecondsAcrossProbePhases() {
+        for (failureAt in listOf(30_000L, 31_000L, 32_000L)) {
+            val fixture = timingFixture(active = true)
+            val monitor = RedundantHealthMonitor()
+            var switchedAt: Long? = null
+            for (now in 0L..(failureAt + 8_000L) step 1_000L) {
+                val observation = fixture.observe(now, healthy = now < failureAt)
+                val decision = monitor.evaluateHealth(now, listOf(
+                    observation,
+                    SlotObservation(index = 1, active = false, health = BackendHealth.READY),
+                ))
+                if (decision.switchTo != null) {
+                    assertEquals(1, decision.switchTo)
+                    assertTrue(observation.probeFailed)
+                    assertTrue(observation.independentFailureSignal)
+                    assertEquals(2, observation.corroboratedProbeFailures)
+                    switchedAt = now
+                    break
+                }
+            }
+            assertTrue("No failover within 8s for loss at $failureAt", switchedAt != null)
+            assertTrue(requireNotNull(switchedAt) >= failureAt)
+        }
+    }
+
+    @Test
+    fun activeProbeTimesOutAtTwoSecondsButStandbyRetainsPanelTimeout() {
+        val active = timingFixture(active = true)
+        val standby = timingFixture(active = false)
+        active.observe(0, healthy = false)
+        standby.observe(0, healthy = false)
+        assertFalse(active.observe(1_999, healthy = false).probeFailed)
+        assertTrue(active.observe(2_000, healthy = false).probeFailed)
+        assertFalse(standby.observe(2_000, healthy = false).probeFailed)
+        assertTrue(standby.observe(4_000, healthy = false).probeFailed)
+    }
+
+    @Test
+    fun readyStandbyKeepsSlowCadenceUntilPromotedToActive() {
+        val fixture = timingFixture(active = false)
+        for (now in 0L..13_000L step 1_000L) fixture.observe(now, healthy = true)
+        assertEquals(BackendHealth.READY, fixture.observe(15_000, healthy = true).health)
+        fixture.observe(27_000, healthy = true)
+        assertTrue(fixture.backend.probeStatuses.values.none { it == NativeProbeStatus.PENDING })
+        assertTrue(fixture.native.activate("lease-a"))
+        fixture.observe(27_000, healthy = false)
+        assertTrue(fixture.backend.probeStatuses.values.any { it == NativeProbeStatus.PENDING })
+        assertTrue(fixture.observe(29_000, healthy = false).probeFailed)
+    }
+
+    @Test
+    fun oneOrTwoLostProbesRecoverWithoutFailover() {
+        for (recoverAt in listOf(3_000L, 5_000L)) {
+            val fixture = timingFixture(active = true)
+            val monitor = RedundantHealthMonitor()
+            for (now in 0L..10_000L step 1_000L) {
+                val observation = fixture.observe(now, healthy = now >= recoverAt)
+                assertFalse("Premature failure at $now, recovery at $recoverAt",
+                    monitor.failed(now, observation))
+                if (now >= recoverAt) assertFalse(observation.independentFailureSignal)
+            }
+        }
+    }
+
+    @Test
+    fun decryptedTrafficAfterTwoLossesCancelsFastFailover() {
+        val fixture = timingFixture(active = true)
+        for (now in 0L..4_000L step 1_000L) fixture.observe(now, healthy = false)
+        fixture.backend.decryptedReceivePackets = 1
+        val recovered = fixture.observe(5_000, healthy = false)
+        assertFalse(recovered.independentFailureSignal)
+        assertFalse(RedundantHealthMonitor().failed(5_000, recovered))
+    }
+
+    @Test
+    fun promotionCapsAlreadyPendingStandbyProbeToActiveDeadline() {
+        val fixture = timingFixture(active = false)
+        fixture.observe(0, healthy = false)
+        fixture.observe(1_000, healthy = false)
+        assertTrue(fixture.native.activate("lease-a"))
+        assertTrue(fixture.observe(2_000, healthy = false).probeFailed)
+    }
+
+    @Test
+    fun unsentConfirmationBreaksConsecutiveFailureSequence() {
+        val fixture = timingFixture(active = true)
+        fixture.observe(0, healthy = false)
+        fixture.observe(2_000, healthy = false)
+        fixture.backend.countProbeSend = false
+        assertEquals(1, fixture.observe(4_000, healthy = false).corroboratedProbeFailures)
+        fixture.backend.countProbeSend = true
+        val uncorroborated = fixture.observe(6_000, healthy = false)
+        assertFalse(uncorroborated.independentFailureSignal)
+        assertEquals(0, uncorroborated.corroboratedProbeFailures)
+        assertFalse(RedundantHealthMonitor().failed(6_000, uncorroborated))
+    }
+
+    @Test
     fun urgentSequenceUsesElapsedTimeAndDoesNotWaitForReadyCadence() {
         val clock = TestDualClock(
             epochMs = 1_800_000_000_000L,
             elapsedMs = 10_000L,
         )
         val backend = RecordingSessionBackend { clock.epochMs }
+        backend.probeClock = { clock.elapsedMs }
         val native = ServiceRedundantConnectionNative(
             backend = backend,
             establishTun = { 41 },
@@ -41,16 +339,17 @@ class RedundantProductionAdaptersTest {
         clock.elapsedMs = 25_000L
         assertEquals(BackendHealth.READY, native.healthObservations().single().health)
 
-        clock.elapsedMs = 35_003L
-        native.healthObservations()
+        // The active path has already launched the next ordinary probe at 25s.
         val ordinaryToken = requireNotNull(backend.latestProbeToken)
         backend.probeStatuses[ordinaryToken] = NativeProbeStatus.FAILED
         clock.elapsedMs += 1L
         val suspected = native.healthObservations().single()
+        clock.elapsedMs = 27_000L
+        native.healthObservations()
         val urgentOne = requireNotNull(backend.latestProbeToken)
 
         assertTrue(suspected.independentFailureSignal)
-        assertEquals(clock.elapsedMs, suspected.softFailureStartedAtMs)
+        assertEquals(25_001L, suspected.softFailureStartedAtMs)
         assertEquals(0, suspected.corroboratedProbeFailures)
         assertTrue(urgentOne != ordinaryToken)
 
@@ -62,7 +361,7 @@ class RedundantProductionAdaptersTest {
         val corroborated = native.healthObservations().single()
 
         assertEquals(2, corroborated.corroboratedProbeFailures)
-        assertEquals(35_004L, corroborated.softFailureStartedAtMs)
+        assertEquals(25_001L, corroborated.softFailureStartedAtMs)
         assertTrue(corroborated.independentFailureSignal)
     }
 
@@ -86,6 +385,8 @@ class RedundantProductionAdaptersTest {
         backend.probeStatuses[ordinaryToken] = NativeProbeStatus.FAILED
         clock.elapsedMs += 1L
         assertTrue(native.healthObservations().single().independentFailureSignal)
+        clock.elapsedMs = 12_000L
+        native.healthObservations()
         backend.probeStatuses[requireNotNull(backend.latestProbeToken)] =
             NativeProbeStatus.SUCCEEDED
         clock.elapsedMs += 1L
@@ -500,6 +801,70 @@ class RedundantProductionAdaptersTest {
         timeoutMs = 4_000,
     )
 
+    private fun timingFixture(active: Boolean): TimingFixture {
+        val clock = TestDualClock(epochMs = 1_800_000_000_000L, elapsedMs = 0L)
+        val backend = RecordingSessionBackend { clock.epochMs }
+        backend.probeClock = { clock.elapsedMs }
+        val native = ServiceRedundantConnectionNative(
+            backend = backend,
+            establishTun = { 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+            epochNowMs = { clock.epochMs },
+            elapsedNowMs = { clock.elapsedMs },
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        if (active) assertTrue(native.activate("lease-a"))
+        return TimingFixture(clock, backend, native)
+    }
+
+    private fun pairFixture(primary: Int, warmUntil: Long = 29_000L): PairFixture {
+        val single = timingFixture(active = false)
+        single.backend.useSlotCounters = true
+        assertTrue(single.native.start("lease-b", RedundantSlot.B, byteArrayOf(2), probe()))
+        assertTrue(single.native.activate(if (primary == 0) "lease-a" else "lease-b"))
+        val pair = PairFixture(single.clock, single.backend, single.native)
+        for (now in 0L..warmUntil step 1_000L) pair.tick(now) { _, _ -> true }
+        return pair
+    }
+
+    private class PairFixture(
+        val clock: TestDualClock,
+        val backend: RecordingSessionBackend,
+        val native: ServiceRedundantConnectionNative,
+    ) {
+        val monitor = RedundantHealthMonitor()
+        fun tick(now: Long, succeeds: (Int, Long) -> Boolean): FailoverDecision =
+            monitor.evaluateHealth(now, observe(now, succeeds))
+
+        fun observe(now: Long, succeeds: (Int, Long) -> Boolean): List<SlotObservation> {
+            clock.elapsedMs = now
+            backend.probeStatuses.replaceAll { token, status ->
+                val (started, slot) = backend.probeDetails.getValue(token)
+                if (status == NativeProbeStatus.PENDING && succeeds(slot, started)) {
+                    NativeProbeStatus.SUCCEEDED
+                } else status
+            }
+            return native.healthObservations()
+        }
+    }
+
+    private class TimingFixture(
+        val clock: TestDualClock,
+        val backend: RecordingSessionBackend,
+        val native: ServiceRedundantConnectionNative,
+    ) {
+        fun observe(now: Long, healthy: Boolean): SlotObservation {
+            clock.elapsedMs = now
+            if (healthy) {
+                backend.probeStatuses.replaceAll { _, status ->
+                    if (status == NativeProbeStatus.PENDING) NativeProbeStatus.SUCCEEDED else status
+                }
+            }
+            return native.healthObservations().single()
+        }
+    }
+
     private fun suspectedFixture(): SuspectedFixture {
         val clock = TestDualClock(epochMs = 1_800_000_000_000L, elapsedMs = 10_000L)
         val backend = RecordingSessionBackend { clock.epochMs }
@@ -569,6 +934,11 @@ private class RecordingSessionBackend(
     val additionalSlots = mutableListOf<Int>()
     val activeSlots = mutableListOf<Int>()
     val probeStatuses = mutableMapOf<Long, NativeProbeStatus>()
+    val probeLaunches = mutableListOf<Pair<Long, Int>>()
+    val probeDetails = mutableMapOf<Long, Pair<Long, Int>>()
+    var probeClock: () -> Long = { 0L }
+    var useSlotCounters = false
+    private val slotSendPackets = mutableMapOf<Int, Long>()
     val rebindFailures = mutableSetOf<Int>()
     var latestProbeToken: Long? = null
     var countProbeSend = true
@@ -616,7 +986,13 @@ private class RecordingSessionBackend(
         slot: Int,
         template: NativeDnsProbeTemplate,
     ): Long = nextToken++.also {
-        if (countProbeSend) udpSendPackets += 1
+        if (countProbeSend) {
+            udpSendPackets += 1
+            slotSendPackets[slot] = (slotSendPackets[slot] ?: 0L) + 1L
+        }
+        val launched = probeClock() to slot
+        probeLaunches += launched
+        probeDetails[it] = launched
         latestProbeToken = it
         probeStatuses[it] = NativeProbeStatus.PENDING
     }
@@ -634,7 +1010,8 @@ private class RecordingSessionBackend(
             prefix = "{\"slots\":[",
             postfix = "]}",
         ) { slot ->
-            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$udpSendPackets,"udp_receive_packets":$udpReceivePackets}}"""
+            val sent = if (useSlotCounters) slotSendPackets[slot] ?: 0L else udpSendPackets
+            """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":${nowMs()},"telemetry":{"tun_read_bytes":7,"tun_write_bytes":11,"tun_write_packets":$decryptedReceivePackets,"udp_send_packets":$sent,"udp_receive_packets":$udpReceivePackets}}"""
         }
     }
 

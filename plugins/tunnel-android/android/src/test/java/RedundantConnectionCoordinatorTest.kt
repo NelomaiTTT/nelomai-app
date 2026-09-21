@@ -523,7 +523,7 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
-    fun wallClockJumpsCannotConfirmSoftFailureBeforeElapsedDeadline() {
+    fun wallClockJumpsCannotReplaceProbeConfirmations() {
         var epochMs = 1_800_000_000_000L
         var elapsedMs = 10_000L
         val native = FakeNative()
@@ -536,6 +536,7 @@ class RedundantConnectionCoordinatorTest {
             healthMonitor = RedundantHealthMonitor(rebindStabilizationMs = 0),
         )
         val failedAt = elapsedMs
+        var confirmations = 0
         fun observations() = listOf(
             healthSlot(
                 index = 0,
@@ -543,7 +544,7 @@ class RedundantConnectionCoordinatorTest {
                 probeFailed = true,
                 independentFailureSignal = true,
                 softFailureStartedAtMs = failedAt,
-                corroboratedProbeFailures = 2,
+                corroboratedProbeFailures = confirmations,
             ),
             healthSlot(index = 1, health = BackendHealth.READY),
         )
@@ -552,11 +553,13 @@ class RedundantConnectionCoordinatorTest {
         assertTrue(native.activated.isEmpty())
         epochMs = 1L
         elapsedMs += 4_999L
+        confirmations = 1
         assertTrue(coordinator.onHealthObservations(observations()))
         assertTrue(native.activated.isEmpty())
 
         epochMs = Long.MAX_VALUE
         elapsedMs += 1L
+        confirmations = 2
         assertTrue(coordinator.onHealthObservations(observations()))
         assertEquals(listOf("lease-b"), native.activated)
     }

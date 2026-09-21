@@ -160,6 +160,8 @@ internal class ServiceRedundantConnectionNative(
         var probeToken: Long? = null,
         var probeDeadlineElapsedMs: Long? = null,
         var lastProbeAtElapsedMs: Long = Long.MIN_VALUE,
+        var lastProbeFinishedAtElapsedMs: Long = Long.MIN_VALUE,
+        var lastCompletedProbeStartedAtMs: Long = Long.MIN_VALUE,
         var urgentProbe: Boolean = false,
         var consecutiveProbeSuccesses: Int = 0,
         var probeFailed: Boolean = false,
@@ -190,6 +192,8 @@ internal class ServiceRedundantConnectionNative(
     private var activeSlot: RedundantSlot? = null
     private var networkValidated = initialNetworkValidated
     private var probeSourceIpv4 = probeSourceIpv4
+    private var standbyCheckStartedAtMs: Long? = null
+    private var standbyCheckFirstProbeAtMs: Long? = null
 
     override fun start(
         leaseId: String,
@@ -243,7 +247,13 @@ internal class ServiceRedundantConnectionNative(
         val runtime = slots.values.singleOrNull { it.leaseId == leaseId }
             ?: return@synchronized false
         backend.switchActive(nativeSession, runtime.slot.index).also { switched ->
-            if (switched) activeSlot = runtime.slot
+            if (switched) {
+                if (activeSlot != runtime.slot) clearStandbyCheckLocked()
+                activeSlot = runtime.slot
+                runtime.probeDeadlineElapsedMs = runtime.probeDeadlineElapsedMs?.let {
+                    minOf(it, saturatingAdd(runtime.lastProbeAtElapsedMs, ACTIVE_PROBE_TIMEOUT_MILLIS))
+                }
+            }
         }
     }
 
@@ -262,6 +272,7 @@ internal class ServiceRedundantConnectionNative(
         slots.clear()
         session = null
         activeSlot = null
+        clearStandbyCheckLocked()
         true
     }
 
@@ -271,6 +282,7 @@ internal class ServiceRedundantConnectionNative(
 
     override fun setNetworkValidated(validated: Boolean) = synchronized(gate) {
         networkValidated = validated
+        if (!validated) clearStandbyCheckLocked()
         if (!validated) slots.values.forEach { runtime ->
             cancelProbeLocked(runtime)
             clearUrgentFailureLocked(runtime)
@@ -295,6 +307,9 @@ internal class ServiceRedundantConnectionNative(
                 runtime.probeToken = null
                 runtime.probeDeadlineElapsedMs = null
                 runtime.lastProbeAtElapsedMs = Long.MIN_VALUE
+                runtime.lastProbeFinishedAtElapsedMs = Long.MIN_VALUE
+                runtime.lastCompletedProbeStartedAtMs = Long.MIN_VALUE
+                if (runtime.slot == activeSlot) clearStandbyCheckLocked()
                 runtime.probeBaselineTxPackets = null
                 runtime.probeBaselineRxPackets = null
                 clearUrgentFailureLocked(runtime)
@@ -339,11 +354,41 @@ internal class ServiceRedundantConnectionNative(
             runCatching { backend.metrics(nativeSession) }.getOrNull(),
         ) ?: return@synchronized invalidHealthObservationsLocked()
         slots.values.forEach { it.invalidMetricsSnapshots = 0 }
+        // Process the active slot first regardless of A/B ordering so the reserve
+        // sees suspicion in the same tick, including after a previous failover.
+        val active = slots[activeSlot]
+        val activeMetrics = active?.let { metricsBySlot.getValue(it.slot.index) }
+        if (active != null && activeMetrics != null) {
+            advanceProbeLocked(nativeSession, active, elapsedNow,
+                activeMetrics.txPackets, activeMetrics.rxPackets)
+        }
+        val activeHardFailure = active != null && activeMetrics != null &&
+            (active.hardFailure || activeMetrics.closed || !activeMetrics.admitted)
+        // DNS failure alone can coexist with working traffic. Only a data-plane
+        // suspicion spends the bounded reserve-check budget; otherwise keep the
+        // ordinary reserve probes running and allow a later loss its own episode.
+        val activeSuspected = activeHardFailure ||
+            (active?.probeFailed == true && active.urgentEvidence)
+        if (networkValidated && active != null && activeSuspected) {
+            if (standbyCheckStartedAtMs == null) {
+                standbyCheckStartedAtMs = elapsedNow
+                standbyCheckFirstProbeAtMs = saturatingAdd(
+                    active.lastProbeAtElapsedMs.takeIf { it != Long.MIN_VALUE } ?: elapsedNow,
+                    STANDBY_PROBE_OFFSET_MILLIS,
+                )
+            }
+        } else clearStandbyCheckLocked()
+        val activeConfirmed = activeHardFailure || (active?.urgentEvidence == true &&
+            active.urgentCorroboratedFailures >= REQUIRED_URGENT_FAILURES)
+        slots.values.filter { it.slot != activeSlot }.forEach { runtime ->
+            val metrics = metricsBySlot.getValue(runtime.slot.index)
+            advanceProbeLocked(nativeSession, runtime, elapsedNow,
+                metrics.txPackets, metrics.rxPackets, holdCompletedStandby = activeConfirmed)
+        }
         slots.values.sortedBy { it.slot.index }.map { runtime ->
             val nativeMetrics = requireNotNull(metricsBySlot[runtime.slot.index])
             val txPackets = nativeMetrics.txPackets
             val rxPackets = nativeMetrics.rxPackets
-            advanceProbeLocked(nativeSession, runtime, elapsedNow, txPackets, rxPackets)
             runtime.previousTxPackets = txPackets
             runtime.previousRxPackets = rxPackets
             val latestHandshake = nativeMetrics.latestHandshakeUnixMs
@@ -372,6 +417,7 @@ internal class ServiceRedundantConnectionNative(
                 handshakeFresh = handshakeFresh,
                 consecutiveProbeSuccesses = runtime.consecutiveProbeSuccesses,
                 stableSinceMs = runtime.startedAtElapsedMs,
+                standbyProbeState = standbyProbeStateLocked(runtime, elapsedNow),
             )
         }
     }
@@ -427,6 +473,7 @@ internal class ServiceRedundantConnectionNative(
                 corroboratedProbeFailures = runtime.urgentCorroboratedFailures,
                 consecutiveProbeSuccesses = runtime.consecutiveProbeSuccesses,
                 stableSinceMs = runtime.startedAtElapsedMs,
+                standbyProbeState = StandbyProbeState.FAILED,
             )
         }
 
@@ -446,8 +493,19 @@ internal class ServiceRedundantConnectionNative(
         elapsedNow: Long,
         currentTxPackets: Long,
         currentRxPackets: Long,
+        holdCompletedStandby: Boolean = false,
     ) {
         if (!networkValidated) return
+        val checkStarted = standbyCheckStartedAtMs.takeIf { runtime.slot != activeSlot }
+        if (checkStarted != null && standbyCheckExpired(elapsedNow)) {
+            cancelProbeLocked(runtime)
+            return
+        }
+        if (checkStarted != null && runtime.lastProbeAtElapsedMs < checkStarted) {
+            // An old in-flight response is not evidence for this failure episode.
+            cancelProbeLocked(runtime)
+            clearUrgentFailureLocked(runtime)
+        }
         val urgentRxPacketsAtStart = runtime.urgentRxPacketsAtStart
         if (runtime.urgentEvidence && urgentRxPacketsAtStart != null &&
             currentRxPackets > urgentRxPacketsAtStart
@@ -455,7 +513,7 @@ internal class ServiceRedundantConnectionNative(
             cancelProbeLocked(runtime)
             clearUrgentFailureLocked(runtime)
             runtime.probeFailed = false
-            runtime.lastProbeAtElapsedMs = elapsedNow
+            runtime.lastProbeFinishedAtElapsedMs = elapsedNow
             return
         }
         val urgentDeadline = runtime.urgentDeadlineElapsedMs
@@ -500,22 +558,32 @@ internal class ServiceRedundantConnectionNative(
             }
             if (runtime.probeToken != null) return
         }
+        if (checkStarted != null && holdCompletedStandby &&
+            runtime.lastCompletedProbeStartedAtMs >= checkStarted &&
+            recentStandbyResult(runtime, elapsedNow)
+        ) return
         val urgent = runtime.urgentEvidence
-        val interval = if (urgent) {
+        val interval = if (runtime.slot == activeSlot || checkStarted != null) {
+            ACTIVE_PROBE_INTERVAL_MILLIS
+        } else if (urgent) {
             0L
         } else if (runtime.consecutiveProbeSuccesses >= READY_PROBE_SUCCESSES) {
             READY_PROBE_INTERVAL_MILLIS
         } else {
             WARMUP_PROBE_INTERVAL_MILLIS
         }
-        if (runtime.lastProbeAtElapsedMs != Long.MIN_VALUE &&
-            elapsedNow >= runtime.lastProbeAtElapsedMs &&
-            elapsedNow - runtime.lastProbeAtElapsedMs < interval
-        ) return
+        val intervalBase = if (runtime.slot == activeSlot || checkStarted != null) {
+            runtime.lastProbeAtElapsedMs
+        } else runtime.lastProbeFinishedAtElapsedMs
+        if (checkStarted != null && runtime.lastProbeAtElapsedMs < checkStarted) {
+            if (elapsedNow < requireNotNull(standbyCheckFirstProbeAtMs)) return
+        } else if (intervalBase != Long.MIN_VALUE && elapsedNow >= intervalBase &&
+            elapsedNow - intervalBase < interval) return
         val probe = runtime.probe ?: return
         runtime.probeBaselineTxPackets = currentTxPackets
         runtime.probeBaselineRxPackets = currentRxPackets
         runtime.urgentProbe = urgent
+        runtime.lastProbeAtElapsedMs = elapsedNow
         val opaque = backend.startProbe(
             nativeSession,
             runtime.slot.index,
@@ -537,11 +605,12 @@ internal class ServiceRedundantConnectionNative(
         runtime.probeToken = opaque
         val timeoutMs = if (urgent) {
             minOf(probe.timeoutMs, URGENT_PROBE_TIMEOUT_MILLIS)
+        } else if (runtime.slot == activeSlot || checkStarted != null) {
+            minOf(probe.timeoutMs, ACTIVE_PROBE_TIMEOUT_MILLIS)
         } else {
             probe.timeoutMs
         }
         runtime.probeDeadlineElapsedMs = saturatingAdd(elapsedNow, timeoutMs)
-        runtime.lastProbeAtElapsedMs = elapsedNow
     }
 
     private fun finishProbe(
@@ -558,7 +627,8 @@ internal class ServiceRedundantConnectionNative(
             currentTxPackets > baselineTx && currentRxPackets <= baselineRx
         runtime.probeToken = null
         runtime.probeDeadlineElapsedMs = null
-        runtime.lastProbeAtElapsedMs = elapsedNow
+        runtime.lastProbeFinishedAtElapsedMs = elapsedNow
+        runtime.lastCompletedProbeStartedAtMs = runtime.lastProbeAtElapsedMs
         runtime.urgentProbe = false
         runtime.probeFailed = !succeeded
         runtime.consecutiveProbeSuccesses = if (succeeded) {
@@ -572,6 +642,8 @@ internal class ServiceRedundantConnectionNative(
             if (sentWithoutReceive) {
                 runtime.urgentCorroboratedFailures =
                     (runtime.urgentCorroboratedFailures + 1).coerceAtMost(REQUIRED_URGENT_FAILURES)
+            } else {
+                clearUrgentFailureLocked(runtime)
             }
         } else if (sentWithoutReceive) {
             runtime.urgentStartedAtElapsedMs = elapsedNow
@@ -597,6 +669,38 @@ internal class ServiceRedundantConnectionNative(
         runtime.probeBaselineRxPackets = null
     }
 
+    private fun clearStandbyCheckLocked() {
+        standbyCheckStartedAtMs = null
+        standbyCheckFirstProbeAtMs = null
+    }
+
+    private fun standbyProbeStateLocked(runtime: SlotRuntime, elapsedNow: Long): StandbyProbeState {
+        val since = standbyCheckStartedAtMs?.takeIf { runtime.slot != activeSlot }
+            ?: return StandbyProbeState.NOT_REQUIRED
+        if (standbyCheckExpired(elapsedNow)) return StandbyProbeState.FAILED
+        if (runtime.probe == null || runtime.hardFailure) return StandbyProbeState.FAILED
+        if (runtime.probeToken != null) return StandbyProbeState.PENDING
+        if (runtime.lastCompletedProbeStartedAtMs >= since && runtime.probeFailed) {
+            return StandbyProbeState.FAILED
+        }
+        return if (runtime.lastCompletedProbeStartedAtMs >= since &&
+            runtime.consecutiveProbeSuccesses > 0 && recentStandbyResult(runtime, elapsedNow)
+        ) StandbyProbeState.SUCCEEDED else StandbyProbeState.PENDING
+    }
+
+    private fun recentStandbyResult(runtime: SlotRuntime, elapsedNow: Long): Boolean =
+        runtime.lastCompletedProbeStartedAtMs != Long.MIN_VALUE &&
+            elapsedNow >= runtime.lastCompletedProbeStartedAtMs &&
+            // Native reports success when polled, not its receive timestamp. Allow
+            // one health tick to observe it; pending probes still time out at 2s.
+            elapsedNow - runtime.lastCompletedProbeStartedAtMs <=
+                ACTIVE_PROBE_TIMEOUT_MILLIS + PROBE_RESULT_POLL_GRACE_MILLIS
+
+    private fun standbyCheckExpired(elapsedNow: Long): Boolean =
+        standbyCheckStartedAtMs?.let { started ->
+            elapsedNow >= started && elapsedNow - started >= STANDBY_CHECK_BUDGET_MILLIS
+        } ?: false
+
     private fun clearUrgentFailureLocked(runtime: SlotRuntime) {
         runtime.urgentStartedAtElapsedMs = null
         runtime.urgentDeadlineElapsedMs = null
@@ -619,6 +723,11 @@ internal class ServiceRedundantConnectionNative(
         const val READY_STABILITY_MILLIS = 15_000L
         const val WARMUP_PROBE_INTERVAL_MILLIS = 5_000L
         const val READY_PROBE_INTERVAL_MILLIS = 15_000L
+        const val ACTIVE_PROBE_INTERVAL_MILLIS = 2_000L
+        const val ACTIVE_PROBE_TIMEOUT_MILLIS = 2_000L
+        const val STANDBY_PROBE_OFFSET_MILLIS = 1_000L
+        const val PROBE_RESULT_POLL_GRACE_MILLIS = 1_000L
+        const val STANDBY_CHECK_BUDGET_MILLIS = 8_000L
         const val URGENT_PROBE_TIMEOUT_MILLIS = 2_000L
         const val URGENT_SEQUENCE_DEADLINE_MILLIS = 8_000L
         const val REQUIRED_URGENT_FAILURES = 2
