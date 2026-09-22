@@ -359,13 +359,12 @@ pub fn recover_phase(_previous: Phase, facts: RecoveryFacts) -> Phase {
     if !facts.peer_bound {
         return Phase::NeedsPeerBinding;
     }
-    if matches!(
-        facts.tunnel_status,
-        TunnelStatus::Running | TunnelStatus::Starting
-    ) {
-        return Phase::Connected;
+    match facts.tunnel_status {
+        TunnelStatus::Running => Phase::Connected,
+        TunnelStatus::Starting => Phase::Connecting,
+        TunnelStatus::Stopping => Phase::Stopping,
+        _ => Phase::Ready,
     }
-    Phase::Ready
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1258,6 +1257,7 @@ pub struct ClientCore<A, S, T, L> {
     auth: Arc<dyn RuntimeAuthProvider>,
     state: Arc<Mutex<CoreState>>,
     intent_recovery_gate: Arc<Mutex<()>>,
+    recovered_native_transition: Mutex<Option<(CoreState, StartCancellationEpoch)>>,
     runtime_writers: Arc<RuntimeWriterGates>,
     start_cancel_epoch: Arc<AtomicU64>,
     start_in_progress: AtomicBool,
@@ -1321,6 +1321,7 @@ where
             auth,
             state: local.state.clone(),
             intent_recovery_gate: local.writers.intent.clone(),
+            recovered_native_transition: Mutex::new(None),
             runtime_writers: local.writers.clone(),
             start_cancel_epoch: local.epoch.clone(),
             start_in_progress: AtomicBool::new(false),
@@ -1411,6 +1412,60 @@ where
 
     pub async fn state(&self) -> CoreState {
         let current = self.state.lock().await.clone();
+        if matches!(current.phase, Phase::Connecting | Phase::Stopping) {
+            // A recovered native start has no local operation to finish its phase
+            // and desktop has no quick-state event. Reuse native reconciliation,
+            // but never compete with a local Start/Stop or an unresolved start.
+            let Ok(_guard) = self.connection_gate.try_lock() else {
+                return current;
+            };
+            let latest = self.state.lock().await.clone();
+            let recovered = self.recovered_native_transition.lock().await.clone();
+            let recovered = recovered.filter(|(expected, epoch)| {
+                *expected == latest && self.ensure_start_not_cancelled(*epoch).is_ok()
+            });
+            if !matches!(latest.phase, Phase::Connecting | Phase::Stopping)
+                || (latest.phase == Phase::Stopping && recovered.is_none())
+                || self.start_in_progress.load(Ordering::SeqCst)
+                || self.pending_start_active.load(Ordering::SeqCst)
+            {
+                return latest;
+            }
+            let next = self.reconcile_tunnel_state(Some(&latest)).await;
+            if let Some((_, epoch)) = recovered {
+                let restore = {
+                    let state = self.state.lock().await;
+                    let mut pending = self.recovered_native_transition.lock().await;
+                    if *state == next
+                        && next.connection == latest.connection
+                        && self.ensure_start_not_cancelled(epoch).is_ok()
+                        && pending.as_ref() == Some(&(latest, epoch))
+                    {
+                        *pending = matches!(next.phase, Phase::Connecting | Phase::Stopping)
+                            .then(|| (next.clone(), epoch));
+                        next.phase == Phase::Connected
+                    } else {
+                        false
+                    }
+                };
+                if restore {
+                    // Restoration can wait on the panel. Stop must remain free
+                    // to cancel it; the restore helpers fence their late writes.
+                    drop(_guard);
+                    if let Some(connection) = &next.connection {
+                        self.restore_running_connection_configuration(
+                            connection,
+                            time::OffsetDateTime::now_utc().unix_timestamp(),
+                            epoch,
+                        )
+                        .await;
+                        self.restore_running_split_tunnel_options(connection, epoch)
+                            .await;
+                    }
+                }
+            }
+            return self.state.lock().await.clone();
+        }
         if current.phase != Phase::Connected {
             return current;
         }
@@ -1426,7 +1481,19 @@ where
                 }
                 state
             }
-            Ok(_) => {
+            Ok(status @ (TunnelStatus::Starting | TunnelStatus::Stopping)) => {
+                // Project the native transition without starting another lifecycle
+                // operation or making this read overwrite a concurrent user Stop.
+                CoreState {
+                    phase: if status == TunnelStatus::Stopping {
+                        Phase::Stopping
+                    } else {
+                        Phase::Connecting
+                    },
+                    ..current
+                }
+            }
+            Ok(TunnelStatus::Running) => {
                 self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
                     .await;
                 current
@@ -1509,6 +1576,23 @@ where
     }
 
     pub async fn reconcile_external_tunnel_state(&self) -> CoreState {
+        let recovered = {
+            let state = self.state.lock().await;
+            self.recovered_native_transition
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|(expected, epoch)| {
+                    *expected == *state && self.ensure_start_not_cancelled(*epoch).is_ok()
+                })
+        };
+        if recovered {
+            return self.state().await;
+        }
+        self.reconcile_tunnel_state(None).await
+    }
+
+    async fn reconcile_tunnel_state(&self, expected: Option<&CoreState>) -> CoreState {
         let epoch = self.start_cancel_epoch.load(Ordering::SeqCst);
         let active = matches!(self.auth.state().await, Ok(RuntimeAuthState::Active));
         let status = match self.tunnel.status().await {
@@ -1518,14 +1602,23 @@ where
         let mut state = self.state.lock().await;
         if active
             && self.start_cancel_epoch.load(Ordering::SeqCst) == epoch
-            && state.connection.is_some()
+            && expected.is_none_or(|expected| *state == *expected)
+            && (state.connection.is_some()
+                || expected.is_some()
+                || state.phase == Phase::Connecting)
         {
             state.phase = match status {
-                TunnelStatus::Running | TunnelStatus::Starting => Phase::Connected,
+                TunnelStatus::Running => Phase::Connected,
+                TunnelStatus::Starting => Phase::Connecting,
                 TunnelStatus::Stopped => Phase::Ready,
                 TunnelStatus::Stopping => Phase::Stopping,
                 TunnelStatus::Failed => Phase::Error,
             };
+            if expected.is_none() {
+                *self.recovered_native_transition.lock().await =
+                    matches!(state.phase, Phase::Connecting | Phase::Stopping)
+                        .then(|| (state.clone(), StartCancellationEpoch(epoch)));
+            }
         }
         state.clone()
     }
@@ -1683,6 +1776,9 @@ where
                 phase,
                 connection: response.connection.clone(),
             };
+            *self.recovered_native_transition.lock().await =
+                matches!(phase, Phase::Connecting | Phase::Stopping)
+                    .then(|| (state.clone(), cancel_epoch));
         }
         if phase == Phase::Connected {
             if let Some(connection) = &response.connection {
@@ -1721,6 +1817,15 @@ where
             .chain(stored.pinned_connection.as_ref())
             .any(|saved| saved.lease_id == connection.lease_id);
         if already_saved {
+            return;
+        }
+        // The native v2 owner already has both slot configurations. A legacy
+        // fetch uses the active lease as a new start operation and conflicts
+        // with that session. On an unreadable owner, do not guess single-lease.
+        if !matches!(self.tunnel.owns_redundant_session().await, Ok(false)) {
+            return;
+        }
+        if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             return;
         }
         let Ok(mut access_token) = self.access_snapshot().await else {
@@ -1792,7 +1897,11 @@ where
         let Ok(mut current_stored) = self.load_runtime() else {
             return;
         };
-        if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
+        let state = self.state.lock().await;
+        if self.ensure_start_not_cancelled(cancel_epoch).is_err()
+            || state.phase != Phase::Connected
+            || state.connection.as_ref() != Some(connection)
+        {
             return;
         }
         if kind == StoredConnectionKind::Pinned {

@@ -202,6 +202,9 @@ struct MemoryTunnel {
     block_start: AtomicBool,
     start_release: Notify,
     status_failures: AtomicUsize,
+    hold_next_status: AtomicBool,
+    status_entered: Notify,
+    status_release: Notify,
     metrics_supported: AtomicBool,
     metrics_calls: AtomicUsize,
     metric_successes_before_failures: AtomicUsize,
@@ -225,6 +228,7 @@ struct MemoryTunnel {
     rebind_release: Notify,
     configuration: Mutex<Option<String>>,
     redundant_session_id: Mutex<Option<String>>,
+    redundant_ownership_unavailable: AtomicBool,
     standby_configuration: Mutex<Option<String>>,
     quick_connection: Mutex<Option<QuickConnection>>,
     quick_reconnect: Mutex<QuickReconnect>,
@@ -235,6 +239,13 @@ struct MemoryTunnel {
 
 #[async_trait]
 impl TunnelController for MemoryTunnel {
+    async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {
+        if self.redundant_ownership_unavailable.load(Ordering::SeqCst) {
+            return Err(TunnelError::Backend("owner_unreadable".into()));
+        }
+        Ok(self.redundant_session_id.lock().unwrap().is_some())
+    }
+
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         *self.quick_connection.lock().unwrap() = request.quick_connection.clone();
@@ -304,7 +315,12 @@ impl TunnelController for MemoryTunnel {
         {
             return Err(TunnelError::Backend("service_unavailable".to_string()));
         }
-        Ok(*self.status.lock().unwrap())
+        let status = *self.status.lock().unwrap();
+        if self.hold_next_status.swap(false, Ordering::SeqCst) {
+            self.status_entered.notify_one();
+            self.status_release.notified().await;
+        }
+        Ok(status)
     }
 
     async fn rebind_udp(&self) -> Result<bool, TunnelError> {
@@ -3865,8 +3881,14 @@ async fn external_quick_action_reconciles_the_local_tunnel_without_panel_operati
     assert_eq!(stopped.phase, Phase::Ready);
     assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
 
+    *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+    assert_eq!(
+        core.reconcile_external_tunnel_state().await.phase,
+        Phase::Connecting
+    );
+
     *tunnel.status.lock().unwrap() = TunnelStatus::Running;
-    let started = core.reconcile_external_tunnel_state().await;
+    let started = core.state().await;
 
     assert_eq!(started.phase, Phase::Connected);
     assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
@@ -3922,6 +3944,161 @@ async fn bootstrap_recovers_configuration_after_external_quick_start_changes_lea
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn bootstrap_does_not_fetch_a_legacy_configuration_for_native_redundancy() {
+    for unreadable in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        let fresh_connection = connection("22222222-2222-4222-8222-222222222222");
+        *api.bootstrap_connection.lock().unwrap() = Some(fresh_connection.clone());
+        let tunnel = Arc::new(MemoryTunnel::default());
+        *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        *tunnel.redundant_session_id.lock().unwrap() = Some("native-v2-session".into());
+        tunnel
+            .redundant_ownership_unavailable
+            .store(unreadable, Ordering::SeqCst);
+        let store = Arc::new(MemoryStore::new(auth()));
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+
+        core.bootstrap(1_700_000_000).await.unwrap();
+
+        assert_eq!(core.state().await.phase, Phase::Connected);
+        assert_eq!(core.state().await.connection, Some(fresh_connection));
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+        assert!(store.load().unwrap().unwrap().saved_connection.is_none());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn starting_bootstrap_observes_running_without_android_event() {
+    let api = Arc::new(MockApi::new(0));
+    let recovered = connection("22222222-2222-4222-8222-222222222222");
+    *api.bootstrap_connection.lock().unwrap() = Some(recovered.clone());
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    assert_eq!(core.state().await.phase, Phase::Connecting);
+    assert!(core.connection_metrics_context().await.is_none());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    tunnel.status_failures.store(1, Ordering::SeqCst);
+    assert_eq!(core.state().await.phase, Phase::Connecting);
+    assert_eq!(core.state().await.phase, Phase::Connected);
+    assert_eq!(core.state().await.connection, Some(recovered.clone()));
+    assert_eq!(
+        core.connection_metrics_context().await.unwrap().session_id,
+        recovered.lease_id
+    );
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn state_does_not_finish_an_in_flight_local_start_from_native_status() {
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.block_start.store(true, Ordering::SeqCst);
+    let core = Arc::new(support::core(
+        Arc::new(MockApi::new(0)),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    let starting = {
+        let core = core.clone();
+        tokio::spawn(async move { core.start(options(), 1_700_000_000).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while tunnel.starts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    for status in [
+        TunnelStatus::Running,
+        TunnelStatus::Stopped,
+        TunnelStatus::Failed,
+    ] {
+        *tunnel.status.lock().unwrap() = status;
+        assert_eq!(core.state().await.phase, Phase::Connecting);
+        assert!(core.connection_metrics_context().await.is_none());
+    }
+    tunnel.start_release.notify_one();
+    starting.await.unwrap().unwrap();
+    assert_eq!(core.state().await.phase, Phase::Connected);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovered_start_respects_local_attempt_and_terminal_native_states() {
+    for (status, expected) in [
+        (TunnelStatus::Running, Phase::Connected),
+        (TunnelStatus::Stopped, Phase::Ready),
+        (TunnelStatus::Failed, Phase::Error),
+    ] {
+        let api = Arc::new(MockApi::new(0));
+        *api.bootstrap_connection.lock().unwrap() = Some(connection("recovered-lease"));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+        let core = support::core(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.bootstrap(1_700_000_000).await.unwrap();
+        core.begin_start_attempt();
+        *tunnel.status.lock().unwrap() = status;
+        assert_eq!(core.state().await.phase, Phase::Connecting);
+        core.finish_start_attempt();
+        assert_eq!(core.state().await.phase, expected);
+        assert_eq!(
+            api.start_calls.load(Ordering::SeqCst),
+            usize::from(status == TunnelStatus::Running)
+        );
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovered_state_poll_does_not_overwrite_a_newer_bootstrap() {
+    let api = Arc::new(MockApi::new(0));
+    *api.bootstrap_connection.lock().unwrap() = Some(connection("recovered-lease"));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+    let core = Arc::new(support::core(
+        api,
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    core.bootstrap(1_700_000_000).await.unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    tunnel.hold_next_status.store(true, Ordering::SeqCst);
+    let poll = {
+        let core = core.clone();
+        tokio::spawn(async move { core.state().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), tunnel.status_entered.notified())
+        .await
+        .unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    core.bootstrap(1_700_000_001).await.unwrap();
+    tunnel.status_release.notify_one();
+    assert_eq!(poll.await.unwrap().phase, Phase::Ready);
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert!(core.connection_metrics_context().await.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn saved_quick_connection_keeps_its_metrics_context() {
     let api = Arc::new(MockApi::new(0));
     let tunnel = Arc::new(MemoryTunnel::default());
@@ -3944,45 +4121,56 @@ async fn saved_quick_connection_keeps_its_metrics_context() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn running_quick_tunnel_uses_saved_metrics_context_after_bootstrap() {
-    let api = Arc::new(MockApi::new(0));
-    api.bootstrap_binding_without_connection
-        .store(true, Ordering::SeqCst);
-    let tunnel = Arc::new(MemoryTunnel::default());
-    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
-    let mut stored = auth();
-    stored.saved_connection = Some(StoredConnection {
-        lease_id: "quick-lease".to_string(),
-        pool_id: None,
-        layer: Layer::Tic,
-        tic_connection_mode: TicConnectionMode::Personal,
-        route_mode: RouteMode::ViaTak,
-        egress_mode: EgressMode::Ipv4,
-        probe_url: Some("https://1b.example.test/probe".to_string()),
-        kind: StoredConnectionKind::Fixed,
-        configuration: "[Interface]\nPrivateKey = tunnel-secret\n".to_string(),
-        valid_until_unix: None,
-    });
-    let core = support::core(
-        api,
-        Arc::new(MemoryStore::new(stored)),
-        tunnel,
-        Arc::new(MemoryLogger::default()),
-    );
+    for initial_status in [TunnelStatus::Running, TunnelStatus::Starting] {
+        let api = Arc::new(MockApi::new(0));
+        api.bootstrap_binding_without_connection
+            .store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(MemoryTunnel::default());
+        *tunnel.status.lock().unwrap() = initial_status;
+        let mut stored = auth();
+        stored.saved_connection = Some(StoredConnection {
+            lease_id: "quick-lease".to_string(),
+            pool_id: None,
+            layer: Layer::Tic,
+            tic_connection_mode: TicConnectionMode::Personal,
+            route_mode: RouteMode::ViaTak,
+            egress_mode: EgressMode::Ipv4,
+            probe_url: Some("https://1b.example.test/probe".to_string()),
+            kind: StoredConnectionKind::Fixed,
+            configuration: "[Interface]\nPrivateKey = tunnel-secret\n".to_string(),
+            valid_until_unix: None,
+        });
+        let core = support::core(
+            api,
+            Arc::new(MemoryStore::new(stored)),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
 
-    core.bootstrap(1_700_000_000).await.unwrap();
-    let state = core.state().await;
-    let context = core
-        .connection_metrics_context()
-        .await
-        .expect("quick tunnel metrics context after bootstrap");
+        core.bootstrap(1_700_000_000).await.unwrap();
+        assert_eq!(
+            core.state().await.phase,
+            if initial_status == TunnelStatus::Starting {
+                Phase::Connecting
+            } else {
+                Phase::Connected
+            }
+        );
+        *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        let state = core.state().await;
+        let context = core
+            .connection_metrics_context()
+            .await
+            .expect("quick tunnel metrics context after bootstrap");
 
-    assert_eq!(state.phase, Phase::Connected);
-    assert_eq!(state.connection, None);
-    assert_eq!(context.session_id, "quick-lease");
-    assert_eq!(
-        context.probe_url.as_deref(),
-        Some("https://1b.example.test/probe")
-    );
+        assert_eq!(state.phase, Phase::Connected);
+        assert_eq!(state.connection, None);
+        assert_eq!(context.session_id, "quick-lease");
+        assert_eq!(
+            context.probe_url.as_deref(),
+            Some("https://1b.example.test/probe")
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -4065,6 +4253,173 @@ async fn state_preserves_connected_during_transient_tunnel_status_failure() {
             .count(),
         1
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn state_does_not_claim_protection_while_native_is_stopping() {
+    let api = Arc::new(MockApi::new(0));
+    api.bootstrap_binding_without_connection
+        .store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopping;
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    core.bootstrap(1_700_000_001).await.unwrap();
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    assert_eq!(core.state().await.phase, Phase::Ready);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn starting_bootstrap_restores_configuration_only_for_legacy_owner() {
+    for (redundant, external_event) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let api = Arc::new(MockApi::new(0));
+        *api.bootstrap_connection.lock().unwrap() = Some(connection("restored-lease"));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+        if redundant {
+            *tunnel.redundant_session_id.lock().unwrap() = Some("native-v2".into());
+        }
+        let store = Arc::new(MemoryStore::new(auth()));
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.bootstrap(1_700_000_000).await.unwrap();
+        assert!(store.load().unwrap().unwrap().saved_connection.is_none());
+        assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+        *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        if external_event {
+            assert_eq!(
+                core.reconcile_external_tunnel_state().await.phase,
+                Phase::Connected
+            );
+        }
+        assert_eq!(core.state().await.phase, Phase::Connected);
+        let saved = store.load().unwrap().unwrap().saved_connection;
+        if redundant {
+            assert!(saved.is_none());
+        } else {
+            assert_eq!(saved.unwrap().lease_id, "restored-lease");
+            assert!(core.connection_recovery_transport("restored-lease").is_ok());
+        }
+        core.state().await;
+        assert_eq!(
+            api.start_calls.load(Ordering::SeqCst),
+            usize::from(!redundant)
+        );
+        assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recovered_start_can_finish_stopping_but_cannot_finish_failed_user_stop() {
+    for user_stop in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        *api.bootstrap_connection.lock().unwrap() = Some(connection("restored-lease"));
+        let tunnel = Arc::new(MemoryTunnel::default());
+        *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+        let core = support::core(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        )
+        .with_retry_policy(RetryPolicy::new(vec![]));
+        core.bootstrap(1_700_000_000).await.unwrap();
+        *tunnel.status.lock().unwrap() = TunnelStatus::Stopping;
+        assert_eq!(core.state().await.phase, Phase::Stopping);
+        if user_stop {
+            *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);
+            assert!(core.stop().await.is_err());
+        }
+        *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+        assert_eq!(
+            core.state().await.phase,
+            if user_stop {
+                Phase::Stopping
+            } else {
+                Phase::Ready
+            }
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logout_fences_configuration_restore_triggered_by_state_poll() {
+    let api = Arc::new(MockApi::new(0));
+    api.hold_restore.store(true, Ordering::SeqCst);
+    *api.bootstrap_connection.lock().unwrap() = Some(connection("restored-lease"));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    core.bootstrap(1_700_000_000).await.unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let poll = {
+        let core = core.clone();
+        tokio::spawn(async move { core.state().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), api.restore_entered.notified())
+        .await
+        .unwrap();
+    core.sign_out().await.unwrap();
+    let after = store.load().unwrap();
+    api.restore_release.notify_one();
+    assert_eq!(poll.await.unwrap().phase, Phase::SignedOut);
+    assert_eq!(store.load().unwrap(), after);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn user_stop_does_not_wait_for_recovered_configuration_fetch() {
+    let api = Arc::new(MockApi::new(0));
+    api.hold_restore.store(true, Ordering::SeqCst);
+    *api.bootstrap_connection.lock().unwrap() = Some(connection("restored-lease"));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = Arc::new(support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    core.bootstrap(1_700_000_000).await.unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    let poll = {
+        let core = core.clone();
+        tokio::spawn(async move { core.state().await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), api.restore_entered.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), core.stop())
+        .await
+        .expect("Stop must not wait for a bootstrap configuration request")
+        .unwrap();
+    api.restore_release.notify_one();
+    assert_eq!(poll.await.unwrap().phase, Phase::Ready);
+    assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Stopped);
+    assert!(store.load().unwrap().unwrap().saved_connection.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

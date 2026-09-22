@@ -414,6 +414,34 @@ class RedundantTotalLossLifecycleTest {
     }
 
     @Test
+    fun repeatedReadersCannotPostponeCleanupAndRetryCanScheduleItself() {
+        var now = 0L
+        var runs = 0
+        val queue = mutableMapOf<Runnable, Long>()
+        lateinit var scheduler: RedundantTotalLossRetryScheduler
+        scheduler = RedundantTotalLossRetryScheduler(
+            retry = { runs += 1; if (runs == 1) scheduler.schedule() },
+            delayMillis = 1_000L,
+            scheduleAllowed = { true },
+            remove = { queue.remove(it) },
+            postDelayed = { task, delay -> queue[task] = now + delay },
+        )
+        scheduler.schedule()
+        for (time in listOf(200L, 500L, 900L)) {
+            now = time
+            scheduler.schedule()
+        }
+        now = 1_000
+        queue.filterValues { it <= now }.keys.toList().forEach { queue.remove(it); it.run() }
+        assertEquals(1, runs)
+        assertEquals(listOf(2_000L), queue.values.toList())
+        scheduler.cancel()
+        now = 1_100
+        scheduler.schedule()
+        assertEquals(listOf(2_100L), queue.values.toList())
+    }
+
+    @Test
     fun acknowledgedRestartIsQueuedAndResumedOnlyFromStartPending() {
         val fixture = Fixture(recovery = RecoveryStoreResult.Success(restartEnvelope()))
 

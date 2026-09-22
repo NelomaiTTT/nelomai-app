@@ -434,13 +434,20 @@ internal fun dispatchRedundantWork(
     fallbackDispatcher: RedundantVpnWorkDispatcher,
     action: () -> Unit,
     onRejected: () -> Unit,
+    coalescingGate: AtomicBoolean? = null,
 ) {
+    if (coalescingGate != null && !coalescingGate.compareAndSet(false, true)) return
+    val guarded = {
+        try { action() } finally { coalescingGate?.set(false) }
+        Unit
+    }
     try {
-        dispatcher.execute(action)
+        dispatcher.execute(guarded)
     } catch (_: RejectedExecutionException) {
         try {
-            fallbackDispatcher.execute(action)
+            fallbackDispatcher.execute(guarded)
         } catch (_: RejectedExecutionException) {
+            coalescingGate?.set(false)
             onRejected()
         }
     }
@@ -766,7 +773,14 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         MutableList<(RedundantRevokeResult) -> Unit>,
     >()
     @Volatile private var redundantCancelTombstoneUnreadable = false
-    private val redundantStopRetry = Runnable { retryPendingRedundantStop() }
+    private val redundantStopRetryQueued = AtomicBoolean(false)
+    private val redundantStopRetry = RedundantTotalLossRetryScheduler(
+        retry = ::retryPendingRedundantStop,
+        delayMillis = REDUNDANT_STOP_RETRY_MILLIS,
+        scheduleAllowed = { pendingRedundantStop != null || redundantCancelTombstoneUnreadable },
+        remove = restoreHandler::removeCallbacks,
+        postDelayed = { task, delay -> restoreHandler.postDelayed(task, delay) },
+    )
     private val retainedRedundantOwnerRetry = Runnable { retryRetainedRedundantOwners() }
     @Volatile private var serviceDestroyed = false
     private var redundantPhysicalNetworks: PhysicalNetworks? = null
@@ -1826,16 +1840,14 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     }
 
     private fun schedulePendingRedundantStopRetry() {
-        if (pendingRedundantStop == null && !redundantCancelTombstoneUnreadable) return
-        restoreHandler.removeCallbacks(redundantStopRetry)
-        restoreHandler.postDelayed(redundantStopRetry, REDUNDANT_STOP_RETRY_MILLIS)
+        redundantStopRetry.schedule()
     }
 
     private fun retryPendingRedundantStop() {
         val pending = pendingRedundantStop
         if (pending == null) {
             val lookupServiceGeneration = serviceGeneration
-            executeRedundantCleanup {
+            executeRedundantCleanup(coalescingGate = redundantStopRetryQueued) {
                 val restored = redundantCancelTombstones.read()
                 restoreHandler.post {
                     handleRedundantTombstoneRead(
@@ -1869,7 +1881,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             }
             return
         }
-        executeRedundantCleanup {
+        executeRedundantCleanup(coalescingGate = redundantStopRetryQueued) {
             val tombstone = pending.tombstone ?: when (
                 val persisted = redundantCancelTombstones.persist(
                     pending.startOperationId,
@@ -2098,11 +2110,15 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         redundantStopWaiters.remove(startOperationId)?.forEach { waiter -> waiter(result) }
     }
 
-    private fun executeRedundantCleanup(action: () -> Unit) {
+    private fun executeRedundantCleanup(
+        coalescingGate: AtomicBoolean? = null,
+        action: () -> Unit,
+    ) {
         dispatchRedundantWork(
             dispatcher = redundantWork,
             fallbackDispatcher = VPN_PROCESS_CLEANUP_WORK,
             action = action,
+            coalescingGate = coalescingGate,
             onRejected = {
                 TunnelLog.warning("redundant.cleanup_dispatch_rejected")
                 schedulePendingRedundantStopRetry()
@@ -5617,6 +5633,7 @@ internal data class ConnectionIntentServiceStatus(
     val nextRetryAtUnix: Long?,
     val lastErrorCode: String?,
     val reserveState: String? = null,
+    val redundantSessionOwned: Boolean = false,
 )
 
 internal enum class AndroidStaleConnectionIntentAction {
@@ -5890,6 +5907,7 @@ internal fun connectionIntentServiceStatus(
         nextRetryAtUnix = envelope.intent.retry.nextRetryAtUnix,
         lastErrorCode = envelope.intent.retry.lastErrorCode,
         reserveState = reserveState,
+        redundantSessionOwned = envelope.redundantTransaction != null,
     )
 }
 
@@ -5902,6 +5920,7 @@ internal fun redundantStoppingConnectionIntentStatus(
     leasePhase = LeasePhase.CLEANUP_PENDING.wireName,
     nextRetryAtUnix = null,
     lastErrorCode = null,
+    redundantSessionOwned = true,
 )
 
 internal fun redundantNotificationContent(state: RedundantReserveState?): String = when (state) {

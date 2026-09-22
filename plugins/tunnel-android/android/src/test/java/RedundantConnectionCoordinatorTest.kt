@@ -1023,6 +1023,20 @@ class RedundantConnectionCoordinatorTest {
     }
 
     @Test
+    fun localCloseClearsPublishedReserveBeforeRemoteCleanup() {
+        val states = mutableListOf<RedundantReserveState?>()
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), FakeNative(),
+            onReserveStateChanged = { states += it })
+        assertTrue(coordinator.recover())
+        assertTrue(coordinator.reserveState() != null)
+        assertTrue(coordinator.closeLocal())
+        assertFalse(coordinator.isRunning())
+        assertEquals(null, coordinator.reserveState())
+        assertEquals(null, states.last())
+        assertTrue(coordinator.status() != null) // Remote ownership still needs cleanup.
+    }
+
+    @Test
     fun revokeFencePersistsStopWithoutTouchingNativeOrPanel() {
         val panel = FakePanel()
         val native = FakeNative()

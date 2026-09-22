@@ -4814,6 +4814,7 @@ mod tests {
                         next_retry_at_unix: None,
                         last_error_code: None,
                         reserve_state: None,
+                        redundant_session_owned: false,
                     },
                 )
             },
@@ -5068,6 +5069,7 @@ mod tests {
                             next_retry_at_unix: None,
                             last_error_code: None,
                             reserve_state: None,
+                            redundant_session_owned: false,
                         },
                     )
                 },
@@ -5100,6 +5102,7 @@ mod tests {
                             next_retry_at_unix: None,
                             last_error_code: None,
                             reserve_state: None,
+                            redundant_session_owned: false,
                         },
                     )
                 },
@@ -5543,6 +5546,7 @@ mod tests {
                                             next_retry_at_unix: None,
                                             last_error_code: None,
                                             reserve_state: None,
+                                            redundant_session_owned: false,
                                         },
                                     )
                                 },
@@ -5582,6 +5586,7 @@ mod tests {
                                             next_retry_at_unix: None,
                                             last_error_code: None,
                                             reserve_state: None,
+                                            redundant_session_owned: false,
                                         },
                                     )
                                 },
@@ -5619,6 +5624,7 @@ mod tests {
                                 next_retry_at_unix: None,
                                 last_error_code: None,
                                 reserve_state: None,
+                                redundant_session_owned: false,
                             },
                         )
                     })
@@ -5793,6 +5799,7 @@ mod tests {
             next_retry_at_unix: None,
             last_error_code: None,
             reserve_state: None,
+            redundant_session_owned: false,
         }
     }
 
@@ -5833,6 +5840,7 @@ mod tests {
                         next_retry_at_unix: None,
                         last_error_code: None,
                         reserve_state: None,
+                        redundant_session_owned: false,
                     },
                 )
             },
@@ -5879,6 +5887,7 @@ mod tests {
                         next_retry_at_unix: None,
                         last_error_code: None,
                         reserve_state: None,
+                        redundant_session_owned: false,
                     },
                 )
             },
@@ -5955,6 +5964,7 @@ mod tests {
                                 next_retry_at_unix: None,
                                 last_error_code: None,
                                 reserve_state: None,
+                                redundant_session_owned: false,
                             },
                         )
                     },
@@ -6002,6 +6012,7 @@ mod tests {
                         next_retry_at_unix: None,
                         last_error_code: None,
                         reserve_state: None,
+                        redundant_session_owned: false,
                     },
                 )
             },

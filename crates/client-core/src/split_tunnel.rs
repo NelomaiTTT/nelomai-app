@@ -1961,6 +1961,13 @@ where
             )
             .await
         {
+            let current_state = self.state.lock().await;
+            if self.ensure_start_not_cancelled(cancel_epoch).is_err()
+                || current_state.phase != crate::Phase::Connected
+                || current_state.connection.as_ref() != Some(connection)
+            {
+                return;
+            }
             {
                 let mut current = self.split_tunnel_options.lock().await;
                 if self.ensure_start_not_cancelled(cancel_epoch).is_err() {

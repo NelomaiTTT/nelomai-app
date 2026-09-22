@@ -121,15 +121,26 @@ internal class RedundantTotalLossRetryScheduler(
     private val remove: (Runnable) -> Unit,
     private val postDelayed: (Runnable, Long) -> Unit,
 ) {
-    private val task = Runnable(retry)
+    private var scheduled = false
+    private val task = Runnable {
+        scheduled = false
+        if (scheduleAllowed()) retry()
+    }
 
     fun schedule() {
-        remove(task)
-        if (!scheduleAllowed()) return
+        if (!scheduleAllowed()) {
+            cancel()
+            return
+        }
+        if (scheduled) return
+        scheduled = true
         postDelayed(task, delayMillis)
     }
 
-    fun cancel() = remove(task)
+    fun cancel() {
+        scheduled = false
+        remove(task)
+    }
 }
 
 internal fun <T : Any> dispatchDeferredRedundantTotalLossAndDurableWork(

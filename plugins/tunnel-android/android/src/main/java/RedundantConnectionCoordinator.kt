@@ -1360,6 +1360,7 @@ internal class RedundantConnectionCoordinator(
         pendingPrimaryReadiness = null
         recoveryStarted = false
         primaryReadinessFailed = false
+        publishReserveStateLocked(null, emptyList())
         if (pending?.freshStart == true) pending.onCancelled()
         runCatching(native::stop).getOrDefault(false)
     }

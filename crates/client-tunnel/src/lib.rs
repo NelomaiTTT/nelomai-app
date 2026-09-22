@@ -455,6 +455,11 @@ pub trait TunnelController: Send + Sync {
         Ok(false)
     }
     async fn status(&self) -> Result<TunnelStatus, TunnelError>;
+    /// A native owner manages the whole v2 session, including its configurations.
+    /// UI bootstrap must not recover it through the legacy single-lease API.
+    async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {
+        Ok(false)
+    }
     async fn metrics(&self, _probe: bool) -> Result<Option<TunnelMetrics>, TunnelError> {
         Ok(None)
     }

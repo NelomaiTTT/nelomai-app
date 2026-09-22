@@ -3329,5 +3329,6 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         put("nextRetryAtUnix", nextRetryAtUnix)
         put("lastErrorCode", lastErrorCode)
         put("reserveState", reserveState)
+        put("redundantSessionOwned", redundantSessionOwned)
     }
 }

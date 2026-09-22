@@ -1649,22 +1649,46 @@ class NelomaiVpnServiceTest {
     }
 
     @Test
+    fun cleanupReadersDoNotQueueDuplicateSlowAttemptsAndFailureReleasesGate() {
+        val queue = ArrayDeque<Runnable>()
+        val dispatcher = RedundantVpnWorkDispatcher(Executor(queue::addLast))
+        val gate = java.util.concurrent.atomic.AtomicBoolean(false)
+        var attempts = 0
+        fun schedule() = dispatchRedundantWork(
+            dispatcher = dispatcher, fallbackDispatcher = dispatcher,
+            coalescingGate = gate,
+            action = { attempts += 1; throw IllegalStateException("cleanup-failed") },
+            onRejected = { error("unexpected rejection") },
+        )
+        repeat(50) { schedule() }
+        assertEquals(1, queue.size)
+        runCatching { queue.removeFirst().run() }
+        assertEquals(1, attempts)
+        assertFalse(gate.get())
+        schedule()
+        assertEquals(1, queue.size)
+    }
+
+    @Test
     fun redundantCleanupReportsWhenBothDispatchersReject() {
         val rejected = RedundantVpnWorkDispatcher(Executor {
             throw RejectedExecutionException("destroyed")
         })
         var actionCalls = 0
         var rejectedCalls = 0
+        val gate = java.util.concurrent.atomic.AtomicBoolean(false)
 
         dispatchRedundantWork(
             dispatcher = rejected,
             fallbackDispatcher = rejected,
             action = { actionCalls += 1 },
             onRejected = { rejectedCalls += 1 },
+            coalescingGate = gate,
         )
 
         assertEquals(0, actionCalls)
         assertEquals(1, rejectedCalls)
+        assertFalse(gate.get())
     }
 
     @Test
@@ -2144,6 +2168,8 @@ class NelomaiVpnServiceTest {
         assertEquals("stopping", status.status)
         assertEquals("cleanup_pending", status.leasePhase)
         assertEquals(serviceV2Envelope(), before)
+        assertTrue(status.redundantSessionOwned)
+        assertTrue(connectionIntentServiceStatus(before).redundantSessionOwned)
     }
 
     @Test
@@ -2156,6 +2182,7 @@ class NelomaiVpnServiceTest {
         val status = connectionIntentServiceStatus(cancelled)
 
         // A null lease phase tells Rust to send a legacy per-lease stop as well.
+        assertTrue(status.redundantSessionOwned)
         assertFalse(status.desiredActive)
         assertEquals("stopping", status.status)
         assertEquals("cleanup_pending", status.leasePhase)
