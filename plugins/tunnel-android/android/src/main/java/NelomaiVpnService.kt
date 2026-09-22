@@ -1471,7 +1471,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             redundantPhysicalNetworks?.stop()
             val monitor = PhysicalNetworks(applicationContext)
             try {
-                monitor.start { state ->
+                monitor.start(initialState = physicalState) { state ->
                     applyRedundantPhysicalNetworks(
                         callbackIdentity,
                         options,
