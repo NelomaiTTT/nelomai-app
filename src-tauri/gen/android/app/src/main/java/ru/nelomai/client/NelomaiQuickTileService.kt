@@ -9,6 +9,7 @@ class NelomaiQuickTileService : TileService() {
     private val selection by lazy { RuntimeSelectionStore(this) }
     private val handler = Handler(Looper.getMainLooper())
     private val pendingDispatches = mutableSetOf<AutoCloseable>()
+    private var lastLoggedState: Pair<String?, Int>? = null
     override fun onStartListening() {
         super.onStartListening()
         updateTile()
@@ -63,7 +64,11 @@ class NelomaiQuickTileService : TileService() {
                 "starting", "stopping" -> Tile.STATE_UNAVAILABLE
                 else -> Tile.STATE_INACTIVE
             }
-            android.util.Log.i("NelomaiTile", "state.updated engine=$engineState tile=$state")
+            val currentState = engineState to state
+            if (currentState != lastLoggedState) {
+                android.util.Log.i("NelomaiTile", "state.updated engine=$engineState tile=$state")
+                lastLoggedState = currentState
+            }
             updateTile()
         } }
     }
