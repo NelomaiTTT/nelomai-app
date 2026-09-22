@@ -62,7 +62,8 @@ class RedundantProductionAdaptersTest {
     @Test
     fun healthyPrimaryCompletesWithoutAnInitialSwitch() {
         val fixture = StartupFixture(0, ::prepared)
-        for (now in 0L..20_000L step 100L) fixture.tick(now)
+        fixture.healthySlots = setOf(0)
+        for (now in 0L..1_000L step 100L) fixture.tick(now)
         assertEquals(1, fixture.ready)
         assertEquals(0, fixture.failed)
         assertEquals(listOf(0), fixture.backend.activeSlots)
@@ -903,7 +904,7 @@ class RedundantProductionAdaptersTest {
                         transaction.membershipGeneration, null))
             override fun stop(transaction: AndroidRedundantTransaction): Boolean = true
         }
-        private val coordinator = RedundantConnectionCoordinator(store, panel, native,
+        private val coordinator = testRedundantCoordinator(store, panel, native,
             epochNowMs = { now }, monotonicMs = { now })
 
         init {
@@ -1073,7 +1074,7 @@ private data class TestDualClock(
     var elapsedMs: Long,
 )
 
-private class RecordingSessionBackend(
+internal class RecordingSessionBackend(
     private val nowMs: () -> Long = { 1_000_000L },
 ) : RedundantSessionBackend {
     val primarySlots = mutableListOf<Int>()

@@ -901,7 +901,30 @@ impl RemoteOwner {
                             }
                             self.live(deadline).map_err(|_| BrokerError::Cancelled)
                         },
-                        |request| native.dispatch(request, action),
+                        |mut request| async move {
+                            if matches!(action, BackgroundAction::Provision) {
+                                // Provision cannot rotate owner auth. Bound its network/native
+                                // work BEFORE the IPC deadline so the broker can clear this
+                                // ticket and return an error without killing the runtime channel.
+                                // Pass the earlier expiry to native too: late callbacks must
+                                // not persist credentials after this attempt has expired.
+                                let margin = Duration::from_secs(1);
+                                let dispatch_deadline = deadline - margin;
+                                if Instant::now() >= dispatch_deadline {
+                                    return Err(crate::NativeAuthFailure::NotIssued);
+                                }
+                                request.expires_at_unix_ms = request
+                                    .expires_at_unix_ms
+                                    .saturating_sub(margin.as_millis() as u64);
+                                timeout_at(dispatch_deadline, native.dispatch(request, action))
+                                    .await
+                                    .unwrap_or(Err(crate::NativeAuthFailure::OutcomeUnknown))
+                            } else {
+                                // A recovery may rotate refresh credentials; its unknown
+                                // outcome must retain the original durable recovery fence.
+                                native.dispatch(request, action).await
+                            }
+                        },
                         matches!(action, BackgroundAction::Recover),
                         deadline,
                     )

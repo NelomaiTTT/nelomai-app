@@ -194,6 +194,17 @@ internal class ServiceRedundantConnectionNative(
     private var probeSourceIpv4 = probeSourceIpv4
     private var standbyCheckStartedAtMs: Long? = null
     private var standbyCheckFirstProbeAtMs: Long? = null
+    private val transportDiagnostics = RedundantTransportDiagnostics()
+
+    private fun recordTransportLocked(phase: String) {
+        val nativeSession = session ?: return
+        transportDiagnostics.record(
+            phase,
+            runCatching { backend.metrics(nativeSession) }.getOrNull(),
+            elapsedNowMs(),
+            force = true,
+        )
+    }
 
     override fun start(
         leaseId: String,
@@ -220,6 +231,7 @@ internal class ServiceRedundantConnectionNative(
                     ?: return@synchronized false
             }
             existing?.let {
+                recordTransportLocked("before_slot_replace")
                 if (!backend.stopSlot(nativeSession, slot.index)) return@synchronized false
                 slots.remove(slot)
             }
@@ -235,6 +247,8 @@ internal class ServiceRedundantConnectionNative(
                 probeTarget,
                 elapsedNowMs(),
             )
+            transportDiagnostics.begin(elapsedNowMs())
+            recordTransportLocked("started")
             true
         } finally {
             configuration.fill(0)
@@ -261,6 +275,7 @@ internal class ServiceRedundantConnectionNative(
         val nativeSession = session ?: return@synchronized false
         val runtime = slots.values.singleOrNull { it.leaseId == leaseId }
             ?: return@synchronized true
+        recordTransportLocked("before_slot_stop")
         backend.stopSlot(nativeSession, runtime.slot.index).also { stopped ->
             if (stopped) slots.remove(runtime.slot)
         }
@@ -268,6 +283,7 @@ internal class ServiceRedundantConnectionNative(
 
     override fun stop(): Boolean = synchronized(gate) {
         val nativeSession = session ?: return@synchronized true
+        recordTransportLocked("before_stop")
         backend.close(nativeSession)
         slots.clear()
         session = null
@@ -298,7 +314,10 @@ internal class ServiceRedundantConnectionNative(
         val nativeSession = session ?: return@synchronized false
         val runtime = slots.values.singleOrNull { it.leaseId == leaseId }
             ?: return@synchronized false
+        recordTransportLocked("before_rebind")
         backend.rebind(nativeSession, runtime.slot.index).also { rebound ->
+            transportDiagnostics.begin(elapsedNowMs())
+            recordTransportLocked(if (rebound) "rebind_succeeded" else "rebind_failed")
             if (rebound) {
                 runtime.startedAtElapsedMs = elapsedNowMs()
                 runtime.consecutiveProbeSuccesses = 0
@@ -350,9 +369,10 @@ internal class ServiceRedundantConnectionNative(
         val nativeSession = session ?: return@synchronized emptyList()
         val epochNow = epochNowMs()
         val elapsedNow = elapsedNowMs()
-        val metricsBySlot = parseHealthMetricsLocked(
-            runCatching { backend.metrics(nativeSession) }.getOrNull(),
-        ) ?: return@synchronized invalidHealthObservationsLocked()
+        val rawMetrics = runCatching { backend.metrics(nativeSession) }.getOrNull()
+        transportDiagnostics.record("sample", rawMetrics, elapsedNow)
+        val metricsBySlot = parseHealthMetricsLocked(rawMetrics)
+            ?: return@synchronized invalidHealthObservationsLocked()
         slots.values.forEach { it.invalidMetricsSnapshots = 0 }
         // Process the active slot first regardless of A/B ordering so the reserve
         // sees suspicion in the same tick, including after a previous failover.

@@ -177,10 +177,10 @@ index 9b9c081f236a1e0c2a5f16becad6b2357e60da52..ca9d7b5c84f1cdc2ac9fa864e9bb7e20
  .DELETE_ON_ERROR:
 diff --git a/tunnel/tools/libwg-go/admission_bind.go b/tunnel/tools/libwg-go/admission_bind.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..19092dd65253493d3d984f8e43e2d89dd24d1849
+index 0000000000000000000000000000000000000000..58298a6d96b6399845d9c405d892b492583cab8f
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/admission_bind.go
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,404 @@
 +/* SPDX-License-Identifier: Apache-2.0 */
 +
 +package main
@@ -211,6 +211,12 @@ index 0000000000000000000000000000000000000000..19092dd65253493d3d984f8e43e2d89d
 +	receive    []conn.ReceiveFunc
 +	generation uint64
 +	actualPort uint16
++	startup    *admissionStartupBatch
++}
++
++type admissionStartupBatch struct {
++	packets  [][]byte
++	endpoint conn.Endpoint
 +}
 +
 +// admissionBind keeps newly opened sockets unable to send or deliver packets
@@ -379,11 +385,22 @@ index 0000000000000000000000000000000000000000..19092dd65253493d3d984f8e43e2d89d
 +	}
 +	previous := a.active
 +	a.active = a.pending
++	admitted := a.active
++	startup := admitted.startup
++	admitted.startup = nil
 +	a.pending = nil
 +	a.changed.Broadcast()
 +	a.mu.Unlock()
 +	if previous != nil {
 +		_ = previous.bind.Close()
++	}
++	if startup != nil {
++		// Send only via this protected generation, never a later replacement.
++		// Socket admission succeeded even if UDP temporarily fails. The
++		// diagnostic bind records the error and the peer's retry timer remains
++		// armed, just as for an ordinary Send. Do not report preparation failure
++		// after consuming its token (AbortPreparedToken could no longer undo it).
++		_ = a.send(admitted, startup.packets, startup.endpoint)
 +	}
 +	return nil
 +}
@@ -511,12 +528,48 @@ index 0000000000000000000000000000000000000000..19092dd65253493d3d984f8e43e2d89d
 +		return net.ErrClosed
 +	}
 +	generation := a.active
-+	a.mu.Unlock()
 +	if generation == nil {
-+		// Peers may queue an initial handshake while Kotlin is protecting the
-+		// descriptors. Dropping it is safe; admission sends a fresh keepalive.
++		defer a.mu.Unlock()
++		if a.pending == nil {
++			return errAdmissionBindNotPending
++		}
++		if len(buffers) == 0 {
++			return nil
++		}
++		// A rejected newer initiation must not replay an obsolete handshake.
++		a.pending.startup = nil
++		// One bounded, owned batch. Keep the newest initiation if protection
++		// is delayed: the peer has already advanced its handshake index/timer.
++		if len(buffers) > conn.IdealBatchSize {
++			return errors.New("startup packet batch too large")
++		}
++		total := 0
++		for _, buffer := range buffers {
++			if len(buffer) > 64*1024-total {
++				return errors.New("startup packet batch too large")
++			}
++			total += len(buffer)
++		}
++		var ownedEndpoint conn.Endpoint
++		if endpoint != nil {
++			var err error
++			ownedEndpoint, err = a.parser.ParseEndpoint(endpoint.DstToString())
++			if err != nil {
++				return err
++			}
++		}
++		packets := make([][]byte, len(buffers))
++		for i, buffer := range buffers {
++			packets[i] = append([]byte(nil), buffer...)
++		}
++		a.pending.startup = &admissionStartupBatch{packets: packets, endpoint: ownedEndpoint}
 +		return nil
 +	}
++	a.mu.Unlock()
++	return a.send(generation, buffers, endpoint)
++}
++
++func (a *admissionBind) send(generation *admissionBindGeneration, buffers [][]byte, endpoint conn.Endpoint) error {
 +	if endpoint != nil {
 +		previous, _ := a.endpointGenerations.Load(endpoint)
 +		if previous != generation.generation {
@@ -4153,7 +4206,7 @@ index 0000000000000000000000000000000000000000..38ee324365e666f96989e873925aa434
 +}
 diff --git a/tunnel/tools/libwg-go/redundant_tun_test.go b/tunnel/tools/libwg-go/redundant_tun_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..ea9c0f3262c37700bd77deb95b32fec23287a65c
+index 0000000000000000000000000000000000000000..db2e5f6afdd8e8f6ab8a47b96cf200bcc01b3565
 --- /dev/null
 +++ b/tunnel/tools/libwg-go/redundant_tun_test.go
 @@ -0,0 +1,1510 @@
@@ -5589,8 +5642,8 @@ index 0000000000000000000000000000000000000000..ea9c0f3262c37700bd77deb95b32fec2
 +	if err := bind.Send([][]byte{{1}}, nil); err != nil {
 +		t.Fatalf("admitted send: %v", err)
 +	}
-+	if network.sendCalls != 1 {
-+		t.Fatalf("admitted bind sent %d packets, want 1", network.sendCalls)
++	if network.sendCalls != 2 {
++		t.Fatalf("admitted bind sent %d batches, want queued plus current", network.sendCalls)
 +	}
 +}
 +
@@ -5759,3 +5812,174 @@ index 0000000000000000000000000000000000000000..11657f756cfc30fa64f6311b511b969a
 +trap 'release_lock' EXIT
 +trap 'exit 130' HUP INT TERM
 +"$@"
+diff --git a/tunnel/tools/libwg-go/admission_startup_test.go b/tunnel/tools/libwg-go/admission_startup_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..77ff7510a805193d54c7e37d80ee741aed791510
+--- /dev/null
++++ b/tunnel/tools/libwg-go/admission_startup_test.go
+@@ -0,0 +1,165 @@
++package main
++
++import (
++	"bytes"
++	"errors"
++	"net"
++	"net/netip"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
++	"github.com/amnezia-vpn/amneziawg-go/v3/device"
++)
++
++func TestAdmissionFirstHandshakeDoesNotWaitForRetry(t *testing.T) {
++	receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer receiver.Close()
++	bind := newAdmissionBind(conn.NewStdNetBind)
++	backend := device.NewDevice(newFakeRealTUN(), bind, device.NewLogger(device.LogLevelError, "test: "))
++	defer backend.Close()
++	// Disposable test keys, localhost only. S1 adds 32 bytes to the 148-byte init.
++	cfg := "private_key=" + strings.Repeat("51", 32) + "\ns1=32\ns2=40\ns3=48\ns4=56\nh1=123456\nh2=223456\nh3=323456\nh4=423456\npublic_key=09" + strings.Repeat("00", 31) + "\nendpoint=" + receiver.LocalAddr().String() + "\nallowed_ip=0.0.0.0/0\npersistent_keepalive_interval=21\n"
++	if err := backend.IpcSet(cfg); err != nil {
++		t.Fatal(err)
++	}
++	if err := backend.Up(); err != nil {
++		t.Fatal(err)
++	}
++	bind.mu.Lock()
++	token := bind.pending.generation
++	bind.mu.Unlock()
++	receiver.SetReadDeadline(time.Now().Add(25 * time.Millisecond))
++	packet := make([]byte, 2048)
++	if _, _, err := receiver.ReadFromUDP(packet); err == nil {
++		t.Fatal("sent before protection/admission")
++	}
++	if err := bind.AdmitPreparedToken(token); err != nil {
++		t.Fatal(err)
++	}
++	backend.SendKeepalivesToAllRunningPeers()
++	receiver.SetReadDeadline(time.Now().Add(time.Second))
++	n, _, err := receiver.ReadFromUDP(packet)
++	if err != nil {
++		t.Fatalf("first handshake lost until retry: %v", err)
++	}
++	if n != 180 {
++		t.Fatalf("init length=%d want180", n)
++	}
++}
++
++func TestAdmissionQueuedSendFailureKeepsProtectedGenerationUsable(t *testing.T) {
++	want := errors.New("test send failure")
++	network := &recordingAdmissionBind{fakeAdmissionBind: fakeAdmissionBind{fds: [2]int{101, 102}}, sendErr: want}
++	bind := newAdmissionBind(func() conn.Bind { return network })
++	defer bind.Close()
++	bind.Open(0)
++	bind.Send([][]byte{{1}}, nil)
++	if err := bind.AdmitPreparedToken(requirePreparedSockets(t, bind).Token); err != nil {
++		t.Fatalf("transport failure invalidated successful socket admission: %v", err)
++	}
++	if len(network.batches) != 1 {
++		t.Fatal("queued send was not attempted")
++	}
++	if err := bind.Send([][]byte{{2}}, nil); !errors.Is(err, want) {
++		t.Fatalf("ordinary send failure not propagated: %v", err)
++	}
++	network.sendErr = nil
++	if err := bind.Send([][]byte{{3}}, nil); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestAdmissionRejectsUnboundedStartupBatch(t *testing.T) {
++	for _, packets := range [][][]byte{{make([]byte, 65*1024)}, make([][]byte, conn.IdealBatchSize+1)} {
++		network := &recordingAdmissionBind{fakeAdmissionBind: fakeAdmissionBind{fds: [2]int{101, 102}}}
++		bind := newAdmissionBind(func() conn.Bind { return network })
++		bind.Open(0)
++		bind.Send([][]byte{{1}}, nil)
++		if err := bind.Send(packets, nil); err == nil {
++			t.Fatal("accepted unbounded batch")
++		}
++		if err := bind.AdmitPreparedToken(requirePreparedSockets(t, bind).Token); err != nil {
++			t.Fatal(err)
++		}
++		if len(network.batches) != 0 {
++			t.Fatal("sent rejected batch")
++		}
++		bind.Close()
++	}
++}
++
++type recordingAdmissionBind struct {
++	fakeAdmissionBind
++	batches      [][][]byte
++	sendErr      error
++	destinations []string
++}
++
++func (b *recordingAdmissionBind) Send(packets [][]byte, endpoint conn.Endpoint) error {
++	if endpoint != nil {
++		b.destinations = append(b.destinations, endpoint.DstToString())
++	}
++	clone := make([][]byte, len(packets))
++	for i, p := range packets {
++		clone[i] = append([]byte(nil), p...)
++	}
++	b.batches = append(b.batches, clone)
++	return b.sendErr
++}
++
++func TestAdmissionRetainsOnlyLatestOwnedBatch(t *testing.T) {
++	network := &recordingAdmissionBind{fakeAdmissionBind: fakeAdmissionBind{fds: [2]int{101, 102}}}
++	bind := newAdmissionBind(func() conn.Bind { return network })
++	defer bind.Close()
++	bind.Open(0)
++	bind.Send([][]byte{{9}}, nil)
++	packet := []byte{1, 2, 3}
++	endpoint, err := bind.ParseEndpoint("127.0.0.1:10001")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := bind.Send([][]byte{packet, {4, 5}}, endpoint); err != nil {
++		t.Fatal(err)
++	}
++	packet[0] = 99
++	endpoint.(*conn.StdNetEndpoint).AddrPort = netip.MustParseAddrPort("127.0.0.1:20002")
++	if len(network.batches) != 0 {
++		t.Fatal("sent before admit")
++	}
++	if err := bind.AdmitPreparedToken(requirePreparedSockets(t, bind).Token); err != nil {
++		t.Fatal(err)
++	}
++	if len(network.batches) != 1 || len(network.batches[0]) != 2 || !bytes.Equal(network.batches[0][0], []byte{1, 2, 3}) {
++		t.Fatalf("lost/reused startup buffers: %v", network.batches)
++	}
++	if len(network.destinations) != 1 || network.destinations[0] != "127.0.0.1:10001" {
++		t.Fatalf("reused caller endpoint: %v", network.destinations)
++	}
++}
++
++func TestAdmissionAbortAndReopenDoNotReplayOldBatch(t *testing.T) {
++	first := &recordingAdmissionBind{fakeAdmissionBind: fakeAdmissionBind{fds: [2]int{101, 102}}}
++	second := &recordingAdmissionBind{fakeAdmissionBind: fakeAdmissionBind{fds: [2]int{201, 202}}}
++	networks := []conn.Bind{first, second}
++	bind := newAdmissionBind(func() conn.Bind { b := networks[0]; networks = networks[1:]; return b })
++	defer bind.Close()
++	bind.Open(0)
++	bind.Send([][]byte{{1}}, nil)
++	token := requirePreparedSockets(t, bind).Token
++	if err := bind.AbortPreparedToken(token); err != nil {
++		t.Fatal(err)
++	}
++	bind.Close()
++	bind.Open(0)
++	if err := bind.AdmitPreparedToken(requirePreparedSockets(t, bind).Token); err != nil {
++		t.Fatal(err)
++	}
++	if len(first.batches)+len(second.batches) != 0 {
++		t.Fatal("replayed cancelled startup")
++	}
++}
