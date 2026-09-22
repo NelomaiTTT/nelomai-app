@@ -10,6 +10,65 @@ import org.junit.Test
 
 class RedundantProductionAdaptersTest {
     @Test
+    fun initialHandshakeBlackholeStartsThroughProvenReserveInEitherSlot() {
+        for (primary in listOf(0, 1)) {
+            val fixture = StartupFixture(primary, ::prepared)
+            fixture.healthySlots = setOf(1 - primary)
+            for (now in 0L..20_000L step 100L) {
+                fixture.tick(now)
+                if (now < 15_000L) assertEquals(0, fixture.ready)
+            }
+            assertEquals("primary=$primary", 1, fixture.ready)
+            assertEquals(0, fixture.failed)
+            assertEquals(listOf(primary, 1 - primary), fixture.backend.activeSlots)
+            assertEquals(0, fixture.maxPrimaryCorroboration)
+        }
+    }
+
+    @Test
+    fun initialBlackholeDoesNotUseBrokenReserveAndStillHasBoundedFailure() {
+        val fixture = StartupFixture(0, ::prepared)
+        fixture.healthySlots = emptySet()
+        for (now in 0L..31_000L step 100L) fixture.tick(now)
+        assertEquals(0, fixture.ready)
+        assertEquals(1, fixture.failed)
+        assertEquals(listOf(0), fixture.backend.activeSlots)
+    }
+
+    @Test
+    fun cancellationWinsBeforeInitialReserveReadiness() {
+        val fixture = StartupFixture(0, ::prepared)
+        fixture.healthySlots = setOf(1)
+        for (now in 0L..20_000L step 100L) {
+            if (now == 14_900L) fixture.cancel = true
+            fixture.tick(now)
+        }
+        assertEquals(0, fixture.ready)
+        assertEquals(1, fixture.cancelled)
+        assertEquals(listOf(0), fixture.backend.activeSlots)
+    }
+
+    @Test
+    fun dnsFailureWithPrimaryHandshakeAndTrafficIsNotInitialHandshakeBlackhole() {
+        val fixture = StartupFixture(0, ::prepared)
+        fixture.healthySlots = setOf(0, 1)
+        fixture.dnsBlockedSlots = setOf(0)
+        for (now in 0L..20_000L step 100L) fixture.tick(now)
+        assertEquals(0, fixture.ready)
+        assertEquals(0, fixture.failed)
+        assertEquals(listOf(0), fixture.backend.activeSlots)
+    }
+
+    @Test
+    fun healthyPrimaryCompletesWithoutAnInitialSwitch() {
+        val fixture = StartupFixture(0, ::prepared)
+        for (now in 0L..20_000L step 100L) fixture.tick(now)
+        assertEquals(1, fixture.ready)
+        assertEquals(0, fixture.failed)
+        assertEquals(listOf(0), fixture.backend.activeSlots)
+    }
+
+    @Test
     fun dnsOnlyFailureDoesNotStopOrdinaryStandbyProbes() {
         for (primary in listOf(0, 1)) {
             val fixture = pairFixture(primary)
@@ -792,6 +851,93 @@ class RedundantProductionAdaptersTest {
         assertFalse(native.healthObservations().single().hardFailure)
         backend.metricsOverride = { """{"slots":[{"slot":"0","admitted":"true"}]}""" }
         assertFalse(native.healthObservations().single().hardFailure)
+    }
+
+    // Real coordinator + native adapter; only JNI/transport, clock and encrypted
+    // bytes storage are replaced. No fabricated SlotObservation confirmations.
+    private class StartupFixture(
+        private val primary: Int,
+        prepare: (ByteArray) -> PreparedRedundantConfiguration,
+    ) {
+        var now = 0L
+        var healthySlots = setOf(0, 1)
+        var dnsBlockedSlots = emptySet<Int>()
+        var cancel = false
+        var ready = 0
+        var failed = 0
+        var cancelled = 0
+        var maxPrimaryCorroboration = 0
+        val backend = RecordingSessionBackend { 1_800_000_000_000L }
+        private val native = ServiceRedundantConnectionNative(backend, { 41 }, prepare,
+            probeSourceIpv4 = "10.241.0.1/32",
+            epochNowMs = { 1_800_000_000_000L }, elapsedNowMs = { now })
+        private val record = object : EncryptedRecordBackend {
+            var bytes = AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1))
+            override fun read(): ByteArray = bytes.clone()
+            override fun write(plaintext: ByteArray): Boolean {
+                bytes = plaintext.clone()
+                return true
+            }
+        }
+        private val store = AndroidRecoveryStore(record, object : BootIdentityProvider {
+            override fun bootCount(): Long = 1
+        })
+        private val transaction = AndroidRedundantTransaction(
+            desiredActive = true,
+            template = AndroidIntentTemplate("11111111-1111-4111-8111-111111111111",
+                "account", "stray", "dynamic", "standalone", "ipv4", true),
+            sessionId = "22222222-2222-4222-8222-222222222222",
+            slotALeaseId = "lease-a", slotBLeaseId = "lease-b",
+            localActiveLeaseId = if (primary == 0) "lease-a" else "lease-b",
+            standbyDesired = true, roleGeneration = 1, membershipGeneration = 1,
+            startOperationId = "start", startRequestFingerprint = "f".repeat(64),
+        )
+        private val panel = object : RedundantConnectionPanel {
+            override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse =
+                error("unexpected recovery")
+            override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse =
+                RedundantRoleResponse("accepted", requireNotNull(transaction.localActiveLeaseId),
+                    BackgroundRedundantSession(transaction.sessionId, "connected",
+                        transaction.localActiveLeaseId, transaction.slotALeaseId,
+                        transaction.slotBLeaseId, true, transaction.roleGeneration,
+                        transaction.membershipGeneration, null))
+            override fun stop(transaction: AndroidRedundantTransaction): Boolean = true
+        }
+        private val coordinator = RedundantConnectionCoordinator(store, panel, native,
+            epochNowMs = { now }, monotonicMs = { now })
+
+        init {
+            backend.probeClock = { now }
+            backend.metricsOverride = {
+                (0..1).joinToString(prefix = "{\"slots\":[", postfix = "]}") { slot ->
+                    val healthy = slot in healthySlots
+                    val tx = if (healthy) 1 + now / 1000 else 3 * (1 + now / 5000)
+                    val rx = if (healthy) now / 1000 else 0
+                    val handshake = if (healthy) 1_800_000_000_000L else 0L
+                    """{"slot":$slot,"admitted":true,"closed":false,"latest_handshake_at_unix_ms":$handshake,"telemetry":{"udp_send_packets":$tx,"tun_write_packets":$rx}}"""
+                }
+            }
+            val probe = BackgroundRedundantHealthProbe("dns_a", "77.88.8.8", "nelomai.ru", 4000)
+            assertTrue(coordinator.start(transaction,
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                mapOf("lease-a" to probe, "lease-b" to probe),
+                shouldCancel = { cancel }, onPrimaryStarted = { ready += 1 },
+                onPrimaryFailed = { failed += 1 }, onPrimaryCancelled = { cancelled += 1 }))
+        }
+
+        fun tick(elapsed: Long) {
+            now = elapsed
+            backend.probeStatuses.replaceAll { token, status ->
+                val slot = backend.probeDetails.getValue(token).second
+                if (status == NativeProbeStatus.PENDING && slot in healthySlots &&
+                    slot !in dnsBlockedSlots) NativeProbeStatus.SUCCEEDED else status
+            }
+            val observations = native.healthObservations()
+            observations.firstOrNull { it.index == primary }?.let {
+                maxPrimaryCorroboration = maxOf(maxPrimaryCorroboration, it.corroboratedProbeFailures)
+            }
+            coordinator.onHealthObservations(observations)
+        }
     }
 
     private fun probe() = BackgroundRedundantHealthProbe(

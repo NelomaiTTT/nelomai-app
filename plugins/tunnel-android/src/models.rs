@@ -456,6 +456,8 @@ pub struct ConnectionIntentStatusResponse {
     pub next_retry_at_unix: Option<i64>,
     pub last_error_code: Option<String>,
     pub reserve_state: Option<String>,
+    #[serde(default)]
+    pub redundant_session_owned: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -902,6 +904,11 @@ mod tests {
         .unwrap();
         assert_eq!(status.generation, 9);
         assert_eq!(status.lease_phase.as_deref(), Some("start_pending"));
+        assert!(!status.redundant_session_owned);
+        let mut value = serde_json::to_value(&status).unwrap();
+        value["redundantSessionOwned"] = serde_json::json!(true);
+        let owned: ConnectionIntentStatusResponse = serde_json::from_value(value).unwrap();
+        assert!(owned.redundant_session_owned);
 
         let cancel = serde_json::to_value(CancelConnectionIntentRequest { generation: 9 }).unwrap();
         assert_eq!(cancel["generation"], 9);

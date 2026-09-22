@@ -562,7 +562,8 @@ internal class RedundantConnectionCoordinator(
         }
         val observation = observations.singleOrNull { it.index == pending.activeIndex }
         if (observation?.hardFailure == true ||
-            observation?.health == BackendHealth.UNHEALTHY
+            observation?.health == BackendHealth.UNHEALTHY ||
+            (observation != null && healthMonitor.failed(elapsedNow(), observation))
         ) {
             return advancePrimaryReadinessThroughStandbyLocked(
                 pending,
@@ -583,6 +584,18 @@ internal class RedundantConnectionCoordinator(
                 pending.drainPendingWork,
                 pending.onReady,
             )
+        }
+        // Before the first handshake, staged DNS packets cannot corroborate
+        // every failed probe with outbound growth: handshake retries are slower
+        // than probes. A fresh start can use an independently proven reserve;
+        // this is not failure detection for an already established connection.
+        val standbyIndex = 1 - pending.activeIndex
+        if (pending.freshStart && observation?.handshakeFresh == false &&
+            observation.probeFailed && transaction.standbyDesired &&
+            transaction.leaseIdAt(standbyIndex) != null &&
+            standbyReadyForStart(observations.singleOrNull { it.index == standbyIndex })
+        ) {
+            return advancePrimaryReadinessThroughStandbyLocked(pending, transaction, observations)
         }
         if (monotonicMs().coerceAtLeast(0L) >= pending.deadlineElapsedMs) {
             return advancePrimaryReadinessThroughStandbyLocked(
@@ -609,9 +622,7 @@ internal class RedundantConnectionCoordinator(
         val standby = observations.singleOrNull { it.index == standbyIndex }
         // READY can predate the current failure episode. As in normal failover,
         // wait for its reserve probe and never activate an expired/failed check.
-        val standbyProbeReady = standby?.standbyProbeState == StandbyProbeState.NOT_REQUIRED ||
-            standby?.standbyProbeState == StandbyProbeState.SUCCEEDED
-        if (standby == null || !standbyProbeReady || !healthMonitor.ready(elapsedNow(), standby)) {
+        if (!standbyReadyForStart(standby)) {
             val standbyFailed = standby?.hardFailure == true ||
                 standby?.health == BackendHealth.UNHEALTHY ||
                 standby?.standbyProbeState == StandbyProbeState.FAILED
@@ -654,6 +665,12 @@ internal class RedundantConnectionCoordinator(
             pending.onReady,
         )
     }
+
+    private fun standbyReadyForStart(standby: SlotObservation?): Boolean =
+        standby != null &&
+            (standby.standbyProbeState == StandbyProbeState.NOT_REQUIRED ||
+                standby.standbyProbeState == StandbyProbeState.SUCCEEDED) &&
+            healthMonitor.ready(elapsedNow(), standby)
 
     private fun completePrimaryReadinessLocked(
         transaction: AndroidRedundantTransaction,
@@ -1360,6 +1377,7 @@ internal class RedundantConnectionCoordinator(
         pendingPrimaryReadiness = null
         recoveryStarted = false
         primaryReadinessFailed = false
+        publishReserveStateLocked(null, emptyList())
         if (pending?.freshStart == true) pending.onCancelled()
         runCatching(native::stop).getOrDefault(false)
     }

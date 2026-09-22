@@ -206,6 +206,14 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         }
     }
 
+    async fn owns_redundant_session(&self) -> std::result::Result<bool, TunnelError> {
+        self.app
+            .tunnel_android()
+            .connection_intent_status()
+            .map(|status| status.redundant_session_owned)
+            .map_err(to_tunnel_error)
+    }
+
     async fn metrics(
         &self,
         probe: bool,

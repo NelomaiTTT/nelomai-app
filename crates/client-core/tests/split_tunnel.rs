@@ -2202,78 +2202,98 @@ async fn missing_saved_configuration_marks_policy_failure_and_reports_it() {
 
 #[tokio::test]
 async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy() {
-    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Android, Some(35), true, true));
-    fixture
-        .core
-        .set_split_tunnel_installed_packages(installed());
-    let initial = policy(SplitTunnelMode::ExcludeSelected);
-    let mut split_state = StoredSplitTunnelState {
-        cached_policy: Some(initial.clone()),
-        working_policy_hash: Some(initial.policy_hash.clone()),
-        ..StoredSplitTunnelState::default()
-    };
-    fixture.split_store.save(&split_state).unwrap();
-    let running = Connection {
-        lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
-        pool_id: None,
-        layer: Layer::Tic,
-        transport_protocol: Default::default(),
-        tic_connection_mode: TicConnectionMode::Dynamic,
-        route_mode: RouteMode::ViaTak,
-        egress_mode: EgressMode::Ipv4,
-        probe_url: Some("https://1a.example.test/probe".to_string()),
-        status: LeaseStatus::Connected,
-        pinned: false,
-        stopped_at: None,
-    };
-    fixture.api.set_bootstrap_connection(running.clone());
-    *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
-
-    fixture.core.bootstrap(1_000).await.unwrap();
-
-    let recovered = fixture
-        .secret_store
-        .load()
-        .unwrap()
-        .unwrap()
-        .saved_connection
-        .expect("background connection configuration recovered");
-    assert_eq!(recovered.lease_id, running.lease_id);
-    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
-    assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
-
-    let mut changed = initial;
-    changed.revision = 8;
-    changed.force_revision = 3;
-    changed.policy_hash = format!("sha256:{}", "b".repeat(64));
-    changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".to_string()];
-    fixture.api.set_policy(changed.clone());
-    fixture
-        .api
-        .set_revision(changed.revision, changed.force_revision);
-
-    assert_eq!(
+    for starting in [false, true] {
+        let fixture =
+            coordinator_fixture(capabilities(TunnelPlatform::Android, Some(35), true, true));
         fixture
             .core
-            .synchronize_split_tunnel(1_100, false)
-            .await
-            .unwrap(),
-        SplitTunnelSyncOutcome::Updated { reconnected: true }
-    );
-    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        *fixture.tunnel.status.lock().unwrap(),
-        TunnelStatus::Running
-    );
-    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
-    assert_eq!(fixture.core.state().await.connection, Some(running));
-    assert_eq!(fixture.core.split_tunnel_warning().await, None);
-    split_state = fixture.split_store.load().unwrap();
-    assert_eq!(
-        split_state.working_policy_hash.as_deref(),
-        Some(changed.policy_hash.as_str())
-    );
+            .set_split_tunnel_installed_packages(installed());
+        let initial = policy(SplitTunnelMode::ExcludeSelected);
+        let mut split_state = StoredSplitTunnelState {
+            cached_policy: Some(initial.clone()),
+            working_policy_hash: Some(initial.policy_hash.clone()),
+            applied_physical_network_fingerprint: Some("network-a".into()),
+            ..StoredSplitTunnelState::default()
+        };
+        fixture.split_store.save(&split_state).unwrap();
+        let running = Connection {
+            lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            pool_id: None,
+            layer: Layer::Tic,
+            transport_protocol: Default::default(),
+            tic_connection_mode: TicConnectionMode::Dynamic,
+            route_mode: RouteMode::ViaTak,
+            egress_mode: EgressMode::Ipv4,
+            probe_url: Some("https://1a.example.test/probe".to_string()),
+            status: LeaseStatus::Connected,
+            pinned: false,
+            stopped_at: None,
+        };
+        fixture.api.set_bootstrap_connection(running.clone());
+        *fixture.tunnel.status.lock().unwrap() = if starting {
+            TunnelStatus::Starting
+        } else {
+            TunnelStatus::Running
+        };
+
+        fixture.core.bootstrap(1_000).await.unwrap();
+        if starting {
+            assert_eq!(fixture.core.state().await.phase, Phase::Connecting);
+            assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 0);
+            *fixture.tunnel.status.lock().unwrap() = TunnelStatus::Running;
+            assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        }
+
+        let recovered = fixture
+            .secret_store
+            .load()
+            .unwrap()
+            .unwrap()
+            .saved_connection
+            .expect("background connection configuration recovered");
+        assert_eq!(recovered.lease_id, running.lease_id);
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(fixture.api.start_calls.load(Ordering::SeqCst), 1);
+
+        fixture.tunnel.set_fingerprints(["network-a"]);
+        assert_eq!(
+            fixture.core.poll_physical_network(1_001).await.unwrap(),
+            PhysicalNetworkPollOutcome::Unchanged
+        );
+
+        let mut changed = initial;
+        changed.revision = 8;
+        changed.force_revision = 3;
+        changed.policy_hash = format!("sha256:{}", "b".repeat(64));
+        changed.excluded_ipv4_cidrs = vec!["198.51.100.0/24".to_string()];
+        fixture.api.set_policy(changed.clone());
+        fixture
+            .api
+            .set_revision(changed.revision, changed.force_revision);
+
+        assert_eq!(
+            fixture
+                .core
+                .synchronize_split_tunnel(1_100, false)
+                .await
+                .unwrap(),
+            SplitTunnelSyncOutcome::Updated { reconnected: true }
+        );
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *fixture.tunnel.status.lock().unwrap(),
+            TunnelStatus::Running
+        );
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(fixture.core.state().await.connection, Some(running));
+        assert_eq!(fixture.core.split_tunnel_warning().await, None);
+        split_state = fixture.split_store.load().unwrap();
+        assert_eq!(
+            split_state.working_policy_hash.as_deref(),
+            Some(changed.policy_hash.as_str())
+        );
+    }
 }
 
 struct CoordinatorFixture {

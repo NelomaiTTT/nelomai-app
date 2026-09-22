@@ -400,6 +400,9 @@ class RedundantConnectionCoordinatorTest {
         val failedPrimaryObservations = listOf(
             healthSlot(index = 0, active = true, hardFailure = true),
             healthSlot(index = 0, active = true, health = BackendHealth.UNHEALTHY),
+            healthSlot(index = 0, active = true, health = BackendHealth.SUSPECT,
+                probeFailed = true, independentFailureSignal = true,
+                softFailureStartedAtMs = 10_000L, corroboratedProbeFailures = 2),
         )
         for (failedPrimary in failedPrimaryObservations) {
             var ready = 0
@@ -444,6 +447,88 @@ class RedundantConnectionCoordinatorTest {
             assertEquals(1, ready)
             assertEquals(0, failed)
         }
+    }
+
+    @Test
+    fun startupSoftFailureRequiresCorroborationAndFreshUsableStandby() {
+        val primary = healthSlot(index = 0, active = true, health = BackendHealth.SUSPECT,
+            handshakeFresh = true, probeFailed = true, independentFailureSignal = true,
+            softFailureStartedAtMs = 10_000L, corroboratedProbeFailures = 2)
+        val standby = healthSlot(index = 1, health = BackendHealth.READY,
+            handshakeFresh = true, consecutiveProbeSuccesses = 3, stableSinceMs = 0)
+        val cases = listOf(
+            primary.copy(corroboratedProbeFailures = 1) to standby,
+            primary.copy(independentFailureSignal = false) to standby,
+            primary to standby.copy(standbyProbeState = StandbyProbeState.PENDING),
+            primary to standby.copy(standbyProbeState = StandbyProbeState.FAILED),
+            primary to standby.copy(health = BackendHealth.WARMING, handshakeFresh = false),
+            primary to standby.copy(health = BackendHealth.UNHEALTHY),
+        )
+        for ((active, reserve) in cases) {
+            val native = FakeNative()
+            var ready = 0
+            val coordinator = RedundantConnectionCoordinator(emptyStore(), FakePanel(), native,
+                epochNowMs = { 20_000L }, monotonicMs = { 20_000L })
+            assertTrue(coordinator.start(transaction(),
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                mapOf("lease-a" to probe()), onPrimaryStarted = { ready += 1 }))
+            coordinator.onHealthObservations(listOf(active, reserve))
+            assertEquals("unsafe reserve: $active / $reserve", listOf("lease-a"), native.activated)
+            assertEquals(0, ready)
+        }
+    }
+
+    @Test
+    fun initialHandshakeFallbackStillRequiresFailedProbeAndFreshReadyReserve() {
+        val primary = healthSlot(0, active = true, health = BackendHealth.SUSPECT,
+            probeFailed = true)
+        val standby = healthSlot(1, health = BackendHealth.WARMING,
+            handshakeFresh = true, consecutiveProbeSuccesses = 3, stableSinceMs = 0)
+        val cases = listOf(
+            primary.copy(probeFailed = false) to standby,
+            primary to standby.copy(standbyProbeState = StandbyProbeState.PENDING),
+            primary to standby.copy(standbyProbeState = StandbyProbeState.FAILED),
+            primary to standby.copy(handshakeFresh = false),
+            primary to standby.copy(consecutiveProbeSuccesses = 2),
+            primary to standby.copy(stableSinceMs = 10_000L),
+            primary to standby.copy(hardFailure = true),
+            primary to standby.copy(health = BackendHealth.UNHEALTHY),
+            primary to null,
+        )
+        for ((active, reserve) in cases) {
+            val native = FakeNative()
+            var ready = 0
+            var failed = 0
+            val coordinator = RedundantConnectionCoordinator(emptyStore(), FakePanel(), native,
+                epochNowMs = { 20_000L }, monotonicMs = { 20_000L })
+            assertTrue(coordinator.start(transaction(),
+                mapOf("lease-a" to byteArrayOf(1), "lease-b" to byteArrayOf(2)),
+                mapOf("lease-a" to probe()), onPrimaryStarted = { ready += 1 },
+                onPrimaryFailed = { failed += 1 }))
+            coordinator.onHealthObservations(listOfNotNull(active, reserve))
+            assertEquals("unsafe reserve: $active / $reserve", listOf("lease-a"), native.activated)
+            assertEquals(0, ready)
+            assertEquals(0, failed)
+        }
+    }
+
+    @Test
+    fun recoveryDoesNotUseTheInitialHandshakeShortcut() {
+        val store = emptyStore()
+        store.beginRedundant(transaction())
+        val native = FakeNative()
+        val events = mutableListOf<Boolean>()
+        val coordinator = RedundantConnectionCoordinator(store,
+            FakePanel(recoveryHealthProbes = mapOf("lease-a" to probe())), native,
+            epochNowMs = { 20_000L }, monotonicMs = { 20_000L },
+            onRecoveryReadiness = { events += it })
+        assertTrue(coordinator.recover())
+        coordinator.onHealthObservations(listOf(
+            healthSlot(0, active = true, health = BackendHealth.SUSPECT, probeFailed = true),
+            healthSlot(1, handshakeFresh = true, consecutiveProbeSuccesses = 3, stableSinceMs = 0),
+        ))
+        assertEquals(listOf("lease-a"), native.activated)
+        assertTrue(events.isEmpty())
     }
 
     @Test
@@ -1020,6 +1105,20 @@ class RedundantConnectionCoordinatorTest {
 
         assertEquals(null, (store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
         assertEquals(1, panel.stopCalls)
+    }
+
+    @Test
+    fun localCloseClearsPublishedReserveBeforeRemoteCleanup() {
+        val states = mutableListOf<RedundantReserveState?>()
+        val coordinator = RedundantConnectionCoordinator(store(transaction()), FakePanel(), FakeNative(),
+            onReserveStateChanged = { states += it })
+        assertTrue(coordinator.recover())
+        assertTrue(coordinator.reserveState() != null)
+        assertTrue(coordinator.closeLocal())
+        assertFalse(coordinator.isRunning())
+        assertEquals(null, coordinator.reserveState())
+        assertEquals(null, states.last())
+        assertTrue(coordinator.status() != null) // Remote ownership still needs cleanup.
     }
 
     @Test
