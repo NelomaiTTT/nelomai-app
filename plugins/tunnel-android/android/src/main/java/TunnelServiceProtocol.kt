@@ -242,7 +242,9 @@ internal object TunnelServiceClient {
     ) {
         val configuration = args.configuration.copyOf()
         val redundant = args.redundancy?.copyForServiceTransport()
-        val clientOperationId = UUID.randomUUID().toString()
+        // Redundant ownership, cancellation and durable stop fences all use the
+        // server start operation. Legacy starts have no such identity.
+        val clientOperationId = redundant?.operationId ?: UUID.randomUUID().toString()
         try {
             requestBundle(
                 context,

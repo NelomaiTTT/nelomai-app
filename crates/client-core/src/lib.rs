@@ -2841,7 +2841,11 @@ where
                 &stored,
                 OperationReconcileRequest {
                     operation_id: pending.operation_id.clone(),
-                    kind: OperationKind::Start,
+                    kind: match contract_version {
+                        1 => OperationKind::Start,
+                        2 => OperationKind::RedundantStart,
+                        _ => return Err(CoreError::Storage),
+                    },
                     contract_version,
                     request_fingerprint,
                     cancel_if_absent: false,
@@ -3140,7 +3144,11 @@ where
                 &background.token,
                 &OperationReconcileRequest {
                     operation_id: pending.operation_id.clone(),
-                    kind: OperationKind::Start,
+                    kind: match contract_version {
+                        1 => OperationKind::Start,
+                        2 => OperationKind::RedundantStart,
+                        _ => return Err(CoreError::Storage),
+                    },
                     contract_version,
                     request_fingerprint,
                     cancel_if_absent: true,

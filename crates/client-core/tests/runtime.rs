@@ -3277,6 +3277,62 @@ fn pending_explicit_start() -> StoredPendingStart {
     }
 }
 
+#[tokio::test]
+#[cfg(not(target_os = "android"))]
+async fn redundant_pending_start_reconciles_its_original_kind_for_retry_and_cancel() {
+    for cancel in [false, true] {
+        let mut stored = auth();
+        let mut pending = pending_explicit_start();
+        pending.recovery_contract_version = Some(2);
+        pending.redundancy_contract_version = Some(1);
+        pending.reserve_enabled = Some(true);
+        pending.request_fingerprint = Some("a".repeat(64));
+        pending.cancel_operation_id = cancel.then(|| "pending-cancel".into());
+        stored.pending_start = Some(pending.clone());
+        let store = Arc::new(MemoryStore::new(stored));
+        let api = Arc::new(MockApi::new(0));
+        api.reconcile_responses
+            .lock()
+            .unwrap()
+            .push_back(OperationReconcileResponse {
+                api_version: ApiVersion::V1,
+                request_id: "redundant-reconcile".into(),
+                state: OperationState::Compensating,
+                cancel_requested: cancel,
+                lease_id: Some("primary-lease".into()),
+                lease_status: Some(LeaseStatus::Issued),
+                retry_count: 1,
+                next_attempt_at: None,
+            });
+        let core = support::core(
+            api.clone(),
+            store.clone(),
+            Arc::new(MemoryTunnel::default()),
+            Arc::new(MemoryLogger::default()),
+        );
+        if cancel {
+            let epoch = core.begin_start_attempt();
+            assert!(core
+                .prepare_explicit_start(&options(), epoch)
+                .await
+                .is_err());
+        } else {
+            assert!(core.reconcile_pending_operation_for_retry().await.is_err());
+        }
+        let requests = api.reconcile_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].kind,
+            nelomai_contracts::OperationKind::RedundantStart
+        );
+        assert_eq!(requests[0].operation_id, pending.operation_id);
+        assert_eq!(requests[0].contract_version, 2);
+        assert_eq!(requests[0].cancel_if_absent, cancel);
+        assert_eq!(store.load().unwrap().unwrap().pending_start, Some(pending));
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn explicit_retry_requires_confirmed_cleanup_of_the_exact_lease() {
     for (lease_id, status) in [

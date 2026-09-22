@@ -28,6 +28,7 @@ internal data class PhysicalNetworkSnapshot(
     val ethernet: Boolean,
     val vpn: Boolean,
     val addresses: List<PhysicalLinkAddress>,
+    val linkFingerprint: String = "",
 )
 
 internal data class PhysicalNetworkState(
@@ -47,10 +48,27 @@ internal class PhysicalNetworks(context: Context) {
 
     private var callback: ConnectivityManager.NetworkCallback? = null
     private var listener: ((PhysicalNetworkState) -> Unit)? = null
+    private var deliveredFingerprint: String? = null
     private val refresh = Runnable {
-        val currentListener = synchronized(lock) { listener }
+        val (currentCallback, currentListener) = synchronized(lock) { callback to listener }
         runCatching(::snapshotState)
-            .onSuccess { currentListener?.invoke(it) }
+            .onSuccess { state ->
+                val deliver = synchronized(lock) {
+                    currentListener != null && callback === currentCallback &&
+                        listener === currentListener &&
+                        deliveredFingerprint != state.fingerprint
+                }
+                if (deliver) {
+                    // The VPN owner can stop this monitor while holding its own
+                    // mutation fence. Never invoke it under the monitor lock.
+                    currentListener?.invoke(state)
+                    synchronized(lock) {
+                        if (callback === currentCallback && listener === currentListener) {
+                            deliveredFingerprint = state.fingerprint
+                        }
+                    }
+                }
+            }
             .onFailure {
                 val active = synchronized(lock) { callback != null && listener != null }
                 if (active) {
@@ -83,7 +101,9 @@ internal class PhysicalNetworks(context: Context) {
         }
         val eligible = preferValidatedNetworks(physical)
         val routes = canonicalLocalCidrs(eligible.map { it.second })
-        val networkIds = eligible.map { (network, _) -> network.toString() }
+        val networkIds = eligible.map { (network, snapshot) ->
+            "${network}:${snapshot.linkFingerprint}"
+        }
         val validated = eligible.any { it.second.validated }
         return PhysicalNetworkState(
             localRoutes = routes,
@@ -99,6 +119,7 @@ internal class PhysicalNetworks(context: Context) {
                 return
             }
             this.listener = listener
+            deliveredFingerprint = null
             val networkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     TunnelLog.info("network.available", mapOf("network" to network.toString()))
@@ -143,6 +164,7 @@ internal class PhysicalNetworks(context: Context) {
             val value = callback
             callback = null
             listener = null
+            deliveredFingerprint = null
             value
         }
         handler.removeCallbacks(refresh)
@@ -209,6 +231,11 @@ internal class PhysicalNetworks(context: Context) {
                         prefixLength = it.prefixLength,
                     )
                 },
+                // Ignore metadata-only changes (signal, private DNS status, etc.),
+                // but retain rebinds after address/route changes on the SAME Network.
+                linkFingerprint = (listOf(properties.interfaceName.orEmpty()) +
+                    properties.linkAddresses.map { "${it.address.hostAddress}/${it.prefixLength}" }.sorted() +
+                    properties.routes.map { it.toString() }.sorted()).joinToString(";"),
             )
 
         private fun canonicalPhysicalNetwork(value: PhysicalLinkAddress): Ipv4Prefix? {
