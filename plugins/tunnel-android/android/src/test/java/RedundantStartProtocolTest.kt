@@ -17,6 +17,15 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE)
 class RedundantStartProtocolTest {
+    @Test fun coreStopScopeSurvivesServiceDispatchWhileExplicitStopRemainsUnscoped() {
+        val context = RuntimeEnvironment.getApplication()
+        for (legacyOnly in listOf(true, false)) {
+            TunnelServiceClient.stop(context, TUNNEL_API_VERSION, { _, _ -> }, {}, legacyOnly = legacyOnly)
+            val intent = shadowOf(context).nextStartedService
+            assertEquals(NelomaiVpnService.ACTION_CLIENT_STOP, intent.action)
+            assertEquals(legacyOnly, intent.getBooleanExtra(EXTRA_LEGACY_STOP_ONLY, false))
+        }
+    }
     @Test fun successfulLegacyStartDoesNotSendLateCancellationAndUsesFreshRequestIdentity() {
         val context = RuntimeEnvironment.getApplication()
         val errors = mutableListOf<String>()

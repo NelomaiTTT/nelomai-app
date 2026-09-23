@@ -187,6 +187,16 @@ impl<R: Runtime> TunnelController for AndroidTunnelController<R> {
         require_state(response, "stopped")
     }
 
+    async fn stop_if_unowned(&self) -> std::result::Result<(), TunnelError> {
+        let response = self
+            .app
+            .tunnel_android()
+            .stop_unowned_tunnel_async()
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, "stopped")
+    }
+
     async fn status(&self) -> std::result::Result<TunnelStatus, TunnelError> {
         let response = self
             .app

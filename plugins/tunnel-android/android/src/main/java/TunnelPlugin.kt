@@ -245,6 +245,12 @@ class VersionedTunnelArgs {
 }
 
 @InvokeArg
+class StopTunnelArgs {
+    var apiVersion: Int = 0
+    var legacyOnly: Boolean = false
+}
+
+@InvokeArg
 class TunnelMetricsArgs {
     var apiVersion: Int = 0
     var probe: Boolean = false
@@ -3220,7 +3226,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun stopTunnel(invoke: Invoke) {
         val args = try {
-            invoke.parseArgs(VersionedTunnelArgs::class.java)
+            invoke.parseArgs(StopTunnelArgs::class.java)
         } catch (_: Throwable) {
             invoke.reject("invalid_tunnel_request")
             return
@@ -3231,6 +3237,7 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
             args.apiVersion,
             { state, duration -> resolveOperation(invoke, state, duration) },
             { code -> activity.runOnUiThread { invoke.reject(code) } },
+            legacyOnly = args.legacyOnly,
         )
     }
 
