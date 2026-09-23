@@ -43,6 +43,13 @@ describe("native client", () => {
     ).toContain("Разрешите VPN-подключение");
   });
 
+  it("does not recommend reinstalling after a connection startup timeout", () => {
+    const message = commandMessage(commandError("tunnel_start_timeout"), "start");
+    expect(message).toContain("сеть");
+    expect(message).toContain("«Старт»");
+    expect(message).not.toMatch(/переустанов|восстановление/);
+  });
+
   it("uses the actual retry and start button labels", () => {
     expect(
       commandMessage(commandError("connection_stop_failed"), "stop"),
@@ -71,6 +78,13 @@ describe("native client", () => {
         "split_tunnel",
       ),
     ).toContain("«Принудительная синхронизация»");
+  });
+
+  it("explains Windows local-only fallback and deferred exclusions", () => {
+    expect(commandMessage(commandError("split_tunnel_local_only"), "split_tunnel"))
+      .toContain("пользовательские исключения временно не применяются");
+    expect(commandMessage(commandError("split_tunnel_policy_deferred"), "split_tunnel"))
+      .toContain("при следующем подключении");
   });
 
   it("explains the safe recovery after a Stray endpoint route failure", () => {

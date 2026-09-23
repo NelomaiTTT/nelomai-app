@@ -51,6 +51,39 @@ fn check<T: DeserializeOwned>(fixture_name: &str, schema_name: &str) {
 }
 
 #[test]
+fn optional_connection_session_scope_accepts_legacy_and_rejects_invalid_types() {
+    let mut value: Value =
+        serde_json::from_str(&fixture("valid/connection-start-response.json")).unwrap();
+    let legacy: ConnectionStartResponse = serde_json::from_value(value.clone()).unwrap();
+    assert!(legacy.connection.session_id.is_none());
+    assert!(schema_is_valid(
+        "connection-start-response.schema.json",
+        &value
+    ));
+    for session_id in [
+        Value::Null,
+        Value::String("20000000-0000-4000-8000-000000000001".into()),
+    ] {
+        value["connection"]["session_id"] = session_id.clone();
+        assert!(schema_is_valid(
+            "connection-start-response.schema.json",
+            &value
+        ));
+        let response: ConnectionStartResponse = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            response.connection.session_id.as_deref(),
+            session_id.as_str()
+        );
+    }
+    value["connection"]["session_id"] = Value::Bool(true);
+    assert!(!schema_is_valid(
+        "connection-start-response.schema.json",
+        &value
+    ));
+    assert!(serde_json::from_value::<ConnectionStartResponse>(value).is_err());
+}
+
+#[test]
 fn shared_valid_fixtures_match_schemas_and_rust_types() {
     check::<Bootstrap>("valid/bootstrap.json", "bootstrap.schema.json");
     check::<PeerOptions>("valid/peer-options.json", "peer-options.schema.json");

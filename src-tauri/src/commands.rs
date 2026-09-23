@@ -1053,6 +1053,10 @@ impl CommandError {
             ),
             CoreError::Api(error) => Self::from_api(error),
             CoreError::Tunnel(code) => match code.as_str() {
+                "tunnel_start_timeout" => Self::new(
+                    "tunnel_start_timeout",
+                    "Подключение не успело запуститься. Проверьте сеть и повторите запуск",
+                ),
                 "tunnel_handshake_timeout" => Self::new(
                     "tunnel_handshake_timeout",
                     "Stray-сервер не ответил через текущую сеть",
@@ -1104,6 +1108,10 @@ impl CommandError {
             nelomai_client_tunnel::TunnelError::InvalidOptions { code } => code.to_string(),
         };
         match code.as_str() {
+            "tunnel_start_timeout" => Self::new(
+                "tunnel_start_timeout",
+                "Подключение не успело запуститься. Проверьте сеть и повторите запуск",
+            ),
             "tunnel_handshake_timeout" => Self::new(
                 "tunnel_handshake_timeout",
                 "Stray-сервер не ответил через текущую сеть",
@@ -4498,6 +4506,17 @@ mod tests {
     }
 
     #[test]
+    fn startup_timeout_is_not_classified_as_a_broken_service() {
+        let core = CommandError::from_core(CoreError::Tunnel("tunnel_start_timeout".into()));
+        let native = CommandError::from_tunnel(nelomai_client_tunnel::TunnelError::Backend(
+            "tunnel_start_timeout".into(),
+        ));
+        assert_eq!(core.code, "tunnel_start_timeout");
+        assert_eq!(native.code, "tunnel_start_timeout");
+        assert!(!core.message.contains("Переустановите"));
+    }
+
+    #[test]
     fn split_tunnel_stop_failure_keeps_its_actionable_error() {
         let error = CommandError::from_core(CoreError::SplitTunnel(
             "split_tunnel_stop_failed".to_string(),
@@ -5806,6 +5825,7 @@ mod tests {
     fn test_connection(lease_id: &str) -> Connection {
         Connection {
             lease_id: lease_id.to_string(),
+            session_id: None,
             pool_id: None,
             layer: Layer::Stray,
             transport_protocol: Default::default(),

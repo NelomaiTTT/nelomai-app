@@ -18,6 +18,7 @@
     { "code": "tunnel_handshake_timeout", "decision": "retry_new_operation" },
     { "code": "service_timeout", "decision": "reconcile_then_retry" },
     { "code": "tunnel_service_timeout", "decision": "reconcile_then_retry" },
+    { "code": "tunnel_start_timeout", "decision": "reconcile_then_retry" },
     { "code": "service_stopping", "decision": "reconcile_then_retry" },
     { "code": "service_unavailable", "decision": "retry_once" },
     { "code": "android_service_dispatch_unavailable", "decision": "reconcile_then_retry" },

@@ -113,13 +113,18 @@ internal class PhysicalNetworks(context: Context) {
         )
     }
 
-    fun start(listener: (PhysicalNetworkState) -> Unit) {
+    fun start(
+        initialState: PhysicalNetworkState? = null,
+        listener: (PhysicalNetworkState) -> Unit,
+    ) {
         synchronized(lock) {
             if (callback != null) {
                 return
             }
             this.listener = listener
-            deliveredFingerprint = null
+            // The owner has already applied this exact snapshot. A changed
+            // snapshot (including one racing registration) still gets delivered.
+            deliveredFingerprint = initialState?.fingerprint
             val networkCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     TunnelLog.info("network.available", mapOf("network" to network.toString()))

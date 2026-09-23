@@ -17,6 +17,78 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun idleCheckScheduledBeforeTileDoesNotInterruptCredentialPreflight() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val idleTasks = mutableListOf<Runnable>()
+        var stopped = false
+        val debouncer = IdleStopDebouncer(400, { task, _ -> idleTasks += task }, {})
+        fun checkIdle() = applyAndroidVpnServiceIdleLifecycle(debouncer,
+            shouldStop = { shouldStopVpnService(SessionState.STOPPED, false, false, false,
+                pendingConnectionStart = dispatch.hasPendingWork()) },
+            stop = { stopped = true })
+        checkIdle() // UI status arrives before the tile's durable desiredActive.
+        val ticket = dispatch.start(1)
+        dispatch.dispatchStartMutation(Executor { it.run() }, ticket, ::checkIdle) {
+            idleTasks.first().run()
+            assertFalse("UI idle timer must not shut down the credential worker", stopped)
+        }
+        idleTasks.last().run()
+        assertTrue("failed/finished preflight must release the idle service", stopped)
+    }
+
+    @Test
+    fun queuedQuickStartKeepsServiceAliveUntilPreparationFinishesEvenAfterStop() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val ticket = dispatch.start(1)
+        val queued = mutableListOf<Runnable>()
+        var idleChecks = 0
+        fun idle() = shouldStopVpnService(SessionState.STOPPED, false, false, false,
+            pendingConnectionStart = dispatch.hasPendingWork())
+        assertFalse(idle())
+        dispatch.dispatchStartMutation(Executor { queued += it }, ticket, { idleChecks++ }) {
+            assertFalse(idle())
+            assertFalse(dispatch.isCurrent(ticket))
+        }
+        // A second tile press still cancels this Start, but must not interrupt
+        // a credential write already dispatched to the worker.
+        assertEquals(AndroidQuickToggleDispatch.Stop, dispatch.toggle(1, false))
+        assertFalse(idle())
+        queued.single().run()
+        assertTrue(idle())
+        assertEquals(1, idleChecks)
+    }
+
+    @Test
+    fun failedQuickPreparationReleasesOccupancyWithoutCancellingANewerStart() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val old = dispatch.start(1)
+        val queued = mutableListOf<Runnable>()
+        dispatch.dispatchStartMutation(Executor { queued += it }, old, {}) {
+            throw IllegalStateException("preflight failed")
+        }
+        val newer = dispatch.start(2)
+        runCatching { queued.single().run() }
+        assertTrue(dispatch.isCurrent(newer))
+        assertTrue(dispatch.hasPendingWork())
+        dispatch.complete(newer)
+        assertFalse(dispatch.hasPendingWork())
+    }
+
+    @Test
+    fun rejectedQuickPreparationDoesNotLeaveServicePermanentlyBusy() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val ticket = dispatch.start(1)
+        var completed = 0
+        val result = runCatching {
+            dispatch.dispatchStartMutation(Executor { throw RejectedExecutionException() },
+                ticket, { completed++ }) { throw AssertionError("must not run") }
+        }
+        assertTrue(result.exceptionOrNull() is RejectedExecutionException)
+        assertFalse(dispatch.hasPendingWork())
+        assertEquals(1, completed)
+    }
+
+    @Test
     fun v2QuickPlanCannotSilentlyFallBackToLegacyWhenRecoveryIsDisabled() {
         val disabled = BackgroundCapabilitySnapshot(9, false, 2_000_000_000)
         try {
@@ -50,7 +122,12 @@ class NelomaiVpnServiceTest {
         assertEquals("primary", checkpoint.redundantTransaction?.localActiveLeaseId)
         assertEquals("standby", checkpoint.redundantTransaction?.slotBLeaseId)
         assertEquals(0, runtime.startCalls)
+        assertEquals(1, runtime.redundantStartCalls)
+        assertEquals(listOf("primary-config", "standby-config"), runtime.preparedConfigurations)
         assertTrue(response.configuration.all { it == 0.toByte() })
+        assertTrue(requireNotNull(response.redundantTransport).configurations.values.all { bytes ->
+            bytes.all { it == 0.toByte() }
+        })
         assertEquals(listOf(pending.startOperationId), panel.startOperationIds)
     }
 
@@ -73,8 +150,12 @@ class NelomaiVpnServiceTest {
         assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
         assertNull(store.load().leaseTransaction)
         assertEquals(0, runtime.startCalls)
+        assertEquals(0, runtime.redundantStartCalls)
         assertTrue(panel.stopLeaseIds.isEmpty())
         assertTrue(response.configuration.all { it == 0.toByte() })
+        assertTrue(requireNotNull(response.redundantTransport).configurations.values.all { bytes ->
+            bytes.all { it == 0.toByte() }
+        })
     }
 
     @Test
@@ -90,9 +171,31 @@ class NelomaiVpnServiceTest {
         assertEquals(listOf(true), panel.cancelIfAbsent)
     }
 
+    @Test
+    fun v2PreparedRuntimeIsNotCalledWhenDurablePromotionFails() {
+        val backend = ServiceRecoveryBackend()
+        val store = recoveryStore(backend)
+        val coordinator = coordinator(store)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        val response = redundantResult(store.load())
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("not_found"))
+            startResults.add(Result.success(response))
+            onStart = { backend.writeSucceeds = false }
+        }
+        val runtime = ServiceRuntimeFake()
+        runCatching { coordinator.runOnce(panel, runtime) }
+        assertEquals(0, runtime.redundantStartCalls)
+        assertEquals(0, runtime.startCalls)
+        assertNull(store.load().redundantTransaction)
+        assertTrue(requireNotNull(response.redundantTransport).configurations.values.all { bytes ->
+            bytes.all { it == 0.toByte() }
+        })
+    }
+
     private fun redundantResult(envelope: AndroidRecoveryEnvelope): BackgroundStartResult {
         val pending = requireNotNull(envelope.leaseTransaction)
-        return startResult("primary").copy(redundantTransaction = AndroidRedundantTransaction(
+        val transaction = AndroidRedundantTransaction(
             desiredActive = true,
             template = requireNotNull(envelope.intent.template),
             sessionId = "22222222-2222-4222-8222-222222222222",
@@ -105,7 +208,22 @@ class NelomaiVpnServiceTest {
             startOperationId = pending.startOperationId,
             startRequestFingerprint = pending.replay.requestFingerprint,
             startReserveEnabled = true,
-        ))
+        )
+        return startResult("primary").copy(
+            redundantTransaction = transaction,
+            redundantTransport = BackgroundRedundantRecoveryTransport(
+                session = BackgroundRedundantSession(
+                    transaction.sessionId, "degraded", "primary", "primary", "standby",
+                    true, 1, 1, null,
+                ),
+                configurations = linkedMapOf(
+                    "primary" to "primary-config".toByteArray(),
+                    "standby" to "standby-config".toByteArray(),
+                ),
+                healthProbes = emptyMap(),
+                virtualAddressV4 = "10.240.3.4/32",
+            ),
+        )
     }
 
     @Test
@@ -7367,7 +7485,19 @@ private class ServiceRuntimeFake(
     private val stopFailureClearsRunning: Boolean = false,
 ) : AndroidConnectionIntentRuntime {
     var startCalls = 0
+    var redundantStartCalls = 0
+    val preparedConfigurations = mutableListOf<String>()
     var stopCalls = 0
+
+    override fun startRedundant(
+        result: BackgroundStartResult,
+        transaction: AndroidRedundantTransaction,
+        isCurrent: () -> Boolean,
+    ) {
+        if (!isCurrent()) return
+        redundantStartCalls += 1
+        preparedConfigurations += requireNotNull(result.redundantTransport).configurations.values.map(::String)
+    }
 
     override fun start(
         result: BackgroundStartResult,

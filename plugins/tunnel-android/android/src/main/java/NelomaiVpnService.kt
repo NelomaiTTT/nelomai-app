@@ -1471,7 +1471,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             redundantPhysicalNetworks?.stop()
             val monitor = PhysicalNetworks(applicationContext)
             try {
-                monitor.start { state ->
+                monitor.start(initialState = physicalState) { state ->
                     applyRedundantPhysicalNetworks(
                         callbackIdentity,
                         options,
@@ -3613,13 +3613,17 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         when (val dispatch = quickDispatch) {
             is AndroidQuickToggleDispatch.Start -> {
                 val admissionTicket = connectionIntentAdmission.snapshot()
-                dispatchSerializedConnectionIntentMutation(credentialExecutor) {
+                connectionIntentDispatch.dispatchStartMutation(
+                    credentialExecutor,
+                    dispatch.ticket,
+                    onComplete = { restoreHandler.post { stopIfIdle() } },
+                ) {
                     if (!connectionIntentAdmission.isCurrent(admissionTicket) ||
                         redundantStartBlocked()
                     ) {
                         receiver.sendError("redundant_stop_pending")
                         schedulePendingRedundantStopRetry()
-                        return@dispatchSerializedConnectionIntentMutation
+                        return@dispatchStartMutation
                     }
                     val credential = BackgroundCredentialStore.load(applicationContext)
                     val quick = QuickTunnelPlanStore.loadTemplate(applicationContext)
@@ -4483,6 +4487,47 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             isCurrent: () -> Boolean,
         ): Boolean = boundary.start(result, operationId, isCurrent)
 
+        override fun startRedundant(
+            result: BackgroundStartResult,
+            transaction: AndroidRedundantTransaction,
+            isCurrent: () -> Boolean,
+        ) {
+            if (!isCurrent()) return
+            val transport = result.redundantTransport ?: return
+            // The intent worker wipes its response on return. The existing v2
+            // worker owns this short-lived copy, serialized with resume/tick/Stop.
+            val prepared = RedundantRecoveryResponse(
+                transport.session,
+                transport.configurations.mapValues { it.value.copyOf() },
+                transport.healthProbes,
+                transport.virtualAddressV4,
+            )
+            try {
+                redundantWork.execute {
+                    try {
+                        if (serviceDestroyed || !serviceCallbackGate.isOpen() ||
+                            serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() ||
+                            !isCurrent() || activeRedundantTransactionForCurrentWork(
+                                recoveryStore.read(), transaction.startOperationId,
+                            ) != transaction || redundantVpnOwnerSlot.snapshot() != null
+                        ) return@execute
+                        val (coordinator, _) = createRedundantCoordinator(
+                            transaction, transport.virtualAddressV4,
+                            PhysicalNetworks(applicationContext).snapshotState(),
+                        )
+                        if (isCurrent()) coordinator.startPrepared(transaction, prepared)
+                    } catch (error: Throwable) {
+                        TunnelLog.warning("redundant.prepared_start_failed", error = error)
+                    } finally {
+                        prepared.configurations.values.forEach { it.fill(0) }
+                    }
+                }
+            } catch (error: Throwable) {
+                prepared.configurations.values.forEach { it.fill(0) }
+                throw error
+            }
+        }
+
         override fun stop(): Boolean = boundary.stop()
 
         override fun isRunning(): Boolean = boundary.isRunning()
@@ -4589,6 +4634,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                         pendingLogout = false,
                         durableConnectionWork = connectionIntentLifecycle
                             .hasPendingConnectionWork(),
+                        pendingConnectionStart = connectionIntentDispatch.hasPendingWork(),
                     )
                 }
             },
@@ -4967,6 +5013,40 @@ internal class AndroidConnectionIntentDispatchState {
     private val gate = Any()
     private var epoch = 0L
     private var pendingStart = false
+    private var pendingMutations = 0
+
+    fun hasPendingWork(): Boolean = synchronized(gate) { pendingStart || pendingMutations > 0 }
+
+    fun dispatchStartMutation(
+        executor: Executor,
+        ticket: AndroidConnectionIntentDispatchTicket,
+        onComplete: () -> Unit,
+        mutation: () -> Unit,
+    ) {
+        synchronized(gate) { pendingMutations++ }
+        val finished = AtomicBoolean(false)
+        val finish = {
+            if (finished.compareAndSet(false, true)) {
+                synchronized(gate) {
+                    complete(ticket)
+                    pendingMutations--
+                }
+                onComplete()
+            }
+        }
+        try {
+            executor.execute {
+                try {
+                    mutation()
+                } finally {
+                    finish()
+                }
+            }
+        } catch (error: Throwable) {
+            finish()
+            throw error
+        }
+    }
 
     fun start(expectedGeneration: Long): AndroidConnectionIntentDispatchTicket =
         synchronized(gate) {
@@ -5477,6 +5557,11 @@ internal interface AndroidConnectionIntentRuntime {
         operationId: String,
         isCurrent: () -> Boolean,
     ): Boolean
+    fun startRedundant(
+        result: BackgroundStartResult,
+        transaction: AndroidRedundantTransaction,
+        isCurrent: () -> Boolean,
+    ) {}
     fun stop(): Boolean
     fun isRunning(): Boolean
 }
@@ -5831,8 +5916,9 @@ internal fun shouldStopVpnService(
     desiredActive: Boolean,
     pendingLogout: Boolean,
     durableConnectionWork: Boolean,
+    pendingConnectionStart: Boolean = false,
 ): Boolean = state != SessionState.RUNNING && !desiredActive && !pendingLogout &&
-    !durableConnectionWork
+    !durableConnectionWork && !pendingConnectionStart
 
 internal fun routeDestroyedServiceIdle(
     serviceDestroyed: Boolean,
@@ -6696,10 +6782,12 @@ internal class AndroidConnectionIntentCoordinator(
             val redundant = result.redundantTransaction
                 ?: throw BackgroundConnectionException("invalid_background_response")
             store.promotePendingRedundant(transaction, redundant).coordinatorEnvelopeOrThrow()
-            // The service resumes the durable v2 owner, never the single-lease runtime.
+            runtime.startRedundant(result, redundant) { stillDesired() && canStart() }
+            // Without this in-memory response (e.g. after process death), the
+            // service resumes the same durable v2 owner by exact replay.
             return AndroidCoordinatorStep.BUSY
         } finally {
-            result.configuration.fill(0)
+            result.clearSensitiveConfigurations()
         }
     }
 

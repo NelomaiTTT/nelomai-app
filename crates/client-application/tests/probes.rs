@@ -47,6 +47,7 @@ impl CoreApi for ProbeApi {
             request_id: "start-request".to_string(),
             connection: Connection {
                 lease_id: "lease-1".to_string(),
+                session_id: None,
                 pool_id: None,
                 layer: request.layer,
                 transport_protocol: Default::default(),

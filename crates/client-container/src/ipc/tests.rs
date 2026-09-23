@@ -1646,6 +1646,89 @@ async fn background_action_stays_owner_side_and_stale_action_never_dispatches() 
     server.abort();
 }
 
+struct HangFirstProvision {
+    calls: AtomicUsize,
+    first_expiry: Mutex<Option<u64>>,
+}
+#[async_trait::async_trait]
+impl PrivateBackgroundDispatcher for HangFirstProvision {
+    async fn prepare_revocation(&self, _: u64) -> Result<(), crate::BrokerError> {
+        Ok(())
+    }
+    async fn dispatch(
+        &self,
+        request: crate::NativeAuthRequest,
+        action: BackgroundAction,
+    ) -> Result<Option<nelomai_client_api::TokenResponse>, crate::NativeAuthFailure> {
+        assert!(matches!(action, BackgroundAction::Provision));
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            *self.first_expiry.lock().unwrap() = Some(request.expires_at_unix_ms);
+            std::future::pending().await
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[tokio::test]
+async fn stalled_provision_preserves_ipc_auth_and_allows_retry() {
+    let native = Arc::new(HangFirstProvision {
+        calls: AtomicUsize::new(0),
+        first_expiry: Mutex::new(None),
+    });
+    let fixture = Fixture::with_background(
+        ClientApi::new("http://127.0.0.1:9").unwrap(),
+        true,
+        Some(native.clone()),
+    );
+    let mut initial = fixture.auth.load().unwrap().unwrap();
+    initial.broker.as_mut().unwrap().confirmed_device_id = Some("device".into());
+    fixture.auth.save(&initial).unwrap();
+    fixture
+        .parent
+        .admit_empty_current(&fixture.broker)
+        .await
+        .unwrap();
+    let original = fixture.client.access(None).await.unwrap();
+    let response = fixture.client.background(BackgroundAction::Provision).await;
+    assert!(
+        matches!(response, Err(PrivateError::RecoveryRequired)),
+        "{response:?}"
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    assert!(
+        u128::from(native.first_expiry.lock().unwrap().unwrap()) <= now_ms,
+        "late native writes must already be fenced when the owner returns"
+    );
+    assert!(fixture
+        .auth
+        .load()
+        .unwrap()
+        .unwrap()
+        .broker
+        .unwrap()
+        .pending_recovery
+        .is_none());
+    fixture.child.check(&transport::scope(&original)).unwrap();
+    assert_eq!(
+        fixture.client.access(None).await.unwrap().access_token(),
+        original.access_token()
+    );
+    fixture
+        .client
+        .background(BackgroundAction::Provision)
+        .await
+        .unwrap();
+    assert_eq!(native.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fixture.auth.load().unwrap().unwrap().refresh_token,
+        initial.refresh_token
+    );
+}
+
 async fn logout_panel() -> (ClientApi, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let incoming = calls.clone();

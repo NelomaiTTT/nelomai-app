@@ -73,6 +73,14 @@ class RedundantStartProtocolTest {
         val cancel = shadowOf(context).nextStartedService
         assertEquals(NelomaiVpnService.ACTION_CANCEL_CLIENT_START, cancel.action)
         assertEquals(operation, cancel.getStringExtra(EXTRA_CLIENT_OPERATION_ID))
+        assertEquals(listOf("tunnel_start_timeout"), errors)
+    }
+
+    @Test fun unresponsiveStatusStillReportsServiceTimeoutNotConnectionTimeout() {
+        val context = RuntimeEnvironment.getApplication()
+        val errors = mutableListOf<String>()
+        TunnelServiceClient.status(context, TUNNEL_API_VERSION, { _, _ -> }, { errors += it })
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(30))
         assertEquals(listOf("tunnel_service_timeout"), errors)
     }
 }

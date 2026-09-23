@@ -1455,6 +1455,7 @@ mod tests {
     fn connection(lease_id: &str) -> Connection {
         Connection {
             lease_id: lease_id.to_string(),
+            session_id: None,
             pool_id: Some("pool".to_string()),
             layer: Layer::Stray,
             transport_protocol: Default::default(),

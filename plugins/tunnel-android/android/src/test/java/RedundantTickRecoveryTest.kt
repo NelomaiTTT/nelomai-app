@@ -37,7 +37,8 @@ class RedundantTickRecoveryTest {
         }
         override fun stop(): Boolean { slots.clear(); return true }
         override fun isUsable(leaseId: String) = leaseId in slots.values
-        override fun healthObservations(): List<SlotObservation> {
+        override fun healthObservations(initialReadiness: Boolean,
+            committedStandbyLeaseId: String?, freshStart: Boolean): List<SlotObservation> {
             if (healthReadFails) throw IllegalStateException("metrics_unavailable")
             reads++
             return slots.keys.map { slot ->
@@ -130,7 +131,7 @@ class RedundantTickRecoveryTest {
         var now = 1_000_000L
         var totalLoss = 0
         val store = AndroidRecoveryStore(Record(), BootIdentityProvider { 1 })
-        val coordinator = RedundantConnectionCoordinator(store, panel, native,
+        val coordinator = testRedundantCoordinator(store, panel, native,
             epochNowMs={ now }, monotonicMs={ now }, onAllSlotsStalled={ totalLoss++ })
     }
     private fun start(f: Fixture, standby: Boolean = true) {
@@ -148,6 +149,15 @@ class RedundantTickRecoveryTest {
         val f = Fixture(); start(f, false)
         repeat(121) { f.now+=1000; f.coordinator.tick() }
         assertTrue("No acquire for initially degraded session after 121 ticks", f.panel.acquires>0)
+    }
+    @Test fun emptyStandbyStartsOnFirstHealthyTickWithoutReplacementDelay() {
+        val f = Fixture(); start(f, false)
+        f.now += 1_000
+        assertTrue(f.coordinator.tick())
+        assertTrue(f.coordinator.isRunning())
+        assertEquals(listOf("lease-a", "candidate"), f.native.started)
+        assertEquals("candidate", f.coordinator.status()?.candidateLeaseId)
+        assertEquals(listOf("lease-a"), f.native.activated)
     }
     @Test fun acknowledgedReleaseDoesNotRepeatEveryTick() {
         val f = Fixture(); start(f)
@@ -194,7 +204,7 @@ class RedundantTickRecoveryTest {
     @Test fun acknowledgedReleaseStaysCompleteAfterCoordinatorReconstruction() {
         val f = Fixture(); start(f)
         assertTrue(f.coordinator.releaseStandby())
-        val reconstructed = RedundantConnectionCoordinator(f.store, f.panel, f.native)
+        val reconstructed = testRedundantCoordinator(f.store, f.panel, f.native)
         repeat(20) { assertTrue(reconstructed.tick()) }
         assertEquals(1, f.panel.releases)
     }
@@ -202,7 +212,7 @@ class RedundantTickRecoveryTest {
         val f = Fixture(); start(f, false); f.panel.releaseFails=true
         assertFalse(f.coordinator.releaseStandby())
         f.panel.releaseFails=false
-        val reconstructed = RedundantConnectionCoordinator(f.store, f.panel, f.native)
+        val reconstructed = testRedundantCoordinator(f.store, f.panel, f.native)
         repeat(20) { assertTrue(reconstructed.tick()) }
         assertEquals(2, f.panel.releases)
         assertFalse(requireNotNull(reconstructed.status()).standbyDesired)
@@ -292,9 +302,8 @@ class RedundantTickRecoveryTest {
         val f = Fixture(); start(f, false)
         f.panel.acquireError = BackgroundConnectionException("standby_unavailable", "15")
         f.coordinator.tick()
-        repeat(60) { f.now += 1000; f.coordinator.tick() }
         assertEquals(1, f.panel.acquires)
-        val reconstructed = RedundantConnectionCoordinator(f.store, f.panel, f.native,
+        val reconstructed = testRedundantCoordinator(f.store, f.panel, f.native,
             epochNowMs = { f.now }, monotonicMs = { f.now })
         repeat(14) { f.now += 1000; reconstructed.tick() }
         assertEquals(1, f.panel.acquires)
@@ -310,7 +319,6 @@ class RedundantTickRecoveryTest {
         val f = Fixture(); start(f, false)
         f.panel.acquireError = BackgroundConnectionException("standby_unavailable", "invalid")
         f.coordinator.tick()
-        repeat(60) { f.now += 1000; f.coordinator.tick() }
         repeat(299) { f.now += 1000; f.coordinator.tick() }
         assertEquals(1, f.panel.acquires)
         f.now += 1000
@@ -333,7 +341,7 @@ class RedundantTickRecoveryTest {
         val f = Fixture(); start(f)
         assertTrue(f.coordinator.acquireAndCommitStandby("replace", "lease-b"))
         f.panel.acquireError = BackgroundConnectionException("connection_retryable", "15")
-        val reconstructed = RedundantConnectionCoordinator(f.store, f.panel, f.native,
+        val reconstructed = testRedundantCoordinator(f.store, f.panel, f.native,
             epochNowMs = { f.now }, monotonicMs = { f.now })
         assertFalse(reconstructed.tick())
         repeat(14) { f.now += 1000; reconstructed.tick() }
@@ -368,7 +376,7 @@ class RedundantTickRecoveryTest {
     @Test fun expiredPersistedCandidateIsRemovedBeforeAcquiringItsReplacement() {
         val f = Fixture(); start(f, false)
         assertTrue(f.coordinator.acquireAndCommitStandby("expired"))
-        val reconstructed = RedundantConnectionCoordinator(f.store, f.panel, f.native,
+        val reconstructed = testRedundantCoordinator(f.store, f.panel, f.native,
             epochNowMs = { f.now }, monotonicMs = { f.now })
         f.panel.acquireError = BackgroundConnectionException("operation_id_conflict")
         reconstructed.tick()
@@ -400,7 +408,7 @@ class RedundantTickRecoveryTest {
         val f = Fixture(); start(f, false)
         assertTrue(f.coordinator.acquireAndCommitStandby("committed"))
         f.panel.roleSession = f.panel.commitCandidate(requireNotNull(f.coordinator.status()), "candidate")
-        val reconstructed = RedundantConnectionCoordinator(f.store, f.panel, f.native,
+        val reconstructed = testRedundantCoordinator(f.store, f.panel, f.native,
             epochNowMs = { f.now }, monotonicMs = { f.now })
         reconstructed.tick()
         assertFalse(requireNotNull(reconstructed.status()).retry.acquirePending)
@@ -412,7 +420,7 @@ class RedundantTickRecoveryTest {
     @Test fun failedExpiredCandidateStopPreservesItsDurableIdentity() {
         val f = Fixture(); start(f, false)
         assertTrue(f.coordinator.acquireAndCommitStandby("expired"))
-        val reconstructed = RedundantConnectionCoordinator(f.store, f.panel, f.native,
+        val reconstructed = testRedundantCoordinator(f.store, f.panel, f.native,
             epochNowMs = { f.now }, monotonicMs = { f.now })
         f.native.stopSlotFails = true
         f.panel.acquireError = BackgroundConnectionException("operation_id_conflict")

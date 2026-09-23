@@ -958,8 +958,8 @@ fn prepare_windows_tunnel_configuration(
     options: &DesktopTunnelOptions,
     transport: TunnelTransport,
 ) -> Zeroizing<String> {
-    let address_split_active = options.policy_hash.is_some()
-        && (options.exclude_local_networks || !options.excluded_ipv4_cidrs.is_empty());
+    let address_split_active = options.exclude_local_networks
+        || (options.policy_hash.is_some() && !options.excluded_ipv4_cidrs.is_empty());
     if !address_split_active && transport != TunnelTransport::AmneziaWg3 {
         return Zeroizing::new(configuration.to_string());
     }

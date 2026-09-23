@@ -270,6 +270,7 @@ internal object TunnelServiceClient {
                 },
                 onError,
                 foreground = true,
+                timeoutError = "tunnel_start_timeout",
                 onTimeout = { cancelClientStart(context, clientOperationId) },
             )
         } finally {
@@ -570,6 +571,7 @@ internal object TunnelServiceClient {
         onError: (String) -> Unit,
         foreground: Boolean = false,
         timeoutMillis: Long = SERVICE_REQUEST_TIMEOUT_MILLIS,
+        timeoutError: String = SERVICE_REQUEST_TIMEOUT_ERROR,
         onTimeout: () -> Unit = {},
     ) {
         val completion = ServiceRequestCompletion()
@@ -586,7 +588,7 @@ internal object TunnelServiceClient {
                 try {
                     onTimeout()
                 } finally {
-                    onError(SERVICE_REQUEST_TIMEOUT_ERROR)
+                    onError(timeoutError)
                 }
             }
         }

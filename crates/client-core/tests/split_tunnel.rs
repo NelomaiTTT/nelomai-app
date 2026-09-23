@@ -2218,6 +2218,7 @@ async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy(
         fixture.split_store.save(&split_state).unwrap();
         let running = Connection {
             lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            session_id: None,
             pool_id: None,
             layer: Layer::Tic,
             transport_protocol: Default::default(),
@@ -2294,6 +2295,200 @@ async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy(
             Some(changed.policy_hash.as_str())
         );
     }
+}
+
+#[tokio::test]
+async fn windows_without_policy_keeps_lan_and_defers_late_policy_until_next_start() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Windows, None, true, false));
+    fixture.api.policy_online.store(false, Ordering::SeqCst);
+    let options = ConnectOptions::windows_default();
+    fixture.core.start(options.clone(), 1_000).await.unwrap();
+    let started = fixture.tunnel.options.lock().unwrap()[0].clone();
+    assert!(started.exclude_local_networks);
+    assert!(started.excluded_ipv4_cidrs.is_empty());
+    assert!(started.policy_hash.is_none());
+    assert_eq!(fixture.api.policy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_local_only")
+    );
+
+    fixture.api.policy_online.store(true, Ordering::SeqCst);
+    for now in [1_001, 1_301] {
+        assert_eq!(
+            fixture
+                .core
+                .synchronize_split_tunnel(now, false)
+                .await
+                .unwrap(),
+            SplitTunnelSyncOutcome::Updated { reconnected: false }
+        );
+        assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+        assert_eq!(
+            fixture.core.split_tunnel_warning().await.as_deref(),
+            Some("split_tunnel_policy_deferred")
+        );
+        assert!(fixture
+            .split_store
+            .load()
+            .unwrap()
+            .working_policy_hash
+            .is_none());
+        assert!(fixture.api.apply_results.lock().unwrap().is_empty());
+    }
+    assert!(fixture.split_store.load().unwrap().cached_policy.is_some());
+    fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+    fixture.core.stop().await.unwrap();
+    assert_eq!(fixture.core.split_tunnel_warning().await, None);
+    fixture.core.start(options, 1_302).await.unwrap();
+    let restarted = fixture.tunnel.options.lock().unwrap()[1].clone();
+    assert!(restarted.exclude_local_networks);
+    assert!(restarted.policy_hash.is_some());
+    assert!(!restarted.excluded_ipv4_cidrs.is_empty());
+    assert_eq!(fixture.core.split_tunnel_warning().await, None);
+}
+
+#[tokio::test]
+async fn windows_deferred_warning_survives_runtime_status_failure_and_recovery() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Windows, None, true, false));
+    fixture
+        .core
+        .start(ConnectOptions::windows_default(), 1_000)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .synchronize_split_tunnel(1_001, false)
+        .await
+        .unwrap();
+
+    fixture
+        .tunnel
+        .fail_next_status
+        .store(true, Ordering::SeqCst);
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("tunnel_status_unavailable")
+    );
+    assert_eq!(fixture.core.state().await.phase, Phase::Connected);
+    assert_eq!(
+        fixture.core.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_policy_deferred")
+    );
+    fixture.core.stop_locally().await.unwrap();
+    assert_eq!(fixture.core.split_tunnel_warning().await, None);
+}
+
+#[tokio::test]
+async fn windows_failed_start_does_not_claim_fallback_vpn_is_running() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Windows, None, true, false));
+    fixture.tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    assert!(fixture
+        .core
+        .start(ConnectOptions::windows_default(), 1_000)
+        .await
+        .is_err());
+    assert_eq!(
+        *fixture.tunnel.status.lock().unwrap(),
+        TunnelStatus::Stopped
+    );
+    assert_eq!(fixture.core.split_tunnel_warning().await, None);
+}
+
+#[tokio::test]
+async fn windows_cached_policy_starts_without_fetch_and_matching_late_routes_need_no_restart() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Windows, None, true, false));
+    let mut local_only = policy(SplitTunnelMode::ExcludeSelected);
+    local_only.excluded_ipv4_cidrs.clear();
+    fixture.api.set_policy(local_only);
+    fixture
+        .core
+        .start(ConnectOptions::windows_default(), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .core
+            .synchronize_split_tunnel(1_001, false)
+            .await
+            .unwrap(),
+        SplitTunnelSyncOutcome::Updated { reconnected: false }
+    );
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert!(fixture
+        .split_store
+        .load()
+        .unwrap()
+        .working_policy_hash
+        .is_some());
+    assert_eq!(fixture.core.split_tunnel_warning().await, None);
+
+    fixture.api.stop_succeeds.store(true, Ordering::SeqCst);
+    fixture.core.stop().await.unwrap();
+    fixture.api.policy_online.store(false, Ordering::SeqCst);
+    let fetches = fixture.api.policy_calls.load(Ordering::SeqCst);
+    fixture
+        .core
+        .start(ConnectOptions::windows_default(), 1_002)
+        .await
+        .unwrap();
+    assert_eq!(fixture.api.policy_calls.load(Ordering::SeqCst), fetches);
+    assert!(fixture.tunnel.options.lock().unwrap()[1]
+        .policy_hash
+        .is_some());
+}
+
+#[tokio::test]
+async fn windows_bootstrap_does_not_treat_downloaded_policy_as_already_applied() {
+    let fixture = coordinator_fixture(capabilities(TunnelPlatform::Windows, None, true, false));
+    fixture
+        .core
+        .start(ConnectOptions::windows_default(), 1_000)
+        .await
+        .unwrap();
+    fixture
+        .core
+        .synchronize_split_tunnel(1_001, false)
+        .await
+        .unwrap();
+    fixture
+        .api
+        .set_bootstrap_connection(fixture.core.state().await.connection.unwrap());
+    let restored = support::core_with_split(
+        fixture.api.clone(),
+        fixture.secret_store.clone(),
+        fixture.split_store.clone(),
+        fixture.tunnel.clone(),
+        fixture.logger.clone(),
+    );
+    restored.bootstrap(1_002).await.unwrap();
+    assert_eq!(restored.state().await.phase, Phase::Connected);
+    assert_eq!(
+        restored.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_local_only")
+    );
+    restored
+        .synchronize_split_tunnel(1_301, false)
+        .await
+        .unwrap();
+    assert_eq!(fixture.tunnel.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.tunnel.stops.load(Ordering::SeqCst), 0);
+    assert!(fixture
+        .split_store
+        .load()
+        .unwrap()
+        .working_policy_hash
+        .is_none());
+    assert_eq!(restored.state().await.phase, Phase::Connected);
+    assert_eq!(
+        restored.split_tunnel_warning().await.as_deref(),
+        Some("split_tunnel_policy_deferred")
+    );
 }
 
 struct CoordinatorFixture {
@@ -2451,6 +2646,7 @@ struct CoordinatorTunnel {
     keep_running_on_stop_failure: AtomicBool,
     options: Mutex<Vec<TunnelOptions>>,
     status: Mutex<TunnelStatus>,
+    fail_next_status: AtomicBool,
     fingerprints: Mutex<VecDeque<String>>,
     fingerprint_calls: AtomicUsize,
     fail_next_fingerprint: AtomicBool,
@@ -2517,6 +2713,9 @@ impl TunnelController for CoordinatorTunnel {
     }
 
     async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        if self.fail_next_status.swap(false, Ordering::SeqCst) {
+            return Err(TunnelError::Backend("test_status_failed".to_string()));
+        }
         Ok(*self.status.lock().unwrap())
     }
 
@@ -2677,6 +2876,7 @@ impl CoreApi for CoordinatorApi {
             request_id: "start".to_string(),
             connection: Connection {
                 lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                session_id: None,
                 pool_id: None,
                 layer: request.layer,
                 transport_protocol: Default::default(),
@@ -2716,6 +2916,7 @@ impl CoreApi for CoordinatorApi {
             request_id: "stop".to_string(),
             connection: Connection {
                 lease_id: request.lease_id.clone(),
+                session_id: None,
                 pool_id: None,
                 layer: Layer::Tic,
                 transport_protocol: Default::default(),

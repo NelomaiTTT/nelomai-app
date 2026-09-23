@@ -325,6 +325,9 @@ pub struct ServerSelectionResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Connection {
     pub lease_id: String,
+    /// Present while the lease still requires whole-session Stop/cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub pool_id: Option<String>,
     pub layer: Layer,

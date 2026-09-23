@@ -50,6 +50,20 @@ const applications: InstalledApplication[] = [
 ];
 
 describe("split-tunnel application model", () => {
+  it("warns that fallback VPN has LAN access but no custom exclusions", () => {
+    const message = splitTunnelWarningMessage("split_tunnel_local_only");
+    expect(message).toContain("локальная сеть доступна напрямую");
+    expect(message).toContain("пользовательские исключения временно не применяются");
+    expect(message).not.toContain("Используем сохранённые настройки");
+  });
+
+  it("explains that downloaded exclusions wait for the next connection", () => {
+    const message = splitTunnelWarningMessage("split_tunnel_policy_deferred");
+    expect(message).toContain("применятся при следующем подключении");
+    expect(message).toContain("без пользовательских исключений");
+    expect(message).not.toContain("Панель временно недоступна");
+  });
+
   it("provides a user-facing message for runtime network failures", () => {
     expect(
       splitTunnelWarningMessage("split_tunnel_network_reconnect_failed"),

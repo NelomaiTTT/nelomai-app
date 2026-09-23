@@ -2135,7 +2135,7 @@ where
                 )
                 .await?,
             ),
-            None => None,
+            None => Some(self.fallback_tunnel_options().await?),
         };
         self.ensure_start_not_cancelled(cancel_epoch)?;
         let access_token = self.access_snapshot().await?;
@@ -2272,7 +2272,7 @@ where
             )
             .await;
         operation_id.clone_from(&request.operation_id);
-        let response = match start_result {
+        let mut response = match start_result {
             Ok(response) => response,
             Err(error) => {
                 if !start_error_preserves_operation(&error) {
@@ -2291,6 +2291,14 @@ where
                 return Err(error);
             }
         };
+        // Older panels deliver session scope only in the Start redundancy block.
+        // Retain it in the in-memory connection for every subsequent Stop path.
+        if response.connection.session_id.is_none() {
+            response.connection.session_id = response
+                .redundancy
+                .as_ref()
+                .map(|redundancy| redundancy.session_id.clone());
+        }
         let redundant_session_id = response
             .redundancy
             .as_ref()
@@ -2378,14 +2386,7 @@ where
                     return Err(compensation_error.unwrap_or(error));
                 }
             },
-            None => {
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Sync,
-                    "split_tunnel_policy_unavailable",
-                )
-                .await;
-                TunnelOptions::default()
-            }
+            None => preflight_tunnel_options.unwrap_or_default(),
         };
         let tunnel_options = self.with_dns_servers(tunnel_options);
         if split_policy.is_some() {
@@ -2590,7 +2591,14 @@ where
                     .await;
             }
         } else {
-            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+            if tunnel_options.exclude_local_networks && tunnel_options.policy_hash.is_none() {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_local_only",
+                )
+                .await;
+            }
+            *self.split_tunnel_options.lock().await = tunnel_options;
             self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record_timed(
@@ -2646,7 +2654,8 @@ where
         let intent_guard = self.intent_recovery_gate.lock().await;
         let split_guard = self.split_tunnel_gate.lock().await;
         let connection_guard = self.connection_gate.lock().await;
-        let current = self.state.lock().await.connection.clone();
+        let current_state = self.state.lock().await.clone();
+        let current = current_state.connection.clone();
         let stored = self.load_runtime();
         // Unknown starts and stalled recovery retain their existing reconciliation path.
         let Some(current) = current.filter(|_| {
@@ -2666,9 +2675,18 @@ where
                         return Err(CoreError::Storage);
                     }
                     Ok(())
-                } else if !compensation_stop_confirms_finished(None, true, current.status) {
-                    self.pending_compensation_stop_identity(&current.lease_id, true, None, None)
-                        .map(|_| ())
+                } else if current.session_id.is_some()
+                    || (current.status == LeaseStatus::Warm
+                        && matches!(current_state.phase, Phase::Connected | Phase::Stopping))
+                    || !compensation_stop_confirms_finished(None, true, current.status)
+                {
+                    self.pending_compensation_stop_identity(
+                        &current.lease_id,
+                        true,
+                        None,
+                        current.session_id.as_deref(),
+                    )
+                    .map(|_| ())
                 } else {
                     Ok(())
                 }
@@ -2760,7 +2778,7 @@ where
                     &current.lease_id,
                     accept_warm,
                     None,
-                    None,
+                    current.session_id.as_deref(),
                 )?;
                 self.resume_pending_compensation_stop(pending).await?;
                 return self
@@ -2960,10 +2978,11 @@ where
         pending: StoredPendingCompensationStop,
     ) -> Result<(), CoreError> {
         let current = self.state.lock().await.connection.clone();
-        if current
-            .as_ref()
-            .is_some_and(|current| current.lease_id != pending.lease_id)
-        {
+        let session_id = pending_compensation_redundant_session(&pending)?;
+        if current.as_ref().is_some_and(|current| {
+            let same_session = session_id.is_some() && current.session_id.as_deref() == session_id;
+            (current.lease_id != pending.lease_id || current.session_id.is_some()) && !same_session
+        }) {
             return Err(CoreError::Storage);
         }
         let pending = self.migrate_legacy_pending_compensation_stop(pending, current.as_ref())?;
@@ -3324,11 +3343,17 @@ where
         if clear_recovery_episode {
             *self.active_recovery_episode.lock().await = None;
         }
-        let panel_connection_finished = compensation_stop_confirms_finished(
-            failure_code,
-            accept_warm_as_finished,
-            current.status,
-        );
+        // Older panels can replay Start with a stale Warm status after reactivating
+        // the peer. A live connection or a durable Stop intent still requires ACK.
+        let warm_requires_stop = current.status == LeaseStatus::Warm
+            && (matches!(current_state.phase, Phase::Connected | Phase::Stopping)
+                || operation_id.is_some());
+        let panel_connection_finished = !warm_requires_stop
+            && compensation_stop_confirms_finished(
+                failure_code,
+                accept_warm_as_finished,
+                current.status,
+            );
         self.set_phase(Phase::Stopping).await;
         let tunnel_status = self.tunnel.status().await.unwrap_or(TunnelStatus::Running);
         if tunnel_status != TunnelStatus::Stopped {
@@ -3357,6 +3382,9 @@ where
             .await;
         self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
             .await;
+        if current.session_id.is_some() {
+            return self.release_restored_session(&current).await;
+        }
         if panel_connection_finished {
             *self.state.lock().await = CoreState {
                 phase: Phase::Ready,
@@ -3436,8 +3464,12 @@ where
             return Ok(());
         };
         let accept_warm = stored_connection_accepts_warm(&current);
-        let pending =
-            self.pending_compensation_stop_identity(&current.lease_id, accept_warm, None, None)?;
+        let pending = self.pending_compensation_stop_identity(
+            &current.lease_id,
+            accept_warm,
+            None,
+            current.session_id.as_deref(),
+        )?;
         match self
             .stop_internal(None, true, Some(&pending.operation_id), pending.accept_warm)
             .await
@@ -3752,14 +3784,7 @@ where
                 self.effective_tunnel_options(policy, saved.layer, saved.route_mode, now_unix, true)
                     .await?
             }
-            None => {
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Sync,
-                    "split_tunnel_policy_unavailable",
-                )
-                .await;
-                TunnelOptions::default()
-            }
+            None => self.fallback_tunnel_options().await?,
         };
         let tunnel_options = self.with_dns_servers(tunnel_options);
         if split_policy.is_some() {
@@ -3770,6 +3795,7 @@ where
         let transport = configuration.transport();
         let connection = Connection {
             lease_id: saved.lease_id.clone(),
+            session_id: None,
             pool_id: saved.pool_id.clone(),
             layer: saved.layer,
             transport_protocol: match transport {
@@ -3847,6 +3873,7 @@ where
                         phase: Phase::Stopping,
                         connection: Some(Connection {
                             lease_id: saved.lease_id.clone(),
+                            session_id: None,
                             pool_id: saved.pool_id.clone(),
                             layer: saved.layer,
                             transport_protocol: match transport {
@@ -3953,7 +3980,14 @@ where
                     .await;
             }
         } else {
-            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+            if tunnel_options.exclude_local_networks && tunnel_options.policy_hash.is_none() {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_local_only",
+                )
+                .await;
+            }
+            *self.split_tunnel_options.lock().await = tunnel_options;
             self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record(CoreLogEvent {
@@ -4043,10 +4077,11 @@ where
             let state = self.state.lock().await;
             state.connection.clone().filter(|connection| {
                 state.phase != Phase::Connected
-                    && matches!(
-                        connection.status,
-                        LeaseStatus::Allocating | LeaseStatus::Issued | LeaseStatus::Connected
-                    )
+                    && (connection.session_id.is_some()
+                        || matches!(
+                            connection.status,
+                            LeaseStatus::Allocating | LeaseStatus::Issued | LeaseStatus::Connected
+                        ))
             })
         };
         let Some(connection) = stale else {
@@ -4065,6 +4100,10 @@ where
             self.tunnel.status().await?,
             TunnelStatus::Stopped | TunnelStatus::Failed
         ) {
+            return Ok(());
+        }
+        if connection.session_id.is_some() {
+            self.release_restored_session(&connection).await?;
             return Ok(());
         }
         let access_token = self.access_snapshot().await?;
@@ -4122,6 +4161,30 @@ where
             code: None,
         });
         Ok(())
+    }
+
+    // Called under connection_gate. Reuse the durable session Stop journal so
+    // a lost response or restart never falls back to releasing one member.
+    async fn release_restored_session(
+        &self,
+        connection: &Connection,
+    ) -> Result<Connection, CoreError> {
+        let pending = self.pending_compensation_stop_identity(
+            &connection.lease_id,
+            stored_connection_accepts_warm(connection),
+            None,
+            connection.session_id.as_deref(),
+        )?;
+        self.set_phase(Phase::Stopping).await;
+        let access = self.access_snapshot().await?;
+        let response = self.retry_compensation_stop(&access, &pending).await?;
+        require_compensation_stop_finished(None, pending.accept_warm, response.connection.status)?;
+        self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)?;
+        *self.state.lock().await = CoreState {
+            phase: Phase::Ready,
+            connection: Some(response.connection.clone()),
+        };
+        Ok(response.connection)
     }
 
     async fn set_phase(&self, phase: Phase) {
@@ -5057,7 +5120,16 @@ where
                 .stop_redundant_connection(&access_token, &request)
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if response.connection.lease_id != pending.lease_id {
+                        return Err(invalid_operation_reconcile_response());
+                    }
+                    // A released primary is not proof that the reserve is clean.
+                    if response.connection.session_id.is_some() {
+                        return Err(compensation_stop_not_terminal_error());
+                    }
+                    return Ok(response);
+                }
                 Err(CoreApiError::Unauthorized) if !refreshed => {
                     access_token = self.refresh_access_token(&access_token).await?;
                     refreshed = true;

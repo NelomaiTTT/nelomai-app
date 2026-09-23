@@ -194,6 +194,17 @@ internal class ServiceRedundantConnectionNative(
     private var probeSourceIpv4 = probeSourceIpv4
     private var standbyCheckStartedAtMs: Long? = null
     private var standbyCheckFirstProbeAtMs: Long? = null
+    private val transportDiagnostics = RedundantTransportDiagnostics()
+
+    private fun recordTransportLocked(phase: String) {
+        val nativeSession = session ?: return
+        transportDiagnostics.record(
+            phase,
+            runCatching { backend.metrics(nativeSession) }.getOrNull(),
+            elapsedNowMs(),
+            force = true,
+        )
+    }
 
     override fun start(
         leaseId: String,
@@ -220,6 +231,7 @@ internal class ServiceRedundantConnectionNative(
                     ?: return@synchronized false
             }
             existing?.let {
+                recordTransportLocked("before_slot_replace")
                 if (!backend.stopSlot(nativeSession, slot.index)) return@synchronized false
                 slots.remove(slot)
             }
@@ -235,6 +247,8 @@ internal class ServiceRedundantConnectionNative(
                 probeTarget,
                 elapsedNowMs(),
             )
+            transportDiagnostics.begin(elapsedNowMs())
+            recordTransportLocked("started")
             true
         } finally {
             configuration.fill(0)
@@ -261,6 +275,7 @@ internal class ServiceRedundantConnectionNative(
         val nativeSession = session ?: return@synchronized false
         val runtime = slots.values.singleOrNull { it.leaseId == leaseId }
             ?: return@synchronized true
+        recordTransportLocked("before_slot_stop")
         backend.stopSlot(nativeSession, runtime.slot.index).also { stopped ->
             if (stopped) slots.remove(runtime.slot)
         }
@@ -268,6 +283,7 @@ internal class ServiceRedundantConnectionNative(
 
     override fun stop(): Boolean = synchronized(gate) {
         val nativeSession = session ?: return@synchronized true
+        recordTransportLocked("before_stop")
         backend.close(nativeSession)
         slots.clear()
         session = null
@@ -298,7 +314,10 @@ internal class ServiceRedundantConnectionNative(
         val nativeSession = session ?: return@synchronized false
         val runtime = slots.values.singleOrNull { it.leaseId == leaseId }
             ?: return@synchronized false
+        recordTransportLocked("before_rebind")
         backend.rebind(nativeSession, runtime.slot.index).also { rebound ->
+            transportDiagnostics.begin(elapsedNowMs())
+            recordTransportLocked(if (rebound) "rebind_succeeded" else "rebind_failed")
             if (rebound) {
                 runtime.startedAtElapsedMs = elapsedNowMs()
                 runtime.consecutiveProbeSuccesses = 0
@@ -346,13 +365,18 @@ internal class ServiceRedundantConnectionNative(
         runCatching { backend.metrics(nativeSession) }.getOrNull()
     }
 
-    override fun healthObservations(): List<SlotObservation> = synchronized(gate) {
+    override fun healthObservations(
+        initialReadiness: Boolean,
+        committedStandbyLeaseId: String?,
+        freshStart: Boolean,
+    ): List<SlotObservation> = synchronized(gate) {
         val nativeSession = session ?: return@synchronized emptyList()
         val epochNow = epochNowMs()
         val elapsedNow = elapsedNowMs()
-        val metricsBySlot = parseHealthMetricsLocked(
-            runCatching { backend.metrics(nativeSession) }.getOrNull(),
-        ) ?: return@synchronized invalidHealthObservationsLocked()
+        val rawMetrics = runCatching { backend.metrics(nativeSession) }.getOrNull()
+        transportDiagnostics.record("sample", rawMetrics, elapsedNow)
+        val metricsBySlot = parseHealthMetricsLocked(rawMetrics)
+            ?: return@synchronized invalidHealthObservationsLocked()
         slots.values.forEach { it.invalidMetricsSnapshots = 0 }
         // Process the active slot first regardless of A/B ordering so the reserve
         // sees suspicion in the same tick, including after a previous failover.
@@ -369,7 +393,22 @@ internal class ServiceRedundantConnectionNative(
         // ordinary reserve probes running and allow a later loss its own episode.
         val activeSuspected = activeHardFailure ||
             (active?.probeFailed == true && active.urgentEvidence)
-        if (networkValidated && active != null && activeSuspected) {
+        // A new Start may fall back before its first handshake without outbound
+        // corroboration. It still needs a fresh reserve check after commit; a
+        // successful socket rebind is not proof that the primary now works.
+        val initialColdFallback = initialReadiness && freshStart &&
+            active?.probeFailed == true && activeMetrics != null &&
+            !handshakeFresh(activeMetrics, epochNow)
+        // Warmup and control-plane commit precede the short initial failover check.
+        // Once a committed member's check starts, never renew it on a failed probe.
+        val canStartStandbyCheck = !initialReadiness || slots.values.any {
+            it.slot != activeSlot && it.leaseId == committedStandbyLeaseId &&
+                (standbyCheckStartedAtMs != null ||
+                    slotReady(it, metricsBySlot.getValue(it.slot.index), epochNow, elapsedNow))
+        }
+        if (networkValidated && active != null &&
+            (activeSuspected || initialColdFallback) && canStartStandbyCheck
+        ) {
             if (standbyCheckStartedAtMs == null) {
                 standbyCheckStartedAtMs = elapsedNow
                 standbyCheckFirstProbeAtMs = saturatingAdd(
@@ -383,7 +422,8 @@ internal class ServiceRedundantConnectionNative(
         slots.values.filter { it.slot != activeSlot }.forEach { runtime ->
             val metrics = metricsBySlot.getValue(runtime.slot.index)
             advanceProbeLocked(nativeSession, runtime, elapsedNow,
-                metrics.txPackets, metrics.rxPackets, holdCompletedStandby = activeConfirmed)
+                metrics.txPackets, metrics.rxPackets,
+                holdCompletedStandby = activeConfirmed || initialColdFallback)
         }
         slots.values.sortedBy { it.slot.index }.map { runtime ->
             val nativeMetrics = requireNotNull(metricsBySlot[runtime.slot.index])
@@ -391,15 +431,10 @@ internal class ServiceRedundantConnectionNative(
             val rxPackets = nativeMetrics.rxPackets
             runtime.previousTxPackets = txPackets
             runtime.previousRxPackets = rxPackets
-            val latestHandshake = nativeMetrics.latestHandshakeUnixMs
-            val handshakeFresh = latestHandshake > 0L && epochNow >= latestHandshake &&
-                epochNow - latestHandshake <= HANDSHAKE_FRESH_MILLIS
+            val handshakeFresh = handshakeFresh(nativeMetrics, epochNow)
             val admitted = nativeMetrics.admitted
             val closed = nativeMetrics.closed
-            val ready = handshakeFresh &&
-                runtime.consecutiveProbeSuccesses >= READY_PROBE_SUCCESSES &&
-                elapsedNow >= runtime.startedAtElapsedMs &&
-                elapsedNow - runtime.startedAtElapsedMs >= READY_STABILITY_MILLIS
+            val ready = slotReady(runtime, nativeMetrics, epochNow, elapsedNow)
             SlotObservation(
                 index = runtime.slot.index,
                 active = runtime.slot == activeSlot,
@@ -417,10 +452,29 @@ internal class ServiceRedundantConnectionNative(
                 handshakeFresh = handshakeFresh,
                 consecutiveProbeSuccesses = runtime.consecutiveProbeSuccesses,
                 stableSinceMs = runtime.startedAtElapsedMs,
-                standbyProbeState = standbyProbeStateLocked(runtime, elapsedNow),
+                // Do not let a commit completed after this snapshot use pre-commit
+                // evidence. The next tick starts the confirmed member's fresh check.
+                standbyProbeState = if (initialReadiness && runtime.slot != activeSlot &&
+                    runtime.leaseId != committedStandbyLeaseId
+                ) StandbyProbeState.PENDING else standbyProbeStateLocked(runtime, elapsedNow),
             )
         }
     }
+
+    private fun handshakeFresh(metrics: NativeSlotHealthMetrics, epochNow: Long): Boolean =
+        metrics.latestHandshakeUnixMs > 0L && epochNow >= metrics.latestHandshakeUnixMs &&
+            epochNow - metrics.latestHandshakeUnixMs <= HANDSHAKE_FRESH_MILLIS
+
+    private fun slotReady(
+        runtime: SlotRuntime,
+        metrics: NativeSlotHealthMetrics,
+        epochNow: Long,
+        elapsedNow: Long,
+    ): Boolean = !runtime.hardFailure && metrics.admitted && !metrics.closed &&
+        handshakeFresh(metrics, epochNow) &&
+        runtime.consecutiveProbeSuccesses >= READY_PROBE_SUCCESSES &&
+        elapsedNow >= runtime.startedAtElapsedMs &&
+        elapsedNow - runtime.startedAtElapsedMs >= READY_STABILITY_MILLIS
 
     private fun parseHealthMetricsLocked(payload: String?): Map<Int, NativeSlotHealthMetrics>? {
         val root = payload?.let { runCatching { JSONObject(it) }.getOrNull() } ?: return null

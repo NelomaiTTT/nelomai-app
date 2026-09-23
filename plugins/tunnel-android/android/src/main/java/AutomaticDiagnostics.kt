@@ -275,7 +275,7 @@ internal fun automaticDiagnosticsConnectionIntentReasonClass(errorCode: String):
         "udp_rebind_failed",
         "udp_rebind_timeout",
         -> "local_service"
-        "tunnel_handshake_timeout", "tunnel_data_plane_stalled" -> "tunnel"
+        "tunnel_start_timeout", "tunnel_handshake_timeout", "tunnel_data_plane_stalled" -> "tunnel"
         "amneziawg_profile_mismatch",
         "awg3_profile_apply_failed",
         "awg3_profile_transform_mismatch",

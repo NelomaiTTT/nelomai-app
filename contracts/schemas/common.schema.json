@@ -58,6 +58,12 @@
       ],
       "properties": {
         "lease_id": { "$ref": "#/$defs/uuid" },
+        "session_id": {
+          "anyOf": [
+            { "$ref": "#/$defs/uuid" },
+            { "type": "null" }
+          ]
+        },
         "pool_id": {
           "anyOf": [
             { "$ref": "#/$defs/id" },

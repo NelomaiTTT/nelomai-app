@@ -1534,8 +1534,25 @@ where
                 self.effective_tunnel_options(&policy, layer, route_mode, now_unix, false)
                     .await
             }
-            None => Ok(self.with_dns_servers(TunnelOptions::default())),
+            None => self.fallback_tunnel_options().await,
         }
+    }
+
+    pub(crate) async fn fallback_tunnel_options(&self) -> Result<TunnelOptions, CoreError> {
+        let windows = self.tunnel.capabilities().await?.platform == TunnelPlatform::Windows;
+        // The Windows warning describes a running VPN. Publish it only after
+        // Start succeeds (or a running tunnel is restored), not during preflight.
+        if !windows {
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Sync,
+                "split_tunnel_policy_unavailable",
+            )
+            .await;
+        }
+        Ok(self.with_dns_servers(TunnelOptions {
+            exclude_local_networks: windows,
+            ..TunnelOptions::default()
+        }))
     }
 
     pub(crate) async fn record_started_split_tunnel_policy(
@@ -1763,6 +1780,19 @@ where
             return Ok(ConnectedPolicyApplyOutcome::AppliedWithoutReconnect);
         }
 
+        // A Windows connection started without policy is deliberately local-only.
+        // Cache the downloaded policy, but don't recreate a working VPN behind
+        // the user's back. The next explicit Start consumes the cache normally.
+        if previous_options.policy_hash.is_none() && previous_options.exclude_local_networks {
+            // Policy application is still pending even when runtime health is
+            // good. Ordinary status polling must not dismiss this warning.
+            self.set_split_tunnel_warning(
+                SplitTunnelWarningKind::Operation,
+                "split_tunnel_policy_deferred",
+            )
+            .await;
+            return Ok(ConnectedPolicyApplyOutcome::Unchanged);
+        }
         if self.tunnel.stop().await.is_err() {
             mark_policy_failure(state, policy, now_unix);
             let phase = match self.tunnel.status().await {
@@ -1948,19 +1978,20 @@ where
         let Ok(state) = self.split_tunnel_store.load() else {
             return;
         };
-        let Some(policy) = working_policy(&state) else {
-            return;
+        let options = match working_policy(&state) {
+            Some(policy) => {
+                self.effective_tunnel_options(
+                    policy,
+                    connection.layer,
+                    connection.route_mode,
+                    OffsetDateTime::now_utc().unix_timestamp(),
+                    false,
+                )
+                .await
+            }
+            None => self.fallback_tunnel_options().await,
         };
-        if let Ok(options) = self
-            .effective_tunnel_options(
-                policy,
-                connection.layer,
-                connection.route_mode,
-                OffsetDateTime::now_utc().unix_timestamp(),
-                false,
-            )
-            .await
-        {
+        if let Ok(options) = options {
             let current_state = self.state.lock().await;
             if self.ensure_start_not_cancelled(cancel_epoch).is_err()
                 || current_state.phase != crate::Phase::Connected
@@ -1974,6 +2005,13 @@ where
                     return;
                 }
                 *current = options.clone();
+            }
+            if options.policy_hash.is_none() && options.exclude_local_networks {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_local_only",
+                )
+                .await;
             }
             let mut detector = self.physical_network_change.lock().await;
             if self.ensure_start_not_cancelled(cancel_epoch).is_err() {

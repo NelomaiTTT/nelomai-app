@@ -236,6 +236,34 @@ AllowedIPs = 0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1\r
 }
 
 #[test]
+fn handler_keeps_lan_reachable_without_a_cached_policy() {
+    let options = nelomai_client_tunnel::TunnelOptions {
+        exclude_local_networks: true,
+        ..Default::default()
+    };
+    let desktop = DesktopTunnelOptions::from_tunnel_options(&options);
+    assert!(desktop.exclude_local_networks);
+    assert!(desktop.policy_hash.is_none());
+    assert!(desktop.validate().is_ok());
+    let mut handler = TunnelRequestHandler::new(RecordingBackend::default(), "1.2.3");
+    let response = handler.handle(Request::start_with_options(
+        "[Interface]\nPrivateKey = transient\n[Peer]\nAllowedIPs = 0.0.0.0/0, ::/0\n".to_string(),
+        desktop,
+    ));
+    assert!(response.ok);
+    assert!(
+        handler.backend().starts[0].contains("AllowedIPs = 0.0.0.0/1, 128.0.0.0/1, ::/1, 8000::/1")
+    );
+    assert!(DesktopTunnelOptions {
+        excluded_ipv4_cidrs: vec!["203.0.113.0/24".into()],
+        exclude_local_networks: true,
+        policy_hash: None,
+    }
+    .validate()
+    .is_err());
+}
+
+#[test]
 fn handler_preserves_full_range_allowed_ips_without_address_split() {
     let backend = RecordingBackend::default();
     let mut handler = TunnelRequestHandler::new(backend, "1.2.3");
