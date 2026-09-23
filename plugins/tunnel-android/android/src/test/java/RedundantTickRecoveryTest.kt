@@ -37,7 +37,8 @@ class RedundantTickRecoveryTest {
         }
         override fun stop(): Boolean { slots.clear(); return true }
         override fun isUsable(leaseId: String) = leaseId in slots.values
-        override fun healthObservations(): List<SlotObservation> {
+        override fun healthObservations(initialReadiness: Boolean,
+            committedStandbyLeaseId: String?, freshStart: Boolean): List<SlotObservation> {
             if (healthReadFails) throw IllegalStateException("metrics_unavailable")
             reads++
             return slots.keys.map { slot ->

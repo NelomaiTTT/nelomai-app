@@ -92,19 +92,22 @@ internal class RedundantHealthMonitor(
     fun health(nowMs: Long, observation: SlotObservation): BackendHealth =
         classify(nowMs, observation)
 
+    fun networkReady(nowMs: Long): Boolean =
+        networkValidated && nowMs >= suppressFailoverUntilMs
+
     fun ready(nowMs: Long, observation: SlotObservation): Boolean =
-        networkValidated && nowMs >= suppressFailoverUntilMs &&
+        networkReady(nowMs) &&
             classify(nowMs, observation) == BackendHealth.READY
 
     /** Initial primary needs proven traffic, not the reserve's stability window. */
     fun primaryReady(nowMs: Long, observation: SlotObservation): Boolean =
-        networkValidated && nowMs >= suppressFailoverUntilMs &&
+        networkReady(nowMs) &&
             !observation.hardFailure && observation.health != BackendHealth.UNHEALTHY &&
             !observation.probeFailed && observation.handshakeFresh &&
             observation.consecutiveProbeSuccesses >= 1
 
     fun failed(nowMs: Long, observation: SlotObservation): Boolean =
-        networkValidated && nowMs >= suppressFailoverUntilMs &&
+        networkReady(nowMs) &&
             (classify(nowMs, observation) == BackendHealth.UNHEALTHY ||
                 softFailureConfirmed(nowMs, observation))
 

@@ -20,7 +20,11 @@ internal interface RedundantConnectionNative {
     fun setNetworkValidated(validated: Boolean) = Unit
     fun setProbeSourceIpv4(sourceIpv4: String) = Unit
     fun rebind(leaseId: String): Boolean = false
-    fun healthObservations(): List<SlotObservation> = emptyList()
+    fun healthObservations(
+        initialReadiness: Boolean = false,
+        committedStandbyLeaseId: String? = null,
+        freshStart: Boolean = false,
+    ): List<SlotObservation> = emptyList()
     fun metrics(includeProbeTarget: Boolean): RedundantVpnMetrics? = null
     fun diagnosticMetrics(): String? = null
 }
@@ -108,9 +112,10 @@ private data class PendingPrimaryReadiness(
     val activeLeaseId: String,
     val activeIndex: Int,
     val deadlineElapsedMs: Long,
+    var rebindAtElapsedMs: Long,
+    var rebindAttempted: Boolean = false,
     val shouldCancel: () -> Boolean,
     val freshStart: Boolean,
-    val drainPendingWork: Boolean,
     val onReady: () -> Unit,
     val onFailed: () -> Unit,
     val onCancelled: () -> Unit,
@@ -389,7 +394,7 @@ internal class RedundantConnectionCoordinator(
     ): Boolean = synchronized(gate) {
         try {
             if (status() != expected) return@synchronized false
-            recoverUsing { response }
+            recoverUsing(fetch = { response }, freshStart = true)
         } finally {
             response.configurations.values.forEach { it.fill(0) }
         }
@@ -397,6 +402,7 @@ internal class RedundantConnectionCoordinator(
 
     private fun recoverUsing(
         fetch: (AndroidRedundantTransaction) -> RedundantRecoveryResponse,
+        freshStart: Boolean = false,
     ): Boolean = synchronized(gate) {
         if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
@@ -534,7 +540,7 @@ internal class RedundantConnectionCoordinator(
                     activeSlot = activeSlot,
                     healthProbe = response.healthProbes[active],
                     shouldCancel = { false },
-                    freshStart = false,
+                    freshStart = freshStart,
                     drainPendingWork = true,
                     onReady = { onRecoveryReadiness(true) },
                     onFailed = { onRecoveryReadiness(false) },
@@ -603,6 +609,8 @@ internal class RedundantConnectionCoordinator(
                 onReady,
             )
         }
+        // With live probes, publish readiness and release the owner gate first.
+        // Pending role/standby work is durable and resumes on the following tick.
         val startedAt = monotonicMs().coerceAtLeast(0L)
         pendingPrimaryReadiness = PendingPrimaryReadiness(
             activeLeaseId = activeLeaseId,
@@ -611,9 +619,9 @@ internal class RedundantConnectionCoordinator(
                 startedAt,
                 PRIMARY_READINESS_TIMEOUT_MILLIS,
             ),
+            rebindAtElapsedMs = saturatingAdd(startedAt, INITIAL_HANDSHAKE_REBIND_MILLIS),
             shouldCancel = shouldCancel,
             freshStart = freshStart,
-            drainPendingWork = drainPendingWork,
             onReady = onReady,
             onFailed = onFailed,
             onCancelled = onCancelled,
@@ -627,7 +635,7 @@ internal class RedundantConnectionCoordinator(
     ): Boolean {
         val pending = pendingPrimaryReadiness ?: return false
         if (pending.shouldCancel()) return cancelPrimaryReadinessLocked(pending)
-        val transaction = status() ?: return failPrimaryReadinessLocked(pending)
+        var transaction = status() ?: return failPrimaryReadinessLocked(pending)
         if (!transaction.desiredActive ||
             transaction.retry.stopState != RedundantStopState.NONE
         ) {
@@ -646,7 +654,7 @@ internal class RedundantConnectionCoordinator(
             pendingPrimaryReadiness = null
             return completePrimaryReadinessLocked(
                 switched,
-                pending.drainPendingWork,
+                drainPendingWork = false,
                 pending.onReady,
             )
         }
@@ -654,16 +662,6 @@ internal class RedundantConnectionCoordinator(
             return cancelPrimaryReadinessLocked(pending)
         }
         val observation = observations.singleOrNull { it.index == pending.activeIndex }
-        if (observation?.hardFailure == true ||
-            observation?.health == BackendHealth.UNHEALTHY ||
-            (observation != null && healthMonitor.failed(elapsedNow(), observation))
-        ) {
-            return advancePrimaryReadinessThroughStandbyLocked(
-                pending,
-                transaction,
-                observations,
-            )
-        }
         if (observation != null && healthMonitor.primaryReady(elapsedNow(), observation)) {
             val ready = transaction.copy(retry = transaction.retry.copy(
                 roleObservationPending = true,
@@ -674,19 +672,38 @@ internal class RedundantConnectionCoordinator(
             pendingPrimaryReadiness = null
             return completePrimaryReadinessLocked(
                 ready,
-                pending.drainPendingWork,
+                drainPendingWork = false,
                 pending.onReady,
             )
+        }
+        // The primary must not depend on reserve HTTP work. Reuse the existing
+        // async acquire/commit path while it is still waiting for its handshake.
+        if (elapsedNow() < pending.deadlineElapsedMs) {
+            advanceStartupStandbyLocked(transaction, observations)
+            transaction = status() ?: return failPrimaryReadinessLocked(pending)
+            if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE ||
+                transaction.localActiveLeaseId != pending.activeLeaseId
+            ) return cancelPrimaryReadinessLocked(pending)
+        }
+        val waitingForStrayHandshake = transaction.template.layer == "stray" &&
+            observation?.handshakeFresh == false && !observation.hardFailure &&
+            observation.health != BackendHealth.UNHEALTHY
+        val standbyIndex = 1 - pending.activeIndex
+        val readyStandby = transaction.standbyDesired && transaction.leaseIdAt(standbyIndex) != null &&
+            standbyReadyForStart(observations.singleOrNull { it.index == standbyIndex })
+        if (observation?.hardFailure == true ||
+            observation?.health == BackendHealth.UNHEALTHY ||
+            (observation != null && healthMonitor.failed(elapsedNow(), observation) &&
+                (!waitingForStrayHandshake || readyStandby))
+        ) {
+            return advancePrimaryReadinessThroughStandbyLocked(pending, transaction, observations)
         }
         // Before the first handshake, staged DNS packets cannot corroborate
         // every failed probe with outbound growth: handshake retries are slower
         // than probes. A fresh start can use an independently proven reserve;
         // this is not failure detection for an already established connection.
-        val standbyIndex = 1 - pending.activeIndex
         if (pending.freshStart && observation?.handshakeFresh == false &&
-            observation.probeFailed && transaction.standbyDesired &&
-            transaction.leaseIdAt(standbyIndex) != null &&
-            standbyReadyForStart(observations.singleOrNull { it.index == standbyIndex })
+            observation.probeFailed && readyStandby
         ) {
             return advancePrimaryReadinessThroughStandbyLocked(pending, transaction, observations)
         }
@@ -697,7 +714,40 @@ internal class RedundantConnectionCoordinator(
                 observations,
             )
         }
+        // Match the ordinary AWG first-handshake recovery: one new protected UDP
+        // socket, not a new lease or a longer startup deadline. DNS failure after
+        // an established handshake is not a reason to change the socket.
+        if (waitingForStrayHandshake &&
+            !pending.rebindAttempted && elapsedNow() >= pending.rebindAtElapsedMs &&
+            healthMonitor.networkReady(elapsedNow())
+        ) {
+            pending.rebindAttempted = true
+            mutateNative(transaction) { runCatching { native.rebind(pending.activeLeaseId) }.getOrDefault(false) }
+        }
         return true
+    }
+
+    private fun advanceStartupStandbyLocked(
+        transaction: AndroidRedundantTransaction,
+        observations: List<SlotObservation>,
+    ) {
+        if (!transaction.standbyDesired ||
+            (transaction.slotALeaseId != null && transaction.slotBLeaseId != null)
+        ) return
+        var current = transaction
+        if (!current.retry.acquirePending && current.candidateLeaseId == null &&
+            (current.slotALeaseId == null || current.slotBLeaseId == null)
+        ) {
+            val staged = scheduleReplacement(current, null)
+            if (!persistExactTransaction(current, staged)) return
+            current = staged
+        }
+        if (!current.retry.acquirePending) return
+        if (current.candidateLeaseId != null) {
+            advanceCandidateLocked(current, observations)
+        } else if (current.retry.nextRetryAtUnix?.let { currentUnixSeconds() < it } != true) {
+            acquireAndCommitStandby(requireNotNull(current.retry.acquireOperationId))
+        }
     }
 
     private fun advancePrimaryReadinessThroughStandbyLocked(
@@ -709,7 +759,9 @@ internal class RedundantConnectionCoordinator(
         val standbyLeaseId = listOfNotNull(
             transaction.slotALeaseId,
             transaction.slotBLeaseId,
-        ).firstOrNull { it != pending.activeLeaseId } ?: return failPrimaryReadinessLocked(pending)
+        ).firstOrNull { it != pending.activeLeaseId } ?: return if (
+            transaction.retry.acquirePending && elapsedNow() < pending.deadlineElapsedMs
+        ) true else failPrimaryReadinessLocked(pending)
         val standbyIndex = transaction.slotIndex(standbyLeaseId)
             ?: return failPrimaryReadinessLocked(pending)
         val standby = observations.singleOrNull { it.index == standbyIndex }
@@ -754,7 +806,7 @@ internal class RedundantConnectionCoordinator(
         pendingPrimaryReadiness = null
         return completePrimaryReadinessLocked(
             switched,
-            pending.drainPendingWork,
+            drainPendingWork = false,
             pending.onReady,
         )
     }
@@ -784,6 +836,7 @@ internal class RedundantConnectionCoordinator(
         pendingPrimaryReadiness = null
         recoveryStarted = false
         primaryReadinessFailed = true
+        standbyWorkEpoch++
         runCatching(native::stop)
         publishReserveStateLocked(null, emptyList())
         pending.onFailed()
@@ -794,7 +847,8 @@ internal class RedundantConnectionCoordinator(
         if (pendingPrimaryReadiness !== pending) return false
         pendingPrimaryReadiness = null
         recoveryStarted = false
-        primaryReadinessFailed = false
+        primaryReadinessFailed = true
+        standbyWorkEpoch++
         runCatching(native::stop)
         publishReserveStateLocked(null, emptyList())
         if (pending.freshStart) pending.onCancelled()
@@ -919,9 +973,16 @@ internal class RedundantConnectionCoordinator(
 
     override fun tick(): Boolean = synchronized(gate) {
         if (totalLossCommandEmitted) return@synchronized false
-        if (pendingPrimaryReadiness != null) {
+        val pending = pendingPrimaryReadiness
+        if (pending != null) {
+            val committedStandby = status()?.takeIf { it.standbyDesired }
+                ?.leaseIdAt(1 - pending.activeIndex)
             val observations = try {
-                native.healthObservations()
+                native.healthObservations(
+                    initialReadiness = true,
+                    committedStandbyLeaseId = committedStandby,
+                    freshStart = pending.freshStart,
+                )
             } catch (_: Throwable) {
                 emptyList()
             }
@@ -963,9 +1024,16 @@ internal class RedundantConnectionCoordinator(
             }
         ) return@synchronized false
         val results = mutableListOf<Boolean>()
-        for (leaseId in listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId).distinct()) {
-            results += mutateNative(transaction) {
+        val runningCandidate = transaction.candidateLeaseId?.takeIf { it == candidateWarmupLeaseId }
+        val members = listOfNotNull(transaction.slotALeaseId, transaction.slotBLeaseId)
+            .filterNot { runningCandidate != null && transaction.slot(it) == transaction.candidateSlot }
+        for (leaseId in (members + listOfNotNull(runningCandidate)).distinct()) {
+            val rebound = mutateNative(transaction) {
                 runCatching { native.rebind(leaseId) }.getOrDefault(false)
+            }
+            results += rebound
+            if (rebound) pendingPrimaryReadiness?.takeIf { it.activeLeaseId == leaseId }?.let {
+                it.rebindAtElapsedMs = saturatingAdd(elapsedNow(), INITIAL_HANDSHAKE_REBIND_MILLIS)
             }
         }
         results.all { it }
@@ -1025,7 +1093,7 @@ internal class RedundantConnectionCoordinator(
                     ?: return false
                 return@repeat
             }
-            val canonical = transaction.withCanonical(response.session)
+            val canonical = transaction.withRecoveredCanonical(response.session)
             if (response.action == "rebase") {
                 if (!persist(canonical)) return false
                 transaction = status() ?: return false
@@ -1610,9 +1678,8 @@ internal class RedundantConnectionCoordinator(
         failoverActive = true
         publishReserveStateLocked(committed, emptyList())
         onDiagnosticEvent(RedundantDiagnosticEvent.FAILOVER)
-        // The dataplane switch is authoritative. A panel outage leaves the durable
-        // observation pending and must not roll traffic back to the failed member.
-        flushRoleObservationLocked()
+        // The dataplane switch is authoritative. The regular tick sends this
+        // durable observation; role HTTP must not delay startup readiness.
         return true
     }
 
@@ -1776,6 +1843,7 @@ internal class RedundantConnectionCoordinator(
         const val REDUNDANT_ROLE_MEMBERSHIP_CONFLICT = "session_membership_conflict"
         const val MAX_PENDING_NATIVE_SWITCH_ATTEMPTS = 3
         const val PRIMARY_READINESS_TIMEOUT_MILLIS = 30_000L
+        const val INITIAL_HANDSHAKE_REBIND_MILLIS = 7_000L
         const val REPLACEMENT_DELAY_SECONDS = 60L
         val RECOVERY_RETRY_DELAYS_SECONDS = longArrayOf(2, 5, 15, 30, 60, 300)
         private val REDUNDANT_GENERATION_CONFLICT_CODES = setOf(
