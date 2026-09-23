@@ -2218,6 +2218,7 @@ async fn background_start_bootstrap_recovers_configuration_and_reapplies_policy(
         fixture.split_store.save(&split_state).unwrap();
         let running = Connection {
             lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            session_id: None,
             pool_id: None,
             layer: Layer::Tic,
             transport_protocol: Default::default(),
@@ -2677,6 +2678,7 @@ impl CoreApi for CoordinatorApi {
             request_id: "start".to_string(),
             connection: Connection {
                 lease_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                session_id: None,
                 pool_id: None,
                 layer: request.layer,
                 transport_protocol: Default::default(),
@@ -2716,6 +2718,7 @@ impl CoreApi for CoordinatorApi {
             request_id: "stop".to_string(),
             connection: Connection {
                 lease_id: request.lease_id.clone(),
+                session_id: None,
                 pool_id: None,
                 layer: Layer::Tic,
                 transport_protocol: Default::default(),
