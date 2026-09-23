@@ -60,6 +60,10 @@ export interface SplitTunnelSaveResult {
 
 export function splitTunnelWarningMessage(code: string): string {
   switch (code) {
+    case "split_tunnel_local_only":
+      return "VPN работает, локальная сеть доступна напрямую. Настройки split-tunnel пока недоступны: пользовательские исключения временно не применяются.";
+    case "split_tunnel_policy_deferred":
+      return "Настройки split-tunnel загружены и применятся при следующем подключении. Сейчас VPN работает с прямым доступом к локальной сети, без пользовательских исключений.";
     case "split_tunnel_apply_failed":
       return "Новые настройки не применились. Продолжаем использовать предыдущие.";
     case "split_tunnel_stop_failed":

@@ -517,6 +517,19 @@ async fn exercise_split_logout(held_start: usize, fail_forward: bool) {
         local,
         Arc::new(NoopLogger),
     ));
+    // Exercise a real policy replacement, not the no-cache fallback whose
+    // first downloaded policy is deliberately deferred until the next Start.
+    let mut initial_policy = changed_policy();
+    initial_policy.revision = 7;
+    initial_policy.policy_hash = format!("sha256:{}", "a".repeat(64));
+    initial_policy.excluded_ipv4_cidrs = vec!["198.51.100.0/24".into()];
+    owner
+        .split()
+        .save(&StoredSplitTunnelState {
+            cached_policy: Some(initial_policy),
+            ..Default::default()
+        })
+        .unwrap();
     application.start_saved_stray_offline(1000).await.unwrap();
     // Consume the notification from the initial start; all later waits are exact callbacks.
     tunnel.entered.notified().await;

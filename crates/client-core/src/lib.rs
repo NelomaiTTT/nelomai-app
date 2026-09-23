@@ -2135,7 +2135,7 @@ where
                 )
                 .await?,
             ),
-            None => None,
+            None => Some(self.fallback_tunnel_options().await?),
         };
         self.ensure_start_not_cancelled(cancel_epoch)?;
         let access_token = self.access_snapshot().await?;
@@ -2386,14 +2386,7 @@ where
                     return Err(compensation_error.unwrap_or(error));
                 }
             },
-            None => {
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Sync,
-                    "split_tunnel_policy_unavailable",
-                )
-                .await;
-                TunnelOptions::default()
-            }
+            None => preflight_tunnel_options.unwrap_or_default(),
         };
         let tunnel_options = self.with_dns_servers(tunnel_options);
         if split_policy.is_some() {
@@ -2598,7 +2591,14 @@ where
                     .await;
             }
         } else {
-            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+            if tunnel_options.exclude_local_networks && tunnel_options.policy_hash.is_none() {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_local_only",
+                )
+                .await;
+            }
+            *self.split_tunnel_options.lock().await = tunnel_options;
             self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record_timed(
@@ -2654,7 +2654,8 @@ where
         let intent_guard = self.intent_recovery_gate.lock().await;
         let split_guard = self.split_tunnel_gate.lock().await;
         let connection_guard = self.connection_gate.lock().await;
-        let current = self.state.lock().await.connection.clone();
+        let current_state = self.state.lock().await.clone();
+        let current = current_state.connection.clone();
         let stored = self.load_runtime();
         // Unknown starts and stalled recovery retain their existing reconciliation path.
         let Some(current) = current.filter(|_| {
@@ -2675,6 +2676,8 @@ where
                     }
                     Ok(())
                 } else if current.session_id.is_some()
+                    || (current.status == LeaseStatus::Warm
+                        && matches!(current_state.phase, Phase::Connected | Phase::Stopping))
                     || !compensation_stop_confirms_finished(None, true, current.status)
                 {
                     self.pending_compensation_stop_identity(
@@ -3340,11 +3343,17 @@ where
         if clear_recovery_episode {
             *self.active_recovery_episode.lock().await = None;
         }
-        let panel_connection_finished = compensation_stop_confirms_finished(
-            failure_code,
-            accept_warm_as_finished,
-            current.status,
-        );
+        // Older panels can replay Start with a stale Warm status after reactivating
+        // the peer. A live connection or a durable Stop intent still requires ACK.
+        let warm_requires_stop = current.status == LeaseStatus::Warm
+            && (matches!(current_state.phase, Phase::Connected | Phase::Stopping)
+                || operation_id.is_some());
+        let panel_connection_finished = !warm_requires_stop
+            && compensation_stop_confirms_finished(
+                failure_code,
+                accept_warm_as_finished,
+                current.status,
+            );
         self.set_phase(Phase::Stopping).await;
         let tunnel_status = self.tunnel.status().await.unwrap_or(TunnelStatus::Running);
         if tunnel_status != TunnelStatus::Stopped {
@@ -3775,14 +3784,7 @@ where
                 self.effective_tunnel_options(policy, saved.layer, saved.route_mode, now_unix, true)
                     .await?
             }
-            None => {
-                self.set_split_tunnel_warning(
-                    SplitTunnelWarningKind::Sync,
-                    "split_tunnel_policy_unavailable",
-                )
-                .await;
-                TunnelOptions::default()
-            }
+            None => self.fallback_tunnel_options().await?,
         };
         let tunnel_options = self.with_dns_servers(tunnel_options);
         if split_policy.is_some() {
@@ -3978,7 +3980,14 @@ where
                     .await;
             }
         } else {
-            *self.split_tunnel_options.lock().await = TunnelOptions::default();
+            if tunnel_options.exclude_local_networks && tunnel_options.policy_hash.is_none() {
+                self.set_split_tunnel_warning(
+                    SplitTunnelWarningKind::Operation,
+                    "split_tunnel_local_only",
+                )
+                .await;
+            }
+            *self.split_tunnel_options.lock().await = tunnel_options;
             self.clear_applied_physical_network_fingerprint();
         }
         self.logger.record(CoreLogEvent {

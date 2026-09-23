@@ -2272,6 +2272,120 @@ async fn failed_fixed_start_accepts_panel_release_and_clears_compensation() {
 
 #[cfg(not(target_os = "android"))]
 #[tokio::test]
+async fn warm_start_local_stop_keeps_server_cleanup_until_acknowledged() {
+    let api = Arc::new(MockApi::new(0));
+    api.warm_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    core.start(options(), 1_700_000_000).await.unwrap();
+    core.stop_locally().await.unwrap();
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert!(core.has_pending_stop_cleanup().unwrap());
+    let pending = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .unwrap();
+    *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);
+    assert!(core.stop().await.is_err());
+    assert!(core.has_pending_stop_cleanup().unwrap());
+    *api.stop_error.lock().unwrap() = None;
+    core.stop().await.unwrap();
+    assert!(!core.has_pending_stop_cleanup().unwrap());
+    assert_eq!(
+        api.stop_operation_ids.lock().unwrap().as_slice(),
+        &[pending.operation_id.clone(), pending.operation_id]
+    );
+    let calls = api.stop_calls.load(Ordering::SeqCst);
+    core.stop_locally().await.unwrap();
+    assert!(!core.has_pending_stop_cleanup().unwrap());
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), calls);
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn warm_start_direct_stop_still_contacts_panel() {
+    let api = Arc::new(MockApi::new(0));
+    api.warm_start.store(true, Ordering::SeqCst);
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    core.stop().await.unwrap();
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    core.stop().await.unwrap();
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn warm_start_failed_direct_stop_is_retried() {
+    let api = Arc::new(MockApi::new(0));
+    api.warm_start.store(true, Ordering::SeqCst);
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        Arc::new(MemoryTunnel::default()),
+        Arc::new(MemoryLogger::default()),
+    )
+    .with_retry_policy(RetryPolicy::new(Vec::new()));
+    core.start(options(), 1_700_000_000).await.unwrap();
+    *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);
+    assert!(core.stop().await.is_err());
+    *api.stop_error.lock().unwrap() = None;
+    core.stop().await.unwrap();
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn warm_start_pending_stop_survives_core_reconstruction() {
+    let api = Arc::new(MockApi::new(0));
+    api.warm_start.store(true, Ordering::SeqCst);
+    let store = Arc::new(MemoryStore::new(auth()));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    core.stop_locally().await.unwrap();
+    let pending = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .unwrap();
+    drop(core);
+    let restored = support::core(
+        api.clone(),
+        store.clone(),
+        tunnel,
+        Arc::new(MemoryLogger::default()),
+    );
+    restored.stop().await.unwrap();
+    assert!(!restored.has_pending_stop_cleanup().unwrap());
+    assert_eq!(
+        api.stop_operation_ids.lock().unwrap().as_slice(),
+        &[pending.operation_id]
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
 async fn explicit_local_stop_journals_cleanup_and_replays_after_restart() {
     let api = Arc::new(MockApi::new(0));
     *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);

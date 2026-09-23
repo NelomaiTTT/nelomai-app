@@ -1,4 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { splitTunnelWarningMessage } from "./split-tunnel";
 
 import type {
   AppState,
@@ -448,6 +449,9 @@ export function commandMessage(
       return "Android не предоставил список приложений. Перезапустите Nelomai и откройте split-tunnel снова.";
     case "split_tunnel_policy_unavailable":
       return "Не удалось загрузить настройки split-tunnel. Проверьте интернет и нажмите «Принудительная синхронизация».";
+    case "split_tunnel_local_only":
+    case "split_tunnel_policy_deferred":
+      return splitTunnelWarningMessage(code);
     case "split_tunnel_state_save_failed":
       return "VPN продолжает работать, но новые настройки могут не сохраниться после перезапуска. Попробуйте сохранить их ещё раз.";
     case "preferences_unavailable":

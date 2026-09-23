@@ -329,7 +329,10 @@ pub struct DesktopTunnelOptions {
 impl DesktopTunnelOptions {
     pub fn from_tunnel_options(options: &TunnelOptions) -> Self {
         if options.policy_hash.is_none() {
-            return Self::default();
+            return Self {
+                exclude_local_networks: options.exclude_local_networks,
+                ..Self::default()
+            };
         }
         Self {
             excluded_ipv4_cidrs: options.excluded_ipv4_cidrs.clone(),
@@ -342,9 +345,9 @@ impl DesktopTunnelOptions {
         if self.excluded_ipv4_cidrs.len() > MAX_IPV4_CIDRS {
             return Err(TunnelOptionsError::new("split_tunnel_cidrs_limit"));
         }
-        if self.policy_hash.is_none()
-            && (self.exclude_local_networks || !self.excluded_ipv4_cidrs.is_empty())
-        {
+        // Local LAN bypass is also used by the no-policy Windows fallback.
+        // Custom exclusions still require an authenticated policy identity.
+        if self.policy_hash.is_none() && !self.excluded_ipv4_cidrs.is_empty() {
             return Err(TunnelOptionsError::new("split_tunnel_inactive_options"));
         }
         if self.policy_hash.as_ref().is_some_and(|value| {

@@ -50,7 +50,12 @@ class NelomaiVpnServiceTest {
         assertEquals("primary", checkpoint.redundantTransaction?.localActiveLeaseId)
         assertEquals("standby", checkpoint.redundantTransaction?.slotBLeaseId)
         assertEquals(0, runtime.startCalls)
+        assertEquals(1, runtime.redundantStartCalls)
+        assertEquals(listOf("primary-config", "standby-config"), runtime.preparedConfigurations)
         assertTrue(response.configuration.all { it == 0.toByte() })
+        assertTrue(requireNotNull(response.redundantTransport).configurations.values.all { bytes ->
+            bytes.all { it == 0.toByte() }
+        })
         assertEquals(listOf(pending.startOperationId), panel.startOperationIds)
     }
 
@@ -73,8 +78,12 @@ class NelomaiVpnServiceTest {
         assertEquals(AndroidCoordinatorStep.IDLE, coordinator.runOnce(panel, runtime))
         assertNull(store.load().leaseTransaction)
         assertEquals(0, runtime.startCalls)
+        assertEquals(0, runtime.redundantStartCalls)
         assertTrue(panel.stopLeaseIds.isEmpty())
         assertTrue(response.configuration.all { it == 0.toByte() })
+        assertTrue(requireNotNull(response.redundantTransport).configurations.values.all { bytes ->
+            bytes.all { it == 0.toByte() }
+        })
     }
 
     @Test
@@ -90,9 +99,31 @@ class NelomaiVpnServiceTest {
         assertEquals(listOf(true), panel.cancelIfAbsent)
     }
 
+    @Test
+    fun v2PreparedRuntimeIsNotCalledWhenDurablePromotionFails() {
+        val backend = ServiceRecoveryBackend()
+        val store = recoveryStore(backend)
+        val coordinator = coordinator(store)
+        coordinator.begin(template().copy(reserveEnabled = true))
+        val response = redundantResult(store.load())
+        val panel = ServicePanelFake().apply {
+            reconcileResults.add(reconcile("not_found"))
+            startResults.add(Result.success(response))
+            onStart = { backend.writeSucceeds = false }
+        }
+        val runtime = ServiceRuntimeFake()
+        runCatching { coordinator.runOnce(panel, runtime) }
+        assertEquals(0, runtime.redundantStartCalls)
+        assertEquals(0, runtime.startCalls)
+        assertNull(store.load().redundantTransaction)
+        assertTrue(requireNotNull(response.redundantTransport).configurations.values.all { bytes ->
+            bytes.all { it == 0.toByte() }
+        })
+    }
+
     private fun redundantResult(envelope: AndroidRecoveryEnvelope): BackgroundStartResult {
         val pending = requireNotNull(envelope.leaseTransaction)
-        return startResult("primary").copy(redundantTransaction = AndroidRedundantTransaction(
+        val transaction = AndroidRedundantTransaction(
             desiredActive = true,
             template = requireNotNull(envelope.intent.template),
             sessionId = "22222222-2222-4222-8222-222222222222",
@@ -105,7 +136,22 @@ class NelomaiVpnServiceTest {
             startOperationId = pending.startOperationId,
             startRequestFingerprint = pending.replay.requestFingerprint,
             startReserveEnabled = true,
-        ))
+        )
+        return startResult("primary").copy(
+            redundantTransaction = transaction,
+            redundantTransport = BackgroundRedundantRecoveryTransport(
+                session = BackgroundRedundantSession(
+                    transaction.sessionId, "degraded", "primary", "primary", "standby",
+                    true, 1, 1, null,
+                ),
+                configurations = linkedMapOf(
+                    "primary" to "primary-config".toByteArray(),
+                    "standby" to "standby-config".toByteArray(),
+                ),
+                healthProbes = emptyMap(),
+                virtualAddressV4 = "10.240.3.4/32",
+            ),
+        )
     }
 
     @Test
@@ -7367,7 +7413,19 @@ private class ServiceRuntimeFake(
     private val stopFailureClearsRunning: Boolean = false,
 ) : AndroidConnectionIntentRuntime {
     var startCalls = 0
+    var redundantStartCalls = 0
+    val preparedConfigurations = mutableListOf<String>()
     var stopCalls = 0
+
+    override fun startRedundant(
+        result: BackgroundStartResult,
+        transaction: AndroidRedundantTransaction,
+        isCurrent: () -> Boolean,
+    ) {
+        if (!isCurrent()) return
+        redundantStartCalls += 1
+        preparedConfigurations += requireNotNull(result.redundantTransport).configurations.values.map(::String)
+    }
 
     override fun start(
         result: BackgroundStartResult,

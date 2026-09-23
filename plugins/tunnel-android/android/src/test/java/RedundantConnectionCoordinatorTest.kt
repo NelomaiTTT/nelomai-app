@@ -11,6 +11,62 @@ import java.util.concurrent.atomic.AtomicReference
 
 class RedundantConnectionCoordinatorTest {
     @Test
+    fun preparedStartUsesFirstResponseAndLaterResumeDoesNotReplay() {
+        val expected = transaction()
+        val panel = FakePanel()
+        val native = FakeNative()
+        val readiness = mutableListOf<Boolean>()
+        val coordinator = testRedundantCoordinator(store(expected), panel, native,
+            onRecoveryReadiness = readiness::add)
+        val response = RedundantRecoveryResponse(session("lease-a", 1, 1), mapOf(
+            "lease-a" to "primary-config".toByteArray(),
+            "lease-b" to "standby-config".toByteArray(),
+        ))
+        assertTrue(coordinator.startPrepared(expected, response))
+        assertTrue(coordinator.resume())
+        assertEquals(0, panel.recoverCalls)
+        assertEquals(listOf("lease-a", "lease-b"), native.started)
+        assertEquals(listOf(true), readiness)
+        assertTrue(response.configurations.values.all { bytes -> bytes.all { it == 0.toByte() } })
+    }
+
+    @Test
+    fun preparedStartRequiresExactPersistedOwnerAndWipesRejectedConfigurations() {
+        val expected = transaction()
+        for (recovery in listOf(emptyStore(), store(expected.copy(startOperationId = "new-start")),
+            store(expected.copy(desiredActive = false)))) {
+            val panel = FakePanel()
+            val native = FakeNative()
+            val coordinator = testRedundantCoordinator(recovery, panel, native)
+            val response = RedundantRecoveryResponse(session("lease-a", 1, 1), mapOf(
+                "lease-a" to "primary-config".toByteArray(),
+            ))
+            assertFalse(coordinator.startPrepared(expected, response))
+            assertTrue(native.started.isEmpty())
+            assertEquals(0, panel.recoverCalls)
+            assertTrue(response.configurations.values.all { bytes -> bytes.all { it == 0.toByte() } })
+        }
+    }
+
+    @Test
+    fun preparedNativeFailureKeepsExistingFailureCallbackAndWipesConfigurations() {
+        val expected = transaction()
+        val panel = FakePanel()
+        val readiness = mutableListOf<Boolean>()
+        val native = FakeNative(startFailures = setOf("lease-a"))
+        val coordinator = testRedundantCoordinator(store(expected), panel, native,
+            onRecoveryReadiness = readiness::add)
+        val response = RedundantRecoveryResponse(session("lease-a", 1, 1), mapOf(
+            "lease-a" to "primary-config".toByteArray(),
+            "lease-b" to "standby-config".toByteArray(),
+        ))
+        assertFalse(coordinator.startPrepared(expected, response))
+        assertEquals(listOf(false), readiness)
+        assertEquals(0, panel.recoverCalls)
+        assertTrue(response.configurations.values.all { bytes -> bytes.all { it == 0.toByte() } })
+    }
+
+    @Test
     fun blockedStandbyAcquireDoesNotBlockOwnerAndLateResponseCannotRestartStoppedSession() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)

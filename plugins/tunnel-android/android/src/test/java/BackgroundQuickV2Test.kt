@@ -64,7 +64,7 @@ class BackgroundQuickV2Test {
     }
 
     @Test
-    fun firstResponseCreatesFixedSlotsForExistingRecoveryWithoutPersistingConfigurations() {
+    fun firstResponseKeepsConfigurationsInMemoryForImmediateStart() {
         val template = template(true)
         val result = backgroundExactStartResult(payload(), template, pending(template))
         val transaction = requireNotNull(result.redundantTransaction)
@@ -75,6 +75,14 @@ class BackgroundQuickV2Test {
         assertEquals(template, transaction.template)
         assertTrue(transaction.startReserveEnabled)
         assertTrue(result.configuration.isEmpty())
+        val transport = requireNotNull(result.redundantTransport)
+        assertEquals("primary-secret", String(requireNotNull(transport.configurations[PRIMARY])))
+        assertEquals("standby-secret", String(requireNotNull(transport.configurations[STANDBY])))
+        val durable = String(AndroidRecoveryEnvelopeCodec.encode(AndroidRecoveryEnvelope.empty(1).copy(
+            redundantTransaction = transaction,
+        )))
+        assertFalse(durable.contains("primary-secret"))
+        assertFalse(durable.contains("standby-secret"))
     }
 
     @Test

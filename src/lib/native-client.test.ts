@@ -73,6 +73,13 @@ describe("native client", () => {
     ).toContain("«Принудительная синхронизация»");
   });
 
+  it("explains Windows local-only fallback and deferred exclusions", () => {
+    expect(commandMessage(commandError("split_tunnel_local_only"), "split_tunnel"))
+      .toContain("пользовательские исключения временно не применяются");
+    expect(commandMessage(commandError("split_tunnel_policy_deferred"), "split_tunnel"))
+      .toContain("при следующем подключении");
+  });
+
   it("explains the safe recovery after a Stray endpoint route failure", () => {
     expect(
       commandMessage(commandError("endpoint_route_unavailable"), "start"),

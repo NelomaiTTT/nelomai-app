@@ -380,7 +380,24 @@ internal class RedundantConnectionCoordinator(
     }
 
     /** Replays the v2 session before callers attempt any recovery-v1 flow. */
-    override fun recover(): Boolean = synchronized(gate) {
+    override fun recover(): Boolean = recoverUsing(panel::recover)
+
+    /** The first Start already returned these configs; never persist them or replay it twice. */
+    fun startPrepared(
+        expected: AndroidRedundantTransaction,
+        response: RedundantRecoveryResponse,
+    ): Boolean = synchronized(gate) {
+        try {
+            if (status() != expected) return@synchronized false
+            recoverUsing { response }
+        } finally {
+            response.configurations.values.forEach { it.fill(0) }
+        }
+    }
+
+    private fun recoverUsing(
+        fetch: (AndroidRedundantTransaction) -> RedundantRecoveryResponse,
+    ): Boolean = synchronized(gate) {
         if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
@@ -392,7 +409,7 @@ internal class RedundantConnectionCoordinator(
         // Retryable control-plane errors retain the exact session. Native readiness
         // failure remains terminal; a durable switch has its own bounded retries.
         val response = try {
-            panel.recover(transaction)
+            fetch(transaction)
         } catch (error: Throwable) {
             val policy = ConnectionIntentErrorPolicy()
             val decision = policy.classify((error as? BackgroundConnectionException)?.code.orEmpty())

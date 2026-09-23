@@ -25,7 +25,13 @@ internal data class BackgroundStartResult(
     val connection: QuickConnectionArgs,
     val options: TunnelOptionsArgs,
     val redundantTransaction: AndroidRedundantTransaction? = null,
-)
+    val redundantTransport: BackgroundRedundantRecoveryTransport? = null,
+) {
+    fun clearSensitiveConfigurations() {
+        configuration.fill(0)
+        redundantTransport?.configurations?.values?.forEach { it.fill(0) }
+    }
+}
 
 internal data class BackgroundSessionRecoveryResult(
     val responseJson: String,
@@ -1537,11 +1543,12 @@ internal fun backgroundExactStartResult(
             )
             require(redundant.startReserveEnabled || !redundant.standbyDesired)
             // Reuse the same validation as recovery, including disabled sessions and probes.
-            // Only safe ownership metadata survives: recovery obtains exact configs again.
+            // Persist only ownership metadata; the first transport stays in memory
+            // until the durable owner accepts it. Recovery still replays after death.
+            val options = template.options.toTunnelOptionsArgs()
             val transport = redundantRecoveryTransportFromJson(payload, redundant)
-            transport.configurations.values.forEach { it.fill(0) }
             return BackgroundStartResult(
-                byteArrayOf(), selected, template.options.toTunnelOptionsArgs(), redundant,
+                byteArrayOf(), selected, options, redundant, transport,
             )
         } catch (_: Throwable) {
             throw BackgroundConnectionException("invalid_background_response")
