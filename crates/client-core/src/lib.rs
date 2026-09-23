@@ -2741,9 +2741,19 @@ where
         }
     }
 
+    async fn require_core_stop_ownership(&self) -> Result<(), CoreError> {
+        if self.tunnel.owns_redundant_session().await? {
+            return Err(TunnelError::Backend("redundant_session_service_owned".into()).into());
+        }
+        Ok(())
+    }
+
     pub async fn stop(&self) -> Result<Connection, CoreError> {
         self.signal_start_cancellation();
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        // Android's service owns its whole-session Stop (including cleanup).
+        // A Stopping projection in Rust is not a second cleanup intent.
+        self.require_core_stop_ownership().await?;
         if let Some(pending) = self
             .store
             .load()
@@ -2977,6 +2987,7 @@ where
         &self,
         pending: StoredPendingCompensationStop,
     ) -> Result<(), CoreError> {
+        self.require_core_stop_ownership().await?;
         let current = self.state.lock().await.connection.clone();
         let session_id = pending_compensation_redundant_session(&pending)?;
         if current.as_ref().is_some_and(|current| {
@@ -3023,7 +3034,7 @@ where
         let _guard = self.connection_gate.lock().await;
         self.set_phase(Phase::Stopping).await;
         if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
-            self.tunnel.stop().await?;
+            self.tunnel.stop_if_unowned().await?;
         }
         match self.api.reset_transport() {
             Ok(()) => self.logger.record(CoreLogEvent {
@@ -3336,6 +3347,7 @@ where
     ) -> Result<Connection, CoreError> {
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
+        self.require_core_stop_ownership().await?;
         let current_state = self.state.lock().await.clone();
         let current = current_state
             .connection
@@ -3357,7 +3369,7 @@ where
         self.set_phase(Phase::Stopping).await;
         let tunnel_status = self.tunnel.status().await.unwrap_or(TunnelStatus::Running);
         if tunnel_status != TunnelStatus::Stopped {
-            if let Err(error) = self.tunnel.stop().await {
+            if let Err(error) = self.tunnel.stop_if_unowned().await {
                 self.set_phase(Phase::Stopping).await;
                 return Err(error.into());
             }

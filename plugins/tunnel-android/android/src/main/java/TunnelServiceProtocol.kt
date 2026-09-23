@@ -19,6 +19,7 @@ internal fun androidServiceDispatchErrorCode(): String =
 
 internal const val EXTRA_RESULT_RECEIVER = "result_receiver"
 internal const val EXTRA_API_VERSION = "api_version"
+internal const val EXTRA_LEGACY_STOP_ONLY = "legacy_stop_only"
 internal const val EXTRA_START_SOURCE = "start_source"
 internal const val EXTRA_CONFIGURATION = "configuration"
 internal const val EXTRA_OPTIONS = "options"
@@ -285,11 +286,13 @@ internal object TunnelServiceClient {
         apiVersion: Int,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
+        legacyOnly: Boolean = false,
     ) = requestBundle(
         context,
         ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
             .setAction(NelomaiVpnService.ACTION_CLIENT_STOP)
-            .putExtra(EXTRA_API_VERSION, apiVersion),
+            .putExtra(EXTRA_API_VERSION, apiVersion)
+            .putExtra(EXTRA_LEGACY_STOP_ONLY, legacyOnly),
         { result ->
             val state = SessionState.values().firstOrNull {
                 it.wireName == result.getString(EXTRA_STATE)

@@ -2210,6 +2210,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         resolveDurableOperationId: (AndroidRecoveryEnvelope) -> String? = {
             it.redundantTransaction?.startOperationId
         },
+        invalidateStarts: Boolean = true,
         complete: (ResolvedRedundantStopLookup) -> Unit,
     ) {
         val lookupServiceGeneration = serviceGeneration
@@ -2233,7 +2234,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             },
             postToCaller = { action -> restoreHandler.post { action() } },
             complete = complete,
-            onBegin = ::invalidateConnectionIntentStarts,
+            onBegin = { if (invalidateStarts) invalidateConnectionIntentStarts() },
             onRejected = {
                 complete(
                     ResolvedRedundantStopLookup(
@@ -2330,6 +2331,10 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             receiver.sendError("unsupported_api_version")
             return
         }
+        if (intent.getBooleanExtra(EXTRA_LEGACY_STOP_ONLY, false)) {
+            handleLegacyOnlyClientStop(apiVersion, receiver)
+            return
+        }
         val pendingOperationId = redundantStartOperation.cancelPending()
         val installedOwner = redundantVpnOwnerSlot.snapshot()
         val inMemoryOperationId = inMemoryRedundantStopOperationId(
@@ -2355,6 +2360,36 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 beginClientRedundantStop(lookup.operationId, currentOwner, receiver)
             } else if (lookup.recovery is RecoveryStoreResult.Failure) {
                 receiver.sendError("redundant_stop_fence_failed")
+            } else {
+                beginLegacyClientStop(apiVersion, receiver)
+            }
+        }
+    }
+
+    private fun handleLegacyOnlyClientStop(apiVersion: Int, receiver: ResultReceiver?) {
+        fun nativeOwnerPresent() = redundantStartOperation.hasPending() ||
+            redundantVpnOwnerSlot.snapshot() != null || pendingRedundantStop != null ||
+            connectionIntentDispatch.hasPendingWork()
+        // Use the existing lookup barrier: a new Start cannot cross the durable
+        // ownership read. Unlike explicit Stop, do not cancel a pending native Start.
+        resolveRedundantStopFromMemoryOrRecovery(
+            resolveInMemoryOperationId = { "native-owned".takeIf { nativeOwnerPresent() } },
+            resolveDurableOperationId = {
+                it.redundantTransaction?.startOperationId
+                    ?: it.leaseTransaction?.takeIf { tx -> tx.replay.contractVersion == 2 }
+                        ?.startOperationId
+            },
+            invalidateStarts = false,
+        ) { lookup ->
+            // The lookup barrier belongs to this instance. A late callback must
+            // not cancel an intent installed by a recreated service; checking
+            // the generation in afterComplete would already be too late.
+            if (serviceDestroyed || !serviceCallbackGate.isOpen() ||
+                serviceGeneration != VPN_PROCESS_SERVICE_GENERATION.get() ||
+                nativeOwnerPresent() || lookup.operationId != null ||
+                lookup.recovery == null || !shouldEnterLegacyVpnRecovery(lookup.recovery)
+            ) {
+                receiver.sendError("redundant_session_service_owned")
             } else {
                 beginLegacyClientStop(apiVersion, receiver)
             }
@@ -5993,7 +6028,8 @@ internal fun connectionIntentServiceStatus(
         nextRetryAtUnix = envelope.intent.retry.nextRetryAtUnix,
         lastErrorCode = envelope.intent.retry.lastErrorCode,
         reserveState = reserveState,
-        redundantSessionOwned = envelope.redundantTransaction != null,
+        redundantSessionOwned = envelope.redundantTransaction != null ||
+            transaction?.replay?.contractVersion == 2,
     )
 }
 
@@ -6310,9 +6346,6 @@ internal class AndroidConnectionIntentCoordinator(
             ) {
                 return AndroidCoordinatorStep.BUSY
             }
-            if (transaction.replay.contractVersion == 2) {
-                return runPendingRedundantStart(envelope, transaction, panel, runtime, canStart)
-            }
             resumePendingAction(
                 envelope,
                 transaction,
@@ -6323,6 +6356,9 @@ internal class AndroidConnectionIntentCoordinator(
             envelope = store.read().coordinatorEnvelopeOrNull()
                 ?: return AndroidCoordinatorStep.TERMINAL
             transaction = envelope.leaseTransaction ?: return AndroidCoordinatorStep.IDLE
+            if (transaction.replay.contractVersion == 2) {
+                return runPendingRedundantStart(envelope, transaction, panel, runtime, canStart)
+            }
             when (transaction.phase) {
                 LeasePhase.START_PENDING -> runPendingStart(
                     envelope,

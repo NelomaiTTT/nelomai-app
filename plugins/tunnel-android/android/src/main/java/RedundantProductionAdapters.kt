@@ -797,6 +797,11 @@ internal class ServiceRedundantConnectionPanel(
         BackgroundCredential,
         AndroidRedundantTransaction,
     ) -> BackgroundRedundantRecoveryTransport = BackgroundConnectionClient::recoverRedundant,
+    private val stopTransport: (
+        BackgroundCredential,
+        AndroidRedundantTransaction,
+        String,
+    ) -> org.json.JSONObject = BackgroundConnectionClient::stopRedundant,
 ) : RedundantConnectionPanel {
     override fun recover(transaction: AndroidRedundantTransaction): RedundantRecoveryResponse {
         val transport = recoverTransport(
@@ -855,12 +860,16 @@ internal class ServiceRedundantConnectionPanel(
             ?: transaction.slotBLeaseId
             ?: return false
         return runCatching {
-            BackgroundConnectionClient.stopRedundant(
+            val connection = stopTransport(
                 credential(transaction.template.deviceId),
                 transaction,
                 leaseId,
             ).getJSONObject("connection")
-            true
+            // HTTP 200/APPLIED only accepts the Stop. A released primary may
+            // still belong to a session whose standby cleanup is in progress.
+            connection.getString("lease_id") == leaseId &&
+                connection.getString("status") in setOf("released", "failed") &&
+                connection.has("session_id") && connection.isNull("session_id")
         }.getOrDefault(false)
     }
 }

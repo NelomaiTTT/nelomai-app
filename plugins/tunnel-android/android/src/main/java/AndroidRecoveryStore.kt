@@ -1386,6 +1386,9 @@ internal class AndroidRecoveryStore(
                 reconcileOnceUsed = reconcileOnceUsed
                     ?: current.intent.retry.reconcileOnceUsed,
                 pendingAction = pendingAction,
+                redundantTotalLossSourceStartOperationId =
+                    current.intent.retry.redundantTotalLossSourceStartOperationId
+                        .takeIf { pendingAction == "redundant_total_loss_restart" },
             ),
         )))
     }
@@ -1476,6 +1479,7 @@ internal class AndroidRecoveryStore(
                 scheduledDelaySeconds = scheduledDelaySeconds,
                 lastErrorCode = errorCode.also(AndroidRecoveryEnvelopeCodec::validateSafeValue),
                 pendingAction = "validate_capability",
+                redundantTotalLossSourceStartOperationId = null,
             )),
             leaseTransaction = transaction.copy(
                 phase = LeasePhase.START_PENDING,
@@ -1517,6 +1521,7 @@ internal class AndroidRecoveryStore(
                 scheduledDelaySeconds = scheduledDelaySeconds,
                 lastErrorCode = errorCode.also(AndroidRecoveryEnvelopeCodec::validateSafeValue),
                 pendingAction = "validate_capability",
+                redundantTotalLossSourceStartOperationId = null,
             )),
             leaseTransaction = transaction.copy(
                 replay = normalized,
@@ -1718,6 +1723,7 @@ internal class AndroidRecoveryStore(
                     ),
                     terminalDiagnosticPending = true,
                     pendingAction = "initial_terminal_report_pending",
+                    redundantTotalLossSourceStartOperationId = null,
                 ),
             ),
             leaseTransaction = transaction.copy(
@@ -1765,6 +1771,7 @@ internal class AndroidRecoveryStore(
                     lastErrorCode = safeCode,
                     terminalDiagnosticPending = true,
                     pendingAction = "initial_terminal_report_pending",
+                    redundantTotalLossSourceStartOperationId = null,
                 ),
             ),
             leaseTransaction = transaction.copy(generation = nextGeneration),
@@ -2017,7 +2024,16 @@ internal class AndroidRecoveryStore(
     }
 
     private fun persist(envelope: AndroidRecoveryEnvelope): RecoveryStoreResult<AndroidRecoveryEnvelope> {
-        val plaintext = AndroidRecoveryEnvelopeCodec.encode(envelope)
+        val plaintext = try {
+            AndroidRecoveryEnvelopeCodec.encode(envelope)
+        } catch (_: Throwable) {
+            // Reject an invalid transition without killing the VPN executor or
+            // replacing the last valid recovery record with an empty one.
+            return RecoveryStoreResult.Failure(
+                if (envelope.redundantTransaction != null) "redundant_recovery_invalid"
+                else "connection_intent_invalid",
+            )
+        }
         return try {
             if (backend.write(plaintext)) {
                 RecoveryStoreResult.Success(envelope)

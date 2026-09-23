@@ -265,16 +265,29 @@ impl<R: Runtime> TunnelAndroid<R> {
                 "stopTunnel",
                 StopTunnelRequest {
                     api_version: TUNNEL_API_VERSION,
+                    legacy_only: false,
                 },
             )
             .map_err(Into::into)
     }
 
     pub async fn stop_tunnel_async(&self) -> crate::Result<TunnelOperationResponse> {
+        self.stop_tunnel_with_scope(false).await
+    }
+
+    pub async fn stop_unowned_tunnel_async(&self) -> crate::Result<TunnelOperationResponse> {
+        self.stop_tunnel_with_scope(true).await
+    }
+
+    async fn stop_tunnel_with_scope(
+        &self,
+        legacy_only: bool,
+    ) -> crate::Result<TunnelOperationResponse> {
         self.run_mobile_plugin_async(
             "stopTunnel",
             StopTunnelRequest {
                 api_version: TUNNEL_API_VERSION,
+                legacy_only,
             },
         )
         .await

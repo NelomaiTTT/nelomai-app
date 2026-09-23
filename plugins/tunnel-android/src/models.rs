@@ -551,6 +551,8 @@ impl fmt::Debug for BackgroundUiProvisionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct StopTunnelRequest {
     pub api_version: u16,
+    #[serde(default)]
+    pub legacy_only: bool,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -600,6 +602,21 @@ pub struct QuickStateChangeAcknowledgeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_cleanup_and_explicit_stop_keep_distinct_wire_semantics() {
+        for legacy_only in [true, false] {
+            let value = serde_json::to_value(StopTunnelRequest {
+                api_version: TUNNEL_API_VERSION,
+                legacy_only,
+            })
+            .unwrap();
+            assert_eq!(value["legacyOnly"], legacy_only);
+        }
+        let old_request: StopTunnelRequest =
+            serde_json::from_value(serde_json::json!({"apiVersion": TUNNEL_API_VERSION})).unwrap();
+        assert!(!old_request.legacy_only);
+    }
 
     #[test]
     fn start_request_redacts_wireguard_configuration() {

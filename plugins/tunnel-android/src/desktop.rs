@@ -157,6 +157,10 @@ impl<R: Runtime> TunnelAndroid<R> {
         self.stop_tunnel()
     }
 
+    pub async fn stop_unowned_tunnel_async(&self) -> crate::Result<TunnelOperationResponse> {
+        self.stop_tunnel_async().await
+    }
+
     pub async fn recover_background_session(
         &self,
         _request: BackgroundSessionRecoveryRequest,

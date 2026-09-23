@@ -450,6 +450,11 @@ pub enum TunnelError {
 pub trait TunnelController: Send + Sync {
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
+    /// Core cleanup must not cancel an independent native session. Native
+    /// owners enforce this at command execution, not just at a prior status read.
+    async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
+        self.stop().await
+    }
     /// Rebind the client UDP socket without replacing the panel lease.
     ///
     /// Returns `true` when the active backend performed a rebind and `false`

@@ -184,6 +184,116 @@ impl SecretStore for MemoryStore {
 #[derive(Default)]
 struct MemoryLogger(Mutex<Vec<CoreLogEvent>>);
 
+#[tokio::test]
+async fn native_owner_appearing_after_status_read_is_fenced_at_stop_execution() {
+    let mut saved = auth();
+    saved.pending_compensation_stop = Some(StoredPendingCompensationStop {
+        operation_id: "old-ui-stop".into(),
+        lease_id: "old-lease".into(),
+        recovery_contract_version: Some(2),
+        redundant_session_id: Some("20000000-0000-4000-8000-000000000001".into()),
+        accept_warm: true,
+        failure_code: None,
+    });
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = Arc::new(support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(saved)),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    ));
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    tunnel.hold_next_status.store(true, Ordering::SeqCst);
+    let task = tokio::spawn({
+        let core = core.clone();
+        async move { core.stop().await }
+    });
+    tunnel.status_entered.notified().await;
+    tunnel.native_session_owned.store(true, Ordering::SeqCst);
+    tunnel.status_release.notify_one();
+    assert!(task.await.unwrap().is_err());
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    assert!(core.has_pending_stop_cleanup().unwrap());
+}
+
+#[tokio::test]
+async fn native_owned_stop_projection_cannot_create_a_second_cleanup_owner() {
+    let store = Arc::new(MemoryStore::new(auth()));
+    let api = Arc::new(MockApi::new(0));
+    let mut old = connection("old-lease");
+    old.session_id = Some("20000000-0000-4000-8000-000000000001".into());
+    *api.bootstrap_connection.lock().unwrap() = Some(old);
+    let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+    tunnel.native_session_owned.store(true, Ordering::SeqCst);
+    let core = support::core(
+        api.clone(),
+        store,
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.bootstrap(1_700_000_000).await.unwrap();
+    *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    assert!(core.stop().await.is_err());
+    assert!(!core.has_pending_stop_cleanup().unwrap());
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn old_stop_journal_cannot_stop_a_new_native_owner_or_guess_unreadable_ownership() {
+    for unreadable in [false, true] {
+        let mut saved = auth();
+        saved.pending_compensation_stop = Some(StoredPendingCompensationStop {
+            operation_id: "old-ui-stop".into(),
+            lease_id: "old-lease".into(),
+            recovery_contract_version: Some(2),
+            redundant_session_id: Some("20000000-0000-4000-8000-000000000001".into()),
+            accept_warm: true,
+            failure_code: None,
+        });
+        let store = Arc::new(MemoryStore::new(saved));
+        let api = Arc::new(MockApi::new(0));
+        let mut old = connection("old-lease");
+        old.session_id = Some("20000000-0000-4000-8000-000000000001".into());
+        *api.bootstrap_connection.lock().unwrap() = Some(old);
+        let tunnel = Arc::new(MemoryTunnel::default());
+        let core = support::core(
+            api.clone(),
+            store,
+            tunnel.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        core.bootstrap(1_700_000_000).await.unwrap();
+        *tunnel.status.lock().unwrap() = TunnelStatus::Running;
+        *tunnel.redundant_session_id.lock().unwrap() = Some("new-tile-session".into());
+        tunnel.native_session_owned.store(true, Ordering::SeqCst);
+        tunnel
+            .redundant_ownership_unavailable
+            .store(unreadable, Ordering::SeqCst);
+        assert!(core.stop().await.is_err());
+        assert_eq!(tunnel.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(*tunnel.status.lock().unwrap(), TunnelStatus::Running);
+        assert!(core.has_pending_stop_cleanup().unwrap());
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        // The old journal remains usable once the native owner has finished.
+        tunnel.native_session_owned.store(false, Ordering::SeqCst);
+        tunnel
+            .redundant_ownership_unavailable
+            .store(false, Ordering::SeqCst);
+        *tunnel.status.lock().unwrap() = TunnelStatus::Stopped;
+        core.stop().await.unwrap();
+        assert!(!core.has_pending_stop_cleanup().unwrap());
+        assert_eq!(
+            api.redundant_stop_requests.lock().unwrap()[0].session_id,
+            "20000000-0000-4000-8000-000000000001"
+        );
+    }
+}
+
 impl CoreLogger for MemoryLogger {
     fn record(&self, event: CoreLogEvent) {
         self.0.lock().unwrap().push(event);
@@ -228,6 +338,7 @@ struct MemoryTunnel {
     rebind_release: Notify,
     configuration: Mutex<Option<String>>,
     redundant_session_id: Mutex<Option<String>>,
+    native_session_owned: AtomicBool,
     redundant_ownership_unavailable: AtomicBool,
     standby_configuration: Mutex<Option<String>>,
     quick_connection: Mutex<Option<QuickConnection>>,
@@ -239,11 +350,18 @@ struct MemoryTunnel {
 
 #[async_trait]
 impl TunnelController for MemoryTunnel {
+    async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
+        if self.owns_redundant_session().await? {
+            return Err(TunnelError::Backend("native_owned".into()));
+        }
+        self.stop().await
+    }
+
     async fn owns_redundant_session(&self) -> Result<bool, TunnelError> {
         if self.redundant_ownership_unavailable.load(Ordering::SeqCst) {
             return Err(TunnelError::Backend("owner_unreadable".into()));
         }
-        Ok(self.redundant_session_id.lock().unwrap().is_some())
+        Ok(self.native_session_owned.load(Ordering::SeqCst))
     }
 
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError> {
@@ -4288,6 +4406,7 @@ async fn bootstrap_does_not_fetch_a_legacy_configuration_for_native_redundancy()
         let tunnel = Arc::new(MemoryTunnel::default());
         *tunnel.status.lock().unwrap() = TunnelStatus::Running;
         *tunnel.redundant_session_id.lock().unwrap() = Some("native-v2-session".into());
+        tunnel.native_session_owned.store(true, Ordering::SeqCst);
         tunnel
             .redundant_ownership_unavailable
             .store(unreadable, Ordering::SeqCst);
@@ -4626,6 +4745,7 @@ async fn starting_bootstrap_restores_configuration_only_for_legacy_owner() {
         *tunnel.status.lock().unwrap() = TunnelStatus::Starting;
         if redundant {
             *tunnel.redundant_session_id.lock().unwrap() = Some("native-v2".into());
+            tunnel.native_session_owned.store(true, Ordering::SeqCst);
         }
         let store = Arc::new(MemoryStore::new(auth()));
         let core = support::core(
