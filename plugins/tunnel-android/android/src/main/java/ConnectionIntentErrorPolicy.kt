@@ -78,6 +78,7 @@ internal class ConnectionIntentErrorPolicy {
                 "connection_already_active",
                 "service_timeout",
                 "tunnel_service_timeout",
+                "tunnel_start_timeout",
                 "service_stopping",
                 "android_service_dispatch_unavailable",
             ).forEach { put(it, ConnectionIntentDecision.RECONCILE_THEN_RETRY) }

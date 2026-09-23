@@ -43,6 +43,13 @@ describe("native client", () => {
     ).toContain("Разрешите VPN-подключение");
   });
 
+  it("does not recommend reinstalling after a connection startup timeout", () => {
+    const message = commandMessage(commandError("tunnel_start_timeout"), "start");
+    expect(message).toContain("сеть");
+    expect(message).toContain("«Старт»");
+    expect(message).not.toMatch(/переустанов|восстановление/);
+  });
+
   it("uses the actual retry and start button labels", () => {
     expect(
       commandMessage(commandError("connection_stop_failed"), "stop"),

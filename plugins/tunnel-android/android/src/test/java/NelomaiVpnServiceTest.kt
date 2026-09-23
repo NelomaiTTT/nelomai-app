@@ -17,6 +17,78 @@ import java.util.concurrent.atomic.AtomicReference
 
 class NelomaiVpnServiceTest {
     @Test
+    fun idleCheckScheduledBeforeTileDoesNotInterruptCredentialPreflight() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val idleTasks = mutableListOf<Runnable>()
+        var stopped = false
+        val debouncer = IdleStopDebouncer(400, { task, _ -> idleTasks += task }, {})
+        fun checkIdle() = applyAndroidVpnServiceIdleLifecycle(debouncer,
+            shouldStop = { shouldStopVpnService(SessionState.STOPPED, false, false, false,
+                pendingConnectionStart = dispatch.hasPendingWork()) },
+            stop = { stopped = true })
+        checkIdle() // UI status arrives before the tile's durable desiredActive.
+        val ticket = dispatch.start(1)
+        dispatch.dispatchStartMutation(Executor { it.run() }, ticket, ::checkIdle) {
+            idleTasks.first().run()
+            assertFalse("UI idle timer must not shut down the credential worker", stopped)
+        }
+        idleTasks.last().run()
+        assertTrue("failed/finished preflight must release the idle service", stopped)
+    }
+
+    @Test
+    fun queuedQuickStartKeepsServiceAliveUntilPreparationFinishesEvenAfterStop() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val ticket = dispatch.start(1)
+        val queued = mutableListOf<Runnable>()
+        var idleChecks = 0
+        fun idle() = shouldStopVpnService(SessionState.STOPPED, false, false, false,
+            pendingConnectionStart = dispatch.hasPendingWork())
+        assertFalse(idle())
+        dispatch.dispatchStartMutation(Executor { queued += it }, ticket, { idleChecks++ }) {
+            assertFalse(idle())
+            assertFalse(dispatch.isCurrent(ticket))
+        }
+        // A second tile press still cancels this Start, but must not interrupt
+        // a credential write already dispatched to the worker.
+        assertEquals(AndroidQuickToggleDispatch.Stop, dispatch.toggle(1, false))
+        assertFalse(idle())
+        queued.single().run()
+        assertTrue(idle())
+        assertEquals(1, idleChecks)
+    }
+
+    @Test
+    fun failedQuickPreparationReleasesOccupancyWithoutCancellingANewerStart() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val old = dispatch.start(1)
+        val queued = mutableListOf<Runnable>()
+        dispatch.dispatchStartMutation(Executor { queued += it }, old, {}) {
+            throw IllegalStateException("preflight failed")
+        }
+        val newer = dispatch.start(2)
+        runCatching { queued.single().run() }
+        assertTrue(dispatch.isCurrent(newer))
+        assertTrue(dispatch.hasPendingWork())
+        dispatch.complete(newer)
+        assertFalse(dispatch.hasPendingWork())
+    }
+
+    @Test
+    fun rejectedQuickPreparationDoesNotLeaveServicePermanentlyBusy() {
+        val dispatch = AndroidConnectionIntentDispatchState()
+        val ticket = dispatch.start(1)
+        var completed = 0
+        val result = runCatching {
+            dispatch.dispatchStartMutation(Executor { throw RejectedExecutionException() },
+                ticket, { completed++ }) { throw AssertionError("must not run") }
+        }
+        assertTrue(result.exceptionOrNull() is RejectedExecutionException)
+        assertFalse(dispatch.hasPendingWork())
+        assertEquals(1, completed)
+    }
+
+    @Test
     fun v2QuickPlanCannotSilentlyFallBackToLegacyWhenRecoveryIsDisabled() {
         val disabled = BackgroundCapabilitySnapshot(9, false, 2_000_000_000)
         try {

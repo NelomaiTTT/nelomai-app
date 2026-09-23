@@ -166,6 +166,7 @@ pub fn classify_recovery(code: &str, context: RecoveryPolicyContext) -> Recovery
         "connection_already_active"
         | "service_timeout"
         | "tunnel_service_timeout"
+        | "tunnel_start_timeout"
         | "service_stopping"
         | "android_service_dispatch_unavailable" => RecoveryDecision::ReconcileThenRetry,
         "connection_stall_not_recyclable" => {

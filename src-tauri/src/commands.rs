@@ -1053,6 +1053,10 @@ impl CommandError {
             ),
             CoreError::Api(error) => Self::from_api(error),
             CoreError::Tunnel(code) => match code.as_str() {
+                "tunnel_start_timeout" => Self::new(
+                    "tunnel_start_timeout",
+                    "Подключение не успело запуститься. Проверьте сеть и повторите запуск",
+                ),
                 "tunnel_handshake_timeout" => Self::new(
                     "tunnel_handshake_timeout",
                     "Stray-сервер не ответил через текущую сеть",
@@ -1104,6 +1108,10 @@ impl CommandError {
             nelomai_client_tunnel::TunnelError::InvalidOptions { code } => code.to_string(),
         };
         match code.as_str() {
+            "tunnel_start_timeout" => Self::new(
+                "tunnel_start_timeout",
+                "Подключение не успело запуститься. Проверьте сеть и повторите запуск",
+            ),
             "tunnel_handshake_timeout" => Self::new(
                 "tunnel_handshake_timeout",
                 "Stray-сервер не ответил через текущую сеть",
@@ -4495,6 +4503,17 @@ mod tests {
             CommandError::from_core(CoreError::Tunnel("tunnel_handshake_timeout".to_string()));
         assert_eq!(handshake.code, "tunnel_handshake_timeout");
         assert!(handshake.message.contains("Stray-сервер"));
+    }
+
+    #[test]
+    fn startup_timeout_is_not_classified_as_a_broken_service() {
+        let core = CommandError::from_core(CoreError::Tunnel("tunnel_start_timeout".into()));
+        let native = CommandError::from_tunnel(nelomai_client_tunnel::TunnelError::Backend(
+            "tunnel_start_timeout".into(),
+        ));
+        assert_eq!(core.code, "tunnel_start_timeout");
+        assert_eq!(native.code, "tunnel_start_timeout");
+        assert!(!core.message.contains("Переустановите"));
     }
 
     #[test]

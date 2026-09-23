@@ -3613,13 +3613,17 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         when (val dispatch = quickDispatch) {
             is AndroidQuickToggleDispatch.Start -> {
                 val admissionTicket = connectionIntentAdmission.snapshot()
-                dispatchSerializedConnectionIntentMutation(credentialExecutor) {
+                connectionIntentDispatch.dispatchStartMutation(
+                    credentialExecutor,
+                    dispatch.ticket,
+                    onComplete = { restoreHandler.post { stopIfIdle() } },
+                ) {
                     if (!connectionIntentAdmission.isCurrent(admissionTicket) ||
                         redundantStartBlocked()
                     ) {
                         receiver.sendError("redundant_stop_pending")
                         schedulePendingRedundantStopRetry()
-                        return@dispatchSerializedConnectionIntentMutation
+                        return@dispatchStartMutation
                     }
                     val credential = BackgroundCredentialStore.load(applicationContext)
                     val quick = QuickTunnelPlanStore.loadTemplate(applicationContext)
@@ -4630,6 +4634,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                         pendingLogout = false,
                         durableConnectionWork = connectionIntentLifecycle
                             .hasPendingConnectionWork(),
+                        pendingConnectionStart = connectionIntentDispatch.hasPendingWork(),
                     )
                 }
             },
@@ -5008,6 +5013,40 @@ internal class AndroidConnectionIntentDispatchState {
     private val gate = Any()
     private var epoch = 0L
     private var pendingStart = false
+    private var pendingMutations = 0
+
+    fun hasPendingWork(): Boolean = synchronized(gate) { pendingStart || pendingMutations > 0 }
+
+    fun dispatchStartMutation(
+        executor: Executor,
+        ticket: AndroidConnectionIntentDispatchTicket,
+        onComplete: () -> Unit,
+        mutation: () -> Unit,
+    ) {
+        synchronized(gate) { pendingMutations++ }
+        val finished = AtomicBoolean(false)
+        val finish = {
+            if (finished.compareAndSet(false, true)) {
+                synchronized(gate) {
+                    complete(ticket)
+                    pendingMutations--
+                }
+                onComplete()
+            }
+        }
+        try {
+            executor.execute {
+                try {
+                    mutation()
+                } finally {
+                    finish()
+                }
+            }
+        } catch (error: Throwable) {
+            finish()
+            throw error
+        }
+    }
 
     fun start(expectedGeneration: Long): AndroidConnectionIntentDispatchTicket =
         synchronized(gate) {
@@ -5877,8 +5916,9 @@ internal fun shouldStopVpnService(
     desiredActive: Boolean,
     pendingLogout: Boolean,
     durableConnectionWork: Boolean,
+    pendingConnectionStart: Boolean = false,
 ): Boolean = state != SessionState.RUNNING && !desiredActive && !pendingLogout &&
-    !durableConnectionWork
+    !durableConnectionWork && !pendingConnectionStart
 
 internal fun routeDestroyedServiceIdle(
     serviceDestroyed: Boolean,
