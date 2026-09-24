@@ -305,7 +305,9 @@ struct MemoryTunnel {
     starts: AtomicUsize,
     stops: AtomicUsize,
     fail_next_starts: AtomicUsize,
+    start_failure_code: Mutex<Option<String>>,
     fail_next_stops: AtomicUsize,
+    stop_failure_code: Mutex<Option<String>>,
     leave_running_on_start_failure: AtomicBool,
     leave_failed_on_start_failure: AtomicBool,
     start_delay_millis: AtomicU64,
@@ -397,7 +399,13 @@ impl TunnelController for MemoryTunnel {
                 } else {
                     TunnelStatus::Stopped
                 };
-            return Err(TunnelError::Backend("test_start_failed".to_string()));
+            return Err(TunnelError::Backend(
+                self.start_failure_code
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "test_start_failed".to_string()),
+            ));
         }
         *self.configuration.lock().unwrap() = Some(request.configuration.expose().to_string());
         *self.options.lock().unwrap() = Some(request.options);
@@ -417,7 +425,13 @@ impl TunnelController for MemoryTunnel {
             })
             .is_ok()
         {
-            return Err(TunnelError::Backend("test_stop_failed".to_string()));
+            return Err(TunnelError::Backend(
+                self.stop_failure_code
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "test_stop_failed".to_string()),
+            ));
         }
         *self.status.lock().unwrap() = TunnelStatus::Stopped;
         Ok(())
@@ -535,6 +549,7 @@ struct MockApi {
     start_requests: Mutex<Vec<ConnectionStartRequest>>,
     operation_ids: Mutex<Vec<String>>,
     stop_calls: AtomicUsize,
+    hold_stop: AtomicBool,
     redundant_stop_calls: AtomicUsize,
     redundant_stop_requests: Mutex<Vec<RedundantStopRequest>>,
     stop_failures: AtomicUsize,
@@ -588,6 +603,7 @@ impl MockApi {
             start_requests: Mutex::new(Vec::new()),
             operation_ids: Mutex::new(Vec::new()),
             stop_calls: AtomicUsize::new(0),
+            hold_stop: AtomicBool::new(false),
             redundant_stop_calls: AtomicUsize::new(0),
             redundant_stop_requests: Mutex::new(Vec::new()),
             stop_failures: AtomicUsize::new(0),
@@ -788,6 +804,9 @@ impl CoreApi for MockApi {
             .lock()
             .unwrap()
             .push(request.failure_code.clone());
+        if self.hold_stop.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.reject_stale_stop.load(Ordering::SeqCst)
             && access_token.access_token() == "stale-access"
         {
@@ -2321,6 +2340,43 @@ async fn start_refreshes_once_and_reuses_the_same_operation() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn start_timeout_is_not_replaced_by_pending_redundant_cleanup() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    tunnel.fail_next_starts.store(1, Ordering::SeqCst);
+    *tunnel.start_failure_code.lock().unwrap() = Some("tunnel_start_timeout".into());
+    tunnel
+        .leave_failed_on_start_failure
+        .store(true, Ordering::SeqCst);
+    tunnel.fail_next_stops.store(1, Ordering::SeqCst);
+    *tunnel.stop_failure_code.lock().unwrap() = Some("redundant_stop_pending".into());
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = support::core(
+        api,
+        store.clone(),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let error = core.start(options(), 1_700_000_000).await.unwrap_err();
+    assert!(matches!(error, CoreError::Tunnel(code) if code == "tunnel_start_timeout"));
+    assert_eq!(core.state().await.phase, Phase::Stopping);
+    let pending = store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .unwrap();
+    core.stop().await.unwrap();
+    assert!(store
+        .load()
+        .unwrap()
+        .unwrap()
+        .pending_compensation_stop
+        .is_none());
+    assert!(!pending.operation_id.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn local_start_failure_stops_the_panel_lease_and_returns_to_ready() {
     let api = Arc::new(MockApi::new(0));
     let tunnel = Arc::new(MemoryTunnel::default());
@@ -2420,7 +2476,11 @@ async fn warm_start_local_stop_keeps_server_cleanup_until_acknowledged() {
     assert!(!core.has_pending_stop_cleanup().unwrap());
     assert_eq!(
         api.stop_operation_ids.lock().unwrap().as_slice(),
-        &[pending.operation_id.clone(), pending.operation_id]
+        &[
+            pending.operation_id.clone(),
+            pending.operation_id.clone(),
+            pending.operation_id
+        ]
     );
     let calls = api.stop_calls.load(Ordering::SeqCst);
     core.stop_locally().await.unwrap();
@@ -2498,16 +2558,47 @@ async fn warm_start_pending_stop_survives_core_reconstruction() {
     assert!(!restored.has_pending_stop_cleanup().unwrap());
     assert_eq!(
         api.stop_operation_ids.lock().unwrap().as_slice(),
-        &[pending.operation_id]
+        &[pending.operation_id.clone(), pending.operation_id]
     );
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn hanging_initial_stop_does_not_delay_local_close_or_lose_control_replay() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let store = Arc::new(MemoryStore::new(auth()));
+    let core = support::core(
+        api.clone(),
+        store,
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    core.start(options(), 1_700_000_000).await.unwrap();
+    api.hold_stop.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(1), core.stop_locally())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert!(core.local_stop_pending_cleanup().await);
+    api.hold_stop.store(false, Ordering::SeqCst);
+    core.stop().await.unwrap();
+    let ids = api.stop_operation_ids.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1]);
 }
 
 #[cfg(not(target_os = "android"))]
 #[tokio::test]
 async fn explicit_local_stop_journals_cleanup_and_replays_after_restart() {
     let api = Arc::new(MockApi::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    *api.operation_events.lock().unwrap() = Some(events.clone());
     *api.stop_error.lock().unwrap() = Some(CoreApiError::Retryable);
     let tunnel = Arc::new(MemoryTunnel::default());
+    *tunnel.operation_events.lock().unwrap() = Some(events.clone());
     let store = Arc::new(MemoryStore::new(auth()));
     let core = support::core(
         api.clone(),
@@ -2522,7 +2613,11 @@ async fn explicit_local_stop_journals_cleanup_and_replays_after_restart() {
     assert_eq!(core.state().await.phase, Phase::Stopping);
     assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
     assert!(core.local_stop_pending_cleanup().await);
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        &["panel_stop", "local_stop"]
+    );
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
     let pending = store
         .load()
         .unwrap()
@@ -2562,6 +2657,7 @@ async fn explicit_local_stop_journals_cleanup_and_replays_after_restart() {
         &[
             pending.operation_id.clone(),
             pending.operation_id.clone(),
+            pending.operation_id.clone(),
             pending.operation_id
         ]
     );
@@ -2595,7 +2691,7 @@ async fn explicit_local_stop_failure_retains_cleanup_without_claiming_local_disc
         .unwrap()
         .pending_compensation_stop
         .is_some());
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
     core.stop_locally().await.unwrap();
     assert!(core.local_stop_pending_cleanup().await);
     assert!(core.start_saved_stray_offline(1_700_000_001).await.is_err());
@@ -2647,7 +2743,7 @@ async fn explicit_local_stop_cleanup_fences_new_starts_and_conflicting_leases() 
             .as_ref(),
         Some(&pending)
     );
-    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(api.stop_calls.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(not(target_os = "android"))]

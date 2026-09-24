@@ -1991,7 +1991,10 @@ pub async fn app_state(
     #[cfg(not(target_os = "android"))]
     let local_cleanup = application.local_stop_pending_cleanup().await;
     #[cfg(target_os = "android")]
-    let local_cleanup = false;
+    let local_cleanup = app
+        .tunnel_android()
+        .connection_intent_status()
+        .is_ok_and(|status| status.local_stop_pending_cleanup);
     Ok(AppStateResponse::new(
         state,
         warning,
@@ -2333,7 +2336,10 @@ pub(crate) async fn quick_toggle(
     #[cfg(not(target_os = "android"))]
     let local_cleanup = application.local_stop_pending_cleanup().await;
     #[cfg(target_os = "android")]
-    let local_cleanup = false;
+    let local_cleanup = app
+        .tunnel_android()
+        .connection_intent_status()
+        .is_ok_and(|status| status.local_stop_pending_cleanup);
     Ok(AppStateResponse::new(
         state,
         warning,
@@ -4834,6 +4840,7 @@ mod tests {
                         last_error_code: None,
                         reserve_state: None,
                         redundant_session_owned: false,
+                        local_stop_pending_cleanup: false,
                     },
                 )
             },
@@ -5089,6 +5096,7 @@ mod tests {
                             last_error_code: None,
                             reserve_state: None,
                             redundant_session_owned: false,
+                            local_stop_pending_cleanup: false,
                         },
                     )
                 },
@@ -5122,6 +5130,7 @@ mod tests {
                             last_error_code: None,
                             reserve_state: None,
                             redundant_session_owned: false,
+                            local_stop_pending_cleanup: false,
                         },
                     )
                 },
@@ -5566,6 +5575,7 @@ mod tests {
                                             last_error_code: None,
                                             reserve_state: None,
                                             redundant_session_owned: false,
+                                            local_stop_pending_cleanup: false,
                                         },
                                     )
                                 },
@@ -5606,6 +5616,7 @@ mod tests {
                                             last_error_code: None,
                                             reserve_state: None,
                                             redundant_session_owned: false,
+                                            local_stop_pending_cleanup: false,
                                         },
                                     )
                                 },
@@ -5644,6 +5655,7 @@ mod tests {
                                 last_error_code: None,
                                 reserve_state: None,
                                 redundant_session_owned: false,
+                                local_stop_pending_cleanup: false,
                             },
                         )
                     })
@@ -5819,6 +5831,7 @@ mod tests {
             last_error_code: None,
             reserve_state: None,
             redundant_session_owned: false,
+            local_stop_pending_cleanup: false,
         }
     }
 
@@ -5861,6 +5874,7 @@ mod tests {
                         last_error_code: None,
                         reserve_state: None,
                         redundant_session_owned: false,
+                        local_stop_pending_cleanup: false,
                     },
                 )
             },
@@ -5908,6 +5922,7 @@ mod tests {
                         last_error_code: None,
                         reserve_state: None,
                         redundant_session_owned: false,
+                        local_stop_pending_cleanup: false,
                     },
                 )
             },
@@ -5985,6 +6000,7 @@ mod tests {
                                 last_error_code: None,
                                 reserve_state: None,
                                 redundant_session_owned: false,
+                                local_stop_pending_cleanup: false,
                             },
                         )
                     },
@@ -6033,6 +6049,7 @@ mod tests {
                         last_error_code: None,
                         reserve_state: None,
                         redundant_session_owned: false,
+                        local_stop_pending_cleanup: false,
                     },
                 )
             },

@@ -2494,6 +2494,15 @@ where
                 .compensate_failed_start(failed_start, FailedStartStage::Local, &error)
                 .await
                 .err();
+            // Cleanup remains durable and keeps Phase::Stopping. It must not
+            // replace the cause of a failed Start with an unrelated VPN hint.
+            if matches!(&error, CoreError::Tunnel(code)
+                if code == "tunnel_start_timeout" || code == "tunnel_handshake_timeout")
+                && matches!(&compensation_error, Some(CoreError::Tunnel(code))
+                    if code == "redundant_stop_pending")
+            {
+                return Err(error);
+            }
             return Err(compensation_error.unwrap_or(error));
         }
         self.logger.record_timed(
@@ -2696,7 +2705,54 @@ where
         *self.active_recovery_episode.lock().await = None;
         self.set_phase(Phase::Stopping).await;
         if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
-            self.tunnel.stop().await?;
+            let pending = journal_result
+                .as_ref()
+                .ok()
+                .and_then(|_| self.load_runtime().ok())
+                .and_then(|stored| stored.pending_compensation_stop);
+            // Initiate the durable request before closing the tunnel, but never
+            // wait for its response. Losing it while routes change is expected;
+            // the post-close worker replays the exact same operation.
+            let initial_request = async {
+                if let Some(pending) = pending {
+                    if let Ok(access) = self.access_snapshot().await {
+                        if let Some(session_id) = pending.redundant_session_id {
+                            let _ = self
+                                .api
+                                .stop_redundant_connection(
+                                    &access,
+                                    &RedundantStopRequest {
+                                        operation_id: pending.operation_id,
+                                        lease_id: pending.lease_id,
+                                        recovery_contract_version: RecoveryContractV2,
+                                        session_id,
+                                    },
+                                )
+                                .await;
+                        } else {
+                            let _ = self
+                                .api
+                                .stop_connection(
+                                    &access,
+                                    &ConnectionOperationRequest {
+                                        operation_id: pending.operation_id,
+                                        lease_id: pending.lease_id,
+                                        failure_code: pending.failure_code,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                }
+            };
+            tokio::pin!(initial_request);
+            let local_stop = self.tunnel.stop();
+            tokio::pin!(local_stop);
+            tokio::select! {
+                biased;
+                _ = &mut initial_request => { local_stop.await?; }
+                result = &mut local_stop => { result?; }
+            }
         }
         // Storage failure must not leave the user's local tunnel running.
         // No panel request is sent until a cleanup identity has been persisted.
@@ -5501,6 +5557,7 @@ fn redundant_tunnel_start(
             configuration: TunnelConfiguration::new(member.configuration.clone()),
         });
     Ok(Some(RedundantTunnelStart {
+        warm_stop_v1: redundancy.warm_stop_v1,
         session_id: redundancy.session_id.clone(),
         state: redundancy.state,
         operation_id: operation_id.to_string(),

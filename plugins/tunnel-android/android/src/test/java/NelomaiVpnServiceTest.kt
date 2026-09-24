@@ -2304,6 +2304,18 @@ class NelomaiVpnServiceTest {
         assertFalse(status.desiredActive)
         assertEquals("stopping", status.status)
         assertEquals("cleanup_pending", status.leasePhase)
+        assertFalse(status.localStopPendingCleanup)
+        val stopping = recovery.cancelRedundantIntentAndDeferStop("stop-one",
+            requireNotNull(cancelled.redundantTransaction).startOperationId).successEnvelope()
+        val locallyClosed = connectionIntentServiceStatus(stopping, localClosedStartOperationId =
+            requireNotNull(cancelled.redundantTransaction).startOperationId)
+        assertTrue(locallyClosed.localStopPendingCleanup)
+        assertTrue(locallyClosed.redundantSessionOwned)
+        assertEquals("stopping", locallyClosed.status)
+        assertFalse(connectionIntentServiceStatus(cancelled, localClosedStartOperationId = "other-start")
+            .localStopPendingCleanup)
+        assertFalse(connectionIntentServiceStatus(serviceV2Envelope(), localClosedStartOperationId =
+            requireNotNull(serviceV2Envelope().redundantTransaction).startOperationId).localStopPendingCleanup)
     }
 
     @Test

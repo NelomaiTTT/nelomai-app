@@ -5,6 +5,81 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RedundantStopAcknowledgementTest {
+    @Test fun retentionDecisionAndLastPrimaryAreFrozenAcrossStopRetries() {
+        for (supported in listOf(false, true)) {
+            var bytes: ByteArray? = null
+            val store = AndroidRecoveryStore(object : EncryptedRecordBackend {
+                override fun read() = bytes?.copyOf()
+                override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.copyOf(); return true }
+            }, BootIdentityProvider { 7L })
+            assertTrue(store.beginRedundant(transaction.copy(warmStopSupported = supported,
+                localActiveLeaseId = "lease-b")) is RecoveryStoreResult.Success)
+            val first = (store.cancelRedundantIntentAndDeferStop("stop-first", "old-start",
+                retainActivePeer = true) as RecoveryStoreResult.Success).value.redundantTransaction!!
+            assertEquals(supported, first.retainActivePeerOnStop)
+            assertEquals("lease-b", first.localActiveLeaseId)
+            val repeated = (store.cancelRedundantIntentAndDeferStop("stop-second", "old-start")
+                as RecoveryStoreResult.Success).value.redundantTransaction!!
+            assertEquals("stop-first", repeated.stopOperationId)
+            assertEquals(first.retainActivePeerOnStop, repeated.retainActivePeerOnStop)
+            assertEquals("lease-b", repeated.localActiveLeaseId)
+        }
+    }
+
+    @Test fun initialStopRequestAndInFlightRoleDoNotHoldLocalShutdown() {
+        for (holdRole in listOf(false, true)) checkLocalShutdown(holdRole)
+    }
+
+    private fun checkLocalShutdown(holdRole: Boolean) {
+        var bytes: ByteArray? = null
+        val store = AndroidRecoveryStore(object : EncryptedRecordBackend {
+            override fun read() = bytes?.copyOf()
+            override fun write(plaintext: ByteArray): Boolean { bytes = plaintext.copyOf(); return true }
+        }, BootIdentityProvider { 7L })
+        assertTrue(store.beginRedundant(transaction) is RecoveryStoreResult.Success)
+        if (!holdRole) assertTrue(store.cancelRedundantIntentAndDeferStop("stop-one", "old-start") is RecoveryStoreResult.Success)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val nativeStops = java.util.concurrent.atomic.AtomicInteger()
+        val panel = object : RedundantConnectionPanel {
+            override fun recover(transaction: AndroidRedundantTransaction) = error("unused")
+            override fun reportRole(transaction: AndroidRedundantTransaction, reason: String): RedundantRoleResponse {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                error("network lost")
+            }
+            override fun releaseStandby(transaction: AndroidRedundantTransaction, inactiveLeaseId: String?) = error("unused")
+            override fun acquireStandby(transaction: AndroidRedundantTransaction, operationId: String, replaceLeaseId: String?) = error("unused")
+            override fun commitCandidate(transaction: AndroidRedundantTransaction, candidateLeaseId: String) = error("unused")
+            override fun stop(transaction: AndroidRedundantTransaction): Boolean {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                return true
+            }
+        }
+        val native = object : RedundantConnectionNative {
+            override fun start(leaseId: String, slot: RedundantSlot, configuration: ByteArray, healthProbe: BackgroundRedundantHealthProbe?) = false
+            override fun activate(leaseId: String) = false
+            override fun stopSlot(leaseId: String) = true
+            override fun stop(): Boolean { nativeStops.incrementAndGet(); return true }
+            override fun isUsable(leaseId: String) = false
+        }
+        val coordinator = RedundantConnectionCoordinator(store, panel, native,
+            expectedStartOperationId = "old-start")
+        val worker = Thread {
+            if (holdRole) coordinator.reportLocalRole("primary_ready") else coordinator.notifyStop()
+        }.also { it.start() }
+        try {
+            assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            if (holdRole) assertTrue(store.cancelRedundantIntentAndDeferStop("stop-one", "old-start") is RecoveryStoreResult.Success)
+            assertTrue(coordinator.closeDataplaneForStop())
+            assertEquals(1, nativeStops.get())
+            assertNotNull((store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+        } finally { release.countDown(); worker.join(2_000) }
+        assertFalse(worker.isAlive)
+        assertNotNull((store.read() as RecoveryStoreResult.Success).value.redundantTransaction)
+    }
+
     private val transaction = AndroidRedundantTransaction(
         desiredActive = true,
         template = AndroidIntentTemplate("11111111-1111-4111-8111-111111111111", "account",
@@ -46,6 +121,24 @@ class RedundantStopAcknowledgementTest {
             assertFalse(reply.toString(), panel { reply }.stop(transaction))
         }
         assertFalse(panel { error("transport down") }.stop(transaction))
+    }
+
+    @Test fun warmStopAcknowledgementRequiresNegotiatedCapabilityAndWholeSessionCleanup() {
+        val requested = transaction.copy(warmStopSupported = true, retainActivePeerOnStop = true,
+            desiredActive = false, stopOperationId = "stop-one",
+            retry = transaction.retry.copy(stopState = RedundantStopState.PENDING))
+        assertTrue(backgroundRedundantStopPayload(requested, "lease-a").getBoolean("retain_active_peer"))
+        assertFalse(backgroundRedundantStopPayload(transaction.copy(stopOperationId = "stop-one"), "lease-a")
+            .has("retain_active_peer"))
+        assertFalse(panel { response("warm") }.stop(transaction))
+        assertFalse(panel { response("warm") }.stop(transaction.copy(warmStopSupported = true)))
+        assertTrue(panel { response("warm") }.stop(requested))
+        assertFalse(panel { response("warm", transaction.sessionId) }.stop(requested))
+        assertFalse(panel { response("warm", lease = "other") }.stop(requested))
+        val envelope = AndroidRecoveryEnvelope.empty(7).copy(redundantTransaction = requested)
+        val reopened = AndroidRecoveryEnvelopeCodec.decode(AndroidRecoveryEnvelopeCodec.encode(envelope))
+        assertEquals(backgroundRedundantStopPayload(requested, "lease-a").toString(),
+            backgroundRedundantStopPayload(reopened.redundantTransaction!!, "lease-a").toString())
     }
 
     @Test fun networkRestartRemainsBehindWholeSessionBarrierAcrossProcessRecreation() {

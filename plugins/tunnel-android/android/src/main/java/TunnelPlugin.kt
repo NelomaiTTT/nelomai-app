@@ -145,6 +145,7 @@ class RedundantStandbyArgs {
 
 @InvokeArg
 class RedundantStartArgs {
+    var warmStopV1: Boolean = false
     lateinit var sessionId: String
     lateinit var state: String
     lateinit var operationId: String
@@ -3337,5 +3338,6 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
         put("lastErrorCode", lastErrorCode)
         put("reserveState", reserveState)
         put("redundantSessionOwned", redundantSessionOwned)
+        put("localStopPendingCleanup", localStopPendingCleanup)
     }
 }

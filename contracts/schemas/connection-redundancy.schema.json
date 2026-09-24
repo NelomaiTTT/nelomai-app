@@ -177,6 +177,7 @@
       "type": "object",
       "required": ["operation_id", "lease_id", "recovery_contract_version", "session_id"],
       "properties": {
+        "retain_active_peer": { "type": "boolean", "default": false },
         "operation_id": { "$ref": "common.schema.json#/$defs/uuid" },
         "lease_id": { "$ref": "common.schema.json#/$defs/uuid" },
         "recovery_contract_version": { "const": 2 },

@@ -204,6 +204,7 @@ impl Serialize for RedundantStandbyRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RedundantStartRequest {
+    pub warm_stop_v1: bool,
     pub session_id: String,
     pub state: RedundancyState,
     pub operation_id: String,
@@ -257,6 +258,7 @@ impl From<RedundantTunnelStandbyStart> for RedundantStandbyRequest {
 impl From<RedundantTunnelStart> for RedundantStartRequest {
     fn from(start: RedundantTunnelStart) -> Self {
         Self {
+            warm_stop_v1: start.warm_stop_v1,
             session_id: start.session_id,
             state: start.state,
             operation_id: start.operation_id,
@@ -458,6 +460,8 @@ pub struct ConnectionIntentStatusResponse {
     pub reserve_state: Option<String>,
     #[serde(default)]
     pub redundant_session_owned: bool,
+    #[serde(default)]
+    pub local_stop_pending_cleanup: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -661,6 +665,7 @@ mod tests {
     fn start_request_serializes_both_redundant_members_and_redacts_configs() {
         let mut request = StartTunnelRequest::new(b"primary-never-log-this");
         request.redundancy = Some(RedundantStartRequest {
+            warm_stop_v1: false,
             session_id: "session-1".to_string(),
             state: RedundancyState::Ready,
             operation_id: "operation-1".to_string(),

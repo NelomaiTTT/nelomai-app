@@ -27,6 +27,7 @@
         "membership_generation": { "$ref": "common.schema.json#/$defs/generation" },
         "virtual_address_v4": { "type": "string", "minLength": 1, "maxLength": 64 },
         "standby_desired": { "type": "boolean" },
+        "warm_stop_v1": { "type": "boolean", "default": false },
         "reason": {
           "anyOf": [
             { "type": "string", "minLength": 1, "maxLength": 120 },
