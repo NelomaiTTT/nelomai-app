@@ -26,6 +26,7 @@ internal fun requiresVpnStartAdmission(context: android.content.Context, intent:
         NelomaiVpnService.ACTION_CONNECTION_INTENT_STATUS, NelomaiVpnService.ACTION_BEGIN_BACKGROUND_LOGOUT,
         NelomaiVpnService.ACTION_BACKGROUND_STATUS, NelomaiVpnService.ACTION_CLEAR_BACKGROUND,
         NelomaiVpnService.ACTION_CLEAR_QUICK_PLAN, NelomaiVpnService.ACTION_UPDATE_QUICK_DNS,
+        NelomaiVpnService.ACTION_PREPARE_QUICK_PLAN,
         NelomaiVpnService.ACTION_TAKE_STATE_CHANGE, NelomaiVpnService.ACTION_ACKNOWLEDGE_STATE_CHANGE,
         NelomaiVpnService.ACTION_RELEASE_REDUNDANT_STANDBY -> false
         else -> true

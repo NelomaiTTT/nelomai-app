@@ -5,6 +5,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BackgroundQuickV2Test {
+    @Test fun failedPreflightRetriesWithoutSubmittingAnInvalidStart() {
+        val selected = template(true)
+        val failed = listOf(BackgroundProbeResult("candidate", null, "timeout", "2026-09-25T12:00:00Z"))
+        val error = assertThrows(BackgroundConnectionException::class.java) {
+            backgroundExactStartPayload(selected, pending(selected), failed)
+        }
+        assertEquals("server_probes_unavailable", error.code)
+        assertEquals(ConnectionIntentDecision.RETRY_SAME_OPERATION, ConnectionIntentErrorPolicy().classify(error.code))
+        assertEquals(ConnectionIntentDecision.TERMINAL, ConnectionIntentErrorPolicy().classify("invalid_probe_results"))
+        val healthy = failed + BackgroundProbeResult("healthy", 12.0, null, "2026-09-25T12:00:00Z")
+        assertEquals(2, backgroundExactStartPayload(selected, pending(selected), healthy).getJSONArray("probes").length())
+    }
+
     @Test
     fun foregroundStrayReplayRetainsMeasuredSignatureEvenWithoutAlternatePreference() {
         val selected = template(true)
@@ -65,8 +78,9 @@ class BackgroundQuickV2Test {
 
     @Test
     fun firstResponseKeepsConfigurationsInMemoryForImmediateStart() {
-        val template = template(true)
+        val template = template(true).copy(quickPlanRevision = "local-plan-1")
         val result = backgroundExactStartResult(payload(), template, pending(template))
+        assertEquals("local-plan-1", result.quickPlanRevision)
         val transaction = requireNotNull(result.redundantTransaction)
         assertEquals(PRIMARY, transaction.slotALeaseId)
         assertEquals(STANDBY, transaction.slotBLeaseId)

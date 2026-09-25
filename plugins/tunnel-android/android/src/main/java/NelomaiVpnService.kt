@@ -1045,6 +1045,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             intent?.action == ACTION_CLEAR_BACKGROUND -> handleClearBackground(intent)
             intent?.action == ACTION_CLEAR_QUICK_PLAN -> handleClearQuickPlan(intent)
             intent?.action == ACTION_UPDATE_QUICK_DNS -> handleUpdateQuickDns(intent)
+            intent?.action == ACTION_PREPARE_QUICK_PLAN -> handlePrepareQuickPlan(intent)
             intent?.action == ACTION_TAKE_STATE_CHANGE -> handleTakeStateChange(intent)
             intent?.action == ACTION_ACKNOWLEDGE_STATE_CHANGE -> handleAcknowledgeStateChange(intent)
             intent == null && resumeStickyConnectionIntentAfterRedundantBarrier() -> Unit
@@ -3351,6 +3352,31 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         stopIfIdle()
     }
 
+    private fun handlePrepareQuickPlan(intent: Intent) {
+        val result = runCatching {
+            check(intent.getIntExtra(EXTRA_API_VERSION, 0) == TUNNEL_API_VERSION)
+            val deviceId = canonicalUuid(intent.getStringExtra(EXTRA_DEVICE_ID))
+            val credential = BackgroundCredentialStore.load(applicationContext)
+            check(credential != null && credential.deviceId == deviceId) { "background_owner_scope_mismatch" }
+            val connection = requireNotNull(intent.getBundleExtra(EXTRA_QUICK_CONNECTION)).toQuickConnection()
+            require(connection.leaseId.isEmpty())
+            require(connection.layer in setOf("tic", "stray"))
+            require(connection.ticConnectionMode in setOf("personal", "dynamic"))
+            require(connection.routeMode in setOf("standalone", "via_tak"))
+            require(connection.egressMode in setOf("ipv4", "prefer_ipv6"))
+            connection.reserveEnabled = if (intent.hasExtra(EXTRA_RESERVE_PREFERENCE) &&
+                (connection.layer == "stray" || connection.ticConnectionMode == "dynamic")) {
+                intent.getBooleanExtra(EXTRA_RESERVE_PREFERENCE, false)
+            } else null
+            val options = normalizeAndroidTunnelOptions(Build.VERSION.SDK_INT,
+                requireNotNull(intent.getBundleExtra(EXTRA_OPTIONS)).toTunnelOptions()).toTunnelOptionsArgs()
+            check(QuickTunnelPlanStore.prepareForNextStart(applicationContext, QuickTunnelTemplate(options, connection)))
+        }
+        if (result.isSuccess) intent.resultReceiver().sendSuccess()
+        else intent.resultReceiver().sendError("quick_plan_preparation_failed")
+        stopIfIdle()
+    }
+
     private fun handleTakeStateChange(intent: Intent) {
         val revision = QuickTunnelController.takeStateChangeRevision(applicationContext)
         intent.resultReceiver()?.send(
@@ -4524,6 +4550,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                         apiVersion = TUNNEL_API_VERSION
                         clientOperationId = operationId
                         startSource = "connection_intent"
+                        quickPlanRevision = result.quickPlanRevision
                         configuration = result.configuration
                         options = result.options
                         cacheQuickAction = true
@@ -4917,6 +4944,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         internal const val ACTION_CLEAR_BACKGROUND = "ru.nelomai.tunnel.CLEAR_BACKGROUND"
         internal const val ACTION_CLEAR_QUICK_PLAN = "ru.nelomai.tunnel.CLEAR_QUICK_PLAN"
         internal const val ACTION_UPDATE_QUICK_DNS = "ru.nelomai.tunnel.UPDATE_QUICK_DNS"
+        internal const val ACTION_PREPARE_QUICK_PLAN = "ru.nelomai.tunnel.PREPARE_QUICK_PLAN"
         internal const val ACTION_TAKE_STATE_CHANGE = "ru.nelomai.tunnel.TAKE_STATE_CHANGE"
         internal const val ACTION_ACKNOWLEDGE_STATE_CHANGE =
             "ru.nelomai.tunnel.ACKNOWLEDGE_STATE_CHANGE"
@@ -6135,6 +6163,7 @@ internal fun quickConnectionIntentTemplate(
         allowAlternate = selected.allowAlternate,
         options = normalizeAndroidTunnelOptions(androidApiLevel, quick.options),
         reserveEnabled = selected.reserveEnabled,
+        quickPlanRevision = quick.planRevision,
     )
 }
 

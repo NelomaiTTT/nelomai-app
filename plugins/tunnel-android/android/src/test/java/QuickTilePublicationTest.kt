@@ -3,6 +3,7 @@ package ru.nelomai.tunnel
 import android.content.ComponentName
 import android.content.Context
 import android.service.quicksettings.TileService
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -15,6 +16,196 @@ import org.robolectric.annotation.Implements
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34], manifest = Config.NONE, shadows = [TileRefreshRecorder::class])
 class QuickTilePublicationTest {
+    @Test fun explicitUiStartCanDisableSplitWithoutRestoringAnOldPolicy() {
+        val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs().apply {
+            policyHash = "old-policy"; splitActive = true
+        }, quickConnection(true)))
+        storage.save(StartTunnelArgs().apply {
+            cacheQuickAction = true
+            quickConnection = quickConnection(true).apply { leaseId = "ui-lease" }
+            options = TunnelOptionsArgs()
+        })
+        assertNull(storage.loadTemplate()?.options?.policyHash)
+        assertFalse(requireNotNull(storage.loadTemplate()).options.splitActive)
+    }
+
+    @Test fun policyArrivingAfterFirstStartRepairsNextStartWithoutChangingRunningArgs() {
+        checkFirstStartPolicyRace(syncBeforeSave = false)
+    }
+
+    @Test fun lateFirstStartSaveCannotRollBackTheSyncedPolicy() {
+        checkFirstStartPolicyRace(syncBeforeSave = true)
+    }
+
+    private fun checkFirstStartPolicyRace(syncBeforeSave: Boolean) {
+        val backend = QuickPlanMemoryBackend()
+        val storage = QuickTunnelPlanStorage(backend)
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs(), quickConnection(true)))
+        val captured = requireNotNull(storage.loadTemplate())
+        val running = StartTunnelArgs().apply {
+            cacheQuickAction = true
+            quickPlanRevision = captured.planRevision
+            configuration = byteArrayOf(1)
+            options = captured.options
+            quickConnection = captured.connection.apply { leaseId = "running-lease" }
+        }
+        val fresh = QuickTunnelTemplate(TunnelOptionsArgs().apply {
+            policyHash = "synced-policy"
+            splitActive = true
+            excludedPackages = arrayListOf("com.example.excluded")
+            splitTunnelRoutes = arrayListOf("192.168.0.0/16")
+        }, quickConnection(true))
+        storage.updateReservePreference(false)
+        if (syncBeforeSave) storage.prepareForNextStart(fresh)
+        storage.save(requireNotNull(running.copyForQuickPlan()))
+        if (!syncBeforeSave) storage.prepareForNextStart(fresh)
+        val restored = requireNotNull(QuickTunnelPlanStorage(backend).loadTemplate())
+        assertEquals("synced-policy", restored.options.policyHash)
+        assertTrue(restored.options.splitActive)
+        assertEquals(listOf("com.example.excluded"), restored.options.excludedPackages)
+        assertEquals(listOf("192.168.0.0/16"), restored.options.splitTunnelRoutes)
+        assertEquals("running-lease", restored.connection.leaseId)
+        assertEquals(false, restored.connection.reserveEnabled)
+        assertNull(running.options.policyHash)
+        assertFalse(running.options.splitActive)
+        assertEquals(true, running.quickConnection?.reserveEnabled)
+    }
+
+    @Test fun lateTileSaveCannotUndoAnExplicitlyDisabledSyncedPolicy() {
+        val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs().apply {
+            policyHash = "old-policy"; splitActive = true
+        }, quickConnection(true)))
+        val captured = requireNotNull(storage.loadTemplate())
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs(), quickConnection(true)))
+        storage.save(StartTunnelArgs().apply {
+            cacheQuickAction = true
+            quickPlanRevision = captured.planRevision
+            quickConnection = captured.connection.apply { leaseId = "late-lease" }
+            options = captured.options
+        })
+        assertNull(storage.loadTemplate()?.options?.policyHash)
+        assertFalse(requireNotNull(storage.loadTemplate()).options.splitActive)
+        assertEquals("late-lease", storage.loadTemplate()?.connection?.leaseId)
+    }
+
+    @Test fun quickPlanRevisionSurvivesRecoveryWithoutChangingThePanelFingerprint() {
+        val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs(), quickConnection(true)))
+        val template = quickConnectionIntentTemplate("11111111-1111-4111-8111-111111111111",
+            requireNotNull(storage.loadTemplate()), 34)
+        assertNotNull(template.quickPlanRevision)
+        val recovery = AndroidRecoveryStore(QuickPlanMemoryBackend(), BootIdentityProvider { 1 })
+        assertTrue(AndroidConnectionIntentCoordinator(recovery).begin(template) is AndroidCoordinatorResult.Accepted)
+        val envelope = (recovery.read() as RecoveryStoreResult.Success).value
+        val restored = AndroidRecoveryEnvelopeCodec.decode(AndroidRecoveryEnvelopeCodec.encode(envelope))
+        assertEquals(template.quickPlanRevision, restored.intent.template?.quickPlanRevision)
+        assertEquals(androidConnectionIntentFingerprint(template, true, true),
+            androidConnectionIntentFingerprint(template.copy(quickPlanRevision = null), true, true))
+    }
+
+    @Test fun legacyQuickPlansWithoutRevisionStillDetectAConcurrentRefresh() {
+        val backend = QuickPlanMemoryBackend()
+        val storage = QuickTunnelPlanStorage(backend)
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs(), quickConnection(true)))
+        val legacy = JSONObject(String(requireNotNull(backend.read()))).apply { remove("planRevision") }
+        backend.write(legacy.toString().toByteArray())
+        val captured = requireNotNull(storage.loadTemplate())
+        assertNotNull(captured.planRevision)
+        storage.updateDnsServers(listOf("77.88.8.8"))
+        storage.save(StartTunnelArgs().apply {
+            cacheQuickAction = true; quickPlanRevision = captured.planRevision
+            quickConnection = captured.connection; options = captured.options
+        })
+        assertEquals(listOf("77.88.8.8"), storage.loadTemplate()?.options?.dnsServers)
+    }
+
+    @Test fun savingAnotherProtocolNeverInheritsThePreviousPlansPolicy() {
+        val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
+        storage.prepareForNextStart(QuickTunnelTemplate(TunnelOptionsArgs().apply {
+            policyHash = "stray-policy"; splitActive = true
+        }, quickConnection(true)))
+        storage.save(StartTunnelArgs().apply {
+            cacheQuickAction = true
+            quickConnection = quickConnection(true).apply { layer = "tic"; leaseId = "tic-lease" }
+            options = TunnelOptionsArgs()
+        })
+        val restored = requireNotNull(storage.loadTemplate())
+        assertNull(restored.options.policyHash)
+        assertFalse(restored.options.splitActive)
+        assertEquals("tic-lease", restored.connection.leaseId)
+    }
+
+    @Test fun unusedPreparationRefreshesPolicyButKeepsTheUsersReserveChoice() {
+        val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
+        val fallback = QuickTunnelTemplate(TunnelOptionsArgs(), quickConnection(true))
+        assertTrue(storage.prepareForNextStart(fallback))
+        assertTrue(storage.updateReservePreference(false))
+        val synced = QuickTunnelTemplate(TunnelOptionsArgs().apply {
+            splitActive = true
+            policyHash = "synced-policy"
+            excludedPackages = arrayListOf("com.example.excluded")
+            excludeLocalNetworks = true
+        }, quickConnection(true))
+        assertTrue(storage.prepareForNextStart(synced))
+        val restored = requireNotNull(storage.loadTemplate())
+        assertEquals("synced-policy", restored.options.policyHash)
+        assertTrue(restored.options.splitActive)
+        assertEquals(listOf("com.example.excluded"), restored.options.excludedPackages)
+        assertTrue(restored.options.excludeLocalNetworks)
+        assertEquals(false, restored.connection.reserveEnabled)
+        assertEquals("", restored.connection.leaseId)
+    }
+
+    @Test fun preparationRefreshesFutureOptionsButCannotChangeOwnershipOrAnotherProtocol() {
+        val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
+        val saved = StartTunnelArgs().apply {
+            cacheQuickAction = true
+            quickConnection = quickConnection(true).apply { leaseId = "working-lease" }
+            options = TunnelOptionsArgs().apply { policyHash = "working-policy" }
+        }
+        storage.save(saved)
+        val late = QuickTunnelTemplate(TunnelOptionsArgs().apply { policyHash = "late-policy" }, quickConnection(true))
+        assertTrue(storage.prepareForNextStart(late))
+        assertEquals("late-policy", storage.loadTemplate()?.options?.policyHash)
+        assertEquals("working-lease", storage.loadTemplate()?.connection?.leaseId)
+        assertEquals("working-policy", saved.options.policyHash)
+        saved.quickConnection?.leaseId = ""
+        saved.quickConnection?.layer = "tic"
+        storage.save(saved)
+        assertTrue(storage.prepareForNextStart(late))
+        assertEquals("working-policy", storage.loadTemplate()?.options?.policyHash)
+        assertEquals("tic", storage.loadTemplate()?.connection?.layer)
+    }
+
+    @Test fun preparationCreatesMissingTemplateWithoutLeaseAndPreservesExistingPlan() {
+        val storage = QuickTunnelPlanStorage(QuickPlanMemoryBackend())
+        storage.updateReservePreference(false)
+        val prepared = QuickTunnelTemplate(TunnelOptionsArgs().apply {
+            dnsServers = arrayListOf("9.9.9.9")
+            excludeLocalNetworks = true
+        }, quickConnection(true))
+        assertTrue(storage.prepareForNextStart(prepared))
+        assertEquals("", storage.loadTemplate()?.connection?.leaseId)
+        assertEquals(false, storage.loadTemplate()?.connection?.reserveEnabled)
+        assertEquals(listOf("9.9.9.9"), storage.loadTemplate()?.options?.dnsServers)
+        val old = StartTunnelArgs().apply { cacheQuickAction = true; quickConnection = quickConnection(true).apply { leaseId = "active-lease" } }
+        storage.save(old)
+        assertTrue(storage.prepareForNextStart(prepared))
+        assertEquals("active-lease", storage.loadTemplate()?.connection?.leaseId)
+    }
+
+    @Test fun corruptNewLegacyEnvelopeMustNotBeMistakenForMissingSource() {
+        val context = RuntimeEnvironment.getApplication()
+        val name = "nelomai-quick-tunnel-plan"
+        context.getSharedPreferences(name, Context.MODE_PRIVATE).edit()
+            .putString("encrypted-envelope-v1", "AA==").commit()
+        val source = AndroidNativeRuntimeStorageAccess(context).source(name, "encrypted-envelope-v1")
+        assertThrows(EncryptedRecordCorruptException::class.java) { source.read() }
+        assertTrue(context.getSharedPreferences(name, Context.MODE_PRIVATE).contains("encrypted-envelope-v1"))
+    }
+
     @Test fun reservePreferenceSurvivesLatePlanSaveAndNeverChangesLiveStartArgs() {
         val backend = QuickPlanMemoryBackend()
         val storage = QuickTunnelPlanStorage(backend)

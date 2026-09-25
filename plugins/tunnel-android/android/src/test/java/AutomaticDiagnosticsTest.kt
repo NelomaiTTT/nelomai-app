@@ -13,6 +13,26 @@ import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
 class AutomaticDiagnosticsTest {
+    @Test fun intentReportRetainsSafeProbeFailureCodeAlongsideItsClass() {
+        val event = automaticDiagnosticsConnectionIntentEvent("retry_scheduled", "server_probes_unavailable", 1, 2)
+        val safe = JSONObject(automaticDiagnosticsSafeConnectionIntentLog(event.toString()).trim())
+        assertEquals("server_probes_unavailable", safe.getString("code"))
+        assertEquals("network", safe.getString("reason_class"))
+        val unknown = automaticDiagnosticsConnectionIntentEvent("terminal_failure", "private-token")
+        assertFalse(automaticDiagnosticsSafeConnectionIntentLog(unknown.toString()).contains("private-token"))
+    }
+
+    @Test fun knownStartFailureCodeSurvivesDurableRoundTripButArbitraryTextDoesNot() {
+        val request = StartFailureRequest("33333333-3333-4333-8333-333333333333",
+            "11111111-1111-4111-8111-111111111111", "temporarily_unavailable", 100, false)
+        for (code in listOf("temporarily_unavailable", "android_service_status_unavailable",
+                "invalid_probe_results", "quick_action_plan_unavailable", "server_probes_unavailable")) {
+            assertEquals(code, StartFailureRequest.fromJson(request.copy(errorCode = code).toJson()).errorCode)
+        }
+        assertEquals("other", StartFailureRequest.fromJson(request.copy(errorCode = "secret-token-private").toJson()).errorCode)
+        assertFalse(request.copy(errorCode = "secret-token-private").toJson().contains("secret-token-private"))
+    }
+
     @Test
     fun `redundant recovery and replacement counters use explicit events`() {
         val accumulator = RedundantDiagnosticsAccumulator()

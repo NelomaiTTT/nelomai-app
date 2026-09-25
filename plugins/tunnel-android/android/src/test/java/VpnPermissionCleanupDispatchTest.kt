@@ -77,6 +77,58 @@ class VpnPermissionCleanupDispatchTest {
         assertFalse(intent.getBooleanExtra(RuntimeServiceIntents.EXTRA_FOREGROUND_START, false))
     }
 
+    @Test fun quickPlanPreparationDoesNotStartVpnOrRequireVpnPermission() {
+        val args = PrepareQuickPlanArgs().apply {
+            apiVersion = TUNNEL_API_VERSION
+            deviceId = "11111111-1111-4111-8111-111111111111"
+            connection = QuickConnectionArgs().apply {
+                leaseId = ""; layer = "stray"; ticConnectionMode = "dynamic"
+                routeMode = "standalone"; allowAlternate = true
+            }
+            reserveEnabled = true
+        }
+        TunnelServiceClient.prepareQuickPlan(context, args, {}, {})
+        val intent = shadowOf(context).nextStartedService
+        assertEquals(NelomaiVpnService.ACTION_PREPARE_QUICK_PLAN, intent.action)
+        assertFalse(intent.getBooleanExtra(RuntimeServiceIntents.EXTRA_FOREGROUND_START, false))
+        assertFalse(requiresVpnStartAdmission(context, intent))
+        assertFalse(intent.hasExtra(EXTRA_CONFIGURATION))
+        assertEquals("", intent.getBundleExtra(EXTRA_QUICK_CONNECTION)?.toQuickConnection()?.leaseId)
+        assertTrue(intent.getBooleanExtra(EXTRA_RESERVE_PREFERENCE, false))
+    }
+
+    @Test fun quickPlanPreparationWithoutCredentialIsRejectedWithoutActivatingVpn() {
+        val reply = AwaitingReceiver()
+        withEngine { engine ->
+            engine.start(Intent(NelomaiVpnService.ACTION_PREPARE_QUICK_PLAN)
+                .putExtra(EXTRA_API_VERSION, TUNNEL_API_VERSION)
+                .putExtra(EXTRA_DEVICE_ID, "11111111-1111-4111-8111-111111111111")
+                .putExtra(EXTRA_RESULT_RECEIVER, reply), 0, 1)
+            assertTrue(reply.await())
+            assertEquals(SERVICE_RESULT_ERROR, reply.resultCode)
+            assertEquals("quick_plan_preparation_failed", reply.resultData?.getString(EXTRA_ERROR_CODE))
+        }
+    }
+
+    @Test fun quickPreparationIpcDistinguishesLegacyFromV2WithReserveDisabled() {
+        for (choice in listOf(null, false, true)) {
+            val args = PrepareQuickPlanArgs().apply {
+                apiVersion = TUNNEL_API_VERSION
+                deviceId = "11111111-1111-4111-8111-111111111111"
+                connection = QuickConnectionArgs().apply {
+                    leaseId = ""; layer = "stray"; ticConnectionMode = "dynamic"
+                    routeMode = "standalone"
+                }
+                reserveEnabled = choice
+            }
+            TunnelServiceClient.prepareQuickPlan(context, args, {}, {})
+            val intent = shadowOf(context).nextStartedService
+            assertEquals(choice != null, intent.hasExtra(EXTRA_RESERVE_PREFERENCE))
+            if (choice != null) assertEquals(choice, intent.getBooleanExtra(EXTRA_RESERVE_PREFERENCE, !choice))
+            assertFalse(requiresVpnStartAdmission(context, intent))
+        }
+    }
+
     @Test
     fun bothReservePreferencesUseExistingNonStartingServiceCommand() {
         for (enabled in listOf(false, true)) {

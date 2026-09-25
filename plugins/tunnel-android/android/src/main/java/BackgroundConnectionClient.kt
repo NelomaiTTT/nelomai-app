@@ -26,6 +26,7 @@ internal data class BackgroundStartResult(
     val options: TunnelOptionsArgs,
     val redundantTransaction: AndroidRedundantTransaction? = null,
     val redundantTransport: BackgroundRedundantRecoveryTransport? = null,
+    val quickPlanRevision: String? = null,
 ) {
     fun clearSensitiveConfigurations() {
         configuration.fill(0)
@@ -179,7 +180,10 @@ internal class BackgroundCandidateProbeCache(
             earliestCandidateExpiry,
         )
         synchronized(gate) {
-            cached = CacheEntry(layer, egressMode, networkIdentity, ids, validUntil, results)
+            // A temporary outage must not poison the next retry on the same network.
+            cached = if (results.any { it.latencyMillis != null && it.failureCode == null }) {
+                CacheEntry(layer, egressMode, networkIdentity, ids, validUntil, results)
+            } else null
         }
         return results
     }
@@ -1550,7 +1554,7 @@ internal fun backgroundExactStartResult(
             val options = template.options.toTunnelOptionsArgs()
             val transport = redundantRecoveryTransportFromJson(payload, redundant)
             return BackgroundStartResult(
-                byteArrayOf(), selected, options, redundant, transport,
+                byteArrayOf(), selected, options, redundant, transport, template.quickPlanRevision,
             )
         } catch (_: Throwable) {
             throw BackgroundConnectionException("invalid_background_response")
@@ -1564,14 +1568,22 @@ internal fun backgroundExactStartResult(
         configuration.fill(0)
         throw BackgroundConnectionException("invalid_background_configuration")
     }
-    return BackgroundStartResult(configuration, selected, template.options.toTunnelOptionsArgs())
+    return BackgroundStartResult(configuration, selected, template.options.toTunnelOptionsArgs(),
+        quickPlanRevision = template.quickPlanRevision)
 }
 
 internal fun backgroundExactStartPayload(
     template: AndroidIntentTemplate,
     transaction: AndroidLeaseTransaction,
     probes: List<BackgroundProbeResult>,
-): JSONObject = backgroundStartPayload(
+): JSONObject {
+    if (requiresMeasuredCandidateSelection(template.layer, template.ticConnectionMode, template.allowAlternate) &&
+        probes.isNotEmpty() && probes.size <= BACKGROUND_MAX_CANDIDATES &&
+        probes.all { it.latencyMillis == null && it.failureCode in setOf("timeout", "network_error", "http_error") }
+    ) {
+        throw BackgroundConnectionException("server_probes_unavailable")
+    }
+    return backgroundStartPayload(
     QuickTunnelTemplate(template.options.toTunnelOptionsArgs(), QuickConnectionArgs().apply {
         leaseId = ""
         layer = template.layer
@@ -1590,6 +1602,7 @@ internal fun backgroundExactStartPayload(
         requireNotNull(template.reserveEnabled)
     } else null,
 )
+}
 
 internal fun backgroundStartPayload(
     template: QuickTunnelTemplate,

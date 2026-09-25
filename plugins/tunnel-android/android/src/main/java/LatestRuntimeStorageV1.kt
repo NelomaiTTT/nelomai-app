@@ -84,7 +84,12 @@ internal class AndroidNativeRuntimeStorageAccess(
     },
 ) : NativeRuntimeStorageAccess {
     override fun source(name: String, record: String): EncryptedRecordBackend = when (name) {
-        "nelomai-quick-tunnel-plan" -> legacyPair(context, name)
+        "nelomai-quick-tunnel-plan" -> object : EncryptedRecordBackend {
+            override fun write(plaintext: ByteArray): Boolean = error("legacy_source_read_only")
+            override fun read(): ByteArray? =
+                AndroidSecureEnvelopeBackend(context, name, record, name, scoped = false).read()
+                    ?: legacyPair(context, name).read()
+        }
         "nelomai-background-credential" -> backgroundSource(context, name, record)
         else -> AndroidSecureEnvelopeBackend(context, name, record, name, scoped = false)
     }

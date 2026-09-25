@@ -536,6 +536,18 @@ internal object TunnelServiceClient {
         timeoutMillis = QUICK_DNS_UPDATE_TIMEOUT_MILLIS,
     )
 
+    fun prepareQuickPlan(context: Context, args: PrepareQuickPlanArgs,
+        onSuccess: () -> Unit, onError: (String) -> Unit,
+    ) = requestBundle(context,
+        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
+            .setAction(NelomaiVpnService.ACTION_PREPARE_QUICK_PLAN)
+            .putExtra(EXTRA_API_VERSION, args.apiVersion)
+            .putExtra(EXTRA_DEVICE_ID, args.deviceId)
+            .putExtra(EXTRA_QUICK_CONNECTION, args.connection.toBundle())
+            .putExtra(EXTRA_OPTIONS, args.options.toBundle())
+            .apply { args.reserveEnabled?.let { putExtra(EXTRA_RESERVE_PREFERENCE, it) } },
+        { onSuccess() }, onError)
+
     fun takeQuickStateChange(
         context: Context,
         onSuccess: (Boolean, Long) -> Unit,

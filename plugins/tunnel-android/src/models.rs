@@ -76,6 +76,16 @@ pub struct StartFailureDiagnosticsRequest {
     pub error_code: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareQuickPlanRequest {
+    pub api_version: u16,
+    pub device_id: String,
+    pub connection: QuickConnectionRequest,
+    pub options: TunnelOptions,
+    pub reserve_enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceUsageResponse {
