@@ -3,11 +3,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Сборка кандидата без ручных подтверждений; публикация отдельным запуском"
+        description: "build_and_publish — сборка с релизом; sign_candidate — только кандидат; publish_approved_candidate — готовый кандидат"
         type: "choice"
         options:
           - "build_only"
           - "sign_candidate"
+          - "build_and_publish"
           - "publish_approved_candidate"
         default: "build_only"
         required: true
@@ -47,7 +48,9 @@ defaults:
     shell: "bash"
 env:
   SOURCE_SHA: "${{ inputs.source_sha }}"
-  RELEASE_MODE: "${{ inputs.mode }}"
+  # The combined mode reuses the exact signed-candidate pipeline and inventory.
+  # Publication overrides this with its existing, keyless promotion policy.
+  RELEASE_MODE: "${{ inputs.mode == 'build_and_publish' && 'sign_candidate' || inputs.mode }}"
   RELEASE_VERSION: "${{ inputs.version }}"
   GH_TOKEN: "${{ github.token }}"
   NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64: "${{ vars.NELOMAI_RELEASE_MANIFEST_PUBLIC_KEY_B64 }}"
@@ -210,7 +213,7 @@ jobs:
         name: "Phase-local trust"
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase signing --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
         env:
-          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: "${{ inputs.mode == 'sign_candidate' && secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 || '' }}"
+          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 || '' }}"
       -
         run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
       -
@@ -328,6 +331,7 @@ jobs:
       RELEASE_MINIMUM_SUPPORTED: "${{ inputs.minimum_supported }}"
     outputs:
       inventory_sha256: "${{ steps.final.outputs.inventory_sha256 }}"
+      artifact_id: "${{ steps.candidate.outputs.artifact-id }}"
     steps:
       -
         uses: "actions/checkout@v4"
@@ -367,13 +371,13 @@ jobs:
         name: "Phase-local trust"
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase finalization --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
         env:
-          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: "${{ inputs.mode == 'sign_candidate' && secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 || '' }}"
+          NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64 || '' }}"
       -
         name: "Phase-local Android keystore"
-        if: "inputs.mode == 'sign_candidate'"
+        if: "inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish'"
         run: "python -c 'import base64,os,pathlib; p=pathlib.Path(os.environ[\"RUNNER_TEMP\"])/\"android-finalization.jks\"; p.write_bytes(base64.b64decode(os.environ[\"ANDROID_KEYSTORE_BASE64\"],validate=True)); p.chmod(0o600)'"
         env:
-          ANDROID_KEYSTORE_BASE64: "${{ inputs.mode == 'sign_candidate' && secrets.ANDROID_KEYSTORE_BASE64 || '' }}"
+          ANDROID_KEYSTORE_BASE64: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.ANDROID_KEYSTORE_BASE64 || '' }}"
       -
         run: "cargo build --locked -p nelomai-contracts --bin verify-runtime-manifest"
       -
@@ -388,15 +392,16 @@ jobs:
           python -c 'import json,os; d=json.load(open("final-result.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("inventory_sha256="+d["inventory_sha256"]+"\n")'
         id: "final"
         env:
-          TAURI_SIGNING_PRIVATE_KEY: "${{ inputs.mode == 'sign_candidate' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}"
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "${{ inputs.mode == 'sign_candidate' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}"
-          ANDROID_KEY_ALIAS: "${{ inputs.mode == 'sign_candidate' && secrets.ANDROID_KEY_ALIAS || '' }}"
-          ANDROID_KEYSTORE_PASSWORD: "${{ inputs.mode == 'sign_candidate' && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}"
-          ANDROID_KEY_PASSWORD: "${{ inputs.mode == 'sign_candidate' && secrets.ANDROID_KEY_PASSWORD || '' }}"
+          TAURI_SIGNING_PRIVATE_KEY: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}"
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}"
+          ANDROID_KEY_ALIAS: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.ANDROID_KEY_ALIAS || '' }}"
+          ANDROID_KEYSTORE_PASSWORD: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}"
+          ANDROID_KEY_PASSWORD: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.ANDROID_KEY_PASSWORD || '' }}"
           ANDROID_KEYSTORE_PATH: "${{ runner.temp }}/android-finalization.jks"
           ANDROID_SIGNER_SHA256: "${{ vars.ANDROID_SIGNER_SHA256 }}"
       -
         uses: "actions/upload-artifact@v4"
+        id: "candidate"
         with:
           name: "candidate-0.3.2"
           path: "finalized/candidate/"
@@ -404,14 +409,21 @@ jobs:
           overwrite: true
           retention-days: 14
   publish:
-    if: "inputs.mode == 'publish_approved_candidate'"
+    needs:
+      - "finalize"
+    # Standalone promotion has skipped build dependencies; inline promotion
+    # must fail closed unless finalization (including artifact upload) succeeded.
+    if: "always() && !cancelled() && (inputs.mode == 'publish_approved_candidate' || (inputs.mode == 'build_and_publish' && needs.finalize.result == 'success'))"
     environment: "release-publication"
     permissions:
       contents: "write"
       actions: "read"
     runs-on: "ubuntu-22.04"
     env:
-      CANDIDATE_RUN: "${{ inputs.candidate_run_id }}"
+      RELEASE_MODE: "publish_approved_candidate"
+      CANDIDATE_RUN: "${{ inputs.mode == 'build_and_publish' && github.run_id || inputs.candidate_run_id }}"
+      INVENTORY_SHA256: "${{ needs.finalize.outputs.inventory_sha256 }}"
+      FINALIZED_ARTIFACT_ID: "${{ needs.finalize.outputs.artifact_id }}"
       RELEASE_NOTES: "${{ inputs.release_notes }}"
     steps:
       -
@@ -444,22 +456,28 @@ jobs:
           exit 1
         if: "inputs.panel_notification_ready != true"
       - name: "Select retained shipping build"
+        if: "inputs.mode == 'publish_approved_candidate'"
         id: "select"
         run: |
           python scripts/check-publication-inputs.py --select --repository "$GITHUB_REPOSITORY" \
             --run-id "$CANDIDATE_RUN" --source-sha "$SOURCE_SHA" --version "$RELEASE_VERSION"
+      - name: "Require finalized outputs for inline publication"
+        if: "inputs.mode == 'build_and_publish'"
+        run: |
+          test -n "$FINALIZED_ARTIFACT_ID"
+          test -n "$INVENTORY_SHA256"
       - uses: "actions/download-artifact@v4"
         with:
-          artifact-ids: "${{ steps.select.outputs.artifact_id }}"
+          artifact-ids: "${{ inputs.mode == 'build_and_publish' && needs.finalize.outputs.artifact_id || steps.select.outputs.artifact_id }}"
           path: "candidate"
-          run-id: "${{ inputs.candidate_run_id }}"
+          run-id: "${{ env.CANDIDATE_RUN }}"
           merge-multiple: true
           github-token: "${{ github.token }}"
       -
-        name: "Publish selected build without signature or acceptance gates"
+        name: "Publish verified candidate without rebuilding"
         run: |
           python scripts/check-publication-inputs.py --directory candidate --source-sha "$SOURCE_SHA" \
-            --run-id "$CANDIDATE_RUN"
+            --run-id "$CANDIDATE_RUN" --inventory-sha256 "$INVENTORY_SHA256"
           python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.3.2 --source-sha "$SOURCE_SHA"
           mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
           test "${#assets[@]}" -eq 22

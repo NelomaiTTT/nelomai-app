@@ -11,7 +11,7 @@ New namespaced 0.3.0 runtime artifacts are still built for the existing release
 asset set (possible future stable); they are **not** the installed stable slot.
 The historical synthetic 0.2.21 acceptance path remains a fixture, not the 0.3.0
 shipping path. Build-only uses test trust; installation over production requires
-`sign_candidate` and the existing Android certificate. Publication is separate.
+`sign_candidate` (or `build_and_publish`) and the existing Android certificate.
 
 The sections below describe the original artifact mechanism and historical
 0.2.16 examples; they do not override the current stable/source pins above.
@@ -77,10 +77,11 @@ Signature formats stay distinct:
 - Android installation uses its APK keystore certificate; the expected
   `ANDROID_SIGNER_SHA256` is separate from both public-key formats above.
 
-## Current release pipeline (2026-09-09)
+## Current release pipeline (2026-09-25)
 
 The build graph is `verify → native_drafts → sign → native_packages → finalize`.
-Publication remains a separate dispatch; building never publishes.
+Only the explicit `build_and_publish` mode publishes after building. The default
+and candidate-only modes never publish.
 
 - `build_only` is the default. It uses deliberately public TEST trust derived
   per source/run and cannot be promoted. The shared signing/finalization jobs
@@ -92,8 +93,18 @@ Publication remains a separate dispatch; building never publishes.
   neither packaging Python nor Tauri's before-build hook rebuilds the UI.
   `finalize` signs desktop updater packages and the APK, verifies the final
   signatures and writes the release manifest plus shipping inventory.
+- `build_and_publish` uses that same release-trust pipeline, then runs the
+  keyless `publish` job only after successful finalization and artifact upload.
+  It downloads the exact artifact ID emitted by `finalize` in the current run,
+  pins its inventory digest, and checks source/run identity and all file hashes
+  before creating the release. No second build, local download or second dispatch
+  is needed. Supply the exact source/ref, version, release notes and
+  `panel_notification_ready=true`; `candidate_run_id` is not used in this mode.
+  The artifact inventory still uses `mode=sign_candidate`, so a completed build
+  remains compatible with later standalone promotion. A failed/cancelled/skipped
+  finalization cannot publish; an explicit cancellation also blocks publication.
 - `publish_approved_candidate` selects retained bytes from a successful
-  `sign_candidate` run. Supply the source SHA, version, `candidate_run_id`,
+  candidate run. Supply the source SHA, version, `candidate_run_id`,
   release notes and `panel_notification_ready=true`. Artifact ID and inventory
   digest are resolved automatically. Publication checks source/run identity,
   retention, the exact shipping allowlist and each downloaded file hash. It

@@ -110,6 +110,11 @@ and claims about functionality that is not yet present in the release branch.
   The shared `sign` and `finalize` jobs produce runtime and installer
   signatures respectively; only ordinary shipping installers are packaged.
   Manual approval/full acceptance gates are not part of this workflow.
+- `build_and_publish` builds and verifies the same signed candidate, then
+  publishes its exact artifact in the same run after successful finalization.
+  It requires `panel_notification_ready=true` and the agreed release notes.
+  A failed or cancelled build never reaches publication. No local download,
+  second dispatch or rebuild is required; `sign_candidate` remains build-only.
 - `publish_approved_candidate` publishes retained bytes from the selected
   successful candidate run, including reruns. It automatically selects the
   unique nonexpired artifact and checks source/run identity, inventory and
@@ -144,12 +149,14 @@ For every application release:
    preflight against the working database.
 3. Build/sign the exact candidate and inspect the build results. Hardware testing
    remains distinct from build success; there is no automatic full acceptance gate.
-4. Start the manual `release` workflow in `publish_approved_candidate` mode with
+4. For an already built candidate, start `release` in `publish_approved_candidate` mode with
    the source SHA and successful candidate run ID, and
    `panel_notification_ready=true`. The acknowledgement confirms that the
    notification producer is already deployed; it is not a remote capability
    probe.
-5. Let the separately dispatched publication job recheck and create the exact
+   Alternatively, after steps 1–2, select `build_and_publish` to combine steps
+   3–5 automatically. This does not perform or replace hardware acceptance tests.
+5. Let the publication job recheck and create the exact
    version tag/GitHub release at `source_sha`.
 6. Wait for normal panel release sync and verify the notification audit event.
 
