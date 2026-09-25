@@ -29,7 +29,7 @@ def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
     if version not in ("0.2.20", gates.VERSION):
         raise ValueError("unsupported candidate version")
     if version == gates.VERSION and (confirmed_stable is None or stable_public_key is None):
-        raise ValueError("0.3.0 requires the published confirmed stable release-set")
+        raise ValueError(f"{gates.VERSION} requires the published confirmed stable release-set")
     if output.exists() or output.is_symlink():
         raise ValueError("immutable signed candidate output exists")
     if signing_key.is_symlink() or signing_key.resolve().is_relative_to(drafts.resolve()):
@@ -88,7 +88,7 @@ def sign(drafts, output, source, signing_key, public_key, *, version="0.2.20",
                                          gates.STABLE_ROOT_SHA256, staged / "stable-public-key.raw")
         for platform, architecture in verifier.TARGETS:
             prefix = f"nelomai-runtime-{version}-{platform}-{architecture}"
-            # Real 0.3.0 shipping already exercises two slots; synthetic identities
+            # Current shipping already exercises two slots; synthetic identities
             # remain only for the historical maintenance acceptance fixture.
             for kind in (("shipping",) if confirmed_stable is not None else ("shipping", "acceptance")):
                 latest = documents[platform, "latest"]
