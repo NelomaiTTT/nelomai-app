@@ -443,6 +443,32 @@ fn recovery_v2_preserves_two_member_identity_and_redacts_configs() {
 }
 
 #[test]
+fn warm_stop_extension_is_optional_and_typed() {
+    let mut value: Value =
+        serde_json::from_str(&fixture("valid/connection-start-redundant-response.json")).unwrap();
+    let legacy: ConnectionStartResponse = serde_json::from_value(value.clone()).unwrap();
+    assert!(!legacy.redundancy.unwrap().warm_stop_v1);
+    value["redundancy"]["warm_stop_v1"] = Value::Bool(true);
+    assert!(schema_is_valid(
+        "connection-start-response.schema.json",
+        &value
+    ));
+    let current: ConnectionStartResponse = serde_json::from_value(value.clone()).unwrap();
+    assert!(current.redundancy.unwrap().warm_stop_v1);
+    value["redundancy"]["warm_stop_v1"] = Value::String("true".into());
+    assert!(!schema_is_valid(
+        "connection-start-response.schema.json",
+        &value
+    ));
+    let mut stop: Value =
+        serde_json::from_str(&fixture("valid/connection-redundant-stop.json")).unwrap();
+    stop["retain_active_peer"] = Value::Bool(true);
+    assert!(schema_is_valid("connection-redundancy.schema.json", &stop));
+    stop["retain_active_peer"] = Value::String("true".into());
+    assert!(!schema_is_valid("connection-redundancy.schema.json", &stop));
+}
+
+#[test]
 fn redundant_health_probe_is_required_and_bounded() {
     let redundant: Value =
         serde_json::from_str(&fixture("valid/connection-start-redundant-response.json")).unwrap();

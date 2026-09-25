@@ -548,6 +548,8 @@ impl fmt::Debug for RedundancyMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RedundancySession {
+    #[serde(default)]
+    pub warm_stop_v1: bool,
     pub session_id: String,
     pub state: RedundancyState,
     pub role_generation: u64,

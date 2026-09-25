@@ -215,6 +215,8 @@ internal data class AndroidRedundantTransaction(
     val candidateLeaseId: String? = null,
     val candidateSlot: RedundantSlot? = null,
     val retry: AndroidRedundantRetryState = AndroidRedundantRetryState(),
+    val warmStopSupported: Boolean = false,
+    val retainActivePeerOnStop: Boolean = false,
 ) {
     fun containsCurrentLease(leaseId: String?): Boolean = leaseId != null &&
         leaseId in setOf(slotALeaseId, slotBLeaseId)
@@ -429,6 +431,8 @@ internal object AndroidRecoveryEnvelopeCodec {
     }
 
     private fun redundantToJson(transaction: AndroidRedundantTransaction) = JSONObject().apply {
+        put("warmStopSupported", transaction.warmStopSupported)
+        put("retainActivePeerOnStop", transaction.retainActivePeerOnStop)
         put("desiredActive", transaction.desiredActive)
         put("template", templateToJson(transaction.template))
         put("sessionId", transaction.sessionId)
@@ -503,6 +507,8 @@ internal object AndroidRecoveryEnvelopeCodec {
             )
         }
         return AndroidRedundantTransaction(
+            warmStopSupported = payload.optBoolean("warmStopSupported", false),
+            retainActivePeerOnStop = payload.optBoolean("retainActivePeerOnStop", false),
             desiredActive = payload.getBoolean("desiredActive"),
             template = templateFromJson(payload.getJSONObject("template")),
             sessionId = UUID.fromString(payload.getString("sessionId")).toString(),
@@ -1033,6 +1039,7 @@ internal class AndroidRecoveryStore(
     fun cancelRedundantIntentAndDeferStop(
         stopOperationId: String,
         expectedStartOperationId: String,
+        retainActivePeer: Boolean = false,
     ): RecoveryStoreResult<AndroidRecoveryEnvelope> = synchronized(gate) {
         val currentResult = readLocked()
         if (currentResult is RecoveryStoreResult.Failure) return@synchronized currentResult
@@ -1061,6 +1068,10 @@ internal class AndroidRecoveryStore(
             redundantTransaction = transaction.copy(
                 desiredActive = false,
                 stopOperationId = normalizedStopOperationId,
+                retainActivePeerOnStop = if (transaction.stopOperationId == null) {
+                    retainActivePeer && transaction.warmStopSupported &&
+                        transaction.retry.pendingNativeActiveLeaseId == null
+                } else transaction.retainActivePeerOnStop,
                 candidateLeaseId = null,
                 candidateSlot = null,
                 retry = transaction.retry.copy(

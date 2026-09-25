@@ -91,6 +91,7 @@ internal fun redundantTransactionFromStart(
         canonicalRedundantIpv4(redundancy.virtualAddressV4.removeSuffix("/32")))
     redundantHealthProbesFromStart(redundancy)
     return AndroidRedundantTransaction(
+        warmStopSupported = redundancy.warmStopV1,
         desiredActive = true,
         template = AndroidIntentTemplate(
             deviceId = UUID.fromString(deviceId).toString(),
@@ -188,6 +189,7 @@ internal class ServiceRedundantConnectionNative(
 
     private val gate = Any()
     private var session: NativeSession? = null
+    private var closedForStop = false
     private val slots = mutableMapOf<RedundantSlot, SlotRuntime>()
     private var activeSlot: RedundantSlot? = null
     private var networkValidated = initialNetworkValidated
@@ -212,6 +214,10 @@ internal class ServiceRedundantConnectionNative(
         configuration: ByteArray,
         healthProbe: BackgroundRedundantHealthProbe?,
     ): Boolean = synchronized(gate) {
+        if (closedForStop) {
+            configuration.fill(0)
+            return@synchronized false
+        }
         val existing = slots[slot]
         if (existing?.leaseId == leaseId) {
             configuration.fill(0)
@@ -290,6 +296,11 @@ internal class ServiceRedundantConnectionNative(
         activeSlot = null
         clearStandbyCheckLocked()
         true
+    }
+
+    override fun closeForStop(): Boolean = synchronized(gate) {
+        closedForStop = true
+        stop()
     }
 
     override fun isUsable(leaseId: String): Boolean = synchronized(gate) {
@@ -868,7 +879,8 @@ internal class ServiceRedundantConnectionPanel(
             // HTTP 200/APPLIED only accepts the Stop. A released primary may
             // still belong to a session whose standby cleanup is in progress.
             connection.getString("lease_id") == leaseId &&
-                connection.getString("status") in setOf("released", "failed") &&
+                (connection.getString("status") in setOf("released", "failed") ||
+                    (transaction.retainActivePeerOnStop && connection.getString("status") == "warm")) &&
                 connection.has("session_id") && connection.isNull("session_id")
         }.getOrDefault(false)
     }

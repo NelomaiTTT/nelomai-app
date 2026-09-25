@@ -14,6 +14,24 @@ import org.junit.Test
 
 class RedundantProductionAdaptersTest {
     @Test
+    fun terminalLocalStopRejectsLateNativeStartWithoutReopeningTun() {
+        var tunStarts = 0
+        val native = ServiceRedundantConnectionNative(
+            backend = RecordingSessionBackend(),
+            establishTun = { tunStarts += 1; 41 },
+            prepare = ::prepared,
+            probeSourceIpv4 = "10.200.0.2/32",
+        )
+        assertTrue(native.start("lease-a", RedundantSlot.A, byteArrayOf(1), probe()))
+        assertTrue(native.closeForStop())
+        val staleConfiguration = byteArrayOf(2)
+        assertFalse(native.start("lease-b", RedundantSlot.B, staleConfiguration, probe()))
+        assertTrue(staleConfiguration.all { it == 0.toByte() })
+        assertFalse(native.activate("lease-a"))
+        assertEquals(1, tunStarts)
+    }
+
+    @Test
     fun successfulInitialRebindCannotUseReserveThatDiedWhileCommitWasPending() {
         for (primary in listOf(0, 1)) {
             withDelayedInitialCommit(primary, rebindFails = false, beforeDelayedTicks = {

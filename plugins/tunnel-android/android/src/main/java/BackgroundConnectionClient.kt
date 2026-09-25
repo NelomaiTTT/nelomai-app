@@ -1353,6 +1353,7 @@ internal fun backgroundRedundantStopPayload(
     transaction: AndroidRedundantTransaction,
     leaseId: String,
 ): JSONObject = JSONObject().apply {
+    if (transaction.retainActivePeerOnStop) put("retain_active_peer", true)
     put("operation_id", requireNotNull(transaction.stopOperationId))
     put("lease_id", leaseId)
     put("recovery_contract_version", 2)
@@ -1526,6 +1527,7 @@ internal fun backgroundExactStartResult(
             val address = view.getString("virtual_address_v4")
             require(address.endsWith("/32") && canonicalRedundantIpv4(address.removeSuffix("/32")))
             val redundant = AndroidRedundantTransaction(
+                warmStopSupported = view.optBoolean("warm_stop_v1", false),
                 desiredActive = true,
                 template = template,
                 sessionId = view.getString("session_id").also {

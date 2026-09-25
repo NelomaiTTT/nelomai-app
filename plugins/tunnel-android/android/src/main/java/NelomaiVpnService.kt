@@ -776,7 +776,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
     private val redundantStopRetryQueued = AtomicBoolean(false)
     private val redundantStopRetry = RedundantTotalLossRetryScheduler(
         retry = ::retryPendingRedundantStop,
-        delayMillis = REDUNDANT_STOP_RETRY_MILLIS,
+        delayMillis = 10_000L,
         scheduleAllowed = { pendingRedundantStop != null || redundantCancelTombstoneUnreadable },
         remove = restoreHandler::removeCallbacks,
         postDelayed = { task, delay -> restoreHandler.postDelayed(task, delay) },
@@ -1746,6 +1746,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         startOperationId: String,
         owner: RedundantVpnProcessOwner?,
         allowRestart: Boolean = false,
+        retainActivePeer: Boolean = false,
     ): Boolean {
         val existing = pendingRedundantStop
         if (existing != null && existing.startOperationId != startOperationId) {
@@ -1804,6 +1805,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             when (val result = recoveryStore.cancelRedundantIntentAndDeferStop(
                 stopOperationId = stopOperationId,
                 expectedStartOperationId = startOperationId,
+                retainActivePeer = retainActivePeer,
             )) {
                 is RecoveryStoreResult.Success -> true
                 is RecoveryStoreResult.Failure -> {
@@ -1817,25 +1819,51 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         }
         idleStopDebouncer.cancel()
         if (owner == null || existing?.owner != null) {
-            schedulePendingRedundantStopRetry()
-            return durablePending.tombstone != null && durableStopFence
-        }
-        executeRedundantCleanup {
-            val locallyStopped = runCatching(owner::closeLocal).getOrDefault(false)
-            if (!locallyStopped) {
-                TunnelLog.warning("redundant.local_stop_failed")
-            }
-            restoreHandler.post {
-                if (locallyStopped &&
-                    pendingRedundantStop?.startOperationId == startOperationId &&
-                    pendingRedundantStop?.tombstone != null
-                ) {
-                    pendingRedundantStop = pendingRedundantStop?.copy(localClosed = true)
-                    redundantStartOperation.completeCancelled(startOperationId)
-                }
+            if (durablePending.localClosed && durableStopFence) {
+                QuickTunnelController.updateState(applicationContext, SessionState.STOPPED,
+                    desiredActive = null, changed = true)
+                completeRedundantStopWaiters(startOperationId,
+                    RedundantRevokeResult(fenced = true, stopped = true))
+                retryPendingRedundantStop()
+            } else {
                 schedulePendingRedundantStopRetry()
             }
+            return durablePending.tombstone != null && durableStopFence
         }
+        if (durableStopFence && existing == null) {
+            // Use the existing independent I/O executor, not the native cleanup
+            // queue. Failure is harmless: the durable control request follows.
+            runCatching { credentialExecutor.execute { owner.notifyStop() } }
+        }
+        dispatchRedundantWork(
+            dispatcher = VPN_PROCESS_CLEANUP_WORK,
+            fallbackDispatcher = redundantWork,
+            onRejected = ::schedulePendingRedundantStopRetry,
+            action = {
+                val locallyStopped = runCatching(owner::closeDataplaneForStop).getOrDefault(false)
+                if (!locallyStopped) {
+                    TunnelLog.warning("redundant.local_stop_failed")
+                }
+                restoreHandler.post {
+                    if (locallyStopped &&
+                        pendingRedundantStop?.startOperationId == startOperationId &&
+                        serviceGeneration == VPN_PROCESS_SERVICE_GENERATION.get() &&
+                        !serviceDestroyed &&
+                        pendingRedundantStop?.tombstone != null
+                    ) {
+                        pendingRedundantStop = pendingRedundantStop?.copy(localClosed = true)
+                        redundantStartOperation.completeCancelled(startOperationId)
+                        QuickTunnelController.updateState(applicationContext, SessionState.STOPPED,
+                            desiredActive = null, changed = true)
+                        refreshConnectionNotification("VPN выключен; завершаем подключение")
+                        completeRedundantStopWaiters(startOperationId,
+                            RedundantRevokeResult(fenced = durableStopFence, stopped = true))
+                    }
+                    // The first control request is immediate, retries are 10s apart.
+                    retryPendingRedundantStop()
+                }
+            },
+        )
         return durablePending.tombstone != null && durableStopFence
     }
 
@@ -2420,6 +2448,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
             installedOwner?.takeIf {
                 it.startOperationId == redundantOperationId
             }?.owner,
+            retainActivePeer = true,
         )
     }
 
@@ -2817,6 +2846,9 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                             ?: result.value.redundantTransaction?.standbyDesired
                                 ?.takeIf { it }
                                 ?.let { RedundantReserveState.WARMING.wireName },
+                        localClosedStartOperationId = pendingRedundantStop
+                            ?.takeIf { it.localClosed && it.serviceGeneration == serviceGeneration }
+                            ?.startOperationId,
                     ).toBundle(),
                 )
             }
@@ -3790,6 +3822,7 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
         val tombstonePersisted = beginFailClosedRedundantStop(
             startOperationId,
             redundantOwnerForOperation(startOperationId),
+            retainActivePeer = true,
         )
         if (!shouldAcknowledgeRedundantQuickStop(tombstonePersisted)) {
             receiver.sendError("redundant_stop_pending")
@@ -5754,6 +5787,7 @@ internal data class ConnectionIntentServiceStatus(
     val lastErrorCode: String?,
     val reserveState: String? = null,
     val redundantSessionOwned: Boolean = false,
+    val localStopPendingCleanup: Boolean = false,
 )
 
 internal enum class AndroidStaleConnectionIntentAction {
@@ -6001,11 +6035,16 @@ internal fun interface AndroidConnectionIntentDiagnosticsObserver {
 internal fun connectionIntentServiceStatus(
     envelope: AndroidRecoveryEnvelope,
     reserveState: String? = null,
+    localClosedStartOperationId: String? = null,
 ): ConnectionIntentServiceStatus {
     // The UI must not fall back to a per-lease stop while the service owns
     // cleanup of a whole redundant session (which has no v1 leaseTransaction).
     if (envelope.redundantTransaction != null && !envelope.intent.desiredActive) {
-        return redundantStoppingConnectionIntentStatus(envelope)
+        return redundantStoppingConnectionIntentStatus(envelope).copy(
+            localStopPendingCleanup = localClosedStartOperationId != null &&
+                !envelope.redundantTransaction.desiredActive &&
+                localClosedStartOperationId == envelope.redundantTransaction.startOperationId,
+        )
     }
     val transaction = envelope.leaseTransaction
     val status = when {

@@ -187,6 +187,7 @@ impl fmt::Debug for RedundantTunnelStandbyStart {
 
 #[derive(Debug)]
 pub struct RedundantTunnelStart {
+    pub warm_stop_v1: bool,
     pub session_id: String,
     pub state: RedundancyState,
     pub operation_id: String,
@@ -602,6 +603,7 @@ mod tests {
             quick_reconnect: QuickReconnect::Persistent,
             quick_connection: None,
             redundancy: Some(RedundantTunnelStart {
+                warm_stop_v1: false,
                 session_id: "session-1".to_string(),
                 state: RedundancyState::Ready,
                 operation_id: "operation-1".to_string(),

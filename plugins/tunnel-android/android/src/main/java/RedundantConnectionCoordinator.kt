@@ -16,6 +16,7 @@ internal interface RedundantConnectionNative {
     fun activate(leaseId: String): Boolean
     fun stopSlot(leaseId: String): Boolean
     fun stop(): Boolean
+    fun closeForStop(): Boolean = stop()
     fun isUsable(leaseId: String): Boolean
     fun setNetworkValidated(validated: Boolean) = Unit
     fun setProbeSourceIpv4(sourceIpv4: String) = Unit
@@ -136,6 +137,8 @@ internal interface RedundantVpnProcessOwner {
     fun fenceRevoke(): Boolean = true
     fun revoke(): Boolean
     fun closeLocal(): Boolean = true
+    fun closeDataplaneForStop(): Boolean = closeLocal()
+    fun notifyStop() = Unit
     fun onUnderlyingNetworkChanged(validated: Boolean): Boolean = false
     fun tick(): Boolean = false
     fun isRunning(): Boolean = false
@@ -238,7 +241,7 @@ internal class RedundantConnectionCoordinator(
     private var primaryReadinessFailed = false
     private var recoveryRetryAtUnix: Long? = null
     private var recoveryRetryAttempt = 0
-    private var boundStartOperationId: String? = expectedStartOperationId
+    @Volatile private var boundStartOperationId: String? = expectedStartOperationId
     private var standbyWorkPending = false
     private var standbyWorkEpoch = 0L
 
@@ -1543,6 +1546,23 @@ internal class RedundantConnectionCoordinator(
             if (pending?.freshStart == true) pending.onCancelled()
         }
         return fenced
+    }
+
+    // A best-effort first request is not a cleanup ACK. Never hold the native
+    // gate during this HTTP call: local shutdown must proceed even if it hangs.
+    override fun notifyStop() {
+        val pending = (store.read() as? RecoveryStoreResult.Success)?.value?.redundantTransaction
+            ?.takeIf { it.startOperationId == boundStartOperationId } ?: return
+        if (pending.desiredActive || pending.stopOperationId == null) return
+        runCatching { panel.stop(pending) }
+    }
+
+    // Called only after the service's durable cancellation fence. Native has
+    // its own lock; role/recovery HTTP must not delay closing the real TUN.
+    override fun closeDataplaneForStop(): Boolean {
+        boundStartOperationId?.let(mutationFence::cancel)
+        recoveryStarted = false
+        return runCatching(native::closeForStop).getOrDefault(false)
     }
 
     /** Idempotent best-effort cleanup; callers run it on the dedicated redundant executor. */

@@ -661,6 +661,7 @@ internal fun ConnectionIntentServiceStatus.toBundle(): Bundle = Bundle().apply {
     lastErrorCode?.let { putString(EXTRA_LAST_ERROR_CODE, it) }
     reserveState?.let { putString(EXTRA_RESERVE_STATE, it) }
     putBoolean(EXTRA_REDUNDANT_SESSION_OWNED, redundantSessionOwned)
+    putBoolean("local_stop_pending_cleanup", localStopPendingCleanup)
 }
 
 internal fun Bundle.toConnectionIntentServiceStatus() = ConnectionIntentServiceStatus(
@@ -674,6 +675,7 @@ internal fun Bundle.toConnectionIntentServiceStatus() = ConnectionIntentServiceS
     lastErrorCode = getString(EXTRA_LAST_ERROR_CODE),
     reserveState = getString(EXTRA_RESERVE_STATE),
     redundantSessionOwned = getBoolean(EXTRA_REDUNDANT_SESSION_OWNED),
+    localStopPendingCleanup = getBoolean("local_stop_pending_cleanup", false),
 )
 
 internal fun TunnelOptionsArgs.toBundle(): Bundle = Bundle().apply {
@@ -747,6 +749,7 @@ private fun Bundle.toRedundantMember(): RedundantMemberArgs = RedundantMemberArg
 
 private fun RedundantStartArgs.copyForServiceTransport(): RedundantStartArgs =
     RedundantStartArgs().also { copy ->
+        copy.warmStopV1 = warmStopV1
         copy.sessionId = sessionId
         copy.state = state
         copy.operationId = operationId
@@ -768,6 +771,7 @@ private fun RedundantStartArgs.copyForServiceTransport(): RedundantStartArgs =
     }
 
 internal fun RedundantStartArgs.toBundle(): Bundle = Bundle().apply {
+    putBoolean("warm_stop_v1", warmStopV1)
     putString("session_id", sessionId)
     putString("state", state)
     putString("operation_id", operationId)
@@ -789,6 +793,7 @@ internal fun RedundantStartArgs.toBundle(): Bundle = Bundle().apply {
 }
 
 internal fun Bundle.toRedundantStart(): RedundantStartArgs = RedundantStartArgs().also {
+    it.warmStopV1 = getBoolean("warm_stop_v1", false)
     it.sessionId = requireNotNull(getString("session_id"))
     it.state = requireNotNull(getString("state"))
     it.operationId = requireNotNull(getString("operation_id"))
