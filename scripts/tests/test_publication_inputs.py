@@ -12,28 +12,28 @@ spec.loader.exec_module(publication)
 
 
 class PublicationInputsTest(unittest.TestCase):
-    def test_selects_030_candidate_without_accepting_wrong_identity(self):
+    def test_selects_031_candidate_without_accepting_wrong_identity(self):
         source = "a" * 40
         endpoint = "repos/owner/repo/actions/runs/42"
         run = dict(id=42, head_sha=source, path=".github/workflows/release.yml",
                    event="workflow_dispatch", status="completed", conclusion="success",
                    repository={"full_name": "owner/repo"},
                    head_repository={"full_name": "owner/repo"})
-        artifact = dict(id=123, name="candidate-0.3.0", expired=False,
+        artifact = dict(id=123, name="candidate-0.3.1", expired=False,
                         workflow_run={"id": 42, "head_sha": source})
 
         def fetch(path):
             return {endpoint: run, endpoint + "/artifacts?per_page=100&page=1":
                     {"artifacts": [artifact]}}[path]
 
-        self.assertEqual(publication.select_candidate("owner/repo", "42", source, "0.3.0", fetch), 123)
+        self.assertEqual(publication.select_candidate("owner/repo", "42", source, "0.3.1", fetch), 123)
         for changed in ({"name": "candidate-0.2.20"}, {"expired": True},
                         {"workflow_run": {"id": 43, "head_sha": source}},
                         {"workflow_run": {"id": 42, "head_sha": "b" * 40}}):
             with self.subTest(changed=changed), patch.dict(artifact, changed):
                 with self.assertRaises(ValueError):
-                    publication.select_candidate("owner/repo", "42", source, "0.3.0", fetch)
-        for version in ("", "0.3.1", "0.3.0a"):
+                    publication.select_candidate("owner/repo", "42", source, "0.3.1", fetch)
+        for version in ("", "0.3.0", "0.3.2", "0.3.1a"):
             with self.subTest(version=version), self.assertRaises(ValueError):
                 publication.select_candidate("owner/repo", "42", source, version, fetch)
 

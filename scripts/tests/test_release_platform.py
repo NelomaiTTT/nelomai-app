@@ -2,12 +2,49 @@ import subprocess
 import sys
 import json
 import os
+import shutil
 from types import SimpleNamespace
 from unittest.mock import patch
 from scripts.tests.test_runtime_artifact import ArtifactFixture, SCRIPTS, module
 
 
 class ReleasePlatformTest(ArtifactFixture):
+    def test_desktop_draft_uses_current_version_for_archive_and_signed_manifest(self):
+        builder = module("build-release-platform")
+        native = self.root / "src-tauri/platform-runtime"
+        native.mkdir(parents=True)
+        for name in ("nelomai-unix-service", "amneziawg-go", "resolvconf"):
+            shutil.copy2(self.payload / name, native / name)
+        shutil.copy2(self.payload / "licenses/AMNEZIAWG-GO-LICENSE.txt", native)
+        target = self.root / "target/x86_64-unknown-linux-gnu/release"
+        target.mkdir(parents=True)
+        shutil.copy2(self.payload / "nelomai-runtime", target)
+        shutil.copytree(self.payload / "webview", self.root / "build")
+        tauri = self.root / "tauri"
+        tauri.mkdir()
+        for name in ("LICENSE_MIT", "LICENSE_APACHE-2.0"):
+            (tauri / name).write_text("test attribution")
+        work, output = self.root / "work", self.root / "draft"
+        work.mkdir()
+        output.mkdir()
+        args = SimpleNamespace(platform="linux", architecture="x86_64", output=output,
+            source_sha="b" * 40, draft_key=self.keyfile, draft_public=self.public)
+        # Native compilation is external; packaging and signature verification
+        # consume actual prepared payload bytes, not mocked manifests.
+        def compiled(*command, **kwargs):
+            return SimpleNamespace(stdout=json.dumps({"packages": [
+                {"name": "tauri", "manifest_path": str(tauri / "Cargo.toml")}
+            ]}) if command[:2] == ("cargo", "metadata") else "")
+        with patch.object(builder, "ROOT", self.root), patch.object(builder, "run", side_effect=compiled):
+            manifest = builder.desktop(args, work, {})
+        self.assertEqual(manifest["runtime_version"], "0.3.1")
+        for slot in ("stable", "latest"):
+            self.assertEqual(sorted(path.name for path in (output / slot).iterdir()), [
+                "nelomai-runtime-0.3.1-linux-x86_64.manifest.json",
+                "nelomai-runtime-0.3.1-linux-x86_64.manifest.sig",
+                "nelomai-runtime-0.3.1-linux-x86_64.zip",
+            ])
+
     def test_build_capture_decodes_utf8_independently_of_windows_locale(self):
         builder = module("build-release-platform")
         metadata = json.dumps({"description": "Сборка"}, ensure_ascii=False)
