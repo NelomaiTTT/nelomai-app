@@ -1,13 +1,100 @@
 """Required static authorization graph checks, complemented by executable gates."""
 import re
 import shlex
+import os
+import subprocess
 import unittest
+from types import SimpleNamespace
 import yaml
 
 from scripts.tests.test_runtime_artifact import ROOT
 
 
 class ReleaseWorkflowTest(unittest.TestCase):
+    def expression(self, expression, *, mode, result="success", cancelled=False):
+        """Evaluate the boolean/string expressions used by our dispatch graph."""
+        expression = expression.removeprefix("${{").removesuffix("}}").strip()
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        expression = re.sub(r"!(?!=)", " not ", expression)
+        return eval(expression.strip(), {"__builtins__": {}}, {
+            "inputs": SimpleNamespace(mode=mode, candidate_run_id="42"),
+            "github": SimpleNamespace(run_id="99"),
+            "needs": SimpleNamespace(finalize=SimpleNamespace(result=result, outputs=SimpleNamespace(
+                artifact_id="123", inventory_sha256="a" * 64))),
+            "steps": SimpleNamespace(select=SimpleNamespace(outputs=SimpleNamespace(artifact_id="456"))),
+            "secrets": SimpleNamespace(**{name: "release-secret" for name in (
+                "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64", "ANDROID_KEYSTORE_BASE64",
+                "TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+                "ANDROID_KEY_ALIAS", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_PASSWORD")}),
+            "always": lambda: True, "cancelled": lambda: cancelled,
+        })
+
+    def test_build_and_publish_uses_existing_signed_candidate_pipeline(self):
+        workflow = self.workflow()
+        self.assertIn("build_and_publish", workflow[True]["workflow_dispatch"]["inputs"]["mode"]["options"])
+        for mode, expected in (("build_only", "build_only"), ("sign_candidate", "sign_candidate"),
+                               ("build_and_publish", "sign_candidate"),
+                               ("publish_approved_candidate", "publish_approved_candidate")):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.expression(workflow["env"]["RELEASE_MODE"], mode=mode), expected)
+
+    def test_publication_waits_for_finalization_but_retained_promotion_needs_no_build(self):
+        job = self.workflow()["jobs"]["publish"]
+        self.assertEqual(job.get("needs"), ["finalize"])
+        # Without an explicit status function GitHub skips the standalone path
+        # because its build dependencies were skipped.
+        self.assertIn("always()", job["if"])
+        for mode, result, cancelled, expected in (
+            ("build_and_publish", "success", False, True),
+            ("build_and_publish", "failure", False, False),
+            ("build_and_publish", "cancelled", False, False),
+            ("build_and_publish", "skipped", False, False),
+            ("build_and_publish", "success", True, False),
+            ("sign_candidate", "success", False, False),
+            ("build_only", "success", False, False),
+            ("publish_approved_candidate", "skipped", False, True),
+            ("publish_approved_candidate", "skipped", True, False),
+        ):
+            with self.subTest(mode=mode, result=result, cancelled=cancelled):
+                self.assertEqual(bool(self.expression(job["if"], mode=mode, result=result,
+                                                     cancelled=cancelled)), expected)
+
+    def test_inline_publication_downloads_exact_finalized_artifact_and_pins_inventory(self):
+        jobs = self.workflow()["jobs"]
+        final = jobs["finalize"]
+        upload = next(s for s in final["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertEqual(final["outputs"].get("artifact_id"),
+                         "${{ steps." + upload.get("id", "MISSING") + ".outputs.artifact-id }}")
+        publish = jobs["publish"]
+        self.assertEqual(publish["env"].get("RELEASE_MODE"), "publish_approved_candidate")
+        download = next(s for s in publish["steps"] if s.get("uses", "").startswith("actions/download-artifact@"))
+        selection = next(s for s in publish["steps"] if "--select" in s.get("run", ""))
+        for mode, run, artifact, selects in (("build_and_publish", "99", "123", False),
+                                            ("publish_approved_candidate", "42", "456", True)):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.expression(publish["env"]["CANDIDATE_RUN"], mode=mode), run)
+                self.assertEqual(self.expression(download["with"]["artifact-ids"], mode=mode), artifact)
+                self.assertEqual(self.expression(selection.get("if", "always()"), mode=mode), selects)
+        self.assertEqual(download["with"]["run-id"], "${{ env.CANDIDATE_RUN }}")
+        self.assertEqual(publish["env"].get("INVENTORY_SHA256"), "${{ needs.finalize.outputs.inventory_sha256 }}")
+        commands = "\n".join(s.get("run", "") for s in publish["steps"])
+        self.assertIn('--inventory-sha256 "$INVENTORY_SHA256"', commands)
+
+    def test_inline_publication_rejects_missing_finalization_outputs(self):
+        steps = self.workflow()["jobs"]["publish"]["steps"]
+        gate = next(s for s in steps if "test -n \"$FINALIZED_ARTIFACT_ID\"" in s.get("run", ""))
+        download = next(s for s in steps if s.get("uses", "").startswith("actions/download-artifact@"))
+        self.assertLess(steps.index(gate), steps.index(download))
+        self.assertTrue(self.expression(gate["if"], mode="build_and_publish"))
+        self.assertFalse(self.expression(gate["if"], mode="publish_approved_candidate"))
+        for artifact, digest, expected in (("123", "a" * 64, 0), ("", "a" * 64, 1),
+                                           ("123", "", 1), ("", "", 1)):
+            with self.subTest(artifact=artifact, digest=digest):
+                result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", gate["run"]],
+                                        env={**os.environ, "FINALIZED_ARTIFACT_ID": artifact,
+                                             "INVENTORY_SHA256": digest}, capture_output=True)
+                self.assertEqual(result.returncode, expected)
+
     def test_linux_diagnostic_source_gate_tracks_current_version(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())
         commands = '\n'.join(step.get('run', '') for step in workflow['jobs']['linux-package-diagnostic']['steps'])
@@ -59,7 +146,14 @@ class ReleaseWorkflowTest(unittest.TestCase):
                         self.assertIn("--mode", command)
                         variable = command[command.index("--mode") + 1]
                         self.assertEqual(variable, "$RELEASE_MODE")
-                        self.assertEqual(workflow["env"][variable[1:]], "${{ inputs.mode }}")
+                        effective = {**workflow["env"], **job.get("env", {})}[variable[1:]]
+                        if name == "publish":
+                            self.assertEqual(effective, "publish_approved_candidate")
+                        else:
+                            for mode, expected in (("build_only", "build_only"),
+                                                   ("sign_candidate", "sign_candidate"),
+                                                   ("build_and_publish", "sign_candidate")):
+                                self.assertEqual(self.expression(effective, mode=mode), expected)
 
     def test_existing_release_inputs_keep_repository_secret_bindings(self):
         # These inputs were provisioned as Secrets for existing releases.
@@ -103,7 +197,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
                 gate = next(index for index, command in enumerate(commands) if "scripts/release-workflow-check.py" in command)
                 self.assertLess(build, gate)
 
-    def test_only_separate_promotion_can_write_and_cannot_build_or_sign(self):
+    def test_only_publication_job_can_write_and_cannot_build_or_sign(self):
         workflow = self.workflow()
         self.assertEqual(workflow["permissions"].get("contents"), "read", "default workflow is not read-only")
         jobs = workflow["jobs"]
@@ -165,9 +259,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
             for step in jobs[job]["steps"]:
                 for value in step.get("env", {}).values():
                     if "secrets." in str(value):
-                        self.assertTrue("inputs.mode == 'sign_candidate'" in str(value)
-                                        or step.get("if") == "inputs.mode == 'sign_candidate'",
-                                        "test signing step receives a production credential")
+                        for mode, expected in (("build_only", ""), ("publish_approved_candidate", ""),
+                                               ("sign_candidate", "release-secret"),
+                                               ("build_and_publish", "release-secret")):
+                            self.assertEqual(self.expression(value, mode=mode), expected)
+            keystores = [step for step in jobs[job]["steps"] if "ANDROID_KEYSTORE_BASE64" in step.get("run", "")]
+            for step in keystores:
+                for mode, enabled in (("build_only", False), ("sign_candidate", True),
+                                      ("build_and_publish", True)):
+                    self.assertEqual(self.expression(step["if"], mode=mode), enabled)
         self.assertNotIn("needs", jobs["native_drafts"])
         self.assertEqual(set(jobs["sign"]["needs"]), {"verify", "native_drafts"})
         self.assertEqual(set(jobs["native_packages"]["needs"]), {"native_drafts", "sign"})
@@ -181,7 +281,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         steps = workflow["jobs"]["publish"]["steps"]
         selection = next(step for step in steps if "--select" in step.get("run", ""))
         download = next(step for step in steps if step.get("uses", "").startswith("actions/download-artifact@"))
-        self.assertEqual(download["with"]["artifact-ids"], "${{ steps.select.outputs.artifact_id }}")
+        self.assertEqual(self.expression(download["with"]["artifact-ids"],
+                                         mode="publish_approved_candidate"), "456")
         self.assertEqual(selection["id"], "select")
         self.assertLess(steps.index(selection), steps.index(download))
 
