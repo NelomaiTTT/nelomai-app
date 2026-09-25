@@ -1333,6 +1333,21 @@ class BackgroundConnectionClientTest {
         assertTrue(timeoutValues.all { it == 3_000 })
     }
 
+    @Test fun entirelyFailedProbesAreMeasuredAgainOnTheSameNetwork() {
+        var calls = 0
+        val cache = BackgroundCandidateProbeCache(nowMillis = { 1_000L }, probe = { item, _ ->
+            calls++
+            BackgroundProbeResult(item.candidateId, if (calls == 1) null else 12.0,
+                if (calls == 1) "timeout" else null, "1970-01-01T00:00:01Z")
+        })
+        val candidates = listOf(candidate(1, expiresAtUnix = 400))
+        assertEquals("timeout", cache.measure("tic", "ipv4", "same", candidates).single().failureCode)
+        assertEquals(12.0, cache.measure("tic", "ipv4", "same", candidates).single().latencyMillis)
+        assertEquals(2, calls)
+        cache.measure("tic", "ipv4", "same", candidates)
+        assertEquals(2, calls)
+    }
+
     @Test
     fun oversizedCandidateBatchIsRejectedBeforeAnyProbeIsAllocated() {
         var probeCalls = 0

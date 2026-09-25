@@ -236,6 +236,16 @@ internal class AutomaticDiagnosticsConnectionIntentEpisode(
     }
 }
 
+// Preserve only audited machine codes, never a backend message, URL or token.
+internal fun automaticDiagnosticsStartFailureCode(errorCode: String): String = when (errorCode) {
+    "temporarily_unavailable", "android_service_status_unavailable",
+    "invalid_probe_results", "quick_action_plan_unavailable", "server_probes_unavailable",
+    "transport_error", "android_service_dispatch_unavailable", "tunnel_start_timeout",
+    "tunnel_handshake_timeout", "background_transport_unavailable", "connection_start_failed",
+    -> errorCode
+    else -> automaticDiagnosticsConnectionIntentReasonClass(errorCode)
+}
+
 internal fun automaticDiagnosticsConnectionIntentReasonClass(errorCode: String): String =
     when (errorCode) {
         "network",
@@ -250,6 +260,9 @@ internal fun automaticDiagnosticsConnectionIntentReasonClass(errorCode: String):
         "other",
         -> errorCode
         "transport_error",
+        "temporarily_unavailable",
+        "background_transport_unavailable",
+        "server_probes_unavailable",
         "android_service_dispatch_unavailable",
         "endpoint_route_lost",
         "endpoint_route_unavailable",
@@ -264,11 +277,13 @@ internal fun automaticDiagnosticsConnectionIntentReasonClass(errorCode: String):
         "connection_already_active",
         "connection_release_failed",
         "probe_results_required",
+        "invalid_probe_results",
         "saved_connection_unavailable",
         "connection_stall_verification_unavailable",
         "connection_stall_recycle_rate_limited",
         -> "panel"
         "service_timeout",
+        "android_service_status_unavailable",
         "tunnel_service_timeout",
         "service_stopping",
         "service_unavailable",
@@ -292,7 +307,7 @@ internal fun automaticDiagnosticsConnectionIntentReasonClass(errorCode: String):
         "missing_service_version",
         "recovery_contract_unavailable",
         -> "compatibility"
-        "storage_unavailable", "clock_unavailable", "quick_state_persist_failed" -> "local_state"
+        "storage_unavailable", "clock_unavailable", "quick_state_persist_failed", "quick_action_plan_unavailable" -> "local_state"
         "operation_id_conflict",
         "request_fingerprint_mismatch",
         "invalid_background_response",
@@ -323,6 +338,7 @@ internal fun automaticDiagnosticsConnectionIntentEvent(
         put("event", "connection.intent.$safeKind")
         errorCode?.let {
             put("reason_class", automaticDiagnosticsConnectionIntentReasonClass(it))
+            put("code", automaticDiagnosticsStartFailureCode(it))
         }
         attempt?.takeIf { it >= 0 }?.let { put("attempt", it) }
         delaySeconds?.takeIf { it >= 0 }?.let { put("delay_seconds", it) }
@@ -349,6 +365,9 @@ internal fun automaticDiagnosticsSafeConnectionIntentLog(value: String): String 
                 put("timestamp", it.take(40))
             }
             put("event", event)
+            if (source.has("code")) {
+                put("code", automaticDiagnosticsStartFailureCode(source.optString("code")))
+            }
             if (source.has("reason_class")) {
                 put(
                     "reason_class",
@@ -1178,6 +1197,7 @@ internal object AutomaticDiagnostics {
     private fun logConnectionIntentEvent(payload: JSONObject) {
         val event = payload.getString("event")
         val details = buildMap<String, Any?> {
+            payload.optString("code").takeIf(String::isNotEmpty)?.let { put("code", automaticDiagnosticsStartFailureCode(it)) }
             payload.optString("reason_class").takeIf(String::isNotEmpty)?.let {
                 put("reason_class", it)
             }
@@ -1467,7 +1487,8 @@ internal object AutomaticDiagnostics {
     ): AutomaticDiagnosticsConnectionIntentReportOutcome? {
         ensureDirectories(context)
         val reasonClass = automaticDiagnosticsConnectionIntentReasonClass(errorCode)
-        TunnelLog.warning("diagnostics.connection_start_failed", reasonClass)
+        val safeCode = automaticDiagnosticsStartFailureCode(errorCode)
+        TunnelLog.warning("diagnostics.connection_start_failed", safeCode)
         val now = nowUnix()
         var queuedRequest: StartFailureRequest? = null
         var pendingExists = false
@@ -1494,7 +1515,7 @@ internal object AutomaticDiagnostics {
                 queuedRequest = StartFailureRequest(
                     reportId = UUID.randomUUID().toString(),
                     deviceId = deviceId,
-                    errorCode = reasonClass,
+                    errorCode = safeCode,
                     queuedAt = now,
                     sent = false,
                     trigger = trigger,
@@ -3316,7 +3337,8 @@ private fun startFailureHelperLog(
         put("timestamp", Instant.ofEpochSecond(endedAt).toString())
         put("level", "warning")
         put("event", "diagnostics.connection_start_failed")
-        put("code", errorCode.take(80))
+        put("code", automaticDiagnosticsStartFailureCode(errorCode))
+        put("reason_class", automaticDiagnosticsConnectionIntentReasonClass(errorCode))
     }.toString() + "\n"
     return (interval + durableEvent).takeLast(MAX_HELPER_LOG_BYTES)
 }
@@ -3487,7 +3509,8 @@ internal data class StartFailureRequest(
         put("format", 1)
         put("report_id", reportId)
         put("device_id", deviceId)
-        put("error_code", errorCode)
+        put("error_code", automaticDiagnosticsStartFailureCode(errorCode))
+        put("reason_class", automaticDiagnosticsConnectionIntentReasonClass(errorCode))
         put("queued_at", queuedAt)
         put("sent", sent)
         put("trigger", trigger)
@@ -3506,7 +3529,7 @@ internal data class StartFailureRequest(
             return StartFailureRequest(
                 reportId = reportId,
                 deviceId = deviceId,
-                errorCode = automaticDiagnosticsConnectionIntentReasonClass(
+                errorCode = automaticDiagnosticsStartFailureCode(
                     payload.getString("error_code"),
                 ),
                 queuedAt = payload.getLong("queued_at").coerceAtLeast(0),

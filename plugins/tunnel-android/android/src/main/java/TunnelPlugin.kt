@@ -114,6 +114,7 @@ class StartTunnelArgs {
     var apiVersion: Int = 0
     var clientOperationId: String? = null
     var startSource: String = "ui"
+    var quickPlanRevision: String? = null
     lateinit var configuration: ByteArray
     var options: TunnelOptionsArgs = TunnelOptionsArgs()
     var cacheQuickAction: Boolean = false
@@ -170,6 +171,15 @@ class QuickConnectionArgs {
     var egressMode: String = "ipv4"
     var allowAlternate: Boolean = false
     // Null identifies a legacy single-lease template, not reserve=false.
+    var reserveEnabled: Boolean? = null
+}
+
+@InvokeArg
+class PrepareQuickPlanArgs {
+    var apiVersion: Int = 0
+    lateinit var deviceId: String
+    var connection: QuickConnectionArgs = QuickConnectionArgs()
+    var options: TunnelOptionsArgs = TunnelOptionsArgs()
     var reserveEnabled: Boolean? = null
 }
 
@@ -1262,6 +1272,7 @@ internal object TunnelRuntime {
                 val args = StartTunnelArgs().apply {
                     apiVersion = TUNNEL_API_VERSION
                     startSource = "background"
+                    quickPlanRevision = template.planRevision
                     configuration = result.configuration
                     options = result.options
                     cacheQuickAction = true
@@ -2725,6 +2736,7 @@ internal fun StartTunnelArgs.copyForQuickPlan(): StartTunnelArgs? {
     return StartTunnelArgs().also { copy ->
         copy.apiVersion = apiVersion
         copy.startSource = startSource
+        copy.quickPlanRevision = quickPlanRevision
         copy.configuration = byteArrayOf()
         copy.options = TunnelOptionsArgs().also { optionsCopy ->
             optionsCopy.splitActive = options.splitActive
@@ -2941,6 +2953,15 @@ class TunnelPlugin(private val activity: Activity) : Plugin(activity) {
                 }
             }
         }
+    }
+
+    @Command
+    fun prepareQuickPlan(invoke: Invoke) {
+        val args = try { invoke.parseArgs(PrepareQuickPlanArgs::class.java) }
+        catch (_: Exception) { invoke.reject("invalid_quick_plan"); return }
+        TunnelServiceClient.prepareQuickPlan(activity.applicationContext, args,
+            { activity.runOnUiThread { invoke.resolve() } },
+            { code -> activity.runOnUiThread { invoke.reject(code) } })
     }
 
     @Command

@@ -61,6 +61,7 @@ internal class ConnectionIntentErrorPolicy {
                 "connection_release_failed",
                 "connection_stop_failed",
                 "probe_results_required",
+                "server_probes_unavailable",
                 "saved_connection_unavailable",
                 "saved_stray_unavailable",
                 "connection_stall_verification_unavailable",

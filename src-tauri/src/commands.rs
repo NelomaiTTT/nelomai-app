@@ -14,12 +14,13 @@ use nelomai_client_core::{
     SplitTunnelContext,
 };
 use nelomai_client_tunnel::{TunnelCapabilities, TunnelPlatform};
+#[cfg(any(target_os = "android", test))]
+use nelomai_contracts::ConnectionIntentCapability;
 use nelomai_contracts::{
     AppNotificationList, AppNotificationReadResponse, BindPeerRequest, Bootstrap, Connection,
-    ConnectionIntentCapability, EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions,
-    Platform, ProbeResults, RouteMode, RuntimeSlot, SplitTunnelAddressRuleScope,
-    SplitTunnelAddressRuleUpdate, SplitTunnelMode, SplitTunnelSelectedPackage,
-    SplitTunnelSettingsUpdate, TicConnectionMode,
+    EgressMode, Layer, PeerBinding, PeerBindingResponse, PeerOptions, Platform, ProbeResults,
+    RouteMode, RuntimeSlot, SplitTunnelAddressRuleScope, SplitTunnelAddressRuleUpdate,
+    SplitTunnelMode, SplitTunnelSelectedPackage, SplitTunnelSettingsUpdate, TicConnectionMode,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "android")]
@@ -1900,6 +1901,30 @@ pub struct LeaseCommandRequest {
     lease_id: String,
 }
 
+#[cfg(any(target_os = "android", test))]
+fn record_start_preflight_failure(diagnostics: &AppDiagnostics, stage: &str, error: &CommandError) {
+    let event = match stage {
+        "status" => "connection.start.status_failed",
+        "bootstrap" => "connection.start.bootstrap_failed",
+        "policy" => "connection.start.policy_failed",
+        "dispatch" => "connection.start.dispatch_failed",
+        _ => "connection.start.preflight_failed",
+    };
+    let code = match error.code() {
+        "temporarily_unavailable"
+        | "android_service_status_unavailable"
+        | "android_service_dispatch_unavailable"
+        | "auth_recovery_required"
+        | "storage_unavailable"
+        | "access_expired"
+        | "update_required"
+        | "device_mismatch"
+        | "split_tunnel_policy_unavailable" => error.code(),
+        _ => "other",
+    };
+    diagnostics.record_named(event, None, None, Some(code));
+}
+
 fn default_true() -> bool {
     true
 }
@@ -1957,8 +1982,7 @@ pub async fn app_state(
                     app.clone(),
                     application.inner().clone(),
                     diagnostics.inner().clone(),
-                    response.device.id,
-                    response.capabilities,
+                    response,
                 )
                 .await;
                 if app
@@ -2405,8 +2429,7 @@ pub async fn app_login(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
-        response.device.id.clone(),
-        response.capabilities.clone(),
+        response.clone(),
     )
     .await;
     schedule_startup_split_tunnel_refresh(
@@ -2414,6 +2437,7 @@ pub async fn app_login(
         application.inner().clone(),
         diagnostics.inner().clone(),
         split_tunnel_scheduler.inner().clone(),
+        response.clone(),
     );
     observe_and_schedule_update(
         application.inner().clone(),
@@ -2489,13 +2513,13 @@ pub async fn app_bootstrap(
         application.inner().clone(),
         diagnostics.inner().clone(),
         split_tunnel_scheduler.inner().clone(),
+        response.clone(),
     );
     schedule_android_background_provision(
         app.clone(),
         application.inner().clone(),
         diagnostics.inner().clone(),
-        response.device.id.clone(),
-        response.capabilities.clone(),
+        response.clone(),
     );
     observe_and_schedule_update(
         application.inner().clone(),
@@ -2536,14 +2560,12 @@ pub async fn app_release_history() -> Result<nelomai_client_api::ReleaseHistory,
 async fn provision_android_background(
     app: &AppHandle,
     application: &NativeApplication,
-    device_id: &str,
-    capability: Option<&ConnectionIntentCapability>,
+    bootstrap: &Bootstrap,
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     {
         // The common owner obtains device/capability from its own admitted
         // bootstrap, never from UI-provided install-secret or refresh material.
-        let _ = (application, device_id, capability);
         app.state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
             .background(nelomai_client_container::ipc::BackgroundAction::Provision)
             .await
@@ -2553,9 +2575,47 @@ async fn provision_android_background(
                     "Не удалось подготовить фоновое подключение",
                 )
             })?;
+        prepare_android_quick_plan(app, application, bootstrap).await?;
     }
     #[cfg(not(target_os = "android"))]
-    let _ = (app, application, device_id, capability);
+    let _ = (app, application, bootstrap);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+async fn prepare_android_quick_plan(
+    app: &AppHandle,
+    application: &NativeApplication,
+    bootstrap: &Bootstrap,
+) -> Result<(), CommandError> {
+    if bootstrap.access.can_connect && !bootstrap.update.required {
+        if let Some(binding) = &bootstrap.binding {
+            let preferences = app.state::<Arc<AppPreferenceStore>>().get();
+            let options = application
+                .connection_intent_tunnel_options(
+                    bootstrap.defaults.layer,
+                    bootstrap.defaults.route_mode,
+                    now_unix(),
+                )
+                .await
+                .map_err(CommandError::from)?;
+            app.tunnel_android()
+                .prepare_quick_plan(quick_plan_preparation(
+                    bootstrap,
+                    preferences,
+                    binding.egress_mode,
+                    tauri_plugin_tunnel_android::connection_intent_tunnel_options(options),
+                    now_unix(),
+                ))
+                .await
+                .map_err(|_| {
+                    CommandError::new(
+                        "quick_plan_preparation_failed",
+                        "Не удалось подготовить запуск из плитки",
+                    )
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -2563,16 +2623,9 @@ async fn provision_android_background_resilient(
     app: AppHandle,
     application: Arc<NativeApplication>,
     diagnostics: Arc<AppDiagnostics>,
-    device_id: String,
-    capability: Option<ConnectionIntentCapability>,
+    bootstrap: Bootstrap,
 ) {
-    let Err(error) = provision_android_background_serialized(
-        &app,
-        &application,
-        &device_id,
-        capability.as_ref(),
-    )
-    .await
+    let Err(error) = provision_android_background_serialized(&app, &application, &bootstrap).await
     else {
         return;
     };
@@ -2587,14 +2640,7 @@ async fn provision_android_background_resilient(
     tauri::async_runtime::spawn(async move {
         for delay_seconds in [5, 30, 120] {
             tokio::time::sleep(std::time::Duration::from_secs(delay_seconds)).await;
-            match provision_android_background_serialized(
-                &app,
-                &application,
-                &device_id,
-                capability.as_ref(),
-            )
-            .await
-            {
+            match provision_android_background_serialized(&app, &application, &bootstrap).await {
                 Ok(()) => {
                     diagnostics.record_named("background.provision_recovered", None, None, None);
                     return;
@@ -2610,37 +2656,82 @@ async fn provision_android_background_resilient(
     });
 
     #[cfg(not(target_os = "android"))]
-    let _ = (app, application, device_id, capability);
+    let _ = (app, application, bootstrap);
 }
 
 fn schedule_android_background_provision(
     app: AppHandle,
     application: Arc<NativeApplication>,
     diagnostics: Arc<AppDiagnostics>,
-    device_id: String,
-    capability: Option<ConnectionIntentCapability>,
+    bootstrap: Bootstrap,
 ) {
     tauri::async_runtime::spawn(async move {
-        provision_android_background_resilient(
-            app,
-            application,
-            diagnostics,
-            device_id,
-            capability,
-        )
-        .await;
+        provision_android_background_resilient(app, application, diagnostics, bootstrap).await;
     });
 }
 
 async fn provision_android_background_serialized(
     app: &AppHandle,
     application: &NativeApplication,
-    device_id: &str,
-    capability: Option<&ConnectionIntentCapability>,
+    bootstrap: &Bootstrap,
 ) -> Result<(), CommandError> {
     #[cfg(target_os = "android")]
     let _guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
-    provision_android_background(app, application, device_id, capability).await
+    provision_android_background(app, application, bootstrap).await
+}
+
+#[cfg(any(target_os = "android", test))]
+fn quick_plan_preparation(
+    bootstrap: &Bootstrap,
+    preferences: crate::preferences::AppPreferences,
+    personal_egress: EgressMode,
+    options: tauri_plugin_tunnel_android::TunnelOptions,
+    now: i64,
+) -> tauri_plugin_tunnel_android::PrepareQuickPlanRequest {
+    use tauri_plugin_tunnel_android::{PrepareQuickPlanRequest, QuickConnectionRequest};
+    let defaults = &bootstrap.defaults;
+    let egress = crate::preferences::connection_egress_mode(
+        defaults.layer,
+        defaults.route_mode,
+        defaults.tic_connection_mode,
+        preferences,
+        personal_egress,
+    );
+    PrepareQuickPlanRequest {
+        api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
+        device_id: bootstrap.device.id.clone(),
+        connection: QuickConnectionRequest {
+            lease_id: String::new(),
+            layer: match defaults.layer {
+                Layer::Tic => "tic",
+                Layer::Stray => "stray",
+            }
+            .into(),
+            tic_connection_mode: match defaults.tic_connection_mode {
+                TicConnectionMode::Personal => "personal",
+                TicConnectionMode::Dynamic => "dynamic",
+            }
+            .into(),
+            route_mode: match defaults.route_mode {
+                RouteMode::Standalone => "standalone",
+                RouteMode::ViaTak => "via_tak",
+            }
+            .into(),
+            egress_mode: match egress {
+                EgressMode::Ipv4 => "ipv4",
+                EgressMode::PreferIpv6 => "prefer_ipv6",
+            }
+            .into(),
+            allow_alternate: true,
+        },
+        options,
+        reserve_enabled: (nelomai_contracts::allows_new_connection_intent_operation(
+            bootstrap.capabilities.as_ref(),
+            now,
+        ) && (defaults.layer == Layer::Stray
+            || defaults.tic_connection_mode == TicConnectionMode::Dynamic))
+            .then_some(preferences.use_reserve_connection),
+    }
 }
 
 #[tauri::command]
@@ -2945,6 +3036,7 @@ pub async fn app_start(
         {
             let service_app = app.clone();
             let rust_application = application.inner().clone();
+            let start_diagnostics = diagnostics.inner().clone();
             let response = ANDROID_UI_START_STOP_COORDINATOR
                 .run_start(android_start_ticket, || async move {
                     let now = now_unix();
@@ -2953,10 +3045,12 @@ pub async fn app_start(
                         .tunnel_android()
                         .connection_intent_status()
                         .map_err(|_| {
-                            CommandError::new(
+                            let error = CommandError::new(
                                 "android_service_status_unavailable",
                                 "Не удалось проверить состояние службы подключения",
-                            )
+                            );
+                            record_start_preflight_failure(&start_diagnostics, "status", &error);
+                            error
                         })?;
                     ANDROID_UI_START_STOP_COORDINATOR.observe_projected_status(
                         projection_ticket,
@@ -2970,7 +3064,11 @@ pub async fn app_start(
                         let bootstrap = rust_application
                             .bootstrap(now)
                             .await
-                            .map_err(CommandError::from)?;
+                            .map_err(|error| {
+                                let error = CommandError::from(error);
+                                record_start_preflight_failure(&start_diagnostics, "bootstrap", &error);
+                                error
+                            })?;
                         if bootstrap.device.id != device_id {
                             return Err(CommandError::new(
                                 "device_mismatch",
@@ -3022,6 +3120,7 @@ pub async fn app_start(
                     let recovery_egress_mode = request.egress_mode;
                     let recovery_allow_alternate = request.allow_alternate;
                     let recovery_sync_binding_preferences = binding_request.is_some();
+                    let policy_diagnostics = start_diagnostics.clone();
                     let response = route_android_app_start_with_capability(
                         &current_intent,
                         recovery_capability,
@@ -3035,7 +3134,11 @@ pub async fn app_start(
                                 )
                                 .await
                                 .map(tauri_plugin_tunnel_android::connection_intent_tunnel_options)
-                                .map_err(CommandError::from)?;
+                                .map_err(|error| {
+                                    let error = CommandError::from(error);
+                                    record_start_preflight_failure(&policy_diagnostics, "policy", &error);
+                                    error
+                                })?;
                             Ok(tauri_plugin_tunnel_android::BeginConnectionIntentRequest {
                                 api_version: tauri_plugin_tunnel_android::TUNNEL_API_VERSION,
                                 template:
@@ -3079,10 +3182,14 @@ pub async fn app_start(
                                                 .tunnel_android()
                                                 .begin_connection_intent_async(request)
                                                 .await
-                                                .map_err(|_| CommandError::new(
-                                                    "android_service_dispatch_unavailable",
-                                                    "Не удалось передать намерение службе подключения",
-                                                ))
+                                                .map_err(|_| {
+                                                    let error = CommandError::new(
+                                                        "android_service_dispatch_unavailable",
+                                                        "Не удалось передать намерение службе подключения",
+                                                    );
+                                                    record_start_preflight_failure(&start_diagnostics, "dispatch", &error);
+                                                    error
+                                                })
                                         },
                                     )
                                     .await?;
@@ -3965,6 +4072,7 @@ fn schedule_startup_split_tunnel_refresh(
     application: Arc<NativeApplication>,
     diagnostics: Arc<AppDiagnostics>,
     scheduler: Arc<SplitTunnelScheduler>,
+    bootstrap: Bootstrap,
 ) {
     tauri::async_runtime::spawn(async move {
         #[cfg(target_os = "android")]
@@ -4016,8 +4124,24 @@ fn schedule_startup_split_tunnel_refresh(
             }
         }
         #[cfg(not(target_os = "android"))]
-        let _ = (app, diagnostics);
-        let _ = scheduler.synchronize(&application, false).await;
+        let _ = (&app, &diagnostics, &bootstrap);
+        let synchronized = scheduler.synchronize(&application, false).await;
+        #[cfg(target_os = "android")]
+        if synchronized.is_ok() {
+            // A first login may have prepared a fallback before policy and
+            // package inventory arrived. Refresh only future, unused plans.
+            let _guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
+            if let Err(error) = prepare_android_quick_plan(&app, &application, &bootstrap).await {
+                diagnostics.record_named(
+                    "background.quick_plan_refresh_failed",
+                    None,
+                    None,
+                    Some(error.code()),
+                );
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = synchronized;
     });
 }
 
@@ -4107,6 +4231,101 @@ pub(crate) fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_quick_plan_keeps_legacy_available_without_recovery_capability() {
+        let original: nelomai_contracts::Bootstrap = serde_json::from_str(include_str!(
+            "../../contracts/fixtures/valid/bootstrap.json"
+        ))
+        .unwrap();
+        for state in ["absent", "disabled", "expired", "invalid_revision"] {
+            let mut bootstrap = original.clone();
+            match state {
+                "absent" => bootstrap.capabilities = None,
+                "disabled" => {
+                    bootstrap
+                        .capabilities
+                        .as_mut()
+                        .unwrap()
+                        .connection_intent_recovery_v1 = false
+                }
+                "invalid_revision" => bootstrap.capabilities.as_mut().unwrap().revision = 0,
+                _ => {
+                    bootstrap.capabilities.as_mut().unwrap().expires_at =
+                        "1970-01-01T00:00:00Z".into()
+                }
+            }
+            for reserve in [false, true] {
+                let request = super::quick_plan_preparation(
+                    &bootstrap,
+                    crate::preferences::AppPreferences {
+                        use_reserve_connection: reserve,
+                        ..Default::default()
+                    },
+                    nelomai_contracts::EgressMode::Ipv4,
+                    Default::default(),
+                    1_000,
+                );
+                let wire = serde_json::to_value(request).unwrap();
+                assert!(wire["reserveEnabled"].is_null(), "{state}: {wire}");
+            }
+        }
+    }
+
+    #[test]
+    fn quick_plan_preparation_uses_current_defaults_without_copying_a_lease() {
+        let bootstrap: nelomai_contracts::Bootstrap = serde_json::from_str(include_str!(
+            "../../contracts/fixtures/valid/bootstrap.json"
+        ))
+        .unwrap();
+        let request = super::quick_plan_preparation(
+            &bootstrap,
+            crate::preferences::AppPreferences {
+                use_reserve_connection: true,
+                ..Default::default()
+            },
+            nelomai_contracts::EgressMode::Ipv4,
+            Default::default(),
+            1_000,
+        );
+        assert_eq!(request.device_id, bootstrap.device.id);
+        assert!(request.connection.lease_id.is_empty());
+        assert_eq!(request.reserve_enabled, Some(true));
+        let wire = serde_json::to_value(request).unwrap();
+        assert!(wire.get("configuration").is_none());
+        assert!(wire.get("token").is_none());
+    }
+
+    #[test]
+    fn start_preflight_failure_records_stage_and_safe_code_not_error_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = crate::diagnostics::AppDiagnostics::new(
+            directory.path().to_owned(),
+            crate::resource_usage::ResourceSnapshot::capture_for_test(),
+        )
+        .unwrap();
+        super::record_start_preflight_failure(
+            &diagnostics,
+            "bootstrap",
+            &super::CommandError::new("temporarily_unavailable", "secret response"),
+        );
+        super::record_start_preflight_failure(
+            &diagnostics,
+            "status",
+            &super::CommandError::new("private-token", "secret response"),
+        );
+        let logs: String = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .collect();
+        assert!(logs.contains("connection.start.bootstrap_failed"));
+        assert!(logs.contains("temporarily_unavailable"));
+        assert!(logs.contains("connection.start.status_failed"));
+        assert!(!logs.contains("secret response"));
+        assert!(!logs.contains("private-token"));
+    }
+
     #[test]
     fn runtime_readiness_transients_request_startup_retry_without_relogin() {
         use nelomai_client_container::ipc::PrivateError;

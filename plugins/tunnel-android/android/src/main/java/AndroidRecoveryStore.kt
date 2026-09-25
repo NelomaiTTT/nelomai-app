@@ -35,6 +35,8 @@ internal data class AndroidIntentTemplate(
     val syncBindingPreferences: Boolean = false,
     val options: AndroidTunnelOptions = AndroidTunnelOptions(),
     val reserveEnabled: Boolean? = null,
+    // Local future-plan concurrency metadata; excluded from the panel fingerprint.
+    val quickPlanRevision: String? = null,
 )
 
 internal data class AndroidTunnelOptions(
@@ -305,6 +307,7 @@ internal object AndroidRecoveryEnvelopeCodec {
         put("allowAlternate", template.allowAlternate)
         put("syncBindingPreferences", template.syncBindingPreferences)
         template.reserveEnabled?.let { put("reserveEnabled", it) }
+        template.quickPlanRevision?.let { put("quickPlanRevision", it) }
         put("options", optionsToJson(template.options))
     }
 
@@ -327,6 +330,8 @@ internal object AndroidRecoveryEnvelopeCodec {
             payload.getBoolean("reserveEnabled")
         } else null,
         options = payload.optionalObject("options")?.let(::optionsFromJson) ?: AndroidTunnelOptions(),
+        quickPlanRevision = payload.optString("quickPlanRevision").takeIf(String::isNotEmpty)
+            ?.also { requireSafeValue(it) },
     )
 
     private fun optionsToJson(options: AndroidTunnelOptions) = JSONObject().apply {

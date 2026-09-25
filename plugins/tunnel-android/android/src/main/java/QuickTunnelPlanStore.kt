@@ -1,6 +1,7 @@
 package ru.nelomai.tunnel
 
 import android.content.Context
+import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -11,9 +12,11 @@ private const val QUICK_PLAN_FORMAT = 3
 internal data class QuickTunnelTemplate(
     val options: TunnelOptionsArgs,
     val connection: QuickConnectionArgs,
+    val planRevision: String? = null,
 )
 
 internal object QuickTunnelPlanStore {
+    @Synchronized fun prepareForNextStart(context: Context, template: QuickTunnelTemplate) = storage(context).prepareForNextStart(template)
     @Synchronized fun save(context: Context, args: StartTunnelArgs) = storage(context).save(args)
     @Synchronized fun updateDnsServers(context: Context, dnsServers: List<String>): Boolean =
         storage(context).updateDnsServers(dnsServers)
@@ -28,14 +31,39 @@ internal object QuickTunnelPlanStore {
 
 /** Same encrypted quick-plan record; injectable persistence for regression tests. */
 internal class QuickTunnelPlanStorage(private val backend: EncryptedRecordBackend) {
+    fun prepareForNextStart(template: QuickTunnelTemplate): Boolean {
+        require(template.connection.leaseId.isEmpty()) { "quick_plan_preparation_has_lease" }
+        val current = loadTemplate()
+        if (current != null) {
+            if (!current.connection.sameSelection(template.connection)) return true
+            // This record is for future starts. Updating its options does not
+            // alter the active transport or the durable recovery transaction.
+        }
+        save(StartTunnelArgs().apply {
+            cacheQuickAction = true
+            options = template.options
+            quickConnection = current?.connection ?: template.connection
+        })
+        return true
+    }
+
     fun save(args: StartTunnelArgs) {
-        if (!args.cacheQuickAction || args.quickConnection == null) return
+        if (!args.cacheQuickAction) return
+        val connection = args.quickConnection ?: return
+        val current = loadTemplate()
+        // Only tile Starts carry a captured revision. An explicit UI Start
+        // remains authoritative, including an intentional split disable.
+        val options = current?.takeIf {
+            args.quickPlanRevision != null && args.quickPlanRevision != it.planRevision &&
+                it.connection.sameSelection(connection)
+        }?.options ?: args.options
         val preference = decrypt()?.opt("reservePreference") as? Boolean
         val plaintext = JSONObject().apply {
             put("format", QUICK_PLAN_FORMAT)
+            put("planRevision", UUID.randomUUID().toString())
             put("validUntilUnix", args.quickActionValidUntilUnix ?: JSONObject.NULL)
-            put("options", args.options.toJson())
-            put("connection", args.quickConnection?.toStoredQuickConnectionJson() ?: JSONObject.NULL)
+            put("options", options.toJson())
+            put("connection", connection.toStoredQuickConnectionJson())
             preference?.let { put("reservePreference", it) }
         }.toString().toByteArray(Charsets.UTF_8)
         try {
@@ -58,6 +86,7 @@ internal class QuickTunnelPlanStorage(private val backend: EncryptedRecordBacken
         if (!payload.has("connection")) return true
         val options = payload.optJSONObject("options") ?: return false
         options.put("dnsServers", JSONArray(dnsServers))
+        payload.put("planRevision", UUID.randomUUID().toString())
         val plaintext = payload.toString().toByteArray(Charsets.UTF_8)
         return try {
             backend.write(plaintext)
@@ -83,6 +112,7 @@ internal class QuickTunnelPlanStorage(private val backend: EncryptedRecordBacken
             QuickTunnelTemplate(
                 options = TunnelOptionsArgs.fromJson(payload.getJSONObject("options")),
                 connection = connection,
+                planRevision = payload.optString("planRevision", "legacy"),
             )
         } catch (_: Throwable) {
             clear()
@@ -100,6 +130,11 @@ internal class QuickTunnelPlanStorage(private val backend: EncryptedRecordBacken
         } finally { plaintext.fill(0) }
     }
 }
+
+private fun QuickConnectionArgs.sameSelection(other: QuickConnectionArgs): Boolean =
+    layer == other.layer && ticConnectionMode == other.ticConnectionMode &&
+        routeMode == other.routeMode && egressMode == other.egressMode &&
+        allowAlternate == other.allowAlternate
 
 private fun TunnelOptionsArgs.toJson(): JSONObject = JSONObject().apply {
     put("splitActive", splitActive)
