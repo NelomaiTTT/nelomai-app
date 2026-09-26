@@ -6,6 +6,16 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- Continuation after user “Тогда продолжай брат”: connected nonblocking DNS
+ probes with exact native interface binding, response/timeout validation and no
+ unbound fallback; shared transactional route/DNS journal and native macOS
+ command adapter; primary-first IPv4/IPv6 route plan keeps reserve probes
+ interface-scoped. Private Unix journal checks runtime/session/Start generation.
+ These are native building blocks, not an enabled desktop redundant connection.
+- Linux kernel-member cleanup retains captured interface index on failure,
+ refuses deletion after replacement and verifies absence before dropping owner.
+ Host test covers the cleanup decision seam, not a real Linux kernel/backend.
+
 - Task1: deterministic health policy and staggered probe scheduler;22 new tests,
  33 total in client-tunnel. Fresh handshake/probe required for promotion, no
  stale ticket acceptance after network change/Stop/promotion; expired probes
@@ -29,15 +39,17 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Remaining, not hidden behind a capability flag
 
-- Task2 common endpoint/data-route/DNS owner, transactional switch/rollback,
- IPv4+IPv6 and bound probes; verify same-VIP behavior and socket egress per OS.
+- Task2 connect the common route/DNS transaction and bound probes to complete
+ session-owned native lifecycle; Linux/Windows network adapters and per-member
+ Windows metrics still needed. Verify same-VIP behavior and socket egress per OS.
  The panel gives both members the same configured DNS health target, not a
  dedicated per-slot diagnostic address. A lower route metric alone is not proof
  of standby isolation. Do not enable the feature based only on Table=off.
 - Durable session/resource recovery: current member constructors refuse to
  adopt an already running interface (`slot_recovery_requires_owner`). This is
  a temporary safe boundary, not implemented crash recovery. Persisted owner,
- generation, native identity and stale-cleanup tests are still needed.
+ native member identity/recovery and stale-cleanup tests are still needed.
+ The new route journal is scope-bound, but is not whole-session crash recovery.
 - Task3 helper-owned coordinator, timer/IPC/capabilities and role ACK fencing.
 - Task4 foreground/background/quick-action server lifecycle and last-active
  WARM (one hour, reserve released). No desktop WARM wiring exists yet.
@@ -46,11 +58,17 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Verification
 
+Continuation verification: client-tunnel + Unix/Windows services **193 passed**
+(26 new tests in this continuation); host Clippy `-D warnings` and Windows MSVC
+cargo check passed again. Native test commands did not install/start any VPN or
+change host routes/DNS/firewall. Linux native compilation remains unverified.
+This is Task2 partial verification, not a whole-feature verdict.
+
 Safe test commands use `TMPDIR` inside the app project (short path necessary for
 macOS Unix-socket SUN_LEN), shared app target cache. No host VPN/firewall/Keychain
 changes, installation, production, push or release.
 
-- Final contracts + client-tunnel + Unix/Windows service suites:228 passed,
+- Previous checkpoint contracts + client-tunnel + Unix/Windows service suites:228 passed,
  including the socket-identity regression (4 Unix slot tests,7 Windows slot
  tests,22 shared health/scheduler tests added). Test log retained in this plan's
  ignored `.superpowers/sdd/2026-09-26-desktop-hot-standby/native-tests.log`.

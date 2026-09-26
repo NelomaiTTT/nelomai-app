@@ -7,8 +7,14 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
-ipnet = "2"
+ipnet = { version = "2", features = ["serde"] }
 nelomai-contracts = { path = "../contracts" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }

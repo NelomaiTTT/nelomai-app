@@ -23,6 +23,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct LinuxBackend {
     mode: ResourceMode,
     member_socket: Option<super::redundancy::SocketIdentity>,
+    member_kernel: Option<u32>,
     wireguard_api: WGApi<Kernel>,
     amneziawg_api: WGApi<Userspace>,
     amneziawg_go: PathBuf,
@@ -118,6 +119,7 @@ impl LinuxBackend {
         Ok(Self {
             mode,
             member_socket: None,
+            member_kernel: None,
             wireguard_api,
             amneziawg_api,
             amneziawg_go,
@@ -168,6 +170,13 @@ impl LinuxBackend {
             }
         }
         self.active_transport = Some(configuration.transport);
+        if !self.mode.owns_network() && configuration.transport == TunnelTransport::WireGuard {
+            let index = kernel_interface_index(interface_name)?;
+            if index == 0 {
+                return Err(ServiceError::Backend("slot_interface_missing".into()));
+            }
+            self.member_kernel = Some(index);
+        }
         if !self.mode.owns_network() && configuration.transport == TunnelTransport::AmneziaWg3 {
             self.member_socket = Some(super::redundancy::capture_userspace_member(interface_name)?);
         }
@@ -225,8 +234,11 @@ impl LinuxBackend {
     }
 
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
-        let transport = self.active_transport.take();
-        self.rebind_peers.clear();
+        let transport = if self.mode.owns_network() {
+            self.active_transport.take()
+        } else {
+            self.active_transport
+        };
         let mut first_error = None;
         if let Err(error) = if self.mode.owns_network() {
             self.amneziawg_routes.cleanup()
@@ -235,8 +247,18 @@ impl LinuxBackend {
         } {
             first_error.get_or_insert(error);
         }
-        let interface_error = match transport {
-            Some(TunnelTransport::WireGuard) => self.wireguard_api.remove_interface().err(),
+        let interface_result = match transport {
+            Some(TunnelTransport::WireGuard) if !self.mode.owns_network() => {
+                super::redundancy::remove_kernel_member(
+                    &mut self.member_kernel,
+                    &mut NativeKernelMember {
+                        interface: self.mode.linux_interface(TunnelTransport::WireGuard),
+                    },
+                )
+            }
+            Some(TunnelTransport::WireGuard) => {
+                self.wireguard_api.remove_interface().map_err(backend_error)
+            }
             Some(TunnelTransport::AmneziaWg3) if !self.mode.owns_network() => {
                 let result = self
                     .member_socket
@@ -249,18 +271,21 @@ impl LinuxBackend {
                             identity,
                         )
                     });
-                if let Err(error) = result {
-                    self.active_transport = transport;
-                    return Err(error);
+                if result.is_ok() {
+                    self.member_socket = None;
                 }
-                self.member_socket = None;
-                None
+                result
             }
-            Some(TunnelTransport::AmneziaWg3) => self.amneziawg_api.remove_interface().err(),
-            None => None,
+            Some(TunnelTransport::AmneziaWg3) => {
+                self.amneziawg_api.remove_interface().map_err(backend_error)
+            }
+            None => Ok(()),
         };
-        if let Some(error) = interface_error {
-            first_error.get_or_insert_with(|| backend_error(error));
+        if let Err(error) = interface_result {
+            first_error.get_or_insert(error);
+        } else {
+            self.active_transport = None;
+            self.rebind_peers.clear();
         }
         if let Err(error) = if self.mode.owns_network() {
             self.routes.cleanup()
@@ -305,6 +330,45 @@ impl LinuxBackend {
             }
         }
         snapshot
+    }
+}
+
+fn kernel_interface_index(interface: &str) -> Result<u32, ServiceError> {
+    let name = std::ffi::CString::new(interface).map_err(|_| ServiceError::InvalidRequest)?;
+    Ok(unsafe { libc::if_nametoindex(name.as_ptr()) })
+}
+
+struct NativeKernelMember {
+    interface: &'static str,
+}
+impl super::redundancy::KernelMemberControl for NativeKernelMember {
+    fn index(&mut self) -> Result<u32, ServiceError> {
+        kernel_interface_index(self.interface)
+    }
+    fn delete(&mut self) -> Result<(), ServiceError> {
+        // Members never installed DNS/fwmark policy. The vendor combined
+        // remove_interface() clears DNS after deleting the link and can fail
+        // there, leaving retries unable to distinguish success from failure.
+        let ip = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .ok_or_else(|| ServiceError::Backend("ip_command_unavailable".into()))?;
+        let status = status_with_timeout(
+            Command::new(ip)
+                .args(["link", "delete", "dev", self.interface])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            COMMAND_TIMEOUT,
+        )
+        .map_err(backend_error)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(ServiceError::Backend(
+                "slot_interface_cleanup_failed".into(),
+            ))
+        }
     }
 }
 

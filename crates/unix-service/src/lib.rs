@@ -4,6 +4,8 @@ mod process;
 mod routes;
 mod socket;
 
+pub mod member_network;
+
 use async_trait::async_trait;
 pub use backend::PlatformBackend;
 pub use config::{

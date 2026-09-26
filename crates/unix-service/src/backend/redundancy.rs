@@ -76,11 +76,82 @@ mod tests {
         unlink_socket_identity(&path, owner, current).unwrap();
         assert!(!path.exists());
     }
+
+    #[test]
+    fn failed_kernel_delete_keeps_identity_for_retry_and_never_deletes_replacement() {
+        struct Kernel {
+            index: u32,
+            failures: usize,
+            deletes: usize,
+        }
+        impl KernelMemberControl for Kernel {
+            fn index(&mut self) -> Result<u32, crate::ServiceError> {
+                Ok(self.index)
+            }
+            fn delete(&mut self) -> Result<(), crate::ServiceError> {
+                self.deletes += 1;
+                if self.failures > 0 {
+                    self.failures -= 1;
+                    return Err(crate::ServiceError::Backend("injected".into()));
+                }
+                self.index = 0;
+                Ok(())
+            }
+        }
+        let mut identity = Some(20);
+        let mut control = Kernel {
+            index: 20,
+            failures: 1,
+            deletes: 0,
+        };
+        assert!(remove_kernel_member(&mut identity, &mut control).is_err());
+        assert_eq!(identity, Some(20));
+        control.index = 21;
+        assert!(remove_kernel_member(&mut identity, &mut control).is_err());
+        assert_eq!(control.deletes, 1);
+        control.index = 20;
+        remove_kernel_member(&mut identity, &mut control).unwrap();
+        assert_eq!(identity, None);
+        assert_eq!(control.deletes, 2);
+        remove_kernel_member(&mut identity, &mut control).unwrap();
+        assert_eq!(control.deletes, 2);
+    }
 }
 #[cfg(any(target_os = "linux", test))]
 use nelomai_client_tunnel::TunnelTransport;
 use nelomai_contracts::dispatcher::TunnelSlot;
 use std::path::{Path, PathBuf};
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) trait KernelMemberControl {
+    fn index(&mut self) -> Result<u32, crate::ServiceError>;
+    fn delete(&mut self) -> Result<(), crate::ServiceError>;
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn remove_kernel_member<C: KernelMemberControl>(
+    identity: &mut Option<u32>,
+    control: &mut C,
+) -> Result<(), crate::ServiceError> {
+    let current = control.index()?;
+    if current == 0 {
+        *identity = None;
+        return Ok(());
+    }
+    if *identity != Some(current) {
+        return Err(crate::ServiceError::Backend(
+            "slot_interface_identity_changed".into(),
+        ));
+    }
+    control.delete()?;
+    if control.index() != Ok(0) {
+        return Err(crate::ServiceError::Backend(
+            "slot_interface_cleanup_pending".into(),
+        ));
+    }
+    *identity = None;
+    Ok(())
+}
 
 // WG/AWG userspace backends exit when their UAPI socket is removed. The vendor
 // remove_interface also mutates DNS (machine-wide on macOS), so members cannot
