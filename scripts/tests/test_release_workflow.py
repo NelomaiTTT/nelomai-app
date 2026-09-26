@@ -25,6 +25,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             "secrets": SimpleNamespace(**{name: "release-secret" for name in (
                 "NELOMAI_RELEASE_MANIFEST_PRIVATE_KEY_B64", "ANDROID_KEYSTORE_BASE64",
                 "TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+                "NELOMAI_MACOS_SIGNING_P12_BASE64", "NELOMAI_MACOS_SIGNING_P12_PASSWORD",
                 "ANDROID_KEY_ALIAS", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_PASSWORD")}),
             "always": lambda: True, "cancelled": lambda: cancelled,
         })
@@ -37,6 +38,54 @@ class ReleaseWorkflowTest(unittest.TestCase):
                                ("publish_approved_candidate", "publish_approved_candidate")):
             with self.subTest(mode=mode):
                 self.assertEqual(self.expression(workflow["env"]["RELEASE_MODE"], mode=mode), expected)
+
+    def test_common_signing_is_protected_keyless_builds_stay_keyless(self):
+        jobs = self.workflow()["jobs"]
+        self.assertIn("macos_common_sign", jobs, "missing isolated macOS signing phase")
+        job = jobs["macos_common_sign"]
+        self.assertEqual(job["runs-on"], "macos-14")
+        self.assertEqual(job["environment"], "release-candidate-finalization")
+        self.assertEqual(set(job["needs"]), {"native_packages", "sign"})
+        for mode, enabled in (("publish_approved_candidate", False), ("build_only", True),
+                              ("sign_candidate", True), ("build_and_publish", True)):
+            self.assertEqual(self.expression(job["if"], mode=mode), enabled)
+        signing = [s for s in job["steps"] if "sign-macos-common-package.py" in s.get("run", "")]
+        self.assertEqual(len(signing), 1)
+        for name in ("NELOMAI_MACOS_SIGNING_P12_BASE64", "NELOMAI_MACOS_SIGNING_P12_PASSWORD"):
+            value = signing[0]["env"][name]
+            for mode, expected in (("build_only", ""), ("publish_approved_candidate", ""),
+                                   ("sign_candidate", "release-secret"), ("build_and_publish", "release-secret")):
+                self.assertEqual(self.expression(value, mode=mode), expected)
+            # Credentials must not escape into build steps/job/global env.
+            for other_name, other in jobs.items():
+                for step in other.get("steps", []):
+                    if other_name != "macos_common_sign" or step is not signing[0]:
+                        self.assertNotIn(name, step.get("env", {}))
+                self.assertNotIn(name, other.get("env", {}))
+            self.assertNotIn(name, self.workflow().get("env", {}))
+        downloads = [s["with"]["name"] for s in job["steps"] if s.get("uses", "").startswith("actions/download-artifact@")]
+        self.assertEqual(downloads, ["packages-macos"])
+
+    def test_finalization_consumes_only_common_signed_macos_artifact(self):
+        jobs = self.workflow()["jobs"]
+        self.assertIn("macos_common_sign", jobs["finalize"]["needs"])
+        downloads = [s["with"] for s in jobs["finalize"]["steps"] if s.get("uses", "").startswith("actions/download-artifact@")]
+        signed = [d for d in downloads if d.get("name") == "signed-common-macos"]
+        self.assertEqual(signed, [{"name": "signed-common-macos", "path": "packages/macos"}])
+        # Execute the actual platform separation shell in a scratch tree. The
+        # unsigned macOS artifact must not be moved into the final input.
+        step = next(s for s in jobs["finalize"]["steps"] if s.get("name") == "Keep platform and purpose separation")
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            for platform in ("macos", "linux", "windows", "android"):
+                p = Path(tmp) / "package-downloads" / ("packages-" + platform)
+                p.mkdir(parents=True)
+                (p / "marker").write_text(platform)
+            subprocess.run(["bash", "-eu", "-c", step["run"]], cwd=tmp, check=True)
+            self.assertFalse((Path(tmp) / "packages/macos").exists())
+            for platform in ("linux", "windows", "android"):
+                self.assertEqual((Path(tmp) / "packages" / platform / "marker").read_text(), platform)
 
     def test_publication_waits_for_finalization_but_retained_promotion_needs_no_build(self):
         job = self.workflow()["jobs"]["publish"]
@@ -98,11 +147,11 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_linux_diagnostic_source_gate_tracks_current_version(self):
         workflow = yaml.safe_load((ROOT / '.github/workflows/checks.yml').read_text())
         commands = '\n'.join(step.get('run', '') for step in workflow['jobs']['linux-package-diagnostic']['steps'])
-        self.assertIn('--version 0.3.2 --mode build_only', commands)
+        self.assertIn('--version 0.3.3 --mode build_only', commands)
 
     def test_032_signing_downloads_pinned_stable_before_signing_containers(self):
         workflow = self.workflow()
-        self.assertEqual(workflow[True]["workflow_dispatch"]["inputs"]["version"]["default"], "0.3.2")
+        self.assertEqual(workflow[True]["workflow_dispatch"]["inputs"]["version"]["default"], "0.3.3")
         commands = "\n".join(step.get("run", "") for step in workflow["jobs"]["sign"]["steps"])
         self.assertLess(commands.index("scripts/download-confirmed-stable.py"),
                         commands.index("scripts/sign-runtime-candidate.py"))
@@ -271,7 +320,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("needs", jobs["native_drafts"])
         self.assertEqual(set(jobs["sign"]["needs"]), {"verify", "native_drafts"})
         self.assertEqual(set(jobs["native_packages"]["needs"]), {"native_drafts", "sign"})
-        self.assertEqual(set(jobs["finalize"]["needs"]), {"native_packages", "sign"})
+        self.assertEqual(set(jobs["finalize"]["needs"]), {"native_packages", "sign", "macos_common_sign"})
 
     def test_publish_resolves_artifact_from_run_without_manual_hashes(self):
         workflow = self.workflow()

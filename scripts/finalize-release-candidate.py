@@ -20,6 +20,15 @@ spec.loader.exec_module(builder)
 gates, verifier = builder.gates, builder.verifier
 
 
+def verify_macos_common_signature(index, mode, pin):
+    if mode == "build_only":
+        return None
+    expected = verifier.load_script("sign-macos-common-package.py").signature_metadata(pin)
+    if index.get("macos_common_signature") != expected:
+        raise ValueError("macOS candidate lacks pinned common code signature verification")
+    return expected
+
+
 def apk_payload(archive):
     with zipfile.ZipFile(archive) as apk:
         names = apk.namelist()
@@ -48,6 +57,7 @@ def main():
     cli = builder.ROOT / "node_modules/.bin/tauri"
     final_inputs = args.work / "collector"
     final_inputs.mkdir()
+    macos_common_signature = None
     for platform, architecture in verifier.TARGETS:
         folder = args.packages / platform
         index = json.loads((folder / "package-digests.json").read_bytes())
@@ -59,6 +69,9 @@ def main():
         expected = index["packages"]["shipping"]
         if expected != dict(name=name, sha256=verifier.digest(path), size_bytes=path.stat().st_size):
             raise ValueError("native package changed before final signing")
+        if platform == "macos":
+            macos_common_signature = verify_macos_common_signature(
+                index, args.mode, os.environ.get("NELOMAI_MACOS_SIGNER_SHA1", ""))
         destination = args.work / ("shipping-" + name)
         shutil.copyfile(path, destination)
         if platform == "android":
@@ -104,6 +117,8 @@ def main():
         trust=policy["trust"], purpose="shipping", run_id=os.environ["GITHUB_RUN_ID"],
         run_attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]), environment_ids=identities,
         assets={path.name: verifier.digest(path) for path in candidate.iterdir()})
+    if macos_common_signature is not None:
+        inventory["macos_common_signature"] = macos_common_signature
     (candidate / "candidate-inventory.json").write_bytes(verifier.load_script("build-runtime-release-set.py").canonical(inventory))
     print(json.dumps(dict(inventory_sha256=verifier.digest(candidate / "candidate-inventory.json"))))
 

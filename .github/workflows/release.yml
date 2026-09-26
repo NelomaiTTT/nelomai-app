@@ -19,7 +19,7 @@ on:
       version:
         description: "Проверяемая версия; исходники не переписываются"
         type: "string"
-        default: "0.3.2"
+        default: "0.3.3"
         required: true
       candidate_run_id:
         description: "Номер успешной sign_candidate сборки; повторные попытки поддерживаются"
@@ -81,8 +81,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.3.2
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.2 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.3
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.3 --mode "$RELEASE_MODE"
       -
         name: "Pinned AmneziaWG source"
         run: |
@@ -154,8 +154,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.3.2
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.2 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.3
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.3 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -201,8 +201,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.3.2
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.2 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.3
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.3 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -285,8 +285,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.3.2
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.2 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.3
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.3 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -318,10 +318,53 @@ jobs:
           if-no-files-found: "error"
           overwrite: true
           retention-days: 14
+  macos_common_sign:
+    if: "inputs.mode != 'publish_approved_candidate'"
+    needs:
+      - "native_packages"
+      - "sign"
+    environment: "release-candidate-finalization"
+    runs-on: "macos-14"
+    env:
+      ROOT_SHA256: "${{ needs.sign.outputs.root_sha256 }}"
+      NELOMAI_MACOS_SIGNER_SHA1: "${{ vars.NELOMAI_MACOS_SIGNER_SHA1 }}"
+    steps:
+      - uses: "actions/checkout@v4"
+        with:
+          ref: "${{ inputs.source_sha }}"
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: "actions/setup-python@v5"
+        with:
+          python-version: "3.12"
+      - name: "Exact source before common signing"
+        run: |
+          test "$GITHUB_SHA" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - uses: "actions/download-artifact@v4"
+        with:
+          name: "packages-macos"
+          path: "unsigned-macos"
+      - name: "Sign outer macOS common without rebuilding runtimes"
+        run: |
+          python scripts/sign-macos-common-package.py --mode "$RELEASE_MODE" --source-sha "$SOURCE_SHA" \
+            --release-set-sha256 "$ROOT_SHA256" --input unsigned-macos --output signed-common-macos \
+            --work "$RUNNER_TEMP/common-signing" --certificate-sha1 "$NELOMAI_MACOS_SIGNER_SHA1"
+        env:
+          NELOMAI_MACOS_SIGNING_P12_BASE64: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.NELOMAI_MACOS_SIGNING_P12_BASE64 || '' }}"
+          NELOMAI_MACOS_SIGNING_P12_PASSWORD: "${{ (inputs.mode == 'sign_candidate' || inputs.mode == 'build_and_publish') && secrets.NELOMAI_MACOS_SIGNING_P12_PASSWORD || '' }}"
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "signed-common-macos"
+          path: "signed-common-macos/"
+          if-no-files-found: "error"
+          overwrite: true
+          retention-days: 14
   finalize:
     needs:
       - "native_packages"
       - "sign"
+      - "macos_common_sign"
     environment: "release-candidate-finalization"
     runs-on: "ubuntu-22.04"
     env:
@@ -329,6 +372,7 @@ jobs:
       RELEASE_NOTES: "${{ inputs.release_notes }}"
       RELEASE_CRITICAL: "${{ inputs.critical }}"
       RELEASE_MINIMUM_SUPPORTED: "${{ inputs.minimum_supported }}"
+      NELOMAI_MACOS_SIGNER_SHA1: "${{ vars.NELOMAI_MACOS_SIGNER_SHA1 }}"
     outputs:
       inventory_sha256: "${{ steps.final.outputs.inventory_sha256 }}"
       artifact_id: "${{ steps.candidate.outputs.artifact-id }}"
@@ -350,8 +394,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.3.2
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.2 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.3
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.3 --mode "$RELEASE_MODE"
       -
         uses: "actions/download-artifact@v4"
         with:
@@ -366,7 +410,11 @@ jobs:
         name: "Keep platform and purpose separation"
         run: |
           mkdir packages
-          for platform in linux windows macos android; do mv "package-downloads/packages-$platform" "packages/$platform"; done
+          for platform in linux windows android; do mv "package-downloads/packages-$platform" "packages/$platform"; done
+      - uses: "actions/download-artifact@v4"
+        with:
+          name: "signed-common-macos"
+          path: "packages/macos"
       -
         name: "Phase-local trust"
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --phase finalization --public-key \"$RUNNER_TEMP/runtime-public.raw\" --private-key \"$RUNNER_TEMP/runtime-private.raw\""
@@ -403,7 +451,7 @@ jobs:
         uses: "actions/upload-artifact@v4"
         id: "candidate"
         with:
-          name: "candidate-0.3.2"
+          name: "candidate-0.3.3"
           path: "finalized/candidate/"
           if-no-files-found: "error"
           overwrite: true
@@ -443,8 +491,8 @@ jobs:
         name: "Exact source before generated inputs"
         run: |
           test "$GITHUB_SHA" = "$SOURCE_SHA"
-          test "$RELEASE_VERSION" = 0.3.2
-          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.2 --mode "$RELEASE_MODE"
+          test "$RELEASE_VERSION" = 0.3.3
+          python scripts/release-candidate-gates.py source --source-sha "$SOURCE_SHA" --version 0.3.3 --mode "$RELEASE_MODE"
       -
         run: "python scripts/prepare-release-trust.py --mode \"$RELEASE_MODE\" --public-key \"$RUNNER_TEMP/runtime-public.raw\""
       -
@@ -478,7 +526,7 @@ jobs:
         run: |
           python scripts/check-publication-inputs.py --directory candidate --source-sha "$SOURCE_SHA" \
             --run-id "$CANDIDATE_RUN" --inventory-sha256 "$INVENTORY_SHA256"
-          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.3.2 --source-sha "$SOURCE_SHA"
+          python scripts/release-candidate-gates.py tag --repository "$GITHUB_REPOSITORY" --version 0.3.3 --source-sha "$SOURCE_SHA"
           mapfile -t assets < <(python -c 'import importlib.util; s=importlib.util.spec_from_file_location("g","scripts/release-candidate-gates.py"); g=importlib.util.module_from_spec(s); s.loader.exec_module(g); print("\n".join("candidate/"+n for n in sorted(g.PUBLISH_ASSETS)))')
           test "${#assets[@]}" -eq 22
-          gh release create v0.3.2 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.3.2" --notes "$RELEASE_NOTES"
+          gh release create v0.3.3 "${assets[@]}" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Nelomai 0.3.3" --notes "$RELEASE_NOTES"

@@ -131,7 +131,9 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
         {
             #[cfg(target_os = "linux")]
             let install = install_linux_common(bytes).await;
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            let install = install_macos_common(bytes).await;
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let install = update
                 .install(bytes)
                 .map_err(|_| UpdateBackendError::new("update_install_failed"));
@@ -144,6 +146,73 @@ impl<R: Runtime> UpdateBackend for DesktopUpdateBackend<R> {
             }))
         }
     }
+}
+
+/// Like Linux, macOS activates the complete root-owned common bundle in one
+/// authorization. Stock Update::install leaves a user-owned extracted bundle,
+/// which otherwise forces another privileged repair during pre-auth startup.
+#[cfg(target_os = "macos")]
+async fn install_macos_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> {
+    let resources = std::path::Path::new(
+        "/Library/Application Support/Nelomai/common/Nelomai.app/Contents/Resources",
+    );
+    for name in [
+        "install-common-macos.sh",
+        "install-common-macos.applescript",
+    ] {
+        for path in resources.join(name).ancestors() {
+            nelomai_contracts::dispatcher::trusted(path, 0)
+                .map_err(|_| UpdateBackendError::new("common_installer_untrusted"))?;
+        }
+    }
+    let (staging, mut command) = stage_macos_update(&bytes, resources)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _staging = staging;
+        let status = super::unix::installer_status(&mut command)
+            .map_err(|_| UpdateBackendError::new("update_install_failed"))?;
+        if !status.success() {
+            return Err(UpdateBackendError::new("update_install_failed"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| UpdateBackendError::new("update_install_failed"))?
+}
+
+/// Caller verified Update::download's signature, stop barrier and root-owned
+/// installer paths. Keep staging alive through authorization; the installer
+/// hashes its protected copy before extraction, closing the source-file race.
+#[cfg(target_os = "macos")]
+fn stage_macos_update(
+    bytes: &[u8],
+    resources: &std::path::Path,
+) -> Result<(tempfile::TempDir, std::process::Command), UpdateBackendError> {
+    use std::{
+        io::Write,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    let staging = tempfile::Builder::new()
+        .prefix("nelomai-verified-update-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    let archive = staging.path().join("Nelomai.app.tar.gz");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&archive)
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| UpdateBackendError::new("update_staging_failed"))?;
+    let mut command = std::process::Command::new("/usr/bin/osascript");
+    command
+        .arg(resources.join("install-common-macos.applescript"))
+        .arg(resources.join("install-common-macos.sh"))
+        .arg(archive)
+        .arg(nelomai_contracts::dispatcher::digest(bytes));
+    Ok((staging, command))
 }
 
 /// `Update::download` has already verified the updater signature. The root
@@ -190,4 +259,45 @@ async fn install_linux_common(bytes: Vec<u8>) -> Result<(), UpdateBackendError> 
     })
     .await
     .map_err(|_| UpdateBackendError::new("update_install_failed"))?
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use std::{ffi::OsString, os::unix::fs::PermissionsExt, path::Path};
+
+    #[test]
+    fn macos_update_handoff_pins_private_bytes_and_installed_installer() {
+        let resources =
+            Path::new("/Library/Application Support/Nelomai/common/Nelomai.app/Contents/Resources");
+        let (staging, command) = stage_macos_update(b"abc", resources).unwrap();
+        let archive = staging.path().join("Nelomai.app.tar.gz");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"abc");
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(staging.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        assert_eq!(command.get_program(), "/usr/bin/osascript");
+        assert_eq!(
+            command.get_args().map(OsString::from).collect::<Vec<_>>(),
+            vec![
+                resources
+                    .join("install-common-macos.applescript")
+                    .into_os_string(),
+                resources.join("install-common-macos.sh").into_os_string(),
+                archive.clone().into_os_string(),
+                OsString::from("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            ]
+        );
+        drop(staging);
+        assert!(!archive.exists());
+    }
 }

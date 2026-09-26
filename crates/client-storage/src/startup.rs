@@ -183,11 +183,19 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     }
     let mut occupied = Vec::new();
     let mut pending = Vec::new();
+    // The owner lock excludes live writers during startup. Keep just the
+    // selected validated value for pre-write decisions, not a lasting cache.
+    // Post-write verification below must still read the protected store anew.
+    let mut current_runtime = None;
     for namespace in &known {
         let paths = paths_from_namespace(root, namespace)?;
         let state = ProtectedRuntimeStore::new(records.record(namespace), paths.clone());
-        if state.load()?.is_some() {
+        let loaded = state.load()?;
+        if loaded.is_some() {
             occupied.push(namespace.clone());
+        }
+        if namespace == selected_paths.namespace() {
+            current_runtime = loaded;
         }
         let staging = ProtectedTransactionStore::new(
             records.record(&format!("{namespace}:pending-write-v1")),
@@ -296,7 +304,6 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
                 return recovery();
             }
             let expected_new_runtime = RuntimeStateV1::empty(&selected_paths, true);
-            let current_runtime = runtime.load()?;
             if occupied.iter().any(|namespace| {
                 namespace != selected_paths.namespace() && !marker.namespaces.contains(namespace)
             }) || current_runtime.as_ref().is_some_and(|state| {
@@ -406,8 +413,7 @@ pub fn prepare_runtime_storage<F: ProtectedRecordFactory>(
     }) || current_auth
         .as_ref()
         .is_some_and(|a| a != &transaction.auth)
-        || runtime
-            .load()?
+        || current_runtime
             .as_ref()
             .is_some_and(|r| r != &transaction.runtime)
     {
