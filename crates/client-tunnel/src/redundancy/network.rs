@@ -135,12 +135,13 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         if let Some(p) = &journal.pending {
             validate_entries(&p.target)?;
         }
-        let mut owner = Self {
+        let owner = Self {
             system,
             store,
             journal,
         };
-        owner.rollback()?;
+        // Loading state is not permission to resume traffic or recreate old
+        // interfaces. The enclosing lifecycle chooses reconciliation or Stop.
         Ok(owner)
     }
 
@@ -168,11 +169,19 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         self.transition(Some(active), values)
     }
 
+    pub fn prepare(&mut self, values: Vec<NetworkValue>) -> io::Result<()> {
+        if self.journal.active.is_some() || self.journal.stopping || self.journal.pending.is_some()
+        {
+            return Err(io::Error::other("network_prepare_fenced"));
+        }
+        self.transition(None, values)
+    }
+
     pub fn cleanup(&mut self) -> io::Result<()> {
         // Local Stop fences any promotion even if persistence or cleanup fails.
         self.journal.stopping = true;
         self.store.save(&self.journal)?;
-        self.rollback()?;
+        self.prepare_pending_cleanup()?;
         self.transition(None, Vec::new())
     }
 
@@ -180,11 +189,7 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         if values.len() > 32768 {
             return Err(invalid());
         }
-        for entry in &self.journal.owned {
-            if self.system.read(&entry.current.key())?.as_ref() != Some(&entry.current) {
-                return Err(conflict());
-            }
-        }
+        self.reconcile_missing_routes()?;
         let mut target = Vec::with_capacity(values.len());
         let mut keys = HashSet::new();
         for value in values {
@@ -289,6 +294,72 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         restored.pending = None;
         self.store.save(&restored)?;
         self.journal = restored;
+        Ok(())
+    }
+
+    fn reconcile_missing_routes(&mut self) -> io::Result<()> {
+        let mut next = self.journal.clone();
+        next.owned.clear();
+        for entry in &self.journal.owned {
+            match self.system.read(&entry.current.key())? {
+                Some(value) if value == entry.current => next.owned.push(entry.clone()),
+                None if matches!(entry.current, NetworkValue::Route(_)) => {
+                    if matches!(&entry.current, NetworkValue::Route(r) if r.scope == RouteScope::Global)
+                    {
+                        next.active = None;
+                    }
+                }
+                _ => return Err(conflict()),
+            }
+        }
+        if next.owned != self.journal.owned {
+            self.store.save(&next)?;
+            self.journal = next;
+        }
+        Ok(())
+    }
+
+    fn prepare_pending_cleanup(&mut self) -> io::Result<()> {
+        let Some(pending) = &self.journal.pending else {
+            return Ok(());
+        };
+        let mut seen = HashSet::new();
+        let mut owned = Vec::new();
+        for entry in self.journal.owned.iter().chain(&pending.target) {
+            let key = entry.current.key();
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let before = find(&self.journal.owned, &key);
+            let after = find(&pending.target, &key);
+            let original = before
+                .map(|e| e.original.clone())
+                .unwrap_or_else(|| entry.original.clone());
+            let current = self.system.read(&key)?;
+            if current == original {
+                continue;
+            }
+            // Lost links remove their routes automatically. Never recreate them
+            // just to roll back an interrupted transition before Stop.
+            if current.is_none() && matches!(key, ResourceKey::Route(..)) {
+                continue;
+            }
+            let known_before = before.map(|e| &e.current).or(original.as_ref());
+            let known_after = after.map(|e| &e.current).or(original.as_ref());
+            if current.as_ref() != known_before && current.as_ref() != known_after {
+                return Err(conflict());
+            }
+            let current = current.ok_or_else(conflict)?;
+            owned.push(Entry { original, current });
+        }
+        let stopped = NetworkJournal {
+            owned,
+            active: None,
+            pending: None,
+            stopping: true,
+        };
+        self.store.save(&stopped)?;
+        self.journal = stopped;
         Ok(())
     }
 }

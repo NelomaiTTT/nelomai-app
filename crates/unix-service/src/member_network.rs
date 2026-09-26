@@ -3,3 +3,5 @@
 pub mod journal;
 #[cfg(any(target_os = "macos", test))]
 pub mod macos;
+pub mod members;
+pub mod session;

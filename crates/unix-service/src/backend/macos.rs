@@ -1,7 +1,7 @@
 use super::redundancy::ResourceMode;
 use super::{
     append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
-    configure_interface_after_awg3, host_diagnostic_snapshot, rebind_peers_from_configuration,
+    configure_interface_after_awg3, host_diagnostic_snapshot, rebind_peers_for_start,
     rebind_peers_from_host, rebind_userspace_udp, state_name, transport_name,
     userspace_log_streams, userspace_socket_path, DiagnosticJournal, RebindPeer,
 };
@@ -244,11 +244,7 @@ impl MacosBackend {
                 return Err(error);
             }
         }
-        self.rebind_peers = if configuration.transport == TunnelTransport::AmneziaWg3 {
-            rebind_peers_from_configuration(configuration)
-        } else {
-            Vec::new()
-        };
+        self.rebind_peers = rebind_peers_for_start(configuration, self.mode);
         Ok(())
     }
 
@@ -367,6 +363,30 @@ impl MacosBackend {
 }
 
 impl ServiceTunnelBackend for MacosBackend {
+    fn member_slot(&self) -> Option<TunnelSlot> {
+        match self.mode {
+            ResourceMode::Single => None,
+            ResourceMode::Member(slot) => Some(slot),
+        }
+    }
+    fn member_interface_index(&self) -> Result<u32, ServiceError> {
+        if self.mode.owns_network() || self.api.is_none() {
+            return Err(ServiceError::Backend("member_interface_unavailable".into()));
+        }
+        let name = read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?;
+        if self.member_socket != Some(super::redundancy::capture_userspace_member(&name)?) {
+            return Err(ServiceError::Backend(
+                "slot_interface_identity_changed".into(),
+            ));
+        }
+        let name = std::ffi::CString::new(name).map_err(|_| ServiceError::InvalidRequest)?;
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if index == 0 {
+            Err(ServiceError::Backend("member_interface_unavailable".into()))
+        } else {
+            Ok(index)
+        }
+    }
     fn start(
         &mut self,
         configuration: &ParsedConfiguration,

@@ -1,7 +1,7 @@
 use super::redundancy::ResourceMode;
 use super::{
     append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
-    configure_interface_after_awg3, host_diagnostic_snapshot, rebind_peers_from_configuration,
+    configure_interface_after_awg3, host_diagnostic_snapshot, rebind_peers_for_start,
     rebind_peers_from_host, rebind_userspace_udp, state_name, transport_name,
     userspace_log_streams, userspace_socket_path, DiagnosticJournal, RebindPeer,
 };
@@ -225,11 +225,7 @@ impl LinuxBackend {
             let _ = self.stop_inner();
             return Err(error);
         }
-        self.rebind_peers = if configuration.transport == TunnelTransport::AmneziaWg3 {
-            rebind_peers_from_configuration(configuration)
-        } else {
-            Vec::new()
-        };
+        self.rebind_peers = rebind_peers_for_start(configuration, self.mode);
         Ok(())
     }
 
@@ -373,6 +369,35 @@ impl super::redundancy::KernelMemberControl for NativeKernelMember {
 }
 
 impl ServiceTunnelBackend for LinuxBackend {
+    fn member_slot(&self) -> Option<TunnelSlot> {
+        match self.mode {
+            ResourceMode::Single => None,
+            ResourceMode::Member(slot) => Some(slot),
+        }
+    }
+    fn member_interface_index(&self) -> Result<u32, ServiceError> {
+        if self.mode.owns_network() {
+            return Err(ServiceError::Backend("member_interface_unavailable".into()));
+        }
+        let transport = self
+            .active_transport
+            .ok_or_else(|| ServiceError::Backend("member_not_running".into()))?;
+        let name = self.mode.linux_interface(transport);
+        let index = kernel_interface_index(name)?;
+        let owned = match transport {
+            TunnelTransport::WireGuard => self.member_kernel == Some(index),
+            TunnelTransport::AmneziaWg3 => {
+                self.member_socket == Some(super::redundancy::capture_userspace_member(name)?)
+            }
+        };
+        if index == 0 || !owned {
+            Err(ServiceError::Backend(
+                "slot_interface_identity_changed".into(),
+            ))
+        } else {
+            Ok(index)
+        }
+    }
     fn start(
         &mut self,
         configuration: &ParsedConfiguration,

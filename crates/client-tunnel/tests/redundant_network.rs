@@ -8,6 +8,7 @@ struct System {
     writes: usize,
     fail_at: Vec<usize>,
     ignore_at: Vec<usize>,
+    reject_interfaces: Vec<u32>,
 }
 impl NetworkSystem for System {
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
@@ -20,6 +21,10 @@ impl NetworkSystem for System {
         after: Option<&NetworkValue>,
     ) -> io::Result<()> {
         self.writes += 1;
+        if matches!(after,Some(NetworkValue::Route(r)) if self.reject_interfaces.contains(&r.interface))
+        {
+            return Err(io::Error::other("interface vanished"));
+        }
         if self.fail_at.contains(&self.writes) {
             return Err(io::Error::other("injected"));
         }
@@ -225,4 +230,61 @@ fn successful_stop_clears_pending_but_cannot_resurrect_same_owner() {
     assert_eq!(owner.active(), None);
     assert!(owner.select(Slot::B, pair(20)).is_err());
     assert!(owner.system_mut().values.is_empty());
+}
+
+#[test]
+fn physical_bypasses_can_be_prepared_without_publishing_unstarted_primary() {
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.prepare(vec![route("192.0.2.1/32", 5)]).unwrap();
+    assert_eq!(owner.active(), None);
+    let mut routes = vec![route("192.0.2.1/32", 5)];
+    routes.extend(pair(10));
+    owner.select(Slot::A, routes).unwrap();
+    assert_eq!(owner.active(), Some(Slot::A));
+    assert!(owner.prepare(vec![]).is_err());
+    assert_eq!(owner.active(), Some(Slot::A));
+}
+
+#[test]
+fn routes_removed_with_dead_interface_do_not_block_promotion_or_cleanup() {
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, pair(10)).unwrap();
+    owner.system_mut().values.clear(); // Kernel removed routes with lost A.
+    owner.select(Slot::B, pair(20)).unwrap();
+    assert_eq!(owner.active(), Some(Slot::B));
+    owner.system_mut().values.clear();
+    owner.cleanup().unwrap();
+    assert!(!owner.cleanup_pending());
+}
+
+#[test]
+fn failed_promotion_after_primary_disappeared_does_not_restore_dead_primary_routes() {
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, pair(10)).unwrap();
+    owner.system_mut().values.clear();
+    owner.system_mut().fail_at = vec![7];
+    assert!(owner.select(Slot::B, pair(20)).is_err());
+    assert_eq!(owner.active(), None);
+    assert!(owner.system_mut().values.is_empty());
+}
+
+#[test]
+fn restart_then_stop_cleans_partial_switch_without_recreating_a_dead_interface() {
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, pair(10)).unwrap();
+    owner.system_mut().fail_at = vec![7, 8];
+    assert!(owner.select(Slot::B, pair(20)).is_err());
+    let (mut system, store) = owner.into_parts();
+    system
+        .values
+        .retain(|_, value| matches!(value,NetworkValue::Route(r) if r.interface==20));
+    system.fail_at.clear();
+    system.reject_interfaces = vec![10];
+    let writes = system.writes;
+    let saved = store.saved.clone().unwrap();
+    let mut owner = NetworkOwner::recover(system, store, saved).unwrap();
+    assert_eq!(owner.system_mut().writes, writes); // Recovery is not permission to resume or switch.
+    owner.cleanup().unwrap();
+    assert!(owner.system_mut().values.is_empty());
+    assert!(!owner.cleanup_pending());
 }

@@ -550,6 +550,14 @@ pub fn authorize_peer(
 }
 
 pub trait ServiceTunnelBackend {
+    fn member_slot(&self) -> Option<dispatcher::TunnelSlot> {
+        None
+    }
+    /// Only member-mode backends expose a verified native index. Ordinary
+    /// backends and older/fake implementations do not gain this capability.
+    fn member_interface_index(&self) -> Result<u32, ServiceError> {
+        Err(ServiceError::Backend("member_interface_unavailable".into()))
+    }
     fn start(
         &mut self,
         configuration: &ParsedConfiguration,

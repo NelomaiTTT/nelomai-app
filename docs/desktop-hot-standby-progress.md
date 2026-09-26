@@ -6,6 +6,23 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- SessionMembers now fences runtime/session/Start generation, rejects single
+ backends and mismatched IPv4/IPv6 VIPs, verifies captured native interface
+ identities before metrics/probes/rebind, retains partial-start cleanup and
+ tries both members on Stop even when one fails. Subnet addresses cannot add
+ unintended connected routes on reserve.
+- SessionNetwork composes those members with the route/DNS owner: physical
+ endpoint bypass before native Start, primary routes without reserve, standby
+ adds only its scoped probe, active IPv4/IPv6 switch with rollback, terminal
+ local Stop, both endpoint bypasses repaired before rebind on network change.
+ This is native composition code, still not connected to the helper IPC loop.
+- Route recovery is read-only until a scoped operation: Stop after an interrupted
+ switch removes known remaining routes without recreating a disappeared primary.
+ A kernel-removed route no longer prevents promotion to a live reserve.
+- macOS WG member now retains rebind peers as AWG does; ordinary single remains
+ unchanged. Linux kernel WG rebind still needs an adapter, not falsely reported
+ as implemented by retaining those peer records.
+
 - Continuation after user “Тогда продолжай брат”: connected nonblocking DNS
  probes with exact native interface binding, response/timeout validation and no
  unbound fallback; shared transactional route/DNS journal and native macOS
@@ -39,8 +56,8 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Remaining, not hidden behind a capability flag
 
-- Task2 connect the common route/DNS transaction and bound probes to complete
- session-owned native lifecycle; Linux/Windows network adapters and per-member
+- Task2 finish native policy discovery/factory and durable member lifecycle;
+ Linux/Windows network adapters and per-member
  Windows metrics still needed. Verify same-VIP behavior and socket egress per OS.
  The panel gives both members the same configured DNS health target, not a
  dedicated per-slot diagnostic address. A lower route metric alone is not proof
@@ -57,6 +74,12 @@ permission to begin is required. This checkpoint is NOT feature completion.
  whole-feature review; later authorized native packet/hardware tests.
 
 ## Verification
+
+Latest continuation: **214 tests passed** in client-tunnel + Unix/Windows
+services, host Clippy `-D warnings` and Windows MSVC check passed. Includes
+16 session/member tests and four extra interrupted-route/recovery regressions.
+No actual VPN/network changes or native packet tests. Full workspace and
+whole-feature review remain for Task5; Linux native build remains unavailable.
 
 Continuation verification: client-tunnel + Unix/Windows services **193 passed**
 (26 new tests in this continuation); host Clippy `-D warnings` and Windows MSVC

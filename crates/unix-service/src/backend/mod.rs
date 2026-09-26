@@ -306,6 +306,17 @@ pub(crate) fn rebind_peers_from_configuration(
         .collect()
 }
 
+fn rebind_peers_for_start(
+    configuration: &ParsedConfiguration,
+    mode: redundancy::ResourceMode,
+) -> Vec<RebindPeer> {
+    if configuration.transport == TunnelTransport::AmneziaWg3 || !mode.owns_network() {
+        rebind_peers_from_configuration(configuration)
+    } else {
+        Vec::new()
+    }
+}
+
 pub(crate) fn rebind_peers_from_host(host: &Host) -> Vec<RebindPeer> {
     host.peers
         .values()
@@ -752,6 +763,19 @@ PersistentKeepalive = 21
 
         assert!(request.contains("persistent_keepalive_interval=1\n"));
         assert!(request.ends_with("persistent_keepalive_interval=0\n\n"));
+    }
+
+    #[test]
+    fn wireguard_member_start_retains_peers_for_network_change_rebind() {
+        let parsed=parse_configuration(&format!("[Interface]\nPrivateKey = {PRIVATE_KEY}\nAddress = 10.8.1.2/32\n[Peer]\nPublicKey = {PUBLIC_KEY}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.1:51820\nPersistentKeepalive = 21\n")).unwrap();
+        let peers = rebind_peers_for_start(
+            &parsed,
+            redundancy::ResourceMode::Member(nelomai_contracts::dispatcher::TunnelSlot::A),
+        );
+        assert_eq!(peers.len(), 1);
+        let request = rebind_uapi_configuration(&peers);
+        assert!(request.contains("update_only=true\npersistent_keepalive_interval=21\n"));
+        assert!(rebind_peers_for_start(&parsed, redundancy::ResourceMode::Single).is_empty());
     }
 
     #[test]
