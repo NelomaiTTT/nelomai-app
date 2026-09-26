@@ -92,6 +92,12 @@ impl NetworkValue {
 }
 
 pub trait NetworkSystem {
+    /// Read-only dependency check. Platforms may accept additional native
+    /// metadata here (e.g. a kernel/DHCP route), but never in ownership CAS.
+    fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {
+        let value = NetworkValue::Route(route.clone());
+        Ok(self.read(&value.key())? == Some(value))
+    }
     /// Pure expansion of a route into the platform's separately journaled
     /// resources. Linux member routes need an oif rule as well as a private-table
     /// route; never create that rule as an invisible side effect of route CAS.

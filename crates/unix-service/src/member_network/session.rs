@@ -148,15 +148,23 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             }
         } else {
             let value = NetworkValue::Route(endpoint_bypass.clone());
-            match self
+            if self
+                .network
+                .system_mut()
+                .verify_retained_route(&endpoint_bypass)
+                .map_err(network_error)?
+            {
+                next.retained_routes.push(endpoint_bypass);
+            } else if self
                 .network
                 .system_mut()
                 .read(&value.key())
                 .map_err(network_error)?
+                .is_none()
             {
-                None => next.bypasses.push(endpoint_bypass),
-                Some(current) if current == value => next.retained_routes.push(endpoint_bypass),
-                _ => return Err(ServiceError::Backend("physical_route_changed".into())),
+                next.bypasses.push(endpoint_bypass);
+            } else {
+                return Err(ServiceError::Backend("physical_route_changed".into()));
             }
         }
         validate_policy(&next)?;
@@ -271,13 +279,11 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
     }
     fn verify_retained(&mut self, policy: &NetworkPolicy) -> Result<(), ServiceError> {
         for route in &policy.retained_routes {
-            let value = NetworkValue::Route(route.clone());
-            if self
+            if !self
                 .network
                 .system_mut()
-                .read(&value.key())
+                .verify_retained_route(route)
                 .map_err(network_error)?
-                != Some(value)
             {
                 return Err(ServiceError::Backend("physical_route_changed".into()));
             }

@@ -325,6 +325,7 @@ use std::{collections::HashMap, io};
 #[derive(Default)]
 struct NetworkState {
     values: HashMap<ResourceKey, NetworkValue>,
+    read_only_routes: Vec<RouteValue>,
     writes: Vec<ResourceKey>,
     fail_interface: Option<u32>,
     require_local_stop: Option<Arc<Mutex<Events>>>,
@@ -333,6 +334,18 @@ struct NetworkState {
 }
 struct Network(Arc<Mutex<NetworkState>>);
 impl NetworkSystem for Network {
+    fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {
+        let state = self.0.lock().unwrap();
+        if state
+            .read_only_routes
+            .iter()
+            .any(|r| r.destination == route.destination)
+        {
+            return Ok(state.read_only_routes.contains(route));
+        }
+        let value = NetworkValue::Route(route.clone());
+        Ok(state.values.get(&value.key()) == Some(&value))
+    }
     fn route_resources(&self, route: RouteValue) -> io::Result<Vec<NetworkValue>> {
         let mut values = vec![NetworkValue::Route(route.clone())];
         if self.0.lock().unwrap().bound_rules {
@@ -348,6 +361,16 @@ impl NetworkSystem for Network {
         Ok(values)
     }
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        if self
+            .0
+            .lock()
+            .unwrap()
+            .read_only_routes
+            .iter()
+            .any(|r| NetworkValue::Route(r.clone()).key() == *key)
+        {
+            return Err(io::Error::other("not_an_owned_static_route"));
+        }
         Ok(self.0.lock().unwrap().values.get(key).cloned())
     }
     fn compare_exchange(
@@ -701,6 +724,56 @@ fn existing_lan_route_is_verified_but_not_adopted_or_deleted_by_session() {
         network.lock().unwrap().values.get(&value.key()),
         Some(&value)
     );
+}
+
+#[test]
+fn session_uses_read_only_dependency_verification_without_claiming_kernel_routes() {
+    let (mut session, _, network) = network_setup();
+    let lan = RouteValue {
+        destination: "192.168.1.0/24".parse().unwrap(),
+        scope: RouteScope::Global,
+        interface: 5,
+        gateway: None,
+        metric: 100,
+    };
+    network.lock().unwrap().read_only_routes.push(lan.clone());
+    let mut p = policy();
+    p.retained_routes.push(lan.clone());
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .unwrap();
+    session
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    session.select_active(&scope(), Slot::B).unwrap();
+    session.close(&scope()).unwrap();
+    let state = network.lock().unwrap();
+    assert_eq!(state.read_only_routes, vec![lan.clone()]);
+    assert!(!state.writes.contains(&NetworkValue::Route(lan).key()));
+}
+
+#[test]
+fn late_standby_can_borrow_its_existing_dhcp_endpoint_without_adopting_it() {
+    let (mut session, _, network) = network_setup();
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    let other=parse_configuration("[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=\nAddress = 10.8.0.2/32\nDNS = 9.9.9.9\n[Peer]\nPublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAI=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 192.0.2.2:51820\n").unwrap();
+    let mut bypass = physical();
+    bypass.destination = "192.0.2.2/32".parse().unwrap();
+    network
+        .lock()
+        .unwrap()
+        .read_only_routes
+        .push(bypass.clone());
+    session
+        .add_standby(&scope(), Slot::B, &other, probe(), bypass.clone())
+        .unwrap();
+    session.select_active(&scope(), Slot::B).unwrap();
+    session.close(&scope()).unwrap();
+    let state = network.lock().unwrap();
+    assert_eq!(state.read_only_routes, vec![bypass.clone()]);
+    assert!(!state.writes.contains(&NetworkValue::Route(bypass).key()));
 }
 
 #[test]

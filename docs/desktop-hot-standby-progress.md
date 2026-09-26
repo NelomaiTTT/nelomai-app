@@ -6,6 +6,24 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- Linux read-only physical-route discovery now excludes VPN/slave/down links,
+  validates interface identity, chooses the most-specific physical prefix and
+  lowest-cost unambiguous next hop, and supports IPv4/IPv6 endpoint bypasses.
+  Kernel/DHCP/RA routes are read-only dependencies, not rewritten as app routes.
+  Unknown policy routing or deviceless blackhole/multipath entries fail closed.
+  Only standard main-table rules plus exact registered member probe rules are
+  accepted. Resolver integration is still separate and unfinished: the result
+  is PhysicalRoutes, not a complete NetworkPolicy or enabled Linux factory.
+- SessionNetwork now uses an explicit read-only dependency check, including
+  the late-standby endpoint path. Linux owned-route CAS remains strict proto4;
+  accepting a kernel route for dependency verification never authorizes deletion.
+  Twelve added tests cover route discovery/conflicts, identity/metadata changes,
+  retained-route Start/switch/Stop and late reserve attachment. All native I/O
+  in these tests is fake; no host routing command was executed.
+  Full offline Rust workspace, host Clippy-D warnings, Linux aarch64 all-target
+  Clippy-D warnings and Windows MSVC check all exit0. Existing real-panel test
+  remains ignored. Logs: this plan's physical-*.log. Task2 is not complete.
+
 - Linux route resources now expand through the actual SessionNetwork planner:
  member route + bound RPDB rule enter the same journal/rollback/Stop transaction.
  Integration tests prove a failed standby rule leaves primary routes/DNS intact;

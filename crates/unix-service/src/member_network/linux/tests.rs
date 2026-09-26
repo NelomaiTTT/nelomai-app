@@ -76,6 +76,199 @@ fn route(cidr: &str, scope: RouteScope, interface: u32) -> NetworkValue {
     })
 }
 
+const PHYSICAL_LINKS: &str = r#"[{"ifindex":5,"ifname":"eth0","flags":["UP","LOWER_UP"],"link_type":"ether"},{"ifindex":10,"ifname":"nlm-wga","flags":["UP"],"link_type":"none","linkinfo":{"info_kind":"wireguard"}}]"#;
+const MAIN_RULES: &str = r#"[{"priority":0,"src":"all","table":"255"},{"priority":32766,"src":"all","table":"254"},{"priority":32767,"src":"all","table":"253"}]"#;
+const PHYSICAL_V4: &str = r#"[{"dst":"default","dev":"nlm-wga","gateway":"10.0.0.1","protocol":"4","flags":[]},{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":"16","metric":100,"flags":[]},{"dst":"192.168.1.0/24","dev":"eth0","protocol":"2","scope":"link","prefsrc":"192.168.1.4","metric":100,"flags":[]}]"#;
+
+#[test]
+fn physical_discovery_never_ignores_a_deviceless_policy_route() {
+    for extra in [
+        r#"{"dst":"198.51.100.0/24","type":"blackhole","protocol":4}"#,
+        r#"{"dst":"default","protocol":4,"nexthops":[{"gateway":"192.168.1.2","dev":"eth0","weight":1}]}"#,
+    ] {
+        let routes = format!(
+            r#"[{{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":16}},{extra}]"#
+        );
+        let mut network = adapter(&[PHYSICAL_LINKS, MAIN_RULES, &routes]);
+        assert!(network
+            .resolve_physical_routes(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+            .is_err());
+    }
+}
+
+#[test]
+fn physical_discovery_uses_onlink_prefix_and_rejects_equal_cost_gateway_guess() {
+    let mut network = adapter(&[PHYSICAL_LINKS, MAIN_RULES, PHYSICAL_V4]);
+    let result = network
+        .resolve_physical_routes(&Default::default(), &["192.168.1.9".parse().unwrap()], &[])
+        .unwrap();
+    assert_eq!(result.bypasses[0].gateway, None);
+    let routes = r#"[{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":16,"metric":100},{"dst":"default","dev":"eth0","gateway":"192.168.1.2","protocol":16,"metric":100}]"#;
+    assert!(adapter(&[PHYSICAL_LINKS, MAIN_RULES, routes])
+        .resolve_physical_routes(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+        .is_err());
+}
+
+#[test]
+fn physical_discovery_rejects_down_or_tunnel_ethernet_and_stale_interface_index() {
+    for links in [
+        r#"[{"ifindex":5,"ifname":"eth0","flags":["UP"],"link_type":"ether"}]"#,
+        r#"[{"ifindex":5,"ifname":"eth0","flags":["UP","LOWER_UP"],"link_type":"ether","linkinfo":{"info_kind":"tun"}}]"#,
+        r#"[{"ifindex":10,"ifname":"eth0","flags":["UP","LOWER_UP"],"link_type":"ether"}]"#,
+    ] {
+        assert!(adapter(&[links, MAIN_RULES, PHYSICAL_V4])
+            .resolve_physical_routes(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+            .is_err());
+    }
+}
+
+#[test]
+fn physical_discovery_accepts_only_exact_registered_probe_rules() {
+    for name in ["nlm-wga", "eth0"] {
+        let rules = format!(
+            r#"[{{"priority":0,"src":"all","table":255}},{{"priority":12000,"src":"all","table":52000,"protocol":4,"oif":"{name}"}},{{"priority":32766,"src":"all","table":254}}]"#
+        );
+        let result = adapter(&[PHYSICAL_LINKS, &rules, PHYSICAL_V4]).resolve_physical_routes(
+            &Default::default(),
+            &["198.51.100.1".parse().unwrap()],
+            &[],
+        );
+        assert_eq!(result.is_ok(), name == "nlm-wga");
+    }
+}
+
+#[test]
+fn physical_discovery_excludes_vpn_gateway_and_retains_kernel_lan_without_mutation() {
+    let mut network = adapter(&[PHYSICAL_LINKS, MAIN_RULES, PHYSICAL_V4, MAIN_RULES, "[]"]);
+    let result = network
+        .resolve_physical_routes(
+            &nelomai_client_tunnel::DesktopTunnelOptions {
+                exclude_local_networks: true,
+                ..Default::default()
+            },
+            &[
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.8".parse().unwrap(),
+            ],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(result.bypasses.len(), 2);
+    assert!(result
+        .bypasses
+        .iter()
+        .all(|r| r.interface == 5 && r.gateway == Some("192.168.1.1".parse().unwrap())));
+    assert_eq!(
+        result.retained_routes,
+        vec![RouteValue {
+            destination: "192.168.1.0/24".parse().unwrap(),
+            scope: RouteScope::Global,
+            interface: 5,
+            gateway: None,
+            metric: 100,
+        }]
+    );
+    assert!(network
+        .commands
+        .calls
+        .iter()
+        .all(|c| c.iter().any(|a| a == "show")
+            && !c
+                .iter()
+                .any(|a| ["add", "del", "replace"].contains(&a.as_str()))));
+}
+
+#[test]
+fn retained_kernel_route_can_be_verified_but_never_mutated_as_owned_static_route() {
+    let text = r#"[{"dst":"192.168.1.0/24","dev":"eth0","protocol":"2","scope":"link","prefsrc":"192.168.1.4","metric":100,"flags":[]}]"#;
+    let mut network = adapter(&[text, text]);
+    let value = RouteValue {
+        destination: "192.168.1.0/24".parse().unwrap(),
+        scope: RouteScope::Global,
+        interface: 5,
+        gateway: None,
+        metric: 100,
+    };
+    assert!(network.verify_retained_route(&value).unwrap());
+    let owned = NetworkValue::Route(value);
+    assert!(network
+        .compare_exchange(&owned.key(), Some(&owned), None)
+        .is_err());
+    assert_eq!(network.commands.calls.len(), 2);
+}
+
+#[test]
+fn retained_route_change_and_unsupported_forwarding_attributes_are_rejected() {
+    let value = RouteValue {
+        destination: "192.168.1.0/24".parse().unwrap(),
+        scope: RouteScope::Global,
+        interface: 5,
+        gateway: None,
+        metric: 100,
+    };
+    for extra in [
+        r#", "gateway":"192.168.1.2""#,
+        r#", "metric":200"#,
+        r#", "encap":{"type":"seg6"}"#,
+        r#", "flags":["linkdown"]"#,
+    ] {
+        let text = format!(r#"[{{"dst":"192.168.1.0/24","dev":"eth0","protocol":"2"{extra}}}]"#);
+        assert!(!adapter(&[&text])
+            .verify_retained_route(&value)
+            .unwrap_or(false));
+    }
+}
+
+#[test]
+fn physical_discovery_rejects_policy_routing_instead_of_guessing_main_table() {
+    let rules = r#"[{"priority":100,"src":"all","table":100,"fwmark":"0x1"},{"priority":32766,"src":"all","table":254}]"#;
+    let mut network = adapter(&[PHYSICAL_LINKS, rules, PHYSICAL_V4]);
+    assert!(network
+        .resolve_physical_routes(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+        .is_err());
+}
+
+#[test]
+fn physical_discovery_keeps_existing_endpoint_unowned_unless_journal_owns_it() {
+    let text = r#"[{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":16},{"dst":"198.51.100.1","dev":"eth0","gateway":"192.168.1.1","protocol":4,"metric":42}]"#;
+    for owned in [false, true] {
+        let mut network = adapter(&[PHYSICAL_LINKS, MAIN_RULES, text]);
+        let journal = if owned {
+            vec!["198.51.100.1/32".parse().unwrap()]
+        } else {
+            vec![]
+        };
+        let result = network
+            .resolve_physical_routes(
+                &Default::default(),
+                &["198.51.100.1".parse().unwrap()],
+                &journal,
+            )
+            .unwrap();
+        assert_eq!(result.retained_routes.len(), usize::from(!owned));
+        assert_eq!(result.bypasses.len(), usize::from(owned));
+        if !owned {
+            assert_eq!(result.retained_routes[0].metric, 42);
+        }
+    }
+}
+
+#[test]
+fn physical_ipv6_endpoint_uses_link_local_gateway_on_exact_interface() {
+    let routes = r#"[{"dst":"default","dev":"eth0","gateway":"fe80::1","protocol":"9","metric":1024,"expires":900,"pref":"medium","flags":[]}]"#;
+    let mut network = adapter(&[PHYSICAL_LINKS, MAIN_RULES, routes]);
+    let result = network
+        .resolve_physical_routes(&Default::default(), &["2001:db8::9".parse().unwrap()], &[])
+        .unwrap();
+    assert_eq!(result.bypasses[0].interface, 5);
+    assert_eq!(result.bypasses[0].gateway, Some("fe80::1".parse().unwrap()));
+    assert_eq!(
+        result.bypasses[0].destination,
+        "2001:db8::9/128".parse().unwrap()
+    );
+    assert!(network.commands.calls[1].contains(&"-6".into()));
+}
+
 #[test]
 fn primary_table_can_be_registered_without_waiting_for_reserve() {
     let mut network = LinuxNetwork::new(Commands::default(), []).unwrap();

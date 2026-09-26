@@ -6,6 +6,9 @@ use nelomai_client_tunnel::redundancy::network::*;
 use serde_json::{Map, Value};
 use std::{io, net::IpAddr};
 
+mod physical;
+pub use physical::PhysicalRoutes;
+
 pub trait LinuxNetworkCommands {
     fn ip(&mut self, args: &[String]) -> io::Result<String>;
     fn interface_name(&self, index: u32) -> io::Result<String>;
@@ -108,6 +111,14 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
         destination: IpNet,
         scope: RouteScope,
     ) -> io::Result<Option<NetworkValue>> {
+        self.read_route_mode(destination, scope, false)
+    }
+    fn read_route_mode(
+        &mut self,
+        destination: IpNet,
+        scope: RouteScope,
+        retained: bool,
+    ) -> io::Result<Option<NetworkValue>> {
         let table = self.table(scope)?;
         let text = self.commands.ip(&[
             "-j".into(),
@@ -153,14 +164,16 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
             if actual != destination {
                 return Err(invalid());
             }
-            only_keys(
-                row,
-                &[
-                    "dst", "dev", "gateway", "protocol", "scope", "metric", "flags", "type",
-                    "table", "pref",
-                ],
-            )?;
-            if number(row, "protocol")? != 4
+            let mut accepted = vec![
+                "dst", "dev", "gateway", "protocol", "scope", "metric", "flags", "type", "table",
+                "pref",
+            ];
+            if retained {
+                accepted.extend(["prefsrc", "expires"]);
+                physical::validate_metadata(row, destination)?;
+            }
+            only_keys(row, &accepted)?;
+            if (!retained && number(row, "protocol")? != 4)
                 || row.get("type").is_some_and(|v| v != "unicast")
                 || row
                     .get("flags")
@@ -330,6 +343,13 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
 }
 
 impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
+    fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {
+        if route.scope != RouteScope::Global {
+            return Err(invalid());
+        }
+        Ok(self.read_route_mode(route.destination, route.scope, true)?
+            == Some(NetworkValue::Route(route.clone())))
+    }
     fn route_resources(&self, route: RouteValue) -> io::Result<Vec<NetworkValue>> {
         let mut values = vec![NetworkValue::Route(route.clone())];
         self.validate(&values[0])?;
