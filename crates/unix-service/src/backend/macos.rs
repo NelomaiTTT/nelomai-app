@@ -1,3 +1,4 @@
+use super::redundancy::ResourceMode;
 use super::{
     append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
     configure_interface_after_awg3, host_diagnostic_snapshot, rebind_peers_from_configuration,
@@ -11,6 +12,7 @@ use crate::routes::{
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{Userspace, WGApi, WireguardInterfaceApi};
 use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics, TunnelTransport};
+use nelomai_contracts::dispatcher::TunnelSlot;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -29,6 +31,8 @@ const ENDPOINTS_STATE_FILE: &str = "endpoints-state.json";
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct MacosBackend {
+    mode: ResourceMode,
+    member_socket: Option<super::redundancy::SocketIdentity>,
     wireguard_go: PathBuf,
     amneziawg_go: PathBuf,
     runtime_directory: PathBuf,
@@ -48,19 +52,55 @@ impl MacosBackend {
         amneziawg_go: impl Into<PathBuf>,
         runtime_directory: impl Into<PathBuf>,
     ) -> Result<Self, ServiceError> {
-        let runtime_directory = runtime_directory.into();
-        let wireguard_go = wireguard_go.into();
-        let amneziawg_go = amneziawg_go.into();
+        Self::with_mode(
+            wireguard_go.into(),
+            amneziawg_go.into(),
+            &runtime_directory.into(),
+            ResourceMode::Single,
+        )
+    }
+
+    /// The session owns routes/DNS and creates this private slot directory first.
+    pub fn new_member(
+        wireguard_go: impl Into<PathBuf>,
+        amneziawg_go: impl Into<PathBuf>,
+        runtime_directory: &Path,
+        slot: TunnelSlot,
+    ) -> Result<Self, ServiceError> {
+        Self::with_mode(
+            wireguard_go.into(),
+            amneziawg_go.into(),
+            runtime_directory,
+            ResourceMode::Member(slot),
+        )
+    }
+
+    fn with_mode(
+        wireguard_go: PathBuf,
+        amneziawg_go: PathBuf,
+        root: &Path,
+        mode: ResourceMode,
+    ) -> Result<Self, ServiceError> {
+        let runtime_directory = mode.runtime_path(root);
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
-        let dns_snapshot = load_dns_snapshot(&runtime_directory.join(DNS_STATE_FILE))?;
+        let dns_snapshot = if mode.owns_network() {
+            load_dns_snapshot(&runtime_directory.join(DNS_STATE_FILE))?
+        } else {
+            None
+        };
         let api = recover_api(&runtime_directory)?;
+        // Durable session recovery must verify resource ownership; a reused utun
+        // name alone is never sufficient. Until then only fresh slots may start.
+        if api.is_some() && !mode.owns_network() {
+            return Err(ServiceError::Backend("slot_recovery_requires_owner".into()));
+        }
         let rebind_peers = api
             .as_ref()
             .and_then(|api| api.read_interface_data().ok())
             .as_ref()
             .map(rebind_peers_from_host)
             .unwrap_or_default();
-        if api.is_none() {
+        if api.is_none() && mode.owns_network() {
             routes.cleanup()?;
         }
         let endpoints = if api.is_some() {
@@ -85,6 +125,8 @@ impl MacosBackend {
             ),
         );
         let mut backend = Self {
+            mode,
+            member_socket: None,
             wireguard_go,
             amneziawg_go,
             runtime_directory,
@@ -119,8 +161,12 @@ impl MacosBackend {
         validate_runtime_directory(&self.runtime_directory)?;
 
         let mut native = build_backend_configuration(configuration)?;
-        self.routes.apply(options)?;
-        self.capture_dns()?;
+        if self.mode.owns_network() {
+            self.routes.apply(options)?;
+            self.capture_dns()?;
+        } else {
+            native.interface.port = 0;
+        }
         let ifname = match launch_userspace_tunnel(
             &executable,
             &self.runtime_directory,
@@ -143,6 +189,9 @@ impl MacosBackend {
         };
         self.endpoints = native.endpoints;
         self.api = Some(api);
+        if !self.mode.owns_network() {
+            self.member_socket = Some(super::redundancy::capture_userspace_member(&ifname)?);
+        }
         if let Err(error) = save_endpoints(
             &self.runtime_directory.join(ENDPOINTS_STATE_FILE),
             &self.endpoints,
@@ -167,14 +216,16 @@ impl MacosBackend {
             let _ = self.stop_inner();
             return Err(error);
         }
-        if let Err(error) = self
-            .api
-            .as_ref()
-            .expect("WireGuard API assigned")
-            .configure_peer_routing(&native.interface.peers)
-        {
-            let _ = self.stop_inner();
-            return Err(backend_error(error));
+        if self.mode.owns_network() {
+            if let Err(error) = self
+                .api
+                .as_ref()
+                .expect("WireGuard API assigned")
+                .configure_peer_routing(&native.interface.peers)
+            {
+                let _ = self.stop_inner();
+                return Err(backend_error(error));
+            }
         }
         if configuration.transport == TunnelTransport::AmneziaWg3 {
             if let Err(error) = verify_endpoint_routes(&self.endpoints) {
@@ -182,7 +233,7 @@ impl MacosBackend {
                 return Err(error);
             }
         }
-        if !configuration.dns.is_empty() {
+        if self.mode.owns_network() && !configuration.dns.is_empty() {
             if let Err(error) = apply_dns(
                 self.dns_snapshot
                     .as_ref()
@@ -206,19 +257,43 @@ impl MacosBackend {
         self.rebind_peers.clear();
         let mut first_error = None;
         if let Some(api) = self.api.take() {
-            if let Err(error) = api.remove_interface() {
+            if !self.mode.owns_network() {
+                let result = self
+                    .member_socket
+                    .ok_or_else(|| {
+                        ServiceError::Backend("slot_socket_ownership_unavailable".into())
+                    })
+                    .and_then(|identity| {
+                        read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))
+                            .and_then(|name| {
+                                super::redundancy::remove_userspace_member(&name, identity)
+                            })
+                    });
+                if let Err(error) = result {
+                    self.api = Some(api);
+                    return Err(error);
+                }
+            } else if let Err(error) = api.remove_interface() {
                 if api.read_interface_data().is_ok() {
                     self.api = Some(api);
                     return Err(backend_error(error));
                 }
             }
-            for endpoint in self.endpoints.drain(..) {
-                if let Err(error) = api.remove_endpoint_routing(&endpoint.to_string()) {
-                    first_error.get_or_insert_with(|| backend_error(error));
+            if self.mode.owns_network() {
+                for endpoint in self.endpoints.drain(..) {
+                    if let Err(error) = api.remove_endpoint_routing(&endpoint.to_string()) {
+                        first_error.get_or_insert_with(|| backend_error(error));
+                    }
                 }
             }
         }
-        if let Err(error) = self.restore_dns() {
+        self.member_socket = None;
+        self.endpoints.clear();
+        if let Err(error) = if self.mode.owns_network() {
+            self.restore_dns()
+        } else {
+            Ok(())
+        } {
             first_error.get_or_insert(error);
         }
         let state_file = self.runtime_directory.join(INTERFACE_STATE_FILE);
@@ -230,7 +305,11 @@ impl MacosBackend {
         {
             first_error.get_or_insert_with(|| backend_error(error));
         }
-        if let Err(error) = self.routes.cleanup() {
+        if let Err(error) = if self.mode.owns_network() {
+            self.routes.cleanup()
+        } else {
+            Ok(())
+        } {
             first_error.get_or_insert(error);
         }
 

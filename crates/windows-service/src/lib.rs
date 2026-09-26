@@ -4,6 +4,7 @@ use nelomai_client_tunnel::{
     TunnelError, TunnelMetrics, TunnelPlatform, TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
 pub use nelomai_contracts::dispatcher;
+pub mod redundancy;
 
 /// Selection/lifetime routing shared by the production named-pipe transport and
 /// injected transports. Only explicit Start may create an engine lifetime.

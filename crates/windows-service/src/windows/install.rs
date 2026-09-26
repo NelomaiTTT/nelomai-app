@@ -1,11 +1,16 @@
 use super::routes::WindowsRouteManager;
 use super::{platform_error, wide};
+use crate::redundancy::{
+    execute_slot_primitive, slot_config_filename, slot_service_name, slot_service_spec,
+    SlotServiceControl,
+};
 use crate::{
     manager_service_spec, pipe_security_descriptor, private_directory_security_descriptor,
     tunnel_service_spec, ServiceError, ServiceSpec, ServiceStartMode,
     AMNEZIAWG_TUNNEL_SERVICE_NAME, MANAGER_SERVICE_NAME, TUNNEL_SERVICE_NAME,
 };
 use nelomai_client_tunnel::TunnelTransport;
+use nelomai_contracts::dispatcher::TunnelSlot;
 use std::cell::{Cell, RefCell};
 use std::env;
 use std::ffi::OsString;
@@ -215,7 +220,7 @@ fn configure_manager_recovery(service: &Service) -> Result<(), ServiceError> {
 }
 
 pub fn uninstall() -> Result<(), ServiceError> {
-    remove_tunnel_service()?;
+    remove_all_owned_tunnel_services()?;
     remove_service(MANAGER_SERVICE_NAME)?;
     WindowsRouteManager::new()?.cleanup()?;
     let root = state_directory()?;
@@ -228,6 +233,10 @@ pub fn uninstall() -> Result<(), ServiceError> {
 
 pub(crate) fn tunnel_config_path() -> Result<PathBuf, ServiceError> {
     Ok(state_directory()?.join(TUNNEL_CONFIG_FILE))
+}
+
+pub(crate) fn slot_config_path(slot: TunnelSlot) -> Result<PathBuf, ServiceError> {
+    Ok(state_directory()?.join(slot_config_filename(slot)))
 }
 
 pub(crate) fn record_service_diagnostic(context: &str, error: &ServiceError) {
@@ -293,6 +302,11 @@ pub(crate) fn engine_primitive(
     engine: &Path,
 ) -> std::io::Result<()> {
     use nelomai_contracts::dispatcher::EnginePrimitive;
+    if execute_slot_primitive(&mut NativeSlotServices { engine }, action)
+        .map_err(|_| nelomai_contracts::dispatcher::blocked())?
+    {
+        return Ok(());
+    }
     let result = (|| match action {
         EnginePrimitive::StartWireguard | EnginePrimitive::StartAmneziawg => {
             let transport = if matches!(action, EnginePrimitive::StartWireguard) {
@@ -307,7 +321,7 @@ pub(crate) fn engine_primitive(
                 .map_err(|error| platform_error("start versioned tunnel", error))?;
             wait_until_running(&service)
         }
-        EnginePrimitive::StopServices => remove_tunnel_service(),
+        EnginePrimitive::StopServices => remove_all_owned_tunnel_services(),
         EnginePrimitive::RebindService => {
             let service = open_tunnel_service()?.ok_or(ServiceError::InvalidRequest)?;
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -320,8 +334,74 @@ pub(crate) fn engine_primitive(
                 .map_err(|error| platform_error("restart tunnel for rebind", error))?;
             wait_until_running_until(&service, deadline)
         }
+        _ => Err(ServiceError::InvalidRequest),
     })();
     result.map_err(|_| nelomai_contracts::dispatcher::blocked())
+}
+
+struct NativeSlotServices<'a> {
+    engine: &'a Path,
+}
+
+impl SlotServiceControl for NativeSlotServices<'_> {
+    type Error = ServiceError;
+
+    fn stop(&mut self, slot: TunnelSlot, transport: TunnelTransport) -> Result<(), ServiceError> {
+        remove_service(slot_service_name(slot, transport))
+    }
+
+    fn start(&mut self, slot: TunnelSlot, transport: TunnelTransport) -> Result<(), ServiceError> {
+        let path = slot_config_path(slot)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| platform_error("inspect slot configuration", error))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > crate::MAX_FRAME_SIZE as u64
+        {
+            return Err(ServiceError::UnsafePath);
+        }
+        let configuration = zeroize::Zeroizing::new(
+            fs::read_to_string(&path)
+                .map_err(|error| platform_error("read slot configuration", error))?,
+        );
+        if crate::redundancy::slot_configuration(&configuration)?.as_str() != configuration.as_str()
+            || nelomai_client_tunnel::detect_configuration_transport(&configuration) != transport
+        {
+            return Err(ServiceError::InvalidRequest);
+        }
+        let spec = slot_service_spec(self.engine, &path, slot, transport)?;
+        let manager =
+            service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+        let service = create_service(&manager, &spec)?;
+        // On any failure the exact slot remains owned by the engine, and its
+        // cleanup/retry can remove it. Never touch the active sibling here.
+        service
+            .set_config_service_sid_info(ServiceSidType::Unrestricted)
+            .map_err(|error| platform_error("set slot service SID", error))?;
+        service
+            .start(&[] as &[&str])
+            .map_err(|error| platform_error("start slot service", error))?;
+        wait_until_running(&service)
+    }
+
+    fn rebind(&mut self, slot: TunnelSlot, transport: TunnelTransport) -> Result<(), ServiceError> {
+        let manager = service_manager(ServiceManagerAccess::CONNECT)?;
+        let service = manager
+            .open_service(
+                slot_service_name(slot, transport),
+                ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP,
+            )
+            .map_err(|error| platform_error("open slot for rebind", error))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        service
+            .stop()
+            .map_err(|error| platform_error("stop slot for rebind", error))?;
+        wait_until_stopped_until(&service, deadline)?;
+        service
+            .start(&[] as &[&str])
+            .map_err(|error| platform_error("restart slot", error))?;
+        wait_until_running_until(&service, deadline)
+    }
 }
 
 pub(crate) fn installation_directory() -> Result<PathBuf, ServiceError> {
@@ -361,6 +441,18 @@ pub(crate) fn remove_tunnel_service() -> Result<(), ServiceError> {
     for name in [TUNNEL_SERVICE_NAME, AMNEZIAWG_TUNNEL_SERVICE_NAME] {
         if let Err(error) = remove_service(name) {
             first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn remove_all_owned_tunnel_services() -> Result<(), ServiceError> {
+    let mut first_error = remove_tunnel_service().err();
+    for slot in [TunnelSlot::A, TunnelSlot::B] {
+        for transport in [TunnelTransport::WireGuard, TunnelTransport::AmneziaWg3] {
+            if let Err(error) = remove_service(slot_service_name(slot, transport)) {
+                first_error.get_or_insert(error);
+            }
         }
     }
     first_error.map_or(Ok(()), Err)

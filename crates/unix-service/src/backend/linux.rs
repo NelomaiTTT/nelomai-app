@@ -1,3 +1,4 @@
+use super::redundancy::ResourceMode;
 use super::{
     append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
     configure_interface_after_awg3, host_diagnostic_snapshot, rebind_peers_from_configuration,
@@ -9,6 +10,7 @@ use crate::routes::{LinuxUserspaceRouteManager, RouteManager, SystemRouteBackend
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{host::Host, Kernel, Userspace, WGApi, WireguardInterfaceApi};
 use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics, TunnelTransport};
+use nelomai_contracts::dispatcher::TunnelSlot;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,11 +18,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
-const WIREGUARD_INTERFACE_NAME: &str = "nlm-wg0";
-const AMNEZIAWG_INTERFACE_NAME: &str = "nlm-awg0";
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct LinuxBackend {
+    mode: ResourceMode,
+    member_socket: Option<super::redundancy::SocketIdentity>,
     wireguard_api: WGApi<Kernel>,
     amneziawg_api: WGApi<Userspace>,
     amneziawg_go: PathBuf,
@@ -38,17 +40,47 @@ impl LinuxBackend {
         amneziawg_go: impl Into<PathBuf>,
         runtime_directory: impl AsRef<Path>,
     ) -> Result<Self, ServiceError> {
-        let runtime_directory = runtime_directory.as_ref().to_path_buf();
-        let wireguard_api =
-            WGApi::<Kernel>::new(WIREGUARD_INTERFACE_NAME).map_err(backend_error)?;
+        Self::with_mode(
+            amneziawg_go.into(),
+            runtime_directory.as_ref(),
+            ResourceMode::Single,
+        )
+    }
+
+    /// Called only by the session owner after establishing its private directory
+    /// and endpoint bypasses. This backend never owns common routes or DNS.
+    pub fn new_member(
+        amneziawg_go: impl Into<PathBuf>,
+        runtime_directory: &Path,
+        slot: TunnelSlot,
+    ) -> Result<Self, ServiceError> {
+        Self::with_mode(
+            amneziawg_go.into(),
+            runtime_directory,
+            ResourceMode::Member(slot),
+        )
+    }
+
+    fn with_mode(
+        amneziawg_go: PathBuf,
+        root: &Path,
+        mode: ResourceMode,
+    ) -> Result<Self, ServiceError> {
+        let runtime_directory = mode.runtime_path(root);
+        let wireguard_api = WGApi::<Kernel>::new(mode.linux_interface(TunnelTransport::WireGuard))
+            .map_err(backend_error)?;
         let amneziawg_api =
-            WGApi::<Userspace>::new(AMNEZIAWG_INTERFACE_NAME).map_err(backend_error)?;
+            WGApi::<Userspace>::new(mode.linux_interface(TunnelTransport::AmneziaWg3))
+                .map_err(backend_error)?;
         let mut amneziawg_routes = LinuxUserspaceRouteManager::new(&runtime_directory)?;
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
         let wireguard_host = wireguard_api.read_interface_data().ok();
         let amneziawg_host = amneziawg_api.read_interface_data().ok();
         let wireguard_running = wireguard_host.is_some();
         let amneziawg_running = amneziawg_host.is_some();
+        if (wireguard_running || amneziawg_running) && !mode.owns_network() {
+            return Err(ServiceError::Backend("slot_recovery_requires_owner".into()));
+        }
         if wireguard_running && amneziawg_running {
             return Err(ServiceError::Backend(
                 "multiple_tunnel_interfaces_detected".to_string(),
@@ -59,8 +91,10 @@ impl LinuxBackend {
         } else if amneziawg_running {
             Some(TunnelTransport::AmneziaWg3)
         } else {
-            amneziawg_routes.cleanup()?;
-            routes.cleanup()?;
+            if mode.owns_network() {
+                amneziawg_routes.cleanup()?;
+                routes.cleanup()?;
+            }
             None
         };
         let state = if active_transport.is_some() {
@@ -82,9 +116,11 @@ impl LinuxBackend {
             ),
         );
         Ok(Self {
+            mode,
+            member_socket: None,
             wireguard_api,
             amneziawg_api,
-            amneziawg_go: amneziawg_go.into(),
+            amneziawg_go,
             runtime_directory,
             active_transport,
             rebind_peers,
@@ -108,15 +144,17 @@ impl LinuxBackend {
         }
 
         let mut native = build_backend_configuration(configuration)?;
-        let interface_name = match configuration.transport {
-            TunnelTransport::WireGuard => WIREGUARD_INTERFACE_NAME,
-            TunnelTransport::AmneziaWg3 => AMNEZIAWG_INTERFACE_NAME,
-        };
+        let interface_name = self.mode.linux_interface(configuration.transport);
         native.interface.name = interface_name.to_string();
-        if configuration.transport == TunnelTransport::AmneziaWg3 {
+        if self.mode.owns_network() && configuration.transport == TunnelTransport::AmneziaWg3 {
             native.interface.fwmark = Some(AWG_FWMARK);
         }
-        self.routes.apply(options)?;
+        if self.mode.owns_network() {
+            self.routes.apply(options)?;
+        }
+        if !self.mode.owns_network() {
+            native.interface.port = 0;
+        }
 
         match configuration.transport {
             TunnelTransport::WireGuard => {
@@ -130,6 +168,9 @@ impl LinuxBackend {
             }
         }
         self.active_transport = Some(configuration.transport);
+        if !self.mode.owns_network() && configuration.transport == TunnelTransport::AmneziaWg3 {
+            self.member_socket = Some(super::redundancy::capture_userspace_member(interface_name)?);
+        }
 
         let configured = configure_interface_after_awg3(
             configuration.awg3.as_ref(),
@@ -152,20 +193,24 @@ impl LinuxBackend {
             return Err(error);
         }
 
-        let configured_routes: Result<(), ServiceError> = match configuration.transport {
-            TunnelTransport::WireGuard => self
-                .wireguard_api
-                .configure_peer_routing(&native.interface.peers)
-                .and_then(|_| self.wireguard_api.configure_dns(&configuration.dns, &[]))
-                .map_err(backend_error),
-            TunnelTransport::AmneziaWg3 => self
-                .amneziawg_routes
-                .apply(interface_name, &native.interface.peers)
-                .and_then(|_| {
-                    self.amneziawg_api
-                        .configure_dns(&configuration.dns, &[])
-                        .map_err(backend_error)
-                }),
+        let configured_routes: Result<(), ServiceError> = if !self.mode.owns_network() {
+            Ok(())
+        } else {
+            match configuration.transport {
+                TunnelTransport::WireGuard => self
+                    .wireguard_api
+                    .configure_peer_routing(&native.interface.peers)
+                    .and_then(|_| self.wireguard_api.configure_dns(&configuration.dns, &[]))
+                    .map_err(backend_error),
+                TunnelTransport::AmneziaWg3 => self
+                    .amneziawg_routes
+                    .apply(interface_name, &native.interface.peers)
+                    .and_then(|_| {
+                        self.amneziawg_api
+                            .configure_dns(&configuration.dns, &[])
+                            .map_err(backend_error)
+                    }),
+            }
         };
         if let Err(error) = configured_routes {
             let _ = self.stop_inner();
@@ -183,18 +228,45 @@ impl LinuxBackend {
         let transport = self.active_transport.take();
         self.rebind_peers.clear();
         let mut first_error = None;
-        if let Err(error) = self.amneziawg_routes.cleanup() {
+        if let Err(error) = if self.mode.owns_network() {
+            self.amneziawg_routes.cleanup()
+        } else {
+            Ok(())
+        } {
             first_error.get_or_insert(error);
         }
         let interface_error = match transport {
             Some(TunnelTransport::WireGuard) => self.wireguard_api.remove_interface().err(),
+            Some(TunnelTransport::AmneziaWg3) if !self.mode.owns_network() => {
+                let result = self
+                    .member_socket
+                    .ok_or_else(|| {
+                        ServiceError::Backend("slot_socket_ownership_unavailable".into())
+                    })
+                    .and_then(|identity| {
+                        super::redundancy::remove_userspace_member(
+                            self.mode.linux_interface(TunnelTransport::AmneziaWg3),
+                            identity,
+                        )
+                    });
+                if let Err(error) = result {
+                    self.active_transport = transport;
+                    return Err(error);
+                }
+                self.member_socket = None;
+                None
+            }
             Some(TunnelTransport::AmneziaWg3) => self.amneziawg_api.remove_interface().err(),
             None => None,
         };
         if let Some(error) = interface_error {
             first_error.get_or_insert_with(|| backend_error(error));
         }
-        if let Err(error) = self.routes.cleanup() {
+        if let Err(error) = if self.mode.owns_network() {
+            self.routes.cleanup()
+        } else {
+            Ok(())
+        } {
             first_error.get_or_insert(error);
         }
         first_error.map_or(Ok(()), Err)
@@ -349,7 +421,10 @@ impl ServiceTunnelBackend for LinuxBackend {
         }
         let before = self.diagnostic_snapshot().replace('\n', " ");
         self.diagnostics.record("udp_rebind_begin", &before);
-        match rebind_userspace_udp(AMNEZIAWG_INTERFACE_NAME, &self.rebind_peers) {
+        match rebind_userspace_udp(
+            self.mode.linux_interface(TunnelTransport::AmneziaWg3),
+            &self.rebind_peers,
+        ) {
             Ok(()) => {
                 let after = self.diagnostic_snapshot().replace('\n', " ");
                 self.diagnostics.record("udp_rebind_ok", &after);

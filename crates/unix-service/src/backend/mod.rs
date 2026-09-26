@@ -4,6 +4,7 @@ mod linux;
 mod linux_diagnostics;
 #[cfg(target_os = "macos")]
 mod macos;
+mod redundancy;
 
 use crate::{Awg3Parameters, ParsedConfiguration, ServiceError, ServiceTunnelState};
 use base64::{engine::general_purpose::STANDARD, Engine};

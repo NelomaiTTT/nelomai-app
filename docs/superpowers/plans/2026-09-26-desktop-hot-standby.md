@@ -59,32 +59,40 @@ and configure_dns, but current singleton managers must not be used twice.
 `network_changed(now_ms: u64, validated: bool)`, `evaluate(now_ms: u64, slots: &[SlotObservation]) -> FailoverDecision`,
 `primary_ready(now_ms: u64, slot: &SlotObservation) -> bool`, `failed(...) -> bool`.
 Types mirror Android BackendHealth/StandbyProbeState/SlotObservation; monotonic time only.
-Produces `ProbeSchedule::new(active: Slot, now_ms: u64)`, `poll(now_ms) -> Vec<ProbeTicket>`,
+Produces `ProbeSchedule::new(active: Slot, now_ms: u64)`, `poll(now_ms) -> ProbeBatch`,
 `complete(ticket, succeeded: bool, now_ms) -> bool`, `set_standby_available(bool)`,
 `network_changed(now_ms)`, `promote(slot, now_ms)`, `stop()`.
-Tickets include unique sequence and network epoch; slot enum A/B prevents invalid indexing.
+Tickets include a process-unique sequence; epoch changes clear accepted in-flight
+tickets. ProbeBatch carries both started and expired probes so native cancellation
+and failure accounting cannot be skipped. Slot enum A/B prevents invalid indexing.
 
-- [ ] Step1: Write behavioral tests for initial primary readiness without standby,
+- [x] Step1: Write behavioral tests for initial primary readiness without standby,
   soft failure corroboration (initial +2 retries), no stale/unproven standby,
   hard failure promotion, pending standby vs stalled, malformed slot sets,
   network stabilization4s, ready dwell15s/3successes, standby failure dwell5s.
   Assert literal decision `switch_to=Some(1)` only for usable reserve;
   initial failed primary probe alone must return no switch.
-- [ ] Step2: Run `cargo test -p nelomai-client-tunnel --test redundant_health`.
+- [x] Step2: Run `cargo test -p nelomai-client-tunnel --test redundant_health`.
   Expected RED (new policy missing), not a native/host failure.
-- [ ] Step3: Implement health.rs matching Android decisions, requiring fresh
+- [x] Step3: Implement health.rs matching Android decisions, requiring fresh
   handshake and successful probe even for cached READY. No platform side effects.
-- [ ] Step4: Write probe scheduler tests: primary@0, standby@1000 after failure,
+- [x] Step4: Write probe scheduler tests: primary@0, standby@1000 after failure,
   primary@2000, standby@3000; no concurrent probe per slot; cancel/fence on network
   change/promotion/Stop; late/duplicate/forged tickets ignored. Expire a probe at
   1000ms as failure; never catch up by launching an unbounded batch after sleep.
-- [ ] Step5: RED then implement probes.rs. Primary period2000ms; suspect standby
+- [x] Step5: RED then implement probes.rs. Primary period2000ms; suspect standby
   phase1000ms; no standby probe without installed slot. Completed primary success
   ends suspicion, but does not counterfeit/cancel delivered standby evidence.
-- [ ] Step6: `cargo test -p nelomai-client-tunnel` and changed-file rustfmt/Clippy.
+- [x] Step6: `cargo test -p nelomai-client-tunnel` and changed-file rustfmt/Clippy.
   Expected all pass. Commit shared policies with tests, no feature capability yet.
 
 ### Task 2: Platform slot/data-route ownership
+
+Status: **in progress**, not complete. Low-level independently named member
+backends/SCM primitives and side-effect separation are implemented. Common
+route/DNS transactions, bound probes, same-VIP verification, durable resource
+recovery and full lifecycle tests still required before enabling this path.
+See `docs/desktop-hot-standby-progress.md` for evidence and remaining gates.
 
 **Files:** Existing Unix/Windows backend/routes/install modules; create each platform's `redundancy.rs` adapter and fake route/process tests adjacent to platform modules.
 

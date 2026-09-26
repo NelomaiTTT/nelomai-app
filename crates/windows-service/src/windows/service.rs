@@ -401,6 +401,29 @@ pub fn run_wireguard_service(configuration: &Path) -> Result<(), ServiceError> {
 }
 
 pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
+    run_named_amneziawg_service(configuration, AMNEZIAWG_TUNNEL_SERVICE_NAME)
+}
+
+pub fn run_amneziawg_slot_service(
+    configuration: &Path,
+    slot: nelomai_contracts::dispatcher::TunnelSlot,
+) -> Result<(), ServiceError> {
+    if configuration != super::install::slot_config_path(slot)? {
+        return Err(ServiceError::UnsafePath);
+    }
+    run_named_amneziawg_service(
+        configuration,
+        crate::redundancy::slot_service_name(
+            slot,
+            nelomai_client_tunnel::TunnelTransport::AmneziaWg3,
+        ),
+    )
+}
+
+fn run_named_amneziawg_service(
+    configuration: &Path,
+    service_name: &str,
+) -> Result<(), ServiceError> {
     record_service_message(
         "AmneziaWG tunnel lifecycle",
         &format!("started pid={}", std::process::id()),
@@ -450,7 +473,7 @@ pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
         unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(procedure) };
     let configuration_text =
         zeroize::Zeroizing::new(wide(std::ffi::OsStr::new(configuration_text.as_str())));
-    let service_name = wide(std::ffi::OsStr::new(AMNEZIAWG_TUNNEL_SERVICE_NAME));
+    let service_name = wide(std::ffi::OsStr::new(service_name));
     let succeeded = unsafe { service(configuration_text.as_ptr(), service_name.as_ptr()) };
     unsafe {
         FreeLibrary(module);

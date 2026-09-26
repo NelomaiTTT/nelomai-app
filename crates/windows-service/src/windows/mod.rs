@@ -13,7 +13,8 @@ pub use elevation::{repair_defender_exclusion, repair_installation, RepairError}
 pub use install::{install, uninstall, InstallOptions};
 pub use ipc::{dispatcher_exchange, NamedPipeTransport};
 pub use service::{
-    run_amneziawg_service, run_engine_mode, run_manager_service, run_wireguard_service,
+    run_amneziawg_service, run_amneziawg_slot_service, run_engine_mode, run_manager_service,
+    run_wireguard_service,
 };
 
 use crate::ServiceError;

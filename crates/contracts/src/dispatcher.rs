@@ -964,13 +964,27 @@ pub fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Native tunnel member, not the Stable/Latest runtime selection. The engine
+/// owns both members; this closed selector never carries a caller-supplied path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TunnelSlot {
+    A,
+    B,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnginePrimitive {
     StartWireguard,
     StartAmneziawg,
     StopServices,
     RebindService,
+    StartWireguardSlot { slot: TunnelSlot },
+    StartAmneziawgSlot { slot: TunnelSlot },
+    StopSlot { slot: TunnelSlot },
+    RebindWireguardSlot { slot: TunnelSlot },
+    RebindAmneziawgSlot { slot: TunnelSlot },
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
