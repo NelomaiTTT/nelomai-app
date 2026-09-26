@@ -177,10 +177,11 @@ pub(super) fn remove_userspace_member(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct SocketIdentity {
-    device: u64,
-    inode: u64,
+    pub(super) device: u64,
+    pub(super) inode: u64,
 }
 
 pub(super) fn capture_userspace_member(

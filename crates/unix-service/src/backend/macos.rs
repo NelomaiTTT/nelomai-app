@@ -1,3 +1,4 @@
+use super::member_owner::{MemberOwner, MemberTransport, UserspaceIdentity};
 use super::redundancy::ResourceMode;
 use super::{
     append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
@@ -33,6 +34,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct MacosBackend {
     mode: ResourceMode,
     member_socket: Option<super::redundancy::SocketIdentity>,
+    member_owner: Option<MemberOwner>,
     wireguard_go: PathBuf,
     amneziawg_go: PathBuf,
     runtime_directory: PathBuf,
@@ -57,6 +59,7 @@ impl MacosBackend {
             amneziawg_go.into(),
             &runtime_directory.into(),
             ResourceMode::Single,
+            None,
         )
     }
 
@@ -66,12 +69,20 @@ impl MacosBackend {
         amneziawg_go: impl Into<PathBuf>,
         runtime_directory: &Path,
         slot: TunnelSlot,
+        scope: nelomai_client_tunnel::redundancy::SessionScope,
     ) -> Result<Self, ServiceError> {
+        let owner = MemberOwner::open_root(
+            &ResourceMode::Member(slot).runtime_path(runtime_directory),
+            scope,
+            slot,
+        )
+        .map_err(backend_error)?;
         Self::with_mode(
             wireguard_go.into(),
             amneziawg_go.into(),
             runtime_directory,
             ResourceMode::Member(slot),
+            Some(owner),
         )
     }
 
@@ -80,6 +91,7 @@ impl MacosBackend {
         amneziawg_go: PathBuf,
         root: &Path,
         mode: ResourceMode,
+        member_owner: Option<MemberOwner>,
     ) -> Result<Self, ServiceError> {
         let runtime_directory = mode.runtime_path(root);
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
@@ -88,12 +100,34 @@ impl MacosBackend {
         } else {
             None
         };
-        let api = recover_api(&runtime_directory)?;
-        // Durable session recovery must verify resource ownership; a reused utun
-        // name alone is never sufficient. Until then only fresh slots may start.
-        if api.is_some() && !mode.owns_network() {
-            return Err(ServiceError::Backend("slot_recovery_requires_owner".into()));
-        }
+        let mut active_transport = None;
+        let mut member_socket = None;
+        let api = if let Some(owner) = &member_owner {
+            let boot = boot_identity()?;
+            if let Some(transport) = owner
+                .recover(&boot, |saved| inspect_member(saved, &boot))
+                .map_err(backend_error)?
+            {
+                let identity = owner.identity().expect("verified owned member");
+                member_socket = Some(identity.socket);
+                active_transport = Some(match transport {
+                    MemberTransport::WireGuard => TunnelTransport::WireGuard,
+                    MemberTransport::AmneziaWg3 => TunnelTransport::AmneziaWg3,
+                });
+                Some(WGApi::<Userspace>::new(&identity.interface).map_err(backend_error)?)
+            } else {
+                // A legacy/name-only remnant is not evidence of ownership.
+                if owner.identity().is_none()
+                    && !owner.stopping()
+                    && fs::symlink_metadata(runtime_directory.join(INTERFACE_STATE_FILE)).is_ok()
+                {
+                    return Err(ServiceError::Backend("slot_recovery_requires_owner".into()));
+                }
+                None
+            }
+        } else {
+            recover_api(&runtime_directory)?
+        };
         let rebind_peers = api
             .as_ref()
             .and_then(|api| api.read_interface_data().ok())
@@ -105,12 +139,16 @@ impl MacosBackend {
         }
         let endpoints = if api.is_some() {
             load_endpoints(&runtime_directory.join(ENDPOINTS_STATE_FILE))?
-        } else {
+        } else if mode.owns_network() {
             remove_regular_file_if_present(&runtime_directory.join(ENDPOINTS_STATE_FILE))
                 .map_err(backend_error)?;
             Vec::new()
+        } else {
+            Vec::new()
         };
-        let state = if api.is_some() {
+        let state = if member_owner.as_ref().is_some_and(MemberOwner::stopping) {
+            ServiceTunnelState::Stopping
+        } else if api.is_some() {
             ServiceTunnelState::Running
         } else {
             ServiceTunnelState::Stopped
@@ -126,12 +164,13 @@ impl MacosBackend {
         );
         let mut backend = Self {
             mode,
-            member_socket: None,
+            member_socket,
+            member_owner,
             wireguard_go,
             amneziawg_go,
             runtime_directory,
             api,
-            active_transport: None,
+            active_transport,
             rebind_peers,
             endpoints,
             dns_snapshot,
@@ -161,6 +200,14 @@ impl MacosBackend {
         validate_runtime_directory(&self.runtime_directory)?;
 
         let mut native = build_backend_configuration(configuration)?;
+        if let Some(owner) = &mut self.member_owner {
+            owner
+                .begin(match configuration.transport {
+                    TunnelTransport::WireGuard => MemberTransport::WireGuard,
+                    TunnelTransport::AmneziaWg3 => MemberTransport::AmneziaWg3,
+                })
+                .map_err(backend_error)?;
+        }
         if self.mode.owns_network() {
             self.routes.apply(options)?;
             self.capture_dns()?;
@@ -191,6 +238,12 @@ impl MacosBackend {
         self.api = Some(api);
         if !self.mode.owns_network() {
             self.member_socket = Some(super::redundancy::capture_userspace_member(&ifname)?);
+            let identity = capture_member(&ifname, &boot_identity()?).map_err(backend_error)?;
+            self.member_owner
+                .as_mut()
+                .expect("member has owner")
+                .capture(identity)
+                .map_err(backend_error)?;
         }
         if let Err(error) = save_endpoints(
             &self.runtime_directory.join(ENDPOINTS_STATE_FILE),
@@ -249,6 +302,38 @@ impl MacosBackend {
     }
 
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
+        if let Some(owner) = &mut self.member_owner {
+            // Capture may have failed on disk after native launch. The in-memory
+            // socket identity is still required before retrying that write.
+            if owner.interrupted_launch() {
+                let name = read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?;
+                let identity = capture_member(&name, &boot_identity()?).map_err(backend_error)?;
+                if self.member_socket != Some(identity.socket) {
+                    return Err(ServiceError::Backend("slot_recovery_requires_owner".into()));
+                }
+                owner.capture(identity).map_err(backend_error)?;
+            }
+            let boot = boot_identity()?;
+            owner
+                .stop_owned(
+                    &boot,
+                    |saved| inspect_member(saved, &boot),
+                    |identity| {
+                        super::redundancy::remove_userspace_member(
+                            &identity.interface,
+                            identity.socket,
+                        )
+                        .map_err(|_| std::io::Error::other("member_cleanup_pending"))
+                    },
+                )
+                .map_err(backend_error)?;
+            self.api = None;
+            self.active_transport = None;
+            self.rebind_peers.clear();
+            self.member_socket = None;
+            self.endpoints.clear();
+            return Ok(());
+        }
         self.active_transport = None;
         self.rebind_peers.clear();
         let mut first_error = None;
@@ -363,6 +448,14 @@ impl MacosBackend {
 }
 
 impl ServiceTunnelBackend for MacosBackend {
+    fn member_recovery_scope(&self) -> Option<nelomai_client_tunnel::redundancy::SessionScope> {
+        self.member_owner.as_ref().map(|o| o.scope.clone())
+    }
+    fn member_cleanup_pending(&self) -> bool {
+        self.member_owner
+            .as_ref()
+            .is_some_and(MemberOwner::cleanup_pending)
+    }
     fn member_slot(&self) -> Option<TunnelSlot> {
         match self.mode {
             ResourceMode::Single => None,
@@ -373,25 +466,30 @@ impl ServiceTunnelBackend for MacosBackend {
         if self.mode.owns_network() || self.api.is_none() {
             return Err(ServiceError::Backend("member_interface_unavailable".into()));
         }
-        let name = read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?;
-        if self.member_socket != Some(super::redundancy::capture_userspace_member(&name)?) {
-            return Err(ServiceError::Backend(
-                "slot_interface_identity_changed".into(),
-            ));
+        let owner = self
+            .member_owner
+            .as_ref()
+            .ok_or(ServiceError::InvalidRequest)?;
+        if owner.stopping() {
+            return Err(ServiceError::Backend("member_not_running".into()));
         }
-        let name = std::ffi::CString::new(name).map_err(|_| ServiceError::InvalidRequest)?;
-        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-        if index == 0 {
-            Err(ServiceError::Backend("member_interface_unavailable".into()))
-        } else {
-            Ok(index)
-        }
+        let boot = boot_identity()?;
+        owner
+            .recover(&boot, |saved| inspect_member(saved, &boot))
+            .map_err(backend_error)?
+            .ok_or_else(|| ServiceError::Backend("member_interface_unavailable".into()))?;
+        Ok(owner.identity().expect("verified owned member").index)
     }
     fn start(
         &mut self,
         configuration: &ParsedConfiguration,
         options: &DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
+        // Reject before the failure-cleanup path: duplicate Start must not tear
+        // down the already-owned member it attempted to replace.
+        if let Some(owner) = &self.member_owner {
+            owner.ensure_fresh().map_err(backend_error)?;
+        }
         self.state = ServiceTunnelState::Starting;
         self.diagnostics.record(
             "start_begin",
@@ -497,10 +595,16 @@ impl ServiceTunnelBackend for MacosBackend {
     }
 
     fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.member_owner.is_some() {
+            self.member_interface_index()?;
+        }
         if self.api.is_none() {
             return Err(ServiceError::Backend("tunnel_not_running".to_string()));
         }
-        let ifname = read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?;
+        let ifname = rebind_interface_name(
+            &self.runtime_directory,
+            self.member_owner.as_ref().and_then(MemberOwner::identity),
+        )?;
         let before = self.diagnostic_snapshot().replace('\n', " ");
         self.diagnostics.record("udp_rebind_begin", &before);
         if let Err(error) = verify_endpoint_routes(&self.endpoints) {
@@ -725,6 +829,16 @@ fn read_interface_name(path: &Path) -> Result<String, ServiceError> {
     Ok(value.to_string())
 }
 
+fn rebind_interface_name(
+    directory: &Path,
+    owned: Option<&UserspaceIdentity>,
+) -> Result<String, ServiceError> {
+    match owned {
+        Some(identity) => Ok(identity.interface.clone()),
+        None => read_interface_name(&directory.join(INTERFACE_STATE_FILE)),
+    }
+}
+
 fn recover_api(runtime_directory: &Path) -> Result<Option<WGApi<Userspace>>, ServiceError> {
     let state_file = runtime_directory.join(INTERFACE_STATE_FILE);
     if !state_file.exists() {
@@ -739,6 +853,56 @@ fn recover_api(runtime_directory: &Path) -> Result<Option<WGApi<Userspace>>, Ser
     WGApi::<Userspace>::new(ifname)
         .map(Some)
         .map_err(backend_error)
+}
+
+pub(crate) fn boot_identity() -> Result<String, ServiceError> {
+    let mut bytes = [0u8; 128];
+    let mut len = bytes.len();
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.bootsessionuuid".as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 || len == 0 || len > bytes.len() {
+        return Err(ServiceError::Backend("boot_identity_unavailable".into()));
+    }
+    let value = std::str::from_utf8(&bytes[..len])
+        .map_err(backend_error)?
+        .trim_end_matches('\0');
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(ServiceError::Backend("boot_identity_unavailable".into()));
+    }
+    Ok(value.to_owned())
+}
+fn capture_member(name: &str, boot: &str) -> std::io::Result<UserspaceIdentity> {
+    let cname = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
+    let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if index == 0 {
+        return Err(std::io::Error::other("member_interface_unavailable"));
+    }
+    Ok(UserspaceIdentity {
+        boot: boot.into(),
+        interface: name.into(),
+        index,
+        socket: super::redundancy::capture_userspace_member(name)
+            .map_err(|_| std::io::Error::other("slot_socket_identity_unavailable"))?,
+    })
+}
+fn inspect_member(
+    saved: &UserspaceIdentity,
+    boot: &str,
+) -> std::io::Result<Option<UserspaceIdentity>> {
+    let name = std::ffi::CString::new(saved.interface.as_str()).map_err(std::io::Error::other)?;
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    match fs::symlink_metadata(userspace_socket_path(&saved.interface)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && index == 0 => Ok(None),
+        Err(e) => Err(e),
+        Ok(_) => capture_member(&saved.interface, boot).map(Some),
+    }
 }
 
 fn validate_root_owned_binary(path: &Path) -> Result<(), ServiceError> {
@@ -893,5 +1057,25 @@ mod tests {
             .get_envs()
             .any(|(key, value)| key == "WG_TUN_NAME_FILE"
                 && value == Some(OsStr::new("/var/run/nelomai/interface-name"))));
+    }
+
+    #[test]
+    fn member_rebind_uses_owned_interface_not_replaceable_name_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(INTERFACE_STATE_FILE), b"utun99").unwrap();
+        let identity = UserspaceIdentity {
+            boot: "boot".into(),
+            interface: "utun42".into(),
+            index: 42,
+            socket: super::super::redundancy::SocketIdentity {
+                device: 1,
+                inode: 2,
+            },
+        };
+        assert_eq!(
+            rebind_interface_name(dir.path(), Some(&identity)).unwrap(),
+            "utun42"
+        );
+        assert_eq!(rebind_interface_name(dir.path(), None).unwrap(), "utun99");
     }
 }

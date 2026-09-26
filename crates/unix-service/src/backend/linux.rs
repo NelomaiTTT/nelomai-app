@@ -505,6 +505,23 @@ impl ServiceTunnelBackend for LinuxBackend {
     }
 
     fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        if !self.mode.owns_network() && self.active_transport == Some(TunnelTransport::WireGuard) {
+            let index = self.member_interface_index()?;
+            super::kernel_rebind::reset_kernel_port(index).map_err(backend_error)?;
+            if self.member_interface_index()? != index
+                || self
+                    .wireguard_api
+                    .read_interface_data()
+                    .map_err(backend_error)?
+                    .listen_port
+                    == 0
+            {
+                return Err(ServiceError::Backend(
+                    "kernel_udp_rebind_unconfirmed".into(),
+                ));
+            }
+            return Ok(ServiceTunnelState::Running);
+        }
         if self.active_transport != Some(TunnelTransport::AmneziaWg3) {
             return Err(ServiceError::Backend("udp_rebind_unsupported".to_string()));
         }

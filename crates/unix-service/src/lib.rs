@@ -550,6 +550,13 @@ pub fn authorize_peer(
 }
 
 pub trait ServiceTunnelBackend {
+    /// Present only when a native adapter has verified durable session ownership.
+    fn member_recovery_scope(&self) -> Option<nelomai_client_tunnel::redundancy::SessionScope> {
+        None
+    }
+    fn member_cleanup_pending(&self) -> bool {
+        false
+    }
     fn member_slot(&self) -> Option<dispatcher::TunnelSlot> {
         None
     }

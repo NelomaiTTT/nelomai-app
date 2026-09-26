@@ -20,11 +20,18 @@ tokio = { version = "1", features = ["net", "rt", "sync"] }
 zeroize = "1"
 
 [dev-dependencies]
+netlink-packet-core = "0.8"
+netlink-packet-generic = "0.4"
+netlink-packet-wireguard = "0.4"
 ed25519-dalek = "2.2"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.8"
+netlink-packet-generic = "0.4"
+netlink-packet-wireguard = "0.4"
+netlink-sys = "0.8"
 defguard_boringtun = { version = "=0.6.5", default-features = false, features = ["device"] }
 defguard_wireguard_rs = { version = "=0.10.0", default-features = false }
 

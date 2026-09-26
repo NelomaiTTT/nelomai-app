@@ -1,9 +1,15 @@
+#[cfg(any(target_os = "linux", test))]
+mod kernel_rebind;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(any(target_os = "linux", test))]
 mod linux_diagnostics;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod member_owner;
+#[cfg(test)]
+mod member_owner_tests;
 mod redundancy;
 
 use crate::{Awg3Parameters, ParsedConfiguration, ServiceError, ServiceTunnelState};
@@ -28,6 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as PlatformBackend;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::boot_identity as macos_boot_identity;
 #[cfg(target_os = "macos")]
 pub use macos::MacosBackend as PlatformBackend;
 

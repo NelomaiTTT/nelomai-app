@@ -26,6 +26,33 @@ pub struct SessionMembers<B> {
 }
 impl<B: ServiceTunnelBackend> SessionMembers<B> {
     pub fn new(scope: SessionScope, backends: [B; 2]) -> Result<Self, ServiceError> {
+        if backends
+            .iter()
+            .any(ServiceTunnelBackend::member_cleanup_pending)
+        {
+            return Err(ServiceError::Backend("member_recovery_required".into()));
+        }
+        Self::construct(scope, backends, false)
+    }
+    /// Restart recovery deliberately exposes cleanup only, never old health or
+    /// Running. Native constructors verify actual identities before this call.
+    pub fn recover_for_cleanup(
+        scope: SessionScope,
+        backends: [B; 2],
+    ) -> Result<Self, ServiceError> {
+        if backends
+            .iter()
+            .any(|b| b.member_recovery_scope().as_ref() != Some(&scope))
+        {
+            return Err(ServiceError::UnauthorizedClient);
+        }
+        Self::construct(scope, backends, true)
+    }
+    fn construct(
+        scope: SessionScope,
+        backends: [B; 2],
+        closing: bool,
+    ) -> Result<Self, ServiceError> {
         if !scope.validate() {
             return Err(ServiceError::InvalidRequest);
         }
@@ -37,12 +64,21 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
                 "member_backend_scope_mismatch".into(),
             ));
         }
+        if backends
+            .iter()
+            .any(|b| b.member_recovery_scope().is_some_and(|s| s != scope))
+        {
+            return Err(ServiceError::UnauthorizedClient);
+        }
+        let needs_cleanup = backends
+            .each_ref()
+            .map(ServiceTunnelBackend::member_cleanup_pending);
         Ok(Self {
             scope,
             backends,
-            needs_cleanup: [false; 2],
+            needs_cleanup,
             views: [None, None],
-            closing: false,
+            closing,
         })
     }
     pub fn cleanup_needed(&self, slot: Slot) -> bool {

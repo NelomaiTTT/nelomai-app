@@ -15,23 +15,38 @@ const STATE_FILE: &str = "redundant-network.json";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Envelope {
+struct Envelope<T> {
     format: u16,
     scope: SessionScope,
-    state: NetworkJournal,
+    state: T,
 }
 
-pub struct FileNetworkJournal {
+pub struct ScopedJournal<T> {
     root: PathBuf,
     scope: SessionScope,
     owner: u32,
+    name: &'static str,
+    value: std::marker::PhantomData<T>,
 }
+
+pub type FileNetworkJournal = ScopedJournal<NetworkJournal>;
 
 impl FileNetworkJournal {
     pub fn open_root(root: &Path, scope: SessionScope) -> io::Result<Self> {
         Self::open_for_owner(root, scope, 0)
     }
     fn open_for_owner(root: &Path, scope: SessionScope, owner: u32) -> io::Result<Self> {
+        Self::open_named(root, scope, owner, STATE_FILE)
+    }
+}
+
+impl<T: Serialize + serde::de::DeserializeOwned> ScopedJournal<T> {
+    pub(crate) fn open_named(
+        root: &Path,
+        scope: SessionScope,
+        owner: u32,
+        name: &'static str,
+    ) -> io::Result<Self> {
         if !scope.validate() {
             return Err(untrusted());
         }
@@ -39,6 +54,8 @@ impl FileNetworkJournal {
             root: root.to_path_buf(),
             scope,
             owner,
+            name,
+            value: std::marker::PhantomData,
         };
         store.validate_root()?;
         Ok(store)
@@ -54,12 +71,12 @@ impl FileNetworkJournal {
         }
         Ok(())
     }
-    pub fn load(&self) -> io::Result<Option<NetworkJournal>> {
+    pub fn load(&self) -> io::Result<Option<T>> {
         self.validate_root()?;
         let file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.root.join(STATE_FILE))
+            .open(self.root.join(self.name))
         {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -78,21 +95,18 @@ impl FileNetworkJournal {
         if bytes.len() as u64 > MAX_BYTES {
             return Err(untrusted());
         }
-        let saved: Envelope = serde_json::from_slice(&bytes).map_err(|_| untrusted())?;
+        let saved: Envelope<T> = serde_json::from_slice(&bytes).map_err(|_| untrusted())?;
         if saved.format != 1 || saved.scope != self.scope || !saved.scope.validate() {
             return Err(untrusted());
         }
         Ok(Some(saved.state))
     }
-}
-
-impl NetworkJournalStore for FileNetworkJournal {
-    fn save(&mut self, state: &NetworkJournal) -> io::Result<()> {
+    pub(crate) fn save_state(&mut self, state: &T) -> io::Result<()> {
         self.load()?; // Validate existing identity/mode; never overwrite another runtime's journal.
         let bytes = serde_json::to_vec(&Envelope {
             format: 1,
             scope: self.scope.clone(),
-            state: state.clone(),
+            state,
         })
         .map_err(|_| untrusted())?;
         if bytes.len() as u64 > MAX_BYTES {
@@ -102,9 +116,9 @@ impl NetworkJournalStore for FileNetworkJournal {
         let (path, mut file) = (0..32)
             .find_map(|_| {
                 let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let path = self
-                    .root
-                    .join(format!(".{STATE_FILE}.{}.{seq}.tmp", std::process::id()));
+                let path =
+                    self.root
+                        .join(format!(".{}.{}.{seq}.tmp", self.name, std::process::id()));
                 match OpenOptions::new()
                     .create_new(true)
                     .write(true)
@@ -121,7 +135,7 @@ impl NetworkJournalStore for FileNetworkJournal {
         let result = (|| {
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::rename(&path, self.root.join(STATE_FILE))?;
+            fs::rename(&path, self.root.join(self.name))?;
             File::open(&self.root)?.sync_all()
         })();
         // This exact create_new file is ours, never an existing stale/user file.
@@ -129,6 +143,11 @@ impl NetworkJournalStore for FileNetworkJournal {
             let _ = fs::remove_file(&path);
         }
         result
+    }
+}
+impl NetworkJournalStore for FileNetworkJournal {
+    fn save(&mut self, state: &NetworkJournal) -> io::Result<()> {
+        self.save_state(state)
     }
 }
 fn untrusted() -> io::Error {

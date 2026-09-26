@@ -17,6 +17,8 @@ struct Events {
     fail_a_stop: bool,
     index_override: Option<u32>,
     rebind_stopped: bool,
+    recovered_scope: Option<SessionScope>,
+    recovered_pending: bool,
 }
 struct Backend {
     label: &'static str,
@@ -24,6 +26,12 @@ struct Backend {
     events: Arc<Mutex<Events>>,
 }
 impl ServiceTunnelBackend for Backend {
+    fn member_recovery_scope(&self) -> Option<SessionScope> {
+        self.events.lock().unwrap().recovered_scope.clone()
+    }
+    fn member_cleanup_pending(&self) -> bool {
+        self.events.lock().unwrap().recovered_pending
+    }
     fn member_slot(&self) -> Option<nelomai_contracts::dispatcher::TunnelSlot> {
         match self.label {
             "A" => Some(nelomai_contracts::dispatcher::TunnelSlot::A),
@@ -72,6 +80,49 @@ impl ServiceTunnelBackend for Backend {
             ServiceTunnelState::Running
         })
     }
+}
+
+#[test]
+fn restart_only_cleanup_recovers_exact_scope_and_never_pretends_to_be_fresh_start() {
+    let events = Arc::new(Mutex::new(Events {
+        recovered_scope: Some(scope()),
+        recovered_pending: true,
+        ..Default::default()
+    }));
+    let backends = || {
+        [
+            Backend {
+                label: "A",
+                index: 10,
+                events: events.clone(),
+            },
+            Backend {
+                label: "B",
+                index: 20,
+                events: events.clone(),
+            },
+        ]
+    };
+    assert!(SessionMembers::new(scope(), backends()).is_err());
+    let mut old = scope();
+    old.connection_generation += 1;
+    assert!(SessionMembers::recover_for_cleanup(old, backends()).is_err());
+    let mut recovered = SessionMembers::recover_for_cleanup(scope(), backends()).unwrap();
+    assert!(recovered.view(Slot::A).is_none());
+    assert!(recovered
+        .start(&scope(), Slot::A, &config(), probe())
+        .is_err());
+    assert!(events.lock().unwrap().calls.is_empty());
+    events.lock().unwrap().fail_a_stop = true;
+    assert!(recovered.close(&scope()).is_err());
+    assert!(recovered.cleanup_needed(Slot::A));
+    assert!(!recovered.cleanup_needed(Slot::B));
+    events.lock().unwrap().fail_a_stop = false;
+    recovered.close(&scope()).unwrap();
+    assert_eq!(events.lock().unwrap().calls, ["stop A", "stop B", "stop A"]);
+    assert!(recovered
+        .start(&scope(), Slot::B, &config(), probe())
+        .is_err());
 }
 fn scope() -> SessionScope {
     SessionScope {
@@ -276,6 +327,7 @@ struct NetworkState {
     values: HashMap<ResourceKey, NetworkValue>,
     writes: Vec<ResourceKey>,
     fail_interface: Option<u32>,
+    require_local_stop: Option<Arc<Mutex<Events>>>,
 }
 struct Network(Arc<Mutex<NetworkState>>);
 impl NetworkSystem for Network {
@@ -289,6 +341,11 @@ impl NetworkSystem for Network {
         after: Option<&NetworkValue>,
     ) -> io::Result<()> {
         let mut state = self.0.lock().unwrap();
+        if let Some(events) = &state.require_local_stop {
+            if !events.lock().unwrap().calls.iter().any(|c| c == "stop A") {
+                return Err(io::Error::other("local_vpn_still_running"));
+            }
+        }
         if state.values.get(key) != before {
             return Err(io::Error::other("foreign"));
         }
@@ -474,6 +531,18 @@ fn stale_scope_and_wrong_endpoint_bypass_cannot_mutate_network_or_start_backend(
 }
 
 #[test]
+fn local_stop_precedes_potentially_slow_route_and_dns_cleanup() {
+    let (mut session, events, network) = network_setup();
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    network.lock().unwrap().require_local_stop = Some(events.clone());
+    session.close(&scope()).unwrap();
+    assert!(!session.cleanup_pending());
+    assert_eq!(network.lock().unwrap().values.len(), 1);
+}
+
+#[test]
 fn changing_physical_network_rebinds_both_only_after_endpoint_bypasses_are_committed() {
     let (mut session, events, network) = network_setup();
     session
@@ -608,4 +677,98 @@ fn preexisting_physical_endpoint_route_remains_foreign_through_start_and_stop() 
         Some(&value)
     );
     assert!(!network.lock().unwrap().writes.contains(&value.key()));
+}
+
+#[test]
+fn restart_cleanup_restores_network_and_stops_owned_pair_without_replaying_start() {
+    #[derive(Clone, Default)]
+    struct Durable(Arc<Mutex<NetworkJournal>>);
+    impl NetworkJournalStore for Durable {
+        fn save(&mut self, value: &NetworkJournal) -> io::Result<()> {
+            *self.0.lock().unwrap() = value.clone();
+            Ok(())
+        }
+    }
+    let events = Arc::new(Mutex::new(Events::default()));
+    let backends = || {
+        [
+            Backend {
+                label: "A",
+                index: 10,
+                events: events.clone(),
+            },
+            Backend {
+                label: "B",
+                index: 20,
+                events: events.clone(),
+            },
+        ]
+    };
+    let network = Arc::new(Mutex::new(NetworkState::default()));
+    let baseline = NetworkValue::Dns(DnsValue {
+        service: "Wi-Fi".into(),
+        servers: vec!["192.168.1.1".parse().unwrap()],
+    });
+    network
+        .lock()
+        .unwrap()
+        .values
+        .insert(baseline.key(), baseline.clone());
+    let durable = Durable::default();
+    let mut original = SessionNetwork::new(
+        scope(),
+        backends(),
+        Network(network.clone()),
+        durable.clone(),
+    )
+    .unwrap();
+    original
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    original
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    original.select_active(&scope(), Slot::B).unwrap();
+    drop(original); // helper process state disappears; native resources persist
+    events.lock().unwrap().recovered_scope = Some(scope());
+    events.lock().unwrap().recovered_pending = true;
+    let journal = durable.0.lock().unwrap().clone();
+    events.lock().unwrap().recovered_pending = false;
+    let network_only = SessionNetwork::recover_for_cleanup(
+        scope(),
+        backends(),
+        Network(network.clone()),
+        durable.clone(),
+        journal.clone(),
+    )
+    .unwrap();
+    assert!(
+        network_only.cleanup_pending(),
+        "native members may already be gone while routes/DNS still need cleanup"
+    );
+    drop(network_only);
+    events.lock().unwrap().recovered_pending = true;
+    let writes = network.lock().unwrap().writes.len();
+    let mut recovered = SessionNetwork::recover_for_cleanup(
+        scope(),
+        backends(),
+        Network(network.clone()),
+        durable,
+        journal,
+    )
+    .unwrap();
+    assert_eq!(network.lock().unwrap().writes.len(), writes);
+    assert_eq!(recovered.active(), None);
+    assert!(recovered.cleanup_pending());
+    assert!(recovered.select_active(&scope(), Slot::B).is_err());
+    recovered.close(&scope()).unwrap();
+    assert!(!recovered.cleanup_pending());
+    assert_eq!(
+        network.lock().unwrap().values,
+        HashMap::from([(baseline.key(), baseline)])
+    );
+    assert_eq!(
+        events.lock().unwrap().calls,
+        ["start A", "start B", "stop A", "stop B"]
+    );
 }

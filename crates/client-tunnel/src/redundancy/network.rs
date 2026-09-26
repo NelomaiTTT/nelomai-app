@@ -155,6 +155,9 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
     pub fn cleanup_pending(&self) -> bool {
         self.journal.pending.is_some() || (self.journal.stopping && !self.journal.owned.is_empty())
     }
+    pub fn has_resources(&self) -> bool {
+        !self.journal.owned.is_empty() || self.journal.pending.is_some()
+    }
     pub fn system_mut(&mut self) -> &mut B {
         &mut self.system
     }

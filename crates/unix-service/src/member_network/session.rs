@@ -53,12 +53,32 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             self.network.active()
         }
     }
+    /// The factory must load `journal` from its private scope-bound store. This
+    /// path never resumes data routing or reports stale native health as Running.
+    pub fn recover_for_cleanup(
+        scope: SessionScope,
+        backends: [B; 2],
+        system: N,
+        store: S,
+        journal: NetworkJournal,
+    ) -> Result<Self, ServiceError> {
+        Ok(Self {
+            members: SessionMembers::recover_for_cleanup(scope.clone(), backends)?,
+            scope,
+            network: NetworkOwner::recover(system, store, journal).map_err(network_error)?,
+            policy: None,
+            dns: [Vec::new(), Vec::new()],
+            endpoints: [None, None],
+            closing: true,
+        })
+    }
     pub fn cleanup_pending(&self) -> bool {
         self.network.cleanup_pending()
             || (self.closing
-                && [Slot::A, Slot::B]
-                    .into_iter()
-                    .any(|s| self.members.cleanup_needed(s)))
+                && (self.network.has_resources()
+                    || [Slot::A, Slot::B]
+                        .into_iter()
+                        .any(|s| self.members.cleanup_needed(s))))
     }
     pub fn members(&self) -> &SessionMembers<B> {
         &self.members
@@ -186,11 +206,11 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             return Err(ServiceError::UnauthorizedClient);
         }
         self.closing = true;
-        // Attempt both paths even when DNS/route ownership was changed by
-        // someone else. Never leave a native VPN alive just because DNS failed.
-        let network = self.network.cleanup().map_err(network_error);
+        // Cut native traffic before potentially slow DNS/route cleanup. Still
+        // attempt both paths on failure and retain their independent journals.
         let members = self.members.close(scope);
-        network.and(members)
+        let network = self.network.cleanup().map_err(network_error);
+        members.and(network)
     }
 
     fn values(

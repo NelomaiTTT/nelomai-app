@@ -6,6 +6,29 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- macOS member ownership is now durable and exact: local runtime/session/Start
+ scope + slot + OS boot + interface/index + socket device/inode. Persist intent
+ before launch and identity before peer configuration. Restarted pair construction
+ loads cleanup-only state, never replays Start or stale Running/health. Scope/boot
+ mismatches and replaced native resources fail closed without adoption.
+- Added private Mac pair factory joining the two owned native backends, scoped
+ network journal and native network adapter. Reopening cannot take the fresh
+ path; symlinked slot directories and unknown initial directory contents are
+ preserved/rejected. This factory is not yet wired to helper IPC/timer lifecycle.
+- Native Stop verifies actual disappearance and retains cleanup proof on errors;
+ disk write failure no longer prevents turning off an in-memory verified member.
+ Session Stop cuts native traffic before slow DNS/route cleanup, and route-only
+ remnants remain pending even when both native members are already gone.
+- Rebind uses the verified owned interface, not a replaceable interface-name file.
+ Cleaned individual slots may be reused in a live session; the whole-session Stop
+ fence stays terminal in SessionMembers/NetworkOwner.
+- Linux member WG now has an addressed netlink listening-socket reset using
+ only verified IfIndex + ListenPort(0). It avoids configure_interface (which in
+ pinned defguard flushes addresses), does not rewrite keys/peers/routes, and
+ confirms the kernel ACK plus native interface/port readback. Four portable
+ request/ACK tests cover failure and unrelated replies; native Linux execution
+ and compilation are NOT verified here (missing aarch64-linux-gnu-gcc for ring).
+
 - macOS read-only physical policy discovery now selects the physical gateway,
  keeps both outer endpoints outside the VPN, preserves existing LAN/endpoint
  routes as verified but unowned dependencies, and handles IPv6 link-local gateway
@@ -30,8 +53,8 @@ permission to begin is required. This checkpoint is NOT feature completion.
  switch removes known remaining routes without recreating a disappeared primary.
  A kernel-removed route no longer prevents promotion to a live reserve.
 - macOS WG member now retains rebind peers as AWG does; ordinary single remains
- unchanged. Linux kernel WG rebind still needs an adapter, not falsely reported
- as implemented by retaining those peer records.
+ unchanged. Linux kernel WG reset adapter is now written separately (above);
+ retaining peer records alone was not a rebind implementation.
 
 - Continuation after user “Тогда продолжай брат”: connected nonblocking DNS
  probes with exact native interface binding, response/timeout validation and no
@@ -66,17 +89,17 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Remaining, not hidden behind a capability flag
 
-- Task2 connect the native factory and durable member lifecycle;
+- Task2 connect the Mac factory to engine lifecycle; finish durable member lifecycle;
  Linux/Windows network adapters and per-member
  Windows metrics still needed. Verify same-VIP behavior and socket egress per OS.
  The panel gives both members the same configured DNS health target, not a
  dedicated per-slot diagnostic address. A lower route metric alone is not proof
  of standby isolation. Do not enable the feature based only on Table=off.
-- Durable session/resource recovery: current member constructors refuse to
- adopt an already running interface (`slot_recovery_requires_owner`). This is
- a temporary safe boundary, not implemented crash recovery. Persisted owner,
- native member identity/recovery and stale-cleanup tests are still needed.
- The new route journal is scope-bound, but is not whole-session crash recovery.
+- macOS captured member identity now permits verified cleanup recovery. The
+ launch-to-durable-capture crash window still fails closed (no name-only cleanup);
+ Linux/Windows durable native recovery remains missing. The service must still
+ select/reconcile the saved session and server intent; this is not automatic
+ whole-application restart recovery or resumed hot-standby after helper death.
 - Task3 helper-owned coordinator, timer/IPC/capabilities and role ACK fencing.
 - Task4 foreground/background/quick-action server lifecycle and last-active
  WARM (one hour, reserve released). No desktop WARM wiring exists yet.
@@ -84,6 +107,16 @@ permission to begin is required. This checkpoint is NOT feature completion.
  whole-feature review; later authorized native packet/hardware tests.
 
 ## Verification
+
+Current continuation: full `cargo test --workspace --offline --quiet` **passed**
+(1194 reported passes, including nested child-test output; one pre-existing
+ignored real-panel recovery test requires a synthetic external fixture).
+Host Clippy for client-tunnel/Unix/Windows services `--all-targets -D warnings`
+passed; Windows MSVC check passed; `git diff --check` clean. Linux target check
+stopped in ring's C build: missing `aarch64-linux-gnu-gcc`, so Linux native
+compilation and execution are explicitly unverified. No npm/frontend test run
+in this continuation (no frontend changes); whole-feature review still pending.
+No host VPN/routes/DNS/Keychain/firewall changes, install, push or production work.
 
 Latest follow-up: **224 tests passed** in client-tunnel + Unix/Windows services;
 host Clippy `-D warnings`, `git diff --check`, Windows MSVC check passed. No Linux
