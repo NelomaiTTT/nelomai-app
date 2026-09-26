@@ -1,5 +1,10 @@
 # Desktop WARM: prerequisite audit
 
+Update 26.09.2026: the user clarified that full desktop hot-standby was already
+authorized, not only WARM. The authorization blocker below was a mistaken reading
+and is superseded. Technical findings remain valid. Work continues in this same
+local branch; see `superpowers/specs/2026-09-26-desktop-hot-standby-design.md`.
+
 Base: main 6b8aa90 (candidate0.3.3), read-only code audit, no device test.
 
 The premise that desktop already runs two hot-standby tunnels is false in this
