@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub mod redundancy;
 mod routes;
 
 pub use routes::{Ipv4RoutePlan, RoutePlanError};
