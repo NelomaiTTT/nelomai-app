@@ -92,6 +92,12 @@ impl NetworkValue {
 }
 
 pub trait NetworkSystem {
+    /// Pure expansion of a route into the platform's separately journaled
+    /// resources. Linux member routes need an oif rule as well as a private-table
+    /// route; never create that rule as an invisible side effect of route CAS.
+    fn route_resources(&self, route: RouteValue) -> io::Result<Vec<NetworkValue>> {
+        Ok(vec![NetworkValue::Route(route)])
+    }
     /// Must fail on ambiguous/multiple native matches, never select an arbitrary
     /// row. Missing resource is None, not a failed query disguised as absence.
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>>;

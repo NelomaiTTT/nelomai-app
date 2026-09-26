@@ -50,6 +50,7 @@ fn persisted_identity_is_scoped_private_and_only_exact_live_resource_is_recovere
     owner.begin(MemberTransport::AmneziaWg3).unwrap();
     owner.capture(identity()).unwrap();
     let recovered = store(dir.path());
+    assert_eq!(recovered.scope, scope());
     assert_eq!(
         recovered.owned(&identity()).unwrap(),
         MemberTransport::AmneziaWg3

@@ -24,24 +24,41 @@ pub struct MemberTable {
 
 pub struct LinuxNetwork<C> {
     pub commands: C,
-    members: [MemberTable; 2],
+    members: Vec<MemberTable>,
 }
 
 impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
-    pub fn new(commands: C, members: [MemberTable; 2]) -> io::Result<Self> {
-        if members.iter().any(|m| {
-            m.interface == 0
-                || !valid_name(&m.name)
-                || m.table <= 255
-                || !(1..32766).contains(&m.priority)
-        }) || members[0].interface == members[1].interface
-            || members[0].name == members[1].name
-            || members[0].table == members[1].table
-            || members[0].priority == members[1].priority
+    pub fn new(commands: C, members: impl IntoIterator<Item = MemberTable>) -> io::Result<Self> {
+        let mut result = Self {
+            commands,
+            members: Vec::new(),
+        };
+        for member in members {
+            result.register_member(member)?;
+        }
+        Ok(result)
+    }
+    /// Register only after the privileged factory has persisted a freshly
+    /// captured member identity and free table/priority assignment. No network
+    /// commands here; empty/primary-only construction never waits for standby.
+    /// Replacing a live binding is deliberately not an adoption/recovery path.
+    pub fn register_member(&mut self, member: MemberTable) -> io::Result<()> {
+        if self.members.len() >= 2
+            || member.interface == 0
+            || !valid_name(&member.name)
+            || member.table <= 255
+            || !(1..32766).contains(&member.priority)
+            || self.members.iter().any(|m| {
+                m.interface == member.interface
+                    || m.name == member.name
+                    || m.table == member.table
+                    || m.priority == member.priority
+            })
         {
             return Err(invalid());
         }
-        Ok(Self { commands, members })
+        self.members.push(member);
+        Ok(())
     }
     pub fn member_rule(&self, interface: u32, ipv6: bool) -> io::Result<NetworkValue> {
         let m = self.member(interface)?;
@@ -313,6 +330,14 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
 }
 
 impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
+    fn route_resources(&self, route: RouteValue) -> io::Result<Vec<NetworkValue>> {
+        let mut values = vec![NetworkValue::Route(route.clone())];
+        self.validate(&values[0])?;
+        if let RouteScope::Member(interface) = route.scope {
+            values.push(self.member_rule(interface, route.destination.addr().is_ipv6())?);
+        }
+        Ok(values)
+    }
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         match key {
             ResourceKey::Route(destination, scope) => self.read_route(*destination, *scope),

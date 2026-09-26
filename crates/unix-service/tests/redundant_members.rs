@@ -328,9 +328,25 @@ struct NetworkState {
     writes: Vec<ResourceKey>,
     fail_interface: Option<u32>,
     require_local_stop: Option<Arc<Mutex<Events>>>,
+    bound_rules: bool,
+    fail_rule_interface: Option<u32>,
 }
 struct Network(Arc<Mutex<NetworkState>>);
 impl NetworkSystem for Network {
+    fn route_resources(&self, route: RouteValue) -> io::Result<Vec<NetworkValue>> {
+        let mut values = vec![NetworkValue::Route(route.clone())];
+        if self.0.lock().unwrap().bound_rules {
+            if let RouteScope::Member(interface) = route.scope {
+                values.push(NetworkValue::BoundRule(BoundRuleValue {
+                    ipv6: route.destination.addr().is_ipv6(),
+                    priority: 12000 + interface,
+                    table: 52000 + interface,
+                    interface,
+                }));
+            }
+        }
+        Ok(values)
+    }
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         Ok(self.0.lock().unwrap().values.get(key).cloned())
     }
@@ -351,6 +367,10 @@ impl NetworkSystem for Network {
         }
         if matches!(after,Some(NetworkValue::Route(r)) if Some(r.interface)==state.fail_interface) {
             return Err(io::Error::other("interface failed"));
+        }
+        if matches!(after,Some(NetworkValue::BoundRule(r)) if Some(r.interface)==state.fail_rule_interface)
+        {
+            return Err(io::Error::other("rule failed"));
         }
         state.writes.push(key.clone());
         match after {
@@ -450,6 +470,54 @@ fn primary_routes_are_ready_before_reserve_exists_and_reserve_only_adds_scoped_p
         )]
     );
     assert_eq!(events.lock().unwrap().calls, ["start A", "start B"]);
+}
+
+#[test]
+fn member_probe_rules_participate_in_session_switch_and_stop_transaction() {
+    let (mut session, _, network) = network_setup();
+    network.lock().unwrap().bound_rules = true;
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    let a = ResourceKey::BoundRule {
+        ipv6: false,
+        priority: 12010,
+    };
+    let b = ResourceKey::BoundRule {
+        ipv6: false,
+        priority: 12020,
+    };
+    assert!(network.lock().unwrap().values.contains_key(&a));
+    assert!(!network.lock().unwrap().values.contains_key(&b));
+    session
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    session.select_active(&scope(), Slot::B).unwrap();
+    assert!(network.lock().unwrap().values.contains_key(&a));
+    assert!(network.lock().unwrap().values.contains_key(&b));
+    session.close(&scope()).unwrap();
+    let values = &network.lock().unwrap().values;
+    assert!(!values.contains_key(&a));
+    assert!(!values.contains_key(&b));
+    assert_eq!(values.len(), 1); // original DNS only
+}
+
+#[test]
+fn failed_standby_rule_rolls_back_probe_route_without_breaking_primary() {
+    let (mut session, _, network) = network_setup();
+    network.lock().unwrap().bound_rules = true;
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    let before = network.lock().unwrap().values.clone();
+    network.lock().unwrap().fail_rule_interface = Some(20);
+    assert!(session
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .is_err());
+    assert_eq!(session.active(), Some(Slot::A));
+    assert_eq!(network.lock().unwrap().values, before);
+    session.close(&scope()).unwrap();
+    assert!(!session.cleanup_pending());
 }
 
 #[test]

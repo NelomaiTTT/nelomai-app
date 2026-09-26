@@ -6,6 +6,28 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- Linux route resources now expand through the actual SessionNetwork planner:
+ member route + bound RPDB rule enter the same journal/rollback/Stop transaction.
+ Integration tests prove a failed standby rule leaves primary routes/DNS intact;
+ promotion retains both probe rules and Stop removes both. Registration now
+ permits zero/one member followed by standby; no constructor dependency on B.
+ Native binding persistence and free-table allocation still belong to the
+ unfinished Linux factory; registration itself performs no native commands.
+- Five additional tests RED→GREEN; the three affected service/shared crate
+ suites report281 passes, host Clippy-D warnings and Windows MSVC check pass.
+- The old Linux compile limitation has now been removed locally: downloaded
+ Zig0.15.2 from the official distribution, verified SHA256
+ `3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b`,
+ all compiler/cache files under
+ app/.tmp/linux-cross.j4Tyyw. Corrected only cc-rs→Zig target spelling in a local
+ wrapper. `cargo check -p nelomai-unix-service --target aarch64-unknown-linux-gnu
+ --offline --quiet` now exits0, including native Linux backend/routing/RPF code.
+ This proves compilation, not packet behavior. No system compiler installation.
+ Linux all-target Clippy-D warnings also exits0 after correcting Mac-only test
+ compilation boundaries and checking restored journal/scope values in fixtures.
+ Host Unix library tests116pass after those changes. Tool source/checksum:
+ [official Zig download index](https://ziglang.org/download/index.json).
+
 - Windows member telemetry now reads the addressed WireGuardNT1.1 adapter or
  protected AmneziaWG UAPI pipe, never the global ringlogger. Capture requires
  the engine's own Start PID/index; every sample checks SCM PID, process creation

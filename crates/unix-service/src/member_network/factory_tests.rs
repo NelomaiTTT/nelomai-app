@@ -24,6 +24,10 @@ fn scope_and_boot_are_sealed_before_slot_directories_and_reopen_is_recovery_only
     let uid = unsafe { libc::geteuid() };
     let first = SessionDirectory::open(d.path(), scope(), "boot-one", uid).unwrap();
     assert!(!first.recovering);
+    assert_eq!(
+        serde_json::to_value(first.network.load().unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&first.journal).unwrap(),
+    );
     for slot in ["slot-a", "slot-b"] {
         assert_eq!(
             fs::metadata(d.path().join(slot)).unwrap().mode() & 0o777,

@@ -251,7 +251,14 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             .cloned()
             .map(NetworkValue::Route)
             .collect::<Vec<_>>();
-        values.extend(routes.into_iter().map(NetworkValue::Route));
+        for route in routes {
+            values.extend(
+                self.network
+                    .system_mut()
+                    .route_resources(route)
+                    .map_err(network_error)?,
+            );
+        }
         if !self.dns[index(active)].is_empty() {
             values.extend(policy.dns_services.iter().map(|service| {
                 NetworkValue::Dns(DnsValue {

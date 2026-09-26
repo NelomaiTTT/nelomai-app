@@ -77,6 +77,102 @@ fn route(cidr: &str, scope: RouteScope, interface: u32) -> NetworkValue {
 }
 
 #[test]
+fn primary_table_can_be_registered_without_waiting_for_reserve() {
+    let mut network = LinuxNetwork::new(Commands::default(), []).unwrap();
+    let a = MemberTable {
+        interface: 10,
+        name: "nlm-wga".into(),
+        table: 52000,
+        priority: 12000,
+    };
+    network.register_member(a.clone()).unwrap();
+    let NetworkValue::Route(probe) = route("9.9.9.9/32", RouteScope::Member(10), 10) else {
+        unreachable!()
+    };
+    assert_eq!(
+        network.route_resources(probe.clone()).unwrap(),
+        vec![
+            NetworkValue::Route(probe),
+            network.member_rule(10, false).unwrap()
+        ]
+    );
+    assert!(network.member_rule(20, false).is_err());
+    network
+        .register_member(MemberTable {
+            interface: 20,
+            name: "nlm-wgb".into(),
+            table: 52001,
+            priority: 12001,
+        })
+        .unwrap();
+    assert!(network.member_rule(20, false).is_ok());
+    assert!(network.register_member(a).is_err());
+    assert!(network.commands.calls.is_empty()); // planning/registration changes no host state
+}
+
+#[test]
+fn registering_ambiguous_table_never_changes_existing_primary_binding() {
+    for conflict in [
+        MemberTable {
+            interface: 20,
+            name: "nlm-wgb".into(),
+            table: 52000,
+            priority: 12001,
+        },
+        MemberTable {
+            interface: 20,
+            name: "nlm-wgb".into(),
+            table: 52001,
+            priority: 12000,
+        },
+        MemberTable {
+            interface: 10,
+            name: "nlm-wgb".into(),
+            table: 52001,
+            priority: 12001,
+        },
+        MemberTable {
+            interface: 20,
+            name: "nlm-wga".into(),
+            table: 52001,
+            priority: 12001,
+        },
+    ] {
+        let mut network = LinuxNetwork::new(
+            Commands::default(),
+            [MemberTable {
+                interface: 10,
+                name: "nlm-wga".into(),
+                table: 52000,
+                priority: 12000,
+            }],
+        )
+        .unwrap();
+        let before = network.member_rule(10, false).unwrap();
+        assert!(network.register_member(conflict).is_err());
+        assert_eq!(network.member_rule(10, false).unwrap(), before);
+        assert_eq!(network.members.len(), 1);
+    }
+}
+
+#[test]
+fn route_resource_expansion_keeps_global_routes_global_and_ipv6_rules_distinct() {
+    let network = adapter(&[]);
+    let NetworkValue::Route(global) = route("0.0.0.0/1", RouteScope::Global, 10) else {
+        unreachable!()
+    };
+    assert_eq!(
+        network.route_resources(global.clone()).unwrap(),
+        vec![NetworkValue::Route(global)]
+    );
+    let NetworkValue::Route(probe) = route("2001:db8::1/128", RouteScope::Member(20), 20) else {
+        unreachable!()
+    };
+    let resources = network.route_resources(probe).unwrap();
+    assert_eq!(resources[1], network.member_rule(20, true).unwrap());
+}
+
+#[test]
 fn reserve_probe_route_is_in_private_table_not_main() {
     let mut network = adapter(&["[]", ""]);
     let probe = route("9.9.9.9/32", RouteScope::Member(20), 20);

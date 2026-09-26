@@ -57,6 +57,7 @@ pub(super) struct MemberOwner {
     pub(super) scope: SessionScope,
 }
 impl MemberOwner {
+    #[cfg(target_os = "macos")]
     pub(super) fn open_root(
         root: &Path,
         scope: SessionScope,
