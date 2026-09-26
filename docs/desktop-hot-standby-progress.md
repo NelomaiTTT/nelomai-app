@@ -6,6 +6,41 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- Linux pair route adapter now renders exact IPv4/IPv6 main data routes and
+ separate per-member probe tables with device-bound `oif` RPDB rules. Rules are
+ first-class owned journal resources, never an unjournaled companion command.
+ Foreign/duplicate/modified rules fail closed; detached rules can be removed
+ after native Stop, but name reuse cannot authorize cleanup of a new interface.
+ A failed rule add rolls back its probe route through the real NetworkOwner.
+- iproute2 JSON parsing verified against upstream print_string/numeric behavior;
+ table dumps use `table all` plus exact filtering because a never-created table
+ is not reliably an empty successful dump. Parser rejects unknown route/rule
+ attributes instead of forgetting them during ownership comparison.
+- Linux member creation configures only its verified VPN interface rp_filter=2
+ (loose), with readback. `all`/`default`/physical interfaces are untouched; native
+ interface deletion removes the setting. Strict RPF would otherwise discard
+ standby replies while the ordinary reverse route points at the active member.
+ Native procfs/ip wrappers have NOT been executed or Linux-cross-compiled here.
+- This is still Task2, NOT complete Linux pair networking: resolver ownership,
+ physical-policy discovery/retained routes, durable table/interface bindings,
+ table allocation preflight and session integration remain. DNS explicitly
+ returns Unsupported; no new capability/UI path is enabled. Constructor currently
+ takes both proven member bindings; primary-first dynamic registration belongs
+ to the forthcoming factory integration, not delayed primary startup.
+
+Linux references used for this stage:
+[iproute2 rule JSON](https://github.com/iproute2/iproute2/blob/main/ip/iprule.c),
+[route JSON](https://github.com/iproute2/iproute2/blob/main/ip/iproute.c),
+[numeric name formatting](https://github.com/iproute2/iproute2/blob/main/lib/rt_names.c),
+[kernel rp_filter semantics](https://www.kernel.org/doc/html/v6.17/networking/ip-sysctl.html).
+
+Stage verification: 22 added tests (3 shared journal,13 Linux route/rule,6 member
+RPF); final `cargo test --workspace --offline --quiet` exit0, one existing ignored
+real-panel synthetic-fixture test. Clippy-D warnings and Windows MSVC check exit0.
+Linux cross-check exit101 before native adapter compilation: ring needs absent
+`aarch64-linux-gnu-gcc`. Logs: this plan's ignored workspace, `linux-network-final-*`.
+Partial-stage parent review only; full feature review and hardware proof remain.
+
 - macOS member ownership is now durable and exact: local runtime/session/Start
  scope + slot + OS boot + interface/index + socket device/inode. Persist intent
  before launch and identity before peer configuration. Restarted pair construction

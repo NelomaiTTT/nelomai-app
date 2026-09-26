@@ -94,7 +94,8 @@ Status: **in progress**, not complete. Low-level independently named member
 backends/SCM primitives, common route/DNS transactions, bound probes, Unix native
 composition and macOS physical policy discovery are implemented. Mac private
 pair factory and captured native identity cleanup recovery added. Engine wiring,
-Linux/Windows network adapters/recovery, launch crash-gap handling and full lifecycle
+Linux route/rule adapter and member-only loose RPF added; Linux resolver/factory,
+Windows network adapter/recovery, launch crash-gap handling and full lifecycle
 integration still required before enabling this path. Same-VIP packet behavior
 is not proven by the fake tests.
 See `docs/desktop-hot-standby-progress.md` for evidence and remaining gates.

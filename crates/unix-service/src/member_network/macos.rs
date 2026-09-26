@@ -18,6 +18,7 @@ pub struct MacNetwork<C> {
 impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         match key {
+            ResourceKey::BoundRule { .. } => Err(invalid()),
             ResourceKey::Dns(service) => {
                 valid_service(service)?;
                 let text = self.commands.run(
@@ -109,6 +110,7 @@ impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
             return Ok(());
         }
         match key {
+            ResourceKey::BoundRule { .. } => return Err(invalid()),
             ResourceKey::Dns(service) => {
                 // An unset explicit DNS list is represented by an empty baseline,
                 // not by deleting a network service.

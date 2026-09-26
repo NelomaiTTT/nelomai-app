@@ -203,7 +203,10 @@ impl LinuxBackend {
         }
 
         let configured_routes: Result<(), ServiceError> = if !self.mode.owns_network() {
-            Ok(())
+            self.member_interface_index().and_then(|index| {
+                super::member_rpf::enable_member_reply_path(interface_name, index)
+                    .map_err(backend_error)
+            })
         } else {
             match configuration.transport {
                 TunnelTransport::WireGuard => self

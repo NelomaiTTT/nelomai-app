@@ -66,6 +66,61 @@ fn route(destination: &str, interface: u32) -> NetworkValue {
         metric: 1,
     })
 }
+
+fn bound_rule() -> NetworkValue {
+    NetworkValue::BoundRule(BoundRuleValue {
+        ipv6: false,
+        priority: 12001,
+        table: 52001,
+        interface: 20,
+    })
+}
+
+#[test]
+fn preexisting_bound_rule_is_not_adopted_even_when_identical() {
+    let rule = bound_rule();
+    let mut system = System::default();
+    system
+        .values
+        .insert(format!("{:?}", rule.key()), rule.clone());
+    let mut owner = NetworkOwner::fresh(system, Journal::default());
+    assert!(owner.prepare(vec![rule.clone()]).is_err());
+    assert_eq!(owner.system_mut().writes, 0);
+    owner.cleanup().unwrap();
+    assert_eq!(owner.system_mut().read(&rule.key()).unwrap(), Some(rule));
+}
+
+#[test]
+fn bound_rule_survives_journal_restart_and_is_removed_only_by_its_owner() {
+    let rule = bound_rule();
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.prepare(vec![rule.clone()]).unwrap();
+    let (system, store) = owner.into_parts();
+    let persisted = store.saved.clone().unwrap();
+    let mut recovered = NetworkOwner::recover(system, store, persisted).unwrap();
+    recovered.cleanup().unwrap();
+    assert_eq!(recovered.system_mut().read(&rule.key()).unwrap(), None);
+}
+
+#[test]
+fn bound_rule_rejects_builtin_table_zero_interface_and_default_rule_priority() {
+    for (table, interface, priority) in [
+        (254, 20, 12001),
+        (52001, 0, 12001),
+        (52001, 20, 0),
+        (52001, 20, 32766),
+    ] {
+        let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+        let value = NetworkValue::BoundRule(BoundRuleValue {
+            ipv6: false,
+            priority,
+            table,
+            interface,
+        });
+        assert!(owner.prepare(vec![value]).is_err());
+        assert_eq!(owner.system_mut().writes, 0);
+    }
+}
 fn pair(interface: u32) -> Vec<NetworkValue> {
     vec![
         route("0.0.0.0/1", interface),

@@ -5,6 +5,8 @@ pub mod factory;
 #[cfg(test)]
 mod factory_tests;
 pub mod journal;
+#[cfg(any(target_os = "linux", test))]
+pub mod linux;
 #[cfg(any(target_os = "macos", test))]
 pub mod macos;
 pub mod members;

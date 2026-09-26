@@ -10,6 +10,8 @@ mod macos;
 mod member_owner;
 #[cfg(test)]
 mod member_owner_tests;
+#[cfg(any(target_os = "linux", test))]
+mod member_rpf;
 mod redundancy;
 
 use crate::{Awg3Parameters, ParsedConfiguration, ServiceError, ServiceTunnelState};

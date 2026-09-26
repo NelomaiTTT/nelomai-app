@@ -1,0 +1,487 @@
+//! Private pair route adapter. Not constructed by the service until Linux pair
+//! lifecycle, resolver and reverse-path-filter ownership are connected.
+
+use ipnet::IpNet;
+use nelomai_client_tunnel::redundancy::network::*;
+use serde_json::{Map, Value};
+use std::{io, net::IpAddr};
+
+pub trait LinuxNetworkCommands {
+    fn ip(&mut self, args: &[String]) -> io::Result<String>;
+    fn interface_name(&self, index: u32) -> io::Result<String>;
+    fn interface_index(&self, name: &str) -> io::Result<u32>;
+}
+
+/// Assigned by the privileged owner, never accepted from application IPC.
+/// The enclosing session must persist these bindings with its native identity.
+#[derive(Clone)]
+pub struct MemberTable {
+    pub interface: u32,
+    pub name: String,
+    pub table: u32,
+    pub priority: u32,
+}
+
+pub struct LinuxNetwork<C> {
+    pub commands: C,
+    members: [MemberTable; 2],
+}
+
+impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
+    pub fn new(commands: C, members: [MemberTable; 2]) -> io::Result<Self> {
+        if members.iter().any(|m| {
+            m.interface == 0
+                || !valid_name(&m.name)
+                || m.table <= 255
+                || !(1..32766).contains(&m.priority)
+        }) || members[0].interface == members[1].interface
+            || members[0].name == members[1].name
+            || members[0].table == members[1].table
+            || members[0].priority == members[1].priority
+        {
+            return Err(invalid());
+        }
+        Ok(Self { commands, members })
+    }
+    pub fn member_rule(&self, interface: u32, ipv6: bool) -> io::Result<NetworkValue> {
+        let m = self.member(interface)?;
+        Ok(NetworkValue::BoundRule(BoundRuleValue {
+            ipv6,
+            priority: m.priority,
+            table: m.table,
+            interface,
+        }))
+    }
+    fn member(&self, interface: u32) -> io::Result<&MemberTable> {
+        self.members
+            .iter()
+            .find(|m| m.interface == interface)
+            .ok_or_else(invalid)
+    }
+    fn table(&self, scope: RouteScope) -> io::Result<u32> {
+        match scope {
+            RouteScope::Global => Ok(254),
+            RouteScope::Member(i) => Ok(self.member(i)?.table),
+        }
+    }
+    fn name(&self, interface: u32) -> io::Result<String> {
+        let name = self.commands.interface_name(interface)?;
+        if !valid_name(&name) || self.commands.interface_index(&name)? != interface {
+            return Err(invalid());
+        }
+        if self
+            .members
+            .iter()
+            .any(|m| m.interface == interface && m.name != name)
+        {
+            return Err(invalid());
+        }
+        Ok(name)
+    }
+    fn rule_name(&self, interface: u32) -> io::Result<(&str, bool)> {
+        let m = self.member(interface)?;
+        match self.commands.interface_index(&m.name) {
+            Ok(index) if index == interface => Ok((&m.name, false)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((&m.name, true)),
+            _ => Err(invalid()),
+        }
+    }
+    fn read_route(
+        &mut self,
+        destination: IpNet,
+        scope: RouteScope,
+    ) -> io::Result<Option<NetworkValue>> {
+        let table = self.table(scope)?;
+        let text = self.commands.ip(&[
+            "-j".into(),
+            "-N".into(),
+            family(destination.addr().is_ipv6()).into(),
+            "route".into(),
+            "show".into(),
+            "table".into(),
+            "all".into(),
+            "exact".into(),
+            destination.to_string(),
+        ])?;
+        let rows = rows(&text)?;
+        let mut result = None;
+        for row in rows {
+            let row = row.as_object().ok_or_else(invalid)?;
+            // A table-specific dump can fail when the table has never existed.
+            // Dump all tables and filter, rather than treating command failures
+            // as an empty routing table. Main table may be omitted by iproute2.
+            let actual_table = if row.contains_key("table") {
+                number(row, "table")?
+            } else {
+                254
+            };
+            if actual_table != table {
+                continue;
+            }
+            // Query was already exact. Unexpected destinations are not absence.
+            let dst = string(row, "dst")?;
+            let actual = if dst == "default" {
+                if destination.addr().is_ipv4() {
+                    "0.0.0.0/0"
+                } else {
+                    "::/0"
+                }
+                .parse()
+                .map_err(|_| invalid())?
+            } else {
+                dst.parse::<IpNet>()
+                    .or_else(|_| dst.parse::<IpAddr>().map(IpNet::from))
+                    .map_err(|_| invalid())?
+            };
+            if actual != destination {
+                return Err(invalid());
+            }
+            only_keys(
+                row,
+                &[
+                    "dst", "dev", "gateway", "protocol", "scope", "metric", "flags", "type",
+                    "table", "pref",
+                ],
+            )?;
+            if number(row, "protocol")? != 4
+                || row.get("type").is_some_and(|v| v != "unicast")
+                || row
+                    .get("flags")
+                    .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
+                || row.get("pref").is_some_and(|v| v != "medium")
+                || (row.contains_key("table") && number(row, "table")? != table)
+            {
+                return Err(invalid());
+            }
+            let name = string(row, "dev")?;
+            let interface = self.commands.interface_index(name)?;
+            if self.name(interface)? != name
+                || matches!(scope,RouteScope::Member(i) if i != interface)
+            {
+                return Err(invalid());
+            }
+            let gateway = row
+                .get("gateway")
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(invalid)?
+                        .parse::<IpAddr>()
+                        .map_err(|_| invalid())
+                })
+                .transpose()?;
+            if gateway.is_some_and(|g| g.is_ipv4() != destination.addr().is_ipv4()) {
+                return Err(invalid());
+            }
+            if let Some(native_scope) = row.get("scope") {
+                let expected = if gateway.is_none() { "link" } else { "global" };
+                let expected_numeric = if gateway.is_none() { 253 } else { 0 };
+                if native_scope != expected && number(row, "scope")? != expected_numeric {
+                    return Err(invalid());
+                }
+            }
+            let metric = row
+                .get("metric")
+                .map(|_| number(row, "metric"))
+                .transpose()?
+                .unwrap_or(0);
+            if result
+                .replace(NetworkValue::Route(RouteValue {
+                    destination,
+                    scope,
+                    interface,
+                    gateway,
+                    metric,
+                }))
+                .is_some()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(result)
+    }
+    fn read_rule(&mut self, ipv6: bool, priority: u32) -> io::Result<Option<NetworkValue>> {
+        let member = self
+            .members
+            .iter()
+            .find(|m| m.priority == priority)
+            .ok_or_else(invalid)?
+            .clone();
+        let text = self.commands.ip(&[
+            "-j".into(),
+            "-N".into(),
+            family(ipv6).into(),
+            "rule".into(),
+            "show".into(),
+        ])?;
+        let mut result = None;
+        for row in rows(&text)? {
+            let row = row.as_object().ok_or_else(invalid)?;
+            if number(row, "priority")? != priority {
+                continue;
+            }
+            only_keys(
+                row,
+                &[
+                    "priority",
+                    "src",
+                    "table",
+                    "protocol",
+                    "oif",
+                    "oif_detached",
+                ],
+            )?;
+            let (name, absent) = self.rule_name(member.interface)?;
+            if string(row, "src")? != "all"
+                || number(row, "table")? != member.table
+                || number(row, "protocol")? != 4
+                || string(row, "oif")? != name
+                || row.contains_key("oif_detached") != absent
+                || row.get("oif_detached").is_some_and(|v| !v.is_null())
+            {
+                return Err(invalid());
+            }
+            if result
+                .replace(self.member_rule(member.interface, ipv6)?)
+                .is_some()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(result)
+    }
+    fn validate(&self, value: &NetworkValue) -> io::Result<()> {
+        match value {
+            NetworkValue::Route(r) => {
+                if r.interface == 0
+                    || r.destination != r.destination.trunc()
+                    || r.gateway
+                        .is_some_and(|g| g.is_ipv4() != r.destination.addr().is_ipv4())
+                    || matches!(r.scope,RouteScope::Member(i) if i!=r.interface)
+                {
+                    return Err(invalid());
+                }
+                self.table(r.scope)?;
+            }
+            NetworkValue::BoundRule(r) if self.member_rule(r.interface, r.ipv6)? == *value => {}
+            _ => return Err(invalid()),
+        }
+        Ok(())
+    }
+    fn mutate(&mut self, add: bool, value: &NetworkValue) -> io::Result<()> {
+        let action = if add { "add" } else { "del" };
+        let args = match value {
+            NetworkValue::Route(r) => {
+                let mut args = vec![
+                    family(r.destination.addr().is_ipv6()).into(),
+                    "route".into(),
+                    action.into(),
+                    r.destination.to_string(),
+                    "table".into(),
+                    self.table(r.scope)?.to_string(),
+                    "dev".into(),
+                    self.name(r.interface)?,
+                    "metric".into(),
+                    r.metric.to_string(),
+                    "proto".into(),
+                    "4".into(),
+                ];
+                if let Some(gateway) = r.gateway {
+                    args.extend(["via".into(), gateway.to_string()]);
+                } else if r.destination.addr().is_ipv4() {
+                    args.extend(["scope".into(), "link".into()]);
+                }
+                args
+            }
+            NetworkValue::BoundRule(r) => vec![
+                family(r.ipv6).into(),
+                "rule".into(),
+                action.into(),
+                "priority".into(),
+                r.priority.to_string(),
+                "oif".into(),
+                self.rule_name(r.interface)?.0.into(),
+                "lookup".into(),
+                r.table.to_string(),
+                "protocol".into(),
+                "4".into(),
+            ],
+            _ => return Err(invalid()),
+        };
+        self.commands.ip(&args)?;
+        Ok(())
+    }
+}
+
+impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
+    fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        match key {
+            ResourceKey::Route(destination, scope) => self.read_route(*destination, *scope),
+            ResourceKey::BoundRule { ipv6, priority } => self.read_rule(*ipv6, *priority),
+            ResourceKey::Dns(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pair_dns_not_connected",
+            )),
+        }
+    }
+    fn compare_exchange(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+    ) -> io::Result<()> {
+        for value in [before, after].into_iter().flatten() {
+            if value.key() != *key {
+                return Err(invalid());
+            }
+            self.validate(value)?;
+        }
+        if let Some(value) = after {
+            match value {
+                NetworkValue::Route(r) => {
+                    self.name(r.interface)?;
+                }
+                NetworkValue::BoundRule(r) => {
+                    self.name(r.interface)?;
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        if self.read(key)?.as_ref() != before {
+            return Err(io::Error::other("network_resource_changed"));
+        }
+        if before == after {
+            return Ok(());
+        }
+        if let Some(value) = before {
+            self.mutate(false, value)?;
+        }
+        if let Some(value) = after {
+            self.mutate(true, value)?;
+        }
+        Ok(())
+    }
+}
+fn family(ipv6: bool) -> &'static str {
+    if ipv6 {
+        "-6"
+    } else {
+        "-4"
+    }
+}
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+}
+fn invalid() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid_linux_pair_network_state",
+    )
+}
+fn rows(text: &str) -> io::Result<Vec<Value>> {
+    if text.len() > 8 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    let rows: Vec<Value> = serde_json::from_str(text).map_err(|_| invalid())?;
+    if rows.len() > 32768 {
+        return Err(invalid());
+    }
+    Ok(rows)
+}
+fn string<'a>(row: &'a Map<String, Value>, key: &str) -> io::Result<&'a str> {
+    row.get(key).and_then(Value::as_str).ok_or_else(invalid)
+}
+fn number(row: &Map<String, Value>, key: &str) -> io::Result<u32> {
+    let value = row.get(key).ok_or_else(invalid)?;
+    if let Some(n) = value.as_u64() {
+        return u32::try_from(n).map_err(|_| invalid());
+    }
+    let text = value.as_str().ok_or_else(invalid)?;
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    text.parse().map_err(|_| invalid())
+}
+fn only_keys(row: &Map<String, Value>, keys: &[&str]) -> io::Result<()> {
+    if row.keys().any(|k| !keys.contains(&k.as_str())) {
+        Err(invalid())
+    } else {
+        Ok(())
+    }
+}
+
+/// Uses the same allowlisted executable discovery and bounded subprocess seam
+/// as the existing Linux route manager. Unit tests never construct this type.
+#[cfg(target_os = "linux")]
+pub struct NativeLinuxCommands {
+    ip: std::path::PathBuf,
+}
+#[cfg(target_os = "linux")]
+impl NativeLinuxCommands {
+    pub fn new() -> io::Result<Self> {
+        Ok(Self {
+            ip: crate::routes::ip_command()
+                .map_err(|_| io::Error::other("ip_command_unavailable"))?,
+        })
+    }
+}
+#[cfg(target_os = "linux")]
+impl LinuxNetworkCommands for NativeLinuxCommands {
+    fn ip(&mut self, args: &[String]) -> io::Result<String> {
+        let output = crate::process::output_with_timeout(
+            std::process::Command::new(&self.ip)
+                .args(args)
+                .env("LANG", "C")
+                .env("LC_ALL", "C"),
+            crate::process::COMMAND_TIMEOUT,
+        )?;
+        if !output.status.success() {
+            return Err(io::Error::other("linux_pair_network_command_failed"));
+        }
+        String::from_utf8(output.stdout).map_err(|_| invalid())
+    }
+    fn interface_name(&self, index: u32) -> io::Result<String> {
+        if index == 0 {
+            return Err(invalid());
+        }
+        let mut buffer = [0 as libc::c_char; libc::IF_NAMESIZE];
+        if unsafe { libc::if_indextoname(index, buffer.as_mut_ptr()) }.is_null() {
+            let error = io::Error::last_os_error();
+            return Err(
+                if matches!(error.raw_os_error(), Some(libc::ENXIO | libc::ENODEV)) {
+                    io::ErrorKind::NotFound.into()
+                } else {
+                    error
+                },
+            );
+        }
+        unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+            .to_str()
+            .map(str::to_string)
+            .map_err(|_| invalid())
+    }
+    fn interface_index(&self, name: &str) -> io::Result<u32> {
+        if !valid_name(name) {
+            return Err(invalid());
+        }
+        let name = std::ffi::CString::new(name).map_err(|_| invalid())?;
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if index == 0 {
+            let error = io::Error::last_os_error();
+            return Err(
+                if matches!(error.raw_os_error(), Some(libc::ENXIO | libc::ENODEV)) {
+                    io::ErrorKind::NotFound.into()
+                } else {
+                    error
+                },
+            );
+        }
+        Ok(index)
+    }
+}
+
+#[cfg(test)]
+mod tests;

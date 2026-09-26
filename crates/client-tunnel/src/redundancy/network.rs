@@ -30,16 +30,29 @@ pub struct DnsValue {
     pub servers: Vec<IpAddr>,
 }
 
+/// Linux RPDB selector for locally generated, device-bound probe sockets only.
+/// Never a general source rule or a catch-all rule for user traffic.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundRuleValue {
+    pub ipv6: bool,
+    pub priority: u32,
+    pub table: u32,
+    pub interface: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NetworkValue {
     Route(RouteValue),
     Dns(DnsValue),
+    BoundRule(BoundRuleValue),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum ResourceKey {
     Route(IpNet, RouteScope),
     Dns(String),
+    BoundRule { ipv6: bool, priority: u32 },
 }
 
 impl NetworkValue {
@@ -47,10 +60,17 @@ impl NetworkValue {
         match self {
             Self::Route(r) => ResourceKey::Route(r.destination, r.scope),
             Self::Dns(d) => ResourceKey::Dns(d.service.clone()),
+            Self::BoundRule(r) => ResourceKey::BoundRule {
+                ipv6: r.ipv6,
+                priority: r.priority,
+            },
         }
     }
     fn valid(&self) -> bool {
         match self {
+            Self::BoundRule(r) => {
+                r.interface != 0 && (1..32766).contains(&r.priority) && r.table > 255
+            }
             Self::Route(r) => {
                 r.interface != 0
                     && r.destination == r.destination.trunc()
@@ -204,7 +224,7 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
             } else {
                 let original = self.system.read(&value.key())?;
                 // DNS has a baseline to restore; pre-existing routes aren't ours.
-                if matches!(value, NetworkValue::Route(_)) && original.is_some() {
+                if !matches!(value, NetworkValue::Dns(_)) && original.is_some() {
                     return Err(conflict());
                 }
                 if original
@@ -306,7 +326,7 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
         for entry in &self.journal.owned {
             match self.system.read(&entry.current.key())? {
                 Some(value) if value == entry.current => next.owned.push(entry.clone()),
-                None if matches!(entry.current, NetworkValue::Route(_)) => {
+                None if !matches!(entry.current, NetworkValue::Dns(_)) => {
                     if matches!(&entry.current, NetworkValue::Route(r) if r.scope == RouteScope::Global)
                     {
                         next.active = None;
@@ -344,7 +364,7 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
             }
             // Lost links remove their routes automatically. Never recreate them
             // just to roll back an interrupted transition before Stop.
-            if current.is_none() && matches!(key, ResourceKey::Route(..)) {
+            if current.is_none() && !matches!(key, ResourceKey::Dns(..)) {
                 continue;
             }
             let known_before = before.map(|e| &e.current).or(original.as_ref());
@@ -413,7 +433,7 @@ fn validate_entries(entries: &[Entry]) -> io::Result<()> {
         if !entry.current.valid()
             || !keys.insert(entry.current.key())
             || entry.original.as_ref().is_some_and(|v| {
-                !v.valid() || v.key() != entry.current.key() || matches!(v, NetworkValue::Route(_))
+                !v.valid() || v.key() != entry.current.key() || !matches!(v, NetworkValue::Dns(_))
             })
         {
             return Err(invalid());
