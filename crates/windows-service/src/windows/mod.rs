@@ -4,6 +4,7 @@ mod defender_layout;
 mod elevation;
 mod install;
 mod ipc;
+pub mod member_metrics;
 mod ringlogger;
 mod routes;
 mod service;

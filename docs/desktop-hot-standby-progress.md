@@ -6,6 +6,32 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- Windows member telemetry now reads the addressed WireGuardNT1.1 adapter or
+ protected AmneziaWG UAPI pipe, never the global ringlogger. Capture requires
+ the engine's own Start PID/index; every sample checks SCM PID, process creation
+ time, interface index/LUID/alias before and after I/O. AWG also checks pipe
+ server PID; WG checks adapter LUID/state. Handshake must belong to the exact
+ expected peer and be no older than this member's Start; transport counters and
+ interface data counters remain separate. This is NOT wired to pair IPC yet.
+- Native configuration buffers are bounded/aligned/zeroized, with bounded NT
+ size retries. UAPI uses cancellable nonblocking I/O (1s metrics deadline),
+ framing/size checks and no blocking worker left behind on timeout. Errors do
+ not format configuration. Eleven portable tests cover decoders and I/O seams;
+ Windows target also type-checks that the health-read future is Send.
+- Verification: full offline Rust workspace exit0 (one pre-existing ignored
+ real-panel fixture), host Clippy-D warnings exit0; Windows MSVC check and
+ all-targets Clippy-D warnings exit0. Native Windows telemetry was NOT executed.
+ Source audit uses the actual AWG DLL root main.go/service.go, not the separate
+ tunnel/ package: its supplied name becomes the UAPI/interface name; fixed-GUID
+ mode still hashes that name, so different A/B names do not share one GUID.
+ Windows data-route/probe isolation, durable ownership and helper integration
+ remain; no capability/feature enablement, hardware/install/production changes.
+
+Windows sources: [pinned AWG DLL entry](https://github.com/amnezia-vpn/amneziawg-windows/blob/575626d8f8aa5b64114cf378a08e54bf852d909b/main.go),
+[actual DLL service](https://github.com/amnezia-vpn/amneziawg-windows/blob/575626d8f8aa5b64114cf378a08e54bf852d909b/service.go),
+[per-name GUID](https://github.com/amnezia-vpn/amneziawg-windows/blob/575626d8f8aa5b64114cf378a08e54bf852d909b/deterministicguid.go),
+[WG-NT1.1 ABI](https://github.com/WireGuard/wireguard-nt/blob/1.1/api/wireguard.h).
+
 - Linux pair route adapter now renders exact IPv4/IPv6 main data routes and
  separate per-member probe tables with device-bound `oif` RPDB rules. Rules are
  first-class owned journal resources, never an unjournaled companion command.
