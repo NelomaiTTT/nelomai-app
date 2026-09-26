@@ -27,6 +27,10 @@ permission to begin is required. This checkpoint is NOT feature completion.
  compilation boundaries and checking restored journal/scope values in fixtures.
  Host Unix library tests116pass after those changes. Tool source/checksum:
  [official Zig download index](https://ziglang.org/download/index.json).
+ Final complete Rust workspace run after all code edits: exit0, one existing
+ ignored real-panel fixture; host all-target Clippy-D warnings also exit0.
+ Logs: `continuation-final-workspace.log`, `continuation-final-clippy.log` in
+ this plan's ignored workspace. No full-feature completion or hardware claim.
 
 - Windows member telemetry now reads the addressed WireGuardNT1.1 adapter or
  protected AmneziaWG UAPI pipe, never the global ringlogger. Capture requires
@@ -72,9 +76,9 @@ Windows sources: [pinned AWG DLL entry](https://github.com/amnezia-vpn/amneziawg
 - This is still Task2, NOT complete Linux pair networking: resolver ownership,
  physical-policy discovery/retained routes, durable table/interface bindings,
  table allocation preflight and session integration remain. DNS explicitly
- returns Unsupported; no new capability/UI path is enabled. Constructor currently
- takes both proven member bindings; primary-first dynamic registration belongs
- to the forthcoming factory integration, not delayed primary startup.
+ returns Unsupported; no new capability/UI path is enabled. Incremental member
+ registration is now present (follow-up above); factory persistence/preflight
+ must connect it after each native Start without waiting for reserve.
 
 Linux references used for this stage:
 [iproute2 rule JSON](https://github.com/iproute2/iproute2/blob/main/ip/iprule.c),

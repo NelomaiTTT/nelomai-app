@@ -93,9 +93,12 @@ and failure accounting cannot be skipped. Slot enum A/B prevents invalid indexin
 Status: **in progress**, not complete. Low-level independently named member
 backends/SCM primitives, common route/DNS transactions, bound probes, Unix native
 composition and macOS physical policy discovery are implemented. Mac private
-pair factory and captured native identity cleanup recovery added. Engine wiring,
-Linux route/rule adapter and member-only loose RPF added; Linux resolver/factory,
-Windows network adapter/recovery, launch crash-gap handling and full lifecycle
+pair factory and captured native identity cleanup recovery added. Linux route/rule
+adapter and member-only loose RPF added, bound-rule resources connected to the
+session planner with primary-first registration. Addressed Windows NT/UAPI
+metrics added. Mac host, Windows MSVC and Linux GNU cross-checks now pass.
+Linux resolver/factory, Windows network adapter/recovery, launch crash-gap
+handling, engine wiring and full lifecycle
 integration still required before enabling this path. Same-VIP packet behavior
 is not proven by the fake tests.
 See `docs/desktop-hot-standby-progress.md` for evidence and remaining gates.
