@@ -330,10 +330,37 @@ struct NetworkState {
     fail_interface: Option<u32>,
     require_local_stop: Option<Arc<Mutex<Events>>>,
     bound_rules: bool,
+    link_dns: bool,
     fail_rule_interface: Option<u32>,
 }
 struct Network(Arc<Mutex<NetworkState>>);
 impl NetworkSystem for Network {
+    fn dns_resources(
+        &self,
+        interface: u32,
+        servers: &[std::net::IpAddr],
+        services: &[String],
+    ) -> io::Result<Vec<NetworkValue>> {
+        if self.0.lock().unwrap().link_dns {
+            Ok(vec![
+                NetworkValue::LinkDns(LinkDnsValue {
+                    interface,
+                    servers: servers.to_vec(),
+                }),
+                NetworkValue::LinkDnsRoute(interface),
+            ])
+        } else {
+            Ok(services
+                .iter()
+                .map(|service| {
+                    NetworkValue::Dns(DnsValue {
+                        service: service.clone(),
+                        servers: servers.to_vec(),
+                    })
+                })
+                .collect())
+        }
+    }
     fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {
         let state = self.0.lock().unwrap();
         if state
@@ -467,6 +494,44 @@ fn dns_config() -> ParsedConfiguration {
     let mut c = config();
     c.dns = vec!["9.9.9.9".parse().unwrap()];
     c
+}
+
+#[test]
+fn session_link_dns_follows_active_member_not_standby_creation() {
+    let (mut session, _, network) = network_setup();
+    network.lock().unwrap().link_dns = true;
+    let mut p = policy();
+    p.dns_services.clear(); // Linux has no physical DNS-service overrides.
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .unwrap();
+    let mut b = dns_config();
+    b.dns = vec!["77.88.8.8".parse().unwrap()];
+    session
+        .add_standby(&scope(), Slot::B, &b, probe(), physical())
+        .unwrap();
+    {
+        let state = network.lock().unwrap();
+        assert!(state.values.contains_key(&ResourceKey::LinkDnsRoute(10)));
+        assert!(!state.values.contains_key(&ResourceKey::LinkDns(20)));
+        assert!(!state.values.contains_key(&ResourceKey::LinkDnsRoute(20)));
+    }
+    session.select_active(&scope(), Slot::B).unwrap();
+    {
+        let state = network.lock().unwrap();
+        assert!(!state.values.contains_key(&ResourceKey::LinkDns(10)));
+        assert!(!state.values.contains_key(&ResourceKey::LinkDnsRoute(10)));
+        assert_eq!(
+            state.values.get(&ResourceKey::LinkDns(20)),
+            Some(&NetworkValue::LinkDns(LinkDnsValue {
+                interface: 20,
+                servers: b.dns
+            }))
+        );
+        assert!(state.values.contains_key(&ResourceKey::LinkDnsRoute(20)));
+    }
+    session.close(&scope()).unwrap();
+    assert_eq!(network.lock().unwrap().values.len(), 1); // untouched physical DNS.
 }
 
 #[test]

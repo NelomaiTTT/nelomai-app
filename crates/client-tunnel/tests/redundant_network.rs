@@ -76,6 +76,81 @@ fn bound_rule() -> NetworkValue {
     })
 }
 
+fn link_dns(interface: u32) -> Vec<NetworkValue> {
+    // Exercise the durable journal representation as well as ownership.
+    vec![
+        serde_json::from_value(serde_json::json!({"LinkDns": {
+            "interface": interface, "servers": ["9.9.9.9", "2620:fe::fe"]
+        }}))
+        .unwrap(),
+        serde_json::from_value(serde_json::json!({"LinkDnsRoute": interface})).unwrap(),
+    ]
+}
+
+#[test]
+fn link_dns_switch_failure_rolls_back_each_property_then_restart_can_clean() {
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, link_dns(10)).unwrap();
+    // Removing A's two properties, adding B's DNS, then failure adding B's domain.
+    owner.system_mut().fail_at = vec![6];
+    assert!(owner.select(Slot::B, link_dns(20)).is_err());
+    assert_eq!(owner.active(), Some(Slot::A));
+    assert!(!owner.cleanup_pending());
+    for value in link_dns(10) {
+        assert_eq!(owner.system_mut().read(&value.key()).unwrap(), Some(value));
+    }
+    for value in link_dns(20) {
+        assert_eq!(owner.system_mut().read(&value.key()).unwrap(), None);
+    }
+    let (system, store) = owner.into_parts();
+    let journal =
+        serde_json::from_str(&serde_json::to_string(store.saved.as_ref().unwrap()).unwrap())
+            .unwrap();
+    let mut recovered = NetworkOwner::recover(system, store, journal).unwrap();
+    recovered.cleanup().unwrap();
+    assert!(recovered.system_mut().values.is_empty());
+}
+
+#[test]
+fn link_dns_never_adopts_existing_properties_or_deletes_foreign_replacement() {
+    for value in link_dns(10) {
+        let mut system = System::default();
+        system
+            .values
+            .insert(format!("{:?}", value.key()), value.clone());
+        let mut owner = NetworkOwner::fresh(system, Journal::default());
+        assert!(owner.select(Slot::A, link_dns(10)).is_err());
+        assert_eq!(owner.system_mut().writes, 0);
+        owner.cleanup().unwrap();
+        assert_eq!(owner.system_mut().read(&value.key()).unwrap(), Some(value));
+    }
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, link_dns(10)).unwrap();
+    let foreign: NetworkValue = serde_json::from_value(serde_json::json!({"LinkDns": {
+        "interface": 10, "servers": ["77.88.8.8"]
+    }}))
+    .unwrap();
+    owner
+        .system_mut()
+        .values
+        .insert(format!("{:?}", foreign.key()), foreign.clone());
+    assert!(owner.cleanup().is_err());
+    assert_eq!(
+        owner.system_mut().read(&foreign.key()).unwrap(),
+        Some(foreign)
+    );
+}
+
+#[test]
+fn link_dns_disappeared_with_native_member_does_not_prevent_cleanup() {
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner.select(Slot::A, link_dns(10)).unwrap();
+    owner.system_mut().values.clear();
+    owner.cleanup().unwrap();
+    assert!(!owner.cleanup_pending());
+    assert_eq!(owner.system_mut().writes, 2);
+}
+
 #[test]
 fn preexisting_bound_rule_is_not_adopted_even_when_identical() {
     let rule = bound_rule();

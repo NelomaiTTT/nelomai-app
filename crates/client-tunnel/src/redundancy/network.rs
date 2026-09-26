@@ -30,6 +30,15 @@ pub struct DnsValue {
     pub servers: Vec<IpAddr>,
 }
 
+/// DNS on a session-owned link, never on the physical uplink. Unlike DnsValue,
+/// a preexisting value cannot be adopted. Empty means absence, not a baseline.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkDnsValue {
+    pub interface: u32,
+    pub servers: Vec<IpAddr>,
+}
+
 /// Linux RPDB selector for locally generated, device-bound probe sockets only.
 /// Never a general source rule or a catch-all rule for user traffic.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,6 +55,10 @@ pub enum NetworkValue {
     Route(RouteValue),
     Dns(DnsValue),
     BoundRule(BoundRuleValue),
+    LinkDns(LinkDnsValue),
+    /// Exactly the routing-only root domain (~.) on an owned link. Journal it
+    /// separately because resolved's DNS and Domains setters are not atomic.
+    LinkDnsRoute(u32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -53,6 +66,8 @@ pub enum ResourceKey {
     Route(IpNet, RouteScope),
     Dns(String),
     BoundRule { ipv6: bool, priority: u32 },
+    LinkDns(u32),
+    LinkDnsRoute(u32),
 }
 
 impl NetworkValue {
@@ -60,6 +75,8 @@ impl NetworkValue {
         match self {
             Self::Route(r) => ResourceKey::Route(r.destination, r.scope),
             Self::Dns(d) => ResourceKey::Dns(d.service.clone()),
+            Self::LinkDns(d) => ResourceKey::LinkDns(d.interface),
+            Self::LinkDnsRoute(i) => ResourceKey::LinkDnsRoute(*i),
             Self::BoundRule(r) => ResourceKey::BoundRule {
                 ipv6: r.ipv6,
                 priority: r.priority,
@@ -68,6 +85,17 @@ impl NetworkValue {
     }
     fn valid(&self) -> bool {
         match self {
+            Self::LinkDns(d) => {
+                d.interface != 0
+                    && d.interface <= i32::MAX as u32
+                    && !d.servers.is_empty()
+                    && d.servers.len() <= 16
+                    && d.servers
+                        .iter()
+                        .all(|s| !s.is_unspecified() && !s.is_multicast())
+                    && d.servers.iter().collect::<HashSet<_>>().len() == d.servers.len()
+            }
+            Self::LinkDnsRoute(i) => *i != 0 && *i <= i32::MAX as u32,
             Self::BoundRule(r) => {
                 r.interface != 0 && (1..32766).contains(&r.priority) && r.table > 255
             }
@@ -92,6 +120,24 @@ impl NetworkValue {
 }
 
 pub trait NetworkSystem {
+    /// Pure platform expansion for the active member only. An inactive reserve
+    /// must not acquire resolver ownership merely because its interface exists.
+    fn dns_resources(
+        &self,
+        _interface: u32,
+        servers: &[IpAddr],
+        services: &[String],
+    ) -> io::Result<Vec<NetworkValue>> {
+        Ok(services
+            .iter()
+            .map(|service| {
+                NetworkValue::Dns(DnsValue {
+                    service: service.clone(),
+                    servers: servers.to_vec(),
+                })
+            })
+            .collect())
+    }
     /// Read-only dependency check. Platforms may accept additional native
     /// metadata here (e.g. a kernel/DHCP route), but never in ownership CAS.
     fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {

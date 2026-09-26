@@ -7,8 +7,12 @@ struct Commands {
     calls: Vec<Vec<String>>,
     missing_b: bool,
     replaced_b: bool,
+    reused_b_index: bool,
 }
 impl LinuxNetworkCommands for Commands {
+    fn busctl(&mut self, args: &[String]) -> io::Result<String> {
+        self.ip(args)
+    }
     fn ip(&mut self, args: &[String]) -> io::Result<String> {
         self.calls.push(args.to_vec());
         let value = self.replies.pop_front().unwrap_or_default();
@@ -18,6 +22,9 @@ impl LinuxNetworkCommands for Commands {
         Ok(value)
     }
     fn interface_name(&self, index: u32) -> io::Result<String> {
+        if index == 20 && self.reused_b_index {
+            return Ok("foreign0".into());
+        }
         if index == 20 && (self.missing_b || self.replaced_b) {
             return Err(io::ErrorKind::NotFound.into());
         }
@@ -76,9 +83,439 @@ fn route(cidr: &str, scope: RouteScope, interface: u32) -> NetworkValue {
     })
 }
 
+fn dns_value(interface: u32) -> NetworkValue {
+    NetworkValue::LinkDns(LinkDnsValue {
+        interface,
+        servers: vec!["9.9.9.9".parse().unwrap(), "2620:fe::fe".parse().unwrap()],
+    })
+}
+const DNS: &str = r#"{"type":"a(iayqs)","data":[[2,[9,9,9,9],0,""],[10,[38,32,0,254,0,0,0,0,0,0,0,0,0,0,0,254],0,""]]}"#;
+const NO_DNS: &str = r#"{"type":"a(iayqs)","data":[]}"#;
+const DOMAIN: &str = r#"{"type":"a(sb)","data":[[".",true]]}"#;
+const NO_DOMAIN: &str = r#"{"type":"a(sb)","data":[]}"#;
+
+#[test]
+fn link_dns_reads_exact_ipv4_ipv6_and_root_domain_on_owned_link() {
+    let mut network = adapter(&[DNS, DOMAIN, NO_DNS, NO_DOMAIN]);
+    assert_eq!(
+        network.read(&ResourceKey::LinkDns(10)).unwrap(),
+        Some(dns_value(10))
+    );
+    assert_eq!(
+        network.read(&ResourceKey::LinkDnsRoute(10)).unwrap(),
+        Some(NetworkValue::LinkDnsRoute(10))
+    );
+    assert_eq!(network.read(&ResourceKey::LinkDns(20)).unwrap(), None);
+    assert_eq!(network.read(&ResourceKey::LinkDnsRoute(20)).unwrap(), None);
+    // sd_bus_path_encode escapes the first digit by its ASCII hex code.
+    assert!(network.commands.calls[0]
+        .iter()
+        .any(|s| s == "/org/freedesktop/resolve1/link/_310"));
+    assert!(network.commands.calls[2]
+        .iter()
+        .any(|s| s == "/org/freedesktop/resolve1/link/_320"));
+}
+
+#[test]
+fn link_dns_expansion_targets_owned_active_not_physical_service() {
+    let network = adapter(&[]);
+    let servers = vec!["9.9.9.9".parse().unwrap(), "2620:fe::fe".parse().unwrap()];
+    assert_eq!(
+        network.dns_resources(10, &servers, &[]).unwrap(),
+        vec![dns_value(10), NetworkValue::LinkDnsRoute(10)]
+    );
+    assert!(network.dns_resources(5, &servers, &[]).is_err());
+    assert!(network
+        .dns_resources(10, &servers, &["eth0".into()])
+        .is_err());
+    assert!(network.commands.calls.is_empty());
+}
+
+#[test]
+fn link_dns_rechecks_property_after_slow_resolver_preflight() {
+    let foreign = r#"{"type":"a(iayqs)","data":[[2,[77,88,8,8],0,""]]}"#;
+    let mut network = adapter(&[
+        NO_DNS,
+        r#"{"type":"s","data":"stub"}"#,
+        r#"{"type":"s","data":"yes"}"#,
+        foreign,
+    ]);
+    let value = dns_value(10);
+    assert!(network
+        .compare_exchange(&value.key(), None, Some(&value))
+        .is_err());
+    assert!(!network
+        .commands
+        .calls
+        .iter()
+        .flatten()
+        .any(|s| s == "SetLinkDNS"));
+}
+
+#[test]
+fn link_dns_rejects_foreign_domain_malformed_family_and_failed_query() {
+    for reply in [
+        r#"{"type":"a(iayqs)","data":[[2,[9,9,9,9],853,"dns.example"]]}"#,
+        r#"{"type":"a(iayqs)","data":[[2,[9,9,9,9],0,"dns.example"]]}"#,
+        r#"{"type":"a(iayqs)","data":[[2,[9,9,9,9],853,""]]}"#,
+        r#"{"type":"a(iayqs)","data":[[2,[9,9,9],0,""]]}"#,
+        r#"{"type":"a(iayqs)","data":[[2,[9,9,9,256],0,""]]}"#,
+        r#"{"type":"a(iayqs)","data":[[99,[9,9,9,9],0,""]]}"#,
+        r#"{"type":"a(iayqs)","data":[[2,[9,9,9,9],0,""],[2,[9,9,9,9],0,""]]}"#,
+        r#"{"type":"a(iayqs)","data":[[2,[0,0,0,0],0,""]]}"#,
+        r#"{"type":"a(sb)","data":[]}"#,
+        "command_failure",
+        "{}",
+    ] {
+        assert!(adapter(&[reply]).read(&ResourceKey::LinkDns(10)).is_err());
+    }
+    for reply in [
+        r#"{"type":"a(sb)","data":[[".",false]]}"#,
+        r#"{"type":"a(sb)","data":[["corp.example",true]]}"#,
+        r#"{"type":"a(sb)","data":[[".",true],["corp.example",true]]}"#,
+    ] {
+        assert!(adapter(&[reply])
+            .read(&ResourceKey::LinkDnsRoute(10))
+            .is_err());
+    }
+}
+
+#[test]
+fn link_dns_missing_member_is_absent_but_replacement_or_physical_link_is_not() {
+    let mut network = adapter(&[]);
+    network.commands.missing_b = true;
+    assert_eq!(network.read(&ResourceKey::LinkDns(20)).unwrap(), None);
+    assert_eq!(network.read(&ResourceKey::LinkDnsRoute(20)).unwrap(), None);
+    network.commands.reused_b_index = true;
+    assert!(network.read(&ResourceKey::LinkDns(20)).is_err());
+    network.commands.reused_b_index = false;
+    network.commands.missing_b = false;
+    network.commands.replaced_b = true;
+    assert!(network.read(&ResourceKey::LinkDns(20)).is_err());
+    assert!(network.read(&ResourceKey::LinkDns(5)).is_err());
+    assert!(network.commands.calls.is_empty());
+}
+
+#[test]
+fn link_dns_cas_sets_or_clears_only_one_property_and_never_reverts_link() {
+    let value = dns_value(10);
+    let mut network = adapter(&[
+        NO_DNS,
+        r#"{"type":"s","data":"stub"}"#,
+        r#"{"type":"s","data":"yes"}"#,
+        NO_DNS,
+        "",
+        DNS,
+        "",
+    ]);
+    network
+        .compare_exchange(&value.key(), None, Some(&value))
+        .unwrap();
+    network
+        .compare_exchange(&value.key(), Some(&value), None)
+        .unwrap();
+    let calls = &network.commands.calls;
+    let set = &calls[4];
+    assert_eq!(
+        &set[set.iter().position(|s| s == "SetLinkDNS").unwrap()..],
+        [
+            "SetLinkDNS",
+            "ia(iay)",
+            "10",
+            "2",
+            "2",
+            "4",
+            "9",
+            "9",
+            "9",
+            "9",
+            "10",
+            "16",
+            "38",
+            "32",
+            "0",
+            "254",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "254"
+        ]
+    );
+    let clear = calls.last().unwrap();
+    assert_eq!(
+        &clear[clear.len() - 4..],
+        ["SetLinkDNS", "ia(iay)", "10", "0"]
+    );
+    assert!(!calls
+        .iter()
+        .flatten()
+        .any(|s| s.contains("Revert") || s == "SetLinkDomains"));
+}
+
+#[test]
+fn link_domain_cas_clears_only_exact_root_route_and_refuses_foreign_change() {
+    let value = NetworkValue::LinkDnsRoute(10);
+    let mut network = adapter(&[
+        NO_DOMAIN,
+        r#"{"type":"s","data":"static"}"#,
+        r#"{"type":"s","data":"yes"}"#,
+        NO_DOMAIN,
+        "",
+        DOMAIN,
+        "",
+    ]);
+    network
+        .compare_exchange(&value.key(), None, Some(&value))
+        .unwrap();
+    network
+        .compare_exchange(&value.key(), Some(&value), None)
+        .unwrap();
+    let set = &network.commands.calls[4];
+    assert_eq!(
+        &set[set.len() - 6..],
+        ["SetLinkDomains", "ia(sb)", "10", "1", ".", "true"]
+    );
+    let clear = network.commands.calls.last().unwrap();
+    assert_eq!(
+        &clear[clear.len() - 4..],
+        ["SetLinkDomains", "ia(sb)", "10", "0"]
+    );
+    let mut network = adapter(&[r#"{"type":"a(sb)","data":[["corp.example",true]]}"#]);
+    assert!(network
+        .compare_exchange(&value.key(), Some(&value), None)
+        .is_err());
+    assert_eq!(network.commands.calls.len(), 1);
+}
+
+#[test]
+fn link_dns_requires_stub_resolver_but_cleanup_does_not_depend_on_mode() {
+    for mode in ["uplink", "foreign", "missing", "future"] {
+        let reply = format!(r#"{{"type":"s","data":"{mode}"}}"#);
+        let mut network = adapter(&[NO_DNS, &reply]);
+        let value = dns_value(10);
+        assert!(network
+            .compare_exchange(&value.key(), None, Some(&value))
+            .is_err());
+        assert!(!network
+            .commands
+            .calls
+            .iter()
+            .flatten()
+            .any(|s| s == "SetLinkDNS"));
+    }
+    for listener in ["no", "udp", "tcp"] {
+        let reply = format!(r#"{{"type":"s","data":"{listener}"}}"#);
+        let mut network = adapter(&[NO_DNS, r#"{"type":"s","data":"stub"}"#, &reply]);
+        let value = dns_value(10);
+        assert!(network
+            .compare_exchange(&value.key(), None, Some(&value))
+            .is_err());
+    }
+    let value = dns_value(10);
+    let mut network = adapter(&[DNS, ""]);
+    network
+        .compare_exchange(&value.key(), Some(&value), None)
+        .unwrap();
+    assert_eq!(network.commands.calls.len(), 2);
+}
+
+#[test]
+fn resolved_property_failure_flows_through_real_adapter_journal_and_recovery() {
+    use nelomai_client_tunnel::redundancy::Slot;
+    use std::collections::{HashMap, HashSet};
+    #[derive(Default)]
+    struct Resolved {
+        dns: HashMap<u32, Vec<Value>>,
+        domains: HashSet<u32>,
+        failed: bool,
+        partial_failure: bool,
+    }
+    impl LinuxNetworkCommands for Resolved {
+        fn ip(&mut self, _: &[String]) -> io::Result<String> {
+            panic!("DNS must not issue route commands")
+        }
+        fn interface_name(&self, i: u32) -> io::Result<String> {
+            Commands::default().interface_name(i)
+        }
+        fn interface_index(&self, name: &str) -> io::Result<u32> {
+            Commands::default().interface_index(name)
+        }
+        fn busctl(&mut self, args: &[String]) -> io::Result<String> {
+            assert_eq!(args[1], "org.freedesktop.resolve1");
+            if args[0] == "get-property" {
+                let (signature, data) = match args[4].as_str() {
+                    "ResolvConfMode" => ("s", serde_json::json!("stub")),
+                    "DNSStubListener" => ("s", serde_json::json!("yes")),
+                    property => {
+                        let i = match args[2].as_str() {
+                            "/org/freedesktop/resolve1/link/_310" => 10,
+                            "/org/freedesktop/resolve1/link/_320" => 20,
+                            _ => panic!("unexpected link path"),
+                        };
+                        match property {
+                            "DNSEx" => (
+                                "a(iayqs)",
+                                serde_json::json!(self.dns.get(&i).cloned().unwrap_or_default()),
+                            ),
+                            "Domains" => (
+                                "a(sb)",
+                                if self.domains.contains(&i) {
+                                    serde_json::json!([[".", true]])
+                                } else {
+                                    serde_json::json!([])
+                                },
+                            ),
+                            _ => panic!("unexpected property"),
+                        }
+                    }
+                };
+                return Ok(serde_json::json!({"type":signature,"data":data}).to_string());
+            }
+            assert_eq!(args[0], "call");
+            assert_eq!(args[2], "/org/freedesktop/resolve1");
+            let i = args[6].parse::<u32>().unwrap();
+            let count = args[7].parse::<usize>().unwrap();
+            match args[4].as_str() {
+                "SetLinkDNS" => {
+                    assert_eq!(args[5], "ia(iay)");
+                    let mut cursor = 8;
+                    let mut values = Vec::new();
+                    for _ in 0..count {
+                        let family = args[cursor].parse::<u32>().unwrap();
+                        let len = args[cursor + 1].parse::<usize>().unwrap();
+                        let bytes = args[cursor + 2..cursor + 2 + len]
+                            .iter()
+                            .map(|s| s.parse::<u8>().unwrap())
+                            .collect::<Vec<_>>();
+                        values.push(serde_json::json!([family, bytes, 0, ""]));
+                        cursor += 2 + len;
+                    }
+                    assert_eq!(cursor, args.len());
+                    self.dns.insert(i, values);
+                }
+                "SetLinkDomains" => {
+                    assert_eq!(args[5], "ia(sb)");
+                    assert!(count <= 1);
+                    if i == 20 && count == 1 && !self.failed {
+                        self.failed = true;
+                        // Test both failure-before-side-effect and lost ACK after
+                        // the property actually changed; journal must inspect.
+                        if self.partial_failure {
+                            self.domains.insert(i);
+                        }
+                        return Err(io::Error::other("injected domain failure"));
+                    }
+                    if count == 0 {
+                        self.domains.remove(&i);
+                    } else {
+                        assert_eq!(&args[8..], [".", "true"]);
+                        self.domains.insert(i);
+                    }
+                }
+                _ => panic!("unexpected mutation"),
+            }
+            Ok(String::new())
+        }
+    }
+    #[derive(Default)]
+    struct Journal(Option<NetworkJournal>);
+    impl NetworkJournalStore for Journal {
+        fn save(&mut self, value: &NetworkJournal) -> io::Result<()> {
+            self.0 = Some(value.clone());
+            Ok(())
+        }
+    }
+    for partial_failure in [false, true] {
+        let network = LinuxNetwork::new(
+            Resolved {
+                partial_failure,
+                ..Default::default()
+            },
+            adapter(&[]).members,
+        )
+        .unwrap();
+        let mut owner = NetworkOwner::fresh(network, Journal::default());
+        owner
+            .select(Slot::A, vec![dns_value(10), NetworkValue::LinkDnsRoute(10)])
+            .unwrap();
+        assert!(owner
+            .select(Slot::B, vec![dns_value(20), NetworkValue::LinkDnsRoute(20)])
+            .is_err());
+        assert_eq!(owner.active(), Some(Slot::A));
+        assert!(!owner.cleanup_pending());
+        assert_eq!(
+            owner.system_mut().read(&ResourceKey::LinkDns(10)).unwrap(),
+            Some(dns_value(10))
+        );
+        assert_eq!(
+            owner
+                .system_mut()
+                .read(&ResourceKey::LinkDnsRoute(10))
+                .unwrap(),
+            Some(NetworkValue::LinkDnsRoute(10))
+        );
+        assert_eq!(
+            owner.system_mut().read(&ResourceKey::LinkDns(20)).unwrap(),
+            None
+        );
+        assert_eq!(
+            owner
+                .system_mut()
+                .read(&ResourceKey::LinkDnsRoute(20))
+                .unwrap(),
+            None
+        );
+        let (system, store) = owner.into_parts();
+        let state = store.0.clone().unwrap();
+        let mut recovered = NetworkOwner::recover(system, store, state).unwrap();
+        recovered.cleanup().unwrap();
+        assert!(recovered.system_mut().commands.domains.is_empty());
+        assert!(recovered
+            .system_mut()
+            .commands
+            .dns
+            .values()
+            .all(Vec::is_empty));
+    }
+}
+
 const PHYSICAL_LINKS: &str = r#"[{"ifindex":5,"ifname":"eth0","flags":["UP","LOWER_UP"],"link_type":"ether"},{"ifindex":10,"ifname":"nlm-wga","flags":["UP"],"link_type":"none","linkinfo":{"info_kind":"wireguard"}}]"#;
 const MAIN_RULES: &str = r#"[{"priority":0,"src":"all","table":"255"},{"priority":32766,"src":"all","table":"254"},{"priority":32767,"src":"all","table":"253"}]"#;
 const PHYSICAL_V4: &str = r#"[{"dst":"default","dev":"nlm-wga","gateway":"10.0.0.1","protocol":"4","flags":[]},{"dst":"default","dev":"eth0","gateway":"192.168.1.1","protocol":"16","metric":100,"flags":[]},{"dst":"192.168.1.0/24","dev":"eth0","protocol":"2","scope":"link","prefsrc":"192.168.1.4","metric":100,"flags":[]}]"#;
+
+#[test]
+fn full_linux_policy_checks_stub_before_start_and_uses_no_physical_dns_override() {
+    let mut network = adapter(&[
+        r#"{"type":"s","data":"stub"}"#,
+        r#"{"type":"s","data":"yes"}"#,
+        PHYSICAL_LINKS,
+        MAIN_RULES,
+        PHYSICAL_V4,
+    ]);
+    let p = network
+        .resolve_policy(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+        .unwrap();
+    assert!(p.dns_services.is_empty());
+    assert_eq!(p.metric, 42);
+    assert_eq!(p.bypasses.len(), 1);
+    assert_eq!(p.bypasses[0].interface, 5);
+    assert!(network.commands.calls.iter().all(|c| !c
+        .iter()
+        .any(|s| matches!(s.as_str(), "add" | "del" | "call"))));
+    let mut unsupported = adapter(&[r#"{"type":"s","data":"foreign"}"#]);
+    assert!(unsupported
+        .resolve_policy(&Default::default(), &["198.51.100.1".parse().unwrap()], &[])
+        .is_err());
+    assert_eq!(unsupported.commands.calls.len(), 1);
+}
 
 #[test]
 fn physical_discovery_never_ignores_a_deviceless_policy_route() {

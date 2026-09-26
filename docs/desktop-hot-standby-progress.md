@@ -6,6 +6,36 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- Linux pair DNS now uses systemd-resolved **owned VPN link** properties through
+  the same session NetworkOwner journal. DNS servers and routing-only root domain
+  are separate records/setters; standby creation does not acquire DNS, promotion
+  transfers it, and Stop never resets physical/global DNS or calls RevertLink.
+  Full DNSEx reads preserve foreign port/SNI by rejecting rather than flattening
+  them. Foreign domains, ambiguous values and replaced interface name/index fail
+  closed. A deleted owned link's DNS is already absent, not a reason to recreate it.
+- Read-only Linux resolve_policy now combines physical routes with resolved
+  preflight before member launch. Only stub/static resolv.conf with UDP+TCP stub
+  is supported in this adapter; uplink/foreign/missing modes and openresolv are
+  explicitly unsupported, not silently accepted. Native factory still absent.
+  Cleanup does not depend on the resolver remaining in a usable stub mode.
+- Added14 tests: shared journal rollback/restart/absence, real SessionNetwork
+  A-only DNS then promotion/Stop, Linux DNSEx parsing and exact scoped writes,
+  resolver compatibility, native identity reuse, full read-only policy, real
+  adapter+journal lost-ACK/failure rollback. Own review caught/fixed numeric DBus
+  path encoding and stale property observation across slow manager preflight;
+  both have failing-then-passing regressions. Native I/O is fake in tests.
+  Final offline Rust workspace exit0; host/Linux aarch64/Windows MSVC all-target
+  Clippy-D warnings exit0. One pre-existing real-panel fixture remains ignored.
+  Logs in plan workspace: dns-final-workspace.log, dns-final-clippy.log,
+  dns-final-linux-clippy.log, dns-windows-clippy.log. No capability enabled.
+
+DNS API/fixture references (primary systemd v257 source):
+[resolve1 interface](https://raw.githubusercontent.com/systemd/systemd/v257/man/org.freedesktop.resolve1.xml),
+[link setters](https://raw.githubusercontent.com/systemd/systemd/v257/src/resolve/resolved-link-bus.c),
+[DNSEx serialization](https://raw.githubusercontent.com/systemd/systemd/v257/src/resolve/resolved-bus.c),
+[busctl JSON](https://raw.githubusercontent.com/systemd/systemd/v257/src/busctl/busctl.c),
+[object-path escaping](https://raw.githubusercontent.com/systemd/systemd/v257/src/basic/bus-label.c).
+
 - Shared probe scheduler now also checks healthy-primary standby: immediate
   first probe, then5s from completion,15s after three consecutive successes;
   failed/expired probe resets warmup. This cadence does NOT grant Ready without
@@ -211,7 +241,8 @@ Partial-stage parent review only; full feature review and hardware proof remain.
 ## Remaining, not hidden behind a capability flag
 
 - Task2 connect the Mac factory to engine lifecycle; finish durable member lifecycle;
- Linux resolver/binding allocation and recovery/factory; Windows data-route and
+ Linux binding allocation and durable recovery/factory (resolved adapter now
+ implemented; other resolver modes unsupported); Windows data-route and
  probe isolation, resolver/recovery/factory remain. Windows addressed metrics
  and Linux physical route discovery are implemented above, not remaining tasks.
  Verify same-VIP behavior and socket egress per OS.

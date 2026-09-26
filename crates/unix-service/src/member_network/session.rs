@@ -268,12 +268,18 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             );
         }
         if !self.dns[index(active)].is_empty() {
-            values.extend(policy.dns_services.iter().map(|service| {
-                NetworkValue::Dns(DnsValue {
-                    service: service.clone(),
-                    servers: self.dns[index(active)].clone(),
-                })
-            }));
+            let interface = self
+                .members
+                .view(active)
+                .ok_or(ServiceError::InvalidRequest)?
+                .routes
+                .interface;
+            values.extend(
+                self.network
+                    .system_mut()
+                    .dns_resources(interface, &self.dns[index(active)], &policy.dns_services)
+                    .map_err(network_error)?,
+            );
         }
         Ok(values)
     }

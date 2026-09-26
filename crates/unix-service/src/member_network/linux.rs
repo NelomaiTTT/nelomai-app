@@ -6,11 +6,15 @@ use nelomai_client_tunnel::redundancy::network::*;
 use serde_json::{Map, Value};
 use std::{io, net::IpAddr};
 
+mod dns;
 mod physical;
 pub use physical::PhysicalRoutes;
 
 pub trait LinuxNetworkCommands {
     fn ip(&mut self, args: &[String]) -> io::Result<String>;
+    fn busctl(&mut self, _args: &[String]) -> io::Result<String> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     fn interface_name(&self, index: u32) -> io::Result<String>;
     fn interface_index(&self, name: &str) -> io::Result<u32>;
 }
@@ -31,6 +35,22 @@ pub struct LinuxNetwork<C> {
 }
 
 impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
+    /// Read-only preflight before any member launch or route mutation.
+    pub fn resolve_policy(
+        &mut self,
+        options: &nelomai_client_tunnel::DesktopTunnelOptions,
+        endpoints: &[IpAddr],
+        owned: &[IpNet],
+    ) -> io::Result<super::session::NetworkPolicy> {
+        self.verify_resolver()?;
+        let physical = self.resolve_physical_routes(options, endpoints, owned)?;
+        Ok(super::session::NetworkPolicy {
+            bypasses: physical.bypasses,
+            retained_routes: physical.retained_routes,
+            dns_services: Vec::new(),
+            metric: 42,
+        })
+    }
     pub fn new(commands: C, members: impl IntoIterator<Item = MemberTable>) -> io::Result<Self> {
         let mut result = Self {
             commands,
@@ -343,6 +363,27 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
 }
 
 impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
+    fn dns_resources(
+        &self,
+        interface: u32,
+        servers: &[IpAddr],
+        services: &[String],
+    ) -> io::Result<Vec<NetworkValue>> {
+        self.member(interface)?;
+        if !services.is_empty() {
+            return Err(invalid());
+        }
+        if servers.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![
+            NetworkValue::LinkDns(LinkDnsValue {
+                interface,
+                servers: servers.to_vec(),
+            }),
+            NetworkValue::LinkDnsRoute(interface),
+        ])
+    }
     fn verify_retained_route(&mut self, route: &RouteValue) -> io::Result<bool> {
         if route.scope != RouteScope::Global {
             return Err(invalid());
@@ -362,6 +403,7 @@ impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
         match key {
             ResourceKey::Route(destination, scope) => self.read_route(*destination, *scope),
             ResourceKey::BoundRule { ipv6, priority } => self.read_rule(*ipv6, *priority),
+            ResourceKey::LinkDns(_) | ResourceKey::LinkDnsRoute(_) => self.read_link_dns(key),
             ResourceKey::Dns(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "pair_dns_not_connected",
@@ -374,6 +416,9 @@ impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
         before: Option<&NetworkValue>,
         after: Option<&NetworkValue>,
     ) -> io::Result<()> {
+        if matches!(key, ResourceKey::LinkDns(_) | ResourceKey::LinkDnsRoute(_)) {
+            return self.compare_link_dns(key, before, after);
+        }
         for value in [before, after].into_iter().flatten() {
             if value.key() != *key {
                 return Err(invalid());
@@ -475,6 +520,35 @@ impl NativeLinuxCommands {
 }
 #[cfg(target_os = "linux")]
 impl LinuxNetworkCommands for NativeLinuxCommands {
+    fn busctl(&mut self, args: &[String]) -> io::Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        let program = ["/usr/bin/busctl", "/bin/busctl"]
+            .into_iter()
+            .find(|path| {
+                std::fs::metadata(path).is_ok_and(|m| {
+                    m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0 && m.mode() & 0o111 != 0
+                })
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "busctl_unavailable"))?;
+        let output = crate::process::output_with_timeout(
+            std::process::Command::new(program)
+                .args([
+                    "--system",
+                    "--no-pager",
+                    "--json=short",
+                    "--timeout=5",
+                    "--allow-interactive-authorization=no",
+                ])
+                .args(args)
+                .env("LANG", "C")
+                .env("LC_ALL", "C"),
+            crate::process::COMMAND_TIMEOUT,
+        )?;
+        if !output.status.success() {
+            return Err(io::Error::other("linux_pair_resolver_command_failed"));
+        }
+        String::from_utf8(output.stdout).map_err(|_| invalid())
+    }
     fn ip(&mut self, args: &[String]) -> io::Result<String> {
         let output = crate::process::output_with_timeout(
             std::process::Command::new(&self.ip)
