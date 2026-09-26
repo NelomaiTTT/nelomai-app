@@ -39,20 +39,21 @@ fn timeout_is_reported_once_and_no_slot_has_two_live_probes() {
     schedule.set_standby_available(true);
     let first = schedule.poll(0).started[0];
     assert!(schedule.poll(500).started.is_empty());
-    let batch = schedule.poll(1000);
+    let batch = schedule.poll(2000);
     assert_eq!(batch.timed_out, vec![first]);
-    assert_eq!(batch.started.len(), 1);
-    assert_eq!(batch.started[0].slot(), Slot::B);
-    assert!(!schedule.complete(first, true, 1000));
-    assert!(schedule.poll(1001).timed_out.is_empty());
+    assert_eq!(batch.started.len(), 2);
+    assert_eq!(batch.started[0].slot(), Slot::A);
+    assert_eq!(batch.started[1].slot(), Slot::B);
+    assert!(!schedule.complete(first, true, 2000));
+    assert!(schedule.poll(2001).timed_out.is_empty());
 }
 
 #[test]
 fn expired_success_is_not_accepted_before_timeout_poll() {
     let mut schedule = ProbeSchedule::new(Slot::A, 0);
     let first = schedule.poll(0).started[0];
-    assert!(!schedule.complete(first, true, 1000));
-    assert_eq!(schedule.poll(1000).timed_out, vec![first]);
+    assert!(!schedule.complete(first, true, 2000));
+    assert_eq!(schedule.poll(2000).timed_out, vec![first]);
 }
 
 #[test]
@@ -122,4 +123,14 @@ fn ticket_from_another_session_cannot_complete_a_probe() {
     let current = second.poll(0).started[0];
     assert!(!second.complete(old, true, 100));
     assert!(second.complete(current, true, 100));
+}
+
+#[test]
+fn ordinary_probe_keeps_android_two_second_response_budget() {
+    let mut schedule = ProbeSchedule::new(Slot::A, 0);
+    let probe = schedule.poll(0).started[0];
+    assert!(schedule.poll(1_000).timed_out.is_empty());
+    assert!(schedule.complete(probe, true, 1_500));
+    assert!(schedule.poll(1_999).started.is_empty());
+    assert_eq!(schedule.poll(2_000).started[0].slot(), Slot::A);
 }

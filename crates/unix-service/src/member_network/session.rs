@@ -13,6 +13,8 @@ use std::{collections::HashSet, net::IpAddr};
 #[derive(Clone, Debug)]
 pub struct NetworkPolicy {
     pub bypasses: Vec<RouteValue>,
+    /// Existing physical LAN routes: verify but never adopt/mutate/clean them.
+    pub retained_routes: Vec<RouteValue>,
     pub dns_services: Vec<String>,
     pub metric: u32,
 }
@@ -76,7 +78,8 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         }
         self.members.validate_start(scope, slot, config, &probe)?;
         validate_policy(&policy)?;
-        let endpoint = validate_endpoint(config, &policy.bypasses)?;
+        self.verify_retained(&policy)?;
+        let endpoint = validate_endpoint(config, &policy.bypasses, &policy.retained_routes)?;
         validate_dns(&config.dns)?;
         self.network
             .prepare(
@@ -111,19 +114,30 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             return Err(fenced());
         }
         self.members.validate_start(scope, slot, config, &probe)?;
-        let endpoint = validate_endpoint(config, std::slice::from_ref(&endpoint_bypass))?;
+        let endpoint = validate_endpoint(config, std::slice::from_ref(&endpoint_bypass), &[])?;
         validate_dns(&config.dns)?;
         let mut next = self.policy.clone().ok_or_else(fenced)?;
         if let Some(old) = next
             .bypasses
             .iter()
+            .chain(&next.retained_routes)
             .find(|r| r.destination == endpoint_bypass.destination)
         {
             if old != &endpoint_bypass {
                 return Err(ServiceError::InvalidRequest);
             }
         } else {
-            next.bypasses.push(endpoint_bypass);
+            let value = NetworkValue::Route(endpoint_bypass.clone());
+            match self
+                .network
+                .system_mut()
+                .read(&value.key())
+                .map_err(network_error)?
+            {
+                None => next.bypasses.push(endpoint_bypass),
+                Some(current) if current == value => next.retained_routes.push(endpoint_bypass),
+                _ => return Err(ServiceError::Backend("physical_route_changed".into())),
+            }
         }
         validate_policy(&next)?;
         let values = self.values(active, &next)?;
@@ -140,7 +154,8 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
     pub fn select_active(&mut self, scope: &SessionScope, slot: Slot) -> Result<(), ServiceError> {
         self.check(scope)?;
         self.members.check_live(scope, slot)?;
-        let values = self.values(slot, self.policy.as_ref().ok_or_else(fenced)?)?;
+        let policy = self.policy.clone().ok_or_else(fenced)?;
+        let values = self.values(slot, &policy)?;
         self.network.select(slot, values).map_err(network_error)
     }
 
@@ -153,12 +168,10 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
     ) -> Result<(), ServiceError> {
         self.check(scope)?;
         validate_policy(&policy)?;
-        if self
-            .endpoints
-            .iter()
-            .flatten()
-            .any(|endpoint| !has_endpoint(*endpoint, &policy.bypasses))
-        {
+        if self.endpoints.iter().flatten().any(|endpoint| {
+            !has_endpoint(*endpoint, &policy.bypasses)
+                && !has_endpoint(*endpoint, &policy.retained_routes)
+        }) {
             return Err(ServiceError::InvalidRequest);
         }
         let active = self.active().ok_or_else(fenced)?;
@@ -181,10 +194,11 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
     }
 
     fn values(
-        &self,
+        &mut self,
         active: Slot,
         policy: &NetworkPolicy,
     ) -> Result<Vec<NetworkValue>, ServiceError> {
+        self.verify_retained(policy)?;
         let members = [Slot::A, Slot::B]
             .into_iter()
             .filter_map(|slot| {
@@ -198,6 +212,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         if policy
             .bypasses
             .iter()
+            .chain(&policy.retained_routes)
             .any(|r| members.iter().any(|m| m.interface == r.interface))
         {
             return Err(ServiceError::InvalidRequest);
@@ -205,6 +220,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         let exclusions = policy
             .bypasses
             .iter()
+            .chain(&policy.retained_routes)
             .map(|r| r.destination)
             .collect::<Vec<_>>();
         let routes = member_route_plan(active, &members, &exclusions, policy.metric)
@@ -225,6 +241,21 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             }));
         }
         Ok(values)
+    }
+    fn verify_retained(&mut self, policy: &NetworkPolicy) -> Result<(), ServiceError> {
+        for route in &policy.retained_routes {
+            let value = NetworkValue::Route(route.clone());
+            if self
+                .network
+                .system_mut()
+                .read(&value.key())
+                .map_err(network_error)?
+                != Some(value)
+            {
+                return Err(ServiceError::Backend("physical_route_changed".into()));
+            }
+        }
+        Ok(())
     }
     fn check(&self, scope: &SessionScope) -> Result<(), ServiceError> {
         if &self.scope != scope {
@@ -251,6 +282,7 @@ fn network_error(_: std::io::Error) -> ServiceError {
 fn validate_endpoint(
     config: &ParsedConfiguration,
     bypasses: &[RouteValue],
+    retained: &[RouteValue],
 ) -> Result<IpAddr, ServiceError> {
     let endpoint = config
         .peers
@@ -262,7 +294,7 @@ fn validate_endpoint(
         .map_err(|_| ServiceError::InvalidConfiguration)?;
     // Native adapter must pin a resolved address in the member configuration;
     // otherwise DNS rotation could send encrypted packets through the other VPN.
-    if !has_endpoint(endpoint, bypasses) {
+    if !has_endpoint(endpoint, bypasses) && !has_endpoint(endpoint, retained) {
         return Err(ServiceError::InvalidRequest);
     }
     Ok(endpoint)
@@ -274,16 +306,24 @@ fn has_endpoint(endpoint: IpAddr, bypasses: &[RouteValue]) -> bool {
 }
 fn validate_policy(policy: &NetworkPolicy) -> Result<(), ServiceError> {
     let mut seen = HashSet::new();
-    if policy.bypasses.len() > 16384
+    if policy
+        .bypasses
+        .len()
+        .saturating_add(policy.retained_routes.len())
+        > 16384
         || policy.dns_services.len() > 64
-        || policy.bypasses.iter().any(|r| {
-            r.interface == 0
-                || r.scope != RouteScope::Global
-                || r.destination != r.destination.trunc()
-                || r.gateway
-                    .is_some_and(|g| g.is_ipv4() != r.destination.addr().is_ipv4())
-                || !seen.insert(r.destination)
-        })
+        || policy
+            .bypasses
+            .iter()
+            .chain(&policy.retained_routes)
+            .any(|r| {
+                r.interface == 0
+                    || r.scope != RouteScope::Global
+                    || r.destination != r.destination.trunc()
+                    || r.gateway
+                        .is_some_and(|g| g.is_ipv4() != r.destination.addr().is_ipv4())
+                    || !seen.insert(r.destination)
+            })
     {
         return Err(ServiceError::InvalidRequest);
     }

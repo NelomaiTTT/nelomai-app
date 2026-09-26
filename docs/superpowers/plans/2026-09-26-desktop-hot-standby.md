@@ -79,7 +79,9 @@ and failure accounting cannot be skipped. Slot enum A/B prevents invalid indexin
 - [x] Step4: Write probe scheduler tests: primary@0, standby@1000 after failure,
   primary@2000, standby@3000; no concurrent probe per slot; cancel/fence on network
   change/promotion/Stop; late/duplicate/forged tickets ignored. Expire a probe at
-  1000ms as failure; never catch up by launching an unbounded batch after sleep.
+  2000ms as failure; never catch up by launching an unbounded batch after sleep.
+  Correction during Task2 integration: the earlier1000ms expiry confused the
+  standby phase with Android's2000ms DNS response budget. Preserve that budget.
 - [x] Step5: RED then implement probes.rs. Primary period2000ms; suspect standby
   phase1000ms; no standby probe without installed slot. Completed primary success
   ends suspicion, but does not counterfeit/cancel delivered standby evidence.
@@ -89,9 +91,11 @@ and failure accounting cannot be skipped. Slot enum A/B prevents invalid indexin
 ### Task 2: Platform slot/data-route ownership
 
 Status: **in progress**, not complete. Low-level independently named member
-backends/SCM primitives and side-effect separation are implemented. Common
-route/DNS transactions, bound probes, same-VIP verification, durable resource
-recovery and full lifecycle tests still required before enabling this path.
+backends/SCM primitives, common route/DNS transactions, bound probes, Unix native
+composition and macOS physical policy discovery are implemented. Native factory,
+Linux/Windows network adapters, durable member recovery and full lifecycle
+integration still required before enabling this path. Same-VIP packet behavior
+is not proven by the fake tests.
 See `docs/desktop-hot-standby-progress.md` for evidence and remaining gates.
 
 **Files:** Existing Unix/Windows backend/routes/install modules; create each platform's `redundancy.rs` adapter and fake route/process tests adjacent to platform modules.

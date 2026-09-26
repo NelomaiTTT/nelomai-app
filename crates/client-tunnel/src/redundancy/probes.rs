@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const PERIOD_MS: u64 = 2_000;
 const PHASE_MS: u64 = 1_000;
-const TIMEOUT_MS: u64 = 1_000;
+// Same response budget as Android. The one-second standby phase is not a
+// one-second DNS timeout; slow-but-valid replies must not create false failures.
+const TIMEOUT_MS: u64 = 2_000;
 // Tickets are process-local, never persisted. A new helper process has no live
 // callback from an old process. Across sessions in one helper they never repeat.
 static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);

@@ -6,6 +6,16 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- macOS read-only physical policy discovery now selects the physical gateway,
+ keeps both outer endpoints outside the VPN, preserves existing LAN/endpoint
+ routes as verified but unowned dependencies, and handles IPv6 link-local gateway
+ zones. Unneeded IPv6 default ambiguity cannot block IPv4 endpoints. No native
+ policy discovery or application was executed against this Mac in tests.
+- Corrected a plan/implementation mismatch: DNS response budget is Android's
+ 2 seconds, not the 1-second standby phase. A 1.5-second reply regression was
+ first RED then GREEN. Healthy standby warmup/ready scheduling is still pending
+ in the actual health driver and must not be represented as complete parity.
+
 - SessionMembers now fences runtime/session/Start generation, rejects single
  backends and mismatched IPv4/IPv6 VIPs, verifies captured native interface
  identities before metrics/probes/rebind, retains partial-start cleanup and
@@ -56,7 +66,7 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Remaining, not hidden behind a capability flag
 
-- Task2 finish native policy discovery/factory and durable member lifecycle;
+- Task2 connect the native factory and durable member lifecycle;
  Linux/Windows network adapters and per-member
  Windows metrics still needed. Verify same-VIP behavior and socket egress per OS.
  The panel gives both members the same configured DNS health target, not a
@@ -74,6 +84,11 @@ permission to begin is required. This checkpoint is NOT feature completion.
  whole-feature review; later authorized native packet/hardware tests.
 
 ## Verification
+
+Latest follow-up: **224 tests passed** in client-tunnel + Unix/Windows services;
+host Clippy `-D warnings`, `git diff --check`, Windows MSVC check passed. No Linux
+native build, host network/Keychain/production mutation or hardware validation.
+The two local implementation commits after3d4ba6e are not whole-feature completion.
 
 Latest continuation: **214 tests passed** in client-tunnel + Unix/Windows
 services, host Clippy `-D warnings` and Windows MSVC check passed. Includes

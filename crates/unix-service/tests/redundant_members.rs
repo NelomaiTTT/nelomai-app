@@ -325,6 +325,7 @@ fn physical() -> RouteValue {
 fn policy() -> NetworkPolicy {
     NetworkPolicy {
         bypasses: vec![physical()],
+        retained_routes: vec![],
         dns_services: vec!["Wi-Fi".into()],
         metric: 0,
     }
@@ -534,4 +535,77 @@ fn non_running_rebind_result_is_not_reported_as_success() {
         events.lock().unwrap().calls,
         ["start A", "start B", "rebind A", "rebind B"]
     );
+}
+
+#[test]
+fn existing_lan_route_is_verified_but_not_adopted_or_deleted_by_session() {
+    let (mut session, _, network) = network_setup();
+    let lan = RouteValue {
+        destination: "192.168.1.0/24".parse().unwrap(),
+        scope: RouteScope::Global,
+        interface: 5,
+        gateway: None,
+        metric: 0,
+    };
+    let value = NetworkValue::Route(lan.clone());
+    network
+        .lock()
+        .unwrap()
+        .values
+        .insert(value.key(), value.clone());
+    let mut p = policy();
+    p.retained_routes.push(lan);
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .unwrap();
+    assert!(!network.lock().unwrap().writes.contains(&value.key()));
+    session.close(&scope()).unwrap();
+    assert_eq!(
+        network.lock().unwrap().values.get(&value.key()),
+        Some(&value)
+    );
+}
+
+#[test]
+fn vanished_retained_lan_route_cannot_be_used_to_claim_exclusion_is_installed() {
+    let (mut session, events, network) = network_setup();
+    let mut p = policy();
+    p.retained_routes.push(RouteValue {
+        destination: "192.168.1.0/24".parse().unwrap(),
+        scope: RouteScope::Global,
+        interface: 5,
+        gateway: None,
+        metric: 0,
+    });
+    assert!(session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .is_err());
+    assert!(events.lock().unwrap().calls.is_empty());
+    assert!(network.lock().unwrap().writes.is_empty());
+}
+
+#[test]
+fn preexisting_physical_endpoint_route_remains_foreign_through_start_and_stop() {
+    let (mut session, _, network) = network_setup();
+    let value = NetworkValue::Route(physical());
+    network
+        .lock()
+        .unwrap()
+        .values
+        .insert(value.key(), value.clone());
+    let mut p = policy();
+    p.retained_routes = p.bypasses.clone();
+    p.bypasses.clear();
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), p)
+        .unwrap();
+    session
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    session.close(&scope()).unwrap();
+    assert_eq!(
+        network.lock().unwrap().values.get(&value.key()),
+        Some(&value)
+    );
+    assert!(!network.lock().unwrap().writes.contains(&value.key()));
 }
