@@ -85,6 +85,12 @@ and failure accounting cannot be skipped. Slot enum A/B prevents invalid indexin
 - [x] Step5: RED then implement probes.rs. Primary period2000ms; suspect standby
   phase1000ms; no standby probe without installed slot. Completed primary success
   ends suspicion, but does not counterfeit/cancel delivered standby evidence.
+  Continuation: normal standby probes are immediate then5000ms after completion,
+  switching to15000ms after three consecutive successes (Android cadence, not a
+  substitute for handshake/Ready dwell). A new failure episode cancels an older
+  in-flight standby ticket; ProbeBatch.cancelled must be consumed before native
+  starts. Epoch change/removal resets normal cadence; repeat failures within one
+  episode do not cancel its fresh reserve query.
 - [x] Step6: `cargo test -p nelomai-client-tunnel` and changed-file rustfmt/Clippy.
   Expected all pass. Commit shared policies with tests, no feature capability yet.
 

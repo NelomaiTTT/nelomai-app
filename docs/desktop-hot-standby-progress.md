@@ -6,6 +6,22 @@ permission to begin is required. This checkpoint is NOT feature completion.
 
 ## Implemented
 
+- Shared probe scheduler now also checks healthy-primary standby: immediate
+  first probe, then5s from completion,15s after three consecutive successes;
+  failed/expired probe resets warmup. This cadence does NOT grant Ready without
+  the existing handshake/dwell checks. A new active-failure episode fences and
+  emits cancellation of an earlier in-flight normal reserve probe, then keeps
+  the accepted1s phase/2s urgent cadence. Repeated failure in the same episode
+  does not cancel its fresh probe. Network change/replacement clears cadence.
+  Seven new fake-clock regressions,18 scheduler tests total. Native helper
+  integration is still absent: Task3 must consume ProbeBatch.cancelled before
+  launching new I/O, and cancel all handles on Stop/network epoch/promotion.
+  This closes the known normal-cadence gap, not the whole native health driver.
+  Final offline Rust workspace exit0 (one pre-existing ignored panel fixture);
+  host, Linux aarch64 and Windows MSVC all-target Clippy-D warnings exit0.
+  Logs: cadence-workspace.log, cadence-{clippy,linux-clippy,windows-clippy}.log
+  in the plan workspace. No native packet/hardware testing or feature activation.
+
 - Linux read-only physical-route discovery now excludes VPN/slave/down links,
   validates interface identity, chooses the most-specific physical prefix and
   lowest-cost unambiguous next hop, and supports IPv4/IPv6 endpoint bypasses.
@@ -195,8 +211,10 @@ Partial-stage parent review only; full feature review and hardware proof remain.
 ## Remaining, not hidden behind a capability flag
 
 - Task2 connect the Mac factory to engine lifecycle; finish durable member lifecycle;
- Linux/Windows network adapters and per-member
- Windows metrics still needed. Verify same-VIP behavior and socket egress per OS.
+ Linux resolver/binding allocation and recovery/factory; Windows data-route and
+ probe isolation, resolver/recovery/factory remain. Windows addressed metrics
+ and Linux physical route discovery are implemented above, not remaining tasks.
+ Verify same-VIP behavior and socket egress per OS.
  The panel gives both members the same configured DNS health target, not a
  dedicated per-slot diagnostic address. A lower route metric alone is not proof
  of standby isolation. Do not enable the feature based only on Table=off.

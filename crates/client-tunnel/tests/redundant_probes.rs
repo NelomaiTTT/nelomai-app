@@ -1,5 +1,142 @@
 use nelomai_client_tunnel::redundancy::{ProbeSchedule, Slot};
 
+fn healthy_primary_run(fail_reserve_number: Option<usize>) -> Vec<u64> {
+    let mut schedule = ProbeSchedule::new(Slot::A, 0);
+    schedule.set_standby_available(true);
+    let mut pending_reserve = None;
+    let mut starts = Vec::new();
+    // A deterministic clock, 100ms reserve latency. No real sleep or networking.
+    for now in (0..=41_000).step_by(100) {
+        if let Some(ticket) = pending_reserve.take() {
+            assert!(schedule.complete(ticket, fail_reserve_number != Some(starts.len()), now));
+        }
+        let batch = schedule.poll(now);
+        assert!(batch.timed_out.is_empty());
+        for ticket in batch.started {
+            if ticket.slot() == Slot::A {
+                assert!(schedule.complete(ticket, true, now));
+            } else {
+                starts.push(now);
+                pending_reserve = Some(ticket);
+            }
+        }
+    }
+    starts
+}
+
+#[test]
+fn healthy_standby_is_probed_during_warmup_then_every_fifteen_seconds_from_completion() {
+    assert_eq!(
+        healthy_primary_run(None),
+        vec![0, 5_100, 10_200, 25_300, 40_400]
+    );
+}
+
+#[test]
+fn failed_background_probe_returns_reserve_to_warmup_cadence() {
+    assert_eq!(
+        healthy_primary_run(Some(3)),
+        vec![0, 5_100, 10_200, 15_300, 20_400, 25_500, 40_600]
+    );
+}
+
+#[test]
+fn new_primary_failure_cancels_prior_normal_reserve_probe_and_requires_new_evidence() {
+    let mut schedule = ProbeSchedule::new(Slot::A, 0);
+    schedule.set_standby_available(true);
+    let batch = schedule.poll(0);
+    assert_eq!(batch.started.len(), 2);
+    let old_reserve = batch.started[1];
+    assert!(schedule.complete(batch.started[0], false, 100));
+    assert!(!schedule.complete(old_reserve, true, 150));
+    assert_eq!(schedule.poll(200).cancelled, vec![old_reserve]);
+    assert!(schedule.poll(201).cancelled.is_empty());
+    assert!(schedule.poll(999).started.is_empty());
+    let fresh = schedule.poll(1000).started[0];
+    assert_eq!(fresh.slot(), Slot::B);
+    assert!(schedule.complete(fresh, true, 1100));
+}
+
+#[test]
+fn normal_reserve_timeout_retries_after_completion_and_never_delays_primary() {
+    let mut schedule = ProbeSchedule::new(Slot::A, 0);
+    schedule.set_standby_available(true);
+    let batch = schedule.poll(0);
+    assert_eq!(batch.started.len(), 2);
+    schedule.complete(batch.started[0], true, 0);
+    let batch = schedule.poll(2000);
+    assert_eq!(batch.timed_out.len(), 1);
+    assert_eq!(batch.timed_out[0].slot(), Slot::B);
+    assert_eq!(batch.started.len(), 1);
+    schedule.complete(batch.started[0], true, 2000);
+    for now in [4000, 6000] {
+        let batch = schedule.poll(now);
+        assert_eq!(batch.started.len(), 1);
+        schedule.complete(batch.started[0], true, now);
+    }
+    assert!(schedule.poll(6999).started.is_empty());
+    assert_eq!(schedule.poll(7000).started[0].slot(), Slot::B);
+}
+
+#[test]
+fn repeated_failure_in_same_episode_keeps_its_fresh_reserve_probe() {
+    let mut schedule = ProbeSchedule::new(Slot::A, 0);
+    schedule.set_standby_available(true);
+    let first = schedule.poll(0);
+    schedule.complete(first.started[0], false, 100);
+    let fresh = schedule.poll(1000).started[0];
+    let primary = schedule.poll(2000).started[0];
+    schedule.complete(primary, false, 2100);
+    assert!(schedule.poll(2200).cancelled.is_empty());
+    assert!(schedule.complete(fresh, true, 2500));
+}
+
+#[test]
+fn new_network_resets_previously_successful_reserve_to_five_second_warmup() {
+    let mut schedule = ProbeSchedule::new(Slot::A, 0);
+    schedule.set_standby_available(true);
+    for now in (0..=10_000).step_by(100) {
+        for ticket in schedule.poll(now).started {
+            assert!(schedule.complete(ticket, true, now));
+        }
+    }
+    // Three background successes at 0/5000/10000 had extended the next gap.
+    schedule.network_changed(11_000);
+    let mut reserves = vec![];
+    for now in (11_000..=16_000).step_by(100) {
+        for ticket in schedule.poll(now).started {
+            if ticket.slot() == Slot::B {
+                reserves.push(now);
+            }
+            assert!(schedule.complete(ticket, true, now));
+        }
+    }
+    assert_eq!(reserves, vec![11_000, 16_000]);
+}
+
+#[test]
+fn network_change_and_replacement_discard_normal_cadence_and_old_completions() {
+    for replace in [false, true] {
+        let mut schedule = ProbeSchedule::new(Slot::A, 0);
+        schedule.set_standby_available(true);
+        let old = schedule.poll(0);
+        assert_eq!(old.started.len(), 2);
+        schedule.complete(old.started[0], true, 0);
+        if replace {
+            schedule.set_standby_available(false);
+            schedule.set_standby_available(true);
+        } else {
+            schedule.network_changed(100);
+        }
+        assert!(!schedule.complete(old.started[1], true, 150));
+        assert!(schedule
+            .poll(200)
+            .started
+            .iter()
+            .any(|t| t.slot() == Slot::B));
+    }
+}
+
 #[test]
 fn failed_primary_staggers_reserve_between_two_second_primary_probes() {
     let mut schedule = ProbeSchedule::new(Slot::A, 0);
