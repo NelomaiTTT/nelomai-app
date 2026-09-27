@@ -307,11 +307,9 @@ internal object TunnelServiceClient {
         apiVersion: Int,
         onSuccess: (SessionState, Long) -> Unit,
         onError: (String) -> Unit,
-    ) = requestBundle(
+    ) = TunnelStatusTransport.request(
         context,
-        ru.nelomai.runtime.v1.RuntimeServiceIntents.vpn(context)
-            .setAction(NelomaiVpnService.ACTION_CLIENT_STATUS)
-            .putExtra(EXTRA_API_VERSION, apiVersion),
+        apiVersion,
         { result ->
             val state = SessionState.values().firstOrNull {
                 it.wireName == result.getString(EXTRA_STATE)
