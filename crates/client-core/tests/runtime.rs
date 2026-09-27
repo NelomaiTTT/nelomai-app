@@ -552,6 +552,13 @@ struct MockApi {
     hold_stop: AtomicBool,
     redundant_stop_calls: AtomicUsize,
     redundant_stop_requests: Mutex<Vec<RedundantStopRequest>>,
+    desktop_role_responses: Mutex<VecDeque<nelomai_contracts::RedundantRoleResponse>>,
+    desktop_acquire_responses: Mutex<VecDeque<nelomai_contracts::RedundantStandbyAcquireResponse>>,
+    desktop_acquire_errors: Mutex<VecDeque<CoreApiError>>,
+    desktop_acquire_requests: Mutex<Vec<nelomai_contracts::RedundantStandbyAcquireRequest>>,
+    desktop_commit_responses: Mutex<VecDeque<nelomai_contracts::RedundantSessionResponse>>,
+    desktop_role_block: AtomicBool,
+    desktop_role_calls: AtomicUsize,
     stop_failures: AtomicUsize,
     stop_error: Mutex<Option<CoreApiError>>,
     stop_apply_then_fail_once: AtomicBool,
@@ -606,6 +613,13 @@ impl MockApi {
             hold_stop: AtomicBool::new(false),
             redundant_stop_calls: AtomicUsize::new(0),
             redundant_stop_requests: Mutex::new(Vec::new()),
+            desktop_role_responses: Mutex::new(VecDeque::new()),
+            desktop_acquire_responses: Mutex::new(VecDeque::new()),
+            desktop_acquire_errors: Mutex::new(VecDeque::new()),
+            desktop_acquire_requests: Mutex::new(Vec::new()),
+            desktop_commit_responses: Mutex::new(VecDeque::new()),
+            desktop_role_block: AtomicBool::new(false),
+            desktop_role_calls: AtomicUsize::new(0),
             stop_failures: AtomicUsize::new(0),
             stop_error: Mutex::new(None),
             stop_apply_then_fail_once: AtomicBool::new(false),
@@ -783,6 +797,17 @@ impl CoreApi for MockApi {
                 "../../../contracts/fixtures/valid/connection-start-redundant-response.json"
             ))
             .unwrap();
+            // The shared wire fixture omits native AWG markers. Desktop also
+            // validates that the advertised transport matches the configuration.
+            let awg = "HeaderProtectionKey = synthetic\nContentPaddingAddition = 1\n";
+            response.configuration.push_str(awg);
+            if let Some(standby) = response
+                .redundancy
+                .as_mut()
+                .and_then(|r| r.standby.as_mut())
+            {
+                standby.configuration.push_str(awg);
+            }
         }
         Ok(response)
     }
@@ -877,6 +902,65 @@ impl CoreApi for MockApi {
                 ..connection(&request.lease_id)
             },
         })
+    }
+
+    async fn report_redundant_role(
+        &self,
+        _: &AccessSnapshot,
+        request: &nelomai_contracts::RedundantRoleRequest,
+    ) -> Result<nelomai_contracts::RedundantRoleResponse, CoreApiError> {
+        self.desktop_role_calls.fetch_add(1, Ordering::SeqCst);
+        if self.desktop_role_block.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let response = self
+            .desktop_role_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(CoreApiError::Retryable)?;
+        assert_eq!(request.active_lease_id, response.local_active_lease_id);
+        assert!(
+            response.session.role_generation == request.expected_role_generation
+                || response.session.role_generation == request.expected_role_generation + 1
+        );
+        Ok(response)
+    }
+
+    async fn acquire_redundant_standby(
+        &self,
+        _: &AccessSnapshot,
+        request: &nelomai_contracts::RedundantStandbyAcquireRequest,
+    ) -> Result<nelomai_contracts::RedundantStandbyAcquireResponse, CoreApiError> {
+        self.desktop_acquire_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        if let Some(error) = self.desktop_acquire_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
+        self.desktop_acquire_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(CoreApiError::Retryable)
+    }
+    async fn commit_redundant_candidate(
+        &self,
+        _: &AccessSnapshot,
+        request: &nelomai_contracts::RedundantCandidateCommitRequest,
+    ) -> Result<nelomai_contracts::RedundantSessionResponse, CoreApiError> {
+        let response = self
+            .desktop_commit_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(CoreApiError::Retryable)?;
+        assert_eq!(
+            response.session.membership_generation,
+            request.expected_membership_generation + 1
+        );
+        Ok(response)
     }
 
     async fn stop_redundant_connection(
@@ -1064,6 +1148,1528 @@ fn options() -> ConnectOptions {
         egress_mode: EgressMode::Ipv4,
         probes: Vec::new(),
         allow_alternate: false,
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn desktop_reserve_refuses_an_old_helper_before_issuing_a_server_lease() {
+    let api = Arc::new(MockApi::new(0));
+    let tunnel = Arc::new(MemoryTunnel::default());
+    let core = support::core(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        tunnel.clone(),
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    let error = core
+        .desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Tunnel(code) if code == "desktop_redundancy_unsupported"));
+    assert_eq!(api.start_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tunnel.starts.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Default)]
+struct DesktopPairTunnel {
+    legacy: MemoryTunnel,
+    commands: Mutex<Vec<String>>,
+    pair: Mutex<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>>,
+    scopes: Mutex<Vec<nelomai_client_tunnel::redundancy::SessionScope>>,
+    fail_absence: AtomicBool,
+    fail_pair_close: AtomicBool,
+}
+#[async_trait]
+impl TunnelController for DesktopPairTunnel {
+    async fn desktop_redundancy_absent(&self) -> Result<bool, TunnelError> {
+        self.commands.lock().unwrap().push("absent".into());
+        if self.fail_absence.load(Ordering::SeqCst) {
+            return Err(TunnelError::Backend("status unavailable".into()));
+        }
+        Ok(self.pair.lock().unwrap().is_none()
+            && *self.legacy.status.lock().unwrap() == TunnelStatus::Stopped)
+    }
+    async fn desktop_redundancy_supported(&self) -> Result<bool, TunnelError> {
+        Ok(true)
+    }
+    async fn desktop_redundancy_command(
+        &self,
+        command: nelomai_client_tunnel::redundancy::protocol::Command,
+    ) -> Result<nelomai_client_tunnel::redundancy::protocol::Snapshot, TunnelError> {
+        use nelomai_client_tunnel::redundancy::{
+            protocol::{Command, Snapshot},
+            session::SessionState,
+        };
+        self.scopes.lock().unwrap().push(command.scope().clone());
+        if !matches!(&command, Command::Start { .. })
+            && self
+                .pair
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|pair| pair.session.scope != *command.scope())
+        {
+            return Err(TunnelError::Backend("missing exact owner".into()));
+        }
+        match command {
+            Command::Start {
+                scope,
+                primary,
+                role_generation,
+                membership_generation,
+                warm_stop_v1,
+                ..
+            } => {
+                self.commands.lock().unwrap().push("primary".into());
+                *self.legacy.status.lock().unwrap() = TunnelStatus::Running;
+                let mut state = SessionState::new(
+                    scope.clone(),
+                    primary.slot,
+                    role_generation,
+                    membership_generation,
+                )
+                .unwrap();
+                state.primary_started(&scope).unwrap();
+                *self.pair.lock().unwrap() = Some(Snapshot {
+                    session: state.snapshot(),
+                    current_leases: [Some(primary.lease_id.clone()), None],
+                    standby_failed: false,
+                    stalled: false,
+                    leases: [Some(primary.lease_id), None],
+                    primary_ready: false,
+                    standby_ready: false,
+                    cleanup_pending: false,
+                    warm_stop_v1,
+                });
+            }
+            Command::Status { scope } => {
+                self.commands.lock().unwrap().push("status".into());
+                let mut pair = self.pair.lock().unwrap();
+                assert_eq!(pair.as_ref().unwrap().session.scope, scope);
+                let pair = pair.as_mut().unwrap();
+                pair.primary_ready = !pair.stalled
+                    && pair.session.phase
+                        == nelomai_client_tunnel::redundancy::session::SessionPhase::Running;
+            }
+            Command::PrepareRecoveryStop {
+                scope,
+                expected_revision,
+                expected_network_epoch,
+            } => {
+                let mut guard = self.pair.lock().unwrap();
+                let pair = guard.as_mut().unwrap();
+                if pair.session.scope != scope
+                    || pair.session.local_revision != expected_revision
+                    || pair.session.network_epoch != expected_network_epoch
+                    || !pair.stalled
+                    || pair.primary_ready
+                {
+                    return Err(TunnelError::Backend("stale recovery".into()));
+                }
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push("prepare_recovery_stop".into());
+                if pair.session.phase
+                    == nelomai_client_tunnel::redundancy::session::SessionPhase::Running
+                {
+                    pair.session.phase =
+                        nelomai_client_tunnel::redundancy::session::SessionPhase::Stopping;
+                }
+            }
+            Command::PrepareStop { scope } => {
+                self.commands.lock().unwrap().push("prepare_stop".into());
+                let mut pair = self.pair.lock().unwrap();
+                let pair = pair.as_mut().unwrap();
+                assert_eq!(pair.session.scope, scope);
+                if pair.session.phase
+                    != nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped
+                {
+                    pair.session.phase =
+                        nelomai_client_tunnel::redundancy::session::SessionPhase::Stopping;
+                }
+                pair.primary_ready = false;
+                pair.standby_ready = false;
+            }
+            Command::Attach { scope, member, .. } => {
+                self.commands.lock().unwrap().push("attach".into());
+                let mut pair = self.pair.lock().unwrap();
+                let pair = pair.as_mut().unwrap();
+                assert_eq!(pair.session.scope, scope);
+                let i = if member.slot == nelomai_client_tunnel::redundancy::Slot::A {
+                    0
+                } else {
+                    1
+                };
+                pair.current_leases[i] = Some(member.lease_id.clone());
+                pair.leases[i] = Some(member.lease_id);
+                pair.session.installed[i] = true;
+                pair.session.committed[i] = true;
+                pair.session.local_revision += 1;
+            }
+            Command::StageCandidate { scope, member, .. } => {
+                self.commands.lock().unwrap().push("stage_candidate".into());
+                let mut pair = self.pair.lock().unwrap();
+                let pair = pair.as_mut().unwrap();
+                assert_eq!(pair.session.scope, scope);
+                let i = if member.slot == nelomai_client_tunnel::redundancy::Slot::A {
+                    0
+                } else {
+                    1
+                };
+                pair.leases[i] = Some(member.lease_id);
+                pair.session.installed[i] = true;
+                pair.session.committed[i] = false;
+                pair.session.local_revision += 1;
+            }
+            Command::RetireInactive {
+                scope,
+                slot,
+                lease_id,
+                ..
+            } => {
+                self.commands.lock().unwrap().push("retire".into());
+                let mut guard = self.pair.lock().unwrap();
+                let pair = guard.as_mut().unwrap();
+                assert_eq!(pair.session.scope, scope);
+                let i = if slot == nelomai_client_tunnel::redundancy::Slot::A {
+                    0
+                } else {
+                    1
+                };
+                assert_ne!(pair.session.active, slot);
+                assert_eq!(pair.current_leases[i].as_deref(), Some(lease_id.as_str()));
+                pair.leases[i] = None;
+                pair.session.installed[i] = false;
+                pair.session.committed[i] = false;
+                pair.session.local_revision += 1;
+                pair.standby_failed = false;
+                pair.standby_ready = false;
+            }
+            Command::CommitCandidate {
+                scope,
+                slot,
+                session,
+                ..
+            } => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push("commit_candidate".into());
+                let mut pair = self.pair.lock().unwrap();
+                let pair = pair.as_mut().unwrap();
+                assert_eq!(pair.session.scope, scope);
+                let i = if slot == nelomai_client_tunnel::redundancy::Slot::A {
+                    0
+                } else {
+                    1
+                };
+                pair.session.committed[i] = true;
+                pair.session.membership_generation = session.membership_generation;
+                pair.current_leases = [session.slot_a_lease_id, session.slot_b_lease_id];
+                pair.session.local_revision += 1;
+            }
+            Command::RemoveStandby {
+                scope,
+                slot,
+                lease_id,
+                ..
+            } => {
+                self.commands
+                    .lock()
+                    .unwrap()
+                    .push("remove_candidate".into());
+                let mut guard = self.pair.lock().unwrap();
+                let pair = guard.as_mut().unwrap();
+                let i = if slot == nelomai_client_tunnel::redundancy::Slot::A {
+                    0
+                } else {
+                    1
+                };
+                assert_eq!(pair.session.scope, scope);
+                assert_ne!(pair.session.active, slot);
+                assert!(!pair.session.committed[i]);
+                assert_eq!(pair.leases[i].as_deref(), Some(lease_id.as_str()));
+                pair.leases[i] = None;
+                pair.session.installed[i] = false;
+                pair.session.local_revision += 1;
+                pair.standby_failed = false;
+                pair.standby_ready = false;
+            }
+            Command::Stop { scope } => {
+                self.commands.lock().unwrap().push("stop_pair".into());
+                if self.fail_pair_close.load(Ordering::SeqCst) {
+                    return Err(TunnelError::Backend("native cleanup pending".into()));
+                }
+                let mut pair = self.pair.lock().unwrap();
+                let pair = pair.as_mut().unwrap();
+                assert_eq!(pair.session.scope, scope);
+                pair.session.phase =
+                    nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped;
+                pair.session.installed = [false; 2];
+                pair.session.committed = [false; 2];
+                *self.legacy.status.lock().unwrap() = TunnelStatus::Stopped;
+            }
+            _ => panic!("reserve must not block primary Start"),
+        }
+        Ok(self.pair.lock().unwrap().clone().unwrap())
+    }
+    async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+        panic!("no singleton fallback")
+    }
+    async fn stop(&self) -> Result<(), TunnelError> {
+        self.legacy.stop().await
+    }
+    async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        self.legacy.status().await
+    }
+}
+struct PairRuntime {
+    paths: nelomai_client_storage::RuntimePaths,
+    value: Mutex<nelomai_client_storage::RuntimeStateV1>,
+    reject_next_save: AtomicBool,
+    lose_next_save_ack: AtomicBool,
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_total_loss_cleanup_is_cold_scoped_and_rejects_stale_observation() {
+    for (fail_journal, lose_ack) in [(true, false), (false, false), (false, true)] {
+        let api = Arc::new(MockApi::new(0));
+        api.redundant_start.store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(DesktopPairTunnel::default());
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let owner = Arc::new(support::TestOwner::new(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            local.clone(),
+        ));
+        let access = support::snapshot("access");
+        let paths = nelomai_client_storage::RuntimePaths::new(
+            "/synthetic-no-filesystem-access",
+            access.identity().slot,
+            &access.identity().runtime_version,
+        )
+        .unwrap();
+        let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+        value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        });
+        let store = Arc::new(PairRuntime {
+            paths,
+            value: Mutex::new(value),
+            reject_next_save: AtomicBool::new(false),
+            lose_next_save_ack: AtomicBool::new(false),
+        });
+        let core = nelomai_client_core::ClientCore::new(
+            api.clone(),
+            store.clone(),
+            owner,
+            local,
+            Arc::new(MemoryLogger::default()),
+        );
+        let epoch = core.begin_start_attempt();
+        core.desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap();
+        core.finish_start_attempt();
+        let healthy = tunnel.pair.lock().unwrap().clone().unwrap();
+        assert!(!core.prepare_desktop_recovery(&healthy).await.unwrap());
+        {
+            let mut guard = tunnel.pair.lock().unwrap();
+            let native = guard.as_mut().unwrap();
+            native.stalled = true;
+            native.primary_ready = false;
+            native.session.local_revision += 1;
+        }
+        let observed = tunnel.pair.lock().unwrap().clone().unwrap();
+        let mut stale = observed.clone();
+        stale.session.local_revision -= 1;
+        assert!(core.prepare_desktop_recovery(&stale).await.is_err());
+        assert!(store
+            .value
+            .lock()
+            .unwrap()
+            .pending_compensation_stop
+            .is_none());
+        if fail_journal {
+            store.reject_next_save.store(true, Ordering::SeqCst);
+            assert!(core.prepare_desktop_recovery(&observed).await.is_err());
+            assert!(store
+                .value
+                .lock()
+                .unwrap()
+                .pending_compensation_stop
+                .is_none());
+            assert_eq!(
+                core.state().await.phase,
+                Phase::Error,
+                "an unjournaled automatic stop must not be stolen by the ordinary stop worker"
+            );
+            let stopped = tunnel.pair.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                stopped.session.phase,
+                nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped
+            );
+            assert!(core.prepare_desktop_recovery(&stopped).await.unwrap(),"retry must persist cold cleanup after freeze succeeded but its journal write failed");
+        } else {
+            store.lose_next_save_ack.store(lose_ack, Ordering::SeqCst);
+            tunnel.fail_pair_close.store(true, Ordering::SeqCst);
+            assert!(core.prepare_desktop_recovery(&observed).await.unwrap(),"durable cold cleanup may be retried by the existing worker before reconciliation permits Start");
+        }
+        let pending = store
+            .value
+            .lock()
+            .unwrap()
+            .pending_compensation_stop
+            .clone()
+            .unwrap();
+        assert!(!pending.accept_warm);
+        assert_eq!(
+            pending.redundant_session_id.as_deref(),
+            Some(observed.session.scope.session_id.as_str())
+        );
+        let repeated = tunnel.pair.lock().unwrap().clone().unwrap();
+        assert!(
+            core.prepare_desktop_recovery(&repeated).await.unwrap(),
+            "an exact already accepted cold cleanup remains accepted on retry"
+        );
+        let mut foreign = repeated.clone();
+        foreign.session.scope.connection_generation += 1;
+        assert!(core.prepare_desktop_recovery(&foreign).await.is_err());
+        assert_eq!(
+            store
+                .value
+                .lock()
+                .unwrap()
+                .pending_compensation_stop
+                .as_ref(),
+            Some(&pending)
+        );
+        assert_eq!(
+            tunnel.pair.lock().unwrap().as_ref().unwrap().session.phase,
+            if fail_journal {
+                nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped
+            } else {
+                nelomai_client_tunnel::redundancy::session::SessionPhase::Stopping
+            }
+        );
+        assert_eq!(tunnel.legacy.stops.load(Ordering::SeqCst), 0);
+        tunnel.fail_pair_close.store(false, Ordering::SeqCst);
+        core.stop().await.unwrap();
+        assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+        assert!(api
+            .redundant_stop_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| !r.retain_active_peer && r.operation_id == pending.operation_id));
+    }
+}
+impl nelomai_client_storage::RuntimeStateStore for PairRuntime {
+    fn paths(&self) -> &nelomai_client_storage::RuntimePaths {
+        &self.paths
+    }
+    fn load(&self) -> Result<Option<nelomai_client_storage::RuntimeStateV1>, StorageError> {
+        Ok(Some(self.value.lock().unwrap().clone()))
+    }
+    fn save(&self, value: &nelomai_client_storage::RuntimeStateV1) -> Result<(), StorageError> {
+        if self.reject_next_save.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::RecoveryRequired("synthetic lost write"));
+        }
+        *self.value.lock().unwrap() = value.clone();
+        if self.lose_next_save_ack.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::RecoveryRequired(
+                "synthetic lost acknowledgement",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reserve() {
+    for missing_reserve in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        api.redundant_start.store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(DesktopPairTunnel::default());
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let auth_source = Arc::new(MemoryStore::new(auth()));
+        let owner = Arc::new(support::TestOwner::new(
+            api.clone(),
+            auth_source,
+            local.clone(),
+        ));
+        let access = support::snapshot("access");
+        let paths = nelomai_client_storage::RuntimePaths::new(
+            "/synthetic-no-filesystem-access",
+            access.identity().slot,
+            &access.identity().runtime_version,
+        )
+        .unwrap();
+        let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+        value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        });
+        let store = Arc::new(PairRuntime {
+            paths,
+            value: Mutex::new(value),
+            reject_next_save: AtomicBool::new(false),
+            lose_next_save_ack: AtomicBool::new(false),
+        });
+        let core = nelomai_client_core::ClientCore::new(
+            api.clone(),
+            store.clone(),
+            owner,
+            local,
+            Arc::new(MemoryLogger::default()),
+        );
+        let epoch = core.begin_start_attempt();
+        core.desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(core.state().await.phase, Phase::Connected);
+        assert_eq!(
+            tunnel.commands.lock().unwrap().as_slice(),
+            ["primary", "status"]
+        );
+        *api.bootstrap_connection.lock().unwrap() = core.state().await.connection.clone();
+        let starts_before = api.start_requests.lock().unwrap().len();
+        core.bootstrap(1_700_000_001).await.unwrap();
+        assert_eq!(
+            api.start_requests.lock().unwrap().len(),
+            starts_before,
+            "bootstrap must not issue a legacy Start for a live desktop pair"
+        );
+        let issued_standby = store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_ref()
+            .unwrap()
+            .session
+            .standby
+            .clone()
+            .unwrap();
+        if missing_reserve {
+            store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_mut()
+                .unwrap()
+                .session
+                .standby = None;
+        }
+        let state = store.value.lock().unwrap().clone();
+        let pair = state.desktop_redundancy.as_ref().unwrap();
+        assert_eq!(pair.session.standby.is_none(), missing_reserve);
+        assert!(
+            state.saved_connection.is_none(),
+            "never offline-adopt the VIP configuration"
+        );
+        assert_eq!(
+            api.start_requests.lock().unwrap()[0].reserve_enabled,
+            Some(true)
+        );
+        api.desktop_role_responses.lock().unwrap().push_back(
+            nelomai_contracts::RedundantRoleResponse {
+                api_version: ApiVersion::V1,
+                request_id: "primary-ready".into(),
+                action: nelomai_contracts::RedundantRoleAction::Acknowledged,
+                local_active_lease_id: pair.connection.lease_id.clone(),
+                session: nelomai_contracts::RedundantSessionView {
+                    session_id: pair.session.session_id.clone(),
+                    state: nelomai_contracts::RedundantSessionState::Connected,
+                    active_lease_id: Some(pair.connection.lease_id.clone()),
+                    slot_a_lease_id: Some(pair.connection.lease_id.clone()),
+                    slot_b_lease_id: pair
+                        .session
+                        .standby
+                        .as_ref()
+                        .map(|m| m.connection.lease_id.clone()),
+                    standby_desired: true,
+                    role_generation: pair.session.role_generation,
+                    membership_generation: pair.session.membership_generation,
+                    reason: None,
+                },
+            },
+        );
+        core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+        assert!(
+            store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .primary_reported
+        );
+        assert!(!tunnel
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == "attach"));
+        if !missing_reserve {
+            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            assert_eq!(tunnel.commands.lock().unwrap().last().unwrap(), "attach");
+            tunnel.pair.lock().unwrap().as_mut().unwrap().standby_failed = true;
+            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            assert_eq!(tunnel.commands.lock().unwrap().last().unwrap(), "retire");
+            assert!(core.desktop_redundancy_tick(Vec::new()).await.is_err());
+            let operation = store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .pending_acquire
+                .clone()
+                .unwrap();
+            assert_eq!(
+                operation.replace_lease_id.as_deref(),
+                Some(issued_standby.connection.lease_id.as_str())
+            );
+            assert_eq!(
+                tunnel
+                    .pair
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .installed,
+                [true, false]
+            );
+            store.reject_next_save.store(true, Ordering::SeqCst);
+            assert!(core.stop_locally().await.is_err());
+            assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+            assert!(store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .stop
+                .is_none());
+            core.stop_locally().await.unwrap();
+            assert!(
+                !store
+                    .value
+                    .lock()
+                    .unwrap()
+                    .desktop_redundancy
+                    .as_ref()
+                    .unwrap()
+                    .stop
+                    .as_ref()
+                    .unwrap()
+                    .retain_active_peer
+            );
+            core.stop().await.unwrap();
+            assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+        } else {
+            // Failed acquisition is durable and cannot stop A or change the operation.
+            assert!(core.desktop_redundancy_tick(Vec::new()).await.is_err());
+            let operation = store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .pending_acquire
+                .clone()
+                .unwrap();
+            let native = tunnel.pair.lock().unwrap().clone().unwrap();
+            let view = nelomai_contracts::RedundantSessionView {
+                session_id: pair.session.session_id.clone(),
+                state: nelomai_contracts::RedundantSessionState::Degraded,
+                active_lease_id: Some(pair.connection.lease_id.clone()),
+                slot_a_lease_id: native.leases[0].clone(),
+                slot_b_lease_id: None,
+                standby_desired: true,
+                role_generation: pair.session.role_generation,
+                membership_generation: pair.session.membership_generation,
+                reason: None,
+            };
+            api.desktop_acquire_responses.lock().unwrap().push_back(
+                nelomai_contracts::RedundantStandbyAcquireResponse {
+                    api_version: ApiVersion::V1,
+                    request_id: "acquire".into(),
+                    session: view.clone(),
+                    candidate_lease_id: issued_standby.connection.lease_id.clone(),
+                    candidate_slot: nelomai_contracts::RedundancyMemberSlot::B,
+                    connection: issued_standby.connection.clone(),
+                    configuration: issued_standby.configuration.clone(),
+                    health_probe: issued_standby.health_probe.clone(),
+                    reused: false,
+                },
+            );
+            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            assert_eq!(
+                store
+                    .value
+                    .lock()
+                    .unwrap()
+                    .desktop_redundancy
+                    .as_ref()
+                    .unwrap()
+                    .pending_acquire
+                    .as_ref(),
+                Some(&operation)
+            );
+            assert_eq!(
+                tunnel
+                    .pair
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .installed,
+                [true, false]
+            );
+            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            assert_eq!(
+                tunnel.commands.lock().unwrap().last().unwrap(),
+                "stage_candidate"
+            );
+            assert_eq!(
+                tunnel
+                    .pair
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .committed,
+                [true, false]
+            );
+            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            assert!(!tunnel
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s == "commit_candidate"));
+            tunnel.pair.lock().unwrap().as_mut().unwrap().standby_ready = true;
+            api.desktop_commit_responses.lock().unwrap().push_back(
+                nelomai_contracts::RedundantSessionResponse {
+                    api_version: ApiVersion::V1,
+                    request_id: "commit".into(),
+                    session: nelomai_contracts::RedundantSessionView {
+                        slot_b_lease_id: Some(issued_standby.connection.lease_id),
+                        membership_generation: view.membership_generation + 1,
+                        state: nelomai_contracts::RedundantSessionState::Connected,
+                        ..view
+                    },
+                },
+            );
+            store.reject_next_save.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                core.desktop_redundancy_tick(Vec::new()).await,
+                Err(CoreError::Storage)
+            ));
+            assert_eq!(
+                tunnel
+                    .pair
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .committed,
+                [true, true]
+            );
+            assert!(store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .candidate
+                .is_some());
+            core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+            let stored = store.value.lock().unwrap();
+            let pair = stored.desktop_redundancy.as_ref().unwrap();
+            assert!(pair.candidate.is_none() && pair.pending_acquire.is_none());
+            assert!(pair.session.standby.is_some());
+        }
+    }
+}
+
+type PairCore =
+    nelomai_client_core::ClientCore<MockApi, PairRuntime, DesktopPairTunnel, MemoryLogger>;
+async fn missing_desktop_reserve() -> (
+    PairCore,
+    Arc<MockApi>,
+    Arc<PairRuntime>,
+    Arc<DesktopPairTunnel>,
+    nelomai_contracts::RedundancyMember,
+) {
+    let api = Arc::new(MockApi::new(0));
+    api.redundant_start.store(true, Ordering::SeqCst);
+    let tunnel = Arc::new(DesktopPairTunnel::default());
+    let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+    let owner = Arc::new(support::TestOwner::new(
+        api.clone(),
+        Arc::new(MemoryStore::new(auth())),
+        local.clone(),
+    ));
+    let access = support::snapshot("access");
+    let paths = nelomai_client_storage::RuntimePaths::new(
+        "/synthetic-no-filesystem-access",
+        access.identity().slot,
+        &access.identity().runtime_version,
+    )
+    .unwrap();
+    let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+    value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+        auth_epoch: access.auth_epoch(),
+        family: access.family().into(),
+        identity: access.identity().clone(),
+    });
+    let store = Arc::new(PairRuntime {
+        paths,
+        value: Mutex::new(value),
+        reject_next_save: AtomicBool::new(false),
+        lose_next_save_ack: AtomicBool::new(false),
+    });
+    let core = PairCore::new(
+        api.clone(),
+        store.clone(),
+        owner,
+        local,
+        Arc::new(MemoryLogger::default()),
+    );
+    let epoch = core.begin_start_attempt();
+    core.desktop_connection_intent_attempt_with_cancellation_epoch(
+        options(),
+        1_700_000_000,
+        true,
+        epoch,
+    )
+    .await
+    .unwrap();
+    let member = {
+        let mut value = store.value.lock().unwrap();
+        let pair = value.desktop_redundancy.as_mut().unwrap();
+        pair.primary_reported = true;
+        pair.session.standby.take().unwrap()
+    };
+    (core, api, store, tunnel, member)
+}
+fn canonical_pair_role(tunnel: &DesktopPairTunnel) -> nelomai_contracts::RedundantRoleResponse {
+    let guard = tunnel.pair.lock().unwrap();
+    let s = guard.as_ref().unwrap();
+    let active = if s.session.active == nelomai_client_tunnel::redundancy::Slot::A {
+        0
+    } else {
+        1
+    };
+    nelomai_contracts::RedundantRoleResponse {
+        api_version: ApiVersion::V1,
+        request_id: "canonical".into(),
+        action: nelomai_contracts::RedundantRoleAction::Acknowledged,
+        local_active_lease_id: s.leases[active].clone().unwrap(),
+        session: nelomai_contracts::RedundantSessionView {
+            session_id: s.session.scope.session_id.clone(),
+            state: nelomai_contracts::RedundantSessionState::Degraded,
+            active_lease_id: s.leases[active].clone(),
+            slot_a_lease_id: s.current_leases[0].clone(),
+            slot_b_lease_id: s.current_leases[1].clone(),
+            standby_desired: true,
+            role_generation: s.session.role_generation,
+            membership_generation: s.session.membership_generation,
+            reason: None,
+        },
+    }
+}
+fn reserve_probe(id: &str) -> Vec<ProbeResult> {
+    vec![ProbeResult {
+        candidate_id: id.into(),
+        latency_ms: Some(10.0),
+        failure_code: None,
+        measured_at: "2026-09-27T00:00:00Z".into(),
+    }]
+}
+async fn stage_test_candidate(
+    core: &PairCore,
+    api: &MockApi,
+    tunnel: &DesktopPairTunnel,
+    member: nelomai_contracts::RedundancyMember,
+) {
+    api.desktop_acquire_responses.lock().unwrap().push_back(
+        nelomai_contracts::RedundantStandbyAcquireResponse {
+            api_version: ApiVersion::V1,
+            request_id: "candidate".into(),
+            session: canonical_pair_role(tunnel).session,
+            candidate_lease_id: member.connection.lease_id.clone(),
+            candidate_slot: nelomai_contracts::RedundancyMemberSlot::B,
+            connection: member.connection,
+            configuration: member.configuration,
+            health_probe: member.health_probe,
+            reused: false,
+        },
+    );
+    core.desktop_redundancy_tick(reserve_probe("fresh"))
+        .await
+        .unwrap();
+    core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_acquire_retry_refreshes_probes_without_changing_operation_identity() {
+    let (core, api, store, _, _) = missing_desktop_reserve().await;
+    assert!(core
+        .desktop_redundancy_tick(reserve_probe("expired"))
+        .await
+        .is_err());
+    let original = store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .pending_acquire
+        .clone()
+        .unwrap();
+    assert!(core
+        .desktop_redundancy_tick(reserve_probe("fresh"))
+        .await
+        .is_err());
+    let calls = api.desktop_acquire_requests.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].operation_id, original.operation_id);
+    assert_eq!(calls[1].probes, reserve_probe("fresh"));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_failed_candidate_is_removed_without_stopping_primary_and_consumed_id_is_reconciled(
+) {
+    let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+    stage_test_candidate(&core, &api, &tunnel, member).await;
+    tunnel.pair.lock().unwrap().as_mut().unwrap().standby_failed = true;
+    api.desktop_role_responses
+        .lock()
+        .unwrap()
+        .push_back(canonical_pair_role(&tunnel));
+    let _ = core.desktop_redundancy_tick(Vec::new()).await;
+    assert!(tunnel
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c == "remove_candidate"));
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Running);
+    assert!(store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .candidate
+        .is_none());
+    assert!(store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .pending_acquire
+        .is_some());
+    api.desktop_acquire_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Rejected {
+            code: "operation_id_conflict".into(),
+            message: "consumed".into(),
+            retry_after_seconds: None,
+        });
+    api.desktop_role_responses
+        .lock()
+        .unwrap()
+        .push_back(canonical_pair_role(&tunnel));
+    let _ = core.desktop_redundancy_tick(reserve_probe("fresh")).await;
+    assert!(store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .pending_acquire
+        .is_none());
+    let consumed_id = api
+        .desktop_acquire_requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .operation_id
+        .clone();
+    api.desktop_acquire_errors
+        .lock()
+        .unwrap()
+        .push_back(CoreApiError::Retryable);
+    assert!(core
+        .desktop_redundancy_tick(reserve_probe("new-round"))
+        .await
+        .is_err());
+    let next_id = store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .pending_acquire
+        .as_ref()
+        .unwrap()
+        .operation_id
+        .clone();
+    assert_ne!(next_id, consumed_id);
+    assert_eq!(
+        api.desktop_acquire_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .operation_id,
+        next_id
+    );
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Running);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_failed_candidate_with_lost_commit_receipt_is_retired_as_current_not_forgotten() {
+    let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+    stage_test_candidate(&core, &api, &tunnel, member).await;
+    tunnel.pair.lock().unwrap().as_mut().unwrap().standby_failed = true;
+    let mut response = canonical_pair_role(&tunnel);
+    response.session.slot_b_lease_id =
+        tunnel.pair.lock().unwrap().as_ref().unwrap().leases[1].clone();
+    response.session.membership_generation += 1;
+    api.desktop_role_responses
+        .lock()
+        .unwrap()
+        .push_back(response);
+    core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+    assert!(
+        tunnel
+            .pair
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .session
+            .committed[1]
+    );
+    assert!(store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .candidate
+        .is_none());
+    core.desktop_redundancy_tick(Vec::new()).await.unwrap();
+    assert_eq!(tunnel.commands.lock().unwrap().last().unwrap(), "retire");
+    assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Running);
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_candidate_cleanup_rejects_foreign_canonical_state_without_native_effects() {
+    for wrong in 0..4 {
+        let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+        stage_test_candidate(&core, &api, &tunnel, member).await;
+        tunnel.pair.lock().unwrap().as_mut().unwrap().standby_failed = true;
+        let before = store.value.lock().unwrap().clone();
+        let mut response = canonical_pair_role(&tunnel);
+        match wrong {
+            0 => response.session.session_id = "cccccccc-0000-4000-8000-000000000003".into(),
+            1 => response.session.membership_generation += 1,
+            2 => response.session.standby_desired = false,
+            _ => {
+                response.session.slot_b_lease_id =
+                    Some("cccccccc-0000-4000-8000-000000000003".into())
+            }
+        }
+        api.desktop_role_responses
+            .lock()
+            .unwrap()
+            .push_back(response);
+        assert!(core.desktop_redundancy_tick(Vec::new()).await.is_err());
+        assert!(!tunnel
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "remove_candidate" || c == "commit_candidate" || c == "stop_pair"));
+        assert_eq!(*store.value.lock().unwrap(), before);
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_stop_freezes_last_active_and_replays_the_same_warm_intent() {
+    for direct_stop in [false, true] {
+        for role_confirmed in [true, false] {
+            let api = Arc::new(MockApi::new(0));
+            api.redundant_start.store(true, Ordering::SeqCst);
+            let tunnel = Arc::new(DesktopPairTunnel::default());
+            let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+            let owner = Arc::new(support::TestOwner::new(
+                api.clone(),
+                Arc::new(MemoryStore::new(auth())),
+                local.clone(),
+            ));
+            let access = support::snapshot("access");
+            let paths = nelomai_client_storage::RuntimePaths::new(
+                "/synthetic-no-filesystem-access",
+                access.identity().slot,
+                &access.identity().runtime_version,
+            )
+            .unwrap();
+            let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+            value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+                auth_epoch: access.auth_epoch(),
+                family: access.family().into(),
+                identity: access.identity().clone(),
+            });
+            let store = Arc::new(PairRuntime {
+                paths,
+                value: Mutex::new(value),
+                reject_next_save: AtomicBool::new(false),
+                lose_next_save_ack: AtomicBool::new(false),
+            });
+            let core = nelomai_client_core::ClientCore::new(
+                api.clone(),
+                store.clone(),
+                owner,
+                local,
+                Arc::new(MemoryLogger::default()),
+            );
+            let epoch = core.begin_start_attempt();
+            core.desktop_connection_intent_attempt_with_cancellation_epoch(
+                options(),
+                1_700_000_000,
+                true,
+                epoch,
+            )
+            .await
+            .unwrap();
+            core.finish_start_attempt();
+            let last_active = {
+                let mut stored = store.value.lock().unwrap();
+                let pair = stored.desktop_redundancy.as_mut().unwrap();
+                pair.session.warm_stop_v1 = true;
+                pair.primary_reported = true;
+                let id = pair
+                    .session
+                    .standby
+                    .as_ref()
+                    .unwrap()
+                    .connection
+                    .lease_id
+                    .clone();
+                let mut native = tunnel.pair.lock().unwrap();
+                let native = native.as_mut().unwrap();
+                native.warm_stop_v1 = true;
+                native.leases[1] = Some(id.clone());
+                native.current_leases[1] = Some(id.clone());
+                native.session.installed = [true; 2];
+                native.session.committed = [true; 2];
+                native.session.active = nelomai_client_tunnel::redundancy::Slot::B;
+                native.session.role_confirmed = role_confirmed;
+                if !role_confirmed {
+                    api.desktop_role_responses.lock().unwrap().push_back(
+                        nelomai_contracts::RedundantRoleResponse {
+                            api_version: ApiVersion::V1,
+                            request_id: "role".into(),
+                            action: nelomai_contracts::RedundantRoleAction::Accepted,
+                            local_active_lease_id: id.clone(),
+                            session: nelomai_contracts::RedundantSessionView {
+                                session_id: pair.session.session_id.clone(),
+                                state: nelomai_contracts::RedundantSessionState::Connected,
+                                active_lease_id: Some(id.clone()),
+                                slot_a_lease_id: native.leases[0].clone(),
+                                slot_b_lease_id: native.leases[1].clone(),
+                                standby_desired: true,
+                                role_generation: pair.session.role_generation + 1,
+                                membership_generation: pair.session.membership_generation,
+                                reason: None,
+                            },
+                        },
+                    );
+                }
+                id
+            };
+            api.redundant_stop_responses
+                .lock()
+                .unwrap()
+                .push_back(Err(CoreApiError::Retryable));
+            api.desktop_role_block
+                .store(!role_confirmed, Ordering::SeqCst);
+            let background = core.desktop_redundancy_tick(Vec::new());
+            tokio::pin!(background);
+            if !role_confirmed {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1), &mut background)
+                        .await
+                        .is_err()
+                );
+            }
+            if direct_stop {
+                api.desktop_role_block.store(false, Ordering::SeqCst);
+                api.redundant_stop_responses.lock().unwrap().push_back(Err(
+                    CoreApiError::Rejected {
+                        code: "connection_retryable".into(),
+                        message: "cleanup pending".into(),
+                        retry_after_seconds: Some(10),
+                    },
+                ));
+                assert!(core.stop().await.is_err());
+            } else {
+                tokio::time::timeout(Duration::from_millis(10), core.stop_locally())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            api.desktop_role_block.store(false, Ordering::SeqCst);
+            assert_eq!(tunnel.status().await.unwrap(), TunnelStatus::Stopped);
+            assert!(tunnel
+                .commands
+                .lock()
+                .unwrap()
+                .windows(2)
+                .any(|w| w == ["prepare_stop", "stop_pair"]));
+            let frozen = store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .clone()
+                .unwrap()
+                .stop
+                .unwrap();
+            assert_eq!(frozen.active_lease_id, last_active);
+            assert!(frozen.retain_active_peer);
+            assert_eq!(core.state().await.connection.unwrap().lease_id, last_active);
+            assert!(core.local_stop_pending_cleanup().await);
+            core.stop().await.unwrap();
+            let requests = api.redundant_stop_requests.lock().unwrap();
+            assert!(requests.len() >= 2);
+            assert!(requests.iter().all(|r| r.retain_active_peer
+                && r.lease_id == last_active
+                && r.operation_id == frozen.operation_id));
+            assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_session() {
+    for reconstruct in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        api.redundant_start.store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(DesktopPairTunnel::default());
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let owner = Arc::new(support::TestOwner::new(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            local.clone(),
+        ));
+        let access = support::snapshot("access");
+        let paths = nelomai_client_storage::RuntimePaths::new(
+            "/synthetic-no-filesystem-access",
+            access.identity().slot,
+            &access.identity().runtime_version,
+        )
+        .unwrap();
+        let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+        value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        });
+        let store = Arc::new(PairRuntime {
+            paths,
+            value: Mutex::new(value),
+            reject_next_save: AtomicBool::new(false),
+            lose_next_save_ack: AtomicBool::new(false),
+        });
+        let core = nelomai_client_core::ClientCore::new(
+            api.clone(),
+            store.clone(),
+            owner.clone(),
+            local.clone(),
+            Arc::new(MemoryLogger::default()),
+        );
+        let epoch = core.begin_start_attempt();
+        core.desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap();
+        core.finish_start_attempt();
+        let original = store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .clone()
+            .unwrap();
+        let original_native = tunnel.pair.lock().unwrap().clone().unwrap();
+        let scope = original_native.session.scope.clone();
+        // Helper restart already cleaned native resources and retains no owner.
+        *tunnel.pair.lock().unwrap() = None;
+        *tunnel.legacy.status.lock().unwrap() = TunnelStatus::Stopped;
+        tunnel.scopes.lock().unwrap().clear();
+        if reconstruct {
+            store.reject_next_save.store(true, Ordering::SeqCst);
+            assert!(matches!(core.stop_locally().await, Err(CoreError::Storage)));
+            assert!(store
+                .value
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .stop
+                .is_none());
+            assert!(
+                api.redundant_stop_requests.lock().unwrap().is_empty(),
+                "server Stop requires sealed intent"
+            );
+            assert_eq!(
+                tunnel.scopes.lock().unwrap().as_slice(),
+                [scope.clone(), scope.clone()]
+            );
+            tunnel.scopes.lock().unwrap().clear();
+        }
+        api.redundant_stop_responses
+            .lock()
+            .unwrap()
+            .push_back(Err(CoreApiError::Retryable));
+        core.stop_locally().await.unwrap();
+        let cold = store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_ref()
+            .unwrap()
+            .stop
+            .clone()
+            .unwrap();
+        assert_eq!(cold.active_lease_id, original.connection.lease_id);
+        assert_eq!(
+            cold.committed_leases,
+            [
+                Some(original.connection.lease_id.clone()),
+                original
+                    .session
+                    .standby
+                    .as_ref()
+                    .map(|m| m.connection.lease_id.clone())
+            ]
+        );
+        assert_eq!(cold.role_generation, original.session.role_generation);
+        assert_eq!(
+            cold.membership_generation,
+            original.session.membership_generation
+        );
+        assert!(
+            !cold.retain_active_peer && !cold.role_confirmed,
+            "absence cannot infer a native last-active role"
+        );
+        assert_eq!(
+            tunnel.scopes.lock().unwrap().as_slice(),
+            [scope.clone(), scope.clone()]
+        );
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+        if reconstruct {
+            let replay_local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+            let replay_owner = Arc::new(support::TestOwner::new(
+                api.clone(),
+                Arc::new(MemoryStore::new(auth())),
+                replay_local.clone(),
+            ));
+            let replay = nelomai_client_core::ClientCore::new(
+                api.clone(),
+                store.clone(),
+                replay_owner,
+                replay_local,
+                Arc::new(MemoryLogger::default()),
+            );
+            assert!(replay.state().await.connection.is_none());
+            // Even a sealed cold replay must fail closed on an unknown status.
+            tunnel.fail_absence.store(true, Ordering::SeqCst);
+            assert!(replay.stop().await.is_err());
+            assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+            assert!(store
+                .value
+                .lock()
+                .unwrap()
+                .pending_compensation_stop
+                .is_some());
+            tunnel.fail_absence.store(false, Ordering::SeqCst);
+            let mut foreign = original_native;
+            foreign.session.scope.connection_generation += 1;
+            *tunnel.pair.lock().unwrap() = Some(foreign.clone());
+            assert!(replay.stop().await.is_err());
+            assert_eq!(tunnel.pair.lock().unwrap().as_ref(), Some(&foreign));
+            assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+            *tunnel.pair.lock().unwrap() = None;
+            replay.stop().await.unwrap();
+        } else {
+            core.stop().await.unwrap();
+        }
+        assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+        assert!(store
+            .value
+            .lock()
+            .unwrap()
+            .pending_compensation_stop
+            .is_none());
+        assert_eq!(tunnel.legacy.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(api.stop_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(api.desktop_role_calls.load(Ordering::SeqCst), 0);
+        assert!(tunnel.scopes.lock().unwrap().iter().all(|s| s == &scope));
+        let requests = api.redundant_stop_requests.lock().unwrap();
+        assert!(requests.len() >= 2);
+        assert!(requests.iter().all(|r| !r.retain_active_peer
+            && r.lease_id == original.connection.lease_id
+            && r.session_id == original.session.session_id
+            && r.operation_id == cold.operation_id));
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_helper_restart_unknown_or_foreign_status_cannot_authorize_stop() {
+    for fault in 0..4 {
+        let api = Arc::new(MockApi::new(0));
+        api.redundant_start.store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(DesktopPairTunnel::default());
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let owner = Arc::new(support::TestOwner::new(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            local.clone(),
+        ));
+        let access = support::snapshot("access");
+        let paths = nelomai_client_storage::RuntimePaths::new(
+            "/synthetic-no-filesystem-access",
+            access.identity().slot,
+            &access.identity().runtime_version,
+        )
+        .unwrap();
+        let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+        value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        });
+        let store = Arc::new(PairRuntime {
+            paths,
+            value: Mutex::new(value),
+            reject_next_save: AtomicBool::new(false),
+            lose_next_save_ack: AtomicBool::new(false),
+        });
+        let core = nelomai_client_core::ClientCore::new(
+            api.clone(),
+            store.clone(),
+            owner,
+            local,
+            Arc::new(MemoryLogger::default()),
+        );
+        let epoch = core.begin_start_attempt();
+        core.desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap();
+        core.finish_start_attempt();
+        let scope = tunnel
+            .pair
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .session
+            .scope
+            .clone();
+        let original = store.value.lock().unwrap().desktop_redundancy.clone();
+        if fault == 1 {
+            tunnel
+                .pair
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .session
+                .scope
+                .connection_generation += 1;
+        } else {
+            *tunnel.pair.lock().unwrap() = None;
+        }
+        *tunnel.legacy.status.lock().unwrap() = match fault {
+            2 => TunnelStatus::Starting,
+            3 => TunnelStatus::Running,
+            _ => TunnelStatus::Stopped,
+        };
+        tunnel.fail_absence.store(fault == 0, Ordering::SeqCst);
+        let native = tunnel.pair.lock().unwrap().clone();
+        tunnel.scopes.lock().unwrap().clear();
+        assert!(core.stop_locally().await.is_err());
+        assert_eq!(tunnel.pair.lock().unwrap().as_ref(), native.as_ref());
+        assert_eq!(store.value.lock().unwrap().desktop_redundancy, original);
+        assert!(store
+            .value
+            .lock()
+            .unwrap()
+            .pending_compensation_stop
+            .is_none());
+        assert!(api.redundant_stop_requests.lock().unwrap().is_empty());
+        assert_eq!(tunnel.legacy.stops.load(Ordering::SeqCst), 0);
+        assert!(tunnel.scopes.lock().unwrap().iter().all(|s| s == &scope));
     }
 }
 

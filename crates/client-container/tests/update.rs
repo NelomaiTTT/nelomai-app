@@ -218,6 +218,7 @@ impl RuntimeSwitchControl for Control {
         self.handoffs.fetch_add(1, Ordering::SeqCst);
         let identity = source.identity().ok_or(BrokerError::RecoveryRequired)?;
         let snapshot = RuntimeCleanupSnapshotV1 {
+            redundant_session_ids: Vec::new(),
             slot: identity.slot,
             runtime_version: identity.runtime_version.clone(),
             auth_scope: Some(nelomai_client_storage::RuntimeAuthScope {

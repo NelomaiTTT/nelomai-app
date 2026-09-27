@@ -464,8 +464,20 @@ fn warm_stop_extension_is_optional_and_typed() {
         serde_json::from_str(&fixture("valid/connection-redundant-stop.json")).unwrap();
     stop["retain_active_peer"] = Value::Bool(true);
     assert!(schema_is_valid("connection-redundancy.schema.json", &stop));
+    let retain: RedundantStopRequest = serde_json::from_value(stop.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(retain).unwrap()["retain_active_peer"],
+        true
+    );
+    stop.as_object_mut().unwrap().remove("retain_active_peer");
+    let release: RedundantStopRequest = serde_json::from_value(stop.clone()).unwrap();
+    assert!(serde_json::to_value(release)
+        .unwrap()
+        .get("retain_active_peer")
+        .is_none());
     stop["retain_active_peer"] = Value::String("true".into());
     assert!(!schema_is_valid("connection-redundancy.schema.json", &stop));
+    assert!(serde_json::from_value::<RedundantStopRequest>(stop).is_err());
 }
 
 #[test]

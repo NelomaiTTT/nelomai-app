@@ -1,0 +1,1317 @@
+//! Native assembly used by the engine's CompositeBackend.
+//! Construction accepts an authenticated service layout
+//! and protected record adapter, never paths or runtime authority from IPC.
+use super::{
+    member_files::MemberFiles, member_guard::NativeGuard, member_metrics::MemberMetrics,
+    member_owner::NativeMemberIo, member_routes::NativeRowIo, member_session::*,
+};
+use crate::{
+    member_actor::PairFactory,
+    member_dns::{self, Identity, Ownership},
+    member_guard::{ExchangePlan, GuardStore, ProbeTuple, SplitEngines},
+    member_owner::{Journal, MemberOwner, Phase, Record as OwnerRecord},
+    member_pair::*,
+    member_physical::{Family, InterfaceIdentity, PhysicalProof, PhysicalRoute, PhysicalSnapshot},
+    member_plan::{member_route_plan, InterfaceMetric},
+    member_routes::{IdentityCheck, MemberRoutes, NativeProof},
+};
+use nelomai_client_tunnel::{
+    detect_configuration_transport,
+    redundancy::{
+        control::SessionControl,
+        driver::{NativePair as _, SessionStore},
+        evidence::NativeHealthSample,
+        network::{
+            NetworkJournalStore, NetworkOwner, NetworkSystem, NetworkValue, ResourceKey,
+            RouteScope, RouteValue,
+        },
+        protocol::{Command, Member},
+        NativeProbeSocket, SessionScope, Slot,
+    },
+    DesktopTunnelOptions, TunnelMetrics,
+};
+use nelomai_contracts::RuntimeSlot;
+use sha2::{Digest, Sha256};
+use std::{
+    cell::RefCell,
+    io,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use windows_sys::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
+
+type Owner = MemberOwner<MemberFiles, NativeMemberIo<MemberFiles>>;
+#[derive(Clone)]
+struct Proofs {
+    members: [Option<MemberRecord>; 2],
+    physical: Vec<PhysicalLease>,
+}
+#[derive(Clone)]
+struct Identities(Rc<RefCell<Proofs>>);
+impl IdentityCheck for Identities {
+    fn verify(&mut self, index: u32) -> io::Result<NativeProof> {
+        let proofs = self.0.borrow();
+        if let Some(m) = proofs
+            .members
+            .iter()
+            .flatten()
+            .find(|m| m.owner.proof.is_some_and(|p| p.interface.index == index))
+        {
+            verify_record(m)?;
+            let p = m.owner.proof.ok_or_else(failed)?;
+            return Ok(NativeProof {
+                index,
+                luid: p.interface.luid,
+            });
+        }
+        let p = proofs
+            .physical
+            .iter()
+            .find(|p| p.interface == index)
+            .ok_or_else(failed)?;
+        let actual = super::member_physical::read_identity(index)?;
+        if actual
+            != (InterfaceIdentity {
+                index,
+                luid: p.luid,
+                guid: p.guid,
+            })
+        {
+            return Err(failed());
+        }
+        Ok(NativeProof {
+            index,
+            luid: p.luid,
+        })
+    }
+}
+struct RouteStore<F: SessionFiles> {
+    store: Rc<RefCell<ProtectedStore<F, NativeNetworkRecord>>>,
+    proofs: Identities,
+}
+impl<F: SessionFiles> NetworkJournalStore for RouteStore<F> {
+    fn save(
+        &mut self,
+        journal: &nelomai_client_tunnel::redundancy::network::NetworkJournal,
+    ) -> io::Result<()> {
+        self.store.borrow_mut().save_value(&NativeNetworkRecord {
+            journal: journal.clone(),
+            physical: self.proofs.0.borrow().physical.clone(),
+        })
+    }
+}
+struct CheckedRows {
+    rows: MemberRoutes<NativeRowIo, Identities>,
+    proofs: Identities,
+}
+impl CheckedRows {
+    fn absent_member(&self, key: &ResourceKey) -> io::Result<bool> {
+        let ResourceKey::Route(_, RouteScope::WindowsInterface(index)) = key else {
+            return Err(failed());
+        };
+        let member = self
+            .proofs
+            .0
+            .borrow()
+            .members
+            .iter()
+            .flatten()
+            .find(|m| {
+                m.owner
+                    .proof
+                    .or(m.owner.retired_proof)
+                    .is_some_and(|p| p.interface.index == *index)
+            })
+            .cloned();
+        match member {
+            Some(m) => retained_owner(&m)?
+                .confirm_absent(&m.owner)
+                .map_err(|_| failed()),
+            None => Ok(false),
+        }
+    }
+}
+impl NetworkSystem for CheckedRows {
+    fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        if self.absent_member(key)? {
+            return crate::member_routes::read_absent_route(&mut NativeRowIo, key, || {
+                self.absent_member(key)
+            });
+        }
+        self.rows.read(key)
+    }
+    fn compare_exchange(
+        &mut self,
+        key: &ResourceKey,
+        before: Option<&NetworkValue>,
+        after: Option<&NetworkValue>,
+    ) -> io::Result<()> {
+        if self.absent_member(key)? {
+            if before.is_none() && after.is_none() && self.read(key)?.is_none() {
+                return Ok(());
+            }
+            return Err(failed());
+        }
+        self.rows.compare_exchange(key, before, after)
+    }
+}
+type Routes<F> = NetworkOwner<CheckedRows, RouteStore<F>>;
+pub(crate) struct WindowsPairIo<F: SessionFiles> {
+    scope: SessionScope,
+    engine: PathBuf,
+    runtime: Rc<tokio::runtime::Runtime>,
+    owners: [Option<Owner>; 2],
+    guard: NativeGuard,
+    routes: Option<Routes<F>>,
+    proofs: Identities,
+    guard_reopen: bool,
+    guard_read_failed: bool,
+    files: F,
+}
+impl<F: SessionFiles> WindowsPairIo<F> {
+    fn open(
+        scope: SessionScope,
+        engine: PathBuf,
+        runtime: Rc<tokio::runtime::Runtime>,
+        files: F,
+        recovered: Option<&PairRecord>,
+    ) -> io::Result<Self> {
+        let (store, saved) = ProtectedStore::<F, NativeNetworkRecord>::open(
+            files.clone(),
+            scope.clone(),
+            RecordKind::Network,
+        )?;
+        let saved = saved.unwrap_or_default();
+        let members = recovered.map(|r| r.members.clone()).unwrap_or([None, None]);
+        let proofs = Identities(Rc::new(RefCell::new(Proofs {
+            members,
+            physical: saved.physical,
+        })));
+        let routes = NetworkOwner::recover(
+            CheckedRows {
+                rows: MemberRoutes::new(NativeRowIo, proofs.clone()),
+                proofs: proofs.clone(),
+            },
+            RouteStore {
+                store: Rc::new(RefCell::new(store)),
+                proofs: proofs.clone(),
+            },
+            saved.journal,
+        )?;
+        let guard = NativeGuard::open(scope.clone()).map_err(|_| failed())?;
+        let mut value = Self {
+            scope,
+            engine,
+            runtime,
+            owners: [None, None],
+            guard,
+            routes: Some(routes),
+            proofs,
+            guard_reopen: false,
+            guard_read_failed: false,
+            files,
+        };
+        if let Some(record) = recovered {
+            for slot in [Slot::A, Slot::B] {
+                if let Some(m) = &record.members[slot.idx()] {
+                    if value.abandon_unstarted(m)? {
+                        continue;
+                    }
+                    let mut files = MemberFiles::new().map_err(|_| failed())?;
+                    let saved = files
+                        .load(slot_native(slot))
+                        .map_err(|_| failed())?
+                        .ok_or_else(failed)?;
+                    if saved.intent != m.owner.intent {
+                        return Err(failed());
+                    }
+                    let io = NativeMemberIo::for_retained_cleanup(
+                        &saved,
+                        MemberFiles::new().map_err(|_| failed())?,
+                    )
+                    .map_err(|_| failed())?;
+                    value.owners[slot.idx()] = Some(
+                        MemberOwner::recover_for_cleanup(
+                            value.scope.clone(),
+                            slot_native(slot),
+                            saved.intent.transport,
+                            value.engine.clone(),
+                            saved,
+                            files,
+                            io,
+                        )
+                        .map_err(|_| failed())?,
+                    );
+                }
+            }
+        }
+        Ok(value)
+    }
+    fn owner(&mut self, m: &MemberRecord) -> io::Result<&mut Owner> {
+        if m.owner.intent.scope != self.scope {
+            return Err(failed());
+        }
+        self.owners[slot_shared(m.owner.intent.slot).idx()]
+            .as_mut()
+            .ok_or_else(failed)
+    }
+    fn sync_proofs(&mut self, members: &[Option<MemberRecord>; 2]) {
+        for slot in [Slot::A, Slot::B] {
+            if let Some(m) = &members[slot.idx()] {
+                self.proofs.0.borrow_mut().members[slot.idx()] = Some(m.clone());
+            }
+        }
+    }
+    fn physical_snapshot(
+        &mut self,
+        members: &[Option<MemberRecord>; 2],
+    ) -> io::Result<PhysicalSnapshot> {
+        verify_physical_members(self, members)?;
+        let snapshot = super::member_physical::capture(&owned(members))?;
+        let proofs = self.proofs.0.borrow();
+        let mut excluded = Vec::new();
+        for route in self.routes.as_ref().ok_or_else(failed)?.excluded_routes() {
+            if proofs.members.iter().flatten().any(|m| {
+                m.owner
+                    .proof
+                    .or(m.owner.retired_proof)
+                    .is_some_and(|p| p.interface.index == route.interface)
+            }) {
+                continue;
+            }
+            let retained = proofs
+                .physical
+                .iter()
+                .find(|p| p.interface == route.interface)
+                .ok_or_else(failed)?;
+            let identity = super::member_physical::read_identity(route.interface)?;
+            if identity
+                != (InterfaceIdentity {
+                    index: route.interface,
+                    luid: retained.luid,
+                    guid: retained.guid,
+                })
+            {
+                return Err(failed());
+            }
+            excluded.push(crate::member_routes::Row::static_route(
+                route,
+                NativeProof {
+                    index: identity.index,
+                    luid: identity.luid,
+                },
+            ));
+        }
+        let snapshot = snapshot
+            .without_owned_rows(&excluded)
+            .map_err(|_| failed())?;
+        drop(proofs);
+        verify_physical_members(self, members)?;
+        Ok(snapshot)
+    }
+}
+impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
+    type Socket = NativeProbeSocket;
+    fn prepare_member(&mut self, scope: &SessionScope, m: &Member) -> io::Result<MemberRecord> {
+        if scope != &self.scope {
+            return Err(failed());
+        }
+        if let Some(owner) = &mut self.owners[m.slot.idx()] {
+            let retired = owner.snapshot().map_err(|_| failed())?.ok_or_else(failed)?;
+            let (_, pair) =
+                WindowsPairStore::open(self.files.clone(), scope.clone(), RecordKind::Pair)?;
+            let routes = self.routes.as_ref().ok_or_else(failed)?;
+            if routes.cleanup_pending() {
+                return Err(failed());
+            }
+            let guard = GuardStore::snapshot(&mut self.guard, scope).map_err(|_| failed())?;
+            verify_retired_slot(
+                &retired,
+                &pair.ok_or_else(failed)?,
+                &routes.excluded_routes(),
+                &guard,
+            )?;
+            if !owner.confirm_absent(&retired).map_err(|_| failed())? {
+                return Err(failed());
+            }
+        }
+        let p = MemberParameters::parse(m.configuration.expose())?;
+        if !p
+            .allowed
+            .iter()
+            .any(|n| n.contains(&IpAddr::V4(m.probe.target_ipv4)))
+        {
+            return Err(failed());
+        }
+        let transport = detect_configuration_transport(m.configuration.expose());
+        let native = NativeMemberIo::from_trusted_factory(
+            self.engine.clone(),
+            slot_native(m.slot),
+            transport,
+            MemberFiles::new().map_err(|_| failed())?,
+        )
+        .map_err(|_| failed())?;
+        let mut owner = MemberOwner::from_trusted_engine(
+            scope.clone(),
+            slot_native(m.slot),
+            transport,
+            self.engine.clone(),
+            m.configuration.expose(),
+            MemberFiles::new().map_err(|_| failed())?,
+            native,
+        )
+        .map_err(|_| failed())?;
+        let prior_stopped = owner.prior_stopped().map_err(|_| failed())?;
+        let record = MemberRecord {
+            prior_stopped,
+            owner: OwnerRecord {
+                intent: owner.intent().clone(),
+                phase: Phase::Prepared,
+                proof: None,
+                retired_proof: None,
+                previous_config_sha256: None,
+            },
+            source: p.source,
+            endpoint: p.endpoint,
+            allowed: p.allowed,
+            dns: p.dns,
+            probe: m.probe.clone(),
+            peer: p.peer,
+            started_epoch_ms: epoch_ms()?,
+        };
+        self.owners[m.slot.idx()] = Some(owner);
+        Ok(record)
+    }
+    fn start(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
+        self.owner(m)?
+            .start_with_prior(m.prior_stopped.as_ref())
+            .map_err(|_| failed())
+    }
+    fn abandon_unstarted(&mut self, m: &MemberRecord) -> io::Result<bool> {
+        if m.owner.intent.scope != self.scope || m.owner.intent.engine != self.engine {
+            return Err(failed());
+        }
+        let mut files = MemberFiles::new().map_err(|_| failed())?;
+        let current = files.load(m.owner.intent.slot).map_err(|_| failed())?;
+        if !matches_unstarted_prior(m, current.as_ref())? {
+            return Ok(false);
+        }
+        let absent = if let Some(prior) = &current {
+            let mut retained = m.clone();
+            retained.owner = prior.clone();
+            retained_owner(&retained)?
+                .confirm_absent(prior)
+                .map_err(|_| failed())?
+        } else {
+            let mut io = NativeMemberIo::from_trusted_factory(
+                self.engine.clone(),
+                m.owner.intent.slot,
+                m.owner.intent.transport,
+                MemberFiles::new().map_err(|_| failed())?,
+            )
+            .map_err(|_| failed())?;
+            let observed = io.observe_unclaimed().map_err(|_| failed())?;
+            observed.config_sha256.is_none()
+                && observed.service.is_none()
+                && !observed.alternative_service_present
+                && observed.interface.is_none()
+                && observed.retained_interfaces.is_empty()
+        };
+        if !absent || files.load(m.owner.intent.slot).map_err(|_| failed())? != current {
+            return Err(failed());
+        }
+        self.proofs.0.borrow_mut().members[slot_shared(m.owner.intent.slot).idx()] = None;
+        Ok(true)
+    }
+    fn current(&mut self, slot: Slot) -> io::Result<Option<OwnerRecord>> {
+        let current = self.owners[slot.idx()]
+            .as_mut()
+            .ok_or_else(failed)?
+            .snapshot()
+            .map_err(|_| failed())?;
+        if let (Some(m), Some(r)) = (
+            &mut self.proofs.0.borrow_mut().members[slot.idx()],
+            &current,
+        ) {
+            if m.owner.intent != r.intent {
+                return Err(failed());
+            }
+            m.owner = r.clone();
+        }
+        Ok(current)
+    }
+    fn verify(&mut self, m: &MemberRecord) -> io::Result<()> {
+        self.owner(m)?.verify_live(&m.owner).map_err(|_| failed())
+    }
+    fn confirm_absent(&mut self, m: &MemberRecord) -> io::Result<bool> {
+        self.owner(m)?
+            .confirm_absent(&m.owner)
+            .map_err(|_| failed())
+    }
+    fn confirm_inactive_for_discovery(&mut self, m: &MemberRecord) -> io::Result<bool> {
+        self.owner(m)?
+            .confirm_inactive_for_discovery(&m.owner)
+            .map_err(|_| failed())
+    }
+    fn stop(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
+        let owner = self.owner(m)?;
+        let current = owner.snapshot().map_err(|_| failed())?.ok_or_else(failed)?;
+        if current.intent != m.owner.intent {
+            return Err(failed());
+        }
+        owner.stop_best_effort(&current).map_err(|_| failed())
+    }
+    fn rebind(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
+        self.owner(m)?.rebind(&m.owner).map_err(|_| failed())
+    }
+    fn observe(&mut self, m: &MemberRecord) -> io::Result<(TunnelMetrics, NativeHealthSample)> {
+        self.verify(m)?;
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(failed());
+        }
+        let metrics = MemberMetrics::capture_owned(
+            m.owner.intent.slot,
+            m.owner.intent.transport,
+            m.owner.proof.ok_or_else(failed)?,
+            m.peer,
+            m.started_epoch_ms,
+        )?;
+        let sample = self.runtime.block_on(metrics.read())?;
+        self.verify(m)?;
+        let now = epoch_ms()?;
+        let handshake_fresh = sample
+            .transport
+            .latest_handshake_epoch_millis
+            .filter(|t| *t > 0)
+            .and_then(|t| now.checked_sub(t))
+            .is_some_and(|age| age <= 180_000);
+        Ok((
+            sample.transport,
+            NativeHealthSample {
+                admitted: true,
+                closed: false,
+                handshake_fresh,
+                tx_packets: sample.sent_unicast_packets,
+                rx_data_packets: sample.received_unicast_packets,
+            },
+        ))
+    }
+    fn fingerprint(&mut self, members: &[Option<MemberRecord>; 2]) -> io::Result<String> {
+        let snapshot = self.physical_snapshot(members)?;
+        let mut hash = Sha256::new();
+        let mut found = false;
+        for family in [Family::V4, Family::V6] {
+            if let Some(path) = snapshot.default_route(family).map_err(|_| failed())? {
+                found = true;
+                hash.update(format!(
+                    "{family:?}|{}|{}|{:?}|{}|{:?}|{};",
+                    path.proof.identity.index,
+                    path.proof.identity.luid,
+                    path.proof.identity.guid,
+                    path.proof.metric,
+                    path.row.route.gateway,
+                    path.row.route.metric
+                ));
+                let mut lan = snapshot
+                    .rows()
+                    .iter()
+                    .filter(|r| {
+                        r.route.interface == path.proof.identity.index
+                            && r.route.gateway.is_none()
+                            && r.route.destination.prefix_len() > 0
+                            && Family::of(r.route.destination.addr()) == family
+                    })
+                    .map(|r| r.route.destination.to_string())
+                    .collect::<Vec<_>>();
+                lan.sort();
+                lan.dedup();
+                for n in lan {
+                    hash.update(n);
+                    hash.update(b";");
+                }
+            }
+        }
+        if !found {
+            return Err(failed());
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    fn open_base(&mut self, m: &MemberRecord) -> io::Result<(Self::Socket, ProbeTuple)> {
+        self.verify(m)?;
+        let proof = m.owner.proof.ok_or_else(failed)?;
+        verify_source(m)?;
+        let socket = NativeProbeSocket::open(proof.interface.index, m.source, m.probe.target_ipv4)?;
+        self.verify(m)?;
+        verify_source(m)?;
+        let source = socket.local_addr()?;
+        if source.ip() != IpAddr::V4(m.source) || source.port() == 0 {
+            return Err(failed());
+        }
+        Ok((
+            socket,
+            ProbeTuple {
+                source: source.ip(),
+                source_port: source.port(),
+                target: m.probe.target_ipv4.into(),
+                target_port: 53,
+                protocol: 17,
+            },
+        ))
+    }
+    fn guard_snapshot(&mut self) -> io::Result<crate::member_guard::Snapshot> {
+        if self.guard_read_failed {
+            // The first failure was already returned to the pair's sticky
+            // fail-stop latch. A fresh read handle can prove cleanup after BFE
+            // restarts; it never recreates filters or resumes the old pair.
+            self.guard = NativeGuard::open(self.scope.clone()).map_err(|_| failed())?;
+            self.guard_read_failed = false;
+            self.guard_reopen = false;
+        }
+        let result = GuardStore::snapshot(&mut self.guard, &self.scope).map_err(|_| failed());
+        if result.is_err() {
+            self.guard_read_failed = true;
+        }
+        result
+    }
+    fn guard_exchange(&mut self, p: &ExchangePlan) -> io::Result<()> {
+        if *p != ExchangePlan::new(&p.expected, &p.desired).map_err(|_| failed())? {
+            return Err(failed());
+        }
+        if self.guard_reopen {
+            let mut replacement = NativeGuard::open(self.scope.clone()).map_err(|_| failed())?;
+            if GuardStore::snapshot(&mut replacement, &self.scope).map_err(|_| failed())?
+                != p.expected.expected
+            {
+                return Err(failed());
+            }
+            self.guard = replacement;
+            self.guard_reopen = false;
+        }
+        GuardStore::compare_exchange(&mut self.guard, &p.expected, &p.desired).map_err(|_| failed())
+    }
+    fn close_permits(&mut self) -> io::Result<()> {
+        SplitEngines::close_permits(&mut self.guard).map_err(|_| failed())?;
+        self.guard_reopen = true;
+        Ok(())
+    }
+    fn select_routes(
+        &mut self,
+        active: Slot,
+        members: &[Option<MemberRecord>; 2],
+        options: &DesktopTunnelOptions,
+    ) -> io::Result<()> {
+        let live = live_route_members(self, active, members)?;
+        let snapshot = self.physical_snapshot(members)?;
+        let (routes, physical) = plan(&snapshot, active, &live, options)?;
+        self.sync_proofs(members);
+        // Keep old physical identities too: removals/rollback must validate the
+        // original interface, never authorize index reuse from a fresh discovery.
+        {
+            let mut proofs = self.proofs.0.borrow_mut();
+            for p in &physical {
+                if let Some(old) = proofs
+                    .physical
+                    .iter()
+                    .find(|old| old.interface == p.interface)
+                {
+                    if old.luid != p.luid || old.guid != p.guid {
+                        return Err(failed());
+                    }
+                }
+                if !proofs.physical.contains(p) {
+                    proofs.physical.push(p.clone());
+                }
+            }
+        }
+        // Old leases attest interface identity for deletion, not the continued
+        // existence of the old gateway/default. New selection is independently
+        // revalidated before any owned route additions below.
+        for p in &physical {
+            super::member_physical::verify(&p.restore(), &owned(members))?;
+        }
+        self.routes.as_mut().ok_or_else(failed)?.select(
+            active,
+            routes.into_iter().map(NetworkValue::Route).collect(),
+        )?;
+        live_route_members(self, active, members)?;
+        Ok(())
+    }
+    fn cleanup_routes(&mut self) -> io::Result<()> {
+        let routes = self.routes.as_mut().ok_or_else(failed)?;
+        routes.cleanup()?;
+        // Cleanup is terminal for one NetworkOwner transaction lifetime. A
+        // validated rebind may start another empty lifetime under the SAME
+        // protected store, only after complete exact cleanup succeeded.
+        let (system, mut store) = self.routes.take().ok_or_else(failed)?.into_parts();
+        self.proofs.0.borrow_mut().physical.clear();
+        let saved = store.save(&Default::default());
+        self.routes = Some(NetworkOwner::fresh(system, store));
+        saved
+    }
+    fn read_dns(&mut self, m: &MemberRecord) -> io::Result<member_dns::Snapshot> {
+        let interface = dns_interface(m)?;
+        super::member_dns::owned(interface, OwnedIdentity(m.clone()))
+            .map_err(|_| failed())?
+            .snapshot()
+            .map_err(|_| failed())
+    }
+    fn exchange_dns(
+        &mut self,
+        before: &member_dns::Snapshot,
+        after: &member_dns::Snapshot,
+    ) -> io::Result<()> {
+        let m = self
+            .proofs
+            .0
+            .borrow()
+            .members
+            .iter()
+            .flatten()
+            .find(|m| {
+                m.owner
+                    .proof
+                    .is_some_and(|p| p.interface.index == before.interface.index)
+            })
+            .cloned()
+            .ok_or_else(failed)?;
+        let interface = dns_interface(&m)?;
+        if interface != before.interface || interface != after.interface {
+            return Err(failed());
+        }
+        super::member_dns::owned(interface, OwnedIdentity(m))
+            .map_err(|_| failed())?
+            .compare_exchange(before, after)
+            .map_err(|_| failed())?;
+        Ok(())
+    }
+}
+fn epoch_ms() -> io::Result<u64> {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| failed())?
+            .as_millis(),
+    )
+    .map_err(|_| failed())
+}
+fn owned(members: &[Option<MemberRecord>; 2]) -> Vec<InterfaceIdentity> {
+    members
+        .iter()
+        .flatten()
+        .filter_map(|m| {
+            m.owner.proof.map(|p| InterfaceIdentity {
+                index: p.interface.index,
+                luid: p.interface.luid,
+                guid: p.interface.guid,
+            })
+        })
+        .collect()
+}
+fn verify_record(m: &MemberRecord) -> io::Result<()> {
+    retained_owner(m)?
+        .verify_retained(&m.owner)
+        .map_err(|_| failed())
+}
+fn retained_owner(m: &MemberRecord) -> io::Result<Owner> {
+    let files = MemberFiles::new().map_err(|_| failed())?;
+    let native =
+        NativeMemberIo::for_retained_cleanup(&m.owner, MemberFiles::new().map_err(|_| failed())?)
+            .map_err(|_| failed())?;
+    // Only retained exact proof is queried; no service creation/adoption.
+    MemberOwner::recover_for_cleanup(
+        m.owner.intent.scope.clone(),
+        m.owner.intent.slot,
+        m.owner.intent.transport,
+        m.owner.intent.engine.clone(),
+        m.owner.clone(),
+        files,
+        native,
+    )
+    .map_err(|_| failed())
+}
+struct OwnedIdentity(MemberRecord);
+impl Identity for OwnedIdentity {
+    fn verify_owned(&mut self, i: &member_dns::OwnedInterface) -> member_dns::Result<Ownership> {
+        if dns_interface(&self.0).map_err(|_| member_dns::DnsError::Ownership)? != *i {
+            return Err(member_dns::DnsError::Ownership);
+        }
+        verify_record(&self.0).map_err(|_| member_dns::DnsError::Ownership)?;
+        Ok(Ownership::NewlyCreated)
+    }
+}
+fn dns_interface(m: &MemberRecord) -> io::Result<member_dns::OwnedInterface> {
+    let p = m.owner.proof.ok_or_else(failed)?;
+    Ok(member_dns::OwnedInterface {
+        scope: m.owner.intent.scope.clone(),
+        index: p.interface.index,
+        luid: p.interface.luid,
+        guid: p.interface.guid,
+    })
+}
+fn verify_source(m: &MemberRecord) -> io::Result<()> {
+    let p = m.owner.proof.ok_or_else(failed)?;
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceIndex = p.interface.index;
+    row.InterfaceLuid.Value = p.interface.luid;
+    row.Address.Ipv4 = SOCKADDR_IN {
+        sin_family: AF_INET,
+        sin_port: 0,
+        sin_addr: IN_ADDR {
+            S_un: IN_ADDR_0 {
+                S_addr: u32::from_ne_bytes(m.source.octets()),
+            },
+        },
+        sin_zero: [0; 8],
+    };
+    if unsafe { GetUnicastIpAddressEntry(&mut row) } != 0
+        || row.InterfaceIndex != p.interface.index
+        || unsafe { row.InterfaceLuid.Value } != p.interface.luid
+        || row.DadState != 4
+    {
+        return Err(failed());
+    }
+    Ok(())
+}
+
+pub(crate) type NativeWindowsPair<F> = SessionNativePair<WindowsPairIo<F>, WindowsPairStore<F>>;
+pub(crate) struct NativePairFactory<F: SessionFiles> {
+    files: F,
+    runtime: RuntimeSlot,
+    engine: PathBuf,
+    executor: Rc<tokio::runtime::Runtime>,
+}
+impl<F: SessionFiles> NativePairFactory<F> {
+    pub(crate) fn new(files: F, runtime: RuntimeSlot, trusted_engine: &Path) -> io::Result<Self> {
+        if tokio::runtime::Handle::try_current().is_ok()
+            || !trusted_engine.is_absolute()
+            || std::fs::canonicalize(trusted_engine)? != trusted_engine
+        {
+            return Err(failed());
+        }
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self {
+            files,
+            runtime,
+            engine: trusted_engine.into(),
+            executor: Rc::new(executor),
+        })
+    }
+    fn complete_unrecorded_claim(
+        &mut self,
+        scope: &SessionScope,
+        session_files: &mut F,
+    ) -> io::Result<()> {
+        let mut records_present = [false; 3];
+        for (index, kind) in [RecordKind::Session, RecordKind::Pair, RecordKind::Network]
+            .into_iter()
+            .enumerate()
+        {
+            records_present[index] = session_files.read(scope, kind)?.is_some();
+        }
+        let mut guard = NativeGuard::open(scope.clone()).map_err(|_| failed())?;
+        verify_empty_claim(
+            scope,
+            records_present,
+            |slot| {
+                let slot = slot_native(slot);
+                let mut files = MemberFiles::new().map_err(|_| failed())?;
+                let record = files.load(slot).map_err(|_| failed())?;
+                let private = MemberFiles::new().map_err(|_| failed())?;
+                let mut native = match &record {
+                    Some(record) => NativeMemberIo::for_retained_cleanup(record, private),
+                    None => NativeMemberIo::from_trusted_factory(
+                        self.engine.clone(),
+                        slot,
+                        nelomai_client_tunnel::TunnelTransport::WireGuard,
+                        private,
+                    ),
+                }
+                .map_err(|_| failed())?;
+                // observe_unclaimed also rejects the other transport's service /
+                // alias. No synthetic intent, config write or SCM primitive.
+                let observed = match &record {
+                    Some(record) => crate::member_owner::MemberIo::inspect(
+                        &mut native,
+                        &record.intent,
+                        record.retired_proof.as_ref(),
+                    )
+                    .map_err(|_| failed())?,
+                    None => native.observe_unclaimed().map_err(|_| failed())?,
+                };
+                if files.load(slot).map_err(|_| failed())? != record {
+                    return Err(failed());
+                }
+                Ok((record, observed))
+            },
+            || GuardStore::snapshot(&mut guard, scope).map_err(|_| failed()),
+        )?;
+        // The protected adapter atomically rechecks all three records are still
+        // absent, then durably tombstones the claim. Read/ACK errors retain it.
+        session_files.complete_empty(scope)
+    }
+
+    fn retire_completed_members(&mut self) -> io::Result<()> {
+        for slot in [Slot::A, Slot::B] {
+            let mut files = MemberFiles::new().map_err(|_| failed())?;
+            let Some(record) = files.load(slot_native(slot)).map_err(|_| failed())? else {
+                continue;
+            };
+            if record.phase != Phase::Stopped {
+                return Err(failed());
+            }
+            if self
+                .files
+                .completed_in_previous_boot(&record.intent.scope)?
+            {
+                let mut native = NativeMemberIo::for_retained_cleanup(
+                    &record,
+                    MemberFiles::new().map_err(|_| failed())?,
+                )
+                .map_err(|_| failed())?;
+                crate::member_reboot::retire_member(true, &mut files, &mut native, &record)
+                    .map_err(|_| failed())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_previous_boot(
+        &self,
+        scope: &SessionScope,
+        files: &mut F,
+        mut store: WindowsPairStore<F>,
+        mut record: PairRecord,
+    ) -> io::Result<()> {
+        let empty = crate::member_guard::Model::empty(scope.clone()).map_err(|_| failed())?;
+        let mut guard = NativeGuard::open(scope.clone()).map_err(|_| failed())?;
+        if GuardStore::snapshot(&mut guard, scope).map_err(|_| failed())? != empty.expected {
+            return Err(failed());
+        }
+        let (mut network, saved) = ProtectedStore::<F, NativeNetworkRecord>::open(
+            files.clone(),
+            scope.clone(),
+            RecordKind::Network,
+        )?;
+        if saved
+            .as_ref()
+            .is_some_and(|s| !s.journal.windows_boot_resources_are_ephemeral())
+        {
+            return Err(failed());
+        }
+        record.closing = true;
+        record.active = None;
+        store.save(&record)?;
+        for slot in [Slot::A, Slot::B] {
+            let mut owners = MemberFiles::new().map_err(|_| failed())?;
+            let owner = owners.load(slot_native(slot)).map_err(|_| failed())?;
+            let member = record.members[slot.idx()].as_ref();
+            if let Some(member) = member {
+                // Accept only this attempt or its exact unpublished predecessor.
+                if owner
+                    .as_ref()
+                    .is_none_or(|o| o.intent != member.owner.intent)
+                    && !matches_unstarted_prior(member, owner.as_ref())?
+                {
+                    return Err(failed());
+                }
+            } else if owner.as_ref().is_some_and(|o| o.phase != Phase::Stopped) {
+                return Err(failed());
+            }
+            let mut guids = Vec::new();
+            if let Some(dns) = &record.dns[slot.idx()] {
+                guids.push(dns.baseline.interface.guid);
+                guids.push(dns.current.interface.guid);
+                if let Some(pending) = &dns.pending {
+                    guids.push(pending.interface.guid);
+                }
+            }
+            super::member_owner::require_reboot_guids_absent(slot_native(slot), &guids)
+                .map_err(|_| failed())?;
+            match owner {
+                Some(owner) => {
+                    let mut native = NativeMemberIo::for_retained_cleanup(
+                        &owner,
+                        MemberFiles::new().map_err(|_| failed())?,
+                    )
+                    .map_err(|_| failed())?;
+                    crate::member_reboot::retire_member(true, &mut owners, &mut native, &owner)
+                        .map_err(|_| failed())?;
+                }
+                None => {
+                    let mut native = NativeMemberIo::from_trusted_factory(
+                        self.engine.clone(),
+                        slot_native(slot),
+                        nelomai_client_tunnel::TunnelTransport::WireGuard,
+                        MemberFiles::new().map_err(|_| failed())?,
+                    )
+                    .map_err(|_| failed())?;
+                    let observed = native.observe_unclaimed().map_err(|_| failed())?;
+                    if observed.config_sha256.is_some()
+                        || observed.service.is_some()
+                        || observed.alternative_service_present
+                        || observed.interface.is_some()
+                        || !observed.retained_interfaces.is_empty()
+                    {
+                        return Err(failed());
+                    }
+                }
+            }
+        }
+        if GuardStore::snapshot(&mut guard, scope).map_err(|_| failed())? != empty.expected {
+            return Err(failed());
+        }
+        // IP Helper active route rows do not survive a kernel reboot. DNS was
+        // scoped to owned adapter GUIDs, whose absence was proved above. Never
+        // replay old indices/LUIDs, restore physical DNS or reinstall WFP here.
+        network.save_value(&NativeNetworkRecord::default())?;
+        record.members = [None, None];
+        record.dns = [None, None];
+        record.guard = empty;
+        record.pending_guard = None;
+        record.closing = false;
+        store.save(&record)?;
+        let (mut session, saved) =
+            WindowsSessionStore::open(files.clone(), scope.clone(), RecordKind::Session)?;
+        session.save(&stopped_after_cleanup(scope, saved)?)?;
+        files.complete(scope)
+    }
+}
+impl<F: SessionFiles> PairFactory for NativePairFactory<F> {
+    type Native = NativeWindowsPair<F>;
+    type Store = CompletedSessionStore<F>;
+    fn recover(&mut self, runtime: RuntimeSlot) -> Result<(), crate::ServiceError> {
+        (|| -> io::Result<()> {
+            if runtime != self.runtime {
+                return Err(failed());
+            }
+            let (mut files, different_boot) = self
+                .files
+                .recovery_view(runtime)?
+                .unwrap_or((self.files.clone(), false));
+            for scope in files.scopes(runtime)? {
+                if scope.runtime != runtime || !scope.validate() {
+                    return Err(failed());
+                }
+                let (store, saved) =
+                    WindowsPairStore::open(files.clone(), scope.clone(), RecordKind::Pair)?;
+                let Some(mut record) = saved else {
+                    if different_boot {
+                        self.retire_completed_members()?;
+                    }
+                    self.complete_unrecorded_claim(&scope, &mut files)?;
+                    continue;
+                };
+                if different_boot {
+                    self.recover_previous_boot(&scope, &mut files, store, record)?;
+                    continue;
+                }
+                let recovery_engine = record
+                    .members
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map(|m| m.owner.intent.engine.clone())
+                    .unwrap_or_else(|| self.engine.clone());
+                if record
+                    .members
+                    .iter()
+                    .flatten()
+                    .any(|m| m.owner.intent.engine != recovery_engine)
+                {
+                    return Err(failed());
+                }
+                let native = WindowsPairIo::open(
+                    scope.clone(),
+                    recovery_engine,
+                    self.executor.clone(),
+                    files.clone(),
+                    Some(&record),
+                )?;
+                // Member owner journals may have advanced after the pair journal
+                // write. Same intent only; never substitute a new scope/engine.
+                let mut native = native;
+                for slot in [Slot::A, Slot::B] {
+                    if let Some(member) = record.members[slot.idx()].as_ref() {
+                        if native.abandon_unstarted(member)? {
+                            record.members[slot.idx()] = None;
+                            continue;
+                        }
+                    }
+                    if let Some(m) = &mut record.members[slot.idx()] {
+                        if let Some(current) = native.current(slot)? {
+                            if current.intent != m.owner.intent {
+                                return Err(failed());
+                            }
+                            m.owner = current;
+                        }
+                    }
+                }
+                let mut pair =
+                    SessionNativePair::recover_for_cleanup(scope.clone(), native, store, record)?;
+                pair.close(&scope)?;
+                let (mut state_store, saved) =
+                    WindowsSessionStore::open(files.clone(), scope.clone(), RecordKind::Session)?;
+                state_store.save(&stopped_after_cleanup(&scope, saved)?)?;
+                files.complete(&scope)?;
+            }
+            self.retire_completed_members()
+        })()
+        .map_err(|_| crate::ServiceError::Backend("owned_pair_recovery_failed".into()))
+    }
+    fn prepare(
+        &mut self,
+        runtime: RuntimeSlot,
+        command: &Command,
+        now: u64,
+    ) -> io::Result<SessionControl<Self::Native, Self::Store>> {
+        if runtime != self.runtime || tokio::runtime::Handle::try_current().is_ok() {
+            return Err(failed());
+        }
+        command.validate(runtime)?;
+        let Command::Start { scope, primary, .. } = command else {
+            return Err(failed());
+        };
+        MemberParameters::parse(primary.configuration.expose())?;
+        self.recover(runtime).map_err(|_| failed())?;
+        self.files.claim(scope)?;
+        let (pair_store, old) =
+            WindowsPairStore::open(self.files.clone(), scope.clone(), RecordKind::Pair)?;
+        if old.is_some() {
+            return Err(failed());
+        }
+        let native = WindowsPairIo::open(
+            scope.clone(),
+            self.engine.clone(),
+            self.executor.clone(),
+            self.files.clone(),
+            None,
+        )?;
+        let pair = SessionNativePair::new(scope.clone(), native, pair_store)?;
+        let (store, old) =
+            WindowsSessionStore::open(self.files.clone(), scope.clone(), RecordKind::Session)?;
+        if old.is_some() {
+            return Err(failed());
+        }
+        SessionControl::prepare(
+            runtime,
+            command,
+            pair,
+            CompletedSessionStore {
+                store,
+                files: self.files.clone(),
+                scope: scope.clone(),
+                completion: CompletionState::default(),
+            },
+            now,
+        )
+    }
+}
+pub(crate) struct CompletedSessionStore<F: SessionFiles> {
+    store: WindowsSessionStore<F>,
+    files: F,
+    scope: SessionScope,
+    completion: CompletionState,
+}
+impl<F: SessionFiles> SessionStore for CompletedSessionStore<F> {
+    fn save(
+        &mut self,
+        snapshot: &nelomai_client_tunnel::redundancy::session::SessionSnapshot,
+    ) -> io::Result<()> {
+        self.completion.save(
+            &self.scope,
+            snapshot,
+            |snapshot| self.store.save(snapshot),
+            |scope| self.files.complete(scope),
+        )
+    }
+}
+impl NativePairFactory<NativeSessionFiles> {
+    /// Called by the authenticated engine owner while holding its mutation lock.
+    pub(crate) fn from_service(
+        identity: nelomai_contracts::dispatcher::EngineIdentity,
+        engine: &Path,
+    ) -> io::Result<Self> {
+        let runtime = identity.slot;
+        let boot = super::member_boot::boot_id()?;
+        let files =
+            ProtectedSessionFiles::new(MemberFiles::new().map_err(|_| failed())?, identity, boot)?;
+        Self::new(files, runtime, engine)
+    }
+}
+
+impl PhysicalLease {
+    fn capture(p: &PhysicalRoute) -> Self {
+        Self {
+            interface: p.proof.identity.index,
+            luid: p.proof.identity.luid,
+            guid: p.proof.identity.guid,
+            ipv6: p.proof.family == Family::V6,
+            interface_metric: p.proof.metric,
+            route: p.row.route.clone(),
+            protocol: p.row.protocol,
+            origin: p.row.origin,
+            site_prefix_length: p.row.site_prefix_length,
+            valid_lifetime: p.row.valid_lifetime,
+            preferred_lifetime: p.row.preferred_lifetime,
+            flags: p.row.flags,
+        }
+    }
+    fn restore(&self) -> PhysicalRoute {
+        PhysicalRoute {
+            proof: PhysicalProof {
+                identity: InterfaceIdentity {
+                    index: self.interface,
+                    luid: self.luid,
+                    guid: self.guid,
+                },
+                family: if self.ipv6 { Family::V6 } else { Family::V4 },
+                metric: self.interface_metric,
+            },
+            row: crate::member_routes::Row {
+                route: self.route.clone(),
+                luid: self.luid,
+                protocol: self.protocol,
+                origin: self.origin,
+                site_prefix_length: self.site_prefix_length,
+                valid_lifetime: self.valid_lifetime,
+                preferred_lifetime: self.preferred_lifetime,
+                flags: self.flags,
+            },
+        }
+    }
+}
+fn interface_metric(m: &MemberRecord, ipv6: bool) -> io::Result<InterfaceMetric> {
+    verify_record(m)?;
+    let proof = m.owner.proof.ok_or_else(failed)?;
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = if ipv6 { AF_INET6 } else { AF_INET };
+    row.InterfaceIndex = proof.interface.index;
+    row.InterfaceLuid.Value = proof.interface.luid;
+    if unsafe { GetIpInterfaceEntry(&mut row) } != 0
+        || row.InterfaceIndex != proof.interface.index
+        || unsafe { row.InterfaceLuid.Value } != proof.interface.luid
+    {
+        return Err(failed());
+    }
+    verify_record(m)?;
+    Ok(InterfaceMetric {
+        interface: proof.interface.index,
+        ipv6,
+        metric: row.Metric,
+    })
+}
+fn plan(
+    snapshot: &PhysicalSnapshot,
+    active: Slot,
+    members: &[Option<MemberRecord>; 2],
+    options: &DesktopTunnelOptions,
+) -> io::Result<(Vec<RouteValue>, Vec<PhysicalLease>)> {
+    options.validate().map_err(|_| failed())?;
+    let mut exclusions = options
+        .excluded_ipv4_cidrs
+        .iter()
+        .map(|s| s.parse::<ipnet::IpNet>().map_err(|_| failed()))
+        .collect::<io::Result<Vec<_>>>()?;
+    if options.exclude_local_networks {
+        for row in snapshot.rows() {
+            if row.route.gateway.is_none()
+                && row.route.destination.prefix_len() > 0
+                && snapshot.proofs().contains_key(&(
+                    Family::of(row.route.destination.addr()),
+                    row.route.interface,
+                ))
+            {
+                exclusions.push(row.route.destination);
+            }
+        }
+    }
+    for m in members.iter().flatten() {
+        exclusions.push(ipnet::IpNet::from(m.endpoint));
+    }
+    exclusions.sort();
+    exclusions.dedup();
+    let mut physical = Vec::new();
+    let mut bypasses = Vec::new();
+    let mut retained = Vec::new();
+    let destinations = exclusions
+        .iter()
+        .copied()
+        .chain(
+            members
+                .iter()
+                .flatten()
+                .map(|m| ipnet::IpNet::from(IpAddr::V4(m.probe.target_ipv4))),
+        )
+        .collect::<Vec<_>>();
+    for destination in destinations {
+        let path = if destination.prefix_len() == 0 {
+            snapshot
+                .default_route(Family::of(destination.addr()))
+                .map_err(|_| failed())?
+                .ok_or_else(failed)?
+        } else {
+            snapshot
+                .resolve_host(destination.addr())
+                .map_err(|_| failed())?
+                .path
+        };
+        if !path.row.route.destination.contains(&destination) {
+            return Err(failed());
+        }
+        let route = RouteValue {
+            destination,
+            scope: RouteScope::WindowsInterface(path.proof.identity.index),
+            interface: path.proof.identity.index,
+            gateway: path.row.route.gateway,
+            metric: path.row.route.metric,
+        };
+        if path.row.route == route {
+            retained.push(route.clone());
+        }
+        bypasses.push(route);
+        physical.push(PhysicalLease::capture(&path));
+    }
+    let ipv6 = members
+        .iter()
+        .flatten()
+        .any(|m| m.allowed.iter().any(|n| n.addr().is_ipv6()));
+    let mut metrics = Vec::new();
+    let mut routes = Vec::new();
+    for slot in [Slot::A, Slot::B] {
+        if let Some(m) = &members[slot.idx()] {
+            metrics.push(interface_metric(m, false)?);
+            if ipv6 {
+                metrics.push(interface_metric(m, true)?);
+            }
+            routes.push(
+                nelomai_client_tunnel::redundancy::route_plan::MemberRoutes {
+                    slot,
+                    interface: m.owner.proof.ok_or_else(failed)?.interface.index,
+                    allowed: m.allowed.clone(),
+                    probe: m.probe.target_ipv4,
+                },
+            );
+        }
+    }
+    for p in snapshot.proofs().values() {
+        metrics.push(InterfaceMetric {
+            interface: p.identity.index,
+            ipv6: p.family == Family::V6,
+            metric: p.metric,
+        });
+    }
+    let plan = member_route_plan(active, &routes, &exclusions, &bypasses, &metrics, 0)
+        .map_err(|_| failed())?;
+    let routes = plan
+        .routes
+        .into_iter()
+        .filter(|r| !retained.contains(r))
+        .collect();
+    Ok((routes, physical))
+}

@@ -1544,6 +1544,8 @@ pub struct AppStateResponse {
     warning: Option<String>,
     metrics: Option<ConnectionMetricsResponse>,
     reserve_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desktop_active_slot: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1735,7 +1737,13 @@ impl AppStateResponse {
             warning,
             metrics,
             reserve_state,
+            desktop_active_slot: None,
         }
+    }
+
+    fn with_desktop_active_slot(mut self, slot: Option<&'static str>) -> Self {
+        self.desktop_active_slot = slot;
+        self
     }
 
     fn with_local_stop_pending_cleanup(mut self, confirmed: bool) -> Self {
@@ -1767,6 +1775,101 @@ async fn current_connection_metrics(
 }
 
 #[cfg(not(target_os = "android"))]
+fn desktop_pair_presentation(
+    snapshot: Option<&nelomai_client_tunnel::redundancy::protocol::Snapshot>,
+) -> (Option<String>, Option<&'static str>) {
+    use nelomai_client_tunnel::redundancy::{session::SessionPhase, Slot};
+    let Some(snapshot) = snapshot else {
+        return (None, None);
+    };
+    if matches!(
+        snapshot.session.phase,
+        SessionPhase::Stopping | SessionPhase::Stopped
+    ) {
+        return (None, None);
+    }
+    let active = match snapshot.session.active {
+        Slot::A => "A",
+        Slot::B => "B",
+    };
+    let inactive = if snapshot.session.active == Slot::A {
+        1
+    } else {
+        0
+    };
+    let reserve = if snapshot.cleanup_pending
+        || snapshot.standby_failed
+        || !snapshot.session.role_confirmed
+    {
+        "degraded"
+    } else if !snapshot.primary_ready || snapshot.session.phase == SessionPhase::Starting {
+        "warming"
+    } else if !snapshot.session.installed[inactive] {
+        "degraded"
+    } else if snapshot.standby_ready && snapshot.session.committed[inactive] {
+        "ready"
+    } else {
+        "warming"
+    };
+    (
+        Some(reserve.into()),
+        (snapshot.session.phase == SessionPhase::Running).then_some(active),
+    )
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+#[test]
+fn desktop_pair_ui_uses_exact_active_and_committed_readiness_without_private_payloads() {
+    use nelomai_client_tunnel::redundancy::{
+        protocol::Snapshot, session::SessionState, SessionScope, Slot,
+    };
+    let scope = SessionScope {
+        runtime: nelomai_contracts::RuntimeSlot::Latest,
+        runtime_generation: 1,
+        connection_generation: 1,
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+    };
+    let mut state = SessionState::new(scope.clone(), Slot::A, 0, 0).unwrap();
+    state.primary_started(&scope).unwrap();
+    let mut snapshot = Snapshot {
+        session: state.snapshot(),
+        leases: [Some("a".into()), None],
+        current_leases: [Some("a".into()), None],
+        standby_failed: false,
+        stalled: false,
+        primary_ready: true,
+        standby_ready: false,
+        cleanup_pending: false,
+        warm_stop_v1: false,
+    };
+    assert_eq!(
+        desktop_pair_presentation(Some(&snapshot)),
+        (Some("degraded".into()), Some("A"))
+    );
+    snapshot.session.installed[1] = true;
+    snapshot.session.committed[1] = true;
+    assert_eq!(
+        desktop_pair_presentation(Some(&snapshot)).0.as_deref(),
+        Some("warming")
+    );
+    snapshot.standby_ready = true;
+    assert_eq!(
+        desktop_pair_presentation(Some(&snapshot)).0.as_deref(),
+        Some("ready")
+    );
+    snapshot.session.active = Slot::B;
+    assert_eq!(desktop_pair_presentation(Some(&snapshot)).1, Some("B"));
+    snapshot.session.role_confirmed = false;
+    assert_eq!(
+        desktop_pair_presentation(Some(&snapshot)).0.as_deref(),
+        Some("degraded")
+    );
+    snapshot.session.phase = nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped;
+    assert_eq!(desktop_pair_presentation(Some(&snapshot)), (None, None));
+    assert_eq!(desktop_pair_presentation(None), (None, None));
+}
+
+#[cfg(not(target_os = "android"))]
 async fn current_connection_intent(
     app: &AppHandle,
     _status_unavailable_fallback: nelomai_client_core::ConnectionIntentStatus,
@@ -1775,13 +1878,49 @@ async fn current_connection_intent(
     Option<i64>,
     Option<String>,
 ) {
-    use tauri::Manager;
+    let (status, retry, reserve, _) =
+        current_connection_projection(app, _status_unavailable_fallback).await;
+    (status, retry, reserve)
+}
 
-    let snapshot = app
-        .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
-        .snapshot()
+async fn current_connection_projection(
+    app: &AppHandle,
+    fallback: nelomai_client_core::ConnectionIntentStatus,
+) -> (
+    nelomai_client_core::ConnectionIntentStatus,
+    Option<i64>,
+    Option<String>,
+    Option<&'static str>,
+) {
+    #[cfg(target_os = "android")]
+    {
+        let (status, retry, reserve) = current_connection_intent(app, fallback).await;
+        (status, retry, reserve, None)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = fallback;
+        use tauri::Manager;
+
+        let snapshot = app
+            .state::<Arc<crate::connection_intent::DesktopConnectionIntent>>()
+            .snapshot()
+            .await;
+        let application = app.state::<Arc<NativeApplication>>();
+        let pair = tokio::time::timeout(
+            Duration::from_secs(2),
+            application.desktop_redundancy_status(),
+        )
         .await;
-    (snapshot.status, snapshot.next_retry_at_unix, None)
+        let pair = pair.ok().and_then(Result::ok).flatten();
+        let (reserve, active) = desktop_pair_presentation(pair.as_ref());
+        (
+            snapshot.status,
+            snapshot.next_retry_at_unix,
+            reserve,
+            active,
+        )
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -2010,8 +2149,8 @@ pub async fn app_state(
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
     let status_unavailable_fallback = android_status_unavailable_fallback();
-    let (intent_status, next_retry_at_unix, reserve_state) =
-        current_connection_intent(&app, status_unavailable_fallback).await;
+    let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
+        current_connection_projection(&app, status_unavailable_fallback).await;
     #[cfg(not(target_os = "android"))]
     let local_cleanup = application.local_stop_pending_cleanup().await;
     #[cfg(target_os = "android")]
@@ -2027,6 +2166,7 @@ pub async fn app_state(
         next_retry_at_unix,
         reserve_state,
     )
+    .with_desktop_active_slot(desktop_active_slot)
     .with_local_stop_pending_cleanup(local_cleanup))
 }
 
@@ -2354,8 +2494,8 @@ pub(crate) async fn quick_toggle(
     let metrics = app.state::<Arc<ConnectionMetricsTracker>>();
     let metrics_context = application.connection_metrics_context().await;
     let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    let (intent_status, next_retry_at_unix, reserve_state) =
-        current_connection_intent(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
+    let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
+        current_connection_projection(app, nelomai_client_core::ConnectionIntentStatus::Recovering)
             .await;
     #[cfg(not(target_os = "android"))]
     let local_cleanup = application.local_stop_pending_cleanup().await;
@@ -2372,6 +2512,7 @@ pub(crate) async fn quick_toggle(
         next_retry_at_unix,
         reserve_state,
     )
+    .with_desktop_active_slot(desktop_active_slot)
     .with_local_stop_pending_cleanup(local_cleanup))
 }
 

@@ -131,6 +131,7 @@ fn enrolled_journal_with_snapshot(target: RuntimeTarget) -> serde_json::Value {
         identity: identity.clone(),
     };
     let snapshot = RuntimeCleanupSnapshotV1 {
+        redundant_session_ids: Vec::new(),
         slot: identity.slot,
         runtime_version: identity.runtime_version.clone(),
         auth_scope: Some(scope.clone()),
@@ -446,6 +447,7 @@ fn public_cleanup_projection_rejects_every_secret_marker_and_oversized_aggregate
         "[Interface]",
     ] {
         let snapshot = RuntimeCleanupSnapshotV1 {
+            redundant_session_ids: Vec::new(),
             slot: RuntimeSlot::Latest,
             runtime_version: "0.2.16".into(),
             auth_scope: None,
@@ -463,6 +465,7 @@ fn public_cleanup_projection_rejects_every_secret_marker_and_oversized_aggregate
 
     let snapshot = RuntimeCleanupSnapshotV1 {
         slot: RuntimeSlot::Latest,
+        redundant_session_ids: Vec::new(),
         runtime_version: "0.2.16".into(),
         auth_scope: None,
         lease_ids: (0..1024)

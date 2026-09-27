@@ -2332,6 +2332,7 @@ mod tests {
         );
 
         let redundant_stop = RedundantStopRequest {
+            retain_active_peer: false,
             operation_id: "55555555-5555-4555-8555-555555555555".to_string(),
             lease_id: "22222222-2222-4222-8222-222222222222".to_string(),
             recovery_contract_version: nelomai_contracts::RecoveryContractV2,

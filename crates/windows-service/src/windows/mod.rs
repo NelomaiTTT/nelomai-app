@@ -4,6 +4,16 @@ mod defender_layout;
 mod elevation;
 mod install;
 mod ipc;
+pub(crate) mod member_boot;
+mod member_dns;
+mod member_files;
+mod member_guard;
+pub mod member_metrics;
+mod member_owner;
+mod member_pair;
+pub(crate) mod member_physical;
+pub mod member_routes;
+mod member_session;
 mod ringlogger;
 mod routes;
 mod service;
@@ -13,7 +23,8 @@ pub use elevation::{repair_defender_exclusion, repair_installation, RepairError}
 pub use install::{install, uninstall, InstallOptions};
 pub use ipc::{dispatcher_exchange, NamedPipeTransport};
 pub use service::{
-    run_amneziawg_service, run_engine_mode, run_manager_service, run_wireguard_service,
+    run_amneziawg_service, run_amneziawg_slot_service, run_engine_mode, run_manager_service,
+    run_wireguard_service,
 };
 
 use crate::ServiceError;

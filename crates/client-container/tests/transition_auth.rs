@@ -308,6 +308,7 @@ impl RuntimeSwitchControl for SwitchControl {
                     identity: identity.clone(),
                 });
         let snapshot = RuntimeCleanupSnapshotV1 {
+            redundant_session_ids: Vec::new(),
             slot: source
                 .identity()
                 .map_or(RuntimeSlot::Latest, |identity| identity.slot),

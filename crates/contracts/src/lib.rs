@@ -750,6 +750,10 @@ pub struct RedundantStopRequest {
     pub lease_id: String,
     pub recovery_contract_version: RecoveryContractV2,
     pub session_id: String,
+    /// Send only after negotiating warm_stop_v1 and confirming the last local
+    /// active role. Absence preserves the full-release contract of old clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retain_active_peer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

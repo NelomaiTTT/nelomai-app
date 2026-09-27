@@ -6,7 +6,10 @@ use crate::{
     StoredPendingCompensationStop, StoredPendingStalledStop, StoredPendingStart,
     StoredSplitTunnelState, SystemSecretStore,
 };
-use nelomai_contracts::{RuntimeIdentity, RuntimeSlot};
+use nelomai_contracts::{
+    Connection, RedundancySession, RedundantStandbyAcquireRequest, RedundantStandbyAcquireResponse,
+    RuntimeIdentity, RuntimeSlot,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt,
@@ -107,6 +110,10 @@ pub struct RuntimeStateV1 {
     /// Absent scope is quarantine, never inferred from the currently logged-in user.
     #[serde(default)]
     pub auth_scope: Option<RuntimeAuthScope>,
+    /// Protected, runtime-scoped pair recovery input. Never an offline Start
+    /// template; after a process restart it also fences cleanup of both members.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_redundancy: Option<StoredDesktopRedundancy>,
     pub saved_connection: Option<StoredConnection>,
     pub pinned_connection: Option<StoredConnection>,
     pub pending_start: Option<StoredPendingStart>,
@@ -114,6 +121,44 @@ pub struct RuntimeStateV1 {
     pub pending_compensation_stop: Option<StoredPendingCompensationStop>,
     pub compatibility: Option<StoredCompatibility>,
     pub applied_split_tunnel: StoredSplitTunnelState,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredDesktopRedundancy {
+    #[serde(default)]
+    pub primary_reported: bool,
+    pub runtime_generation: u64,
+    pub connection_generation: u64,
+    pub start_operation_id: String,
+    pub request_fingerprint: String,
+    pub connection: Connection,
+    pub session: RedundancySession,
+    pub pending_acquire: Option<RedundantStandbyAcquireRequest>,
+    pub candidate: Option<RedundantStandbyAcquireResponse>,
+    pub stop: Option<StoredDesktopRedundantStop>,
+}
+
+impl fmt::Debug for StoredDesktopRedundancy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredDesktopRedundancy")
+            .field("payload", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Frozen helper role, not the possibly stale primary displayed by the GUI.
+/// Retention is negotiated and fixed before the first Stop request is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredDesktopRedundantStop {
+    pub operation_id: String,
+    pub active_lease_id: String,
+    pub role_generation: u64,
+    pub membership_generation: u64,
+    pub committed_leases: [Option<String>; 2],
+    pub retain_active_peer: bool,
+    pub role_confirmed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +176,8 @@ pub struct RuntimeCleanupSnapshotV1 {
     pub runtime_version: String,
     pub auth_scope: Option<RuntimeAuthScope>,
     pub lease_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redundant_session_ids: Vec<String>,
     pub operations: Vec<RuntimeCleanupOperationV1>,
     pub cleanup_only: bool,
 }
@@ -145,6 +192,9 @@ impl fmt::Debug for RuntimeStateV1 {
     }
 }
 impl RuntimeStateV1 {
+    pub fn cleanup_snapshot(&self) -> RuntimeCleanupSnapshotV1 {
+        cleanup_snapshot(self)
+    }
     pub fn empty(paths: &RuntimePaths, cleanup_only: bool) -> Self {
         Self {
             schema_version: 1,
@@ -152,6 +202,7 @@ impl RuntimeStateV1 {
             runtime_version: paths.version.clone(),
             cleanup_only,
             auth_scope: None,
+            desktop_redundancy: None,
             saved_connection: None,
             pinned_connection: None,
             pending_start: None,
@@ -173,6 +224,7 @@ impl RuntimeStateV1 {
             runtime_version: paths.version.clone(),
             cleanup_only: true,
             auth_scope: None,
+            desktop_redundancy: None,
             saved_connection: auth.saved_connection.clone(),
             pinned_connection: auth.pinned_connection.clone(),
             pending_start: auth.pending_start.clone(),
@@ -186,7 +238,8 @@ impl RuntimeStateV1 {
         !self.cleanup_only
     }
     pub fn operationally_empty(&self) -> bool {
-        self.saved_connection.is_none()
+        self.desktop_redundancy.is_none()
+            && self.saved_connection.is_none()
             && self.pinned_connection.is_none()
             && self.pending_start.is_none()
             && self.pending_stalled_stop.is_none()
@@ -196,6 +249,7 @@ impl RuntimeStateV1 {
     }
     /// Called by the broker only after server/local cleanup acknowledgement.
     pub fn complete_legacy_cleanup(&mut self) {
+        self.desktop_redundancy = None;
         self.saved_connection = None;
         self.pinned_connection = None;
         self.pending_start = None;
@@ -231,6 +285,28 @@ impl RuntimeStateV1 {
 
 fn cleanup_snapshot(state: &RuntimeStateV1) -> RuntimeCleanupSnapshotV1 {
     let mut lease_ids = Vec::new();
+    let mut redundant_session_ids = Vec::new();
+    if let Some(pair) = &state.desktop_redundancy {
+        redundant_session_ids.push(pair.session.session_id.clone());
+        lease_ids.push(pair.connection.lease_id.clone());
+        if let Some(member) = &pair.session.standby {
+            lease_ids.push(member.connection.lease_id.clone());
+        }
+        if let Some(candidate) = &pair.candidate {
+            if !lease_ids.contains(&candidate.candidate_lease_id) {
+                lease_ids.push(candidate.candidate_lease_id.clone());
+            }
+        }
+    }
+    if let Some(session_id) = state
+        .pending_compensation_stop
+        .as_ref()
+        .and_then(|stop| stop.redundant_session_id.as_ref())
+    {
+        if !redundant_session_ids.contains(session_id) {
+            redundant_session_ids.push(session_id.clone());
+        }
+    }
     for lease_id in state
         .saved_connection
         .as_ref()
@@ -293,11 +369,22 @@ fn cleanup_snapshot(state: &RuntimeStateV1) -> RuntimeCleanupSnapshotV1 {
     if let Some(pending) = &state.pending_compensation_stop {
         push(&pending.operation_id, None, None);
     }
+    if let Some(pair) = &state.desktop_redundancy {
+        push(
+            &pair.start_operation_id,
+            Some(pair.request_fingerprint.clone()),
+            Some(2),
+        );
+        if let Some(stop) = &pair.stop {
+            push(&stop.operation_id, None, None);
+        }
+    }
     RuntimeCleanupSnapshotV1 {
         slot: state.slot,
         runtime_version: state.runtime_version.clone(),
         auth_scope: state.auth_scope.clone(),
         lease_ids,
+        redundant_session_ids,
         operations,
         cleanup_only: state.cleanup_only,
     }
@@ -547,6 +634,7 @@ impl<S: RuntimeStateStore> RuntimeStateStore for RuntimeOperationalStore<S> {
         current.pending_start = value.pending_start.clone();
         current.pending_stalled_stop = value.pending_stalled_stop.clone();
         current.pending_compensation_stop = value.pending_compensation_stop.clone();
+        current.desktop_redundancy = value.desktop_redundancy.clone();
         current.compatibility = value.compatibility.clone();
         self.owner.backend.save(&current)
     }

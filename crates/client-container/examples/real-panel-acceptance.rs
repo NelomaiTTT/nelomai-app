@@ -169,6 +169,7 @@ impl RuntimeSwitchControl for NativeEffects {
     ) -> Result<RuntimeCleanupHandoff, BrokerError> {
         let identity = source.identity().ok_or(BrokerError::RecoveryRequired)?;
         let snapshot = RuntimeCleanupSnapshotV1 {
+            redundant_session_ids: Vec::new(),
             slot: identity.slot,
             runtime_version: identity.runtime_version.clone(),
             auth_scope: Some(RuntimeAuthScope {

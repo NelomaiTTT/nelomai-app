@@ -114,8 +114,16 @@
   );
   let connectionRecoveryCopy = $derived(recoveryCopy(visibleConnectionIntent));
   let connectionMetrics = $state<ConnectionMetrics | null>(null);
-  let reserveState = $state<ReserveState | null>(null);
-  let connectionPresentation = $derived(connectionView({ reserveState }));
+  let reserveState = $state<ReserveState | "degraded" | null>(null);
+  let desktopActiveSlot = $state<"A" | "B" | null>(null);
+  let connectionPresentation = $derived(connectionView({
+    reserveState: reserveState === "degraded" ? "unavailable" : reserveState,
+  }));
+  function readDesktopActiveSlot(value: unknown): "A" | "B" | null {
+    if (!value || typeof value !== "object" || !("desktopActiveSlot" in value)) return null;
+    return value.desktopActiveSlot === "A" || value.desktopActiveSlot === "B"
+      ? value.desktopActiveSlot : null;
+  }
   let pinnedStray = $state<Connection | null>(null);
   let error = $state<string | null>(null);
   let diagnosticsBusy = $state(false);
@@ -415,7 +423,7 @@
 
   async function setUseReserveConnection(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
-    const previous = appPreferences?.useReserveConnection ?? true;
+    const previous = appPreferences?.useReserveConnection ?? (bootstrap?.device.platform === "android");
     try {
       appPreferences = await nativeClient.setUseReserveConnection(input.checked);
       void synchronizeRuntimeState();
@@ -496,6 +504,7 @@
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
+      desktopActiveSlot = readDesktopActiveSlot(current);
       connectionIntentStatus = current.connectionIntentStatus;
       nextRetryAtUnix = current.nextRetryAtUnix;
       if (
@@ -555,6 +564,7 @@
       startupRetry.schedule(code, retryPendingStartup);
       if (code === "signed_out") {
         reserveState = null;
+        desktopActiveSlot = null;
         phase = "signed_out";
         view = "sign_in";
         void nativeClient.recordStartupStage("sign_in_bootstrap_signed_out");
@@ -613,6 +623,7 @@
     nextRetryAtUnix = state.nextRetryAtUnix;
     connectionMetrics = state.metrics;
     reserveState = state.reserveState;
+    desktopActiveSlot = readDesktopActiveSlot(state);
     runtimeWarning = state.warning;
     view = viewForAppState(state);
     if (view === "sign_in") {
@@ -718,6 +729,7 @@
         connection = await nativeClient.stop();
         connectionMetrics = null;
         reserveState = null;
+        desktopActiveSlot = null;
         connectionIntentStatus = "none";
         nextRetryAtUnix = null;
         phase = "ready";
@@ -764,6 +776,7 @@
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
       reserveState = current.reserveState;
+      desktopActiveSlot = readDesktopActiveSlot(current);
     } catch (reason) {
       if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
       const failureCode = commandCode(reason);
@@ -784,6 +797,7 @@
       nextRetryAtUnix = current?.nextRetryAtUnix ?? nextRetryAtUnix;
       connectionMetrics = current?.metrics ?? connectionMetrics;
       reserveState = current?.reserveState ?? reserveState;
+      desktopActiveSlot = current ? readDesktopActiveSlot(current) : null;
       runtimeWarning = current?.warning ?? runtimeWarning;
       error =
         failureCode === "connection_intent_cancelled"
@@ -882,6 +896,7 @@
       await nativeClient.unbindPeer();
       connection = null;
       reserveState = null;
+      desktopActiveSlot = null;
       pinnedStray = null;
       bootstrap = bootstrap
         ? { ...bootstrap, binding: null, connection: null, pinned_stray: null }
@@ -1590,6 +1605,9 @@
           {#if phase === "connected" && reserveState !== null}
             <p class="reserve-status" aria-live="polite">
               {connectionPresentation.statusText}
+              {#if desktopActiveSlot !== null}
+                · Активный канал {desktopActiveSlot}
+              {/if}
             </p>
           {/if}
 
@@ -1743,11 +1761,12 @@
             </strong>
           </div>
           {#if appPreferences}
-            {#if bootstrap?.device.platform === "android"}
               <label class="update-preference">
                 <span>
                   <strong>Использовать резервное подключение</strong>
-                  <small>Выключение освободит резерв; включение применится после переподключения</small>
+                  <small>{bootstrap?.device.platform === "android"
+                    ? "Выключение освободит резерв; включение применится после переподключения"
+                    : "Изменение настройки применится при следующем подключении"}</small>
                 </span>
                 <input
                   type="checkbox"
@@ -1755,7 +1774,6 @@
                   onchange={setUseReserveConnection}
                 />
               </label>
-            {/if}
             <label class="select-field">
               <span>DNS</span>
               <select

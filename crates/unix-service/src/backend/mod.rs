@@ -1,9 +1,24 @@
+#[cfg(any(target_os = "linux", test))]
+mod kernel_rebind;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(any(target_os = "linux", test))]
 mod linux_diagnostics;
+#[cfg(any(target_os = "linux", test))]
+mod linux_owner;
+#[cfg(test)]
+mod linux_owner_tests;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_launch;
+#[cfg(any(target_os = "macos", test))]
+mod member_owner;
+#[cfg(test)]
+mod member_owner_tests;
+#[cfg(any(target_os = "linux", test))]
+mod member_rpf;
+mod redundancy;
 
 use crate::{Awg3Parameters, ParsedConfiguration, ServiceError, ServiceTunnelState};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -26,7 +41,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "linux")]
+pub(crate) use linux::boot_identity as linux_boot_identity;
+#[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as PlatformBackend;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::boot_identity as macos_boot_identity;
 #[cfg(target_os = "macos")]
 pub use macos::MacosBackend as PlatformBackend;
 
@@ -303,6 +322,17 @@ pub(crate) fn rebind_peers_from_configuration(
             persistent_keepalive_interval: peer.persistent_keepalive.unwrap_or(0),
         })
         .collect()
+}
+
+fn rebind_peers_for_start(
+    configuration: &ParsedConfiguration,
+    mode: redundancy::ResourceMode,
+) -> Vec<RebindPeer> {
+    if configuration.transport == TunnelTransport::AmneziaWg3 || !mode.owns_network() {
+        rebind_peers_from_configuration(configuration)
+    } else {
+        Vec::new()
+    }
 }
 
 pub(crate) fn rebind_peers_from_host(host: &Host) -> Vec<RebindPeer> {
@@ -751,6 +781,19 @@ PersistentKeepalive = 21
 
         assert!(request.contains("persistent_keepalive_interval=1\n"));
         assert!(request.ends_with("persistent_keepalive_interval=0\n\n"));
+    }
+
+    #[test]
+    fn wireguard_member_start_retains_peers_for_network_change_rebind() {
+        let parsed=parse_configuration(&format!("[Interface]\nPrivateKey = {PRIVATE_KEY}\nAddress = 10.8.1.2/32\n[Peer]\nPublicKey = {PUBLIC_KEY}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.1:51820\nPersistentKeepalive = 21\n")).unwrap();
+        let peers = rebind_peers_for_start(
+            &parsed,
+            redundancy::ResourceMode::Member(nelomai_contracts::dispatcher::TunnelSlot::A),
+        );
+        assert_eq!(peers.len(), 1);
+        let request = rebind_uapi_configuration(&peers);
+        assert!(request.contains("update_only=true\npersistent_keepalive_interval=21\n"));
+        assert!(rebind_peers_for_start(&parsed, redundancy::ResourceMode::Single).is_empty());
     }
 
     #[test]

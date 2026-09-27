@@ -24,6 +24,9 @@ use windows_sys::Win32::System::LibraryLoader::{
     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
 };
 
+#[path = "../engine_channel.rs"]
+mod engine_channel;
+
 define_windows_service!(manager_service_main, manager_service_entry);
 
 const REQUEST_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(40);
@@ -63,6 +66,73 @@ impl RequestWatchdog {
         let mut completed = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *completed = true;
         condition.notify_one();
+    }
+}
+
+/// One broker wakeup loop for the existing manager, sharing the same serialized
+/// dispatcher owner as GUI exchanges. No engine launch or server/API scheduling.
+struct IdleBroker {
+    stopping: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IdleBroker {
+    fn start(
+        owner: Arc<Mutex<nelomai_contracts::dispatcher::ProcessDispatcher>>,
+        stopping: Arc<AtomicBool>,
+    ) -> Result<Self, ServiceError> {
+        let thread_stopping = Arc::clone(&stopping);
+        let thread = std::thread::Builder::new()
+            .name("nelomai-idle-engine-broker".into())
+            .spawn(move || {
+                let mut failure_reported = false;
+                while !thread_stopping.load(Ordering::Acquire) {
+                    std::thread::park_timeout(Duration::from_secs(1));
+                    if thread_stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // An active GUI exchange already services primitives. Never
+                    // queue a competing exchange behind it or spawn a child.
+                    let Ok(mut dispatcher) = owner.try_lock() else {
+                        continue;
+                    };
+                    if thread_stopping.load(Ordering::Acquire) || !dispatcher.supports_idle_tick() {
+                        continue;
+                    }
+                    let Ok(watchdog) = RequestWatchdog::arm() else {
+                        continue;
+                    };
+                    let result = dispatcher.idle_tick(&mut |action, engine| {
+                        super::install::engine_primitive(action, engine)
+                    });
+                    watchdog.complete();
+                    if result.is_err() && !failure_reported {
+                        // A failed exchange fences the channel. A transient
+                        // ownership-lock failure is logged once until recovery.
+                        record_service_diagnostic(
+                            "idle engine broker",
+                            &ServiceError::Backend("engine_idle_tick_failed".into()),
+                        );
+                    }
+                    failure_reported = result.is_err();
+                }
+            })
+            .map_err(|error| platform_error("start idle engine broker", error))?;
+        Ok(Self {
+            stopping,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for IdleBroker {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            // A live exchange is covered by the existing 40s process watchdog.
+            let _ = thread.join();
+        }
     }
 }
 
@@ -149,6 +219,7 @@ fn manager_service_loop() -> Result<(), ServiceError> {
             return Err(ServiceError::Backend("dispatcher_recovery_pending".into()));
         }
     }
+    let idle_broker = IdleBroker::start(Arc::clone(&owner), Arc::clone(&stopping))?;
     let private_owner = Arc::clone(&owner);
     std::thread::spawn(move || {
         let mut failures = 0_u64;
@@ -205,6 +276,7 @@ fn manager_service_loop() -> Result<(), ServiceError> {
             }
         }
     }
+    drop(idle_broker);
     record_service_message("manager lifecycle", "SCM stop requested");
     if let Ok(mut dispatcher) = owner.lock() {
         let identity = dispatcher.layout.identity.clone();
@@ -256,7 +328,6 @@ fn serve_owned_frame(
 
 pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
     use nelomai_contracts::dispatcher as d;
-    use std::io::Write;
     let installation =
         d::Installation::production(root).map_err(|_| ServiceError::UnauthorizedClient)?;
     let layout = installation
@@ -267,62 +338,112 @@ pub fn run_engine_mode(root: &Path) -> Result<(), ServiceError> {
         .map_err(|_| ServiceError::UnauthorizedClient)?;
     let _lease = d::MutationGuard::at(&root.join("engine-owner.lock"))
         .map_err(|_| ServiceError::UnauthorizedClient)?;
-    let mut handler = TunnelRequestHandler::new(
+    let factory = super::member_pair::NativePairFactory::from_service(
+        layout.identity.clone(),
+        &layout.engine_path(),
+    )
+    .map_err(|_| ServiceError::Backend("member_runtime_factory_failed".into()))?;
+    let backend = crate::member_actor::CompositeBackend::new(
+        layout.identity.slot,
         WindowsServiceBackend::new()?,
-        layout.identity.runtime_version,
-    );
-    loop {
-        let frame = match d::read_frame(&mut std::io::stdin(), MAX_FRAME_SIZE) {
-            Ok(frame) => frame,
-            Err(_) => {
-                let _ = handler.handle(crate::Request::stop());
-                return Ok(());
-            }
-        };
-        let control: serde_json::Value = serde_json::from_slice(
-            d::frame_body(&frame, MAX_FRAME_SIZE).map_err(|_| ServiceError::InvalidRequest)?,
+        factory,
+    )?;
+    let handler = TunnelRequestHandler::new(backend, layout.identity.runtime_version);
+    let mut owner = EngineHandler {
+        handler,
+        shutting_down: false,
+        stopped: false,
+    };
+    let (frames, client) =
+        engine_channel::spawn_input(std::io::stdin()).map_err(|_| ServiceError::InvalidRequest)?;
+    // This function returns directly to engine main, which must exit: the sole
+    // detached reader may remain blocked in the process-owned input pipe.
+    engine_channel::with_owner(client, || {
+        nelomai_client_tunnel::redundancy::engine_channel::run_receiver(
+            frames,
+            &mut std::io::stdout(),
+            &mut owner,
         )
-        .unwrap_or(serde_json::Value::Null);
-        let output = match control.get("dispatcher_control").and_then(|value| value.as_str()) {
-            Some("ready") => d::encode_frame(&serde_json::json!({"engine_ready":true})),
-            Some("stop") => { let response = handler.handle(crate::Request::stop()); d::encode_frame(&serde_json::json!({"engine_stopped":response.ok && response.state == Some(crate::ServiceTunnelState::Stopped)})) }
-            _ => { let response = crate::decode_request(&frame).map(|request| handler.handle(request)).unwrap_or_else(|error| crate::Response::failure(error.code())); d::encode_frame(&response) }
-        }.map_err(|_| ServiceError::InvalidRequest)?;
-        std::io::stdout()
-            .write_all(&output)
-            .map_err(|_| ServiceError::InvalidRequest)?;
-        std::io::stdout()
-            .flush()
-            .map_err(|_| ServiceError::InvalidRequest)?;
+    })
+    .map_err(|_| ServiceError::InvalidRequest)?
+    .map_err(|_| ServiceError::Backend("engine_channel_failed".into()))
+}
+
+struct EngineHandler<B> {
+    handler: TunnelRequestHandler<B>,
+    shutting_down: bool,
+    stopped: bool,
+}
+
+impl<B: crate::ServiceTunnelBackend> nelomai_client_tunnel::redundancy::engine_channel::Handler
+    for EngineHandler<B>
+{
+    fn handle(&mut self, frame: &[u8]) -> std::io::Result<Vec<u8>> {
+        use nelomai_contracts::dispatcher as d;
+        engine_channel::ensure_healthy()?;
+        let value: serde_json::Value =
+            serde_json::from_slice(d::frame_body(frame, MAX_FRAME_SIZE)?)
+                .map_err(|_| d::blocked())?;
+        match value
+            .get("dispatcher_control")
+            .and_then(|value| value.as_str())
+        {
+            Some("stop") => {
+                let stopped = self.shutdown().is_ok();
+                d::encode_frame(&serde_json::json!({"engine_stopped":stopped}))
+            }
+            _ if self.shutting_down => {
+                d::encode_frame(&crate::Response::failure("engine_stopping"))
+            }
+            Some("ready") => {
+                d::encode_frame(&serde_json::json!({"engine_ready":true,"supports_idle_tick":true}))
+            }
+            Some("tick") => d::encode_frame(&serde_json::json!({"engine_tick":true})),
+            _ => {
+                let response = match crate::decode_request(frame) {
+                    Ok(request) => self.handler.handle(request),
+                    Err(error) => {
+                        let _ = self.shutdown();
+                        crate::Response::failure(error.code())
+                    }
+                };
+                d::encode_frame(&response)
+            }
+        }
+    }
+
+    fn tick(&mut self, now: u64) -> std::io::Result<()> {
+        engine_channel::ensure_healthy()?;
+        if self.shutting_down {
+            return Ok(());
+        }
+        self.handler
+            .tick(now)
+            .map_err(|error| std::io::Error::other(error.code().to_owned()))
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.shutting_down = true;
+        if self.stopped {
+            return Ok(());
+        }
+        let state = self
+            .handler
+            .shutdown()
+            .map_err(|error| std::io::Error::other(error.code().to_owned()))?;
+        if state != crate::ServiceTunnelState::Stopped {
+            return Err(std::io::Error::other("engine_cleanup_pending"));
+        }
+        self.stopped = true;
+        Ok(())
     }
 }
 
 pub(crate) fn request_primitive(
     action: nelomai_contracts::dispatcher::EnginePrimitive,
 ) -> Result<(), ServiceError> {
-    use nelomai_contracts::dispatcher as d;
-    use std::io::Write;
-    let request = d::encode_frame(&d::PrimitiveRequest {
-        engine_primitive: action,
-    })
-    .map_err(|_| ServiceError::InvalidRequest)?;
-    std::io::stdout()
-        .write_all(&request)
-        .map_err(|_| ServiceError::InvalidRequest)?;
-    std::io::stdout()
-        .flush()
-        .map_err(|_| ServiceError::InvalidRequest)?;
-    let frame = d::read_frame(&mut std::io::stdin(), d::MAX_DISPATCHER_FRAME)
-        .map_err(|_| ServiceError::InvalidRequest)?;
-    let value: serde_json::Value = serde_json::from_slice(
-        d::frame_body(&frame, d::MAX_DISPATCHER_FRAME).map_err(|_| ServiceError::InvalidRequest)?,
-    )
-    .map_err(|_| ServiceError::InvalidRequest)?;
-    if value.get("primitive_ok") == Some(&serde_json::Value::Bool(true)) {
-        Ok(())
-    } else {
-        Err(ServiceError::Backend("dispatcher_primitive_failed".into()))
-    }
+    engine_channel::request_primitive(action, &mut std::io::stdout())
+        .map_err(|_| ServiceError::Backend("dispatcher_primitive_failed".into()))
 }
 
 fn set_status(
@@ -401,6 +522,29 @@ pub fn run_wireguard_service(configuration: &Path) -> Result<(), ServiceError> {
 }
 
 pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
+    run_named_amneziawg_service(configuration, AMNEZIAWG_TUNNEL_SERVICE_NAME)
+}
+
+pub fn run_amneziawg_slot_service(
+    configuration: &Path,
+    slot: nelomai_contracts::dispatcher::TunnelSlot,
+) -> Result<(), ServiceError> {
+    if configuration != super::install::slot_config_path(slot)? {
+        return Err(ServiceError::UnsafePath);
+    }
+    run_named_amneziawg_service(
+        configuration,
+        crate::redundancy::slot_service_name(
+            slot,
+            nelomai_client_tunnel::TunnelTransport::AmneziaWg3,
+        ),
+    )
+}
+
+fn run_named_amneziawg_service(
+    configuration: &Path,
+    service_name: &str,
+) -> Result<(), ServiceError> {
     record_service_message(
         "AmneziaWG tunnel lifecycle",
         &format!("started pid={}", std::process::id()),
@@ -450,7 +594,7 @@ pub fn run_amneziawg_service(configuration: &Path) -> Result<(), ServiceError> {
         unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, _>(procedure) };
     let configuration_text =
         zeroize::Zeroizing::new(wide(std::ffi::OsStr::new(configuration_text.as_str())));
-    let service_name = wide(std::ffi::OsStr::new(AMNEZIAWG_TUNNEL_SERVICE_NAME));
+    let service_name = wide(std::ffi::OsStr::new(service_name));
     let succeeded = unsafe { service(configuration_text.as_ptr(), service_name.as_ptr()) };
     unsafe {
         FreeLibrary(module);
