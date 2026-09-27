@@ -676,6 +676,75 @@ fn cleanup_recovery_never_adopts_unproven_live_process_after_partial_start() {
     assert!(!shared.borrow().events.contains(&"stop"));
 }
 #[test]
+fn physical_discovery_accepts_exact_stopped_service_without_granting_absence_or_liveness() {
+    let (mut owner, s) = setup();
+    let running = owner.start().unwrap();
+    {
+        let mut state = s.borrow_mut();
+        state.observation.service.as_mut().unwrap().process = None;
+        state.observation.interface = None;
+        state.observation.retained_interfaces.clear();
+        state.events.clear();
+    }
+    assert!(!owner.confirm_absent(&running).unwrap());
+    assert!(owner.confirm_inactive_for_discovery(&running).unwrap());
+    assert!(owner.verify_live(&running).is_err());
+    assert_eq!(s.borrow().record, Some(running));
+    assert!(s.borrow().events.iter().all(|e| *e == "inspect"));
+    assert_eq!(owner.start(), Err(OwnerError::Retired));
+}
+
+#[test]
+fn physical_discovery_stopped_service_rejects_unproven_identity_config_and_read_errors() {
+    for mutation in 0..10 {
+        let (mut owner, s) = setup();
+        let running = owner.start().unwrap();
+        {
+            let mut state = s.borrow_mut();
+            state.observation.service.as_mut().unwrap().process = None;
+            state.observation.interface = None;
+            state.observation.retained_interfaces.clear();
+            match mutation {
+                0 => state.observation.service.as_mut().unwrap().exact_spec = false,
+                1 => {
+                    state.observation.service.as_mut().unwrap().process = Some(ProcessProof {
+                        creation_time: 99,
+                        ..proof().process
+                    })
+                }
+                2 => state.observation.interface = Some(proof().interface),
+                3 => state.observation.retained_interfaces.push(InterfaceProof {
+                    guid: [99; 16],
+                    ..proof().interface
+                }),
+                4 => state.observation.config_sha256 = None,
+                5 => state.observation.config_sha256 = Some([99; 32]),
+                6 => state.observation.alternative_service_present = true,
+                7 => {
+                    state
+                        .record
+                        .as_mut()
+                        .unwrap()
+                        .intent
+                        .scope
+                        .connection_generation += 1
+                }
+                8 => state.fail_capture = true,
+                _ => state.record.as_mut().unwrap().proof = None,
+            }
+            state.events.clear();
+        }
+        let baseline = s.borrow().record.clone();
+        assert!(
+            !matches!(owner.confirm_inactive_for_discovery(&running), Ok(true)),
+            "mutation {mutation}"
+        );
+        assert_eq!(s.borrow().record, baseline);
+        assert!(s.borrow().events.iter().all(|e| *e == "inspect"));
+    }
+}
+
+#[test]
 fn read_only_live_check_rejects_guid_reuse_without_native_effects() {
     let (mut o, s) = setup();
     let r = o.start().unwrap();

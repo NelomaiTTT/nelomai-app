@@ -666,6 +666,23 @@ fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
 #[derive(Default)]
 struct DesktopCoordinationSchedule {
     retry_at_unix: i64,
+    pending: Option<
+        tokio::task::JoinHandle<
+            Result<
+                Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
+                nelomai_client_application::ApplicationError,
+            >,
+        >,
+    >,
+}
+
+#[cfg(not(target_os = "android"))]
+impl Drop for DesktopCoordinationSchedule {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.abort();
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -686,11 +703,12 @@ where
     T: FnOnce() -> TF,
     S: FnOnce() -> SF,
     TF: std::future::Future<
-        Output = Result<
-            Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
-            nelomai_client_application::ApplicationError,
-        >,
-    >,
+            Output = Result<
+                Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
+                nelomai_client_application::ApplicationError,
+            >,
+        > + Send
+        + 'static,
     SF: std::future::Future<
         Output = Result<
             Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
@@ -700,31 +718,43 @@ where
 {
     use nelomai_client_application::ApplicationError;
     use nelomai_client_core::{CoreApiError, CoreError};
-    let step = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        if now >= schedule.retry_at_unix {
-            if let Err(error) = tick().await {
-                let retry = match error {
-                    ApplicationError::Api(CoreApiError::Rejected {
-                        retry_after_seconds,
-                        ..
-                    })
-                    | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
-                        retry_after_seconds,
-                        ..
-                    })) => retry_after_seconds,
-                    _ => None,
-                }
-                .unwrap_or(15)
-                .max(1);
+    if schedule.pending.is_none() && now >= schedule.retry_at_unix {
+        schedule.pending = Some(tokio::spawn(tick()));
+    }
+    if let Some(pending) = schedule.pending.as_mut() {
+        // Poll the same task, not a fresh future on each metrics tick. Network
+        // calls retain their existing API deadlines; UI polling cannot cancel
+        // every slow probe/lease preparation halfway through its work.
+        if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await {
+            schedule.pending = None;
+            let retry = match result {
+                Ok(Ok(_)) => None,
+                result => Some(
+                    match result {
+                        Ok(Err(
+                            ApplicationError::Api(CoreApiError::Rejected {
+                                retry_after_seconds,
+                                ..
+                            })
+                            | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                                retry_after_seconds,
+                                ..
+                            })),
+                        )) => retry_after_seconds,
+                        _ => None,
+                    }
+                    .unwrap_or(15)
+                    .max(1),
+                ),
+            };
+            if let Some(retry) = retry {
                 schedule.retry_at_unix =
                     now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
             }
         }
-        // This fresh scoped read, not GUI state or a tick's optional result,
-        // decides whether legacy repair can touch the tunnel.
-        status().await
-    })
-    .await;
+    }
+    // Always obtain fresh local status, even while the panel request is pending.
+    let step = tokio::time::timeout(std::time::Duration::from_secs(2), status()).await;
     match step {
         Ok(Ok(snapshot)) => DesktopPairObservation {
             owns_tunnel: snapshot.is_some(),
@@ -798,7 +828,14 @@ fn start_connection_metrics_scheduler(
             let pair_observation = coordinate_desktop_redundancy(
                 &mut desktop_coordination,
                 current_unix_time(),
-                || application.desktop_redundancy_tick(current_unix_time()),
+                || {
+                    let application = application.clone();
+                    async move {
+                        application
+                            .desktop_redundancy_tick(current_unix_time())
+                            .await
+                    }
+                },
                 || application.desktop_redundancy_status(),
             )
             .await;
@@ -1734,27 +1771,90 @@ mod tests {
 
     #[cfg(not(target_os = "android"))]
     #[tokio::test]
+    async fn desktop_coordination_reset_cancels_owned_in_flight_work() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let schedule = DesktopCoordinationSchedule {
+            pending: Some(tokio::spawn(async move {
+                let _guard = OnDrop(Some(dropped_tx));
+                entered_tx.send(()).unwrap();
+                std::future::pending().await
+            })),
+            ..Default::default()
+        };
+        entered_rx.await.unwrap();
+        drop(schedule);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("context reset must not detach the old coordinator")
+            .unwrap();
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_coordination_keeps_slow_probe_work_alive_without_duplicate_ticks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker = completed.clone();
+        let mut schedule = DesktopCoordinationSchedule::default();
+        coordinate_desktop_redundancy(
+            &mut schedule,
+            100,
+            move || async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                worker.store(true, Ordering::SeqCst);
+                Ok(None)
+            },
+            || async { Ok(None) },
+        )
+        .await;
+        assert!(!completed.load(Ordering::SeqCst));
+        coordinate_desktop_redundancy(
+            &mut schedule,
+            102,
+            || async { panic!("must continue the in-flight probe, not start another") },
+            || async { Ok(None) },
+        )
+        .await;
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "polling timeout must not cancel probe refresh"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
     async fn desktop_coordination_throttles_panel_errors_and_fences_legacy_repair_when_status_unknown(
     ) {
         use nelomai_client_application::ApplicationError;
         use nelomai_client_core::{CoreApiError, CoreError};
         use std::cell::Cell;
-        let tick_calls = Cell::new(0);
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tick_calls = Arc::new(AtomicUsize::new(0));
         let status_calls = Cell::new(0);
         let mut schedule = DesktopCoordinationSchedule::default();
         assert!(
             coordinate_desktop_redundancy(
                 &mut schedule,
                 10,
-                || async {
-                    tick_calls.set(tick_calls.get() + 1);
-                    Err(ApplicationError::Core(CoreError::Api(
-                        CoreApiError::Rejected {
-                            code: "rate_limited".into(),
-                            message: "private".into(),
-                            retry_after_seconds: Some(45),
-                        },
-                    )))
+                {
+                    let calls = tick_calls.clone();
+                    move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err(ApplicationError::Core(CoreError::Api(
+                            CoreApiError::Rejected {
+                                code: "rate_limited".into(),
+                                message: "private".into(),
+                                retry_after_seconds: Some(45),
+                            },
+                        )))
+                    }
                 },
                 || async {
                     status_calls.set(status_calls.get() + 1);
@@ -1778,36 +1878,39 @@ mod tests {
             .await
             .owns_tunnel
         );
-        assert_eq!(tick_calls.get(), 1);
+        assert_eq!(tick_calls.load(Ordering::SeqCst), 1);
         assert_eq!(status_calls.get(), 2);
         assert!(
             !coordinate_desktop_redundancy(
                 &mut schedule,
                 55,
-                || async {
-                    tick_calls.set(tick_calls.get() + 1);
-                    Ok(None)
+                {
+                    let calls = tick_calls.clone();
+                    move || async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(None)
+                    }
                 },
                 || async { Ok(None) }
             )
             .await
             .owns_tunnel
         );
-        assert_eq!(tick_calls.get(), 2);
+        assert_eq!(tick_calls.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(not(target_os = "android"))]
     #[tokio::test]
-    async fn desktop_coordination_timeout_blocks_legacy_repair_and_defaults_to_15_seconds() {
+    async fn desktop_coordination_unknown_status_blocks_legacy_repair_while_tick_remains_pending() {
         let mut schedule = DesktopCoordinationSchedule::default();
         assert!(
             coordinate_desktop_redundancy(&mut schedule, 100, std::future::pending, || async {
-                panic!("timed-out step must end")
+                Err(nelomai_client_application::ApplicationError::Storage)
             })
             .await
             .owns_tunnel
         );
-        assert_eq!(schedule.retry_at_unix, 115);
+        assert!(schedule.pending.is_some());
     }
 
     #[cfg(not(target_os = "android"))]
@@ -1851,7 +1954,7 @@ mod tests {
         let fresh = coordinate_desktop_redundancy(
             &mut schedule,
             11,
-            || async { Ok(Some(stale)) },
+            move || async move { Ok(Some(stale)) },
             || async { Ok(Some(snapshot.clone())) },
         )
         .await;

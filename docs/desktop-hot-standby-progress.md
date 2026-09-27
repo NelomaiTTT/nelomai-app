@@ -1,5 +1,120 @@
 # Desktop hot-standby — local implementation checkpoint
 
+## 2026-09-27 Windows rebind failure outcomes
+
+The review's remaining three stuck-Running cases (pair journal failure, native
+rebind failure, and failure to persist the new Running owner) were reproduced
+in a permanent composed actor/pair/MemberOwner test before the fix.
+
+- A failed rebind now requires verification on the existing integrity tick
+  before another discovery/rebind. Existing guard reconciliation, exact guard
+  readback, proven usable owners and durable pair state allow safe retry.
+  An incomplete native restart or unproven state instead takes the existing
+  close/driver Stop path and emits the existing stalled recovery signal. No
+  new timer, server path or relaxed owner verification was introduced.
+- Fourteen fault/control cases cover primary and reserve writes, lost ACKs,
+  native restart, guard failures and persistent storage outage with exact
+  PrepareRecoveryStop completion. Additional negative cases retain foreign
+  process/config/owner resources and cleanup journals. The OS Stop fake now
+  models the real adapter's exact observation check; real MemberOwner still
+  decides cleanup authority, including interrupted live-owner operations.
+- Fresh verification: pair tests42/42; full Rust workspace/doctests exit0
+  (1930 reported passes across110 suites including nested child output; one
+  pre-existing real-panel fixture ignored). Host workspace/all-targets and
+  Windows MSVC/all-targets Clippy with warnings denied passed; diff check clean.
+  Evidence: .tmp/rebind-errors-{red,focused,workspace,host-clippy,windows-clippy}.log.
+
+Local only, no commit/push/install/production or hardware changes. This fixes
+the reviewed error paths; it does not constitute native hardware acceptance.
+
+## 2026-09-27 Windows actor rebind retry follow-up
+
+The next review reproduced two actor-level deadlocks: a transient route cleanup
+failure fenced the pair and then prevented physical discovery from scheduling a
+retry; an owned reserve crash before NetworkChanged left readiness suspended
+while Core needed primary readiness to retire that reserve. Both repros were
+moved into permanent tests and failed against the pre-fix implementation.
+
+- Read-only physical discovery now accepts an installed, fully acknowledged,
+  permit-free blocking guard with exact native readback. Missing/foreign guard,
+  residual probe permits and pending guard transactions still reject discovery.
+  This does not enable traffic or adopt an unknown WFP state.
+- Rebind proves the selected member live and all member identities before
+  mutations. Under the existing fence it finishes exact Stop of a proven absent
+  inactive member, preserves its journal for normal retirement, and rebinds only
+  live members. No new timers, server paths, or recovery subsystem.
+- Pair suite40 passed, including actor retries after route/SCM cleanup faults,
+  both absent and installed-stopped SCM reserves, and six negative guard cases.
+  Host workspace and Windows MSVC all-targets Clippy-Dwarnings passed.
+  Full Rust workspace including doctests passed (exit0), with one pre-existing
+  real-panel fixture ignored; see `.tmp/rebind-retry-*.log`.
+
+No push, merge, install, production changes or hardware tests.
+
+## 2026-09-27 Windows retirement/rebind follow-up
+
+Both subsequent review findings reproduced in retained-owner regressions before
+the fix: absent reserve removal stopped the healthy primary, and physical rebind
+after A-to-B failover rejected the durably retired A with `Pending`.
+
+- Reserve removal now fences permits, completes exact owned retirement and
+  refreshes its retained proof before route/DNS cleanup of an absent interface.
+  The live-reserve path still restores DNS before native Stop. The existing
+  Windows `current` adapter updates route proofs before the removal transaction;
+  foreign identity and failed cleanup are not treated as absence.
+- Rebind uses the proven live member set and separately proves retired members
+  absent. It neither restarts retired members nor opens their probe sockets.
+  Journals remain until ordinary member cleanup. Promotion and removal share
+  the same small retirement helper; no new service or server backend.
+- Four new regressions cover cleanup/replacement, rebind after promotion,
+  foreign/unproven identities and cleanup/storage failures. The composed actor
+  test also changes the physical network before the UI removes retired A and
+  verifies B health resumes autonomously. Focused pair suite:37 passed.
+- Host workspace/all-targets and Windows MSVC/all-targets Clippy with warnings
+  denied passed (`.tmp/windows-retirement-{host,cross}-clippy.log`). Full workspace
+  tests including doctests passed, exit0 (`.tmp/windows-retirement-workspace.log`);
+  one pre-existing real-panel fixture remains explicitly ignored.
+
+Local only; no commit, push, installation, hardware tests or production changes.
+
+## 2026-09-27 review fixes after c430d25
+
+Local, uncommitted follow-up; no push, installation, hardware testing or panel
+changes. The server backend remains the existing Android-compatible redundancy
+service/API: desktop uses access-token routes; Android's background-token wrapper
+calls the same services (with its existing unmeasured-selection allowance).
+
+- Physical discovery no longer interprets a proven vanished VPN member as loss
+  of the physical network. Unix tests compose actor/health/native pair/route CAS;
+  Windows tests compose actor/pair/real MemberOwner with fake OS I/O. Windows
+  promotion retires only the exact stopped/absent old member through existing
+  Stop, withdraws its probe permits before releasing sockets, excludes it from
+  new routes and skips DNS writes to its absent interface. A foreign identity,
+  failed cleanup or journal failure still prevents promotion.
+- Missing-reserve selection refreshes the existing scoped probe cache. Retry
+  retains operation identity while replacing measurements. Healthy, stopped,
+  absent and candidate-bearing pairs do not trigger needless discovery. The UI
+  scheduler retains one in-flight step across its two-second poll budget; scope
+  reset aborts that task. Existing API deadlines remain unchanged.
+- A failed uncommitted candidate is reconciled with the panel before targeted
+  local removal. The acquire operation survives ambiguous outcomes; the existing
+  server five-minute candidate TTL handles server cleanup. A consumed ID is
+  replaced only after exact canonical membership reconciliation. No release call
+  that disables standby intent, no new server subsystem. Lost commit receipts
+  update membership even after health deteriorates, but never authorize promotion
+  or clear a stalled pair without usable health evidence.
+
+Final verification after the Windows author froze the diff: full Rust workspace
+exit0 (`.tmp/review-fix-workspace-final.log`), including doctests; one pre-existing
+real-panel fixture ignored. Host workspace/all-targets and Windows MSVC/all-targets
+Clippy with warnings denied exit0 (`review-fix-clippy-final.log`,
+`review-fix-windows.log`). Linux aarch64/all-targets Clippy exit0
+(`review-fix-linux.log`); Android Core/Application compile exit0 with the same three
+pre-existing stalled-recovery warnings (`review-fix-android.log`). Core11 and
+scheduler5 focused tests plus shared Core/Application/tunnel suites passed.
+The earlier workspace run captured a Windows test while its RED→GREEN change was
+still in progress; it is not final evidence. No hardware/packet acceptance claim.
+
 ## 2026-09-27 integration checkpoint (supersedes older partial checkpoints below)
 
 Local branch only. Shared helper driver/IPC, Unix and Windows factories, Core

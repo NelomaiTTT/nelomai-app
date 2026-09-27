@@ -65,6 +65,25 @@ pub trait RowIo {
     fn delete(&mut self, row: &Row) -> io::Result<()>;
     fn set(&mut self, row: &Row) -> io::Result<()>;
 }
+/// Existing absent-interface cleanup seam. The owner must positively attest
+/// exact native absence before AND after enumerating the addressed key. This
+/// can prove an owned row vanished, never authorize writes to a missing/reused
+/// interface or deletion of a foreign/stale row still present there.
+#[cfg_attr(not(windows), allow(dead_code))] // Native caller; portable fake tests below.
+pub(crate) fn read_absent_route(
+    rows: &mut impl RowIo,
+    key: &ResourceKey,
+    mut confirm_absent: impl FnMut() -> io::Result<bool>,
+) -> io::Result<Option<NetworkValue>> {
+    let (destination, index) = route_key(key)?;
+    if !confirm_absent()? {
+        return Err(conflict());
+    }
+    if !rows.read(destination, index)?.is_empty() || !confirm_absent()? {
+        return Err(conflict());
+    }
+    Ok(None)
+}
 
 pub struct MemberRoutes<R, I> {
     rows: R,
@@ -286,6 +305,130 @@ mod tests {
             MemberRoutes::new(f.clone(), proof as fn(u32) -> io::Result<NativeProof>),
             f,
         )
+    }
+    #[test]
+    fn absent_member_row_requires_positive_identity_empty_rows_and_second_absence() {
+        let key = value(&route(false)).key();
+        let mut rows = Fake::default();
+        assert_eq!(
+            read_absent_route(&mut rows, &key, || Ok(true)).unwrap(),
+            None
+        );
+        assert!(read_absent_route(&mut rows, &key, || Ok(false)).is_err());
+        assert!(read_absent_route(&mut rows, &key, || Err(
+            io::ErrorKind::PermissionDenied.into()
+        ))
+        .is_err());
+        let mut calls = 0;
+        assert!(read_absent_route(&mut rows, &key, || {
+            calls += 1;
+            Ok(calls == 1)
+        })
+        .is_err());
+        rows.0.borrow_mut().fail_read = true;
+        assert!(read_absent_route(&mut rows, &key, || Ok(true)).is_err());
+        rows.0.borrow_mut().fail_read = false;
+        rows.0
+            .borrow_mut()
+            .rows
+            .push(Row::static_route(route(false), PROOF));
+        assert!(read_absent_route(&mut rows, &key, || Ok(true)).is_err());
+        assert!(rows.0.borrow().writes.is_empty());
+    }
+    #[test]
+    fn network_owner_promotes_after_owned_interface_rows_vanish_without_recreating_them() {
+        use nelomai_client_tunnel::redundancy::{network::NetworkOwner, Slot};
+        struct System {
+            normal: MemberRoutes<Fake, Box<dyn FnMut(u32) -> io::Result<NativeProof>>>,
+            rows: Fake,
+            absent: Rc<RefCell<bool>>,
+        }
+        impl NetworkSystem for System {
+            fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+                if route_key(key)?.1 == 7 && *self.absent.borrow() {
+                    return read_absent_route(&mut self.rows, key, || Ok(*self.absent.borrow()));
+                }
+                self.normal.read(key)
+            }
+            fn compare_exchange(
+                &mut self,
+                key: &ResourceKey,
+                before: Option<&NetworkValue>,
+                after: Option<&NetworkValue>,
+            ) -> io::Result<()> {
+                if route_key(key)?.1 == 7 && *self.absent.borrow() {
+                    return if before.is_none() && after.is_none() && self.read(key)?.is_none() {
+                        Ok(())
+                    } else {
+                        Err(conflict())
+                    };
+                }
+                self.normal.compare_exchange(key, before, after)
+            }
+        }
+        for foreign in [false, true] {
+            let rows = Fake::default();
+            let absent = Rc::new(RefCell::new(false));
+            let check = absent.clone();
+            let normal = MemberRoutes::new(
+                rows.clone(),
+                Box::new(move |index| {
+                    if index == 7 && *check.borrow() {
+                        return Err(conflict());
+                    }
+                    Ok(NativeProof {
+                        index,
+                        luid: u64::from(index) * 100,
+                    })
+                }) as Box<dyn FnMut(u32) -> io::Result<NativeProof>>,
+            );
+            let mut owner = NetworkOwner::fresh(
+                System {
+                    normal,
+                    rows: rows.clone(),
+                    absent: absent.clone(),
+                },
+                Journal,
+            );
+            let a = route(false);
+            let mut b = a.clone();
+            b.interface = 8;
+            b.scope = RouteScope::WindowsInterface(8);
+            b.metric = 200;
+            owner.select(Slot::A, vec![value(&a), value(&b)]).unwrap();
+            *absent.borrow_mut() = true;
+            rows.0.borrow_mut().rows.retain(|r| r.route.interface != 7);
+            if foreign {
+                rows.0.borrow_mut().rows.push(Row::static_route(
+                    a.clone(),
+                    NativeProof {
+                        index: 7,
+                        luid: 999,
+                    },
+                ));
+            }
+            rows.0.borrow_mut().writes.clear();
+            b.metric = 20;
+            let result = owner.select(Slot::B, vec![value(&b)]);
+            if foreign {
+                assert!(result.is_err());
+                assert!(rows.0.borrow().writes.is_empty());
+            } else {
+                result.unwrap();
+                assert_eq!(owner.active(), Some(Slot::B));
+                assert_eq!(
+                    rows.0.borrow().rows,
+                    vec![Row::static_route(
+                        b,
+                        NativeProof {
+                            index: 8,
+                            luid: 800
+                        }
+                    )]
+                );
+                assert_eq!(rows.0.borrow().writes, ["set"]);
+            }
+        }
     }
     #[test]
     fn create_read_delete_both_families() {

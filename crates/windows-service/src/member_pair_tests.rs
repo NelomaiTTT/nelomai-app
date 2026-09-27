@@ -631,8 +631,47 @@ fn rebind_retries_under_existing_fence_after_transient_route_cleanup_failure() {
     assert!(p.rebind_pair(&scope()).is_err());
     assert!(p.open_probe(Slot::A).is_err());
     s.borrow_mut().fail_cleanup_routes = false;
+    assert!(p.physical_network_fingerprint().is_err());
+    assert!(p.rebind_pair(&scope()).is_err());
+    p.check_integrity().unwrap();
     assert!(p.rebind_pair(&scope()).unwrap());
     assert!(p.open_probe(Slot::A).is_ok());
+}
+
+#[test]
+fn fenced_discovery_requires_exact_installed_permit_free_guard() {
+    for mutation in 0..6 {
+        let (mut p, s) = pair();
+        p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+            .unwrap();
+        let running = p.record.guard.clone();
+        s.borrow_mut().fail_cleanup_routes = true;
+        assert!(p.rebind_pair(&scope()).is_err());
+        s.borrow_mut().fail_cleanup_routes = false;
+        p.check_integrity().unwrap();
+        assert!(p.physical_network_fingerprint().is_ok());
+        match mutation {
+            0 => s.borrow_mut().guard = Some(Model::empty(scope()).unwrap()),
+            1 => s.borrow_mut().guard = Some(running.clone()),
+            2 => s.borrow_mut().fail_guard_read = true,
+            3 => {
+                p.record.pending_guard = Some(ExchangePlan::new(&p.record.guard, &running).unwrap())
+            }
+            4 => {
+                // Even exact readback of a model with dynamic probe permits is
+                // not an acknowledged blocking fence eligible for recovery.
+                p.record.guard = Model::new(scope(), running.members.clone(), None).unwrap();
+                s.borrow_mut().guard = Some(p.record.guard.clone());
+            }
+            _ => {
+                p.record.guard = Model::empty(scope()).unwrap();
+                s.borrow_mut().guard = Some(p.record.guard.clone());
+            }
+        }
+        s.borrow_mut().events.clear();
+        assert!(p.physical_network_fingerprint().is_err());
+        assert!(s.borrow().events.is_empty());
+    }
 }
 #[test]
 fn scope_mismatch_and_durable_failure_prevent_native_effects() {
@@ -830,16 +869,598 @@ fn failed_reserve_route_cleanup_restores_healthy_primary_and_can_retry() {
 mod retained_owner_seam {
     use super::*;
     use crate::member_owner::{self as owner, Journal, MemberIo, MemberOwner};
+    #[test]
+    fn actor_rebind_errors_retry_proven_owners_or_signal_terminal_recovery() {
+        use crate::{member_actor::CompositeBackend, ServiceTunnelBackend};
+        use nelomai_client_tunnel::redundancy::{protocol::Command, session::SessionPhase};
+        let mut failures = Vec::new();
+        for (fault, terminal) in [
+            ("none", false),
+            ("routes", false),
+            ("pair_journal", false),
+            ("pair_journal_persistent", true),
+            ("pair_journal_lost_ack", false),
+            ("guard", false),
+            ("native_rebind", true),
+            ("native_rebind_lost_ack", true),
+            ("owner_prepared_save", false),
+            ("owner_running_save", true),
+            ("owner_running_lost_ack", false),
+            ("reserve_prepared_save", false),
+            ("reserve_running_save", true),
+            ("reserve_running_lost_ack", false),
+        ] {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native {
+                answer_queries: true,
+                dns_enabled: true,
+                ..Default::default()
+            }));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut actor = CompositeBackend::new(
+                RuntimeSlot::Stable,
+                NoSingle,
+                PhysicalFactory(s.clone(), native.clone()),
+            )
+            .unwrap();
+            actor
+                .redundant(Command::Start {
+                    scope: scope(),
+                    primary: member(Slot::A),
+                    role_generation: 0,
+                    membership_generation: 0,
+                    warm_stop_v1: true,
+                    options: DesktopTunnelOptions::default(),
+                })
+                .unwrap();
+            let with_reserve = fault.starts_with("reserve_");
+            if with_reserve {
+                let snapshot = actor.current_redundancy_snapshot().unwrap();
+                let mut reserve = member(Slot::B);
+                reserve.lease_id = "33333333-3333-4333-8333-333333333333".into();
+                actor
+                    .redundant(Command::Attach {
+                        scope: scope(),
+                        member: reserve,
+                        expected_revision: snapshot.session.local_revision,
+                        expected_network_epoch: snapshot.session.network_epoch,
+                        expected_membership_generation: 0,
+                        membership_generation: 0,
+                    })
+                    .unwrap();
+            }
+            for now in (0..=2000).step_by(100) {
+                actor.tick(now).unwrap();
+            }
+            assert!(actor.current_redundancy_snapshot().unwrap().primary_ready);
+            let owner_saves = s.borrow().owner_saves;
+            match fault {
+                "routes" => s.borrow_mut().fail_cleanup_routes = true,
+                "pair_journal" | "pair_journal_persistent" => s.borrow_mut().fail_save = true,
+                "pair_journal_lost_ack" => s.borrow_mut().lost_pair_save = true,
+                "guard" => s.borrow_mut().fail_guard = true,
+                "native_rebind" => native.borrow_mut().fail_rebind = true,
+                "native_rebind_lost_ack" => native.borrow_mut().lost_rebind = true,
+                "owner_prepared_save" => s.borrow_mut().fail_owner_save = Some(owner_saves + 1),
+                "owner_running_save" => s.borrow_mut().fail_owner_save = Some(owner_saves + 2),
+                "owner_running_lost_ack" => s.borrow_mut().lost_owner_save = Some(owner_saves + 2),
+                "reserve_prepared_save" => s.borrow_mut().fail_owner_save = Some(owner_saves + 3),
+                "reserve_running_save" => s.borrow_mut().fail_owner_save = Some(owner_saves + 4),
+                "reserve_running_lost_ack" => {
+                    s.borrow_mut().lost_owner_save = Some(owner_saves + 4)
+                }
+                _ => (),
+            }
+            let initial = actor.redundant(Command::NetworkChanged { scope: scope() });
+            assert_eq!(
+                initial.is_err(),
+                fault != "none",
+                "fault not reached: {fault}"
+            );
+            if fault == "pair_journal_persistent" {
+                assert!(actor.tick(2100).is_err());
+                let snapshot = actor.current_redundancy_snapshot().unwrap();
+                assert_eq!(snapshot.session.phase, SessionPhase::Stopping);
+                assert!(snapshot.stalled && snapshot.cleanup_pending && !snapshot.primary_ready);
+                assert_eq!(native.borrow().live, [None, None]);
+                s.borrow_mut().fail_save = false;
+                // Core's existing exact recovery-stop path can complete the
+                // retained cleanup once storage is available; no new Start.
+                actor
+                    .redundant(Command::PrepareRecoveryStop {
+                        scope: scope(),
+                        expected_revision: snapshot.session.local_revision,
+                        expected_network_epoch: snapshot.session.network_epoch,
+                    })
+                    .unwrap();
+                actor.redundant(Command::Stop { scope: scope() }).unwrap();
+            }
+            s.borrow_mut().fail_cleanup_routes = false;
+            s.borrow_mut().fail_save = false;
+            s.borrow_mut().fail_guard = false;
+            s.borrow_mut().fail_owner_save = None;
+            s.borrow_mut().lost_owner_save = None;
+            native.borrow_mut().fail_rebind = false;
+            native.borrow_mut().lost_rebind = false;
+            for now in (2100..=12000).step_by(100) {
+                let _ = actor.tick(now);
+            }
+            let snapshot = actor.current_redundancy_snapshot().unwrap();
+            let expected = if terminal {
+                snapshot.session.phase == SessionPhase::Stopped
+                    && snapshot.stalled
+                    && !snapshot.primary_ready
+                    && !snapshot.cleanup_pending
+                    && native.borrow().live == [None, None]
+                    && s.borrow().guard.as_ref().unwrap() == &Model::empty(scope()).unwrap()
+            } else {
+                snapshot.session.phase == SessionPhase::Running
+                    && !snapshot.stalled
+                    && snapshot.primary_ready
+                    && !snapshot.cleanup_pending
+                    && native.borrow().live[0].is_some()
+                    && s.borrow().guard.as_ref().unwrap().active == Some(Slot::A)
+            };
+            if !expected {
+                failures.push(format!("{fault}: {snapshot:?}"));
+            }
+            assert_eq!(
+                native.borrow().starts,
+                [1, u64::from(with_reserve)],
+                "must not create new native owners: {fault}"
+            );
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+    #[test]
+    fn rebind_failure_reconciliation_preserves_foreign_member_and_cleanup_journal() {
+        for mutation in 0..3 {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native::default()));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut pair = SessionNativePair::new(
+                scope(),
+                RetainedIo::new(s.clone(), native.clone()),
+                Disk(s.clone()),
+            )
+            .unwrap();
+            pair.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+            pair.attach(&scope(), &member(Slot::B)).unwrap();
+            let retained = pair.record.members[1].as_ref().unwrap().owner.clone();
+            s.borrow_mut().fail_cleanup_routes = true;
+            assert!(pair.rebind_pair(&scope()).is_err());
+            s.borrow_mut().fail_cleanup_routes = false;
+            match mutation {
+                0 => {
+                    native.borrow_mut().live[1]
+                        .as_mut()
+                        .unwrap()
+                        .process
+                        .creation_time += 100
+                }
+                1 => native.borrow_mut().configs[1] = Some([99; 32]),
+                _ => {
+                    s.borrow_mut().owners[1]
+                        .as_mut()
+                        .unwrap()
+                        .intent
+                        .scope
+                        .connection_generation += 1
+                }
+            }
+            let foreign = native.borrow().live[1];
+            assert!(pair.check_integrity().is_err());
+            assert!(pair.cleanup_pending());
+            assert_eq!(native.borrow().live, [None, foreign]);
+            assert_eq!(pair.record.members[1].as_ref().unwrap().owner, retained);
+            assert_eq!(
+                s.borrow().saved.as_ref().unwrap().members[1]
+                    .as_ref()
+                    .unwrap()
+                    .owner,
+                retained
+            );
+            assert!(pair.physical_network_fingerprint().is_err());
+            assert!(pair.rebind_pair(&scope()).is_err());
+            assert_eq!(native.borrow().starts, [1, 1]);
+        }
+    }
+    #[test]
+    fn actor_retries_rebind_after_transient_cleanup_failure() {
+        use crate::{member_actor::CompositeBackend, ServiceTunnelBackend};
+        use nelomai_client_tunnel::redundancy::protocol::Command;
+        let s = Rc::new(RefCell::new(State::default()));
+        let native = Rc::new(RefCell::new(Native {
+            answer_queries: true,
+            dns_enabled: true,
+            ..Default::default()
+        }));
+        s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+        let mut actor = CompositeBackend::new(
+            RuntimeSlot::Stable,
+            NoSingle,
+            PhysicalFactory(s.clone(), native.clone()),
+        )
+        .unwrap();
+        actor
+            .redundant(Command::Start {
+                scope: scope(),
+                primary: member(Slot::A),
+                role_generation: 0,
+                membership_generation: 0,
+                warm_stop_v1: true,
+                options: DesktopTunnelOptions::default(),
+            })
+            .unwrap();
+        for now in (0..=2000).step_by(100) {
+            actor.tick(now).unwrap();
+        }
+        assert!(actor.current_redundancy_snapshot().unwrap().primary_ready);
+        s.borrow_mut().fail_cleanup_routes = true;
+        assert!(actor
+            .redundant(Command::NetworkChanged { scope: scope() })
+            .is_err());
+        s.borrow_mut().fail_cleanup_routes = false;
+        s.borrow_mut().events.clear();
+        for now in (2100..=10000).step_by(100) {
+            actor.tick(now).unwrap();
+        }
+        let final_state = actor.current_redundancy_snapshot().unwrap();
+        assert!(native.borrow().live[0].is_some());
+        assert!(
+            final_state.primary_ready,
+            "state={final_state:?}, retry_events={:?}",
+            s.borrow().events
+        );
+        assert!(s.borrow().events.iter().any(|e| e == "routes_clean"));
+        assert_eq!(s.borrow().guard.as_ref().unwrap().active, Some(Slot::A));
+        assert!(!final_state.cleanup_pending);
+        assert_eq!(native.borrow().starts, [1, 0]);
+    }
+    #[test]
+    fn network_change_before_failed_reserve_retirement_recovers_health() {
+        use crate::{member_actor::CompositeBackend, ServiceTunnelBackend};
+        use nelomai_client_tunnel::redundancy::{protocol::Command, session::SessionPhase};
+        // Healthy control, absent SCM, stopped SCM, route failure after owned
+        // retirement, and transient failure while retiring the stopped SCM.
+        for (crash, stopped_service, failure) in [
+            (false, false, 0),
+            (true, false, 0),
+            (true, true, 0),
+            (true, true, 1),
+            (true, true, 2),
+        ] {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native {
+                answer_queries: true,
+                dns_enabled: true,
+                ..Default::default()
+            }));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut actor = CompositeBackend::new(
+                RuntimeSlot::Stable,
+                NoSingle,
+                PhysicalFactory(s.clone(), native.clone()),
+            )
+            .unwrap();
+            actor
+                .redundant(Command::Start {
+                    scope: scope(),
+                    primary: member(Slot::A),
+                    role_generation: 0,
+                    membership_generation: 0,
+                    warm_stop_v1: true,
+                    options: DesktopTunnelOptions::default(),
+                })
+                .unwrap();
+            let snapshot = actor.current_redundancy_snapshot().unwrap();
+            let mut reserve = member(Slot::B);
+            reserve.lease_id = "33333333-3333-4333-8333-333333333333".into();
+            actor
+                .redundant(Command::Attach {
+                    scope: scope(),
+                    member: reserve,
+                    expected_revision: snapshot.session.local_revision,
+                    expected_network_epoch: snapshot.session.network_epoch,
+                    expected_membership_generation: 0,
+                    membership_generation: 0,
+                })
+                .unwrap();
+            for now in (0..=2000).step_by(100) {
+                actor.tick(now).unwrap();
+            }
+            assert!(actor.current_redundancy_snapshot().unwrap().primary_ready);
+            if crash {
+                native.borrow_mut().live[1] = None;
+                native.borrow_mut().dns[1] = None;
+                native.borrow_mut().stopped_service[1] = stopped_service;
+            }
+            s.borrow_mut().fail_cleanup_routes = failure == 1;
+            native.borrow_mut().fail_stopped_cleanup = failure == 2;
+            let initial = actor.redundant(Command::NetworkChanged { scope: scope() });
+            if failure == 0 {
+                initial.unwrap();
+            } else {
+                assert!(initial.is_err());
+                assert!(!actor.current_redundancy_snapshot().unwrap().primary_ready);
+                assert_eq!(s.borrow().guard.as_ref().unwrap().active, None);
+            }
+            s.borrow_mut().fail_cleanup_routes = false;
+            native.borrow_mut().fail_stopped_cleanup = false;
+            for now in (2100..=10000).step_by(100) {
+                actor.tick(now).unwrap();
+            }
+            let final_state = actor.current_redundancy_snapshot().unwrap();
+            assert_eq!(final_state.session.phase, SessionPhase::Running);
+            assert!(native.borrow().live[0].is_some());
+            assert!(
+                final_state.primary_ready,
+                "crash={crash}, stopped_service={stopped_service}, failure={failure}, state={final_state:?}"
+            );
+            assert_eq!(native.borrow().starts, [1, 1]);
+            assert_eq!(s.borrow().guard.as_ref().unwrap().active, Some(Slot::A));
+            assert!(!final_state.cleanup_pending);
+            if crash {
+                assert!(final_state.standby_failed);
+                assert!(native.borrow().live[1].is_none());
+                assert!(!native.borrow().stopped_service[1]);
+                assert_eq!(
+                    s.borrow().owners[1].as_ref().unwrap().phase,
+                    owner::Phase::Stopped
+                );
+                assert!(s.borrow().saved.as_ref().unwrap().dns[1].is_none());
+            }
+        }
+    }
+    #[test]
+    fn absent_standby_cleanup_preserves_primary_and_allows_replacement() {
+        for stopped_service in [false, true] {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native {
+                dns_enabled: true,
+                ..Default::default()
+            }));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut p = SessionNativePair::new(
+                scope(),
+                RetainedIo::new(s.clone(), native.clone()),
+                Disk(s.clone()),
+            )
+            .unwrap();
+            p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+            p.attach(&scope(), &member(Slot::B)).unwrap();
+            let primary = native.borrow().live[0];
+            native.borrow_mut().live[1] = None;
+            native.borrow_mut().dns[1] = None;
+            native.borrow_mut().stopped_service[1] = stopped_service;
+            s.borrow_mut().events.clear();
+            let result = p.remove_standby(&scope(), Slot::B);
+            assert_eq!(
+                native.borrow().live[0],
+                primary,
+                "healthy primary stopped: {result:?}"
+            );
+            result.unwrap();
+            assert!(!p.cleanup_pending());
+            assert!(p.record.members[1].is_none());
+            assert_eq!(p.record.active, Some(Slot::A));
+            assert_eq!(s.borrow().route_active, Some(Slot::A));
+            assert!(!s.borrow().events.iter().any(|e| e == "dns:B"));
+            assert_eq!(
+                native.borrow().dns[0]
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .name_server
+                    .as_deref(),
+                Some("9.9.9.9")
+            );
+            let guard = s.borrow().guard.clone().unwrap();
+            assert_eq!(guard.active, Some(Slot::A));
+            assert!(guard.members[1].is_none());
+            let mut replacement = member(Slot::B);
+            replacement.lease_id = "33333333-3333-4333-8333-333333333333".into();
+            p.attach(&scope(), &replacement).unwrap();
+            assert_eq!(native.borrow().starts, [1, 2]);
+            assert_eq!(native.borrow().live[0], primary);
+        }
+    }
+    #[test]
+    fn rebind_after_primary_crash_skips_retired_member() {
+        for stopped_service in [false, true] {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native {
+                dns_enabled: true,
+                ..Default::default()
+            }));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut p = SessionNativePair::new(
+                scope(),
+                RetainedIo::new(s.clone(), native.clone()),
+                Disk(s.clone()),
+            )
+            .unwrap();
+            p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+            p.attach(&scope(), &member(Slot::B)).unwrap();
+            assert!(p.rebind_pair(&scope()).unwrap(), "control: both live");
+            native.borrow_mut().live[0] = None;
+            native.borrow_mut().dns[0] = None;
+            native.borrow_mut().stopped_service[0] = stopped_service;
+            p.select_active(&scope(), Slot::B).unwrap();
+            let old_primary = native.borrow().live[1];
+            s.borrow_mut().events.clear();
+            assert!(p.rebind_pair(&scope()).unwrap());
+            assert_eq!(p.record.active, Some(Slot::B));
+            assert!(!p.cleanup_pending());
+            assert!(native.borrow().live[0].is_none());
+            assert_ne!(native.borrow().live[1], old_primary);
+            assert_eq!(native.borrow().starts, [1, 1]);
+            assert!(p.sockets[0].is_none());
+            assert!(p.sockets[1].is_some());
+            assert_eq!(s.borrow().guard.as_ref().unwrap().active, Some(Slot::B));
+            assert_eq!(s.borrow().route_active, Some(Slot::B));
+            assert!(!s.borrow().events.iter().any(|e| e == "dns:A"));
+            assert_eq!(
+                native.borrow().dns[1]
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .name_server
+                    .as_deref(),
+                Some("9.9.9.9")
+            );
+            p.remove_standby(&scope(), Slot::A).unwrap();
+            p.close(&scope()).unwrap();
+            assert!(native.borrow().live.iter().all(Option::is_none));
+        }
+    }
+    #[test]
+    fn rebind_does_not_ignore_foreign_or_unproven_retired_member() {
+        for mutation in 0..4 {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native::default()));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut p = SessionNativePair::new(
+                scope(),
+                RetainedIo::new(s.clone(), native.clone()),
+                Disk(s.clone()),
+            )
+            .unwrap();
+            p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+            p.attach(&scope(), &member(Slot::B)).unwrap();
+            let old = native.borrow().live[0];
+            native.borrow_mut().live[0] = None;
+            p.select_active(&scope(), Slot::B).unwrap();
+            match mutation {
+                0 => native.borrow_mut().live[0] = old,
+                1 => native.borrow_mut().configs[0] = Some([99; 32]),
+                2 => native.borrow_mut().fail_inspect = true,
+                _ => native.borrow_mut().live[1] = None,
+            }
+            let before = native.borrow().live;
+            s.borrow_mut().events.clear();
+            assert!(p.rebind_pair(&scope()).is_err());
+            assert_eq!(native.borrow().live, before);
+            assert!(s.borrow().events.is_empty());
+            assert_eq!(native.borrow().starts, [1, 1]);
+        }
+    }
+    #[test]
+    fn failed_reserve_retirement_never_forgets_owner_or_deletes_foreign_native() {
+        for mutation in 0..5 {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native::default()));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut p = SessionNativePair::new(
+                scope(),
+                RetainedIo::new(s.clone(), native.clone()),
+                Disk(s.clone()),
+            )
+            .unwrap();
+            p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+            p.attach(&scope(), &member(Slot::B)).unwrap();
+            let intent = p.record.members[1].as_ref().unwrap().owner.intent.clone();
+            native.borrow_mut().live[1] = None;
+            native.borrow_mut().stopped_service[1] = true;
+            match mutation {
+                0 => {
+                    let mut foreign = p.record.members[1].as_ref().unwrap().owner.proof.unwrap();
+                    foreign.process.creation_time += 99;
+                    native.borrow_mut().live[1] = Some(foreign);
+                }
+                1 => native.borrow_mut().configs[1] = Some([99; 32]),
+                2 => native.borrow_mut().fail_inspect = true,
+                3 => native.borrow_mut().fail_stopped_cleanup = true,
+                _ => s.borrow_mut().fail_save = true,
+            }
+            let foreign = native.borrow().live[1];
+            s.borrow_mut().events.clear();
+            assert!(p.remove_standby(&scope(), Slot::B).is_err());
+            assert_eq!(native.borrow().live[1], foreign);
+            assert_eq!(s.borrow().owners[1].as_ref().unwrap().intent, intent);
+            assert!(p.record.members[1].is_some());
+            assert!(p.cleanup_pending());
+            assert!(!s.borrow().events.iter().any(|e| e == "guard:Some(A)"));
+            assert_eq!(native.borrow().starts, [1, 1]);
+        }
+    }
     #[derive(Default)]
     struct Native {
         configs: [Option<[u8; 32]>; 2],
         live: [Option<owner::NativeProof>; 2],
+        stopped_service: [bool; 2],
+        answer_queries: bool,
+        tx: [u64; 2],
+        rx: [u64; 2],
+        dns_enabled: bool,
+        dns: [Option<DnsSnapshot>; 2],
         starts: [u64; 2],
         fail_config: bool,
         lost_config: bool,
         fail_inspect: bool,
+        fail_stopped_cleanup: bool,
+        fail_rebind: bool,
+        lost_rebind: bool,
     }
     type NativeState = Rc<RefCell<Native>>;
+    struct HealthSocket {
+        base: Socket,
+        native: NativeState,
+        slot: Slot,
+        query: Vec<u8>,
+        replied: bool,
+        base_owner: bool,
+    }
+    impl Drop for HealthSocket {
+        fn drop(&mut self) {
+            if self.base_owner {
+                self.base
+                    .0
+                    .borrow_mut()
+                    .events
+                    .push(format!("base_drop:{:?}", self.slot));
+            }
+        }
+    }
+    impl ProbeDatagram for HealthSocket {
+        fn send(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.query = bytes.to_vec();
+            self.native.borrow_mut().tx[self.slot.idx()] += 1;
+            Ok(bytes.len())
+        }
+        fn receive(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let mut native = self.native.borrow_mut();
+            if self.replied || !native.answer_queries || native.live[self.slot.idx()].is_none() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let mut response = self.query.clone();
+            response[2] = 0x81;
+            response[3] = 0x80;
+            response[7] = 1;
+            response.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 3, 4]);
+            bytes[..response.len()].copy_from_slice(&response);
+            native.rx[self.slot.idx()] += 1;
+            self.replied = true;
+            Ok(response.len())
+        }
+    }
+    impl PairSocket for HealthSocket {
+        fn duplicate(&self) -> io::Result<Self> {
+            Ok(Self {
+                base: self.base.duplicate()?,
+                native: self.native.clone(),
+                slot: self.slot,
+                query: Vec::new(),
+                replied: false,
+                base_owner: false,
+            })
+        }
+    }
     struct JournalIo(Shared);
     impl Journal for JournalIo {
         fn load(&mut self, slot: TunnelSlot) -> owner::Result<Option<OwnerRecord>> {
@@ -882,10 +1503,17 @@ mod retained_owner_seam {
             let live = s.live[i];
             Ok(owner::Observation {
                 config_sha256: s.configs[i],
-                service: live.map(|p| owner::ServiceObservation {
-                    exact_spec: true,
-                    process: Some(p.process),
-                }),
+                service: live
+                    .map(|p| owner::ServiceObservation {
+                        exact_spec: true,
+                        process: Some(p.process),
+                    })
+                    .or_else(|| {
+                        s.stopped_service[i].then_some(owner::ServiceObservation {
+                            exact_spec: true,
+                            process: None,
+                        })
+                    }),
                 alternative_service_present: false,
                 interface: live.map(|p| p.interface),
                 retained_interfaces: live
@@ -935,29 +1563,76 @@ mod retained_owner_seam {
                     guid: [i as u8 + 1; 16],
                 },
             });
+            if s.dns_enabled {
+                let p = s.live[i].unwrap().interface;
+                s.dns[i] = Some(DnsSnapshot {
+                    interface: crate::member_dns::OwnedInterface {
+                        scope: intent.scope.clone(),
+                        guid: p.guid,
+                        luid: p.luid,
+                        index: p.index,
+                    },
+                    settings: crate::member_dns::Settings {
+                        version: 1,
+                        flags: 0,
+                        domain: None,
+                        name_server: None,
+                        search_list: None,
+                        registration_enabled: 0,
+                        register_adapter_name: 0,
+                        enable_llmnr: 0,
+                        query_adapter_name: 0,
+                        profile_name_server: None,
+                    },
+                });
+            }
             Ok(())
         }
         fn stop_slot(
             &mut self,
             intent: &owner::Intent,
             proof: Option<&owner::NativeProof>,
-            _: &owner::Observation,
+            expected: &owner::Observation,
         ) -> owner::Result<()> {
+            // Match the real adapter's require_same check, including cleanup
+            // by the still-live owner of an interrupted Prepared operation.
+            // MemberOwner (not this OS fake) decides whether that is allowed.
+            if &self.inspect(intent, proof)? != expected {
+                return Err(owner::OwnerError::Conflict);
+            }
             let mut s = self.0.borrow_mut();
             let i = slot_shared(intent.slot).idx();
-            if s.live[i].as_ref() != proof {
+            if s.fail_stopped_cleanup && s.live[i].is_none() && s.stopped_service[i] {
+                return Err(owner::OwnerError::Native);
+            }
+            if expected.service.as_ref().and_then(|svc| svc.process) != s.live[i].map(|p| p.process)
+                || s.configs[i] != Some(intent.config_sha256)
+            {
                 return Err(owner::OwnerError::Conflict);
             }
             s.live[i] = None;
+            s.stopped_service[i] = false;
+            s.dns[i] = None;
             Ok(())
         }
         fn rebind(
             &mut self,
-            _: &owner::Intent,
-            _: &owner::NativeProof,
+            intent: &owner::Intent,
+            proof: &owner::NativeProof,
             _: &owner::Observation,
         ) -> owner::Result<()> {
-            Err(owner::OwnerError::Native)
+            let mut state = self.0.borrow_mut();
+            if state.fail_rebind {
+                return Err(owner::OwnerError::Native);
+            }
+            let current = state.live[slot_shared(intent.slot).idx()].as_mut().unwrap();
+            assert_eq!(current, proof);
+            current.process.creation_time += 100;
+            current.process.pid += 100;
+            if state.lost_rebind {
+                return Err(owner::OwnerError::Native);
+            }
+            Ok(())
         }
     }
     type RealOwner = MemberOwner<JournalIo, NativeIo>;
@@ -1007,7 +1682,7 @@ mod retained_owner_seam {
         }
     }
     impl PairIo for RetainedIo {
-        type Socket = Socket;
+        type Socket = HealthSocket;
         fn prepare_member(&mut self, scope: &SessionScope, m: &Member) -> io::Result<MemberRecord> {
             let i = m.slot.idx();
             if let Some(old) = &mut self.owners[i] {
@@ -1034,6 +1709,9 @@ mod retained_owner_seam {
             let mut record = self.base.prepare_member(scope, m)?;
             record.owner.intent = owner.intent().clone();
             record.prior_stopped = owner.prior_stopped().map_err(io::Error::other)?;
+            if self.native.borrow().dns_enabled {
+                record.dns = vec!["9.9.9.9".parse().unwrap()];
+            }
             self.owners[i] = Some(owner);
             Ok(record)
         }
@@ -1083,6 +1761,11 @@ mod retained_owner_seam {
                 .confirm_absent(&m.owner)
                 .map_err(io::Error::other)
         }
+        fn confirm_inactive_for_discovery(&mut self, m: &MemberRecord) -> io::Result<bool> {
+            self.owner(m)
+                .confirm_inactive_for_discovery(&m.owner)
+                .map_err(io::Error::other)
+        }
         fn stop(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
             self.owner(m)
                 .stop_best_effort(&m.owner)
@@ -1093,14 +1776,30 @@ mod retained_owner_seam {
         }
         fn observe(&mut self, m: &MemberRecord) -> io::Result<(TunnelMetrics, NativeHealthSample)> {
             self.verify(m)?;
-            self.base.observe(m)
+            let (metrics, mut sample) = self.base.observe(m)?;
+            let native = self.native.borrow();
+            let i = slot_shared(m.owner.intent.slot).idx();
+            sample.tx_packets = native.tx[i];
+            sample.rx_data_packets = native.rx[i];
+            Ok((metrics, sample))
         }
         fn fingerprint(&mut self, m: &[Option<MemberRecord>; 2]) -> io::Result<String> {
             self.base.fingerprint(m)
         }
-        fn open_base(&mut self, m: &MemberRecord) -> io::Result<(Socket, ProbeTuple)> {
+        fn open_base(&mut self, m: &MemberRecord) -> io::Result<(HealthSocket, ProbeTuple)> {
             self.verify(m)?;
-            self.base.open_base(m)
+            let (base, tuple) = self.base.open_base(m)?;
+            Ok((
+                HealthSocket {
+                    base,
+                    native: self.native.clone(),
+                    slot: slot_shared(m.owner.intent.slot),
+                    query: Vec::new(),
+                    replied: false,
+                    base_owner: true,
+                },
+                tuple,
+            ))
         }
         fn guard_snapshot(&mut self) -> io::Result<crate::member_guard::Snapshot> {
             self.base.guard_snapshot()
@@ -1117,16 +1816,425 @@ mod retained_owner_seam {
             m: &[Option<MemberRecord>; 2],
             o: &DesktopTunnelOptions,
         ) -> io::Result<()> {
-            self.base.select_routes(a, m, o)
+            let live = live_route_members(self, a, m)?;
+            self.base.select_routes(a, &live, o)
         }
         fn cleanup_routes(&mut self) -> io::Result<()> {
             self.base.cleanup_routes()
         }
         fn read_dns(&mut self, m: &MemberRecord) -> io::Result<DnsSnapshot> {
-            self.base.read_dns(m)
+            self.verify(m)?;
+            self.native.borrow().dns[slot_shared(m.owner.intent.slot).idx()]
+                .clone()
+                .ok_or_else(failed)
         }
         fn exchange_dns(&mut self, a: &DnsSnapshot, b: &DnsSnapshot) -> io::Result<()> {
-            self.base.exchange_dns(a, b)
+            let m = self
+                .base
+                .0
+                .borrow()
+                .saved
+                .as_ref()
+                .unwrap()
+                .members
+                .iter()
+                .flatten()
+                .find(|m| {
+                    m.owner
+                        .proof
+                        .is_some_and(|p| p.interface.index == a.interface.index)
+                })
+                .cloned()
+                .ok_or_else(failed)?;
+            self.verify(&m)?;
+            let i = slot_shared(m.owner.intent.slot).idx();
+            let mut native = self.native.borrow_mut();
+            if a.interface != b.interface || native.dns[i].as_ref() != Some(a) {
+                return Err(failed());
+            }
+            native.dns[i] = Some(b.clone());
+            self.base
+                .0
+                .borrow_mut()
+                .events
+                .push(format!("dns:{:?}", slot_shared(m.owner.intent.slot)));
+            Ok(())
+        }
+    }
+    struct SessionDisk;
+    impl nelomai_client_tunnel::redundancy::driver::SessionStore for SessionDisk {
+        fn save(
+            &mut self,
+            _: &nelomai_client_tunnel::redundancy::session::SessionSnapshot,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    struct NoSingle;
+    impl crate::ServiceTunnelBackend for NoSingle {
+        fn start(
+            &mut self,
+            _: &str,
+            _: &DesktopTunnelOptions,
+            _: nelomai_client_tunnel::TunnelTransport,
+        ) -> Result<crate::ServiceTunnelState, crate::ServiceError> {
+            panic!("no legacy fallback")
+        }
+        fn stop(&mut self) -> Result<crate::ServiceTunnelState, crate::ServiceError> {
+            panic!("no legacy fallback")
+        }
+        fn status(&mut self) -> Result<crate::ServiceTunnelState, crate::ServiceError> {
+            Ok(crate::ServiceTunnelState::Stopped)
+        }
+    }
+    struct PhysicalFactory(Shared, NativeState);
+    impl crate::member_actor::PairFactory for PhysicalFactory {
+        type Native = SessionNativePair<RetainedIo, Disk>;
+        type Store = SessionDisk;
+        fn recover(&mut self, _: RuntimeSlot) -> Result<(), crate::ServiceError> {
+            Ok(())
+        }
+        fn prepare(
+            &mut self,
+            runtime: RuntimeSlot,
+            command: &nelomai_client_tunnel::redundancy::protocol::Command,
+            now: u64,
+        ) -> io::Result<
+            nelomai_client_tunnel::redundancy::control::SessionControl<Self::Native, Self::Store>,
+        > {
+            let native = SessionNativePair::new(
+                command.scope().clone(),
+                RetainedIo::new(self.0.clone(), self.1.clone()),
+                Disk(self.0.clone()),
+            )?;
+            nelomai_client_tunnel::redundancy::control::SessionControl::prepare(
+                runtime,
+                command,
+                native,
+                SessionDisk,
+                now,
+            )
+        }
+    }
+    #[test]
+    fn promotion_rejects_unproven_old_member_or_nonlive_selected_member_before_effects() {
+        for mutation in 0..5 {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native::default()));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut pair = SessionNativePair::new(
+                scope(),
+                RetainedIo::new(s.clone(), native.clone()),
+                Disk(s.clone()),
+            )
+            .unwrap();
+            pair.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+            pair.attach(&scope(), &member(Slot::B)).unwrap();
+            match mutation {
+                0 => {
+                    native.borrow_mut().live[0]
+                        .as_mut()
+                        .unwrap()
+                        .process
+                        .creation_time += 100
+                }
+                1 => native.borrow_mut().live[1] = None,
+                2 => native.borrow_mut().live[1].as_mut().unwrap().interface.guid = [99; 16],
+                3 => native.borrow_mut().fail_inspect = true,
+                _ => {
+                    native.borrow_mut().live[0] = None;
+                    native.borrow_mut().stopped_service[0] = true;
+                    native.borrow_mut().configs[0] = Some([99; 32]);
+                }
+            }
+            s.borrow_mut().events.clear();
+            let before = native.borrow().live;
+            assert!(pair.select_active(&scope(), Slot::B).is_err());
+            assert_eq!(native.borrow().live, before);
+            assert_eq!(native.borrow().starts, [1, 1]);
+            assert!(s.borrow().events.is_empty());
+            assert_eq!(s.borrow().guard.as_ref().unwrap().active, Some(Slot::A));
+        }
+    }
+    #[test]
+    fn actor_promotes_healthy_b_after_a_scm_crash_and_retires_only_a() {
+        use crate::{member_actor::CompositeBackend, ServiceTunnelBackend};
+        use nelomai_client_tunnel::redundancy::{protocol::Command, session::SessionPhase};
+        for (stopped_service, cleanup_failure) in
+            [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)]
+        {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native {
+                answer_queries: true,
+                dns_enabled: true,
+                ..Default::default()
+            }));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut actor = CompositeBackend::new(
+                RuntimeSlot::Stable,
+                NoSingle,
+                PhysicalFactory(s.clone(), native.clone()),
+            )
+            .unwrap();
+            actor
+                .redundant(Command::Start {
+                    scope: scope(),
+                    primary: member(Slot::A),
+                    role_generation: 0,
+                    membership_generation: 0,
+                    warm_stop_v1: true,
+                    options: DesktopTunnelOptions::default(),
+                })
+                .unwrap();
+            let snapshot = actor.current_redundancy_snapshot().unwrap();
+            let mut reserve = member(Slot::B);
+            reserve.lease_id = "33333333-3333-4333-8333-333333333333".into();
+            actor
+                .redundant(Command::Attach {
+                    scope: scope(),
+                    member: reserve,
+                    expected_revision: snapshot.session.local_revision,
+                    expected_network_epoch: snapshot.session.network_epoch,
+                    expected_membership_generation: 0,
+                    membership_generation: 0,
+                })
+                .unwrap();
+            for now in (0..=2000).step_by(100) {
+                actor.tick(now).unwrap();
+            }
+            assert!(actor.current_redundancy_snapshot().unwrap().primary_ready);
+            let b = native.borrow().live[1];
+            native.borrow_mut().live[0] = None;
+            native.borrow_mut().dns[0] = None;
+            native.borrow_mut().stopped_service[0] = stopped_service;
+            match cleanup_failure {
+                1 => native.borrow_mut().fail_stopped_cleanup = true,
+                2 => {
+                    let count = s.borrow().owner_saves;
+                    s.borrow_mut().fail_owner_save = Some(count + 2);
+                }
+                3 => {
+                    let count = s.borrow().owner_saves;
+                    s.borrow_mut().lost_owner_save = Some(count + 2);
+                }
+                _ => (),
+            }
+            s.borrow_mut().events.clear();
+            let mut failed = false;
+            for now in (2100..=12000).step_by(100) {
+                if actor.tick(now).is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            let result = actor.current_redundancy_snapshot().unwrap();
+            if cleanup_failure != 0 {
+                assert!(failed, "failed stopped cleanup must reject promotion");
+                assert_ne!(result.session.active, Slot::B);
+                assert_ne!(result.session.phase, SessionPhase::Running);
+                assert_eq!(native.borrow().starts, [1, 1]);
+                assert!(!s
+                    .borrow()
+                    .events
+                    .iter()
+                    .any(|e| e == "routes:B" || e == "guard:Some(B)"));
+                if cleanup_failure == 1 {
+                    assert!(result.cleanup_pending);
+                    assert!(native.borrow().stopped_service[0]);
+                    let retained = s.borrow().owners[0].clone().unwrap();
+                    assert_eq!(retained.phase, owner::Phase::Stopping);
+                    assert!(retained.proof.is_some());
+                }
+                continue;
+            }
+            assert!(!failed);
+            assert_eq!(result.session.phase, SessionPhase::Running);
+            assert_eq!(result.session.active, Slot::B);
+            assert!(result.primary_ready);
+            assert!(!result.cleanup_pending);
+            assert_eq!(native.borrow().starts, [1, 1]);
+            assert_eq!(native.borrow().live[1], b);
+            assert!(!native.borrow().stopped_service[0]);
+            assert_eq!(
+                s.borrow().owners[0].as_ref().unwrap().phase,
+                owner::Phase::Stopped
+            );
+            assert_eq!(s.borrow().route_active, Some(Slot::B));
+            let guard = s.borrow().guard.clone().unwrap();
+            assert_eq!(guard.active, Some(Slot::B));
+            assert!(guard.members[0].is_none());
+            assert!(guard.members[1].is_some());
+            assert!(s.borrow().saved.as_ref().unwrap().dns[0].is_none());
+            assert!(native.borrow().dns[0].is_none());
+            assert_eq!(
+                native.borrow().dns[1]
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .name_server
+                    .as_deref(),
+                Some("9.9.9.9")
+            );
+            assert!(actor.metrics(false).is_ok());
+            assert!(actor.physical_network_fingerprint().is_ok());
+            let events = s.borrow().events.clone();
+            let fence = events.iter().position(|e| e == "guard:None").unwrap();
+            let drop = events.iter().position(|e| e == "base_drop:A").unwrap();
+            let routes = events.iter().position(|e| e == "routes:B").unwrap();
+            let allow = events.iter().position(|e| e == "guard:Some(B)").unwrap();
+            assert!(fence < routes && routes < allow);
+            assert!(fence < drop && drop < routes);
+            assert!(!events.iter().any(|e| e == "dns:A"));
+            // The UI has not removed the retired A yet. A physical-network
+            // change must still rebind B and resume autonomous health polling.
+            actor
+                .redundant(Command::NetworkChanged { scope: scope() })
+                .unwrap();
+            for now in (12100..=20000).step_by(100) {
+                actor.tick(now).unwrap();
+            }
+            let rebound = actor.current_redundancy_snapshot().unwrap();
+            assert_eq!(rebound.session.active, Slot::B);
+            assert_eq!(rebound.session.phase, SessionPhase::Running);
+            assert!(rebound.primary_ready);
+            assert!(!rebound.cleanup_pending);
+            assert!(native.borrow().live[0].is_none());
+            assert!(native.borrow().live[1].is_some());
+            assert_eq!(native.borrow().starts, [1, 1]);
+            assert!(actor.metrics(false).is_ok());
+        }
+    }
+    #[test]
+    fn physical_poll_keeps_health_running_after_owned_member_disappears_but_rejects_foreign() {
+        use crate::{member_actor::CompositeBackend, ServiceTunnelBackend};
+        use nelomai_client_tunnel::redundancy::protocol::Command;
+        for (stopped_service, foreign) in [(false, false), (true, false), (false, true)] {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native::default()));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut actor = CompositeBackend::new(
+                RuntimeSlot::Stable,
+                NoSingle,
+                PhysicalFactory(s.clone(), native.clone()),
+            )
+            .unwrap();
+            actor
+                .redundant(Command::Start {
+                    scope: scope(),
+                    primary: member(Slot::A),
+                    role_generation: 0,
+                    membership_generation: 0,
+                    warm_stop_v1: true,
+                    options: DesktopTunnelOptions::default(),
+                })
+                .unwrap();
+            let state = actor.current_redundancy_snapshot().unwrap().session;
+            let mut reserve = member(Slot::B);
+            reserve.lease_id = "33333333-3333-4333-8333-333333333333".into();
+            actor
+                .redundant(Command::Attach {
+                    scope: scope(),
+                    member: reserve,
+                    expected_revision: state.local_revision,
+                    expected_network_epoch: state.network_epoch,
+                    expected_membership_generation: 0,
+                    membership_generation: 0,
+                })
+                .unwrap();
+            actor.tick(0).unwrap();
+            let epoch = actor
+                .current_redundancy_snapshot()
+                .unwrap()
+                .session
+                .network_epoch;
+            if foreign {
+                native.borrow_mut().live[0]
+                    .as_mut()
+                    .unwrap()
+                    .process
+                    .creation_time += 100;
+            } else {
+                native.borrow_mut().live[0] = None;
+                native.borrow_mut().stopped_service[0] = stopped_service;
+            }
+            // Poll physical BEFORE any subsequent health sample, exactly as the
+            // production actor does. No missing-metrics evidence exists yet.
+            for now in (2000..=12000).step_by(500) {
+                actor.tick(now).unwrap();
+            }
+            let result = actor.current_redundancy_snapshot().unwrap();
+            if foreign {
+                assert!(actor.physical_network_fingerprint().is_err());
+                assert!(result.session.network_epoch > epoch);
+                assert!(!result.stalled, "invalid discovery must suspend health");
+            } else {
+                assert_eq!(
+                    actor.physical_network_fingerprint().unwrap(),
+                    "a".repeat(64)
+                );
+                assert_eq!(
+                    result.session.network_epoch, epoch,
+                    "native absence is not a physical network change"
+                );
+                assert!(result.stalled,"missing samples must reach health after its existing urgent budget; fake DNS deliberately never replies");
+            }
+            assert_eq!(native.borrow().starts, [1, 1]);
+            assert!(native.borrow().live[1].is_some());
+            assert_eq!(result.session.active, Slot::A);
+        }
+    }
+    #[test]
+    fn physical_fingerprint_accepts_absent_member_not_stale_or_unproven_identity() {
+        for slot in [Slot::A, Slot::B] {
+            for mutation in 0..5 {
+                let s = Rc::new(RefCell::new(State::default()));
+                let native = Rc::new(RefCell::new(Native::default()));
+                s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+                let mut pair = SessionNativePair::new(
+                    scope(),
+                    RetainedIo::new(s.clone(), native.clone()),
+                    Disk(s.clone()),
+                )
+                .unwrap();
+                pair.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                    .unwrap();
+                pair.attach(&scope(), &member(Slot::B)).unwrap();
+                let before = pair.physical_network_fingerprint().unwrap();
+                native.borrow_mut().live[slot.idx()] = None;
+                match mutation {
+                    0 => (),
+                    1 => native.borrow_mut().fail_inspect = true,
+                    2 => native.borrow_mut().configs[slot.idx()] = Some([99; 32]),
+                    3 => {
+                        s.borrow_mut().owners[slot.idx()]
+                            .as_mut()
+                            .unwrap()
+                            .intent
+                            .scope
+                            .connection_generation += 1
+                    }
+                    _ => {
+                        let mut foreign = pair.record.members[slot.idx()]
+                            .as_ref()
+                            .unwrap()
+                            .owner
+                            .proof
+                            .unwrap();
+                        foreign.interface.guid = [99; 16];
+                        native.borrow_mut().live[slot.idx()] = Some(foreign);
+                    }
+                }
+                s.borrow_mut().events.clear();
+                let fingerprint = pair.physical_network_fingerprint();
+                if mutation == 0 {
+                    assert_eq!(fingerprint.unwrap(), before);
+                } else {
+                    assert!(fingerprint.is_err());
+                }
+                assert!(s.borrow().events.is_empty(), "discovery must be read-only");
+                assert_eq!(native.borrow().starts, [1, 1]);
+            }
         }
     }
     #[test]

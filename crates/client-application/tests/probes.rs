@@ -28,10 +28,20 @@ struct ProbeApi {
     all_probes_fail: AtomicBool,
     start_request: Mutex<Option<ConnectionStartRequest>>,
     candidate_modes: Mutex<Vec<EgressMode>>,
+    candidate_failure: AtomicBool,
+    acquire_requests: Mutex<Vec<nelomai_contracts::RedundantStandbyAcquireRequest>>,
 }
 
 #[async_trait]
 impl CoreApi for ProbeApi {
+    async fn acquire_redundant_standby(
+        &self,
+        _access_token: &AccessSnapshot,
+        request: &nelomai_contracts::RedundantStandbyAcquireRequest,
+    ) -> Result<nelomai_contracts::RedundantStandbyAcquireResponse, CoreApiError> {
+        self.acquire_requests.lock().unwrap().push(request.clone());
+        Err(CoreApiError::Retryable)
+    }
     async fn bootstrap(&self, _access_token: &AccessSnapshot) -> Result<Bootstrap, CoreApiError> {
         unreachable!("bootstrap is not used by this test")
     }
@@ -123,6 +133,9 @@ impl ApplicationApi for ProbeApi {
     ) -> Result<ServerCandidatesResponse, CoreApiError> {
         self.candidate_calls.fetch_add(1, Ordering::SeqCst);
         self.candidate_modes.lock().unwrap().push(egress_mode);
+        if self.candidate_failure.load(Ordering::SeqCst) {
+            return Err(CoreApiError::Retryable);
+        }
         Ok(ServerCandidatesResponse {
             api_version: ApiVersion::V1,
             request_id: "candidate-request".to_string(),
@@ -280,6 +293,340 @@ async fn desktop_tick_and_status_do_not_refresh_probes_or_start_an_ordinary_tunn
         calls
     );
     assert!(api.start_request.lock().unwrap().is_none());
+}
+
+#[cfg(not(target_os = "android"))]
+mod desktop_reserve_probes {
+    use super::*;
+    use nelomai_client_storage::{
+        RuntimeAuthScope, RuntimePaths, RuntimeStateStore, RuntimeStateV1, StoredDesktopRedundancy,
+    };
+    use nelomai_client_tunnel::redundancy::{
+        protocol::{Command, Snapshot},
+        session::SessionState,
+        SessionScope, Slot,
+    };
+    use nelomai_contracts::RuntimeSlot;
+
+    struct PairStore {
+        paths: RuntimePaths,
+        state: Mutex<RuntimeStateV1>,
+    }
+    impl RuntimeStateStore for PairStore {
+        fn paths(&self) -> &RuntimePaths {
+            &self.paths
+        }
+        fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError> {
+            Ok(Some(self.state.lock().unwrap().clone()))
+        }
+        fn save(&self, state: &RuntimeStateV1) -> Result<(), StorageError> {
+            *self.state.lock().unwrap() = state.clone();
+            Ok(())
+        }
+    }
+    struct PairTunnel(Mutex<Snapshot>);
+    #[async_trait]
+    impl TunnelController for PairTunnel {
+        async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+            panic!("no ordinary Start")
+        }
+        async fn stop(&self) -> Result<(), TunnelError> {
+            panic!("no ordinary Stop")
+        }
+        async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+            Ok(TunnelStatus::Running)
+        }
+        async fn desktop_redundancy_command(
+            &self,
+            command: Command,
+        ) -> Result<Snapshot, TunnelError> {
+            let snapshot = self.0.lock().unwrap();
+            assert_eq!(command.scope(), &snapshot.session.scope);
+            assert!(
+                matches!(command, Command::Status { .. }),
+                "unexpected native effect"
+            );
+            Ok(snapshot.clone())
+        }
+    }
+    type PairApp = ClientApplication<ProbeApi, PairStore, PairTunnel, NoopLogger>;
+    fn pair_application() -> (PairApp, Arc<ProbeApi>, Arc<PairStore>, Arc<PairTunnel>) {
+        let (_, api) = application();
+        let response: ConnectionStartResponse = serde_json::from_str(include_str!(
+            "../../../contracts/fixtures/valid/connection-start-redundant-response.json"
+        ))
+        .unwrap();
+        let mut session = response.redundancy.unwrap();
+        session.standby = None;
+        let pair = StoredDesktopRedundancy {
+            primary_reported: true,
+            runtime_generation: 1,
+            connection_generation: 1,
+            start_operation_id: "30000000-0000-4000-8000-000000000001".into(),
+            request_fingerprint: "ab".repeat(32),
+            connection: response.connection,
+            session,
+            pending_acquire: None,
+            candidate: None,
+            stop: None,
+        };
+        let scope = SessionScope {
+            runtime: RuntimeSlot::Stable,
+            runtime_generation: 1,
+            connection_generation: 1,
+            session_id: pair.session.session_id.clone(),
+        };
+        let mut native = SessionState::new(
+            scope.clone(),
+            Slot::A,
+            pair.session.role_generation,
+            pair.session.membership_generation,
+        )
+        .unwrap();
+        native.primary_started(&scope).unwrap();
+        let tunnel = Arc::new(PairTunnel(Mutex::new(Snapshot {
+            session: native.snapshot(),
+            leases: [Some(pair.connection.lease_id.clone()), None],
+            current_leases: [Some(pair.connection.lease_id.clone()), None],
+            primary_ready: true,
+            standby_ready: false,
+            standby_failed: false,
+            stalled: false,
+            cleanup_pending: false,
+            warm_stop_v1: pair.session.warm_stop_v1,
+        })));
+        let paths = RuntimePaths::new(
+            "/synthetic-no-filesystem-access",
+            RuntimeSlot::Stable,
+            "0.2.16",
+        )
+        .unwrap();
+        let mut state = RuntimeStateV1::empty(&paths, false);
+        let access = support::snapshot("access-token");
+        state.auth_scope = Some(RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        });
+        state.desktop_redundancy = Some(pair);
+        let store = Arc::new(PairStore {
+            paths,
+            state: Mutex::new(state),
+        });
+        let mut auth = StoredAuth::new_install();
+        auth.access_token = Some("access-token".into());
+        auth.refresh_token = Some("refresh-token".into());
+        let auth_store = Arc::new(MemoryStore(Mutex::new(Some(auth))));
+        let local = CoreLocalStop::new(tunnel.clone());
+        let auth = Arc::new(support::TestOwner::new(
+            api.clone(),
+            auth_store,
+            local.clone(),
+        ));
+        let app = ClientApplication::new(
+            api.clone(),
+            store.clone(),
+            auth,
+            local,
+            Arc::new(NoopLogger),
+        );
+        (app, api, store, tunnel)
+    }
+
+    #[tokio::test]
+    async fn missing_reserve_refreshes_expired_cache_before_measured_acquire() {
+        let (app, api, store, _) = pair_application();
+        let first = app
+            .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+            .await
+            .unwrap();
+        assert!(app.desktop_redundancy_tick(1_800_000_600).await.is_err()); // synthetic acquire failure
+        assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
+        let requests = api.acquire_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let probes = &requests[0].probes;
+        assert_eq!(probes.len(), 2);
+        let fast = probes
+            .iter()
+            .find(|p| p.candidate_id == "candidate-fast")
+            .unwrap();
+        assert_eq!(fast.latency_ms, Some(24.5));
+        assert_ne!(
+            fast.measured_at,
+            first
+                .probes
+                .iter()
+                .find(|p| p.candidate_id == "candidate-fast")
+                .unwrap()
+                .measured_at
+        );
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .pending_acquire
+                .as_ref()
+                .unwrap()
+                .probes,
+            *probes
+        );
+        assert!(api.start_request.lock().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn missing_reserve_refresh_error_never_sends_unmeasured_acquire() {
+        let (app, api, store, _) = pair_application();
+        app.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+            .await
+            .unwrap();
+        api.candidate_failure.store(true, Ordering::SeqCst);
+        assert!(app.desktop_redundancy_tick(1_800_000_600).await.is_err());
+        assert!(api.acquire_requests.lock().unwrap().is_empty());
+        assert!(store
+            .state
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_ref()
+            .unwrap()
+            .pending_acquire
+            .is_none());
+        assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
+    }
+    #[tokio::test]
+    async fn missing_reserve_reuses_fresh_scoped_measurement() {
+        let (app, api, store, _) = pair_application();
+        {
+            let mut state = store.state.lock().unwrap();
+            let connection = &mut state.desktop_redundancy.as_mut().unwrap().connection;
+            connection.layer = Layer::Tic;
+            connection.egress_mode = EgressMode::PreferIpv6;
+        }
+        app.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+            .await
+            .unwrap();
+        let measured = app
+            .refresh_probes(Layer::Tic, EgressMode::PreferIpv6, 1_800_000_000)
+            .await
+            .unwrap();
+        assert!(app.desktop_redundancy_tick(1_800_000_001).await.is_err());
+        assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            api.acquire_requests.lock().unwrap()[0].probes,
+            measured.probes
+        );
+    }
+    #[tokio::test]
+    async fn pending_acquire_replay_refreshes_measurements_but_keeps_operation_identity() {
+        let (app, api, store, _) = pair_application();
+        let measured = app
+            .refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+            .await
+            .unwrap();
+        let mut request = {
+            let mut state = store.state.lock().unwrap();
+            let pair = state.desktop_redundancy.as_mut().unwrap();
+            let request = nelomai_contracts::RedundantStandbyAcquireRequest {
+                operation_id: "30000000-0000-4000-8000-000000000002".into(),
+                session_id: pair.session.session_id.clone(),
+                expected_role_generation: 0,
+                expected_membership_generation: 0,
+                replace_lease_id: None,
+                probes: measured.probes,
+            };
+            pair.pending_acquire = Some(request.clone());
+            request
+        };
+        assert!(app.desktop_redundancy_tick(1_800_000_600).await.is_err());
+        assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 2);
+        for probe in &mut request.probes {
+            probe.measured_at = "2027-01-15T08:10:00Z".into();
+        }
+        assert_eq!(*api.acquire_requests.lock().unwrap(), vec![request.clone()]);
+        assert_eq!(
+            store
+                .state
+                .lock()
+                .unwrap()
+                .desktop_redundancy
+                .as_ref()
+                .unwrap()
+                .pending_acquire,
+            Some(request)
+        );
+    }
+    #[tokio::test]
+    async fn healthy_absent_stopping_and_candidate_pairs_never_refresh() {
+        for case in ["healthy", "absent", "stopping", "candidate"] {
+            let (app, api, store, tunnel) = pair_application();
+            app.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+                .await
+                .unwrap();
+            {
+                let mut state = store.state.lock().unwrap();
+                let mut native = tunnel.0.lock().unwrap();
+                let pair = state.desktop_redundancy.as_mut().unwrap();
+                match case {
+                    "healthy" => {
+                        let response: ConnectionStartResponse = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/connection-start-redundant-response.json")).unwrap();
+                        pair.session.standby = response.redundancy.unwrap().standby;
+                        let lease = pair
+                            .session
+                            .standby
+                            .as_ref()
+                            .unwrap()
+                            .connection
+                            .lease_id
+                            .clone();
+                        native.leases[1] = Some(lease.clone());
+                        native.current_leases[1] = Some(lease);
+                        native.session.installed[1] = true;
+                        native.session.committed[1] = true;
+                        native.standby_ready = true;
+                    }
+                    "absent" => state.desktop_redundancy = None,
+                    "stopping" => {
+                        pair.stop = Some(nelomai_client_storage::StoredDesktopRedundantStop {
+                            operation_id: "30000000-0000-4000-8000-000000000002".into(),
+                            active_lease_id: pair.connection.lease_id.clone(),
+                            role_generation: 0,
+                            membership_generation: 0,
+                            committed_leases: native.current_leases.clone(),
+                            retain_active_peer: false,
+                            role_confirmed: true,
+                        });
+                        native.session.phase =
+                            nelomai_client_tunnel::redundancy::session::SessionPhase::Stopping;
+                        native.primary_ready = false;
+                    }
+                    "candidate" => {
+                        let mut candidate: nelomai_contracts::RedundantStandbyAcquireResponse = serde_json::from_str(include_str!("../../../contracts/fixtures/valid/connection-redundant-standby-acquire-response.json")).unwrap();
+                        candidate.candidate_slot = nelomai_contracts::RedundancyMemberSlot::B;
+                        candidate.session.active_lease_id = Some(pair.connection.lease_id.clone());
+                        candidate.session.slot_b_lease_id = None;
+                        candidate.session.role_generation = 0;
+                        candidate.session.membership_generation = 0;
+                        native.leases[1] = Some(candidate.candidate_lease_id.clone());
+                        native.session.installed[1] = true;
+                        pair.candidate = Some(candidate);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // An unconditional refresh would now fail instead of coordinating.
+            api.candidate_failure.store(true, Ordering::SeqCst);
+            assert!(
+                app.desktop_redundancy_tick(1_800_000_600).await.is_ok(),
+                "{case}"
+            );
+            assert_eq!(api.candidate_calls.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(api.probe_calls.load(Ordering::SeqCst), 2, "{case}");
+            assert!(api.acquire_requests.lock().unwrap().is_empty(), "{case}");
+        }
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -558,6 +905,8 @@ fn application_with_preflight(
         all_probes_fail: AtomicBool::new(false),
         start_request: Mutex::new(None),
         candidate_modes: Mutex::new(Vec::new()),
+        candidate_failure: AtomicBool::new(false),
+        acquire_requests: Mutex::new(Vec::new()),
     });
     let store = Arc::new(MemoryStore::default());
     let mut auth = StoredAuth::new_install();

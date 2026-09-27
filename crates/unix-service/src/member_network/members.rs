@@ -246,24 +246,21 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
     /// Linux member defaults are in private tables; macOS excludes utun defaults.
     /// Keep the frontend's existing IPv4 fingerprint semantics. Never use the
     /// unrelated single backend or manufacture an empty fingerprint on failure.
+    /// Member liveness is deliberately not a prerequisite for this read-only
+    /// discovery: a vanished VPN interface must reach driver health evaluation,
+    /// not masquerade as physical network loss and suspend failover. This does
+    /// not attest member ownership; probes, metrics and mutations keep their
+    /// separate exact-identity fences.
     pub fn physical_network_fingerprint(
         &self,
         scope: &SessionScope,
         slot: Slot,
     ) -> Result<String, ServiceError> {
-        self.check_live(scope, slot)?;
-        for member in [Slot::A, Slot::B] {
-            if self.view(member).is_some() {
-                self.check_live(scope, member)?;
-            }
+        self.check(scope)?;
+        if self.closing || self.view(slot).is_none() {
+            return Err(ServiceError::Backend("member_not_running".into()));
         }
-        let result = self.backends[index(slot)].physical_network_fingerprint();
-        for member in [Slot::A, Slot::B] {
-            if self.view(member).is_some() {
-                self.check_live(scope, member)?;
-            }
-        }
-        let fingerprint = result?;
+        let fingerprint = self.backends[index(slot)].physical_network_fingerprint()?;
         if fingerprint.len() != 64
             || !fingerprint
                 .bytes()

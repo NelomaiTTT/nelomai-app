@@ -301,7 +301,9 @@ pub(crate) fn commit_command(
     snapshot: &Snapshot,
     response: &RedundantSessionResponse,
 ) -> Result<Command, CoreError> {
-    let candidate = ready_candidate(pair, runtime, snapshot)?;
+    // This is a receipt of an already committed panel operation, not permission
+    // to request a commit or to promote. Health may change during that RPC.
+    let candidate = installed_candidate(pair, runtime, snapshot)?;
     let current = snapshot.current_leases[index(slot(candidate.candidate_slot))].as_deref()
         == Some(candidate.candidate_lease_id.as_str());
     let membership = if current {
@@ -520,12 +522,22 @@ fn ready_candidate<'a>(
     runtime: RuntimeSlot,
     snapshot: &Snapshot,
 ) -> Result<&'a RedundantStandbyAcquireResponse, CoreError> {
+    let candidate = installed_candidate(pair, runtime, snapshot)?;
+    if !snapshot.standby_ready {
+        return Err(invalid());
+    }
+    Ok(candidate)
+}
+fn installed_candidate<'a>(
+    pair: &'a StoredDesktopRedundancy,
+    runtime: RuntimeSlot,
+    snapshot: &Snapshot,
+) -> Result<&'a RedundantStandbyAcquireResponse, CoreError> {
     running(pair, runtime, snapshot)?;
     let candidate = pair.candidate.as_ref().ok_or_else(invalid)?;
     validate_candidate(pair, snapshot, candidate)?;
     let i = index(slot(candidate.candidate_slot));
-    if !snapshot.standby_ready
-        || !snapshot.session.installed[i]
+    if !snapshot.session.installed[i]
         || snapshot.session.committed[i]
         || snapshot.leases[i].as_deref() != Some(candidate.candidate_lease_id.as_str())
     {

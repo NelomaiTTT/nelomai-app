@@ -305,6 +305,9 @@ fn journal_failed() -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    mod physical {
+        include!("physical_tests.rs");
+    }
     use super::super::{counters::DataCounters, session::NetworkPolicy};
     use super::*;
     use crate::{parse_configuration, ParsedConfiguration, ServiceError, ServiceTunnelState};
@@ -321,6 +324,10 @@ mod tests {
         calls: Vec<&'static str>,
         bad_identity: bool,
         bad_identity_slot: Option<TunnelSlot>,
+        absent_slot: Option<TunnelSlot>,
+        probe_tx: [u64; 2],
+        probe_rx: [u64; 2],
+        stopped_slots: Vec<TunnelSlot>,
         metric_slots: Vec<TunnelSlot>,
         fingerprint_slots: Vec<TunnelSlot>,
         replace_on_fingerprint: bool,
@@ -345,7 +352,10 @@ mod tests {
         fn member_interface_index(&self) -> Result<u32, ServiceError> {
             let mut s = self.state.borrow_mut();
             s.calls.push("identity");
-            if s.bad_identity || s.bad_identity_slot == Some(self.slot) {
+            if s.bad_identity
+                || s.bad_identity_slot == Some(self.slot)
+                || s.absent_slot == Some(self.slot)
+            {
                 return Err(ServiceError::Backend("secret native details".into()));
             }
             Ok(if self.slot == TunnelSlot::A { 10 } else { 20 })
@@ -360,8 +370,8 @@ mod tests {
                 s.bad_identity = true;
             }
             Ok(DataCounters {
-                sent_packets: 7,
-                received_packets: 11,
+                sent_packets: 7 + s.probe_tx[usize::from(self.slot == TunnelSlot::B)],
+                received_packets: 11 + s.probe_rx[usize::from(self.slot == TunnelSlot::B)],
             })
         }
         fn metrics(&self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
@@ -409,7 +419,17 @@ mod tests {
             Ok(ServiceTunnelState::Running)
         }
         fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
-            self.state.borrow_mut().calls.push("stop");
+            let mut s = self.state.borrow_mut();
+            s.calls.push("stop");
+            // Model the backend's exact ownership fence, including safe cleanup
+            // of an absent owned member, but never a replacement interface.
+            if s.bad_identity || s.bad_identity_slot == Some(self.slot) {
+                return Err(ServiceError::Backend("foreign member".into()));
+            }
+            s.stopped_slots.push(self.slot);
+            if s.absent_slot == Some(self.slot) {
+                s.absent_slot = None;
+            }
             Ok(ServiceTunnelState::Stopped)
         }
         fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
@@ -648,7 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_fence_scope_identity_replacement_and_both_owned_members() {
+    fn physical_discovery_is_independent_of_member_identity_but_metrics_remain_fenced() {
         let (mut pair, state) = setup();
         pair.network
             .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
@@ -668,11 +688,29 @@ mod tests {
         state.borrow_mut().replace_on_metrics = false;
         state.borrow_mut().bad_identity = false;
         state.borrow_mut().bad_identity_slot = Some(TunnelSlot::B);
-        assert!(PairControl::physical_network_fingerprint(&pair).is_err());
-        assert!(state.borrow().fingerprint_slots.is_empty());
+        assert_eq!(
+            PairControl::physical_network_fingerprint(&pair).unwrap(),
+            "ab".repeat(32)
+        );
+        assert_eq!(state.borrow().fingerprint_slots, [TunnelSlot::A]);
+        let before = state.borrow().values.clone();
+        assert!(NativePair::select_active(&mut pair, &scope(), Slot::B).is_err());
+        assert!(PairControl::remove_standby(&mut pair, &scope(), Slot::B).is_err());
+        assert_eq!(state.borrow().values, before);
+        assert!(state.borrow().stopped_slots.is_empty());
+        assert_eq!(pair.sample_at(Slot::B, NOW), None);
+        assert!(pair
+            .open_probe_with(Slot::B, |_, _, _| -> Result<(), ServiceError> {
+                panic!("foreign member must never be probed")
+            })
+            .is_err());
         state.borrow_mut().bad_identity_slot = None;
         state.borrow_mut().replace_on_fingerprint = true;
-        assert!(PairControl::physical_network_fingerprint(&pair).is_err());
+        assert_eq!(
+            PairControl::physical_network_fingerprint(&pair).unwrap(),
+            "ab".repeat(32)
+        );
+        assert!(NativePair::select_active(&mut pair, &scope(), Slot::B).is_err());
         state.borrow_mut().bad_identity_slot = None;
         state.borrow_mut().replace_on_fingerprint = false;
         state.borrow_mut().fail_fingerprint = true;

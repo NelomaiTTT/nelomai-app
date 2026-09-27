@@ -287,6 +287,22 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
             Ok(false)
         }
     }
+    /// Read-only physical discovery is independent of an owned service's
+    /// liveness. An exact installed-but-stopped service is acceptable here,
+    /// never as native absence for cleanup, slot reuse or adoption.
+    pub(crate) fn confirm_inactive_for_discovery(&mut self, expected: &Record) -> Result<bool> {
+        self.require_current(expected)?;
+        let retained = expected
+            .proof
+            .or(expected.retired_proof)
+            .ok_or(OwnerError::Invalid)?;
+        let current = self.io.inspect(&self.intent, Some(&retained))?;
+        authorize(expected, &current)?;
+        self.require_current(expected)?;
+        Ok(current.service.as_ref().is_none_or(|s| s.process.is_none())
+            && current.interface.is_none()
+            && current.retained_interfaces.is_empty())
+    }
     #[cfg(test)]
     pub(crate) fn start(&mut self) -> Result<Record> {
         self.start_inner(None)

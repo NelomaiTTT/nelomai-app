@@ -1240,14 +1240,12 @@ fn uncommitted_candidate_is_ready_but_cannot_promote_without_exact_panel_commit(
 }
 
 #[test]
-fn candidate_commit_requires_ready_current_epoch_exact_maps_and_next_membership() {
-    for wrong in 0..8 {
+fn candidate_commit_receipt_requires_current_epoch_exact_maps_and_next_membership() {
+    for wrong in 1..8 {
         let (mut owner, world) = running();
         attach(&mut owner, true, 0).unwrap();
-        if wrong != 0 {
-            for now in (0..=16000).step_by(100) {
-                owner.tick(now).unwrap();
-            }
+        for now in (0..=16000).step_by(100) {
+            owner.tick(now).unwrap();
         }
         let snapshot = owner.snapshot();
         let mut session = view(&snapshot, true);
@@ -1255,7 +1253,6 @@ fn candidate_commit_requires_ready_current_epoch_exact_maps_and_next_membership(
         let mut revision = snapshot.session.local_revision;
         let mut epoch = snapshot.session.network_epoch;
         match wrong {
-            0 => (),
             1 => session.slot_b_lease_id = Some(FOREIGN.into()),
             2 => session.active_lease_id = Some(B.into()),
             3 => session.role_generation += 1,
@@ -1926,7 +1923,7 @@ fn attach_metadata_failure_clears_readiness_and_keeps_failed_cleanup_owner() {
 }
 
 #[test]
-fn candidate_commit_rechecks_readiness_instead_of_reusing_a_stale_ready_bit() {
+fn candidate_commit_receipt_records_membership_but_never_promotes_a_now_dead_member() {
     let (mut owner, world) = running();
     attach(&mut owner, true, 0).unwrap();
     for now in (0..=16000).step_by(100) {
@@ -1936,8 +1933,8 @@ fn candidate_commit_rechecks_readiness_instead_of_reusing_a_stale_ready_bit() {
     let snapshot = owner.snapshot();
     let mut session = view(&snapshot, true);
     session.membership_generation = 1;
-    world.borrow_mut().dead[1] = true;
-    assert!(owner
+    world.borrow_mut().dead = [true; 2];
+    owner
         .execute(
             Command::CommitCandidate {
                 scope: scope(),
@@ -1946,11 +1943,19 @@ fn candidate_commit_rechecks_readiness_instead_of_reusing_a_stale_ready_bit() {
                 expected_network_epoch: snapshot.session.network_epoch,
                 session,
             },
-            17000
+            17000,
         )
-        .is_err());
+        .unwrap();
     assert!(!owner.snapshot().standby_ready);
-    assert!(!owner.snapshot().session.committed[1]);
+    assert!(owner.snapshot().session.committed[1]);
+    assert!(
+        owner.snapshot().stalled,
+        "membership receipt is not restored traffic"
+    );
+    for now in (17100..=25000).step_by(100) {
+        owner.tick(now).unwrap();
+    }
+    assert_eq!(owner.snapshot().session.active, Slot::A);
 }
 
 #[test]

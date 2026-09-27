@@ -9,6 +9,47 @@ use nelomai_client_tunnel::{
 use nelomai_contracts::RedundancySession;
 
 impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> ClientCore<A, S, T, L> {
+    /// Probe only when selection is actually needed. Discovery happens outside
+    /// the writer; tick revalidates ownership before accepting its results.
+    pub async fn desktop_redundancy_probe_context(
+        &self,
+    ) -> Result<Option<(Layer, EgressMode)>, CoreError> {
+        let _writer = self.connection_gate.lock().await;
+        let stored = self.load_runtime()?;
+        let Some(pair) = stored.desktop_redundancy.as_ref() else {
+            return Ok(None);
+        };
+        if pair.stop.is_some()
+            || stored.pending_compensation_stop.is_some()
+            || !pair.primary_reported
+            || !pair.session.standby_desired
+            || pair.candidate.is_some()
+        {
+            return Ok(None);
+        }
+        let snapshot = self
+            .tunnel
+            .desktop_redundancy_command(Command::Status {
+                scope: desktop_redundancy::scope(pair, stored.slot)?,
+            })
+            .await?;
+        let mut observed = pair.clone();
+        sync_helper_ack(&mut observed, stored.slot, &snapshot)?;
+        let inactive = if snapshot.session.active == nelomai_client_tunnel::redundancy::Slot::A {
+            1
+        } else {
+            0
+        };
+        let initial_attach =
+            inactive == 1 && snapshot.current_leases[1].is_none() && pair.session.standby.is_some();
+        Ok((snapshot.session.phase == SessionPhase::Running
+            && !snapshot.cleanup_pending
+            && snapshot.primary_ready
+            && snapshot.session.role_confirmed
+            && snapshot.leases[inactive].is_none()
+            && !initial_attach)
+            .then_some((pair.connection.layer, pair.connection.egress_mode)))
+    }
     pub async fn desktop_redundancy_status(
         &self,
     ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, CoreError> {
@@ -144,14 +185,112 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                         stored.slot,
                         &snapshot,
                         &Uuid::new_v4().to_string(),
-                        probes,
+                        probes.clone(),
                     )?);
                     stored.desktop_redundancy = Some(pair.clone());
                     self.store.save(&stored).map_err(|_| CoreError::Storage)?;
                 }
+                // Acquire's operation identity is stable, but its measurements
+                // are not: the panel validates them only before allocation.
+                // Existing-candidate replay is idempotent with fresh probes.
+                if pair.candidate.is_none() {
+                    if let Some(request) = pair.pending_acquire.as_mut() {
+                        if request.probes != probes {
+                            request.probes = probes;
+                            stored.desktop_redundancy = Some(pair.clone());
+                            self.store.save(&stored).map_err(|_| CoreError::Storage)?;
+                        }
+                    }
+                }
             }
             (stored, pair, snapshot, access)
         };
+        if pair.candidate.is_some()
+            && snapshot.standby_failed
+            && snapshot.primary_ready
+            && snapshot.session.role_confirmed
+        {
+            // A commit response may have been lost. Reconcile BEFORE removing
+            // a candidate, so a server-CURRENT member is never forgotten.
+            let response = self
+                .api
+                .report_redundant_role(&access, &canonical_role_request(&snapshot)?)
+                .await?;
+            let _writer = self.connection_gate.lock().await;
+            let mut current = self.load_runtime()?;
+            if current.auth_scope != stored.auth_scope
+                || current.desktop_redundancy.as_ref() != Some(&pair)
+                || current.pending_compensation_stop.is_some()
+            {
+                return Ok(None);
+            }
+            let fresh = self
+                .tunnel
+                .desktop_redundancy_command(Command::Status {
+                    scope: snapshot.session.scope.clone(),
+                })
+                .await?;
+            desktop_redundancy::validate_snapshot(&pair, current.slot, &fresh)?;
+            let candidate = pair.candidate.as_ref().ok_or(CoreError::Storage)?;
+            let i = if candidate.candidate_slot == RedundancyMemberSlot::A {
+                0
+            } else {
+                1
+            };
+            if response.action != nelomai_contracts::RedundantRoleAction::Acknowledged
+                || response.local_active_lease_id != canonical_role_request(&fresh)?.active_lease_id
+                || !response.session.standby_desired
+            {
+                return Err(invalid_operation_reconcile_response());
+            }
+            let committed = if i == 0 {
+                &response.session.slot_a_lease_id
+            } else {
+                &response.session.slot_b_lease_id
+            };
+            if committed.as_deref() == Some(candidate.candidate_lease_id.as_str()) {
+                let command = desktop_redundancy::commit_command(
+                    &pair,
+                    current.slot,
+                    &fresh,
+                    &RedundantSessionResponse {
+                        api_version: response.api_version,
+                        request_id: response.request_id,
+                        session: response.session,
+                    },
+                )?;
+                let receipt = self.tunnel.desktop_redundancy_command(command).await?;
+                let mut next = pair;
+                sync_helper_ack(&mut next, current.slot, &receipt)?;
+                current.desktop_redundancy = Some(next);
+                self.store.save(&current).map_err(|_| CoreError::Storage)?;
+                return Ok(Some(receipt));
+            }
+            desktop_redundancy::confirm_role_command(&fresh, &response)?;
+            if !fresh.standby_failed || !fresh.primary_ready {
+                return Ok(Some(fresh));
+            }
+            let removed = self
+                .tunnel
+                .desktop_redundancy_command(Command::RemoveStandby {
+                    scope: fresh.session.scope.clone(),
+                    slot: fresh.session.active.other(),
+                    lease_id: candidate.candidate_lease_id.clone(),
+                    expected_revision: fresh.session.local_revision,
+                    expected_network_epoch: fresh.session.network_epoch,
+                    expected_membership_generation: fresh.session.membership_generation,
+                })
+                .await?;
+            desktop_redundancy::validate_snapshot(&pair, current.slot, &removed)?;
+            current
+                .desktop_redundancy
+                .as_mut()
+                .ok_or(CoreError::Storage)?
+                .candidate = None;
+            self.store.save(&current).map_err(|_| CoreError::Storage)?;
+            // Existing scheduling backoff prevents a broken member restart loop.
+            return Err(CoreApiError::Retryable.into());
+        }
         if !pair.primary_reported && snapshot.primary_ready {
             let request = RedundantRoleRequest {
                 session_id: pair.session.session_id.clone(),
@@ -230,7 +369,48 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             return Ok(Some(confirmed));
         } else if pair.primary_reported && snapshot.primary_ready && pair.candidate.is_none() {
             if let Some(request) = pair.pending_acquire.as_ref() {
-                let response = self.api.acquire_redundant_standby(&access, request).await?;
+                let response = match self.api.acquire_redundant_standby(&access, request).await {
+                    Ok(response) => response,
+                    Err(CoreApiError::Rejected { ref code, .. })
+                        if code == "operation_id_conflict" =>
+                    {
+                        // The server's candidate TTL consumed this ID. Only a
+                        // canonical unchanged CURRENT map permits a fresh ID.
+                        let response = self
+                            .api
+                            .report_redundant_role(&access, &canonical_role_request(&snapshot)?)
+                            .await?;
+                        let _writer = self.connection_gate.lock().await;
+                        let mut current = self.load_runtime()?;
+                        if current.auth_scope != stored.auth_scope
+                            || current.desktop_redundancy.as_ref() != Some(&pair)
+                            || current.pending_compensation_stop.is_some()
+                        {
+                            return Ok(None);
+                        }
+                        let fresh = self
+                            .tunnel
+                            .desktop_redundancy_command(Command::Status {
+                                scope: snapshot.session.scope.clone(),
+                            })
+                            .await?;
+                        desktop_redundancy::validate_snapshot(&pair, current.slot, &fresh)?;
+                        if response.action != nelomai_contracts::RedundantRoleAction::Acknowledged
+                            || !response.session.standby_desired
+                        {
+                            return Err(invalid_operation_reconcile_response());
+                        }
+                        desktop_redundancy::confirm_role_command(&fresh, &response)?;
+                        current
+                            .desktop_redundancy
+                            .as_mut()
+                            .ok_or(CoreError::Storage)?
+                            .pending_acquire = None;
+                        self.store.save(&current).map_err(|_| CoreError::Storage)?;
+                        return Err(CoreApiError::Retryable.into());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let _writer = self.connection_gate.lock().await;
                 let mut current = self.load_runtime()?;
                 if current.auth_scope != stored.auth_scope
@@ -704,6 +884,26 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 .await?;
         }
     }
+}
+
+fn canonical_role_request(
+    snapshot: &nelomai_client_tunnel::redundancy::protocol::Snapshot,
+) -> Result<RedundantRoleRequest, CoreError> {
+    let active = if snapshot.session.active == nelomai_client_tunnel::redundancy::Slot::A {
+        0
+    } else {
+        1
+    };
+    Ok(RedundantRoleRequest {
+        session_id: snapshot.session.scope.session_id.clone(),
+        active_lease_id: snapshot.current_leases[active]
+            .clone()
+            .ok_or(CoreError::Storage)?,
+        expected_role_generation: snapshot.session.role_generation,
+        expected_membership_generation: snapshot.session.membership_generation,
+        reason: None,
+        observed_at: None,
+    })
 }
 
 /// The privileged helper can acknowledge a validated panel reply just before

@@ -351,19 +351,16 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
                 if slot == state.active
                     || !state.installed[index(slot)]
                     || state.committed[index(slot)]
-                    || !self.standby_ready
                     || session.role_generation != state.role_generation
                     || expected_membership != Some(session.membership_generation)
                 {
                     return Err(fenced());
                 }
                 self.validate_view(&state, &session, true)?;
-                // Recheck the current data-plane proof at the command's clock;
-                // an old ready bit cannot commit a now-stale candidate. The only
-                // standby here is uncommitted, so this tick cannot promote it.
-                if !self.tick(now)?.standby_ready {
-                    return Err(fenced());
-                }
+                // Record a canonical server receipt even if health deteriorated
+                // after the commit RPC. Re-sample so stale readiness can never
+                // authorize promotion; membership and usability are separate.
+                self.tick(now)?;
                 if reused {
                     self.driver.recommit_current(
                         &scope,
@@ -383,7 +380,9 @@ impl<N: PairControl, S: SessionStore> SessionControl<N, S> {
                     )?;
                 }
                 self.current_leases = [session.slot_a_lease_id, session.slot_b_lease_id];
-                self.stalled = false;
+                if self.primary_ready || self.standby_ready {
+                    self.stalled = false;
+                }
             }
             Command::ConfirmRole {
                 expected_revision,

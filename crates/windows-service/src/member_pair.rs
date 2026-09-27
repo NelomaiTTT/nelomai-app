@@ -250,6 +250,11 @@ pub(crate) trait PairIo {
     }
     fn verify(&mut self, member: &MemberRecord) -> io::Result<()>;
     fn confirm_absent(&mut self, member: &MemberRecord) -> io::Result<bool>;
+    /// Read-only only: a platform may additionally attest its exact stopped
+    /// service with no process/interface. Cleanup still uses confirm_absent.
+    fn confirm_inactive_for_discovery(&mut self, member: &MemberRecord) -> io::Result<bool> {
+        self.confirm_absent(member)
+    }
     fn stop(&mut self, member: &MemberRecord) -> io::Result<OwnerRecord>;
     fn rebind(&mut self, member: &MemberRecord) -> io::Result<OwnerRecord>;
     fn observe(&mut self, member: &MemberRecord)
@@ -271,6 +276,46 @@ pub(crate) trait PairIo {
     fn read_dns(&mut self, member: &MemberRecord) -> io::Result<DnsSnapshot>;
     fn exchange_dns(&mut self, expected: &DnsSnapshot, desired: &DnsSnapshot) -> io::Result<()>;
 }
+/// Read-only discovery may outlive a member. Failure to prove liveness is NOT
+/// absence: require the exact owner journal/config/retained identities to prove
+/// no live native resources instead. This grants no mutation or Start authority.
+pub(crate) fn verify_physical_members<I: PairIo>(
+    io: &mut I,
+    members: &[Option<MemberRecord>; 2],
+) -> io::Result<()> {
+    for member in members.iter().flatten() {
+        if let Err(error) = io.verify(member) {
+            if !io.confirm_inactive_for_discovery(member)? {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+/// Route targets contain only live members. A durably retired member remains
+/// in the pair/proof journal for exact cleanup, never in a new route plan.
+pub(crate) fn live_route_members<I: PairIo>(
+    io: &mut I,
+    active: Slot,
+    members: &[Option<MemberRecord>; 2],
+) -> io::Result<[Option<MemberRecord>; 2]> {
+    io.verify(members[active.idx()].as_ref().ok_or_else(failed)?)?;
+    let mut live = members.clone();
+    for slot in [Slot::A, Slot::B] {
+        let Some(member) = &members[slot.idx()] else {
+            continue;
+        };
+        if slot != active && member.owner.phase == crate::member_owner::Phase::Stopped {
+            if !io.confirm_absent(member)? {
+                return Err(failed());
+            }
+            live[slot.idx()] = None;
+        } else {
+            io.verify(member)?;
+        }
+    }
+    Ok(live)
+}
 
 pub(crate) struct SessionNativePair<I: PairIo, J: PairStore> {
     io: RefCell<I>,
@@ -280,6 +325,9 @@ pub(crate) struct SessionNativePair<I: PairIo, J: PairStore> {
     tuples: [Option<ProbeTuple>; 2],
     recovery: bool,
     closed: bool,
+    // A synchronous rebind failed. Before discovery can retry it, the existing
+    // tick must reconcile the guard and prove that the owners are still usable.
+    rebind_pending: bool,
     // Sticky for this owned process. Never repair/adopt a vanished guard or
     // resume health after integrity loss; retain journals for exact cleanup.
     integrity_fault: Option<io::Error>,
@@ -312,6 +360,7 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             tuples: [None, None],
             recovery: false,
             closed: false,
+            rebind_pending: false,
             integrity_fault: None,
         })
     }
@@ -355,6 +404,7 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             recovery: true,
             closed: false,
             integrity_fault: None,
+            rebind_pending: false,
         })
     }
     fn check(&self, scope: &SessionScope) -> io::Result<()> {
@@ -480,6 +530,40 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
     fn fence(&mut self) -> io::Result<()> {
         self.guard(self.model(None, false)?)
     }
+    fn verify_discovery_guard(&self) -> io::Result<()> {
+        // A failed rebind can leave our fully acknowledged blocking model in
+        // place. This grants discovery, not permission to adopt an unknown WFP
+        // state or restore traffic through an incompletely restarted member.
+        let fenced = self.record.guard.installed
+            && self.record.guard.active.is_none()
+            && self.record.guard == self.record.guard.without_probes().map_err(|_| failed())?;
+        if self.recovery
+            || self.record.closing
+            || self.integrity_fault.is_some()
+            || self.record.pending_guard.is_some()
+            || self.record.active.is_none()
+            || (self.record.guard.active != self.record.active && !fenced)
+            || self.io.borrow_mut().guard_snapshot()? != self.record.guard.expected
+        {
+            return Err(failed());
+        }
+        Ok(())
+    }
+    fn reconcile_rebind_failure(&mut self) -> io::Result<()> {
+        // Lost journal/guard ACKs are retryable only with exact readback and a
+        // durable reconciled record. Prepared owners are NOT running authority:
+        // if native rebind interrupted a member, use normal close/recovery.
+        self.reconcile_guard()?;
+        self.verify_discovery_guard()?;
+        let active = self.record.active.ok_or_else(failed)?;
+        self.io.borrow_mut().verify(
+            self.record.members[active.idx()]
+                .as_ref()
+                .ok_or_else(failed)?,
+        )?;
+        verify_physical_members(&mut *self.io.borrow_mut(), &self.record.members)?;
+        self.save()
+    }
     fn refresh(&mut self, slot: Slot) -> io::Result<()> {
         if let Some(current) = self.io.borrow_mut().current(slot)? {
             let m = self.record.members[slot.idx()]
@@ -530,7 +614,7 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             if member.dns.is_empty() {
                 continue;
             }
-            if active.is_none()
+            if active != Some(slot)
                 && member.owner.phase == crate::member_owner::Phase::Stopped
                 && self.io.borrow_mut().confirm_absent(&member)?
             {
@@ -584,18 +668,69 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             self.record.options.as_ref().ok_or_else(failed)?,
         )
     }
+    // Caller must fence dynamic permits before retiring native or releasing
+    // sockets. Keep the stopped owner until route/DNS cleanup has acknowledged
+    // its exact absence; discovery alone never authorizes slot reuse.
+    fn retire_inactive(&mut self, slot: Slot) -> io::Result<()> {
+        let member = self.record.members[slot.idx()].clone().ok_or_else(failed)?;
+        if !self
+            .io
+            .borrow_mut()
+            .confirm_inactive_for_discovery(&member)?
+        {
+            return Err(failed());
+        }
+        let stopped = self.io.borrow_mut().stop(&member);
+        self.refresh(slot)?;
+        stopped?;
+        let member = self.record.members[slot.idx()]
+            .as_ref()
+            .ok_or_else(failed)?;
+        if member.owner.phase != crate::member_owner::Phase::Stopped
+            || !self.io.borrow_mut().confirm_absent(member)?
+        {
+            return Err(failed());
+        }
+        self.release(slot);
+        Ok(())
+    }
     fn activate(&mut self, slot: Slot) -> io::Result<()> {
         if self.recovery || self.record.closing || self.record.members[slot.idx()].is_none() {
             return Err(failed());
         }
-        for m in self.record.members.iter().flatten() {
-            self.io.borrow_mut().verify(m)?;
+        self.io.borrow_mut().verify(
+            self.record.members[slot.idx()]
+                .as_ref()
+                .ok_or_else(failed)?,
+        )?;
+        let mut retire = Vec::new();
+        for other in [Slot::A, Slot::B] {
+            if other == slot {
+                continue;
+            }
+            if let Some(member) = &self.record.members[other.idx()] {
+                let verified = self.io.borrow_mut().verify(member);
+                if let Err(error) = verified {
+                    if !self
+                        .io
+                        .borrow_mut()
+                        .confirm_inactive_for_discovery(member)?
+                    {
+                        return Err(error);
+                    }
+                    retire.push(other);
+                }
+            }
         }
         let previous = self.record.active;
         self.fence()?;
         let result = (|| {
+            for retired in retire {
+                self.retire_inactive(retired)?;
+            }
             self.routes(slot)?;
             self.dns(Some(slot))?;
+            live_route_members(&mut *self.io.borrow_mut(), slot, &self.record.members)?;
             self.guard(self.model(Some(slot), true)?)?;
             Ok(())
         })();
@@ -630,6 +765,12 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
 impl<I: PairIo, J: PairStore> NativePair for SessionNativePair<I, J> {
     type Socket = I::Socket;
     fn check_integrity(&mut self) -> io::Result<()> {
+        if self.rebind_pending && self.integrity_fault.is_none() && !self.closed {
+            match self.reconcile_rebind_failure() {
+                Ok(()) => self.rebind_pending = false,
+                Err(error) => self.integrity_fault = Some(error),
+            }
+        }
         if self.integrity_fault.is_none() && !self.recovery && !self.closed {
             let actual = self.io.borrow_mut().guard_snapshot();
             self.integrity_fault = match actual {
@@ -646,7 +787,7 @@ impl<I: PairIo, J: PairStore> NativePair for SessionNativePair<I, J> {
             // not a continuous killswitch. Close still tries BOTH proven
             // members when guard, disk, route or DNS cleanup fails.
             let _ = self.close(&scope);
-            return Err(io::Error::new(kind, "native pair guard integrity lost"));
+            return Err(io::Error::new(kind, "native pair integrity lost"));
         }
         Ok(())
     }
@@ -750,11 +891,15 @@ impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
         self.io.borrow_mut().observe(m).map(|v| v.0)
     }
     fn physical_network_fingerprint(&self) -> io::Result<String> {
-        self.live(self.record.active.ok_or_else(failed)?)?;
-        for m in self.record.members.iter().flatten() {
-            self.io.borrow_mut().verify(m)?;
+        if self.rebind_pending {
+            return Err(failed());
         }
-        self.io.borrow_mut().fingerprint(&self.record.members)
+        self.verify_discovery_guard()?;
+        let mut io = self.io.borrow_mut();
+        verify_physical_members(&mut *io, &self.record.members)?;
+        let fingerprint = io.fingerprint(&self.record.members)?;
+        verify_physical_members(&mut *io, &self.record.members)?;
+        Ok(fingerprint)
     }
     fn start_primary(
         &mut self,
@@ -798,15 +943,24 @@ impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
         retained[slot.idx()] = None;
         let result = (|| {
             self.fence()?;
+            // A crashed reserve has no interface on which to restore DNS or
+            // read routes. First finish exact owned Stop (including a stopped
+            // SCM service) and refresh retained proofs used by route cleanup.
+            let live = self.io.borrow_mut().verify(&m).is_ok();
+            if !live {
+                self.retire_inactive(slot)?;
+            }
             self.io.borrow_mut().select_routes(
                 active,
                 &retained,
                 self.record.options.as_ref().ok_or_else(failed)?,
             )?;
             self.dns(Some(active))?;
-            let result = self.io.borrow_mut().stop(&m);
-            self.refresh(slot)?;
-            result?;
+            if live {
+                let result = self.io.borrow_mut().stop(&m);
+                self.refresh(slot)?;
+                result?;
+            }
             self.release(slot);
             self.record.members[slot.idx()] = None;
             self.record.dns[slot.idx()] = None;
@@ -839,40 +993,70 @@ impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
     }
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool> {
         self.check(scope)?;
-        let active = self.record.active.ok_or_else(failed)?;
-        if self.recovery || self.record.closing {
+        // Do not enter another native transaction before the previous failure
+        // has a proven retry or terminal outcome on the existing helper tick.
+        if self.rebind_pending || self.integrity_fault.is_some() {
             return Err(failed());
         }
-        // A previous unsuccessful rebind may already have fenced both members.
-        // Requiring the old allow model here would make retry impossible.
-        for member in self.record.members.iter().flatten() {
-            self.io.borrow_mut().verify(member)?;
-        }
-        self.fence()?;
-        for slot in [Slot::A, Slot::B] {
-            self.release(slot);
-        }
-        self.io.borrow_mut().cleanup_routes()?;
-        self.dns(None)?;
-        self.record.dns = [None, None];
-        self.save()?;
-        for slot in [Slot::A, Slot::B] {
-            if let Some(m) = self.record.members[slot.idx()].clone() {
-                let result = self.io.borrow_mut().rebind(&m);
-                self.refresh(slot)?;
-                result?;
+        self.rebind_pending = true;
+        let result = (|| {
+            let active = self.record.active.ok_or_else(failed)?;
+            if self.recovery || self.record.closing {
+                return Err(failed());
             }
-        }
-        self.fence()?;
-        for slot in [Slot::A, Slot::B] {
-            if let Some(m) = &self.record.members[slot.idx()] {
-                let (socket, tuple) = self.io.borrow_mut().open_base(m)?;
-                self.sockets[slot.idx()] = Some(socket);
-                self.tuples[slot.idx()] = Some(tuple);
+            // Discovery may observe a crashed reserve before the UI retires it.
+            // Prove the active live and all other identities before any mutation;
+            // then use existing exact Stop under the fence, not liveness as a
+            // prerequisite for restoring health on the surviving primary.
+            self.io.borrow_mut().verify(
+                self.record.members[active.idx()]
+                    .as_ref()
+                    .ok_or_else(failed)?,
+            )?;
+            verify_physical_members(&mut *self.io.borrow_mut(), &self.record.members)?;
+            self.fence()?;
+            let inactive = active.other();
+            if let Some(member) = &self.record.members[inactive.idx()] {
+                let live = self.io.borrow_mut().verify(member).is_ok();
+                if !live {
+                    self.retire_inactive(inactive)?;
+                }
             }
+            // Keep the retired record for normal membership cleanup, but never
+            // restart it or open a probe socket on its missing interface.
+            let live =
+                live_route_members(&mut *self.io.borrow_mut(), active, &self.record.members)?;
+            for slot in [Slot::A, Slot::B] {
+                self.release(slot);
+            }
+            self.io.borrow_mut().cleanup_routes()?;
+            self.dns(None)?;
+            self.record.dns = [None, None];
+            self.save()?;
+            for slot in [Slot::A, Slot::B] {
+                if let Some(m) = live[slot.idx()].clone() {
+                    let result = self.io.borrow_mut().rebind(&m);
+                    self.refresh(slot)?;
+                    result?;
+                }
+            }
+            self.fence()?;
+            let live =
+                live_route_members(&mut *self.io.borrow_mut(), active, &self.record.members)?;
+            for slot in [Slot::A, Slot::B] {
+                if let Some(m) = &live[slot.idx()] {
+                    let (socket, tuple) = self.io.borrow_mut().open_base(m)?;
+                    self.sockets[slot.idx()] = Some(socket);
+                    self.tuples[slot.idx()] = Some(tuple);
+                }
+            }
+            self.activate(active)?;
+            Ok(true)
+        })();
+        if result.is_ok() {
+            self.rebind_pending = false;
         }
-        self.activate(active)?;
-        Ok(true)
+        result
     }
     fn cleanup_pending(&self) -> bool {
         self.record.closing

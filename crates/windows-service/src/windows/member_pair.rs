@@ -136,14 +136,9 @@ impl CheckedRows {
 impl NetworkSystem for CheckedRows {
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
         if self.absent_member(key)? {
-            let ResourceKey::Route(destination, RouteScope::WindowsInterface(index)) = key else {
-                return Err(failed());
-            };
-            let rows = crate::member_routes::RowIo::read(&mut NativeRowIo, *destination, *index)?;
-            if !rows.is_empty() || !self.absent_member(key)? {
-                return Err(failed());
-            }
-            return Ok(None);
+            return crate::member_routes::read_absent_route(&mut NativeRowIo, key, || {
+                self.absent_member(key)
+            });
         }
         self.rows.read(key)
     }
@@ -270,9 +265,10 @@ impl<F: SessionFiles> WindowsPairIo<F> {
         }
     }
     fn physical_snapshot(
-        &self,
+        &mut self,
         members: &[Option<MemberRecord>; 2],
     ) -> io::Result<PhysicalSnapshot> {
+        verify_physical_members(self, members)?;
         let snapshot = super::member_physical::capture(&owned(members))?;
         let proofs = self.proofs.0.borrow();
         let mut excluded = Vec::new();
@@ -308,7 +304,12 @@ impl<F: SessionFiles> WindowsPairIo<F> {
                 },
             ));
         }
-        snapshot.without_owned_rows(&excluded).map_err(|_| failed())
+        let snapshot = snapshot
+            .without_owned_rows(&excluded)
+            .map_err(|_| failed())?;
+        drop(proofs);
+        verify_physical_members(self, members)?;
+        Ok(snapshot)
     }
 }
 impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
@@ -449,6 +450,11 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
             .confirm_absent(&m.owner)
             .map_err(|_| failed())
     }
+    fn confirm_inactive_for_discovery(&mut self, m: &MemberRecord) -> io::Result<bool> {
+        self.owner(m)?
+            .confirm_inactive_for_discovery(&m.owner)
+            .map_err(|_| failed())
+    }
     fn stop(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
         let owner = self.owner(m)?;
         let current = owner.snapshot().map_err(|_| failed())?.ok_or_else(failed)?;
@@ -493,9 +499,6 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
         ))
     }
     fn fingerprint(&mut self, members: &[Option<MemberRecord>; 2]) -> io::Result<String> {
-        for m in members.iter().flatten() {
-            self.verify(m)?;
-        }
         let snapshot = self.physical_snapshot(members)?;
         let mut hash = Sha256::new();
         let mut found = false;
@@ -532,9 +535,6 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
         }
         if !found {
             return Err(failed());
-        }
-        for m in members.iter().flatten() {
-            self.verify(m)?;
         }
         Ok(format!("{:x}", hash.finalize()))
     }
@@ -602,11 +602,9 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
         members: &[Option<MemberRecord>; 2],
         options: &DesktopTunnelOptions,
     ) -> io::Result<()> {
-        for m in members.iter().flatten() {
-            self.verify(m)?;
-        }
+        let live = live_route_members(self, active, members)?;
         let snapshot = self.physical_snapshot(members)?;
-        let (routes, physical) = plan(&snapshot, active, members, options)?;
+        let (routes, physical) = plan(&snapshot, active, &live, options)?;
         self.sync_proofs(members);
         // Keep old physical identities too: removals/rollback must validate the
         // original interface, never authorize index reuse from a fresh discovery.
@@ -637,9 +635,7 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
             active,
             routes.into_iter().map(NetworkValue::Route).collect(),
         )?;
-        for m in members.iter().flatten() {
-            self.verify(m)?;
-        }
+        live_route_members(self, active, members)?;
         Ok(())
     }
     fn cleanup_routes(&mut self) -> io::Result<()> {

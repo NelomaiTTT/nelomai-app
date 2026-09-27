@@ -857,24 +857,22 @@ where
         result.map_err(Into::into)
     }
 
-    /// One coordination step, not a native health loop. Reuse only the scoped
-    /// cache; healthy ticks never initiate HTTP probe refreshes.
+    /// One coordination step, not a native health loop. Refresh the scoped cache
+    /// only when the exact Core/helper owner needs a reserve acquisition.
     #[cfg(not(target_os = "android"))]
     pub async fn desktop_redundancy_tick(
         &self,
         now_unix: i64,
     ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, ApplicationError>
     {
-        let probes = self
-            .core
-            .state()
-            .await
-            .connection
-            .and_then(|connection| {
-                self.cached_probes(connection.layer, connection.egress_mode, now_unix)
-            })
-            .map(|cached| cached.probes)
-            .unwrap_or_default();
+        let probes = match self.core.desktop_redundancy_probe_context().await? {
+            Some((layer, egress_mode)) => {
+                self.refresh_probes(layer, egress_mode, now_unix)
+                    .await?
+                    .probes
+            }
+            None => Vec::new(),
+        };
         self.core
             .desktop_redundancy_tick(probes)
             .await
