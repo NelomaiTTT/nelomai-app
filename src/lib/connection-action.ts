@@ -9,6 +9,27 @@ export interface BegunConnectionAction {
   token: number;
 }
 
+export interface RuntimeStateSync {
+  pending: boolean;
+  blocking: boolean;
+}
+
+export function initialRuntimeStateSync(): RuntimeStateSync {
+  return { pending: false, blocking: false };
+}
+
+// Periodic observation must not flash/disable Start. A foreground wake or
+// native event can promote the same request to a barrier without duplicating it.
+export function beginRuntimeStateSync(
+  state: RuntimeStateSync,
+  foreground: boolean,
+): { state: RuntimeStateSync; started: boolean } {
+  return {
+    state: { pending: true, blocking: state.blocking || foreground },
+    started: !state.pending,
+  };
+}
+
 export function initialConnectionActionState(): ConnectionActionState {
   return { epoch: 0, startBusy: false, cancelBusy: false };
 }

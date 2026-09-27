@@ -5,6 +5,8 @@ use nelomai_client_tunnel::{
     TunnelError, TunnelMetrics, TunnelPlatform, TunnelStartRequest, TunnelStatus, TunnelTransport,
 };
 pub use nelomai_contracts::dispatcher;
+#[cfg(any(windows, test))]
+mod install_recovery;
 pub mod member_actor;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_boot.rs"]
@@ -22,6 +24,8 @@ pub mod member_plan;
 mod member_reboot;
 pub mod member_routes;
 pub mod redundancy;
+#[cfg(any(windows, test))]
+mod service_lifecycle;
 
 #[cfg(test)]
 fn test_engine_path(name: &str) -> std::path::PathBuf {
@@ -36,7 +40,8 @@ fn test_engine_path(name: &str) -> std::path::PathBuf {
 }
 
 /// Selection/lifetime routing shared by the production named-pipe transport and
-/// injected transports. Only explicit Start may create an engine lifetime.
+/// injected transports. A bound Version may create a verified engine lifetime
+/// to query capabilities, but only an explicit Start may start a VPN.
 pub fn exchange_selected(
     request: Request,
     expected: Option<&dispatcher::EngineIdentity>,
@@ -79,7 +84,8 @@ pub fn exchange_selected(
         };
     }
     let starts_engine = matches!(&request, Request::Start { .. })
-        || matches!(&request, Request::Redundant { request, .. } if request.is_start());
+        || matches!(&request, Request::Redundant { request, .. } if request.is_start())
+        || (matches!(&request, Request::Version { .. }) && !ready.running && expected.is_some());
     if !starts_engine {
         if !ready.running {
             return match request {
@@ -111,6 +117,92 @@ pub fn exchange_selected(
 #[cfg(test)]
 mod selected_transport_tests {
     use super::*;
+    fn identity() -> dispatcher::EngineIdentity {
+        dispatcher::EngineIdentity {
+            slot: nelomai_contracts::RuntimeSlot::Latest,
+            runtime_version: "0.3.3".into(),
+            runtime_contract_version: 1,
+            container_version: "0.3.3".into(),
+            manifest_sha256: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn bound_version_queries_actual_cold_and_running_engine_capabilities() {
+        for running in [false, true] {
+            for supported in [false, true] {
+                let identity = identity();
+                let mut launches = 0;
+                let mut private_calls = 0;
+                let response = exchange_selected(
+                    Request::version(),
+                    Some(&identity),
+                    |request| match request {
+                        dispatcher::DispatcherRequest::Version { .. } => Ok(
+                            dispatcher::DispatcherResponse::success(identity.clone(), running),
+                        ),
+                        dispatcher::DispatcherRequest::Start {
+                            identity: selected, ..
+                        } => {
+                            assert_eq!(selected, &identity);
+                            launches += 1;
+                            Ok(dispatcher::DispatcherResponse::success(
+                                identity.clone(),
+                                true,
+                            ))
+                        }
+                        _ => panic!("Version must not stop or clean up an engine"),
+                    },
+                    |request| {
+                        assert!(matches!(request, Request::Version { .. }), "no VPN Start");
+                        private_calls += 1;
+                        // Missing capability on legacy wire responses defaults to false.
+                        let mut response: Response = serde_json::from_value(serde_json::json!({
+                            "ok": true, "protocolVersion": PROTOCOL_VERSION,
+                            "serviceVersion": "0.3.3"
+                        }))
+                        .unwrap();
+                        response.desktop_redundancy_v1 = supported;
+                        Ok(response)
+                    },
+                )
+                .unwrap();
+                assert_eq!(response.desktop_redundancy_v1, supported);
+                assert_eq!(
+                    private_calls, 1,
+                    "capability must come from selected engine"
+                );
+                assert_eq!(launches, usize::from(!running));
+            }
+        }
+    }
+
+    #[test]
+    fn version_rejects_mismatched_running_or_newly_started_engine() {
+        for running in [false, true] {
+            let expected = identity();
+            let mut wrong = expected.clone();
+            wrong.runtime_version = "other".into();
+            let response = exchange_selected(
+                Request::version(),
+                Some(&expected),
+                |request| {
+                    Ok(dispatcher::DispatcherResponse::success(
+                        if matches!(request, dispatcher::DispatcherRequest::Version { .. })
+                            && !running
+                        {
+                            expected.clone()
+                        } else {
+                            wrong.clone()
+                        },
+                        running || matches!(request, dispatcher::DispatcherRequest::Start { .. }),
+                    ))
+                },
+                |_| panic!("identity mismatch must never reach private engine"),
+            );
+            assert!(response.is_err());
+        }
+    }
     #[test]
     fn bound_stable_request_never_adopts_latest_from_dispatcher_version() {
         let stable = dispatcher::EngineIdentity {

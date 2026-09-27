@@ -3068,12 +3068,14 @@ name = "nelomai-windows-service"
 version = "0.3.3"
 dependencies = [
  "async-trait",
+ "ed25519-dalek",
  "ipnet",
  "nelomai-client-tunnel",
  "nelomai-contracts",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "windows 0.61.3",

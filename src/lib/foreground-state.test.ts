@@ -1,7 +1,8 @@
 import page from "../routes/+page.svelte?raw";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
-import { beginConnectionStop, initialConnectionActionState, isCurrentConnectionAction } from "./connection-action";
+import { beginConnectionStart, beginConnectionStop, initialConnectionActionState, isCurrentConnectionAction,
+  beginRuntimeStateSync, initialRuntimeStateSync, canBeginConnectionAction } from "./connection-action";
 import { clearOwnedConnectionIntentNotice } from "./connection-intent-notice";
 
 // Execute the page's actual async callback with controlled native replies. No
@@ -11,13 +12,13 @@ const ast = ts.createSourceFile("page.ts", script, ts.ScriptTarget.Latest, true)
 const callback = ast.statements.find((node) => ts.isFunctionDeclaration(node)
   && node.name?.text === "synchronizeRuntimeState")!;
 const executable = ts.transpile(callback.getText(ast), { target: ts.ScriptTarget.ES2022 });
-const synchronize = new Function("context", `with (context) { ${executable}; return synchronizeRuntimeState(); }`);
+const synchronize = new Function("context", "foreground = true", `with (context) { ${executable}; return synchronizeRuntimeState(foreground); }`);
 
 function fixture() {
   let reply!: (value: unknown) => void;
   const response = new Promise((resolve) => { reply = resolve; });
   const context = {
-    busy: false, runtimeStateBusy: false, bootstrap: { binding: {} },
+    busy: false, runtimeStateSync: initialRuntimeStateSync(), bootstrap: { binding: {} },
     phase: "ready", connection: null, runtimeWarning: "tunnel_runtime_stopped" as string | null,
     connectionActionState: initialConnectionActionState(),
     localStopPendingCleanup: false, connectionMetrics: null, reserveState: null,
@@ -26,6 +27,7 @@ function fixture() {
     nativeClient: { state: () => response, recordStartupStage: () => {} },
     readDesktopActiveSlot: () => null, viewForAppState: () => "connection",
     loadSplitTunnel: async () => {}, isCurrentConnectionAction, clearOwnedConnectionIntentNotice,
+    beginRuntimeStateSync, initialRuntimeStateSync,
   };
   const state = { phase: "connected", connection: null, warning: null, metrics: null,
     reserveState: null, connectionIntentStatus: "none", nextRetryAtUnix: null };
@@ -36,12 +38,41 @@ describe("foreground native state callback", () => {
   it("exposes pending reconciliation and applies the authoritative local reply", async () => {
     const { context, reply, state } = fixture();
     const pending = synchronize(context);
-    expect(context.runtimeStateBusy).toBe(true);
+    expect(context.runtimeStateSync.blocking).toBe(true);
     reply(state);
     await pending;
     expect(context.phase).toBe("connected");
     expect(context.runtimeWarning).toBeNull();
-    expect(context.runtimeStateBusy).toBe(false);
+    expect(context.runtimeStateSync.blocking).toBe(false);
+  });
+
+  it("does not disable Start on periodic polls, and ignores a late poll after Start", async () => {
+    const { context, reply, state } = fixture();
+    const pending = synchronize(context, false);
+    expect(context.runtimeStateSync.pending).toBe(true);
+    expect(context.runtimeStateSync.blocking).toBe(false);
+    expect(canBeginConnectionAction(context.connectionActionState, context.busy, false, context.runtimeStateSync.blocking)).toBe(true);
+    context.connectionActionState = beginConnectionStart(context.connectionActionState).state;
+    context.phase = "connecting";
+    reply({ ...state, phase: "ready" });
+    await pending;
+    expect(context.phase).toBe("connecting");
+    expect(context.runtimeStateSync.pending).toBe(false);
+  });
+
+  it("promotes the same pending request on foreground wake and releases the barrier on failure", async () => {
+    const { context, reply } = fixture();
+    let calls = 0;
+    const nativeState = context.nativeClient.state;
+    context.nativeClient.state = () => { calls++; return nativeState(); };
+    const pending = synchronize(context, false);
+    await synchronize(context);
+    expect(calls).toBe(1);
+    expect(context.runtimeStateSync.blocking).toBe(true);
+    reply(null);
+    await pending;
+    expect(context.runtimeStateSync.blocking).toBe(false);
+    expect(context.phase).toBe("ready");
   });
 
   it("discards a reply captured before a newer Stop", async () => {

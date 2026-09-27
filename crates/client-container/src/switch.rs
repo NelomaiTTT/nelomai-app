@@ -159,6 +159,11 @@ impl SwitchJournalV1 {
     pub(crate) fn supersede_target(&self) -> Option<&RuntimeTarget> {
         self.supersede_target.as_ref()
     }
+
+    pub(crate) fn has_advanced_reconcile_source(&self) -> bool {
+        self.active_reconcile_operation_id.is_some()
+            && self.active_session_generation > self.expected_session_generation
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1013,7 +1018,7 @@ impl SwitchCoordinator {
             // Public recover() reaches this loop without the startup wrapper.
             // Validate update linkage and protected root/successor provenance
             // here, before any caller can replay an obsolete installed update.
-            if obsolete_resume
+            if (obsolete_resume || journal.active_reconcile_operation_id.is_some())
                 && matches!(
                     crate::update_start_recovery(self)?,
                     crate::UpdateStartRecovery::Installed { .. }
@@ -1076,15 +1081,21 @@ impl SwitchCoordinator {
                         });
                     })?;
                     let request = journal.reconcile_request();
-                    let frozen = FrozenReconcileRequest::from_persisted(
-                        request,
-                        journal
-                            .source_device_id
-                            .clone()
-                            .ok_or(SwitchError::RecoveryRequired)?,
-                        journal.source_scope_fingerprint.clone(),
-                        Some(&journal.request_fingerprint),
-                    )?;
+                    let frozen = if journal.active_reconcile_operation_id.is_some() {
+                        broker
+                            .restore_transition_request(request, &journal.request_fingerprint)
+                            .await?
+                    } else {
+                        FrozenReconcileRequest::from_persisted(
+                            request,
+                            journal
+                                .source_device_id
+                                .clone()
+                                .ok_or(SwitchError::RecoveryRequired)?,
+                            journal.source_scope_fingerprint.clone(),
+                            Some(&journal.request_fingerprint),
+                        )?
+                    };
                     let receipt = match broker.reconcile_transition(frozen.clone()).await {
                         Ok(receipt) => receipt,
                         Err(BrokerError::Timeout)
@@ -1113,7 +1124,9 @@ impl SwitchCoordinator {
                             retry_after_seconds: delay,
                         });
                     }
-                    if !journal.cancel_requested {
+                    let cancel =
+                        journal.cancel_requested && journal.active_reconcile_operation_id.is_none();
+                    if !cancel {
                         let selection = current_selection(&self.owner, &self.manifest)
                             .map_err(SwitchJournalError::Io)?;
                         let desired_slot =
@@ -1217,7 +1230,7 @@ impl SwitchCoordinator {
                     self.update(|journal| {
                         journal.retry = None;
                         journal.resume_operation_id = Some(Uuid::new_v4().to_string());
-                        journal.decision = Some(if journal.cancel_requested {
+                        journal.decision = Some(if cancel {
                             SwitchDecision::Cancel
                         } else {
                             SwitchDecision::Apply
@@ -1314,104 +1327,44 @@ impl SwitchCoordinator {
                                 .map_err(|_| SwitchError::RecoveryRequired)?,
                         );
                         if RuntimeTarget::from_identity(resumed.identity()) != desired {
-                            let source = broker.transition_source().await?;
-                            if source.identity() != Some(resumed.identity()) {
-                                return Err(SwitchError::RecoveryRequired);
-                            }
                             let predecessor = broker
                                 .restore_transition_request(
                                     journal.reconcile_request(),
                                     &journal.request_fingerprint,
                                 )
                                 .await?;
-                            let operation_id = match &journal.supersede_operation_id {
-                                Some(operation_id)
-                                    if journal.supersede_target.as_ref() == Some(&desired) =>
-                                {
-                                    operation_id.clone()
-                                }
-                                Some(_) => return Err(SwitchError::RecoveryRequired),
-                                None => {
-                                    let operation_id = Uuid::new_v4().to_string();
-                                    let saved_id = operation_id.clone();
-                                    let saved_target = desired.clone();
-                                    self.update(|journal| {
-                                        journal.supersede_operation_id = Some(saved_id);
-                                        journal.supersede_target = Some(saved_target);
-                                    })?;
-                                    operation_id
-                                }
-                            };
-                            let attempt = journal
-                                .retry
-                                .as_ref()
-                                .map_or(1, |retry| retry.attempt.saturating_add(1).min(32));
-                            let delay = retry_delay(attempt);
-                            self.update(|journal| {
-                                journal.retry = Some(SwitchRetryV1 {
-                                    attempt,
-                                    retry_after_seconds: delay,
-                                    retry_not_before_unix_ms: unix_time_ms()
-                                        .saturating_add(u64::from(delay) * 1000),
-                                });
-                            })?;
-                            let superseded = match broker
-                                .supersede_transition(&operation_id, predecessor, desired.clone())
-                                .await
-                            {
-                                Ok(response) => response,
-                                Err(BrokerError::Timeout)
-                                | Err(BrokerError::Api(ClientApiError::Transport(_))) => {
-                                    return Ok(SwitchProgress::Pending {
-                                        retry_after_seconds: delay,
-                                    });
-                                }
-                                Err(error) => return Err(error.into()),
-                            };
-                            if superseded.state == RuntimeSwitchState::Retry {
-                                let delay = superseded
-                                    .retry_after_seconds
-                                    .unwrap_or(delay)
-                                    .max(delay)
-                                    .min(30);
-                                self.update(|journal| {
-                                    journal.retry = Some(SwitchRetryV1 {
-                                        attempt,
-                                        retry_after_seconds: delay,
-                                        retry_not_before_unix_ms: unix_time_ms()
-                                            .saturating_add(u64::from(delay) * 1000),
-                                    });
-                                })?;
-                                return Ok(SwitchProgress::Pending {
-                                    retry_after_seconds: delay,
-                                });
-                            }
-                            let mut successor_request = journal.reconcile_request();
-                            successor_request.operation_id =
-                                superseded.reconcile_operation_id.clone();
-                            successor_request.source_identity = source.identity().cloned();
-                            successor_request.expected_session_generation =
-                                source.expected_session_generation();
-                            successor_request.target_identity = desired.clone();
-                            let successor =
-                                FrozenReconcileRequest::new(successor_request, &source)?;
-                            let successor_id = superseded.reconcile_operation_id.clone();
-                            let successor_fingerprint = successor.request_fingerprint().to_owned();
-                            self.update(|journal| {
-                                journal.active_reconcile_operation_id = Some(successor_id);
-                                journal.active_session_generation =
-                                    source.expected_session_generation();
-                                journal.target_identity = desired;
-                                journal.request_fingerprint = successor_fingerprint;
-                                journal.resume_operation_id = Some(Uuid::new_v4().to_string());
-                                journal.retry = None;
-                            })?;
-                            broker
-                                .finish_supersede(&operation_id, &superseded.reconcile_operation_id)
+                            let successor = broker
+                                .prepare_completed_apply_reconcile(
+                                    predecessor,
+                                    journal
+                                        .resume_operation_id
+                                        .as_deref()
+                                        .ok_or(SwitchError::RecoveryRequired)?,
+                                    desired,
+                                    journal
+                                        .supersede_operation_id
+                                        .as_deref()
+                                        .zip(journal.supersede_target.as_ref()),
+                                )
                                 .await?;
+                            // Keep the original root identity, stop receipt and
+                            // cleanup snapshot. Only the active server request
+                            // advances, after its protected capture is durable.
                             self.update(|journal| {
+                                journal.active_reconcile_operation_id =
+                                    Some(successor.request().operation_id.clone());
+                                journal.active_session_generation =
+                                    successor.request().expected_session_generation;
+                                journal.target_identity =
+                                    successor.request().target_identity.clone();
+                                journal.request_fingerprint =
+                                    successor.request_fingerprint().to_owned();
+                                journal.resume_operation_id = None;
+                                journal.decision = None;
+                                journal.retry = None;
                                 journal.supersede_operation_id = None;
                                 journal.supersede_target = None;
+                                journal.phase = SwitchPhase::ServerReconciling;
                             })?;
                             continue;
                         }

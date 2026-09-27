@@ -31,12 +31,12 @@ define_windows_service!(manager_service_main, manager_service_entry);
 
 const REQUEST_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(40);
 
-struct RequestWatchdog {
+pub(crate) struct RequestWatchdog {
     completed: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl RequestWatchdog {
-    fn arm() -> Result<Self, ServiceError> {
+    pub(crate) fn arm() -> Result<Self, ServiceError> {
         let completed = Arc::new((Mutex::new(false), Condvar::new()));
         let completed_for_thread = Arc::clone(&completed);
         std::thread::Builder::new()
@@ -61,7 +61,7 @@ impl RequestWatchdog {
         Ok(Self { completed })
     }
 
-    fn complete(self) {
+    pub(crate) fn complete(self) {
         let (lock, condition) = &*self.completed;
         let mut completed = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         *completed = true;
@@ -171,12 +171,16 @@ fn manager_service_loop() -> Result<(), ServiceError> {
             _ => ServiceControlHandlerResult::NotImplemented,
         })
         .map_err(|error| platform_error("register manager service control handler", error))?;
-    set_status(
-        &status_handle,
-        ServiceState::StartPending,
-        ServiceControlAccept::empty(),
-    )?;
+    crate::service_lifecycle::run(
+        |status| set_status(&status_handle, status),
+        |report| serve_manager(stopping, report),
+    )
+}
 
+fn serve_manager(
+    stopping: Arc<AtomicBool>,
+    report: &mut dyn FnMut(crate::service_lifecycle::Status) -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
     use nelomai_contracts::dispatcher as d;
     let installation = d::Installation::production(&super::install::installation_directory()?)
         .map_err(|_| ServiceError::UnauthorizedClient)?;
@@ -241,11 +245,7 @@ fn manager_service_loop() -> Result<(), ServiceError> {
             }
         }
     });
-    set_status(
-        &status_handle,
-        ServiceState::Running,
-        ServiceControlAccept::STOP,
-    )?;
+    report(crate::service_lifecycle::Status::Running)?;
     record_service_message("manager lifecycle", "running");
     let mut accept_failures = 0_u64;
     while !stopping.load(Ordering::Acquire) {
@@ -289,13 +289,12 @@ fn manager_service_loop() -> Result<(), ServiceError> {
         );
         if !response.ok {
             record_service_message("dispatcher stop", "cleanup remains pending");
+            return Err(ServiceError::Backend("dispatcher_recovery_pending".into()));
         }
+    } else {
+        return Err(ServiceError::Backend("dispatcher_recovery_pending".into()));
     }
-    set_status(
-        &status_handle,
-        ServiceState::Stopped,
-        ServiceControlAccept::empty(),
-    )
+    Ok(())
 }
 
 fn serve_owned_frame(
@@ -448,17 +447,44 @@ pub(crate) fn request_primitive(
 
 fn set_status(
     handle: &service_control_handler::ServiceStatusHandle,
-    state: ServiceState,
-    accepted: ServiceControlAccept,
+    status: crate::service_lifecycle::Status,
 ) -> Result<(), ServiceError> {
+    use crate::service_lifecycle::Status;
+    let (state, accepted, exit_code, checkpoint, wait_hint) = match status {
+        Status::StartPending => (
+            ServiceState::StartPending,
+            ServiceControlAccept::empty(),
+            ServiceExitCode::Win32(0),
+            1,
+            REQUEST_WATCHDOG_TIMEOUT,
+        ),
+        Status::Running => (
+            ServiceState::Running,
+            ServiceControlAccept::STOP,
+            ServiceExitCode::Win32(0),
+            0,
+            Duration::ZERO,
+        ),
+        Status::Stopped { failed } => (
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            if failed {
+                ServiceExitCode::ServiceSpecific(1)
+            } else {
+                ServiceExitCode::Win32(0)
+            },
+            0,
+            Duration::ZERO,
+        ),
+    };
     handle
         .set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accepted,
-            exit_code: ServiceExitCode::Win32(0),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
+            exit_code,
+            checkpoint,
+            wait_hint,
             process_id: None,
         })
         .map_err(|error| platform_error("update manager service status", error))

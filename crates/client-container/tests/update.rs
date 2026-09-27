@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+#[path = "support/runtime_switch_contract.rs"]
+mod runtime_switch_contract;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use ed25519_dalek::{Signer, SigningKey};
 use nelomai_client_container::{
@@ -904,6 +906,9 @@ async fn reopened_update_rejects_a_mismatched_live_switch_operation() {
 
 #[derive(Default)]
 struct Panel {
+    contract: Mutex<runtime_switch_contract::RuntimeSwitchContract>,
+    reconcile_bodies: Mutex<Vec<Value>>,
+    lose_reconcile_response: AtomicBool,
     reconcile: AtomicUsize,
     resume: AtomicUsize,
     supersede: AtomicUsize,
@@ -913,16 +918,33 @@ struct Panel {
     resume_cancel: AtomicUsize,
 }
 
-async fn reconcile(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
+async fn reconcile(
+    State(panel): State<Arc<Panel>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
     panel.reconcile.fetch_add(1, Ordering::SeqCst);
-    if panel.retry_reconcile.swap(0, Ordering::SeqCst) > 0 {
-        return Json(json!({"state":"retry","operation_id":body["operation_id"],
-            "retired_lease_ids":[],"retired_session_ids":[],
-            "retired_operation_ids":[],"retry_after_seconds":1}));
+    panel.reconcile_bodies.lock().unwrap().push(body.clone());
+    panel
+        .contract
+        .lock()
+        .unwrap()
+        .reconcile(&body)
+        .map_err(|error| error.0)?;
+    if panel.lose_reconcile_response.swap(false, Ordering::SeqCst) {
+        return Err(StatusCode::BAD_GATEWAY);
     }
-    Json(json!({"state":"clean","operation_id":body["operation_id"],
+    if panel.retry_reconcile.swap(0, Ordering::SeqCst) > 0 {
+        return Ok(Json(
+            json!({"state":"retry","operation_id":body["operation_id"],
+            "retired_lease_ids":[],"retired_session_ids":[],
+            "retired_operation_ids":[],"retry_after_seconds":1}),
+        ));
+    }
+    Ok(Json(
+        json!({"state":"clean","operation_id":body["operation_id"],
         "retired_lease_ids":body["lease_ids"],"retired_session_ids":body["redundant_session_ids"],
-        "retired_operation_ids":body["client_operation_ids"],"retry_after_seconds":null}))
+        "retired_operation_ids":body["client_operation_ids"],"retry_after_seconds":null}),
+    ))
 }
 
 async fn resume(
@@ -942,6 +964,7 @@ async fn resume(
     if panel.fail_resume.swap(0, Ordering::SeqCst) > 0 {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    panel.contract.lock().unwrap().resume(&body);
     Ok(Json(
         json!({"identity":{"container_version":body["target_identity"]["container_version"],
         "runtime_version":body["target_identity"]["runtime_version"],
@@ -952,12 +975,16 @@ async fn resume(
     ))
 }
 
-async fn supersede(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
+async fn supersede(
+    State(panel): State<Arc<Panel>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     panel.supersede.fetch_add(1, Ordering::SeqCst);
-    Json(
+    panel.contract.lock().unwrap().supersede(&body)?;
+    Ok(Json(
         json!({"state":"clean","reconcile_operation_id":body["operation_id"],
         "retry_after_seconds":null}),
-    )
+    ))
 }
 
 async fn panel() -> (
@@ -1719,6 +1746,96 @@ struct InterruptedUpdate {
 }
 
 impl InterruptedUpdate {
+    async fn completed_apply() -> Self {
+        let fixture = Self::new().await;
+        let control = Arc::new(Control::default());
+        control.reject_admission.store(true, Ordering::SeqCst);
+        let coordinator = online_coordinator(
+            fixture.owner.clone(),
+            fixture.store.clone(),
+            control,
+            manifest_with_stable("0.3.2", "0.3.2", Some("0.2.20")),
+            fixture.api.clone(),
+        );
+        assert!(UpdateBarrier::open(coordinator)
+            .unwrap()
+            .recover("0.3.2")
+            .await
+            .is_err());
+        assert_eq!(
+            fixture
+                .store
+                .load()
+                .unwrap()
+                .unwrap()
+                .confirmed_identity
+                .unwrap()
+                .runtime_version,
+            "0.3.2"
+        );
+        fixture
+    }
+
+    async fn broken_supersede_ticket(&self) -> String {
+        use nelomai_client_api::{ClientApiError, RuntimeSwitchReconcileRequest, RuntimeTarget};
+        use nelomai_client_container::FrozenReconcileRequest;
+        let broker = AuthBroker::new(self.api.clone(), self.store.clone(), Arc::new(Stop)).unwrap();
+        let auth = self.store.load().unwrap().unwrap();
+        let predecessor = auth
+            .broker
+            .as_ref()
+            .unwrap()
+            .transition_authorities
+            .iter()
+            .find(|entry| entry.resume_evidence.is_some())
+            .unwrap();
+        let path = self.root.path().join("common/runtime-switch-v1.json");
+        let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let envelope = &journal["cleanup_envelope"];
+        let request = RuntimeSwitchReconcileRequest {
+            operation_id: predecessor.reconcile_operation_id.clone(),
+            source_identity: predecessor.source_identity.clone(),
+            target_identity: RuntimeTarget::from_identity(&predecessor.target_identity),
+            expected_session_generation: predecessor.expected_session_generation,
+            cleanup_contract_version: 1,
+            lease_ids: serde_json::from_value(envelope["lease_ids"].clone()).unwrap(),
+            redundant_session_ids: serde_json::from_value(
+                envelope["redundant_session_ids"].clone(),
+            )
+            .unwrap(),
+            client_operation_ids: envelope["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|operation| operation["operation_id"].as_str().unwrap().to_owned())
+                .collect(),
+        };
+        let frozen = FrozenReconcileRequest::from_persisted(
+            request,
+            predecessor.source_device_id.clone(),
+            predecessor.source_scope_fingerprint.clone(),
+            Some(&predecessor.request_fingerprint),
+        )
+        .unwrap();
+        let target = RuntimeTarget::from_identity(
+            &manifest("0.3.3", "0.3.3", false)
+                .identity(RuntimeSlot::Latest, None)
+                .unwrap(),
+        );
+        let operation = "77777777-7777-4777-8777-777777777777";
+        // Execute the broken candidate's exact path against the production
+        // supersede precondition, leaving its real protected pending ticket.
+        assert!(
+            matches!(broker.supersede_transition(operation, frozen, target.clone()).await,
+            Err(BrokerError::Api(ClientApiError::Api { status, code, .. }))
+                if status == StatusCode::CONFLICT && code == "runtime_switch_supersede_conflict")
+        );
+        journal["supersede_operation_id"] = json!(operation);
+        journal["supersede_target"] = serde_json::to_value(target).unwrap();
+        std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        operation.to_owned()
+    }
+
     async fn new() -> Self {
         let (panel, api, server) = panel().await;
         let root = tempfile::tempdir().unwrap();
@@ -1808,6 +1925,358 @@ impl Drop for InterruptedUpdate {
 }
 
 #[tokio::test]
+async fn completed_apply_migrates_only_exact_post_apply_pending_supersede() {
+    for installed in ["0.3.3", "0.3.4"] {
+        let fixture = InterruptedUpdate::completed_apply().await;
+        let rejected_operation = fixture.broken_supersede_ticket().await;
+        let original: Value = serde_json::from_slice(&fixture.journal_bytes().1).unwrap();
+        write_selection(fixture.root.path(), installed, RuntimeSlot::Latest);
+        let control = Arc::new(Control::default());
+        let coordinator = online_coordinator(
+            fixture.owner.clone(),
+            fixture.store.clone(),
+            control.clone(),
+            manifest_with_stable(installed, installed, Some("0.2.20")),
+            fixture.api.clone(),
+        );
+        let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+        barrier.recover(installed).await.unwrap();
+        assert!(barrier.snapshot().unwrap().is_none());
+        let auth = fixture.store.load().unwrap().unwrap();
+        assert!(auth.pending_runtime_supersede.is_none());
+        assert_eq!(auth.confirmed_identity.unwrap().runtime_version, installed);
+        assert!(!auth
+            .broker
+            .unwrap()
+            .transition_authorities
+            .iter()
+            .any(|entry| entry.reconcile_operation_id == rejected_operation));
+        let completed = serde_json::to_value(coordinator.snapshot().unwrap().unwrap()).unwrap();
+        for field in [
+            "operation_id",
+            "source_identity",
+            "source_device_id",
+            "source_scope_fingerprint",
+            "runtime_snapshot",
+            "cleanup_envelope",
+            "local_stop_receipt",
+        ] {
+            assert_eq!(completed[field], original[field], "lost {field}");
+        }
+        assert_eq!(
+            fixture.panel.supersede.load(Ordering::SeqCst),
+            2,
+            "only original clean supersede and explicitly rejected old-candidate call"
+        );
+        assert_eq!(control.admitted.lock().unwrap().len(), 1);
+        assert_eq!(
+            control.admitted.lock().unwrap()[0].runtime_version,
+            installed
+        );
+    }
+}
+
+#[tokio::test]
+async fn completed_apply_preserves_ambiguous_supersede_and_changed_auth_without_dispatch() {
+    for boundary in [
+        "pre_apply_source",
+        "response_clean",
+        "response_retry",
+        "operation",
+        "target",
+        "refresh_proof",
+        "missing_completed",
+        "epoch",
+        "family",
+        "pending_refresh",
+        "pending_recovery",
+        "pending_logout",
+        "logout",
+    ] {
+        let fixture = InterruptedUpdate::completed_apply().await;
+        fixture.broken_supersede_ticket().await;
+        let mut auth = fixture.store.load().unwrap().unwrap();
+        let meta = auth.broker.as_mut().unwrap();
+        let authority = meta
+            .transition_authorities
+            .iter()
+            .find(|entry| entry.resume_evidence.is_some())
+            .unwrap()
+            .clone();
+        let pending = auth.pending_runtime_supersede.as_mut().unwrap();
+        match boundary {
+            "pre_apply_source" => {
+                pending.source.identity = authority.source_identity.clone();
+                pending.source.scope_fingerprint = authority.source_scope_fingerprint.clone();
+                pending.expected_session_generation = authority.expected_session_generation;
+            }
+            "response_clean" => {
+                pending.response_state = Some("clean".into());
+                pending.response_reconcile_operation_id = Some(pending.operation_id.clone());
+            }
+            "response_retry" => {
+                pending.response_state = Some("retry".into());
+                pending.response_reconcile_operation_id =
+                    Some(pending.superseded_reconcile_operation_id.clone());
+                pending.retry_after_seconds = Some(1);
+            }
+            "operation" => pending.operation_id = uuid::Uuid::new_v4().to_string(),
+            "target" => pending.target_identity.runtime_version = "0.3.4".into(),
+            "refresh_proof" => pending.refresh_proof = "other-refresh".into(),
+            "missing_completed" => meta.completed_resume = None,
+            "epoch" => auth.auth_epoch += 1,
+            "family" => meta.family = "another-login".into(),
+            "pending_refresh" => {
+                let mut request = authority.resume_ticket.clone().unwrap();
+                request.kind = nelomai_client_storage::BrokerRequestKind::Refresh;
+                request.resume = None;
+                request.source_identity = auth.confirmed_identity.clone();
+                meta.pending_request = Some(request);
+            }
+            "pending_recovery" => {
+                meta.pending_recovery = Some(nelomai_client_storage::RecoveryTicketV1 {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    auth_epoch: auth.auth_epoch,
+                    attempt: meta.next_attempt,
+                    family: meta.family.clone(),
+                    identity: auth.confirmed_identity.clone().unwrap(),
+                    device_id: meta.confirmed_device_id.clone(),
+                })
+            }
+            "pending_logout" => {
+                meta.pending_logout = Some(nelomai_client_storage::PendingLogoutV1 {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    refresh_proof: pending.refresh_proof.clone(),
+                    source: Some(pending.source.clone()),
+                })
+            }
+            "logout" => {
+                auth.logout_state = nelomai_client_storage::LogoutState::LoggedOut;
+                auth.auth_epoch += 1;
+            }
+            _ => unreachable!(),
+        }
+        fixture.store.save(&auth).unwrap();
+        let before = fixture.journal_bytes();
+        let calls = (
+            fixture.panel.reconcile.load(Ordering::SeqCst),
+            fixture.panel.resume.load(Ordering::SeqCst),
+            fixture.panel.supersede.load(Ordering::SeqCst),
+        );
+        let control = Arc::new(Control::default());
+        let coordinator = fixture.superseding_coordinator(control.clone());
+        assert!(coordinator.recover().await.is_err(), "accepted {boundary}");
+        assert_eq!(
+            fixture.store.load().unwrap().unwrap(),
+            auth,
+            "changed auth at {boundary}"
+        );
+        assert_eq!(
+            fixture.journal_bytes(),
+            before,
+            "changed journal at {boundary}"
+        );
+        assert_eq!(
+            (
+                fixture.panel.reconcile.load(Ordering::SeqCst),
+                fixture.panel.resume.load(Ordering::SeqCst),
+                fixture.panel.supersede.load(Ordering::SeqCst)
+            ),
+            calls,
+            "dispatched at {boundary}"
+        );
+        assert_eq!(control.completed.load(Ordering::SeqCst), 0);
+    }
+}
+
+struct FailFreshCapture {
+    inner: Arc<dyn AuthStore>,
+    after_commit: bool,
+    armed: AtomicBool,
+}
+
+impl AuthStore for FailFreshCapture {
+    fn load(&self) -> Result<Option<AuthStoreV1>, StorageError> {
+        self.inner.load()
+    }
+    fn save(&self, auth: &AuthStoreV1) -> Result<(), StorageError> {
+        let fresh_capture = auth
+            .broker
+            .as_ref()
+            .unwrap()
+            .transition_authorities
+            .iter()
+            .any(|entry| {
+                entry.dispatch_state == nelomai_client_storage::TransitionDispatchStateV1::Captured
+                    && entry
+                        .source_identity
+                        .as_ref()
+                        .is_some_and(|source| source.runtime_version == "0.3.2")
+            });
+        if fresh_capture && self.armed.swap(false, Ordering::SeqCst) {
+            if self.after_commit {
+                self.inner.save(auth)?;
+            }
+            return Err(StorageError::RecoveryRequired(
+                "injected crash around fresh capture save",
+            ));
+        }
+        self.inner.save(auth)
+    }
+}
+
+#[tokio::test]
+async fn completed_apply_capture_crashes_keep_ticket_or_reuse_durable_authority_before_journal_save(
+) {
+    for after_commit in [false, true] {
+        let fixture = InterruptedUpdate::completed_apply().await;
+        let rejected_operation = fixture.broken_supersede_ticket().await;
+        let original = fixture.journal_bytes();
+        let calls = fixture.panel.reconcile.load(Ordering::SeqCst);
+        let store = Arc::new(FailFreshCapture {
+            inner: fixture.store.clone(),
+            after_commit,
+            armed: AtomicBool::new(true),
+        });
+        write_selection(fixture.root.path(), "0.3.3", RuntimeSlot::Latest);
+        let coordinator = online_coordinator(
+            fixture.owner.clone(),
+            store,
+            Arc::new(Control::default()),
+            manifest_with_stable("0.3.3", "0.3.3", Some("0.2.20")),
+            fixture.api.clone(),
+        );
+        assert!(coordinator.recover().await.is_err());
+        drop(coordinator);
+        assert_eq!(
+            fixture.journal_bytes(),
+            original,
+            "journal not yet published"
+        );
+        assert_eq!(
+            fixture.panel.reconcile.load(Ordering::SeqCst),
+            calls,
+            "no network before both saves"
+        );
+        let saved = fixture.store.load().unwrap().unwrap();
+        assert_eq!(saved.pending_runtime_supersede.is_none(), after_commit);
+        let captured = saved
+            .broker
+            .unwrap()
+            .transition_authorities
+            .into_iter()
+            .find(|entry| {
+                entry.dispatch_state == nelomai_client_storage::TransitionDispatchStateV1::Captured
+            });
+        assert_eq!(captured.is_some(), after_commit);
+        let coordinator = fixture.superseding_coordinator(Arc::new(Control::default()));
+        UpdateBarrier::open(coordinator.clone())
+            .unwrap()
+            .recover("0.3.3")
+            .await
+            .unwrap();
+        let completed = serde_json::to_value(coordinator.snapshot().unwrap().unwrap()).unwrap();
+        assert_ne!(
+            completed["active_reconcile_operation_id"],
+            rejected_operation
+        );
+        if let Some(captured) = captured {
+            assert_eq!(
+                completed["active_reconcile_operation_id"],
+                captured.reconcile_operation_id
+            );
+            assert_eq!(
+                completed["request_fingerprint"],
+                captured.request_fingerprint
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_apply_lost_fresh_reconcile_response_replays_exact_durable_request() {
+    let fixture = InterruptedUpdate::completed_apply().await;
+    fixture
+        .panel
+        .lose_reconcile_response
+        .store(true, Ordering::SeqCst);
+    let control = Arc::new(Control::default());
+    let coordinator = fixture.superseding_coordinator(control.clone());
+    assert!(coordinator.recover().await.is_err());
+    let saved: Value = serde_json::to_value(coordinator.snapshot().unwrap().unwrap()).unwrap();
+    assert_eq!(saved["phase"], "server_reconciling");
+    assert_eq!(control.completed.load(Ordering::SeqCst), 0);
+    drop(coordinator);
+    let mut retry = saved.clone();
+    retry["retry"] = Value::Null;
+    std::fs::write(
+        fixture.root.path().join("common/runtime-switch-v1.json"),
+        serde_json::to_vec(&retry).unwrap(),
+    )
+    .unwrap();
+    let coordinator = fixture.superseding_coordinator(control.clone());
+    UpdateBarrier::open(coordinator.clone())
+        .unwrap()
+        .recover("0.3.3")
+        .await
+        .unwrap();
+    let bodies = fixture.panel.reconcile_bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[1], bodies[2]);
+    assert_eq!(
+        bodies[1]["operation_id"],
+        saved["active_reconcile_operation_id"]
+    );
+    assert_eq!(bodies[1]["source_identity"]["runtime_version"], "0.3.2");
+    assert_eq!(bodies[1]["expected_session_generation"], 8);
+    assert_eq!(bodies[1]["source_identity"]["session_generation"], 8);
+    assert_eq!(bodies[1]["target_identity"]["runtime_version"], "0.3.3");
+    assert_eq!(control.admitted.lock().unwrap()[0].runtime_version, "0.3.3");
+}
+
+#[tokio::test]
+async fn completed_apply_repeated_installs_recover_pending_reconcile_and_completed_resume() {
+    for applied in [false, true] {
+        let fixture = InterruptedUpdate::completed_apply().await;
+        let control = Arc::new(Control::default());
+        control.reject_admission.store(applied, Ordering::SeqCst);
+        if !applied {
+            fixture.panel.retry_reconcile.store(1, Ordering::SeqCst);
+        }
+        let coordinator = fixture.superseding_coordinator(control.clone());
+        let result = coordinator.recover().await;
+        if applied {
+            assert!(result.is_err());
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                nelomai_client_container::SwitchProgress::Pending { .. }
+            ));
+        }
+        drop(coordinator);
+        let path = fixture.root.path().join("common/runtime-switch-v1.json");
+        let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        journal["retry"] = Value::Null;
+        std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        write_selection(fixture.root.path(), "0.3.4", RuntimeSlot::Latest);
+        control.reject_admission.store(false, Ordering::SeqCst);
+        let newest = online_coordinator(
+            fixture.owner.clone(),
+            fixture.store.clone(),
+            control.clone(),
+            manifest_with_stable("0.3.4", "0.3.4", Some("0.2.20")),
+            fixture.api.clone(),
+        );
+        let barrier = UpdateBarrier::open(newest.clone()).unwrap();
+        barrier.recover("0.3.4").await.unwrap();
+        assert!(barrier.snapshot().unwrap().is_none());
+        let admitted = control.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].runtime_version, "0.3.4");
+    }
+}
+
+#[tokio::test]
 async fn superseding_manifest_recovers_interrupted_update_without_admitting_obsolete_runtime() {
     let fixture = InterruptedUpdate::new().await;
     let before = fixture.journal_bytes();
@@ -1876,7 +2345,8 @@ async fn superseding_manifest_recovers_interrupted_update_without_admitting_obso
     assert_eq!(admitted[0].container_version, "0.3.3");
     assert_eq!(admitted[0].runtime_version, "0.3.3");
     assert_eq!(admitted[0].runtime_slot, RuntimeSlot::Latest);
-    assert_eq!(fixture.panel.supersede.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.panel.supersede.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.panel.reconcile.load(Ordering::SeqCst), 2);
     assert!(
         nelomai_client_core::RuntimeStartPreflight::check_start_barrier(coordinator.as_ref())
             .is_ok()
@@ -1977,15 +2447,20 @@ async fn superseding_manifest_rejects_foreign_historical_identity_before_resume_
 
 #[tokio::test]
 async fn superseding_manifest_rejects_coherently_tampered_source_before_side_effects() {
-    assert_coherently_tampered_update_rejected(false).await;
+    assert_coherently_tampered_update_rejected(false, false).await;
 }
 
 #[tokio::test]
 async fn superseding_manifest_direct_recover_rejects_coherently_tampered_source() {
-    assert_coherently_tampered_update_rejected(true).await;
+    assert_coherently_tampered_update_rejected(true, false).await;
 }
 
-async fn assert_coherently_tampered_update_rejected(direct_recovery: bool) {
+#[tokio::test]
+async fn completed_apply_fresh_reconcile_rejects_tampered_root_before_side_effects() {
+    assert_coherently_tampered_update_rejected(true, true).await;
+}
+
+async fn assert_coherently_tampered_update_rejected(direct_recovery: bool, fresh: bool) {
     use sha2::{Digest, Sha256};
     for field in [
         "runtime_version",
@@ -1993,11 +2468,23 @@ async fn assert_coherently_tampered_update_rejected(direct_recovery: bool) {
         "source_family",
         "source_epoch",
         "operation_id",
+        "active_reconcile_operation_id",
     ] {
         let fixture = InterruptedUpdate::new().await;
+        if fresh {
+            fixture.panel.retry_reconcile.store(1, Ordering::SeqCst);
+            let coordinator = fixture.superseding_coordinator(Arc::new(Control::default()));
+            assert!(matches!(
+                coordinator.recover().await.unwrap(),
+                nelomai_client_container::SwitchProgress::Pending { .. }
+            ));
+        }
         let (update, switch) = fixture.journal_bytes();
         let mut update: Value = serde_json::from_slice(&update).unwrap();
         let mut switch: Value = serde_json::from_slice(&switch).unwrap();
+        if fresh {
+            switch["retry"] = Value::Null;
+        }
         match field {
             "runtime_version" => {
                 update["source_runtime"][field] = json!("0.3.0+foreign");
@@ -2017,6 +2504,9 @@ async fn assert_coherently_tampered_update_rejected(direct_recovery: bool) {
                 update[field] = operation.clone();
                 switch[field] = operation.clone();
                 switch["local_stop_receipt"][field] = operation;
+            }
+            "active_reconcile_operation_id" => {
+                switch[field] = json!("99999999-9999-4999-8999-999999999999");
             }
             _ => unreachable!(),
         }

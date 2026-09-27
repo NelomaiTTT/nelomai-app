@@ -145,6 +145,17 @@ fn acl_allowed(acl: &Acl, protection: Protection) -> bool {
                 == 1
         })
 }
+fn recovery_marker_acl_allowed(acl: &Acl) -> bool {
+    // The dispatcher writes this non-secret identity file under a pinned
+    // protected root using ordinary inherited ACLs. Normalize inheritance only
+    // for this marker; durable member secrets retain the stricter File policy.
+    let mut explicit = acl.clone();
+    explicit.control |= PROTECTED;
+    for ace in &mut explicit.aces {
+        ace.flags &= !0x10;
+    }
+    acl_allowed(&explicit, Protection::File)
+}
 fn ancestor_creation_allowed(acl: &Acl) -> bool {
     acl_allowed(acl, Protection::Ancestor)
         && acl.aces.iter().all(|ace| {
@@ -337,7 +348,7 @@ fn exact_config_slot(
 }
 
 #[cfg(windows)]
-pub(crate) use native::MemberFiles;
+pub(crate) use native::{pin_private_directory, pin_recovery_marker, MemberFiles};
 
 #[cfg(windows)]
 mod native {
@@ -604,6 +615,72 @@ mod native {
             }
             Ok(())
         }
+    }
+
+    /// Read-only pinning for installer recovery. Never creates directories or
+    /// repairs permissions: every existing ancestor must pass the same guards
+    /// as durable member ownership, with a protected SYSTEM/Admin-only root.
+    pub(crate) struct PinnedDirectory(Vec<Directory>);
+    impl PinnedDirectory {
+        pub(crate) fn verify(&self) -> Result<()> {
+            for directory in &self.0 {
+                directory.verify()?;
+            }
+            Ok(())
+        }
+    }
+    pub(crate) fn pin_private_directory(root: &Path) -> Result<PinnedDirectory> {
+        let paths: Vec<_> = root.ancestors().map(Path::to_path_buf).collect();
+        let drive = wide(paths.last().ok_or(OwnerError::Invalid)?)?;
+        if unsafe { GetDriveTypeW(drive.as_ptr()) } != 3 {
+            return Err(OwnerError::Invalid);
+        }
+        let mut pinned = PinnedDirectory(Vec::new());
+        for (depth, path) in paths.iter().enumerate().rev() {
+            pinned.verify()?;
+            let file = open_directory(path).map_err(|_| OwnerError::Native)?;
+            let protection = if depth == 0 {
+                Protection::Directory
+            } else {
+                Protection::Ancestor
+            };
+            let id = stamp(&file, true, 0)?.id;
+            let acl = acl(&file, protection)?;
+            let directory = Directory {
+                path: path.clone(),
+                file,
+                id,
+                acl,
+                protection,
+            };
+            directory.verify()?;
+            pinned.0.push(directory);
+        }
+        Ok(pinned)
+    }
+
+    /// Caller holds PinnedDirectory for the protected installation root.
+    /// Deny writes while cleanup runs, reject reparse/multi-link files, and
+    /// permit only the final checked unlink while retaining this read handle.
+    pub(crate) fn pin_recovery_marker(path: &Path) -> Result<File> {
+        let file = open(
+            path,
+            GENERIC_READ | READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_DELETE,
+            OPEN_EXISTING,
+            false,
+            None,
+        )
+        .map_err(|_| OwnerError::Native)?;
+        stamp(
+            &file,
+            false,
+            nelomai_contracts::dispatcher::MAX_DISPATCHER_FRAME,
+        )?;
+        if !recovery_marker_acl_allowed(&acl(&file, Protection::Ancestor)?) {
+            return Err(OwnerError::Conflict);
+        }
+        Ok(file)
     }
     struct ReadFile {
         file: File,

@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+#[path = "support/runtime_switch_contract.rs"]
+mod runtime_switch_contract;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -424,6 +426,7 @@ fn stable_target() -> RuntimeTarget {
 
 #[derive(Default)]
 struct Panel {
+    contract: Mutex<runtime_switch_contract::RuntimeSwitchContract>,
     bootstrap_calls: AtomicUsize,
     refresh_calls: AtomicUsize,
     reconcile_calls: AtomicUsize,
@@ -530,6 +533,7 @@ async fn reconcile(
         ));
     }
     if state.return_full_device_snapshot.load(Ordering::SeqCst) == 1 {
+        state.contract.lock().unwrap().reconcile(&body)?;
         return Ok(Json(
             json!({"state":"clean","operation_id":body["operation_id"],
             "retired_lease_ids":["server-lease"],
@@ -539,12 +543,14 @@ async fn reconcile(
         ));
     }
     if state.return_retry.swap(0, Ordering::SeqCst) == 1 {
+        state.contract.lock().unwrap().reconcile(&body)?;
         return Ok(Json(
             json!({"state":"retry","operation_id":body["operation_id"],
             "retired_lease_ids":[],"retired_session_ids":[],
             "retired_operation_ids":[],"retry_after_seconds":1}),
         ));
     }
+    state.contract.lock().unwrap().reconcile(&body)?;
     Ok(Json(
         json!({"state":"clean","operation_id":body["operation_id"],
         "retired_lease_ids":body["lease_ids"],"retired_session_ids":body["redundant_session_ids"],
@@ -557,6 +563,7 @@ async fn resume(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Jso
     if state.hold_resume.load(Ordering::SeqCst) == 1 {
         state.resume_release.notified().await;
     }
+    state.contract.lock().unwrap().resume(&body);
     let generation = body["expected_session_generation"].as_u64().unwrap_or(0) + 1;
     Json(
         json!({"identity":{"container_version":body["target_identity"]["container_version"],
@@ -566,14 +573,18 @@ async fn resume(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Jso
         "access_token":"runtime-access","token_type":"Bearer","access_expires_in":900}),
     )
 }
-async fn supersede(State(state): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
-    let call = state.supersede_calls.fetch_add(1, Ordering::SeqCst);
-    state.supersede_bodies.lock().unwrap().push(body);
-    Json(json!({
+async fn supersede(
+    State(state): State<Arc<Panel>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    state.supersede_calls.fetch_add(1, Ordering::SeqCst);
+    state.supersede_bodies.lock().unwrap().push(body.clone());
+    state.contract.lock().unwrap().supersede(&body)?;
+    Ok(Json(json!({
         "state":"clean",
-        "reconcile_operation_id":if call == 0 { "44444444-4444-4444-8444-444444444444" } else { "55555555-5555-4555-8555-555555555555" },
+        "reconcile_operation_id":body["operation_id"],
         "retry_after_seconds":null
-    }))
+    })))
 }
 
 #[tokio::test]
@@ -2419,7 +2430,8 @@ async fn cancel_replays_dispatched_apply_before_fresh_reverse_without_rewriting_
     assert_eq!(status.selected_slot, RuntimeSlot::Latest);
     assert!(!status.restart_required());
     assert_eq!(state.resume_calls.load(Ordering::SeqCst), 4);
-    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         broker
             .access_token(None)
@@ -2814,7 +2826,7 @@ async fn updated_manifest_supersedes_only_the_clean_predecessor_and_resumes_succ
 }
 
 #[tokio::test]
-async fn lost_committed_old_apply_is_replayed_without_old_admission_then_superseded() {
+async fn lost_committed_old_apply_is_replayed_without_old_admission_then_reconciled() {
     exercise_committed_apply_updates(false).await;
 }
 
@@ -3185,7 +3197,8 @@ async fn exercise_committed_apply_updates(repeated: bool) {
             .unwrap()
             .attach(broker.clone(), control.clone());
         assert_eq!(newest.recover().await.unwrap(), SwitchProgress::Ready);
-        assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 3);
         assert_eq!(state.resume_calls.load(Ordering::SeqCst), 3);
         assert_eq!(
             broker
@@ -3208,8 +3221,8 @@ async fn exercise_committed_apply_updates(repeated: bool) {
                 .unwrap()
                 .transition_authorities
                 .len(),
-            3,
-            "current original journal retains every successor needed for replay"
+            2,
+            "retain the original root and current completed authority"
         );
         assert_eq!(
             newest.request(RuntimeSlot::Latest).await.unwrap(),
@@ -3232,7 +3245,8 @@ async fn exercise_committed_apply_updates(repeated: bool) {
     }
 
     assert_eq!(updated.recover().await.unwrap(), SwitchProgress::Ready);
-    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.supersede_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.reconcile_calls.load(Ordering::SeqCst), 2);
     assert_eq!(state.resume_calls.load(Ordering::SeqCst), 2);
     assert_eq!(control.completions.load(Ordering::SeqCst), 1);
     server.abort();

@@ -57,6 +57,33 @@ fn private_files_never_accept_world_read_or_inherited_acl() {
 }
 
 #[test]
+fn recovery_marker_accepts_only_private_acl_inherited_from_pinned_private_root() {
+    let mut inherited = private(false);
+    inherited.control = 0;
+    for ace in &mut inherited.aces {
+        ace.flags = 0x10;
+    }
+    assert!(recovery_marker_acl_allowed(&inherited));
+    assert!(recovery_marker_acl_allowed(&private(false)));
+    for mutation in 0..5 {
+        let mut bad = inherited.clone();
+        match mutation {
+            0 => bad.owner = "S-1-5-21-123".into(),
+            1 => bad.aces[0].sid = "S-1-1-0".into(),
+            2 => bad.aces[0].flags |= 8,
+            3 => bad.aces[0].mask = 0x120089,
+            _ => bad.aces.push(Ace {
+                kind: 0,
+                flags: 0,
+                mask: 2,
+                sid: "S-1-1-0".into(),
+            }),
+        }
+        assert!(!recovery_marker_acl_allowed(&bad));
+    }
+}
+
+#[test]
 fn ancestor_policy_preserves_substitution_and_ownership_fences() {
     let mut ace = Ace {
         kind: 0,

@@ -107,6 +107,19 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
         .ok_or(ServiceError::UnsafePath)?
         .join("runtime");
     let install_root = installation_directory()?;
+    // Do not repair an existing recovery root's ACL before validating it.
+    let _recovery_root = if install_root
+        .join(nelomai_contracts::dispatcher::ACTIVE_ENGINE_NAME)
+        .try_exists()
+        .map_err(|error| platform_error("inspect recovery root", error))?
+    {
+        Some(
+            super::member_files::pin_private_directory(&install_root)
+                .map_err(|_| ServiceError::UnauthorizedClient)?,
+        )
+    } else {
+        None
+    };
     fs::create_dir_all(&install_root)
         .map_err(|error| platform_error("create privileged layout", error))?;
     apply_private_acl(&install_root)?;
@@ -118,6 +131,11 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(platform_error("read previous dispatcher pointer", error)),
         };
+    // Retain the registration across recovery/preflight failure. The prior
+    // manager remains explicitly stopped and can be repaired/retried; only
+    // activation below replaces its registration under the rollback path.
+    stop_manager_for_recovery()?;
+    recover_stale_engine(&installation)?;
     let operations = DefenderInstallIo {
         root: &install_root,
         broker: &installed_client_path,
@@ -132,7 +150,7 @@ pub fn install(options: InstallOptions) -> Result<(), ServiceError> {
             &options.owner_sid,
             &operations,
         )
-        .map_err(|_| ServiceError::UnauthorizedClient)?;
+        .map_err(|_| ServiceError::Backend("dispatcher_install_preflight_failed; previous manager registration retained, stopped".into()))?;
     // Published generations stay recoverable on service activation rollback;
     // their exact owned exceptions are retained until full uninstall.
     operations.published.set(true);
@@ -220,13 +238,144 @@ fn configure_manager_recovery(service: &Service) -> Result<(), ServiceError> {
 }
 
 pub fn uninstall() -> Result<(), ServiceError> {
-    remove_all_owned_tunnel_services()?;
+    stop_manager_for_recovery()?;
+    let install_root = installation_directory()?;
+    if install_root
+        .try_exists()
+        .map_err(|error| platform_error("inspect privileged layout", error))?
+    {
+        let installation = nelomai_contracts::dispatcher::Installation::production(&install_root)
+            .map_err(|_| ServiceError::UnauthorizedClient)?;
+        recover_stale_engine(&installation)?;
+    }
     remove_service(MANAGER_SERVICE_NAME)?;
+    remove_all_owned_tunnel_services()?;
     WindowsRouteManager::new()?.cleanup()?;
     let root = state_directory()?;
     if root.exists() {
         fs::remove_dir_all(&root)
             .map_err(|error| platform_error("remove service state directory", error))?;
+    }
+    Ok(())
+}
+
+fn recover_stale_engine(
+    installation: &nelomai_contracts::dispatcher::Installation,
+) -> Result<(), ServiceError> {
+    use nelomai_contracts::dispatcher as d;
+    if !installation
+        .root
+        .join(d::ACTIVE_ENGINE_NAME)
+        .try_exists()
+        .map_err(|error| platform_error("inspect engine recovery marker", error))?
+    {
+        return Ok(());
+    }
+    // The same bounded process watchdog used by dispatcher exchanges prevents
+    // stalled native cleanup from stranding an installer. Failure preserves the
+    // marker and journals; no retry, engine launch, or installation bypass.
+    let watchdog = super::service::RequestWatchdog::arm()?;
+    let result = (|| {
+        let pinned = super::member_files::pin_private_directory(&installation.root)
+            .map_err(|_| d::blocked())?;
+        let _marker = super::member_files::pin_recovery_marker(
+            &installation.root.join(d::ACTIVE_ENGINE_NAME),
+        )
+        .map_err(|_| d::blocked())?;
+        crate::install_recovery::recover(installation, |layout| {
+            use crate::member_actor::PairFactory;
+            pinned.verify().map_err(|_| d::blocked())?;
+            let engine = layout.engine_path();
+            // Existing scoped cleanup validates durable owner identities,
+            // interface proofs, ACLs, routes, DNS and WFP before retirement.
+            let mut pair = super::member_pair::NativePairFactory::from_service(
+                layout.identity.clone(),
+                &engine,
+            )?;
+            pair.recover(layout.identity.slot)
+                .map_err(|_| d::blocked())?;
+            cleanup_legacy_services(&engine).map_err(|_| d::blocked())?;
+            WindowsRouteManager::new()
+                .and_then(|mut routes| routes.cleanup())
+                .map_err(|_| d::blocked())?;
+            pinned.verify().map_err(|_| d::blocked())
+        })
+    })();
+    watchdog.complete();
+    result.map_err(|_| ServiceError::Backend("dispatcher_recovery_pending".into()))
+}
+
+fn stop_manager_for_recovery() -> Result<(), ServiceError> {
+    let manager = service_manager(ServiceManagerAccess::CONNECT)?;
+    let service = match manager.open_service(
+        MANAGER_SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+    ) {
+        Ok(service) => service,
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            return Ok(())
+        }
+        Err(error) => return Err(platform_error("open manager for recovery", error)),
+    };
+    let status = service
+        .query_status()
+        .map_err(|error| platform_error("inspect manager for recovery", error))?;
+    if status.current_state != ServiceState::Stopped {
+        let _ = service.stop();
+        wait_until_stopped(&service)?;
+    }
+    Ok(())
+}
+
+/// Recovery has an exact verified old engine identity, so a matching service
+/// name alone is insufficient authority to stop/delete an ordinary tunnel.
+fn cleanup_legacy_services(engine: &Path) -> Result<(), ServiceError> {
+    let manager = service_manager(ServiceManagerAccess::CONNECT)?;
+    let configuration = tunnel_config_path()?;
+    for transport in [TunnelTransport::WireGuard, TunnelTransport::AmneziaWg3] {
+        let spec = tunnel_service_spec(engine, &configuration, transport)?;
+        let service = match manager.open_service(
+            &spec.name,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::QUERY_CONFIG
+                | ServiceAccess::STOP
+                | ServiceAccess::DELETE,
+        ) {
+            Ok(service) => service,
+            Err(windows_service::Error::Winapi(error))
+                if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+            {
+                continue
+            }
+            Err(error) => return Err(platform_error("open owned recovery service", error)),
+        };
+        let actual = service
+            .query_config()
+            .map_err(|error| platform_error("inspect recovery service", error))?;
+        let mut expected = vec![engine.as_os_str().to_owned()];
+        expected.extend(spec.arguments.iter().map(OsString::from));
+        if super::member_owner::command_arguments(actual.executable_path.as_os_str())
+            .map_err(|_| ServiceError::UnauthorizedClient)?
+            != expected
+            || actual.service_type != ServiceType::OWN_PROCESS
+            || actual.account_name.as_deref() != Some(std::ffi::OsStr::new("LocalSystem"))
+        {
+            return Err(ServiceError::UnauthorizedClient);
+        }
+        let status = service
+            .query_status()
+            .map_err(|error| platform_error("inspect recovery service state", error))?;
+        if status.current_state != ServiceState::Stopped {
+            service
+                .stop()
+                .map_err(|error| platform_error("stop owned recovery service", error))?;
+            wait_until_stopped(&service)?;
+        }
+        service
+            .delete()
+            .map_err(|error| platform_error("delete owned recovery service", error))?;
     }
     Ok(())
 }

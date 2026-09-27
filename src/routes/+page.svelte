@@ -21,6 +21,8 @@
     initialConnectionActionState,
     isCurrentConnectionAction,
     prepareConnectionStartForPlatform,
+    beginRuntimeStateSync,
+    initialRuntimeStateSync,
   } from "$lib/connection-action";
   import {
     historyStateForOverlay,
@@ -144,7 +146,7 @@
   let startupPending = $state(false);
   let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
-  let runtimeStateBusy = $state(false);
+  let runtimeStateSync = $state(initialRuntimeStateSync());
   let splitTunnelState = $state<SplitTunnelState | null>(null);
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
   let splitTunnelOpen = $state(false);
@@ -281,7 +283,7 @@
       else connectionIntentNotificationUnlisten = unlisten;
     });
     stateTimer = window.setInterval(() => {
-      if (document.visibilityState === "visible") void synchronizeRuntimeState();
+      if (document.visibilityState === "visible") void synchronizeRuntimeState(false);
     }, 1_000);
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void refreshProbes();
@@ -486,16 +488,17 @@
     }
   }
 
-  async function synchronizeRuntimeState() {
+  async function synchronizeRuntimeState(foreground = true) {
     if (
       busy ||
-      runtimeStateBusy ||
       !bootstrap?.binding ||
       !["ready", "connecting", "connected", "stopping"].includes(phase)
     ) {
       return;
     }
-    runtimeStateBusy = true;
+    const sync = beginRuntimeStateSync(runtimeStateSync, foreground);
+    runtimeStateSync = sync.state;
+    if (!sync.started) return;
     try {
       const previous = phase;
       const observedBootstrap = bootstrap;
@@ -540,7 +543,7 @@
         await loadSplitTunnel(false);
       }
     } finally {
-      runtimeStateBusy = false;
+      runtimeStateSync = initialRuntimeStateSync();
     }
   }
 
@@ -717,7 +720,7 @@
     }
     const stopping =
       forceStop || connectionAction === "stop" || connectionActionState.startBusy;
-    if (!canBeginConnectionAction(connectionActionState, busy, stopping, runtimeStateBusy)) return;
+    if (!canBeginConnectionAction(connectionActionState, busy, stopping, runtimeStateSync.blocking)) return;
     const startDeviceId = bootstrap?.device.id;
     const startPlatform = bootstrap?.device.platform;
     if (!stopping && !startDeviceId) return;
@@ -1552,7 +1555,7 @@
               connectionActionState,
               busy,
               connectionAction === "stop" || connectionActionState.startBusy,
-              runtimeStateBusy,
+              runtimeStateSync.blocking,
             ) ||
               (connectionAction === "start" &&
                 (!splitTunnelLoaded || splitTunnelBlocksStart)) ||
@@ -1561,7 +1564,7 @@
             <span>
               {localStopPendingCleanup ? "Выключен" : connectionAction === "stop"
                 ? "Стоп"
-                : runtimeStateBusy ? "Проверяем состояние"
+                : runtimeStateSync.blocking ? "Проверяем состояние"
                 : connectionAction === "retry"
                   ? "Повторить"
                   : "Старт"}

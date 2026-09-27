@@ -465,7 +465,7 @@ impl Drop for LocalArgv {
         unsafe { LocalFree(self.0.cast()) };
     }
 }
-fn command_arguments(command: &std::ffi::OsStr) -> Result<Vec<OsString>> {
+pub(crate) fn command_arguments(command: &std::ffi::OsStr) -> Result<Vec<OsString>> {
     let mut wide: Vec<u16> = command.encode_wide().collect();
     if wide.is_empty() || wide.len() > 32767 || wide.contains(&0) {
         return Err(OwnerError::Conflict);
