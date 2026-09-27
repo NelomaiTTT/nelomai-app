@@ -1262,6 +1262,11 @@ impl ProcessDispatcher {
             &encode_frame(&serde_json::json!({"dispatcher_control":"ready"}))?,
             primitive,
         )?;
+        // A live process is not a ready engine. Fence all subsequent traffic
+        // until the complete READY response has been accepted, including JSON
+        // decoding failures and explicit negative acknowledgements. Keep the
+        // recovery marker: only stop's owned cleanup acknowledgement clears it.
+        self.channel_failed = true;
         let response: serde_json::Value =
             serde_json::from_slice(frame_body(&response, MAX_ENGINE_FRAME)?)
                 .map_err(|_| blocked())?;
@@ -1272,6 +1277,7 @@ impl ProcessDispatcher {
         // wakeup; capability/runtime availability is otherwise unchanged.
         self.supports_idle_tick =
             response.get("supports_idle_tick") == Some(&serde_json::Value::Bool(true));
+        self.channel_failed = false;
         Ok(())
     }
     fn stop(

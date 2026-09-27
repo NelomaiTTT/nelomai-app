@@ -2801,10 +2801,13 @@ class NelomaiVpnService(private val runtimeHost: ru.nelomai.runtime.v1.RuntimeVp
                 val redundant = cancelled.envelope.redundantTransaction
                 if (redundant != null) {
                     redundantStartOperation.cancel(redundant.startOperationId)
-                    beginFailClosedRedundantStop(
-                        redundant.startOperationId,
-                        redundantOwnerForOperation(redundant.startOperationId),
-                    )
+                    routeCancelledRedundantIntentStop(intent.action, redundant) { operationId, retain ->
+                        beginFailClosedRedundantStop(
+                            operationId,
+                            redundantOwnerForOperation(operationId),
+                            retainActivePeer = retain,
+                        )
+                    }
                 }
                 runCatching {
                     AutomaticDiagnostics.onConnectionIntentCancelled(
@@ -5352,6 +5355,18 @@ internal fun cancelDispatchedConnectionIntent(
 ): AndroidCoordinatorResult {
     dispatch.invalidate()
     return cancel()
+}
+
+internal fun routeCancelledRedundantIntentStop(
+    action: String?,
+    transaction: AndroidRedundantTransaction,
+    stop: (operationId: String, retainActivePeer: Boolean) -> Unit,
+) {
+    // Only the explicit UI Stop requests retention. Generation cancellation,
+    // failed starts and fail-closed cleanup retain their cold-release policy.
+    // The recovery store still gates capability/role safety and freezes retries.
+    stop(transaction.startOperationId,
+        action == NelomaiVpnService.ACTION_CANCEL_CURRENT_CONNECTION_INTENT)
 }
 
 internal data class AndroidVpnRevokeDisposition(

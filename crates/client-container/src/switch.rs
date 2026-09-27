@@ -823,6 +823,47 @@ impl SwitchCoordinator {
         Ok(())
     }
 
+    async fn validate_interrupted_update_provenance(
+        &self,
+        journal: &SwitchJournalV1,
+    ) -> Result<(), SwitchError> {
+        let (broker, _) = self.components()?;
+        // Update preparation froze a stop against the original source itself.
+        // Later supersedes replace the active target/fingerprint, but retain
+        // that protected root authority. Public crosslinks alone cannot prove it.
+        let source = journal
+            .source_identity
+            .as_ref()
+            .ok_or(SwitchError::RecoveryRequired)?;
+        let mut original = journal.reconcile_request();
+        original.operation_id = journal.operation_id.clone();
+        original.target_identity = RuntimeTarget::from_identity(source);
+        let fingerprint = digest_json(&original)?;
+        let protected = broker
+            .restore_transition_request(original, &fingerprint)
+            .await?;
+        if protected.request().source_identity.as_ref() != Some(source)
+            || protected.source_device_id()
+                != journal.source_device_id.as_deref().unwrap_or_default()
+            || protected.source_scope_fingerprint() != journal.source_scope_fingerprint
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        // Validate the active successor's exact target, cleanup and operation
+        // before retirement or replay can change any protected/public state.
+        let active = broker
+            .restore_transition_request(journal.reconcile_request(), &journal.request_fingerprint)
+            .await?;
+        if active.request().expected_session_generation
+            != journal
+                .active_session_generation
+                .or(journal.expected_session_generation)
+        {
+            return Err(SwitchError::RecoveryRequired);
+        }
+        Ok(())
+    }
+
     async fn before_tunnel_start_locked(
         &self,
         recovering_installed_update: bool,
@@ -967,12 +1008,31 @@ impl SwitchCoordinator {
                 Some(journal) => journal,
                 None => return Ok(SwitchProgress::Ready),
             };
-            broker
-                .retire_completed_transitions(
-                    &journal.operation_id,
-                    journal.active_reconcile_operation_id.as_deref(),
+            let obsolete_resume = journal.phase == SwitchPhase::AuthResuming
+                && !self.is_verified_manifest_target(&journal.target_identity);
+            // Public recover() reaches this loop without the startup wrapper.
+            // Validate update linkage and protected root/successor provenance
+            // here, before any caller can replay an obsolete installed update.
+            if obsolete_resume
+                && matches!(
+                    crate::update_start_recovery(self)?,
+                    crate::UpdateStartRecovery::Installed { .. }
                 )
-                .await?;
+            {
+                self.validate_interrupted_update_provenance(&journal)
+                    .await?;
+            }
+            // An obsolete resume must prove its exact protected ticket/result
+            // before even maintenance changes auth. Retire on the next pass
+            // after recovery has superseded it to a verified installed target.
+            if !obsolete_resume {
+                broker
+                    .retire_completed_transitions(
+                        &journal.operation_id,
+                        journal.active_reconcile_operation_id.as_deref(),
+                    )
+                    .await?;
+            }
             let snapshot = journal
                 .runtime_snapshot
                 .as_ref()

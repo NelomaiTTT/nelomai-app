@@ -763,7 +763,7 @@ impl AppDiagnostics {
             tunnel_session_id: None,
             sequence: None,
             interval_started_at_unix: None,
-            interval_ended_at_unix: Some(generated_at),
+            interval_ended_at_unix: None,
             tunnel_running: None,
             connection_lease_id: None,
             generated_at_unix: generated_at,
@@ -1552,6 +1552,12 @@ mod tests {
         }
         assert!(candidate.report.helper_log.is_none());
         assert!(candidate.report.network_incidents.is_none());
+        assert!(candidate.report.tunnel_session_id.is_none());
+        assert!(candidate.report.sequence.is_none());
+        assert!(candidate.report.interval_started_at_unix.is_none());
+        assert!(candidate.report.interval_ended_at_unix.is_none());
+        assert!(candidate.report.tunnel_running.is_none());
+        assert!(candidate.report.connection_lease_id.is_none());
     }
 
     #[test]

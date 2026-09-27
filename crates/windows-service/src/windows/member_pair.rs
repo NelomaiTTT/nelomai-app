@@ -785,10 +785,11 @@ pub(crate) struct NativePairFactory<F: SessionFiles> {
 }
 impl<F: SessionFiles> NativePairFactory<F> {
     pub(crate) fn new(files: F, runtime: RuntimeSlot, trusted_engine: &Path) -> io::Result<Self> {
-        if tokio::runtime::Handle::try_current().is_ok()
-            || !trusted_engine.is_absolute()
-            || std::fs::canonicalize(trusted_engine)? != trusted_engine
-        {
+        if tokio::runtime::Handle::try_current().is_ok() || !trusted_engine.is_absolute() {
+            return Err(failed());
+        }
+        let engine = std::fs::canonicalize(trusted_engine)?;
+        if !crate::member_pair::canonical_engine_matches(trusted_engine, &engine) {
             return Err(failed());
         }
         let executor = tokio::runtime::Builder::new_current_thread()
@@ -797,7 +798,7 @@ impl<F: SessionFiles> NativePairFactory<F> {
         Ok(Self {
             files,
             runtime,
-            engine: trusted_engine.into(),
+            engine,
             executor: Rc::new(executor),
         })
     }

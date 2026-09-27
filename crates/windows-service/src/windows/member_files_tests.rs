@@ -57,7 +57,7 @@ fn private_files_never_accept_world_read_or_inherited_acl() {
 }
 
 #[test]
-fn ancestor_policy_preserves_existing_launcher_mutation_fences() {
+fn ancestor_policy_preserves_substitution_and_ownership_fences() {
     let mut ace = Ace {
         kind: 0,
         flags: 0,
@@ -68,7 +68,7 @@ fn ancestor_policy_preserves_existing_launcher_mutation_fences() {
     ace.mask = 2 | 4;
     assert!(ancestor_ace_allowed(&ace)); // sibling creation only
     for mask in [
-        0x40, 0x10, 0x100, 0x10000, 0x40000, 0x80000, 0x40000000, 0x10000000, 0x20000000,
+        0x40, 0x10000, 0x40000, 0x80000, 0x40000000, 0x10000000, 0x20000000,
     ] {
         ace.mask = mask;
         assert!(!ancestor_ace_allowed(&ace));
@@ -86,6 +86,108 @@ fn ancestor_policy_preserves_existing_launcher_mutation_fences() {
     assert!(acl_allowed(&acl, Protection::Ancestor));
     acl.owner = "S-1-5-21-123".into();
     assert!(!acl_allowed(&acl, Protection::Ancestor));
+}
+
+#[test]
+fn programdata_create_child_acl_is_accepted_only_for_ancestors() {
+    let mut acl = private(true);
+    acl.control = 0; // Existing ProgramData need not have a protected DACL.
+    acl.aces.push(Ace {
+        kind: 0,
+        flags: 0,
+        mask: 0x116, // add file/subdirectory, write EA/attributes
+        sid: "S-1-5-32-545".into(),
+    });
+    assert!(acl_allowed(&acl, Protection::Ancestor));
+    assert!(!acl_allowed(&acl, Protection::Directory));
+    assert!(!acl_allowed(&acl, Protection::File));
+    acl.control = PROTECTED;
+    assert!(!acl_allowed(&acl, Protection::Directory));
+    for extra in [0x40, 0x10000, 0x40000, 0x80000, 0x10000000, 0x40000000] {
+        acl.aces.last_mut().unwrap().mask = 0x116 | extra;
+        assert!(!acl_allowed(&acl, Protection::Ancestor), "{extra:x}");
+    }
+}
+
+#[test]
+fn creating_missing_child_requires_parent_without_public_reparse_rights() {
+    let mut acl = private(true);
+    assert!(ancestor_creation_allowed(&acl));
+    acl.aces.push(Ace {
+        kind: 0,
+        flags: 0,
+        mask: 2, // FILE_WRITE_DATA can also set a reparse point on an empty parent.
+        sid: "S-1-5-32-545".into(),
+    });
+    for mask in [2, 0x100, 0x116] {
+        acl.aces.last_mut().unwrap().mask = mask;
+        assert!(!ancestor_creation_allowed(&acl), "{mask:x}");
+    }
+    acl.aces.last_mut().unwrap().flags = 8;
+    assert!(ancestor_creation_allowed(&acl));
+}
+
+#[test]
+fn installed_subtree_opens_below_public_create_acl_but_missing_subtree_needs_repair() {
+    let mut parent = private(true);
+    parent.aces.push(Ace {
+        kind: 0,
+        flags: 0,
+        mask: 0x116,
+        sid: "S-1-5-32-545".into(),
+    });
+    // The installer prepares Tunnel before manager startup. Both Nelomai and
+    // Tunnel already exist; opening them must never invoke the creation gate.
+    for depth in [1, 0] {
+        let (opened, created) = open_directory_or_create_owned(
+            depth,
+            Some(&parent),
+            || Ok(private(true)),
+            || panic!("existing subtree"),
+        )
+        .unwrap();
+        assert!(!created);
+        assert!(acl_allowed(&opened, Protection::Directory));
+        assert!(acl_allowed(&parent, Protection::Ancestor));
+        assert!(open_directory_or_create_owned::<Acl>(
+            depth,
+            Some(&parent),
+            || Err(2),
+            || panic!("unsafe parent must not be mutated"),
+        )
+        .is_err());
+    }
+    // Runtime may recreate a missing leaf when the parent itself is protected.
+    let present = Cell::new(false);
+    let (opened, created) = open_directory_or_create_owned(
+        0,
+        Some(&private(true)),
+        || {
+            if present.get() {
+                Ok(private(true))
+            } else {
+                Err(2)
+            }
+        },
+        || {
+            present.set(true);
+            Ok(true)
+        },
+    )
+    .unwrap();
+    assert!(created);
+    assert!(acl_allowed(&opened, Protection::Directory));
+    // Errors other than missing and ancestors outside our two owned levels
+    // never trigger a speculative directory creation.
+    for (depth, error) in [(0, 5), (0, 3), (2, 2)] {
+        assert!(open_directory_or_create_owned::<Acl>(
+            depth,
+            Some(&private(true)),
+            || Err(error),
+            || panic!("not ours to create"),
+        )
+        .is_err());
+    }
 }
 
 #[test]

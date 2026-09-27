@@ -37,6 +37,9 @@ static ANDROID_BACKGROUND_PROVISION_GATE: tokio::sync::Mutex<()> =
 #[cfg(target_os = "android")]
 static ANDROID_QUICK_RECONCILE_RETRY_AFTER_UNIX: AtomicI64 = AtomicI64::new(0);
 #[cfg(target_os = "android")]
+static ANDROID_FOREGROUND_ENRICHMENT_GATE: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+#[cfg(target_os = "android")]
 static ANDROID_UI_START_STOP_COORDINATOR: AndroidUiStartStopCoordinator =
     AndroidUiStartStopCoordinator::new();
 #[cfg(any(target_os = "android", test))]
@@ -1755,6 +1758,22 @@ impl AppStateResponse {
         }
         self
     }
+
+    #[cfg(any(target_os = "android", test))]
+    fn with_android_owner(
+        self,
+        owner: &tauri_plugin_tunnel_android::ConnectionIntentStatusResponse,
+    ) -> Self {
+        // Core Ready confirms local closure; the ordinary native owner does not
+        // set the redundant-session localStopPendingCleanup field.
+        let cleanup_pending = self.phase == "ready"
+            && (owner.status == "stopping"
+                || matches!(
+                    owner.lease_phase.as_deref(),
+                    Some("cleanup_pending" | "stale_cleanup")
+                ));
+        self.with_local_stop_pending_cleanup(owner.local_stop_pending_cleanup || cleanup_pending)
+    }
 }
 
 fn connection_intent_status_name(
@@ -2093,81 +2112,327 @@ pub async fn app_state(
     diagnostics: State<'_, Arc<AppDiagnostics>>,
     metrics: State<'_, Arc<ConnectionMetricsTracker>>,
 ) -> Result<AppStateResponse, CommandError> {
-    if metrics_view_is_visible(&app) {
-        metrics.mark_observed().await;
-    }
     #[cfg(target_os = "android")]
-    let quick_projection_ticket = ANDROID_UI_START_STOP_COORDINATOR.projection_ticket();
-    let quick_state_change = app
+    {
+        android_app_state(
+            app,
+            application.inner().clone(),
+            diagnostics.inner().clone(),
+            metrics.inner().clone(),
+        )
+        .await
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if metrics_view_is_visible(&app) {
+            metrics.mark_observed().await;
+        }
+        let quick_state_change = app
+            .tunnel_android()
+            .take_quick_state_change()
+            .unwrap_or_default();
+        let quick_state_changed = quick_state_change.changed;
+        let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
+            match application.bootstrap(now_unix()).await {
+                Ok(response) => {
+                    #[cfg(desktop)]
+                    diagnostics.set_automatic_device(&response.device.id);
+                    provision_android_background_resilient(
+                        app.clone(),
+                        application.inner().clone(),
+                        diagnostics.inner().clone(),
+                        response,
+                    )
+                    .await;
+                    if app
+                        .tunnel_android()
+                        .acknowledge_quick_state_change(quick_state_change.revision)
+                        .is_ok()
+                    {
+                        clear_quick_reconcile_retry();
+                    } else {
+                        defer_quick_reconcile(now_unix());
+                    }
+                    application.state().await
+                }
+                Err(_) => {
+                    defer_quick_reconcile(now_unix());
+                    application.reconcile_external_tunnel_state().await
+                }
+            }
+        } else if quick_state_changed {
+            application.reconcile_external_tunnel_state().await
+        } else {
+            application.state().await
+        };
+        let warning = application.split_tunnel_warning().await;
+        let metrics_context = application.connection_metrics_context().await;
+        let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
+        let status_unavailable_fallback = android_status_unavailable_fallback();
+        let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
+            current_connection_projection(&app, status_unavailable_fallback).await;
+        let local_cleanup = application.local_stop_pending_cleanup().await;
+        Ok(AppStateResponse::new(
+            state,
+            warning,
+            current_metrics,
+            intent_status,
+            next_retry_at_unix,
+            reserve_state,
+        )
+        .with_desktop_active_slot(desktop_active_slot)
+        .with_local_stop_pending_cleanup(local_cleanup))
+    }
+}
+
+#[cfg(target_os = "android")]
+async fn android_app_state(
+    app: AppHandle,
+    application: Arc<NativeApplication>,
+    diagnostics: Arc<AppDiagnostics>,
+    metrics: Arc<ConnectionMetricsTracker>,
+) -> Result<AppStateResponse, CommandError> {
+    let observation = application.begin_foreground_observation().await;
+    let ticket = ANDROID_UI_START_STOP_COORDINATOR.projection_ticket();
+    let quick = app
         .tunnel_android()
         .take_quick_state_change()
         .unwrap_or_default();
-    #[cfg(target_os = "android")]
-    let quick_projection_applied = ANDROID_UI_START_STOP_COORDINATOR.observe_projected_snapshot(
-        quick_projection_ticket,
+    let quick_accepted = ANDROID_UI_START_STOP_COORDINATOR.observe_projected_snapshot(
+        ticket,
         &ANDROID_DESIRED_ACTIVE_PROJECTION,
-        quick_state_change.changed,
-        quick_state_change.desired_active,
+        quick.changed,
+        quick.desired_active,
     );
-    #[cfg(not(target_os = "android"))]
-    let quick_projection_applied = true;
-    let quick_state_changed = quick_state_change.changed && quick_projection_applied;
-    let state = if quick_state_changed && quick_reconcile_is_due(now_unix()) {
-        match application.bootstrap(now_unix()).await {
-            Ok(response) => {
-                #[cfg(desktop)]
-                diagnostics.set_automatic_device(&response.device.id);
-                provision_android_background_resilient(
-                    app.clone(),
-                    application.inner().clone(),
-                    diagnostics.inner().clone(),
-                    response,
+    let owner = app.tunnel_android().connection_intent_status().ok();
+    let (accepted, fallback) = ANDROID_UI_START_STOP_COORDINATOR.finalize_projected_status(
+        ticket,
+        &ANDROID_DESIRED_ACTIVE_PROJECTION,
+        owner.as_ref().map(|status| status.desired_active),
+    );
+    let owner = owner.filter(|_| accepted);
+    let enrichment_fence = owner.as_ref().map(|owner| AndroidEnrichmentFence {
+        projection: AndroidProjectionTicket(ticket.projection_epoch),
+        quick_revision: quick.revision,
+        generation: owner.generation,
+        desired_active: owner.desired_active,
+    });
+    let enrichment_app = app.clone();
+    let enrichment_application = application.clone();
+    android_foreground_snapshot(
+        async {
+            let state = application
+                .foreground_state_guarded(
+                    observation,
+                    owner
+                        .as_ref()
+                        .map(|owner| nelomai_client_core::NativeConnectionIntent {
+                            generation: owner.generation,
+                            desired_active: owner.desired_active,
+                        }),
+                    || ANDROID_UI_START_STOP_COORDINATOR.projection_observation_is_current(ticket),
                 )
                 .await;
-                if app
+            let warning = application.split_tunnel_warning().await;
+            metrics.mark_observed().await;
+            let context = application.connection_metrics_context().await;
+            // This reads the cached metrics only; it does not probe the network.
+            let current_metrics = current_connection_metrics(&metrics, context.as_ref()).await;
+            if !ANDROID_UI_START_STOP_COORDINATOR.projection_observation_is_current(ticket) {
+                return Err(CommandError::new(
+                    "connection_intent_cancelled",
+                    "Состояние подключения изменилось",
+                ));
+            }
+            let (intent, retry, reserve) = project_android_connection_intent_status(
+                owner.as_ref().map(|owner| {
+                    (
+                        owner.status.as_str(),
+                        owner.next_retry_at_unix,
+                        owner.reserve_state.clone(),
+                    )
+                }),
+                fallback,
+            );
+            let response =
+                AppStateResponse::new(state, warning, current_metrics, intent, retry, reserve);
+            Ok(match owner.as_ref() {
+                Some(owner) => response.with_android_owner(owner),
+                None => response,
+            })
+        },
+        async move {
+            // Keep the existing quick-action enrichment/acknowledgement semantics,
+            // but allow only one bounded worker and never await it in state polling.
+            if !quick.changed
+                || !quick_accepted
+                || !quick_reconcile_is_due(now_unix())
+                || !ANDROID_UI_START_STOP_COORDINATOR
+                    .projection_is_current(AndroidProjectionTicket(ticket.projection_epoch))
+            {
+                return;
+            }
+            let Some(fence) = enrichment_fence else {
+                return;
+            };
+            defer_quick_reconcile(now_unix());
+            let current = || {
+                let quick = enrichment_app
                     .tunnel_android()
-                    .acknowledge_quick_state_change(quick_state_change.revision)
-                    .is_ok()
-                {
-                    clear_quick_reconcile_retry();
-                } else {
-                    defer_quick_reconcile(now_unix());
-                }
-                application.state().await
+                    .take_quick_state_change()
+                    .ok();
+                let owner = enrichment_app
+                    .tunnel_android()
+                    .connection_intent_status()
+                    .ok();
+                fence.is_current(
+                    &ANDROID_UI_START_STOP_COORDINATOR,
+                    quick.as_ref(),
+                    owner.as_ref(),
+                )
+            };
+            let provision_app = &enrichment_app;
+            let provision_application = &enrichment_application;
+            let result = enrich_android_foreground_if_current(
+                current,
+                async {
+                    enrichment_application
+                        .bootstrap(now_unix())
+                        .await
+                        .map_err(CommandError::from)
+                },
+                |response| async move {
+                    let _guard = ANDROID_BACKGROUND_PROVISION_GATE.lock().await;
+                    if !current() {
+                        return Ok(());
+                    }
+                    // The authenticated owner uses its existing bounded, durable IPC
+                    // transaction. Do not cancel it with an extra provisioning timer
+                    // or spawn retries carrying an obsolete bootstrap/epoch.
+                    provision_app
+                        .state::<Arc<nelomai_client_container::ipc::PrivateRuntimeAuthClient>>()
+                        .background(nelomai_client_container::ipc::BackgroundAction::Provision)
+                        .await
+                        .map_err(|error| {
+                            CommandError::new(
+                                private_error_code(error),
+                                "Не удалось подготовить фоновое подключение",
+                            )
+                        })?;
+                    prepare_android_quick_plan_guarded(
+                        provision_app,
+                        provision_application,
+                        &response,
+                        current,
+                    )
+                    .await
+                },
+                || {
+                    enrichment_app
+                        .tunnel_android()
+                        .acknowledge_quick_state_change(quick.revision)
+                        .map_err(|_| {
+                            CommandError::new(
+                                "quick_state_persist_failed",
+                                "Не удалось подтвердить состояние подключения",
+                            )
+                        })
+                },
+            )
+            .await;
+            match result {
+                Ok(true) => clear_quick_reconcile_retry(),
+                Ok(false) => {}
+                Err(error) => diagnostics.record_named(
+                    "background.provision_failed",
+                    None,
+                    None,
+                    Some(error.code()),
+                ),
             }
-            Err(_) => {
-                defer_quick_reconcile(now_unix());
-                application.reconcile_external_tunnel_state().await
-            }
-        }
-    } else if quick_state_changed {
-        application.reconcile_external_tunnel_state().await
-    } else {
-        application.state().await
-    };
-    let warning = application.split_tunnel_warning().await;
-    let metrics_context = application.connection_metrics_context().await;
-    let current_metrics = current_connection_metrics(&metrics, metrics_context.as_ref()).await;
-    let status_unavailable_fallback = android_status_unavailable_fallback();
-    let (intent_status, next_retry_at_unix, reserve_state, desktop_active_slot) =
-        current_connection_projection(&app, status_unavailable_fallback).await;
-    #[cfg(not(target_os = "android"))]
-    let local_cleanup = application.local_stop_pending_cleanup().await;
-    #[cfg(target_os = "android")]
-    let local_cleanup = app
-        .tunnel_android()
-        .connection_intent_status()
-        .is_ok_and(|status| status.local_stop_pending_cleanup);
-    Ok(AppStateResponse::new(
-        state,
-        warning,
-        current_metrics,
-        intent_status,
-        next_retry_at_unix,
-        reserve_state,
+        },
+        ANDROID_FOREGROUND_ENRICHMENT_GATE.clone(),
     )
-    .with_desktop_active_slot(desktop_active_slot)
-    .with_local_stop_pending_cleanup(local_cleanup))
+    .await
+}
+
+#[cfg(any(target_os = "android", test))]
+struct AndroidEnrichmentFence {
+    projection: AndroidProjectionTicket,
+    quick_revision: u64,
+    generation: u64,
+    desired_active: bool,
+}
+
+#[cfg(any(target_os = "android", test))]
+impl AndroidEnrichmentFence {
+    fn is_current(
+        &self,
+        coordinator: &AndroidUiStartStopCoordinator,
+        quick: Option<&tauri_plugin_tunnel_android::QuickStateChangeResponse>,
+        owner: Option<&tauri_plugin_tunnel_android::ConnectionIntentStatusResponse>,
+    ) -> bool {
+        coordinator.projection_is_current(self.projection)
+            && quick.is_some_and(|quick| quick.revision == self.quick_revision)
+            && owner.is_some_and(|owner| {
+                owner.generation == self.generation && owner.desired_active == self.desired_active
+            })
+    }
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn android_foreground_snapshot<L, E>(
+    local: L,
+    enrichment: E,
+    gate: Arc<tokio::sync::Mutex<()>>,
+) -> L::Output
+where
+    L: std::future::Future,
+    E: std::future::Future<Output = ()> + Send + 'static,
+{
+    let snapshot = local.await;
+    if let Ok(guard) = gate.try_lock_owned() {
+        tauri::async_runtime::spawn(async move {
+            let _guard = guard;
+            enrichment.await;
+        });
+    }
+    snapshot
+}
+
+#[cfg(any(target_os = "android", test))]
+async fn enrich_android_foreground_if_current<T, B, P, PF, A>(
+    current: impl Fn() -> bool,
+    bootstrap: B,
+    provision: P,
+    acknowledge: A,
+) -> Result<bool, CommandError>
+where
+    B: std::future::Future<Output = Result<T, CommandError>>,
+    P: FnOnce(T) -> PF,
+    PF: std::future::Future<Output = Result<(), CommandError>>,
+    A: FnOnce() -> Result<(), CommandError>,
+{
+    if !current() {
+        return Ok(false);
+    }
+    let response = tokio::time::timeout(STARTUP_BOOTSTRAP_TIMEOUT, bootstrap)
+        .await
+        .map_err(|_| {
+            CommandError::new(
+                "temporarily_unavailable",
+                "Не удалось обновить состояние подключения",
+            )
+        })??;
+    if !current() {
+        return Ok(false);
+    }
+    provision(response).await?;
+    if !current() {
+        return Ok(false);
+    }
+    acknowledge()?;
+    Ok(true)
 }
 
 #[cfg(target_os = "android")]
@@ -2729,6 +2994,19 @@ async fn prepare_android_quick_plan(
     application: &NativeApplication,
     bootstrap: &Bootstrap,
 ) -> Result<(), CommandError> {
+    prepare_android_quick_plan_guarded(app, application, bootstrap, || true).await
+}
+
+#[cfg(target_os = "android")]
+async fn prepare_android_quick_plan_guarded(
+    app: &AppHandle,
+    application: &NativeApplication,
+    bootstrap: &Bootstrap,
+    current: impl Fn() -> bool,
+) -> Result<(), CommandError> {
+    if !current() {
+        return Ok(());
+    }
     if bootstrap.access.can_connect && !bootstrap.update.required {
         if let Some(binding) = &bootstrap.binding {
             let preferences = app.state::<Arc<AppPreferenceStore>>().get();
@@ -2740,6 +3018,9 @@ async fn prepare_android_quick_plan(
                 )
                 .await
                 .map_err(CommandError::from)?;
+            if !current() {
+                return Ok(());
+            }
             app.tunnel_android()
                 .prepare_quick_plan(quick_plan_preparation(
                     bootstrap,
@@ -4713,6 +4994,288 @@ mod tests {
                 ));
                 assert!(response.metrics.is_none());
             }
+        }
+    }
+
+    #[test]
+    fn android_foreground_stopped_keeps_start_barrier_until_native_cleanup_finishes() {
+        for lease_phase in ["cleanup_pending", "stale_cleanup"] {
+            let owner = tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                generation: 3,
+                desired_active: false,
+                status: "stopping".into(),
+                lease_phase: Some(lease_phase.into()),
+                ..Default::default()
+            };
+            let response = AppStateResponse::new(
+                CoreState {
+                    phase: Phase::Ready,
+                    connection: None,
+                },
+                None,
+                None,
+                nelomai_client_core::ConnectionIntentStatus::None,
+                None,
+                None,
+            )
+            .with_android_owner(&owner);
+            assert!(response.local_stop_pending_cleanup, "{lease_phase}");
+        }
+        let stopped = tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+            generation: 3,
+            desired_active: false,
+            status: "none".into(),
+            ..Default::default()
+        };
+        let response = AppStateResponse::new(
+            CoreState {
+                phase: Phase::Ready,
+                connection: None,
+            },
+            None,
+            None,
+            nelomai_client_core::ConnectionIntentStatus::None,
+            None,
+            None,
+        )
+        .with_android_owner(&stopped);
+        assert!(!response.local_stop_pending_cleanup);
+    }
+
+    #[tokio::test]
+    async fn android_foreground_returns_local_state_while_network_enrichment_is_stalled() {
+        let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            android_foreground_snapshot(
+                async {
+                    CoreState {
+                        phase: Phase::Connected,
+                        connection: None,
+                    }
+                },
+                async {
+                    let _ = waiting.await;
+                },
+                Arc::new(tokio::sync::Mutex::new(())),
+            ),
+        )
+        .await
+        .expect("state polling must not await the panel");
+        assert_eq!(result.phase, Phase::Connected);
+        let _ = release.send(());
+    }
+
+    #[tokio::test]
+    async fn android_foreground_enrichment_is_single_flight_and_releases_its_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+        let (entered, entering) = tokio::sync::oneshot::channel::<()>();
+        let first_calls = calls.clone();
+        android_foreground_snapshot(
+            async { 1 },
+            async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                let _ = waiting.await;
+            },
+            gate.clone(),
+        )
+        .await;
+        entering.await.unwrap();
+        let duplicate_calls = calls.clone();
+        assert_eq!(
+            android_foreground_snapshot(
+                async { 2 },
+                async move {
+                    duplicate_calls.fetch_add(1, Ordering::SeqCst);
+                },
+                gate.clone()
+            )
+            .await,
+            2
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), gate.lock())
+                .await
+                .unwrap(),
+        );
+        let next_calls = calls.clone();
+        android_foreground_snapshot(
+            async { 3 },
+            async move {
+                next_calls.fetch_add(1, Ordering::SeqCst);
+            },
+            gate.clone(),
+        )
+        .await;
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), gate.lock())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn android_foreground_old_enrichment_cannot_provision_or_ack_after_start_or_stop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for stopping in [false, true] {
+            let coordinator = Arc::new(AndroidUiStartStopCoordinator::new());
+            let epoch = coordinator.projection_ticket().projection_epoch;
+            let provisions = Arc::new(AtomicUsize::new(0));
+            let acknowledgements = Arc::new(AtomicUsize::new(0));
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let (entered, entering) = tokio::sync::oneshot::channel::<()>();
+            let work = {
+                let coordinator = coordinator.clone();
+                let provisions = provisions.clone();
+                let acknowledgements = acknowledgements.clone();
+                tokio::spawn(async move {
+                    enrich_android_foreground_if_current(
+                        || coordinator.projection_is_current(AndroidProjectionTicket(epoch)),
+                        async {
+                            entered.send(()).unwrap();
+                            waiting.await.unwrap();
+                            Ok(())
+                        },
+                        |_| async {
+                            provisions.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                        || {
+                            acknowledgements.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+                })
+            };
+            entering.await.unwrap();
+            if stopping {
+                coordinator.begin_projected_stop();
+            } else {
+                assert!(coordinator
+                    .begin_projected_start(
+                        coordinator.start_ticket(),
+                        &AndroidDesiredActiveProjection::new()
+                    )
+                    .is_ok());
+            }
+            release.send(()).unwrap();
+            assert!(matches!(work.await.unwrap(), Ok(false)));
+            assert_eq!(provisions.load(Ordering::SeqCst), 0);
+            assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn android_foreground_enrichment_fences_native_changes_but_not_normal_polling() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        };
+        for change in [
+            "generation",
+            "desire",
+            "revision",
+            "unavailable",
+            "poll_only",
+        ] {
+            let coordinator = Arc::new(AndroidUiStartStopCoordinator::new());
+            let fence = AndroidEnrichmentFence {
+                projection: AndroidProjectionTicket(
+                    coordinator.projection_ticket().projection_epoch,
+                ),
+                quick_revision: 10,
+                generation: 7,
+                desired_active: true,
+            };
+            let native = Arc::new(Mutex::new((
+                tauri_plugin_tunnel_android::QuickStateChangeResponse {
+                    changed: true,
+                    revision: 10,
+                    desired_active: Some(true),
+                },
+                Some(
+                    tauri_plugin_tunnel_android::ConnectionIntentStatusResponse {
+                        generation: 7,
+                        desired_active: true,
+                        status: "none".into(),
+                        ..Default::default()
+                    },
+                ),
+            )));
+            let provisions = Arc::new(AtomicUsize::new(0));
+            let acknowledgements = Arc::new(AtomicUsize::new(0));
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let (entered, entering) = tokio::sync::oneshot::channel::<()>();
+            let work = {
+                let coordinator = coordinator.clone();
+                let native = native.clone();
+                let provisions = provisions.clone();
+                let acknowledgements = acknowledgements.clone();
+                tokio::spawn(async move {
+                    enrich_android_foreground_if_current(
+                        || {
+                            let snapshot = native.lock().unwrap();
+                            fence.is_current(&coordinator, Some(&snapshot.0), snapshot.1.as_ref())
+                        },
+                        async {
+                            entered.send(()).unwrap();
+                            waiting.await.unwrap();
+                            Ok(())
+                        },
+                        |_| async {
+                            provisions.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                        || {
+                            acknowledgements.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+                })
+            };
+            entering.await.unwrap();
+            {
+                let mut snapshot = native.lock().unwrap();
+                match change {
+                    "generation" => snapshot.1.as_mut().unwrap().generation += 1,
+                    "desire" => snapshot.1.as_mut().unwrap().desired_active = false,
+                    "revision" => snapshot.0.revision += 1,
+                    "unavailable" => snapshot.1 = None,
+                    _ => {}
+                }
+            }
+            // Ordinary foreground polls advance observation sequence, never the
+            // owner fence. They must not starve a slow, valid bootstrap.
+            coordinator.finalize_projected_status(
+                coordinator.projection_ticket(),
+                &AndroidDesiredActiveProjection::new(),
+                Some(true),
+            );
+            release.send(()).unwrap();
+            let expected = change == "poll_only";
+            assert!(
+                matches!(work.await.unwrap(), Ok(applied) if applied == expected),
+                "{change}"
+            );
+            assert_eq!(
+                provisions.load(Ordering::SeqCst),
+                usize::from(expected),
+                "{change}"
+            );
+            assert_eq!(
+                acknowledgements.load(Ordering::SeqCst),
+                usize::from(expected),
+                "{change}"
+            );
         }
     }
 

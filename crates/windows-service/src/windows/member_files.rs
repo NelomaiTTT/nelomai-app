@@ -107,14 +107,18 @@ fn privileged(sid: &str) -> bool {
     matches!(sid, SYSTEM | ADMINISTRATORS | TRUSTED_INSTALLER)
 }
 
-// Tiny copy of client-container/desktop/windows_policy::ace_allowed, ancestor
-// branch only. Private payloads below intentionally do NOT permit public reads.
+// Existing ancestors may grant create-child, write-EA and write-attributes
+// (ProgramData's Users 0x116). They cannot grant deletion/replacement or ACL/
+// owner changes. ready() pins the complete non-reparse chain without delete
+// sharing before private IO; every ancestor then retains an undeletable child
+// and cannot become an empty directory junction. Missing children require the
+// stricter creation gate below. Owned directories/files remain SYSTEM/Admin only.
 fn ancestor_ace_allowed(ace: &Ace) -> bool {
     matches!(ace.kind, 0 | 1)
         && (ace.flags & 8 != 0
             || ace.kind == 1
             || privileged(&ace.sid)
-            || ace.mask & 0xf00d_0150 == 0)
+            || ace.mask & 0xf00d_0040 == 0)
 }
 fn acl_allowed(acl: &Acl, protection: Protection) -> bool {
     if protection == Protection::Ancestor {
@@ -140,6 +144,37 @@ fn acl_allowed(acl: &Acl, protection: Protection) -> bool {
                 .count()
                 == 1
         })
+}
+fn ancestor_creation_allowed(acl: &Acl) -> bool {
+    acl_allowed(acl, Protection::Ancestor)
+        && acl.aces.iter().all(|ace| {
+            ace.flags & 8 != 0 || ace.kind == 1 || privileged(&ace.sid) || ace.mask & 0x102 == 0
+        })
+}
+
+// install::install creates Tunnel and applies its protected SYSTEM/Admin DACL
+// before starting the manager. Runtime opens that existing subtree even when
+// ProgramData/Nelomai grant Users 0x116. A missing child of an exposed parent
+// needs installer repair; runtime must not race a reparse conversion on an
+// empty parent. Keep this decision shared with portable tests of the IO boundary.
+fn open_directory_or_create_owned<T>(
+    depth: usize,
+    parent: Option<&Acl>,
+    mut open: impl FnMut() -> std::result::Result<T, u32>,
+    create: impl FnOnce() -> Result<bool>,
+) -> Result<(T, bool)> {
+    match open() {
+        Ok(file) => Ok((file, false)),
+        Err(2) if depth <= 1 => {
+            // ERROR_FILE_NOT_FOUND
+            if !parent.is_some_and(ancestor_creation_allowed) {
+                return Err(OwnerError::Conflict);
+            }
+            let created = create()?;
+            Ok((open().map_err(|_| OwnerError::Native)?, created))
+        }
+        Err(_) => Err(OwnerError::Native),
+    }
 }
 fn local_drive_path(text: &str) -> bool {
     if text.encode_utf16().count() > 32760 {
@@ -635,24 +670,25 @@ mod native {
                 for directory in &directories {
                     directory.verify()?;
                 }
-                let mut created = false;
-                let file = match open_directory(path) {
-                    Ok(file) => file,
-                    Err(ERROR_FILE_NOT_FOUND) if depth <= 1 => {
+                let (file, created) = open_directory_or_create_owned(
+                    depth,
+                    directories.last().map(|parent| &parent.acl),
+                    || open_directory(path),
+                    || {
                         let path_wide = wide(path)?;
                         if unsafe { CreateDirectoryW(path_wide.as_ptr(), &security.attributes()) }
                             == 0
                         {
-                            if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
-                                return Err(OwnerError::Native);
+                            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                                Ok(false)
+                            } else {
+                                Err(OwnerError::Native)
                             }
                         } else {
-                            created = true;
+                            Ok(true)
                         }
-                        open_directory(path).map_err(|_| OwnerError::Native)?
-                    }
-                    Err(_) => return Err(OwnerError::Native),
-                };
+                    },
+                )?;
                 let protection = if depth == 0 || created {
                     Protection::Directory
                 } else {

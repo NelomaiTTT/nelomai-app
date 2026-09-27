@@ -442,6 +442,13 @@ while True:
         open(root+'/persisted-tunnel','w').write('needs recovery')
         time.sleep(60)
     if value.get('dispatcher_control')=='ready':
+        if os.path.exists(root+'/fail-ready'):
+            mode=open(root+'/fail-ready').read()
+            if mode=='eof': os._exit(1)
+            data={'negative':b'{"engine_ready":false}',
+                  'missing':b'{}', 'malformed':b'not json'}[mode]
+            sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
+            continue
         reply={'engine_ready':True}
         if SUPPORTS_IDLE: reply['supports_idle_tick']=True
     elif value.get('dispatcher_control')=='tick':
@@ -835,6 +842,75 @@ fn dispatcher_death_terminates_hung_owned_tree_and_recovers_persisted_state() {
         );
         assert!(!target.path().join("persisted-tunnel").exists());
         assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_ready_never_reports_running_and_preserves_marker_until_acknowledged_cleanup() {
+    for mode in ["negative", "missing", "malformed", "eof"] {
+        let (source, key) = process_fixture();
+        let target = tempfile::tempdir().unwrap();
+        let installation = Installation::for_owner(
+            target.path(),
+            key.verifying_key().to_bytes(),
+            "macos",
+            "aarch64",
+            current_owner(),
+        );
+        installation
+            .install(
+                source.path(),
+                &std::env::current_exe().unwrap(),
+                "501",
+                &RealInstallIo,
+            )
+            .unwrap();
+        let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
+        let identity = dispatcher.layout.identity.clone();
+        let mut primitive = |_, _: &Path| Err(io::Error::other("no SCM"));
+        let start = || DispatcherRequest::Start {
+            contract_version: 1,
+            identity: identity.clone(),
+        };
+        let cleanup = || DispatcherRequest::Cleanup {
+            contract_version: 1,
+            identity: identity.clone(),
+        };
+        fs::write(target.path().join("fail-ready"), mode).unwrap();
+        fs::write(target.path().join("persisted-tunnel"), "needs recovery").unwrap();
+        assert!(!dispatcher.handle(start(), &mut primitive).ok, "{mode}");
+        let status = dispatcher.handle(
+            DispatcherRequest::Status {
+                contract_version: 1,
+            },
+            &mut primitive,
+        );
+        assert!(
+            !status.running,
+            "failed READY must not report running: {mode}"
+        );
+        assert!(!dispatcher.supports_idle_tick());
+        assert!(!dispatcher.handle(start(), &mut primitive).ok);
+        assert!(dispatcher
+            .relay(
+                &encode_frame(&json!({"command":"primitive"})).unwrap(),
+                &mut primitive
+            )
+            .is_err());
+        let marker = target.path().join(ACTIVE_ENGINE_NAME);
+        let marker_bytes = fs::read(&marker).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<EngineIdentity>(&marker_bytes).unwrap(),
+            identity
+        );
+        assert!(!dispatcher.handle(cleanup(), &mut primitive).ok);
+        assert_eq!(fs::read(&marker).unwrap(), marker_bytes);
+        assert!(target.path().join("persisted-tunnel").exists());
+        fs::remove_file(target.path().join("fail-ready")).unwrap();
+        assert!(dispatcher.handle(cleanup(), &mut primitive).ok, "{mode}");
+        assert!(!marker.exists());
+        assert!(!target.path().join("persisted-tunnel").exists());
     }
 }
 

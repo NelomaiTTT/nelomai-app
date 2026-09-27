@@ -391,10 +391,25 @@ fn validate_switch_link(
             | SwitchPhase::AuthResuming
             | SwitchPhase::Complete
     );
+    // A replacement may omit the target of an earlier interrupted install.
+    // Keep that exact resume replayable: recovery validates the original stop
+    // and active request against protected broker provenance, then the exact
+    // resume ticket/result. It supersedes to the installed manifest target
+    // before admission. This authorizes neither a fresh transition nor an
+    // installer stop proof.
+    let interrupted_installed_target = coordinator.installed_container_version()
+        != journal.source_container
+        && matches!(
+            journal.phase,
+            UpdateJournalPhase::LocalStopped | UpdateJournalPhase::InstallerOpened
+        )
+        && switch.phase() == SwitchPhase::AuthResuming
+        && switch.target_identity().container_version == journal.target_container;
     if switch.operation_id() != journal.operation_id
         || switch.source_identity() != Some(&journal.source_runtime)
         || (switch.target_identity() != &source_target
-            && !coordinator.is_verified_manifest_target(switch.target_identity()))
+            && !coordinator.is_verified_manifest_target(switch.target_identity())
+            && !interrupted_installed_target)
         || switch
             .supersede_target()
             .is_some_and(|target| !coordinator.is_verified_manifest_target(target))

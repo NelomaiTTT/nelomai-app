@@ -810,6 +810,23 @@ where
         self.core.state().await
     }
 
+    pub async fn begin_foreground_observation(&self) -> nelomai_client_core::ForegroundObservation {
+        self.core.begin_foreground_observation().await
+    }
+
+    pub async fn foreground_state_guarded(
+        &self,
+        observation: nelomai_client_core::ForegroundObservation,
+        intent: Option<nelomai_client_core::NativeConnectionIntent>,
+        allowed: impl Fn() -> bool,
+    ) -> CoreState {
+        // Do not acquire lifecycle_gate: bootstrap/restoration may be waiting
+        // on the panel while the foreground needs the native owner's state.
+        self.core
+            .foreground_state_guarded(observation, intent, allowed)
+            .await
+    }
+
     pub async fn refresh_update_state(&self) -> Result<UpdateState, ApplicationError> {
         let access_token = self.access_token().await?;
         match self.api.bootstrap(&access_token).await {
@@ -1457,5 +1474,100 @@ mod tests {
         assert!(shutdown_requires_core_stop(Phase::Ready, true));
         assert!(shutdown_requires_core_stop(Phase::ServerUnavailable, true));
         assert!(!shutdown_requires_core_stop(Phase::Ready, false));
+    }
+
+    #[tokio::test]
+    async fn foreground_wrapper_does_not_wait_for_bootstrap_lifecycle_gate() {
+        use super::*;
+        use nelomai_client_api::RuntimeAuthState;
+        use nelomai_client_storage::{RuntimePaths, RuntimeStateV1, StorageError};
+        use nelomai_client_tunnel::{TunnelError, TunnelStartRequest, TunnelStatus};
+        use nelomai_contracts::RuntimeSlot;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RuntimeStore(RuntimePaths);
+        impl RuntimeStateStore for RuntimeStore {
+            fn paths(&self) -> &RuntimePaths {
+                &self.0
+            }
+            fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError> {
+                Ok(Some(RuntimeStateV1::empty(&self.0, false)))
+            }
+            fn save(&self, _: &RuntimeStateV1) -> Result<(), StorageError> {
+                panic!("foreground reads cannot write runtime state")
+            }
+        }
+        struct ActiveAuth;
+        #[async_trait]
+        impl RuntimeAuthProvider for ActiveAuth {
+            async fn state(&self) -> Result<RuntimeAuthState, CoreError> {
+                Ok(RuntimeAuthState::Active)
+            }
+            async fn access(
+                &self,
+                _: Option<&AccessSnapshot>,
+            ) -> Result<AccessSnapshot, CoreError> {
+                panic!("foreground reads cannot refresh auth or obtain network access")
+            }
+            async fn login(&self, _: RuntimeLogin) -> Result<AccessSnapshot, CoreError> {
+                panic!("no login")
+            }
+            async fn logout(&self) -> Result<(), CoreError> {
+                panic!("no logout")
+            }
+        }
+        struct NativeTunnel(AtomicBool);
+        #[async_trait]
+        impl TunnelController for NativeTunnel {
+            async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+                panic!("no start")
+            }
+            async fn stop(&self) -> Result<(), TunnelError> {
+                self.0.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+                Ok(if self.0.load(Ordering::SeqCst) {
+                    TunnelStatus::Running
+                } else {
+                    TunnelStatus::Stopped
+                })
+            }
+        }
+        let tunnel = Arc::new(NativeTunnel(AtomicBool::new(false)));
+        let local = CoreLocalStop::new(tunnel.clone());
+        local.stop_local_for_transition().await.unwrap();
+        let application = ClientApplication::new(
+            Arc::new(ClientApi::new("http://127.0.0.1:9").unwrap()),
+            Arc::new(RuntimeStore(
+                RuntimePaths::new(
+                    "/synthetic-no-filesystem-access",
+                    RuntimeSlot::Stable,
+                    "0.2.16",
+                )
+                .unwrap(),
+            )),
+            Arc::new(ActiveAuth),
+            local,
+            Arc::new(nelomai_client_core::NoopLogger),
+        );
+        let _stalled_bootstrap = application.lifecycle_gate.lock().await;
+        tunnel.0.store(true, Ordering::SeqCst);
+        let observation = application.begin_foreground_observation().await;
+        let state = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            application.foreground_state_guarded(
+                observation,
+                Some(nelomai_client_core::NativeConnectionIntent {
+                    generation: 1,
+                    desired_active: true,
+                }),
+                || true,
+            ),
+        )
+        .await
+        .expect("foreground must bypass stalled bootstrap");
+        assert_eq!(state.phase, Phase::Connected);
+        assert!(state.connection.is_none());
     }
 }

@@ -2,6 +2,30 @@ use super::*;
 use nelomai_contracts::RuntimeSlot;
 use std::{cell::RefCell, rc::Rc};
 
+#[test]
+fn verified_dos_engine_accepts_only_its_canonical_prefix_variant() {
+    use std::path::Path;
+    let dos = Path::new(r"C:\Program Files\Nelomai\engine.exe");
+    let canonical = Path::new(r"\\?\C:\Program Files\Nelomai\engine.exe");
+    assert!(canonical_engine_matches(dos, canonical));
+    assert!(canonical_engine_matches(canonical, canonical));
+    for other in [
+        r"C:\Program Files\Other\engine.exe",
+        r"D:\Program Files\Nelomai\engine.exe",
+        r"C:\Program Files\Nelomai\..\Nelomai\engine.exe",
+        r"C:\PROGRA~1\Nelomai\engine.exe",
+        r"C:\Program Files\Nelomai\engine.exe:stream",
+        r"C:Program Files\Nelomai\engine.exe",
+        r"\\server\share\engine.exe",
+        r"\\.\C:\Program Files\Nelomai\engine.exe",
+    ] {
+        assert!(
+            !canonical_engine_matches(Path::new(other), canonical),
+            "{other}"
+        );
+    }
+}
+
 fn scope() -> SessionScope {
     SessionScope {
         runtime: RuntimeSlot::Stable,

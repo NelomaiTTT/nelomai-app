@@ -144,7 +144,7 @@
   let startupPending = $state(false);
   let refreshPending = $state(false);
   const startupRetry = new StartupRetry();
-  let runtimeStateBusy = false;
+  let runtimeStateBusy = $state(false);
   let splitTunnelState = $state<SplitTunnelState | null>(null);
   let splitTunnelApplications = $state<InstalledApplication[]>([]);
   let splitTunnelOpen = $state(false);
@@ -498,8 +498,11 @@
     runtimeStateBusy = true;
     try {
       const previous = phase;
+      const observedBootstrap = bootstrap;
+      const actionEpoch = connectionActionState.epoch;
       const current = await nativeClient.state().catch(() => null);
-      if (!current) return;
+      if (!current || busy || bootstrap !== observedBootstrap ||
+        !isCurrentConnectionAction(connectionActionState, actionEpoch)) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       runtimeWarning = current.warning;
       connectionMetrics = current.metrics;
@@ -527,6 +530,7 @@
       }
       if (
         (previous === "connected" || previous === "connecting") &&
+        current.warning === "tunnel_runtime_stopped" &&
         current.connectionIntentStatus === "none" &&
         current.phase !== "connected" &&
         current.phase !== "connecting" &&
@@ -713,7 +717,7 @@
     }
     const stopping =
       forceStop || connectionAction === "stop" || connectionActionState.startBusy;
-    if (!canBeginConnectionAction(connectionActionState, busy, stopping)) return;
+    if (!canBeginConnectionAction(connectionActionState, busy, stopping, runtimeStateBusy)) return;
     const startDeviceId = bootstrap?.device.id;
     const startPlatform = bootstrap?.device.platform;
     if (!stopping && !startDeviceId) return;
@@ -771,6 +775,7 @@
       }
       view = "connection";
       const current = await nativeClient.state();
+      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
       localStopPendingCleanup = current.localStopPendingCleanup === true;
       phase = current.phase;
       runtimeWarning = current.warning;
@@ -790,6 +795,7 @@
         );
       }
       const current = await nativeClient.state().catch(() => null);
+      if (!isCurrentConnectionAction(connectionActionState, action.token)) return;
       localStopPendingCleanup = current?.localStopPendingCleanup === true;
       phase = current?.phase ?? (stopping ? "stopping" : "error");
       connection = current?.connection ?? connection;
@@ -1546,6 +1552,7 @@
               connectionActionState,
               busy,
               connectionAction === "stop" || connectionActionState.startBusy,
+              runtimeStateBusy,
             ) ||
               (connectionAction === "start" &&
                 (!splitTunnelLoaded || splitTunnelBlocksStart)) ||
@@ -1554,6 +1561,7 @@
             <span>
               {localStopPendingCleanup ? "Выключен" : connectionAction === "stop"
                 ? "Стоп"
+                : runtimeStateBusy ? "Проверяем состояние"
                 : connectionAction === "retry"
                   ? "Повторить"
                   : "Старт"}

@@ -29,6 +29,14 @@ fn manifest(
     runtime: &str,
     stable: bool,
 ) -> nelomai_contracts::VerifiedContainerManifest {
+    manifest_with_stable(container, runtime, stable.then_some("0.2.15"))
+}
+
+fn manifest_with_stable(
+    container: &str,
+    runtime: &str,
+    stable: Option<&str>,
+) -> nelomai_contracts::VerifiedContainerManifest {
     let artifact = |slot, version: &str| RuntimeSlotManifestV1 {
         slot,
         manifest: RuntimeArtifactManifestV1 {
@@ -47,8 +55,8 @@ fn manifest(
         },
     };
     let mut slots = vec![artifact(RuntimeSlot::Latest, runtime)];
-    if stable {
-        slots.push(artifact(RuntimeSlot::Stable, "0.2.15"));
+    if let Some(version) = stable {
+        slots.push(artifact(RuntimeSlot::Stable, version));
     }
     let unsigned = ContainerManifestV1 {
         format_version: 1,
@@ -56,8 +64,8 @@ fn manifest(
         release_set_id: format!("runtime-{container}"),
         minimum_runtime_contract: 1,
         maximum_runtime_contract: 1,
-        stable_release_set_sha256: stable.then(|| "b".repeat(64)),
-        stable_platform_manifest_sha256: stable.then(|| "c".repeat(64)),
+        stable_release_set_sha256: stable.map(|_| "b".repeat(64)),
+        stable_platform_manifest_sha256: stable.map(|_| "c".repeat(64)),
         slots,
     };
     let bytes = serde_json::to_vec(&serde_json::to_value(unsigned).unwrap()).unwrap();
@@ -184,6 +192,8 @@ struct Control {
     graceful: AtomicUsize,
     forced: AtomicUsize,
     completed: AtomicUsize,
+    admitted: Mutex<Vec<nelomai_client_api::RuntimeTarget>>,
+    reject_admission: AtomicBool,
     fail_graceful: AtomicUsize,
     fail_force: AtomicUsize,
     stall_graceful: AtomicBool,
@@ -286,8 +296,17 @@ impl RuntimeSwitchControl for Control {
         &self,
         _: &RuntimeCleanupSnapshotV1,
         _: &LocalStopReceiptV1,
-        _: &nelomai_client_api::AccessSnapshot,
+        access: &nelomai_client_api::AccessSnapshot,
     ) -> Result<(), BrokerError> {
+        if self.reject_admission.load(Ordering::SeqCst) {
+            return Err(BrokerError::RecoveryRequired);
+        }
+        self.admitted
+            .lock()
+            .unwrap()
+            .push(nelomai_client_api::RuntimeTarget::from_identity(
+                access.identity(),
+            ));
         self.completed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -933,10 +952,10 @@ async fn resume(
     ))
 }
 
-async fn supersede(State(panel): State<Arc<Panel>>) -> Json<Value> {
+async fn supersede(State(panel): State<Arc<Panel>>, Json(body): Json<Value>) -> Json<Value> {
     panel.supersede.fetch_add(1, Ordering::SeqCst);
     Json(
-        json!({"state":"clean","reconcile_operation_id":"44444444-4444-4444-8444-444444444444",
+        json!({"state":"clean","reconcile_operation_id":body["operation_id"],
         "retry_after_seconds":null}),
     )
 }
@@ -1688,6 +1707,463 @@ async fn verified_installed_container_newer_than_the_offer_recovers_to_its_lates
     assert_eq!(panel.supersede.load(Ordering::SeqCst), 1);
     assert_eq!(panel.resume.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+struct InterruptedUpdate {
+    root: tempfile::TempDir,
+    owner: Arc<ContainerOwnerLock>,
+    store: Arc<dyn AuthStore>,
+    panel: Arc<Panel>,
+    api: nelomai_client_api::ClientApi,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl InterruptedUpdate {
+    async fn new() -> Self {
+        let (panel, api, server) = panel().await;
+        let root = tempfile::tempdir().unwrap();
+        write_selection(root.path(), "0.3.0", RuntimeSlot::Latest);
+        let owner = Arc::new(ContainerOwnerLock::try_acquire(root.path()).unwrap());
+        let store = enrolled_store(RuntimeSlot::Latest);
+        let mut auth = store.load().unwrap().unwrap();
+        let identity = auth.confirmed_identity.as_mut().unwrap();
+        identity.container_version = "0.3.0".into();
+        identity.runtime_version = "0.3.0".into();
+        store.save(&auth).unwrap();
+        let old = online_coordinator(
+            owner.clone(),
+            store.clone(),
+            Arc::new(Control::default()),
+            manifest_with_stable("0.3.0", "0.3.0", Some("0.2.20")),
+            api.clone(),
+        );
+        let barrier = UpdateBarrier::open(old).unwrap();
+        barrier.prepare("0.3.2").await.unwrap();
+        barrier.installer_opened().await.unwrap();
+        drop(barrier);
+
+        write_selection(root.path(), "0.3.2", RuntimeSlot::Latest);
+        let updated = online_coordinator(
+            owner.clone(),
+            store.clone(),
+            Arc::new(Control::default()),
+            manifest_with_stable("0.3.2", "0.3.2", Some("0.2.20")),
+            api.clone(),
+        );
+        panel.fail_resume.store(1, Ordering::SeqCst);
+        let barrier = UpdateBarrier::open(updated.clone()).unwrap();
+        assert!(barrier.recover("0.3.2").await.is_err());
+        let switch = updated.snapshot().unwrap().unwrap();
+        assert_eq!(switch.phase(), SwitchPhase::AuthResuming);
+        assert_eq!(switch.target_identity().container_version, "0.3.2");
+        assert_eq!(
+            barrier.snapshot().unwrap().unwrap().phase(),
+            UpdateJournalPhase::InstallerOpened
+        );
+        drop(barrier);
+        drop(updated);
+        Self {
+            root,
+            owner,
+            store,
+            panel,
+            api,
+            server,
+        }
+    }
+
+    fn superseding_coordinator(&self, control: Arc<Control>) -> Arc<SwitchCoordinator> {
+        self.try_superseding_coordinator(control).unwrap()
+    }
+
+    fn try_superseding_coordinator(
+        &self,
+        control: Arc<Control>,
+    ) -> Result<Arc<SwitchCoordinator>, nelomai_client_container::SwitchJournalError> {
+        write_selection(self.root.path(), "0.3.3", RuntimeSlot::Latest);
+        let broker = Arc::new(
+            AuthBroker::new(self.api.clone(), self.store.clone(), Arc::new(Stop)).unwrap(),
+        );
+        Ok(Arc::new(
+            SwitchCoordinator::open(
+                self.owner.clone(),
+                manifest_with_stable("0.3.3", "0.3.3", Some("0.2.20")),
+            )?
+            .attach(broker, control),
+        ))
+    }
+
+    fn journal_bytes(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::fs::read(self.root.path().join("common/update-journal-v1.json")).unwrap(),
+            std::fs::read(self.root.path().join("common/runtime-switch-v1.json")).unwrap(),
+        )
+    }
+}
+
+impl Drop for InterruptedUpdate {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+#[tokio::test]
+async fn superseding_manifest_recovers_interrupted_update_without_admitting_obsolete_runtime() {
+    let fixture = InterruptedUpdate::new().await;
+    let before = fixture.journal_bytes();
+    let original: Value = serde_json::from_slice(&before.1).unwrap();
+    let control = Arc::new(Control::default());
+    let coordinator = fixture.superseding_coordinator(control.clone());
+    let barrier = UpdateBarrier::open(coordinator.clone())
+        .expect("a linked interrupted update must survive its target leaving the manifest");
+    assert_eq!(
+        fixture.journal_bytes(),
+        before,
+        "opening must preserve recovery evidence"
+    );
+    assert!(
+        nelomai_client_core::RuntimeStartPreflight::check_start_barrier(coordinator.as_ref())
+            .is_err()
+    );
+    assert!(barrier
+        .stop_proof("0.3.2", UpdateJournalPhase::InstallerOpened)
+        .is_err());
+    assert!(barrier.prepare("0.3.4").await.is_err());
+    assert!(barrier.installer_failed().await.is_err());
+    assert_eq!(fixture.journal_bytes(), before);
+
+    // A further transient failure must retain both journals and keep admission closed.
+    fixture.panel.fail_resume.store(1, Ordering::SeqCst);
+    assert!(barrier.recover("0.3.3").await.is_err());
+    assert_eq!(fixture.journal_bytes(), before);
+    assert_eq!(control.completed.load(Ordering::SeqCst), 0);
+    assert!(
+        nelomai_client_core::RuntimeStartPreflight::check_start_barrier(coordinator.as_ref())
+            .is_err()
+    );
+    drop(barrier);
+    drop(coordinator);
+
+    let coordinator = fixture.superseding_coordinator(control.clone());
+    let barrier = UpdateBarrier::open(coordinator.clone()).unwrap();
+    assert_eq!(
+        coordinator.recover().await.unwrap(),
+        nelomai_client_container::SwitchProgress::Ready
+    );
+    // Direct switch recovery cannot retire the owning update barrier or grant
+    // tunnel start; startup must still finish its installed-update obligation.
+    assert!(barrier.snapshot().unwrap().is_some());
+    assert!(
+        nelomai_client_core::RuntimeStartPreflight::check_start_barrier(coordinator.as_ref())
+            .is_err()
+    );
+    coordinator.before_tunnel_start().await.unwrap();
+    assert!(barrier.snapshot().unwrap().is_none());
+    let completed = coordinator.snapshot().unwrap().unwrap();
+    assert_eq!(completed.phase(), SwitchPhase::Complete);
+    assert_eq!(completed.target_identity().container_version, "0.3.3");
+    let completed = serde_json::to_value(completed).unwrap();
+    for field in [
+        "operation_id",
+        "source_identity",
+        "cleanup_envelope",
+        "local_stop_receipt",
+    ] {
+        assert_eq!(completed[field], original[field], "lost original {field}");
+    }
+    let admitted = control.admitted.lock().unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].container_version, "0.3.3");
+    assert_eq!(admitted[0].runtime_version, "0.3.3");
+    assert_eq!(admitted[0].runtime_slot, RuntimeSlot::Latest);
+    assert_eq!(fixture.panel.supersede.load(Ordering::SeqCst), 2);
+    assert!(
+        nelomai_client_core::RuntimeStartPreflight::check_start_barrier(coordinator.as_ref())
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn superseding_manifest_rejects_foreign_update_operation_and_source_without_mutation() {
+    for field in ["operation_id", "source_runtime", "target_container"] {
+        let fixture = InterruptedUpdate::new().await;
+        let path = fixture.root.path().join("common/update-journal-v1.json");
+        let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        match field {
+            "operation_id" => journal[field] = json!("99999999-9999-4999-8999-999999999999"),
+            "source_runtime" => journal[field]["runtime_version"] = json!("0.3.0+foreign"),
+            "target_container" => journal[field] = json!("0.3.1"),
+            _ => unreachable!(),
+        }
+        std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let before = fixture.journal_bytes();
+        let control = Arc::new(Control::default());
+        let coordinator = fixture.superseding_coordinator(control.clone());
+        assert!(
+            UpdateBarrier::open(coordinator.clone()).is_err(),
+            "accepted foreign {field}"
+        );
+        assert!(coordinator.before_tunnel_start().await.is_err());
+        assert!(coordinator.recover().await.is_err());
+        assert_eq!(fixture.journal_bytes(), before);
+        assert_eq!(control.completed.load(Ordering::SeqCst), 0);
+        assert!(
+            nelomai_client_core::RuntimeStartPreflight::check_start_barrier(coordinator.as_ref())
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn superseding_manifest_rejects_foreign_historical_identity_before_resume_or_admission() {
+    for field in [
+        "runtime_version",
+        "runtime_build",
+        "runtime_contract_version",
+        "runtime_slot",
+        "resume_operation_id",
+        "active_reconcile_operation_id",
+    ] {
+        let fixture = InterruptedUpdate::new().await;
+        let path = fixture.root.path().join("common/runtime-switch-v1.json");
+        let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        match field {
+            "runtime_version" => journal["target_identity"][field] = json!("0.3.1"),
+            "runtime_build" => {
+                journal["target_identity"]["runtime_version"] = json!("0.3.2+foreign")
+            }
+            "runtime_contract_version" => journal["target_identity"][field] = json!(2),
+            "runtime_slot" => journal["target_identity"][field] = json!("stable"),
+            "resume_operation_id" | "active_reconcile_operation_id" => {
+                journal[field] = json!("99999999-9999-4999-8999-999999999999")
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let before = fixture.journal_bytes();
+        let auth_before = fixture.store.load().unwrap().unwrap();
+        let calls = (
+            fixture.panel.resume.load(Ordering::SeqCst),
+            fixture.panel.reconcile.load(Ordering::SeqCst),
+            fixture.panel.supersede.load(Ordering::SeqCst),
+        );
+        let control = Arc::new(Control::default());
+        let coordinator = fixture.superseding_coordinator(control.clone());
+        // Opening is structural validation; protected authority must reject this
+        // identity during recovery, before any replay or admission can occur.
+        let barrier = UpdateBarrier::open(coordinator.clone())
+            .expect("syntactically valid historical identity must reach protected validation");
+        assert!(
+            barrier.recover("0.3.3").await.is_err(),
+            "accepted foreign {field}"
+        );
+        assert!(coordinator.before_tunnel_start().await.is_err());
+        assert_eq!(fixture.journal_bytes(), before);
+        assert_eq!(fixture.store.load().unwrap().unwrap(), auth_before);
+        assert_eq!(
+            (
+                fixture.panel.resume.load(Ordering::SeqCst),
+                fixture.panel.reconcile.load(Ordering::SeqCst),
+                fixture.panel.supersede.load(Ordering::SeqCst),
+            ),
+            calls
+        );
+        assert_eq!(control.handoffs.load(Ordering::SeqCst), 0);
+        assert_eq!(control.graceful.load(Ordering::SeqCst), 0);
+        assert_eq!(control.forced.load(Ordering::SeqCst), 0);
+        assert_eq!(control.completed.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn superseding_manifest_rejects_coherently_tampered_source_before_side_effects() {
+    assert_coherently_tampered_update_rejected(false).await;
+}
+
+#[tokio::test]
+async fn superseding_manifest_direct_recover_rejects_coherently_tampered_source() {
+    assert_coherently_tampered_update_rejected(true).await;
+}
+
+async fn assert_coherently_tampered_update_rejected(direct_recovery: bool) {
+    use sha2::{Digest, Sha256};
+    for field in [
+        "runtime_version",
+        "source_device_id",
+        "source_family",
+        "source_epoch",
+        "operation_id",
+    ] {
+        let fixture = InterruptedUpdate::new().await;
+        let (update, switch) = fixture.journal_bytes();
+        let mut update: Value = serde_json::from_slice(&update).unwrap();
+        let mut switch: Value = serde_json::from_slice(&switch).unwrap();
+        match field {
+            "runtime_version" => {
+                update["source_runtime"][field] = json!("0.3.0+foreign");
+                switch["source_identity"][field] = json!("0.3.0+foreign");
+                switch["runtime_snapshot"]["auth_scope"]["identity"][field] =
+                    json!("0.3.0+foreign");
+                switch["runtime_snapshot"][field] = json!("0.3.0+foreign");
+                switch["local_stop_receipt"][field] = json!("0.3.0+foreign");
+            }
+            "source_device_id" => switch[field] = json!("foreign-device"),
+            "source_family" => {
+                switch["runtime_snapshot"]["auth_scope"]["family"] = json!("foreign-family")
+            }
+            "source_epoch" => switch["runtime_snapshot"]["auth_scope"]["auth_epoch"] = json!(1),
+            "operation_id" => {
+                let operation = json!("99999999-9999-4999-8999-999999999999");
+                update[field] = operation.clone();
+                switch[field] = operation.clone();
+                switch["local_stop_receipt"][field] = operation;
+            }
+            _ => unreachable!(),
+        }
+        let scope = json!({
+            "auth_epoch": switch["runtime_snapshot"]["auth_scope"]["auth_epoch"],
+            "family": switch["runtime_snapshot"]["auth_scope"]["family"],
+            "identity": switch["source_identity"],
+            "device_id": switch["source_device_id"],
+        });
+        let fingerprint = json!(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&scope).unwrap())
+        ));
+        switch["source_scope_fingerprint"] = fingerprint.clone();
+        switch["local_stop_receipt"]["source_scope_fingerprint"] = fingerprint;
+        std::fs::write(
+            fixture.root.path().join("common/update-journal-v1.json"),
+            serde_json::to_vec(&update).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.root.path().join("common/runtime-switch-v1.json"),
+            serde_json::to_vec(&switch).unwrap(),
+        )
+        .unwrap();
+        let before = fixture.journal_bytes();
+        let auth_before = fixture.store.load().unwrap().unwrap();
+        let calls = (
+            fixture.panel.resume.load(Ordering::SeqCst),
+            fixture.panel.reconcile.load(Ordering::SeqCst),
+            fixture.panel.supersede.load(Ordering::SeqCst),
+        );
+        let control = Arc::new(Control::default());
+        let coordinator = fixture.superseding_coordinator(control.clone());
+        let barrier = UpdateBarrier::open(coordinator.clone())
+            .expect("crosslinks are coherent; protected provenance must reject them");
+        assert!(coordinator.request(RuntimeSlot::Latest).await.is_err());
+        assert!(
+            if direct_recovery {
+                coordinator.recover().await.is_err()
+            } else {
+                barrier.recover("0.3.3").await.is_err()
+            },
+            "accepted forged {field}"
+        );
+        assert_eq!(
+            fixture.journal_bytes(),
+            before,
+            "mutated journals for {field}"
+        );
+        assert_eq!(
+            fixture.store.load().unwrap().unwrap(),
+            auth_before,
+            "mutated auth for {field}"
+        );
+        assert_eq!(
+            (
+                fixture.panel.resume.load(Ordering::SeqCst),
+                fixture.panel.reconcile.load(Ordering::SeqCst),
+                fixture.panel.supersede.load(Ordering::SeqCst)
+            ),
+            calls,
+            "dispatched for {field}"
+        );
+        assert_eq!(control.completed.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn superseding_manifest_checks_resume_operation_before_retiring_protected_evidence() {
+    let fixture = InterruptedUpdate::new().await;
+    let control = Arc::new(Control::default());
+    control.reject_admission.store(true, Ordering::SeqCst);
+    let coordinator = online_coordinator(
+        fixture.owner.clone(),
+        fixture.store.clone(),
+        control,
+        manifest_with_stable("0.3.2", "0.3.2", Some("0.2.20")),
+        fixture.api.clone(),
+    );
+    let barrier = UpdateBarrier::open(coordinator).unwrap();
+    // Persist the genuine resume result but interrupt before runtime admission.
+    assert!(barrier.recover("0.3.2").await.is_err());
+    drop(barrier);
+    let mut auth = fixture.store.load().unwrap().unwrap();
+    let metadata = auth.broker.as_mut().unwrap();
+    assert!(metadata.pending_request.is_none());
+    let mut stale = metadata
+        .transition_authorities
+        .iter()
+        .find(|entry| entry.resume_evidence.is_some())
+        .unwrap()
+        .clone();
+    let stale_id = "88888888-8888-4888-8888-888888888888".to_owned();
+    stale.reconcile_operation_id = stale_id.clone();
+    stale.reconcile_receipt.as_mut().unwrap().operation_id = stale_id.clone();
+    stale
+        .resume_ticket
+        .as_mut()
+        .unwrap()
+        .resume
+        .as_mut()
+        .unwrap()
+        .reconcile_operation_id = stale_id.clone();
+    stale
+        .resume_evidence
+        .as_mut()
+        .unwrap()
+        .reconcile_operation_id = stale_id;
+    metadata.transition_authorities.push(stale);
+    fixture.store.save(&auth).unwrap();
+
+    let path = fixture.root.path().join("common/runtime-switch-v1.json");
+    let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let original_resume = journal["resume_operation_id"].clone();
+    journal["resume_operation_id"] = json!("99999999-9999-4999-8999-999999999999");
+    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let before = fixture.journal_bytes();
+    let calls = (
+        fixture.panel.resume.load(Ordering::SeqCst),
+        fixture.panel.supersede.load(Ordering::SeqCst),
+    );
+    let control = Arc::new(Control::default());
+    let coordinator = fixture.superseding_coordinator(control.clone());
+    let barrier = UpdateBarrier::open(coordinator).unwrap();
+    assert!(barrier.recover("0.3.3").await.is_err());
+    assert_eq!(fixture.journal_bytes(), before);
+    assert_eq!(
+        fixture.store.load().unwrap().unwrap(),
+        auth,
+        "resume rejection must precede authority retirement"
+    );
+    assert_eq!(
+        (
+            fixture.panel.resume.load(Ordering::SeqCst),
+            fixture.panel.supersede.load(Ordering::SeqCst)
+        ),
+        calls
+    );
+    assert_eq!(control.completed.load(Ordering::SeqCst), 0);
+    journal["resume_operation_id"] = original_resume;
+    std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    barrier.recover("0.3.3").await.unwrap();
+    assert!(barrier.snapshot().unwrap().is_none());
+    let admitted = control.admitted.lock().unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].runtime_version, "0.3.3");
 }
 
 #[tokio::test]

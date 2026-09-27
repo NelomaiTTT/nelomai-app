@@ -38,6 +38,98 @@ impl RuntimeStateStore for ReadOnlyRuntime {
     }
 }
 struct StoppedTunnel;
+
+struct CleanupOnlyRuntime(ReadOnlyRuntime);
+impl RuntimeStateStore for CleanupOnlyRuntime {
+    fn paths(&self) -> &RuntimePaths {
+        self.0.paths()
+    }
+    fn load(&self) -> Result<Option<RuntimeStateV1>, StorageError> {
+        let mut state = self.0.load()?.unwrap();
+        state.cleanup_only = true;
+        Ok(Some(state))
+    }
+    fn save(&self, _: &RuntimeStateV1) -> Result<(), StorageError> {
+        panic!("admission rejection must not write storage")
+    }
+}
+
+struct RunningTunnel;
+#[async_trait]
+impl TunnelController for RunningTunnel {
+    async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {
+        panic!("read must not start")
+    }
+    async fn stop(&self) -> Result<(), TunnelError> {
+        Ok(())
+    }
+    async fn status(&self) -> Result<TunnelStatus, TunnelError> {
+        Ok(TunnelStatus::Running)
+    }
+}
+
+#[tokio::test]
+async fn foreground_cleanup_only_cannot_adopt_running_native_owner() {
+    let local = CoreLocalStop::new(Arc::new(RunningTunnel));
+    local.stop_local_for_transition().await.unwrap();
+    let provider = Arc::new(Provider(AtomicUsize::new(0)));
+    let core = ClientCore::new(
+        Arc::new(nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap()),
+        Arc::new(CleanupOnlyRuntime(ReadOnlyRuntime(
+            RuntimePaths::new(
+                "/synthetic-no-filesystem-access",
+                RuntimeSlot::Stable,
+                "0.2.16",
+            )
+            .unwrap(),
+        ))),
+        provider.clone(),
+        local,
+        Arc::new(NoopLogger),
+    );
+    let observation = core.begin_foreground_observation().await;
+    assert_eq!(
+        core.foreground_state(
+            observation,
+            Some(nelomai_client_core::NativeConnectionIntent {
+                generation: 1,
+                desired_active: true,
+            })
+        )
+        .await
+        .phase,
+        nelomai_client_core::Phase::Ready
+    );
+    assert_eq!(
+        core.reconcile_external_tunnel_state().await.phase,
+        nelomai_client_core::Phase::Ready
+    );
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cleanup_only_admission_requires_recovery_without_access_or_storage_writes() {
+    let provider = Arc::new(Provider(AtomicUsize::new(0)));
+    let core = ClientCore::new(
+        Arc::new(nelomai_client_api::ClientApi::new("http://127.0.0.1:9").unwrap()),
+        Arc::new(CleanupOnlyRuntime(ReadOnlyRuntime(
+            RuntimePaths::new(
+                "/synthetic-no-filesystem-access",
+                RuntimeSlot::Stable,
+                "0.2.16",
+            )
+            .unwrap(),
+        ))),
+        provider.clone(),
+        CoreLocalStop::new(Arc::new(StoppedTunnel)),
+        Arc::new(NoopLogger),
+    );
+    assert!(matches!(
+        core.access_snapshot().await,
+        Err(CoreError::AuthRecoveryRequired)
+    ));
+    assert_eq!(provider.0.load(Ordering::SeqCst), 0);
+}
 #[async_trait]
 impl TunnelController for StoppedTunnel {
     async fn start(&self, _: TunnelStartRequest) -> Result<(), TunnelError> {

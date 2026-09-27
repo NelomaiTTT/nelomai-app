@@ -10,6 +10,12 @@ import {
 } from "./connection-action";
 
 describe("connection action coordination", () => {
+  it("blocks stale Start during foreground reconciliation but keeps Stop available", () => {
+    const state = initialConnectionActionState();
+    expect(canBeginConnectionAction(state, false, false, true)).toBe(false);
+    expect(canBeginConnectionAction(state, false, true, true)).toBe(true);
+    expect(canBeginConnectionAction(state, false, false, false)).toBe(true);
+  });
   it("allows Stop while Start is in flight but rejects a second cancellation", () => {
     const started = beginConnectionStart(initialConnectionActionState());
 

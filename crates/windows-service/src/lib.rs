@@ -1095,6 +1095,10 @@ fn stable_route_error_code(code: &str) -> Option<&'static str> {
         "udp_rebind_failed" => "udp_rebind_failed",
         "udp_rebind_unsupported" => "udp_rebind_unsupported",
         "redundancy_unsupported" => "redundancy_unsupported",
+        "member_runtime_factory_failed" => "member_runtime_factory_failed",
+        "redundant_actor_failed" => "redundant_actor_failed",
+        "dispatcher_start_failed" => "dispatcher_start_failed",
+        "engine_channel_failed" => "engine_channel_failed",
         _ => return None,
     })
 }
@@ -1870,6 +1874,22 @@ fn normalize_windows_path(path: &Path) -> String {
 #[cfg(test)]
 mod service_error_tests {
     use super::ServiceError;
+
+    #[test]
+    fn startup_stage_codes_are_visible_without_exposing_backend_details() {
+        for code in [
+            "member_runtime_factory_failed",
+            "redundant_actor_failed",
+            "dispatcher_start_failed",
+            "engine_channel_failed",
+        ] {
+            assert_eq!(ServiceError::Backend(code.into()).code(), code);
+            assert_eq!(
+                ServiceError::Backend(format!("{code}: SECRET path or credentials")).code(),
+                "service_unavailable"
+            );
+        }
+    }
 
     #[test]
     fn exposes_only_allowlisted_backend_codes() {

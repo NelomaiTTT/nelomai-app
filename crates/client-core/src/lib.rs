@@ -1261,6 +1261,21 @@ impl From<CoreApiError> for CoreError {
     }
 }
 
+/// Capture before reading the native owner. A reply belongs to this local
+/// cancellation epoch and observation order, not to whichever operation is current later.
+#[derive(Clone, Debug)]
+pub struct ForegroundObservation {
+    epoch: u64,
+    sequence: u64,
+    state: CoreState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeConnectionIntent {
+    pub generation: u64,
+    pub desired_active: bool,
+}
+
 pub struct ClientCore<A, S, T, L> {
     api: Arc<A>,
     store: Arc<S>,
@@ -1272,6 +1287,8 @@ pub struct ClientCore<A, S, T, L> {
     #[cfg(not(target_os = "android"))]
     desktop_sync_gate: Mutex<()>,
     recovered_native_transition: Mutex<Option<(CoreState, StartCancellationEpoch)>>,
+    foreground_sequence: AtomicU64,
+    foreground_intent: Mutex<Option<(u64, NativeConnectionIntent)>>,
     runtime_writers: Arc<RuntimeWriterGates>,
     start_cancel_epoch: Arc<AtomicU64>,
     start_in_progress: AtomicBool,
@@ -1338,6 +1355,8 @@ where
             #[cfg(not(target_os = "android"))]
             desktop_sync_gate: Mutex::new(()),
             recovered_native_transition: Mutex::new(None),
+            foreground_sequence: AtomicU64::new(0),
+            foreground_intent: Mutex::new(None),
             runtime_writers: local.writers.clone(),
             start_cancel_epoch: local.epoch.clone(),
             start_in_progress: AtomicBool::new(false),
@@ -1427,6 +1446,8 @@ where
     }
 
     pub async fn state(&self) -> CoreState {
+        let epoch = self.start_cancel_epoch.load(Ordering::SeqCst);
+        let foreground_sequence = self.foreground_sequence.load(Ordering::SeqCst);
         let current = self.state.lock().await.clone();
         if matches!(current.phase, Phase::Connecting | Phase::Stopping) {
             // A recovered native start has no local operation to finish its phase
@@ -1485,17 +1506,23 @@ where
         if current.phase != Phase::Connected {
             return current;
         }
-        match self.tunnel.status().await {
+        let status = self.tunnel.status().await;
+        let mut state = self.state.lock().await;
+        let mut warnings = self.split_tunnel_warning.lock().await;
+        if *state != current
+            || self.start_cancel_epoch.load(Ordering::SeqCst) != epoch
+            || self.foreground_sequence.load(Ordering::SeqCst) != foreground_sequence
+        {
+            return state.clone();
+        }
+        match status {
             Ok(TunnelStatus::Stopped | TunnelStatus::Failed) => {
-                let (state, changed) = self.leave_unconfirmed_connected_state().await;
-                if changed {
-                    self.set_split_tunnel_warning(
-                        SplitTunnelWarningKind::Runtime,
-                        "tunnel_runtime_stopped",
-                    )
-                    .await;
-                }
-                state
+                state.phase = Phase::Stopping;
+                warnings.set(
+                    SplitTunnelWarningKind::Runtime,
+                    "tunnel_runtime_stopped".into(),
+                );
+                state.clone()
             }
             Ok(status @ (TunnelStatus::Starting | TunnelStatus::Stopping)) => {
                 // Project the native transition without starting another lifecycle
@@ -1510,17 +1537,14 @@ where
                 }
             }
             Ok(TunnelStatus::Running) => {
-                self.clear_split_tunnel_warning(SplitTunnelWarningKind::Runtime)
-                    .await;
+                warnings.clear(SplitTunnelWarningKind::Runtime);
                 current
             }
             Err(error) => {
-                let changed = self
-                    .set_split_tunnel_warning(
-                        SplitTunnelWarningKind::Runtime,
-                        "tunnel_status_unavailable",
-                    )
-                    .await;
+                let changed = warnings.set(
+                    SplitTunnelWarningKind::Runtime,
+                    "tunnel_status_unavailable".into(),
+                );
                 if changed {
                     self.logger.record(CoreLogEvent {
                         kind: "tunnel.status.unavailable",
@@ -1608,8 +1632,116 @@ where
         self.reconcile_tunnel_state(None).await
     }
 
+    pub async fn begin_foreground_observation(&self) -> ForegroundObservation {
+        ForegroundObservation {
+            epoch: self.start_cancel_epoch.load(Ordering::SeqCst),
+            sequence: self.foreground_sequence.fetch_add(1, Ordering::SeqCst) + 1,
+            state: self.state.lock().await.clone(),
+        }
+    }
+
+    pub async fn foreground_state(
+        &self,
+        observation: ForegroundObservation,
+        intent: Option<NativeConnectionIntent>,
+    ) -> CoreState {
+        self.foreground_state_guarded(observation, intent, || true)
+            .await
+    }
+
+    /// Local presentation only: never restore configuration, refresh credentials,
+    /// start a tunnel, or perform cleanup from a foreground poll.
+    pub async fn foreground_state_guarded(
+        &self,
+        observation: ForegroundObservation,
+        intent: Option<NativeConnectionIntent>,
+        allowed: impl Fn() -> bool,
+    ) -> CoreState {
+        let active = matches!(self.auth.state().await, Ok(RuntimeAuthState::Active));
+        let status = self.tunnel.status().await;
+        let mut state = self.state.lock().await;
+        let mut previous_intent = self.foreground_intent.lock().await;
+        let mut warnings = self.split_tunnel_warning.lock().await;
+        if !active
+            || !allowed()
+            || !self
+                .store
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|stored| stored.start_or_recovery_allowed())
+            || self.start_cancel_epoch.load(Ordering::SeqCst) != observation.epoch
+            || self.foreground_sequence.load(Ordering::SeqCst) != observation.sequence
+            || *state != observation.state
+            || self.start_in_progress.load(Ordering::SeqCst)
+            || self.pending_start_active.load(Ordering::SeqCst)
+            || !matches!(
+                state.phase,
+                Phase::Ready | Phase::Connected | Phase::Connecting | Phase::Stopping
+            )
+            || previous_intent.as_ref().is_some_and(|(epoch, previous)| {
+                *epoch == observation.epoch
+                    && intent.is_some_and(|intent| {
+                        intent.generation < previous.generation
+                            || (intent.generation == previous.generation && intent != *previous)
+                    })
+            })
+        {
+            return state.clone();
+        }
+        if let Some(intent) = intent {
+            *previous_intent = Some((observation.epoch, intent));
+        }
+        let expected_stop = intent.is_some_and(|intent| !intent.desired_active);
+        match status {
+            Ok(TunnelStatus::Running) => {
+                state.phase = if expected_stop {
+                    Phase::Stopping
+                } else {
+                    Phase::Connected
+                };
+                if matches!(
+                    warnings.runtime.as_deref(),
+                    Some("tunnel_runtime_stopped" | "tunnel_status_unavailable")
+                ) {
+                    warnings.clear(SplitTunnelWarningKind::Runtime);
+                }
+            }
+            Ok(TunnelStatus::Starting) => {
+                state.phase = if expected_stop {
+                    Phase::Stopping
+                } else {
+                    Phase::Connecting
+                };
+            }
+            Ok(TunnelStatus::Stopping) => state.phase = Phase::Stopping,
+            Ok(TunnelStatus::Stopped) if expected_stop => {
+                state.phase = Phase::Ready;
+                if warnings.runtime.as_deref() == Some("tunnel_runtime_stopped") {
+                    warnings.clear(SplitTunnelWarningKind::Runtime);
+                }
+            }
+            Ok(TunnelStatus::Stopped | TunnelStatus::Failed) => {
+                if state.phase == Phase::Connected {
+                    state.phase = Phase::Stopping;
+                    warnings.set(
+                        SplitTunnelWarningKind::Runtime,
+                        "tunnel_runtime_stopped".into(),
+                    );
+                }
+            }
+            Err(_) => {
+                // Keep the last local projection on IPC failure. Missing intent
+                // is not confirmation of a voluntary stop.
+            }
+        }
+        state.clone()
+    }
+
     async fn reconcile_tunnel_state(&self, expected: Option<&CoreState>) -> CoreState {
         let epoch = self.start_cancel_epoch.load(Ordering::SeqCst);
+        let foreground_sequence = self.foreground_sequence.load(Ordering::SeqCst);
+        let current = self.state.lock().await.clone();
         let active = matches!(self.auth.state().await, Ok(RuntimeAuthState::Active));
         let status = match self.tunnel.status().await {
             Ok(status) => status,
@@ -1617,11 +1749,23 @@ where
         };
         let mut state = self.state.lock().await;
         if active
+            && self
+                .store
+                .load()
+                .ok()
+                .flatten()
+                .is_some_and(|stored| stored.start_or_recovery_allowed())
             && self.start_cancel_epoch.load(Ordering::SeqCst) == epoch
+            && self.foreground_sequence.load(Ordering::SeqCst) == foreground_sequence
+            && *state == current
             && expected.is_none_or(|expected| *state == *expected)
+            && matches!(
+                state.phase,
+                Phase::Ready | Phase::Connecting | Phase::Connected | Phase::Stopping
+            )
             && (state.connection.is_some()
                 || expected.is_some()
-                || state.phase == Phase::Connecting)
+                || matches!(state.phase, Phase::Ready | Phase::Connecting))
         {
             state.phase = match status {
                 TunnelStatus::Running => Phase::Connected,
@@ -1637,15 +1781,6 @@ where
             }
         }
         state.clone()
-    }
-
-    async fn leave_unconfirmed_connected_state(&self) -> (CoreState, bool) {
-        let mut state = self.state.lock().await;
-        let changed = state.phase == Phase::Connected;
-        if changed {
-            state.phase = Phase::Stopping;
-        }
-        (state.clone(), changed)
     }
 
     pub fn record_tunnel_unavailable(&self, kind: &'static str, code: String) {
@@ -2702,6 +2837,7 @@ where
     }
 
     pub fn begin_start_attempt(&self) -> StartCancellationEpoch {
+        self.foreground_sequence.fetch_add(1, Ordering::SeqCst);
         self.start_in_progress.store(true, Ordering::SeqCst);
         StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst))
     }
@@ -4269,7 +4405,7 @@ where
             .map_err(|_| CoreError::Storage)?
             .ok_or(CoreError::SignedOut)?;
         if !stored.start_or_recovery_allowed() {
-            return Err(CoreError::Storage);
+            return Err(CoreError::AuthRecoveryRequired);
         }
         if stored.pinned_connection.is_none()
             && stored

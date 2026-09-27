@@ -20,6 +20,26 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
+// Both paths must come from the verified installation, never from IPC. Permit
+// only canonicalize's local DOS extended-length prefix; do not resolve aliases,
+// fold case, or accept a different target after following a reparse point.
+pub(crate) fn canonical_engine_matches(
+    trusted: &std::path::Path,
+    canonical: &std::path::Path,
+) -> bool {
+    if trusted == canonical {
+        return true;
+    }
+    let Some(dos) = canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) else {
+        return false;
+    };
+    let bytes = dos.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && &bytes[1..3] == b":\\"
+        && trusted.as_os_str() == std::ffi::OsStr::new(dos)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MemberRecord {

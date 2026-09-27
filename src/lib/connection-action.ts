@@ -17,7 +17,9 @@ export function canBeginConnectionAction(
   state: ConnectionActionState,
   globallyBusy: boolean,
   stopping: boolean,
+  reconciling = false,
 ): boolean {
+  if (reconciling && !stopping) return false;
   if (state.cancelBusy) return false;
   if (stopping && state.startBusy) return true;
   return !globallyBusy && !state.startBusy;
