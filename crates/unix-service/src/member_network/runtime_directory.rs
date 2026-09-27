@@ -163,7 +163,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, RuntimeDirectory) {
         let dir = tempfile::Builder::new()
             .prefix("runtime-directory-")
-            .tempdir_in(std::env::var_os("TMPDIR").unwrap())
+            .tempdir()
             .unwrap();
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let runtime = RuntimeDirectory::for_owner(dir.path(), unsafe { libc::geteuid() }).unwrap();

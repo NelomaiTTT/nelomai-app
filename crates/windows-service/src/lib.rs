@@ -23,6 +23,18 @@ mod member_reboot;
 pub mod member_routes;
 pub mod redundancy;
 
+#[cfg(test)]
+fn test_engine_path(name: &str) -> std::path::PathBuf {
+    // These paths are identities for fake IO, never files to create or execute.
+    // A rooted Unix path is not absolute on Windows (it has no drive prefix).
+    let root = if cfg!(windows) {
+        "C:/trusted"
+    } else {
+        "/trusted"
+    };
+    std::path::Path::new(root).join(name)
+}
+
 /// Selection/lifetime routing shared by the production named-pipe transport and
 /// injected transports. Only explicit Start may create an engine lifetime.
 pub fn exchange_selected(
