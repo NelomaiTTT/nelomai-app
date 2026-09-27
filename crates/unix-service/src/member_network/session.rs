@@ -27,6 +27,8 @@ pub struct SessionNetwork<B, N, S> {
     dns: [Vec<IpAddr>; 2],
     endpoints: [Option<IpAddr>; 2],
     closing: bool,
+    closing_incomplete: bool,
+    retired_interfaces: [Option<u32>; 2],
 }
 
 impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionNetwork<B, N, S> {
@@ -44,6 +46,8 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             dns: [Vec::new(), Vec::new()],
             endpoints: [None, None],
             closing: false,
+            closing_incomplete: false,
+            retired_interfaces: [None, None],
         })
     }
     pub fn active(&self) -> Option<Slot> {
@@ -70,10 +74,14 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             dns: [Vec::new(), Vec::new()],
             endpoints: [None, None],
             closing: true,
+            closing_incomplete: true,
+            retired_interfaces: [None, None],
         })
     }
     pub fn cleanup_pending(&self) -> bool {
-        self.network.cleanup_pending()
+        self.closing_incomplete
+            || self.retired_interfaces.iter().any(Option::is_some)
+            || self.network.cleanup_pending()
             || (self.closing
                 && (self.network.has_resources()
                     || [Slot::A, Slot::B]
@@ -116,7 +124,11 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         self.policy = Some(policy);
         self.dns[index(slot)] = config.dns.clone();
         self.endpoints[index(slot)] = Some(endpoint);
-        self.members.start(scope, slot, config, probe)?;
+        let view = self.members.start(scope, slot, config, probe)?;
+        self.network
+            .system_mut()
+            .member_started(slot, view.routes.interface)
+            .map_err(network_error)?;
         self.select_active(scope, slot)
     }
 
@@ -130,7 +142,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
     ) -> Result<(), ServiceError> {
         self.check(scope)?;
         let active = self.active().ok_or_else(fenced)?;
-        if slot == active {
+        if slot == active || self.retired_interfaces[index(slot)].is_some() {
             return Err(fenced());
         }
         self.members.validate_start(scope, slot, config, &probe)?;
@@ -173,7 +185,11 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         self.policy = Some(next);
         self.dns[index(slot)] = config.dns.clone();
         self.endpoints[index(slot)] = Some(endpoint);
-        self.members.start(scope, slot, config, probe)?;
+        let view = self.members.start(scope, slot, config, probe)?;
+        self.network
+            .system_mut()
+            .member_started(slot, view.routes.interface)
+            .map_err(network_error)?;
         // Same active and DNS: adding B only installs B's scoped probe route.
         self.select_active(scope, active)
     }
@@ -185,6 +201,36 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         let policy = self.policy.clone().ok_or_else(fenced)?;
         let values = self.values(slot, &policy)?;
         self.network.select(slot, values).map_err(network_error)
+    }
+
+    /// A failed reserve does not tear down a working primary. Remove only the
+    /// inactive native member, then its probe routes, then its table binding.
+    /// A journal/rollback conflict is returned to the owner, never hidden as a
+    /// successful detach. Endpoint bypasses stay owned until session Stop.
+    pub fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> Result<(), ServiceError> {
+        self.check(scope)?;
+        let active = self.active().ok_or_else(fenced)?;
+        if active == slot {
+            return Err(fenced());
+        }
+        let i = index(slot);
+        if let Some(view) = self.members.view(slot) {
+            self.retired_interfaces[i] = Some(view.routes.interface);
+        }
+        self.members.stop(scope, slot)?;
+        self.dns[i].clear();
+        self.endpoints[i] = None;
+        let policy = self.policy.clone().ok_or_else(fenced)?;
+        let values = self.values(active, &policy)?;
+        self.network.select(active, values).map_err(network_error)?;
+        if let Some(interface) = self.retired_interfaces[i] {
+            self.network
+                .system_mut()
+                .member_stopped(slot, interface)
+                .map_err(network_error)?;
+            self.retired_interfaces[i] = None;
+        }
+        Ok(())
     }
 
     /// The coordinator invalidates all in-flight probes and health samples
@@ -214,11 +260,19 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             return Err(ServiceError::UnauthorizedClient);
         }
         self.closing = true;
+        self.closing_incomplete = true;
         // Cut native traffic before potentially slow DNS/route cleanup. Still
         // attempt both paths on failure and retain their independent journals.
         let members = self.members.close(scope);
         let network = self.network.cleanup().map_err(network_error);
-        members.and(network)
+        members.and(network)?;
+        self.network
+            .system_mut()
+            .session_closed()
+            .map_err(network_error)?;
+        self.closing_incomplete = false;
+        self.retired_interfaces = [None, None];
+        Ok(())
     }
 
     fn values(
@@ -306,6 +360,67 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         Ok(())
     }
 }
+impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: NetworkJournalStore>
+    SessionNetwork<B, N, S>
+{
+    /// Read-only discovery before any primary member or session routes start.
+    pub fn resolve_primary_policy(
+        &mut self,
+        scope: &SessionScope,
+        options: &nelomai_client_tunnel::DesktopTunnelOptions,
+        endpoint: IpAddr,
+    ) -> Result<NetworkPolicy, ServiceError> {
+        self.check(scope)?;
+        if self.policy.is_some() || self.network.has_resources() {
+            return Err(fenced());
+        }
+        self.resolve_policy(options, &[endpoint])
+    }
+
+    /// Discover against both installed endpoints before standby/network changes.
+    pub fn resolve_updated_policy(
+        &mut self,
+        scope: &SessionScope,
+        options: &nelomai_client_tunnel::DesktopTunnelOptions,
+        extra_endpoint: Option<IpAddr>,
+    ) -> Result<NetworkPolicy, ServiceError> {
+        self.check(scope)?;
+        if self.active().is_none() {
+            return Err(fenced());
+        }
+        let mut endpoints = self
+            .endpoints
+            .iter()
+            .flatten()
+            .copied()
+            .chain(extra_endpoint)
+            .collect::<Vec<_>>();
+        endpoints.sort();
+        endpoints.dedup();
+        self.resolve_policy(options, &endpoints)
+    }
+
+    fn resolve_policy(
+        &mut self,
+        options: &nelomai_client_tunnel::DesktopTunnelOptions,
+        endpoints: &[IpAddr],
+    ) -> Result<NetworkPolicy, ServiceError> {
+        options
+            .validate()
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        if endpoints.is_empty() || endpoints.len() > 2 {
+            return Err(ServiceError::InvalidRequest);
+        }
+        // Only the durable owner may identify routes excluded from discovery.
+        // User policy exclusions remain options, never ownership evidence.
+        let owned = self.network.owned_route_destinations();
+        self.network
+            .system_mut()
+            .resolve_policy(options, endpoints, &owned)
+            .map_err(network_error)
+    }
+}
+
 fn index(slot: Slot) -> usize {
     match slot {
         Slot::A => 0,

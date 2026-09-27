@@ -218,6 +218,92 @@ impl SecretStore for MemoryStore {
 
 struct StoppedTunnel;
 
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn desktop_reserve_never_falls_back_to_single_on_an_old_helper() {
+    let (app, api) = application();
+    let options = ConnectOptions::unix_desktop_default();
+    let result = app
+        .desktop_connection_intent_attempt_guarded(options, 1_800_000_000, true, || true)
+        .await;
+    assert!(
+        matches!(result, Err(ApplicationError::Core(CoreError::Tunnel(ref code))) if code == "desktop_redundancy_unsupported")
+    );
+    assert!(api.start_request.lock().unwrap().is_none());
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn desktop_reserve_guard_cancels_before_any_start_and_old_caller_keeps_single_contract() {
+    let (app, api) = application();
+    let options = ConnectOptions::unix_desktop_default();
+    assert!(matches!(
+        app.desktop_connection_intent_attempt_guarded(options.clone(), 1_800_000_000, true, || {
+            false
+        })
+        .await,
+        Err(ApplicationError::RecoveryDeferred)
+    ));
+    assert!(api.start_request.lock().unwrap().is_none());
+    let _ = app
+        .connection_intent_attempt_guarded(options, 1_800_000_001, || true)
+        .await;
+    let request = api
+        .start_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("legacy panel request");
+    assert_ne!(request.reserve_enabled, Some(true));
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn desktop_tick_and_status_do_not_refresh_probes_or_start_an_ordinary_tunnel() {
+    let (app, api) = application();
+    app.refresh_probes(Layer::Stray, EgressMode::Ipv4, 1_800_000_000)
+        .await
+        .unwrap();
+    let calls = (
+        api.candidate_calls.load(Ordering::SeqCst),
+        api.probe_calls.load(Ordering::SeqCst),
+    );
+    for now in [1_800_000_001, 1_800_000_600, 1_900_000_000] {
+        assert!(app.desktop_redundancy_tick(now).await.unwrap().is_none());
+        assert!(app.desktop_redundancy_status().await.unwrap().is_none());
+    }
+    assert_eq!(
+        (
+            api.candidate_calls.load(Ordering::SeqCst),
+            api.probe_calls.load(Ordering::SeqCst)
+        ),
+        calls
+    );
+    assert!(api.start_request.lock().unwrap().is_none());
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn desktop_personal_tic_remains_single_even_when_preference_is_on() {
+    let (app, api) = application();
+    let _ = app
+        .desktop_connection_intent_attempt_guarded(
+            ConnectOptions::android_default(),
+            1_800_000_000,
+            true,
+            || true,
+        )
+        .await;
+    let request = api
+        .start_request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("personal single request");
+    assert_ne!(request.reserve_enabled, Some(true));
+    assert_eq!(api.probe_calls.load(Ordering::SeqCst), 0);
+}
+
 #[async_trait]
 impl TunnelController for StoppedTunnel {
     async fn start(&self, _request: TunnelStartRequest) -> Result<(), TunnelError> {

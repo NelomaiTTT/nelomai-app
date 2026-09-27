@@ -4,8 +4,14 @@ mod kernel_rebind;
 mod linux;
 #[cfg(any(target_os = "linux", test))]
 mod linux_diagnostics;
+#[cfg(any(target_os = "linux", test))]
+mod linux_owner;
+#[cfg(test)]
+mod linux_owner_tests;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_launch;
 #[cfg(any(target_os = "macos", test))]
 mod member_owner;
 #[cfg(test)]
@@ -34,6 +40,8 @@ use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
+pub(crate) use linux::boot_identity as linux_boot_identity;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBackend as PlatformBackend;
 #[cfg(target_os = "macos")]

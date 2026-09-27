@@ -207,3 +207,84 @@ fn future_soft_failure_timestamp_and_invalid_network_do_not_confirm_failure() {
     assert!(!monitor.failed(5000, &primary));
     assert!(monitor.failed(6000, &primary));
 }
+
+#[test]
+fn emitted_stall_deduplicates_only_stalled_not_a_later_proven_reserve() {
+    let mut monitor = RedundantHealthMonitor::new(true);
+    assert_eq!(
+        monitor.evaluate(0, &[dead_primary()]),
+        FailoverDecision::Stalled
+    );
+    assert_eq!(
+        monitor.evaluate(100, &[dead_primary()]),
+        FailoverDecision::None
+    );
+    assert_eq!(
+        monitor.evaluate(200, &[dead_primary(), healthy(Slot::B, false)]),
+        FailoverDecision::SwitchTo(Slot::B)
+    );
+    let failed_b = SlotObservation {
+        slot: Slot::B,
+        ..dead_primary()
+    };
+    assert_eq!(
+        monitor.evaluate(300, &[failed_b]),
+        FailoverDecision::Stalled,
+        "successful selection of a proven healthy reserve starts a new role episode"
+    );
+}
+
+#[test]
+fn healthy_primary_resets_stalled_episode_but_unproven_primary_does_not() {
+    let mut monitor = RedundantHealthMonitor::new(true);
+    assert_eq!(
+        monitor.evaluate(0, &[dead_primary()]),
+        FailoverDecision::Stalled
+    );
+    let mut unproven = healthy(Slot::A, true);
+    unproven.consecutive_probe_successes = 0;
+    assert_eq!(monitor.evaluate(100, &[unproven]), FailoverDecision::None);
+    assert_eq!(
+        monitor.evaluate(200, &[dead_primary()]),
+        FailoverDecision::None
+    );
+    assert_eq!(
+        monitor.evaluate(300, &[healthy(Slot::A, true)]),
+        FailoverDecision::None
+    );
+    assert_eq!(
+        monitor.evaluate(400, &[dead_primary()]),
+        FailoverDecision::Stalled
+    );
+    assert_eq!(
+        monitor.evaluate(500, &[dead_primary()]),
+        FailoverDecision::None
+    );
+}
+
+#[test]
+fn validated_new_epoch_resets_stalled_after_existing_four_second_suppression() {
+    let mut monitor = RedundantHealthMonitor::new(true);
+    assert_eq!(
+        monitor.evaluate(0, &[dead_primary()]),
+        FailoverDecision::Stalled
+    );
+    monitor.network_changed(100, false);
+    assert_eq!(
+        monitor.evaluate(5000, &[healthy(Slot::A, true)]),
+        FailoverDecision::None
+    );
+    monitor.network_changed(5100, true);
+    assert_eq!(
+        monitor.evaluate(9099, &[dead_primary()]),
+        FailoverDecision::None
+    );
+    assert_eq!(
+        monitor.evaluate(9100, &[dead_primary()]),
+        FailoverDecision::Stalled
+    );
+    assert_eq!(
+        monitor.evaluate(9200, &[dead_primary()]),
+        FailoverDecision::None
+    );
+}

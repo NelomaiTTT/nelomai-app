@@ -85,8 +85,9 @@ async fn production_transport_stop_then_passive_poll_preserves_quiescence() {
         })
     };
     // Stop performs version + stop; each passive poll only reads version.
+    // Capability Version is no longer passive: it may bring up a verified engine.
     let server = std::thread::spawn(move || {
-        for _ in 0..5 {
+        for _ in 0..4 {
             nelomai_unix_service::serve_dispatcher_one(&listener, &server_owner, false).unwrap();
         }
     });
@@ -100,7 +101,6 @@ async fn production_transport_stop_then_passive_poll_preserves_quiescence() {
     use nelomai_client_tunnel::{TunnelController, TunnelStatus};
     let controller = nelomai_unix_service::UnixTunnelController::new(transport);
     assert_eq!(controller.status().await.unwrap(), TunnelStatus::Stopped);
-    assert_eq!(controller.service_version().await.unwrap(), "0.2.16");
     #[cfg(target_os = "linux")]
     {
         assert!(controller

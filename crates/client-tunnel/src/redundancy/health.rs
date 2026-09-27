@@ -43,8 +43,8 @@ pub enum FailoverDecision {
 }
 
 /// Mirrors the accepted Android health policy without timers, networking or
-/// platform effects. A stalled session is handed back to its lifecycle once;
-/// that lifecycle creates a new monitor when recovery creates a new epoch.
+/// platform effects. Stalled is emitted once per loss episode, but never blocks
+/// a later proven CURRENT reserve from taking over without a lifecycle restart.
 pub struct RedundantHealthMonitor {
     network_validated: bool,
     suppress_until_ms: u64,
@@ -63,6 +63,15 @@ impl RedundantHealthMonitor {
     pub fn network_changed(&mut self, now_ms: u64, validated: bool) {
         self.network_validated = validated;
         self.suppress_until_ms = now_ms.saturating_add(4_000);
+        if validated {
+            self.stalled_emitted = false;
+        }
+    }
+
+    /// A newly committed member can resolve a prior total-loss observation.
+    /// Preserve network validation and its stabilization deadline.
+    pub fn membership_changed(&mut self) {
+        self.stalled_emitted = false;
     }
 
     pub fn network_ready(&self, now_ms: u64) -> bool {
@@ -94,8 +103,7 @@ impl RedundantHealthMonitor {
     }
 
     pub fn evaluate(&mut self, now_ms: u64, slots: &[SlotObservation]) -> FailoverDecision {
-        if self.stalled_emitted
-            || !self.network_ready(now_ms)
+        if !self.network_ready(now_ms)
             || slots.is_empty()
             || slots.len() > 2
             || (slots.len() == 2 && slots[0].slot == slots[1].slot)
@@ -107,10 +115,14 @@ impl RedundantHealthMonitor {
             .iter()
             .find(|s| s.active)
             .expect("validated single active");
+        if self.primary_ready(now_ms, active) {
+            self.stalled_emitted = false;
+        }
         if !self.failed(now_ms, active) {
             return FailoverDecision::None;
         }
         if let Some(candidate) = slots.iter().find(|s| !s.active && self.usable(now_ms, s)) {
+            self.stalled_emitted = false;
             return FailoverDecision::SwitchTo(candidate.slot);
         }
         if slots.iter().any(|s| {
@@ -121,11 +133,14 @@ impl RedundantHealthMonitor {
         }) {
             return FailoverDecision::None;
         }
+        if self.stalled_emitted {
+            return FailoverDecision::None;
+        }
         self.stalled_emitted = true;
         FailoverDecision::Stalled
     }
 
-    fn usable(&self, now_ms: u64, slot: &SlotObservation) -> bool {
+    pub(super) fn usable(&self, now_ms: u64, slot: &SlotObservation) -> bool {
         self.primary_ready(now_ms, slot)
             && matches!(
                 slot.standby_probe_state,

@@ -324,6 +324,9 @@ use nelomai_unix_service::member_network::session::{NetworkPolicy, SessionNetwor
 use std::{collections::HashMap, io};
 #[derive(Default)]
 struct NetworkState {
+    registrations: Vec<(Slot, u32)>,
+    fail_registration: bool,
+    fail_close_binding: bool,
     values: HashMap<ResourceKey, NetworkValue>,
     read_only_routes: Vec<RouteValue>,
     writes: Vec<ResourceKey>,
@@ -335,6 +338,34 @@ struct NetworkState {
 }
 struct Network(Arc<Mutex<NetworkState>>);
 impl NetworkSystem for Network {
+    fn member_started(&mut self, slot: Slot, interface: u32) -> io::Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.fail_registration {
+            return Err(io::Error::other("binding write failed"));
+        }
+        state.registrations.push((slot, interface));
+        Ok(())
+    }
+    fn session_closed(&mut self) -> io::Result<()> {
+        let mut state = self.0.lock().unwrap();
+        if state.fail_close_binding {
+            return Err(io::Error::other("binding close failed"));
+        }
+        state.registrations.clear();
+        Ok(())
+    }
+    fn member_stopped(&mut self, slot: Slot, interface: u32) -> io::Result<()> {
+        let mut state = self.0.lock().unwrap();
+        assert!(!state
+            .values
+            .values()
+            .any(|v| matches!(v,NetworkValue::Route(r) if r.interface==interface)));
+        if state.fail_close_binding {
+            return Err(io::Error::other("binding close failed"));
+        }
+        state.registrations.retain(|p| *p != (slot, interface));
+        Ok(())
+    }
     fn dns_resources(
         &self,
         interface: u32,
@@ -494,6 +525,93 @@ fn dns_config() -> ParsedConfiguration {
     let mut c = config();
     c.dns = vec!["9.9.9.9".parse().unwrap()];
     c
+}
+
+#[test]
+fn bindings_are_sealed_before_routes_and_retained_until_cleanup_finishes() {
+    let (mut session, _, network) = network_setup();
+    session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    assert_eq!(network.lock().unwrap().registrations, vec![(Slot::A, 10)]);
+    session
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    assert_eq!(
+        network.lock().unwrap().registrations,
+        vec![(Slot::A, 10), (Slot::B, 20)]
+    );
+    network.lock().unwrap().fail_close_binding = true;
+    assert!(session.close(&scope()).is_err());
+    assert!(session.cleanup_pending());
+    network.lock().unwrap().fail_close_binding = false;
+    session.close(&scope()).unwrap();
+    assert!(!session.cleanup_pending());
+    assert!(network.lock().unwrap().registrations.is_empty());
+}
+
+#[test]
+fn failed_member_binding_does_not_publish_routes_but_keeps_native_cleanup() {
+    let (mut session, events, network) = network_setup();
+    network.lock().unwrap().fail_registration = true;
+    assert!(session
+        .start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .is_err());
+    assert!(session.active().is_none());
+    session.close(&scope()).unwrap();
+    assert!(events.lock().unwrap().calls.contains(&"stop A".into()));
+}
+
+#[test]
+fn removing_inactive_member_preserves_primary_routes_dns_and_native_lifetime() {
+    let (mut s, e, n) = network_setup();
+    s.start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    let original = n.lock().unwrap().values.clone();
+    s.add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    assert!(s.remove_standby(&scope(), Slot::A).is_err());
+    s.remove_standby(&scope(), Slot::B).unwrap();
+    assert_eq!(s.active(), Some(Slot::A));
+    assert_eq!(n.lock().unwrap().values, original);
+    assert_eq!(e.lock().unwrap().calls, ["start A", "start B", "stop B"]);
+    assert_eq!(n.lock().unwrap().registrations, [(Slot::A, 10)]);
+    s.add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    assert_eq!(s.active(), Some(Slot::A));
+}
+
+#[test]
+fn failed_reserve_start_can_be_cleaned_without_stopping_primary() {
+    let (mut s, e, _) = network_setup();
+    s.start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    e.lock().unwrap().fail_b_start = true;
+    assert!(s
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .is_err());
+    s.remove_standby(&scope(), Slot::B).unwrap();
+    assert_eq!(s.active(), Some(Slot::A));
+    assert_eq!(e.lock().unwrap().calls, ["start A", "start B", "stop B"]);
+}
+
+#[test]
+fn failed_reserve_binding_release_is_retained_and_retried_without_second_native_stop() {
+    let (mut s, e, n) = network_setup();
+    s.start_primary(&scope(), Slot::A, &dns_config(), probe(), policy())
+        .unwrap();
+    s.add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .unwrap();
+    n.lock().unwrap().fail_close_binding = true;
+    assert!(s.remove_standby(&scope(), Slot::B).is_err());
+    assert!(s.cleanup_pending());
+    assert!(s
+        .add_standby(&scope(), Slot::B, &dns_config(), probe(), physical())
+        .is_err());
+    n.lock().unwrap().fail_close_binding = false;
+    s.remove_standby(&scope(), Slot::B).unwrap();
+    assert!(!s.cleanup_pending());
+    assert_eq!(e.lock().unwrap().calls, ["start A", "start B", "stop B"]);
 }
 
 #[test]

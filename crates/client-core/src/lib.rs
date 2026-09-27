@@ -35,6 +35,10 @@ use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 mod connection_intent;
+#[cfg(not(target_os = "android"))]
+mod desktop_redundancy;
+#[cfg(not(target_os = "android"))]
+mod desktop_runtime;
 mod split_tunnel;
 
 /// Access-only runtime port. Implementations live in the common credential
@@ -215,6 +219,14 @@ pub enum ConnectionStartContract {
     Legacy,
     RecoveryV1,
     RecoveryV2,
+}
+
+#[derive(Clone, Copy)]
+struct StartPolicy {
+    contract: ConnectionStartContract,
+    reserve: bool,
+    #[cfg(not(target_os = "android"))]
+    desktop_pair: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1257,6 +1269,8 @@ pub struct ClientCore<A, S, T, L> {
     auth: Arc<dyn RuntimeAuthProvider>,
     state: Arc<Mutex<CoreState>>,
     intent_recovery_gate: Arc<Mutex<()>>,
+    #[cfg(not(target_os = "android"))]
+    desktop_sync_gate: Mutex<()>,
     recovered_native_transition: Mutex<Option<(CoreState, StartCancellationEpoch)>>,
     runtime_writers: Arc<RuntimeWriterGates>,
     start_cancel_epoch: Arc<AtomicU64>,
@@ -1321,6 +1335,8 @@ where
             auth,
             state: local.state.clone(),
             intent_recovery_gate: local.writers.intent.clone(),
+            #[cfg(not(target_os = "android"))]
+            desktop_sync_gate: Mutex::new(()),
             recovered_native_transition: Mutex::new(None),
             runtime_writers: local.writers.clone(),
             start_cancel_epoch: local.epoch.clone(),
@@ -1810,6 +1826,11 @@ where
         let Ok(stored) = self.load_runtime() else {
             return;
         };
+        if stored.desktop_redundancy.is_some() {
+            // The protected desktop pair already owns both configurations;
+            // bootstrap must not issue a legacy Start against either member.
+            return;
+        }
         let already_saved = stored
             .saved_connection
             .as_ref()
@@ -1951,8 +1972,12 @@ where
             options,
             now_unix,
             true,
-            ConnectionStartContract::Legacy,
-            false,
+            StartPolicy {
+                contract: ConnectionStartContract::Legacy,
+                reserve: false,
+                #[cfg(not(target_os = "android"))]
+                desktop_pair: false,
+            },
             cancel_epoch,
         )
         .await
@@ -1989,8 +2014,12 @@ where
             options,
             now_unix,
             true,
-            ConnectionStartContract::RecoveryV2,
-            reserve_enabled,
+            StartPolicy {
+                contract: ConnectionStartContract::RecoveryV2,
+                reserve: reserve_enabled,
+                #[cfg(not(target_os = "android"))]
+                desktop_pair: false,
+            },
             cancel_epoch,
         )
         .await
@@ -2055,13 +2084,42 @@ where
         now_unix: i64,
         cancel_epoch: StartCancellationEpoch,
     ) -> Result<Connection, CoreError> {
+        self.desktop_connection_intent_attempt_with_cancellation_epoch(
+            options,
+            now_unix,
+            false,
+            cancel_epoch,
+        )
+        .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn desktop_connection_intent_attempt_with_cancellation_epoch(
+        &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        reserve_enabled: bool,
+        cancel_epoch: StartCancellationEpoch,
+    ) -> Result<Connection, CoreError> {
         let _intent_recovery_guard = self.intent_recovery_gate.lock().await;
+        self.ensure_start_not_cancelled(cancel_epoch)?;
+        if reserve_enabled && !self.tunnel.desktop_redundancy_supported().await? {
+            return Err(TunnelError::Backend("desktop_redundancy_unsupported".into()).into());
+        }
+        self.ensure_start_not_cancelled(cancel_epoch)?;
         self.start_internal(
             options,
             now_unix,
             false,
-            ConnectionStartContract::RecoveryV1,
-            false,
+            StartPolicy {
+                contract: if reserve_enabled {
+                    ConnectionStartContract::RecoveryV2
+                } else {
+                    ConnectionStartContract::RecoveryV1
+                },
+                reserve: reserve_enabled,
+                desktop_pair: reserve_enabled,
+            },
             cancel_epoch,
         )
         .await
@@ -2072,10 +2130,11 @@ where
         options: ConnectOptions,
         now_unix: i64,
         allow_internal_retry: bool,
-        requested_contract: ConnectionStartContract,
-        requested_reserve_enabled: bool,
+        start_policy: StartPolicy,
         cancel_epoch: StartCancellationEpoch,
     ) -> Result<Connection, CoreError> {
+        let requested_contract = start_policy.contract;
+        let requested_reserve_enabled = start_policy.reserve;
         let options = options.normalized_for_layer();
         let total_started = Instant::now();
         self.ensure_start_not_cancelled(cancel_epoch)?;
@@ -2451,36 +2510,49 @@ where
         let configuration = TunnelConfiguration::new(response.configuration);
         let transport = configuration.transport();
         let local_start_started = Instant::now();
+        let local_start_request = TunnelStartRequest {
+            configuration,
+            options: tunnel_options.clone(),
+            quick_reconnect: match (is_redundant, valid_until_unix) {
+                (true, _) => QuickReconnect::Disabled,
+                (false, Some(valid_until_unix)) => QuickReconnect::Until(valid_until_unix),
+                (false, None) => QuickReconnect::Persistent,
+            },
+            // Android also needs these metadata for its redundant transaction
+            // and metadata-only tile template; offline reconnect stays disabled.
+            quick_connection: Some(QuickConnection {
+                lease_id: response.connection.lease_id.clone(),
+                layer: response.connection.layer,
+                tic_connection_mode: response.connection.tic_connection_mode,
+                route_mode: response.connection.route_mode,
+                egress_mode: response.connection.egress_mode,
+                allow_alternate: options.allow_alternate,
+            }),
+            redundancy: redundant_start,
+        };
+        #[cfg(not(target_os = "android"))]
+        let local_start_result = self
+            .start_local_desktop(
+                local_start_request,
+                &response.connection,
+                response.redundancy.as_ref(),
+                cancel_epoch,
+                start_policy.desktop_pair,
+            )
+            .await;
+        #[cfg(target_os = "android")]
         let local_start_result = self
             .tunnel
-            .start(TunnelStartRequest {
-                configuration,
-                options: tunnel_options.clone(),
-                quick_reconnect: match (is_redundant, valid_until_unix) {
-                    (true, _) => QuickReconnect::Disabled,
-                    (false, Some(valid_until_unix)) => QuickReconnect::Until(valid_until_unix),
-                    (false, None) => QuickReconnect::Persistent,
-                },
-                // Android also needs these metadata for its redundant transaction
-                // and metadata-only tile template; offline reconnect stays disabled.
-                quick_connection: Some(QuickConnection {
-                    lease_id: response.connection.lease_id.clone(),
-                    layer: response.connection.layer,
-                    tic_connection_mode: response.connection.tic_connection_mode,
-                    route_mode: response.connection.route_mode,
-                    egress_mode: response.connection.egress_mode,
-                    allow_alternate: options.allow_alternate,
-                }),
-                redundancy: redundant_start,
-            })
-            .await;
+            .start(local_start_request)
+            .await
+            .map_err(CoreError::from);
         if self.ensure_start_not_cancelled(cancel_epoch).is_err() {
             return Err(self
                 .compensate_cancelled_start(failed_start, FailedStartStage::Local)
                 .await);
         }
         if let Err(start_error) = local_start_result {
-            let error = CoreError::from(start_error);
+            let error = start_error;
             self.logger.record_timed(
                 CoreLogEvent {
                     kind: "connection.local_start_rejected",
@@ -2666,6 +2738,12 @@ where
         let current_state = self.state.lock().await.clone();
         let current = current_state.connection.clone();
         let stored = self.load_runtime();
+        if stored
+            .as_ref()
+            .is_ok_and(|state| state.desktop_redundancy.is_some())
+        {
+            return self.stop_desktop_locally(stored?).await;
+        }
         // Unknown starts and stalled recovery retain their existing reconciliation path.
         let Some(current) = current.filter(|_| {
             !stored
@@ -2722,6 +2800,7 @@ where
                                 .stop_redundant_connection(
                                     &access,
                                     &RedundantStopRequest {
+                                        retain_active_peer: false,
                                         operation_id: pending.operation_id,
                                         lease_id: pending.lease_id,
                                         recovery_contract_version: RecoveryContractV2,
@@ -2810,6 +2889,16 @@ where
         // Android's service owns its whole-session Stop (including cleanup).
         // A Stopping projection in Rust is not a second cleanup intent.
         self.require_core_stop_ownership().await?;
+        #[cfg(not(target_os = "android"))]
+        {
+            if self.load_runtime().is_ok_and(|stored| {
+                stored.desktop_redundancy.is_some() && stored.pending_compensation_stop.is_none()
+            }) {
+                let _split = self.split_tunnel_gate.lock().await;
+                let _connection = self.connection_gate.lock().await;
+                self.stop_desktop_locally(self.load_runtime()?).await?;
+            }
+        }
         if let Some(pending) = self
             .store
             .load()
@@ -3082,6 +3171,43 @@ where
         self.clear_pending_compensation_stop(&pending.operation_id, &pending.lease_id)
     }
 
+    /// Close only the protected original scope. A restarted cleanup-only helper
+    /// may have forgotten it, but neither an unknown status nor a newer pair is
+    /// authority to abandon cleanup or send an unscoped/fresh-scope Stop.
+    #[cfg(not(target_os = "android"))]
+    async fn close_desktop_pair(
+        &self,
+        scope: nelomai_client_tunnel::redundancy::SessionScope,
+    ) -> Result<(), CoreError> {
+        match self
+            .tunnel
+            .desktop_redundancy_command(
+                nelomai_client_tunnel::redundancy::protocol::Command::Stop {
+                    scope: scope.clone(),
+                },
+            )
+            .await
+        {
+            Ok(stopped) => {
+                if stopped.session.scope != scope
+                    || stopped.session.phase
+                        != nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped
+                    || stopped.cleanup_pending
+                {
+                    return Err(CoreError::Tunnel("redundancy_stop_pending".into()));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if self.tunnel.desktop_redundancy_absent().await? {
+                    Ok(())
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+    }
+
     async fn replay_pending_compensation_stop_without_connection(
         &self,
         pending: StoredPendingCompensationStop,
@@ -3089,7 +3215,26 @@ where
         let _split_guard = self.split_tunnel_gate.lock().await;
         let _guard = self.connection_gate.lock().await;
         self.set_phase(Phase::Stopping).await;
-        if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
+        #[cfg(not(target_os = "android"))]
+        // Detection must not prevent legacy local cleanup on unreadable storage.
+        // stop_if_unowned below still fences a live native pair.
+        let desktop_pair = self
+            .load_runtime()
+            .ok()
+            .and_then(|stored| stored.desktop_redundancy);
+        #[cfg(not(target_os = "android"))]
+        let desktop_stop = desktop_pair.is_some();
+        #[cfg(target_os = "android")]
+        let desktop_stop = false;
+        #[cfg(not(target_os = "android"))]
+        if let Some(pair) = desktop_pair {
+            if pending.redundant_session_id.as_deref() != Some(pair.session.session_id.as_str()) {
+                return Err(CoreError::Storage);
+            }
+            self.close_desktop_pair(desktop_redundancy::scope(&pair, self.load_runtime()?.slot)?)
+                .await?;
+        }
+        if !desktop_stop && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
             self.tunnel.stop_if_unowned().await?;
         }
         match self.api.reset_transport() {
@@ -3122,7 +3267,13 @@ where
             Ok(response) => response,
             Err(error) => {
                 // A transient panel outage does not undo the confirmed local stop.
-                if self.state.lock().await.phase == Phase::ServerUnavailable {
+                if self.state.lock().await.phase == Phase::ServerUnavailable
+                    || desktop_stop
+                        && self.load_runtime().is_ok_and(|current| {
+                            current.auth_scope == stored.auth_scope
+                                && current.pending_compensation_stop.as_ref() == Some(&pending)
+                        })
+                {
                     self.set_phase(Phase::Stopping).await;
                 }
                 self.logger.record(CoreLogEvent {
@@ -3666,8 +3817,12 @@ where
                 replacement_options,
                 now_unix,
                 false,
-                ConnectionStartContract::RecoveryV1,
-                false,
+                StartPolicy {
+                    contract: ConnectionStartContract::RecoveryV1,
+                    reserve: false,
+                    #[cfg(not(target_os = "android"))]
+                    desktop_pair: false,
+                },
                 cancel_epoch,
             )
             .await;
@@ -4369,6 +4524,15 @@ where
             return Ok(pending);
         }
         let mut stored = self.load_runtime()?;
+        if stored
+            .desktop_redundancy
+            .as_ref()
+            .is_some_and(|pair| pair.stop.is_some())
+        {
+            // A new desktop stop seals retention in the operation payload.
+            // Legacy response-acceptance migration must never change it.
+            return Ok(pending);
+        }
         let accepts_warm = current
             .map(stored_connection_accepts_warm)
             .unwrap_or_else(|| {
@@ -4411,6 +4575,18 @@ where
                 pending.operation_id == operation_id && pending.lease_id == lease_id
             })
         {
+            let session_id = stored
+                .pending_compensation_stop
+                .as_ref()
+                .and_then(|pending| pending.redundant_session_id.as_deref());
+            if session_id.is_some()
+                && stored
+                    .desktop_redundancy
+                    .as_ref()
+                    .is_some_and(|pair| Some(pair.session.session_id.as_str()) == session_id)
+            {
+                stored.desktop_redundancy = None;
+            }
             stored.pending_compensation_stop = None;
             self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         }
@@ -4420,6 +4596,9 @@ where
     #[cfg(not(target_os = "android"))]
     fn clear_pending_compensation_stop_if_absent(&self) -> Result<(), CoreError> {
         let mut stored = self.load_runtime()?;
+        if stored.desktop_redundancy.is_some() {
+            return Err(CoreError::Storage);
+        }
         if stored.pending_compensation_stop.take().is_some() {
             self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         }
@@ -5172,7 +5351,12 @@ where
                 )
                 .await;
         };
+        #[cfg(not(target_os = "android"))]
+        let retain_active_peer = self.desktop_stop_retention(access_token, pending).await?;
+        #[cfg(target_os = "android")]
+        let retain_active_peer = false;
         let request = RedundantStopRequest {
+            retain_active_peer,
             operation_id: pending.operation_id.clone(),
             lease_id: pending.lease_id.clone(),
             recovery_contract_version: RecoveryContractV2,

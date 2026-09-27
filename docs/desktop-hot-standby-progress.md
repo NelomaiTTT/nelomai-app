@@ -1,5 +1,67 @@
 # Desktop hot-standby — local implementation checkpoint
 
+## 2026-09-27 integration checkpoint (supersedes older partial checkpoints below)
+
+Local branch only. Shared helper driver/IPC, Unix and Windows factories, Core
+primary-first server orchestration, reserve lifecycle/role reconciliation,
+DesktopConnectionIntent recovery, immediate local Stop and negotiated last-active
+WARM are connected. Windows service composition is now wired locally; no host
+installation or feature operation has occurred. Parent cross-layer review and
+local automated verification are complete; this is not a hardware acceptance claim.
+
+Recent parent review fixes: exact durable cold-stop acceptance across storage
+failure/ACK-loss and worker races; persistent Unix journals and DNS-only recovery
+after a verified new boot; Windows old-boot cleanup without old PID/index/LUID
+replay, exact previous configuration CAS, terminal predecessor reuse across
+runtime updates, and empty-claim recovery preserving stopped predecessor configs.
+Retained cleanup cannot start/rebind old executables or write configuration.
+
+Windows guard loss is bounded helper fail-stop, **not continuous killswitch**.
+Both owned tunnels are stopped even if the UI is absent. Exact empty WFP state
+can finish cleanup only after native absence is confirmed; no filter reinstall
+or foreign-object deletion. See [Microsoft object lifetime](https://learn.microsoft.com/en-us/windows/win32/fwp/object-management).
+
+Mac launch proof uses a durable nonce/executable receipt plus kernel socket peer,
+process identity and environment proof. Definitely-not-spawned failures in the
+same invocation retire that receipt; nonzero exit/timeout/crash/absent socket do
+not. An ambiguous same-boot pre-capture crash remains fail-closed; new boot has
+separate cleanup-only recovery. No name-only process adoption.
+
+Final evidence (logs retained locally in worktree/.tmp, never committed):
+
+- `desktop-handoff-workspace.log`: full Rust workspace exit0, including doctests;
+  one pre-existing real-panel/loopback fixture explicitly ignored.
+- `desktop-handoff-final-clippy.log`: host workspace/all-targets exit0, warnings
+  denied. `desktop-final-windows-clippy.log`: native Windows MSVC/all-targets exit0
+  after removing obsolete blanket dead-code suppression. Windows portable fake
+  suites also pass in `desktop-final-windows-host-tests.log`.
+- `desktop-handoff-linux-clippy.log`: native Linux aarch64/all-targets exit0.
+- `desktop-frozen-frontend.log`:129 tests, Svelte0errors/0warnings, build pass.
+- `desktop-packaging-tests-bundled.log`:22 packaging/staging tests;32 shared
+  Python wire fixtures pass (`desktop-python-contracts.log`).
+- `desktop-android-final-check.log`: core/application Android aarch64 compile
+  pass using the existing NDK. New desktop-only code is cfg-excluded. Three
+  pre-existing stalled-recovery warnings remain; this is not an APK test or an
+  Android Clippy-Dwarnings claim. No SDK installation or device changes.
+
+Added a composed SessionControl/driver/native-fake lifecycle test:
+primary-first → standby ready → autonomous B promotion → network change →
+Stop/WARM B → fresh scoped Start with a new reserve. A late previous Stop has no
+effect on the new pair. Complementary Core/API tests verify the WARM request,
+role reconciliation and durable retry; no live panel was contacted.
+
+One earlier full run timed out while the dispatcher-death fixture was setting up
+(before persisted-tunnel appeared). The original cause is **not established**:
+isolated and five complete22-test repeats passed. Test-only progress/early-exit
+diagnostics and exact owned-child RAII cleanup were added; production behavior
+and timeout budgets were not changed. The final complete run passed. Earlier
+cancelled runs and the concurrent-edit doctest failure are not final evidence.
+
+Remaining acceptance boundaries: same-VIP packets, actual OS upgrades/reboot,
+power-loss timing and BFE restart require native tests. Linux pair DNS requires
+a supported systemd-resolved stub/static mode, not arbitrary resolv.conf or
+openresolv. Keep this branch local until authorized hardware/install/publication.
+
 2026-09-26, existing branch `codex/desktop-redundant-warm`, base6b8aa90.
 User approved the design and immediate implementation after the plan. No further
 permission to begin is required. This checkpoint is NOT feature completion.

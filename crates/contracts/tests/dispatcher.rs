@@ -411,6 +411,11 @@ fn dispatcher_status_and_version_do_not_launch_or_modify_engine_state() {
 
 #[cfg(unix)]
 fn process_fixture() -> (TempDir, SigningKey) {
+    process_fixture_with_idle(false, false)
+}
+
+#[cfg(unix)]
+fn process_fixture_with_idle(supports_idle: bool, invalid_tick_ack: bool) -> (TempDir, SigningKey) {
     let (directory, key) = fixture();
     let engine = br##"#!/usr/bin/python3
 import json,struct,sys,os,fcntl,time,signal
@@ -421,7 +426,7 @@ while True:
     size=sys.stdin.buffer.read(4)
     if not size: break
     value=json.loads(sys.stdin.buffer.read(struct.unpack('<I',size)[0]))
-    if value.get('command')=='primitive':
+    if value.get('command')=='primitive' or value.get('dispatcher_control')=='tick':
         data=json.dumps({'engine_primitive':'rebind_service'}).encode()
         sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
         size=sys.stdin.buffer.read(4)
@@ -436,7 +441,12 @@ while True:
             os._exit(0)
         open(root+'/persisted-tunnel','w').write('needs recovery')
         time.sleep(60)
-    if value.get('dispatcher_control')=='ready': reply={'engine_ready':True}
+    if value.get('dispatcher_control')=='ready':
+        reply={'engine_ready':True}
+        if SUPPORTS_IDLE: reply['supports_idle_tick']=True
+    elif value.get('dispatcher_control')=='tick':
+        reply={'engine_tick':True}
+        if INVALID_TICK_ACK: reply['extra']=True
     elif value.get('dispatcher_control')=='stop':
         if os.path.exists(root+'/persisted-tunnel'): os.unlink(root+'/persisted-tunnel')
         reply={'engine_stopped':True}
@@ -444,6 +454,17 @@ while True:
     data=json.dumps(reply).encode()
     sys.stdout.buffer.write(struct.pack('<I',len(data))+data); sys.stdout.buffer.flush()
 "##;
+    let engine = String::from_utf8(engine.to_vec())
+        .unwrap()
+        .replace(
+            "SUPPORTS_IDLE",
+            if supports_idle { "True" } else { "False" },
+        )
+        .replace(
+            "INVALID_TICK_ACK",
+            if invalid_tick_ack { "True" } else { "False" },
+        );
+    let engine = engine.as_bytes();
     fs::write(
         directory
             .path()
@@ -465,6 +486,135 @@ while True:
     )
     .unwrap();
     (directory, key)
+}
+
+#[cfg(unix)]
+#[test]
+fn idle_tick_negotiates_broker_without_launching_or_changing_old_engines() {
+    for supports_idle in [false, true] {
+        let (source, key) = process_fixture_with_idle(supports_idle, false);
+        let target = tempfile::tempdir().unwrap();
+        let installation = Installation::for_owner(
+            target.path(),
+            key.verifying_key().to_bytes(),
+            "macos",
+            "aarch64",
+            current_owner(),
+        );
+        installation
+            .install(
+                source.path(),
+                &std::env::current_exe().unwrap(),
+                "501",
+                &RealInstallIo,
+            )
+            .unwrap();
+        let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
+        let identity = dispatcher.layout.identity.clone();
+        let calls = std::cell::Cell::new(0);
+        let mut primitive = |action, _: &Path| {
+            assert!(matches!(action, EnginePrimitive::RebindService));
+            calls.set(calls.get() + 1);
+            Ok(())
+        };
+        dispatcher.idle_tick(&mut primitive).unwrap();
+        assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
+        assert!(
+            dispatcher
+                .handle(
+                    DispatcherRequest::Start {
+                        contract_version: 1,
+                        identity: identity.clone()
+                    },
+                    &mut primitive
+                )
+                .ok
+        );
+        assert_eq!(dispatcher.supports_idle_tick(), supports_idle);
+        dispatcher.idle_tick(&mut primitive).unwrap();
+        assert_eq!(calls.get(), usize::from(supports_idle));
+        if supports_idle {
+            let lock = MutationGuard::acquire(target.path()).unwrap();
+            assert!(dispatcher.idle_tick(&mut primitive).is_err());
+            drop(lock);
+            dispatcher.idle_tick(&mut primitive).unwrap();
+            assert_eq!(calls.get(), 2);
+        }
+        assert!(
+            dispatcher
+                .handle(
+                    DispatcherRequest::Stop {
+                        contract_version: 1,
+                        identity
+                    },
+                    &mut primitive
+                )
+                .ok
+        );
+        let before = calls.get();
+        dispatcher.idle_tick(&mut primitive).unwrap();
+        assert_eq!(calls.get(), before);
+        assert!(!target.path().join(ACTIVE_ENGINE_NAME).exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_idle_tick_ack_fences_channel() {
+    let (source, key) = process_fixture_with_idle(true, true);
+    let target = tempfile::tempdir().unwrap();
+    let installation = Installation::for_owner(
+        target.path(),
+        key.verifying_key().to_bytes(),
+        "macos",
+        "aarch64",
+        current_owner(),
+    );
+    installation
+        .install(
+            source.path(),
+            &std::env::current_exe().unwrap(),
+            "501",
+            &RealInstallIo,
+        )
+        .unwrap();
+    let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
+    let identity = dispatcher.layout.identity.clone();
+    let mut primitive = |_, _: &Path| Ok(());
+    assert!(
+        dispatcher
+            .handle(
+                DispatcherRequest::Start {
+                    contract_version: 1,
+                    identity: identity.clone()
+                },
+                &mut primitive
+            )
+            .ok
+    );
+    assert!(dispatcher.idle_tick(&mut primitive).is_err());
+    assert!(
+        !dispatcher
+            .handle(
+                DispatcherRequest::Start {
+                    contract_version: 1,
+                    identity: identity.clone()
+                },
+                &mut primitive
+            )
+            .ok
+    );
+    assert!(
+        dispatcher
+            .handle(
+                DispatcherRequest::Stop {
+                    contract_version: 1,
+                    identity
+                },
+                &mut primitive
+            )
+            .ok
+    );
 }
 
 #[cfg(unix)]
@@ -549,6 +699,8 @@ fn dispatcher_death_fixture_entry() {
     let Some(root) = std::env::var_os("NELOMAI_TEST_OWNED_DISPATCHER_ROOT") else {
         return;
     };
+    let progress = Path::new(&root).join("fixture-progress");
+    fs::write(&progress, "entered").unwrap();
     let installation = Installation::for_owner(
         Path::new(&root),
         SigningKey::from_bytes(&[81; 32]).verifying_key().to_bytes(),
@@ -557,6 +709,7 @@ fn dispatcher_death_fixture_entry() {
         current_owner(),
     );
     let mut dispatcher = ProcessDispatcher::new(installation).unwrap();
+    fs::write(&progress, "dispatcher-created").unwrap();
     let identity = if std::env::var_os("NELOMAI_TEST_STABLE").is_some() {
         dispatcher
             .installation
@@ -566,6 +719,7 @@ fn dispatcher_death_fixture_entry() {
     } else {
         dispatcher.layout.identity.clone()
     };
+    fs::write(&progress, "identity-selected").unwrap();
     assert!(
         dispatcher
             .handle(
@@ -577,6 +731,7 @@ fn dispatcher_death_fixture_entry() {
             )
             .ok
     );
+    fs::write(&progress, "engine-ready").unwrap();
     let _ = dispatcher.relay(
         &encode_frame(&json!({"command":"hang"})).unwrap(),
         &mut |_, _| Ok(()),
@@ -586,6 +741,15 @@ fn dispatcher_death_fixture_entry() {
 #[cfg(unix)]
 #[test]
 fn dispatcher_death_terminates_hung_owned_tree_and_recovers_persisted_state() {
+    // A failed assertion must release the exact owned dispatcher handle so its
+    // process guardian also terminates the synthetic descendants.
+    struct OwnedFixture(std::process::Child);
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
     for stable in [false, true] {
         let (source, key) = if stable {
             two_slot_process_fixture()
@@ -612,23 +776,30 @@ fn dispatcher_death_terminates_hung_owned_tree_and_recovers_persisted_state() {
         if stable {
             command.env("NELOMAI_TEST_STABLE", "1");
         }
-        let mut owner = command
-            .args(["--exact", "dispatcher_death_fixture_entry"])
-            .env("NELOMAI_TEST_OWNED_DISPATCHER_ROOT", target.path())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut owner = OwnedFixture(
+            command
+                .args(["--exact", "dispatcher_death_fixture_entry", "--nocapture"])
+                .env("NELOMAI_TEST_OWNED_DISPATCHER_ROOT", target.path())
+                .spawn()
+                .unwrap(),
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !target.path().join("persisted-tunnel").exists() {
+            let progress = fs::read_to_string(target.path().join("fixture-progress"))
+                .unwrap_or_else(|_| "not-entered".into());
+            assert!(
+                owner.0.try_wait().unwrap().is_none(),
+                "fixture exited before hung operation: stable={stable}, stage={progress}"
+            );
             assert!(
                 std::time::Instant::now() < deadline,
-                "fixture never entered its hung operation"
+                "fixture never entered its hung operation: stable={stable}, stage={progress}"
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(MutationGuard::at(&target.path().join("engine-owner.lock")).is_err());
-        owner.kill().unwrap(); // exact owned dispatcher handle, no PID-file adoption
-        owner.wait().unwrap();
+        owner.0.kill().unwrap(); // exact owned dispatcher handle, no PID-file adoption
+        owner.0.wait().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Ok(lease) = MutationGuard::at(&target.path().join("engine-owner.lock")) {

@@ -27,6 +27,9 @@ impl ProbeTicket {
     pub fn deadline_ms(self) -> u64 {
         self.deadline_ms
     }
+    pub fn started_ms(self) -> u64 {
+        self.started_ms
+    }
 }
 
 #[derive(Debug, Default)]
@@ -99,6 +102,18 @@ impl ProbeSchedule {
         self.in_flight = [None, None];
         self.next_standby_ms = None;
         self.cancelled.clear();
+    }
+
+    /// Native disappearance can precede a DNS timeout. Start a fresh reserve
+    /// check using the same phased cadence and cancel pre-incident evidence.
+    pub fn suspect_active(&mut self, now_ms: u64) {
+        if self.stopped || self.next_standby_ms.is_some() {
+            return;
+        }
+        if let Some(old) = self.in_flight[self.active.other().index()].take() {
+            self.cancelled.push(old);
+        }
+        self.next_standby_ms = Some(now_ms.saturating_add(PHASE_MS));
     }
 
     pub fn poll(&mut self, now_ms: u64) -> ProbeBatch {

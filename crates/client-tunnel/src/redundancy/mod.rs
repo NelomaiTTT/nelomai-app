@@ -1,12 +1,18 @@
 //! Shared desktop redundancy policy. Native ownership and I/O belong to helpers.
 
+pub mod control;
 mod dns_probe;
+pub mod driver;
+pub mod engine_channel;
+pub mod evidence;
 mod health;
 pub mod network;
 mod probe_socket;
 mod probes;
+pub mod protocol;
 pub mod route_plan;
 mod scope;
+pub mod session;
 pub use scope::SessionScope;
 
 pub use dns_probe::{DnsProbe, ProbeDatagram, ProbePoll};

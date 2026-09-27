@@ -1,4 +1,5 @@
 //! Durable userspace identity. A name alone never authorizes adoption/cleanup.
+use super::macos_launch::{LaunchFailure, LaunchReceipt, VerifiedLaunch};
 use super::redundancy::SocketIdentity;
 use crate::member_network::journal::ScopedJournal;
 use nelomai_client_tunnel::redundancy::SessionScope;
@@ -21,7 +22,7 @@ pub(super) struct UserspaceIdentity {
     pub socket: SocketIdentity,
 }
 impl UserspaceIdentity {
-    fn valid(&self) -> bool {
+    pub(super) fn valid(&self) -> bool {
         !self.boot.is_empty()
             && self.boot.len() <= 128
             && !self.boot.chars().any(char::is_control)
@@ -41,7 +42,7 @@ struct Record {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Phase {
-    Starting(MemberTransport),
+    Starting(LaunchReceipt),
     Owned {
         transport: MemberTransport,
         identity: UserspaceIdentity,
@@ -75,7 +76,9 @@ impl MemberOwner {
             ScopedJournal::<Record>::open_named(root, scope.clone(), uid, "redundant-member.json")?;
         let record = store.load()?;
         if record.as_ref().is_some_and(|r| {
-            r.slot != slot || matches!(&r.phase, Phase::Owned { identity, .. } if !identity.valid())
+            r.slot != slot
+                || matches!(&r.phase, Phase::Owned { identity, .. } if !identity.valid())
+                || matches!(&r.phase, Phase::Starting(receipt) if !receipt.valid())
         }) {
             return Err(invalid());
         }
@@ -94,9 +97,38 @@ impl MemberOwner {
         self.state = Some(state);
         Ok(())
     }
-    pub(super) fn begin(&mut self, transport: MemberTransport) -> io::Result<()> {
+    pub(super) fn begin(&mut self, receipt: LaunchReceipt) -> io::Result<()> {
         self.ensure_fresh()?;
-        self.save(Phase::Starting(transport))
+        if !receipt.valid() {
+            return Err(invalid());
+        }
+        self.save(Phase::Starting(receipt))
+    }
+    /// Outer errors are journal/ownership failures; inner errors retain the
+    /// launcher's original error. This closure runs once, only after a fresh
+    /// begin. No retirement capability escapes to recovery or a later attempt.
+    pub(super) fn launch_attempt<T, E>(
+        &mut self,
+        receipt: LaunchReceipt,
+        launch: impl FnOnce(&LaunchReceipt) -> Result<T, LaunchFailure<E>>,
+    ) -> io::Result<Result<T, E>> {
+        self.begin(receipt.clone())?;
+        match launch(&receipt) {
+            Ok(value) => Ok(Ok(value)),
+            Err(LaunchFailure::SpawnedOrUnknown(error)) => Ok(Err(error)),
+            Err(LaunchFailure::NotSpawned(error)) => {
+                // Never use mere absence as evidence. Verify both the live
+                // attempt and its still-current durable receipt before saving.
+                if self.receipt() != Some(&receipt)
+                    || !matches!(self.store.load()?, Some(Record {slot, phase:Phase::Starting(saved)})
+                        if slot == self.slot && saved == receipt)
+                {
+                    return Err(invalid());
+                }
+                self.save(Phase::Closed)?;
+                Ok(Err(error))
+            }
+        }
     }
     pub(super) fn ensure_fresh(&self) -> io::Result<()> {
         if self.cleanup_pending() {
@@ -108,18 +140,76 @@ impl MemberOwner {
     pub(super) fn cleanup_pending(&self) -> bool {
         matches!(self.state, Some(Phase::Starting(_) | Phase::Owned { .. }))
     }
+    pub(super) fn receipt(&self) -> Option<&LaunchReceipt> {
+        match &self.state {
+            Some(Phase::Starting(receipt)) => Some(receipt),
+            _ => None,
+        }
+    }
+    /// The caller supplies a newly read kernel boot UUID, never journal text.
+    /// A different boot retires only an uncaptured launch: no old interface or
+    /// socket is inspected/deleted. This says nothing about persistent DNS,
+    /// files or pair network journals; their scoped cleanup remains separate.
+    pub(super) fn retire_starting_after_boot(&mut self, current_boot: &str) -> io::Result<bool> {
+        if !valid_boot_uuid(current_boot) {
+            return Err(invalid());
+        }
+        let Some(receipt) = self.receipt() else {
+            return Ok(false);
+        };
+        if !valid_boot_uuid(&receipt.boot) {
+            return Err(invalid());
+        }
+        if receipt.boot.eq_ignore_ascii_case(current_boot) {
+            return Ok(false);
+        }
+        // save updates memory only after persistence succeeds. A write failure
+        // retains Starting authority and stops the caller before any effects.
+        self.save(Phase::Closed)?;
+        Ok(true)
+    }
+    pub(super) fn capture_proven(
+        &mut self,
+        proof: VerifiedLaunch,
+        cleanup_only: bool,
+    ) -> io::Result<()> {
+        let identity = proof.into_identity(self.receipt().ok_or_else(invalid)?)?;
+        self.capture_identity(identity, cleanup_only)
+    }
+    #[cfg(test)]
     pub(super) fn capture(&mut self, identity: UserspaceIdentity) -> io::Result<()> {
+        self.capture_identity(identity, false)
+    }
+    fn capture_identity(
+        &mut self,
+        identity: UserspaceIdentity,
+        cleanup_only: bool,
+    ) -> io::Result<()> {
         if !identity.valid() {
             return Err(invalid());
         }
-        let Some(Phase::Starting(transport)) = self.state else {
+        let Some(receipt) = self.receipt() else {
             return Err(invalid());
         };
-        self.save(Phase::Owned {
+        if identity.boot != receipt.boot {
+            return Err(invalid());
+        }
+        let transport = receipt.transport;
+        let saved = self.save(Phase::Owned {
             transport,
-            identity,
-            stopping: false,
-        })
+            identity: identity.clone(),
+            stopping: cleanup_only,
+        });
+        if saved.is_err() {
+            // Durable Starting can be re-proven after a crash. Keep live proof
+            // even if the first Owned write fails, but grant cleanup only.
+            self.state = Some(Phase::Owned {
+                transport,
+                identity,
+                stopping: true,
+            });
+        }
+        saved
     }
     pub(super) fn identity(&self) -> Option<&UserspaceIdentity> {
         match &self.state {
@@ -211,4 +301,17 @@ impl MemberOwner {
 }
 fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "member_owner_mismatch")
+}
+
+fn valid_boot_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                *b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+        && bytes.iter().any(|b| *b != b'0' && *b != b'-')
 }

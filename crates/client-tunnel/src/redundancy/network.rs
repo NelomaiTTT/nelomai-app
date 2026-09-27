@@ -11,6 +11,11 @@ use std::{collections::HashSet, io, net::IpAddr};
 pub enum RouteScope {
     Global,
     Member(u32),
+    /// Windows route-table key includes the interface. This is globally visible,
+    /// NOT an interface-bound probe route: only the guarded Windows owner may
+    /// use it. Stable keys let a promotion update metrics without deleting a
+    /// different logical row that aliases the same native destination/interface.
+    WindowsInterface(u32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,7 +111,7 @@ impl NetworkValue {
                         .is_none_or(|g| g.is_ipv4() == r.destination.addr().is_ipv4())
                     && match r.scope {
                         RouteScope::Global => true,
-                        RouteScope::Member(i) => i == r.interface,
+                        RouteScope::Member(i) | RouteScope::WindowsInterface(i) => i == r.interface,
                     }
             }
             Self::Dns(d) => {
@@ -120,6 +125,21 @@ impl NetworkValue {
 }
 
 pub trait NetworkSystem {
+    /// Native identity was captured by the privileged member owner. Seal any
+    /// platform table binding before generating route/rule/DNS resources.
+    fn member_started(&mut self, _slot: Slot, _interface: u32) -> io::Result<()> {
+        Ok(())
+    }
+    /// Release this binding only after the exact native member and its routes
+    /// are gone. A failed release remains retryable and never releases a sibling.
+    fn member_stopped(&mut self, _slot: Slot, _interface: u32) -> io::Result<()> {
+        Ok(())
+    }
+    /// Invoked only AFTER both native members and all owned network resources
+    /// are absent. A binding journal may now release its exact reservations.
+    fn session_closed(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     /// Pure platform expansion for the active member only. An inactive reserve
     /// must not acquire resolver ownership merely because its interface exists.
     fn dns_resources(
@@ -191,6 +211,68 @@ pub struct NetworkJournal {
     stopping: bool,
 }
 
+impl NetworkJournal {
+    /// Only the Windows factory, after proving a different boot, may retire
+    /// these nonpersistent IP Helper route rows without querying reused indices.
+    /// Never discard a saved baseline, global DNS, or another platform's state.
+    pub fn windows_boot_resources_are_ephemeral(&self) -> bool {
+        validate_entries(&self.owned).is_ok()
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|pending| validate_entries(&pending.target).is_ok())
+            && self
+                .owned
+                .iter()
+                .chain(self.pending.iter().flat_map(|p| &p.target))
+                .all(|entry| {
+                    entry.original.is_none()
+                        && matches!(
+                            entry.current,
+                            NetworkValue::Route(RouteValue {
+                                scope: RouteScope::WindowsInterface(_),
+                                ..
+                            })
+                        )
+                })
+    }
+    /// Cleanup-only projection for a trusted Unix factory which has proved a
+    /// different OS boot. Native links, routes and per-link resolver state from
+    /// that boot no longer confer authority; persistent service DNS still does.
+    /// Never use this to skip cleanup within the same boot or on Windows.
+    pub fn persistent_dns_cleanup(&self) -> io::Result<Self> {
+        validate_entries(&self.owned)?;
+        if let Some(pending) = &self.pending {
+            validate_entries(&pending.target)?;
+        }
+        let dns = |entries: &[Entry]| {
+            entries
+                .iter()
+                .filter(|entry| matches!(entry.current, NetworkValue::Dns(_)))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let owned = dns(&self.owned);
+        let target = self
+            .pending
+            .as_ref()
+            .map(|pending| dns(&pending.target))
+            .unwrap_or_else(|| owned.clone());
+        // Also reconcile a previous restoration whose ACK was lost. A value
+        // equal to the saved baseline needs no write; a foreign value is never
+        // restored over. Existing pending cleanup supplies that exact CAS logic.
+        Ok(Self {
+            owned,
+            active: None,
+            pending: Some(Pending {
+                target,
+                active: None,
+            }),
+            stopping: true,
+        })
+    }
+}
+
 pub struct NetworkOwner<B, S> {
     system: B,
     store: S,
@@ -235,6 +317,48 @@ impl<B: NetworkSystem, S: NetworkJournalStore> NetworkOwner<B, S> {
     }
     pub fn has_resources(&self) -> bool {
         !self.journal.owned.is_empty() || self.journal.pending.is_some()
+    }
+    /// Exact committed/pending route values, for owner-scoped physical-row
+    /// exclusion. Keep before/after metadata at the same key distinct; never
+    /// exclude a foreign row merely because its destination matches. No IO.
+    pub fn excluded_routes(&self) -> Vec<RouteValue> {
+        let mut seen = HashSet::new();
+        self.journal
+            .owned
+            .iter()
+            .chain(self.journal.pending.iter().flat_map(|p| p.target.iter()))
+            .filter_map(|entry| match &entry.current {
+                NetworkValue::Route(route)
+                    if seen.insert((
+                        route.destination,
+                        route.scope,
+                        route.interface,
+                        route.gateway,
+                        route.metric,
+                    )) =>
+                {
+                    Some(route.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    /// Read-only input to physical-uplink discovery. Never trust an app-provided
+    /// exclusion of rows: include both committed and pending owned routes.
+    pub fn owned_route_destinations(&self) -> Vec<IpNet> {
+        let mut routes = self
+            .journal
+            .owned
+            .iter()
+            .chain(self.journal.pending.iter().flat_map(|p| p.target.iter()))
+            .filter_map(|e| match &e.current {
+                NetworkValue::Route(r) => Some(r.destination),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        routes.sort();
+        routes.dedup();
+        routes
     }
     pub fn system_mut(&mut self) -> &mut B {
         &mut self.system

@@ -96,17 +96,14 @@ and failure accounting cannot be skipped. Slot enum A/B prevents invalid indexin
 
 ### Task 2: Platform slot/data-route ownership
 
-Status: **in progress**, not complete. Low-level independently named member
-backends/SCM primitives, common route/DNS transactions, bound probes, Unix native
-composition and macOS physical policy discovery are implemented. Mac private
-pair factory and captured native identity cleanup recovery added. Linux route/rule
-adapter and member-only loose RPF added, bound-rule resources connected to the
-session planner with primary-first registration. Addressed Windows NT/UAPI
-metrics added. Mac host, Windows MSVC and Linux GNU cross-checks now pass.
-Linux resolver/factory, Windows network adapter/recovery, launch crash-gap
-handling, engine wiring and full lifecycle
-integration still required before enabling this path. Same-VIP packet behavior
-is not proven by the fake tests.
+Status27.09: local native composition is implemented for all three platforms.
+Independent member identities, route/DNS journals, scoped probes, physical
+network discovery/rebind, interrupted-operation recovery, Windows WFP integrity
+fail-stop and persistent reboot cleanup are connected to the helper factories.
+The final compile/fake-test evidence and limitations are recorded below and in
+the progress ledger. Same-VIP packet behavior is not proven by fake tests.
+Mac ambiguous same-boot pre-capture crashes remain fail-closed, not guessed
+process adoption. Windows periodic guard-loss detection is not a killswitch.
 See `docs/desktop-hot-standby-progress.md` for evidence and remaining gates.
 
 **Files:** Existing Unix/Windows backend/routes/install modules; create each platform's `redundancy.rs` adapter and fake route/process tests adjacent to platform modules.
@@ -117,20 +114,20 @@ Produce session-scoped backend operations `start_slot`, `stop_slot`, `probe_slot
 the same typed local ownership key (runtime namespace + session id + generation).
 Keep configuration/keys redacted and bounded, separate slot runtime paths.
 
-- [ ] Step1: Add failing fake-backend lifecycle tests: starting B never invokes A
+- [x] Step1: Add failing fake-backend lifecycle tests: starting B never invokes A
   stop or global DNS restore; probe B cannot use A egress; routes cover IPv4/IPv6.
   Exact fake events after B start must exclude `stop(A)`/`restore_dns`.
-- [ ] Step2: Implement Unix interface naming and independent runtime state, extract
+- [x] Step2: Implement Unix interface naming and independent runtime state, extract
   slot operations from singleton orchestration without changing single behavior.
   One owned route/DNS transaction installs active routes and both endpoint bypasses.
-- [ ] Step3: Implement Windows slot-specific config/service/interface identities;
+- [x] Step3: Implement Windows slot-specific config/service/interface identities;
   TableOff suppresses native route/default filtering, DNS handled by common owner.
   Validate that configured VIP can be retained across selected-member switching;
   no silent fallback to sequential reconnect. If pinned backend prevents correct
   same-VIP/slot-probe isolation, record concrete evidence before redesigning adapter.
-- [ ] Step4: Test partial start/switch/stop failure and restart with exact owned
+- [x] Step4: Test partial start/switch/stop failure and restart with exact owned
   state; preserve foreign routes and interfaces. Failed switch must not publish B.
-- [ ] Step5: Run full Unix/Windows crate suites plus cfg-specific compilation where
+- [x] Step5: Run full Unix/Windows crate suites plus cfg-specific compilation where
   toolchains exist. Report unsupported cross target separately, never as passed.
   Commit independently reviewable platform adapter changes.
 
@@ -143,16 +140,16 @@ generation, active slot, installed members, role/membership generations, Stop ph
 Expose versioned StartRedundant, InstallStandby, StatusRedundant, StopRedundant
 and server-role acknowledgement, preserving existing request compatibility rules.
 
-- [ ] Step1: RED session tests for late observation/old role ACK, duplicate Start,
+- [x] Step1: RED session tests for late observation/old role ACK, duplicate Start,
   Stop-before-standby-install and failed native promotion. Active changes only after
   successful native select; Stop advances a fence before async work.
-- [ ] Step2: Implement one helper-owned lifecycle with durable scoped state and
+- [x] Step2: Implement one helper-owned lifecycle with durable scoped state and
   timer-driven probes independent of UI connection. Do not store panel credentials
   in generic transport configuration, command arguments or logs.
-- [ ] Step3: RED IPC tests for malformed scope, message bounds, old helper capability,
+- [x] Step3: RED IPC tests for malformed scope, message bounds, old helper capability,
   redaction and different runtime user. Implement additive capability negotiation
   and request validation; unsupported helper never drops redundancy silently.
-- [ ] Step4: Run service/session/IPC suites; fake-clock UI-disconnect test must
+- [x] Step4: Run service/session/IPC suites; fake-clock UI-disconnect test must
   still select usable B. Commit.
 
 ### Task 4: Desktop server lifecycle, quick actions and WARM
@@ -162,16 +159,16 @@ and server-role acknowledgement, preserving existing request compatibility rules
 **Interfaces:** Consume service session snapshots; reuse start_recovery_v2,
 report_redundant_role/acquire/release/commit/stop API types and existing durable operations.
 
-- [ ] Step1: RED test that reserve=true reaches helper as pair contract, not ordinary
+- [x] Step1: RED test that reserve=true reaches helper as pair contract, not ordinary
   start; primary success unblocks Running while standby API is deliberately pending.
-- [ ] Step2: Connect desktop intent generation to recovery-v2 and native capability;
+- [x] Step2: Connect desktop intent generation to recovery-v2 and native capability;
   standby API preparation runs asynchronously and fences each response.
-- [ ] Step3: RED tests A→B→Stop keeps B, releases A; full cleanup for logout/revoke/
+- [x] Step3: RED tests A→B→Stop keeps B, releases A; full cleanup for logout/revoke/
   runtime switch; old server without warm_stop_v1 uses full Stop.
-- [ ] Step4: Implement durable scoped Stop: first attempt before local shutdown,
+- [x] Step4: Implement durable scoped Stop: first attempt before local shutdown,
   control retry outside tunnel every10s, same operation id; only terminal ACK clears
   pending record. Unknown server role reconciles before choosing WARM member.
-- [ ] Step5: RED late old Stop ACK/new Start and crash-before-ACK; integrate existing
+- [x] Step5: RED late old Stop ACK/new Start and crash-before-ACK; integrate existing
   scheduler without a parallel retry loop. Run core/application/storage suites;
   verify ordinary single and Android unchanged. Commit.
 
@@ -181,15 +178,50 @@ report_redundant_role/acquire/release/commit/stop API types and existing durable
 
 **Interfaces:** Entire previous lifecycle; no new public API.
 
-- [ ] Step1: Add scripted fake integration Start→A traffic→B ready→A failed→B
+- [x] Step1: Add scripted fake integration Start→A traffic→B ready→A failed→B
   traffic→network change→Stop→WARM→Start fresh standby, with unique op/epoch fences.
-- [ ] Step2: Test failed candidate commit, stale membership, both transports unavailable,
+- [x] Step2: Test failed candidate commit, stale membership, both transports unavailable,
   helper crash recovery and UI close. Run `cargo test --workspace`, frontend checks
   and relevant Python contract tests. Every failure classified, not silently skipped.
-- [ ] Step3: Parent reviews diff/security/lifecycle against spec. Fix real regressions
+- [x] Step3: Parent reviews diff/security/lifecycle against spec. Fix real regressions
   via RED/GREEN; retain branch locally, no merge/push/install.
-- [ ] Step4: Record native build and packet-test gaps per OS. Hardware acceptance
+- [x] Step4: Record native build and packet-test gaps per OS. Hardware acceptance
   remains separate; do not report shared-only code as completed hot-standby.
+
+## 27.09 local integration verification record
+
+Checkboxes above describe implemented code and test coverage. Integration is kept
+as one local commit after the final suite, rather than per-task partial commits.
+No new subsystem, production change, installation, push or merge is authorized.
+
+- Tasks2/3: native platform factories and existing helper actors are wired.
+  Real SCM/IPHelper/WFP, Unix process/socket proofs, route/DNS journaling and
+  reboot cleanup are covered by injected native-I/O tests and target compilation.
+- Task4: Core runtime tests cover primary-first, reserve replacement, role ACK,
+  last-active WARM Stop, durable retries and cleanup races; App intent tests cover
+  total loss without converting reserve=true into an ordinary single Start.
+- Task5 scripted helper sequence:
+  `scripted_failover_network_stop_warm_restart_fences_the_previous_pair`.
+  It composes the real SessionControl/driver/probes/store with fake native I/O;
+  Core/API WARM/retry tests are complementary, not a live panel end-to-end test.
+- Frontend129 tests, Svelte0/0 and build;22 desktop package/staging tests and32
+  Python wire fixtures passed. Host, Linux aarch64 and Windows MSVC Clippy pass.
+  Android core/application aarch64 compile passes (three pre-existing stalled
+  recovery warnings; no claim of Android Clippy-Dwarnings or APK verification).
+- Final Rust workspace suite passed (exit0), including doctests, in
+  `.tmp/desktop-handoff-workspace.log`; the pre-existing real-panel fixture is
+  explicitly ignored because its separate panel/loopback harness was not run.
+  One earlier dispatcher fixture setup timeout did not reproduce in an isolated
+  run or five complete22-test repeats. Its original cause is not established.
+  Added test-only stage/exit diagnostics and exact child cleanup on assertion,
+  without extending timeouts or changing production process ownership.
+
+Native acceptance still required before release: both WG/AWG3 on all desktop
+OSes, same-VIP packets, outer UDP bypass, DNS/split routing, UI close, process
+crash, network switch, reboot/update and WARM reissue. Linux pair DNS currently
+requires a supported systemd-resolved stub/static mode. Windows guard loss uses
+bounded helper fail-stop, not a continuous killswitch; Mac ambiguous same-boot
+pre-capture process ownership fails closed rather than adopting by name.
 
 ## Plan self-review
 

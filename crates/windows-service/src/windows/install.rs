@@ -351,6 +351,13 @@ impl SlotServiceControl for NativeSlotServices<'_> {
     }
 
     fn start(&mut self, slot: TunnelSlot, transport: TunnelTransport) -> Result<(), ServiceError> {
+        // Never replace/adopt either transport by name. The scoped owner has
+        // already journaled Prepared; CreateService also refuses a raced name.
+        for candidate in [TunnelTransport::WireGuard, TunnelTransport::AmneziaWg3] {
+            if open_slot_service(slot, candidate, ServiceAccess::QUERY_STATUS)?.is_some() {
+                return Err(ServiceError::InvalidRequest);
+            }
+        }
         let path = slot_config_path(slot)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| platform_error("inspect slot configuration", error))?;
@@ -373,8 +380,8 @@ impl SlotServiceControl for NativeSlotServices<'_> {
         let manager =
             service_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
         let service = create_service(&manager, &spec)?;
-        // On any failure the exact slot remains owned by the engine, and its
-        // cleanup/retry can remove it. Never touch the active sibling here.
+        // The scoped owner retains Prepared on failure and must revalidate
+        // exact service/config evidence before cleanup. Never auto-stop here.
         service
             .set_config_service_sid_info(ServiceSidType::Unrestricted)
             .map_err(|error| platform_error("set slot service SID", error))?;
@@ -409,6 +416,25 @@ pub(crate) fn installation_directory() -> Result<PathBuf, ServiceError> {
     Ok(PathBuf::from(program_files)
         .join("Nelomai")
         .join("privileged"))
+}
+
+pub(super) fn open_slot_service(
+    slot: TunnelSlot,
+    transport: TunnelTransport,
+    access: ServiceAccess,
+) -> Result<Option<Service>, ServiceError> {
+    let manager = service_manager(ServiceManagerAccess::CONNECT)?;
+    match manager.open_service(slot_service_name(slot, transport), access) {
+        Ok(service) => Ok(Some(service)),
+        Err(windows_service::Error::Winapi(error))
+            if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            Ok(None)
+        }
+        Err(_) => Err(ServiceError::Backend(
+            "member_owner_native_unavailable".into(),
+        )),
+    }
 }
 
 pub(crate) fn open_tunnel_service() -> Result<Option<Service>, ServiceError> {

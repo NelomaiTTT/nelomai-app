@@ -67,6 +67,68 @@ fn route(destination: &str, interface: u32) -> NetworkValue {
     })
 }
 
+#[test]
+fn excluded_routes_retains_exact_committed_and_pending_rows_without_io() {
+    let mut a = route("203.0.113.7/32", 10);
+    if let NetworkValue::Route(r) = &mut a {
+        r.scope = RouteScope::WindowsInterface(10);
+    }
+    let mut b = a.clone();
+    if let NetworkValue::Route(r) = &mut b {
+        r.metric = 90;
+        r.gateway = Some("192.0.2.1".parse().unwrap());
+    }
+    let mut other = route("203.0.113.7/32", 20);
+    if let NetworkValue::Route(r) = &mut other {
+        r.scope = RouteScope::WindowsInterface(20);
+    }
+    let journal: NetworkJournal = serde_json::from_value(serde_json::json!({
+        "owned":[{"original":null,"current":a},{"original":null,"current":other}],
+        "active":"A", "stopping":false,
+        "pending":{"target":[{"original":null,"current":b},{"original":null,"current":other}],"active":"B"}
+    })).unwrap();
+    let mut owner = NetworkOwner::recover(System::default(), Journal::default(), journal).unwrap();
+    let rows = owner.excluded_routes();
+    assert_eq!(rows.len(), 3);
+    for value in [a, b, other] {
+        let NetworkValue::Route(row) = value else {
+            unreachable!()
+        };
+        assert!(rows.contains(&row));
+    }
+    assert_eq!(owner.system_mut().writes, 0);
+    assert!(owner.system_mut().values.is_empty());
+}
+
+#[test]
+fn windows_interface_routes_remain_distinct_and_update_in_place_on_role_change() {
+    let value = |interface, metric| {
+        serde_json::from_value::<NetworkValue>(serde_json::json!({"Route":{
+        "destination":"9.9.9.9/32", "scope":{"WindowsInterface":interface},"interface":interface,"gateway":null,"metric":metric
+    }})).unwrap()
+    };
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    owner
+        .select(Slot::A, vec![value(10, 1), value(20, 100)])
+        .unwrap();
+    owner
+        .select(Slot::B, vec![value(10, 100), value(20, 1)])
+        .unwrap();
+    assert_eq!(owner.system_mut().values.len(), 2);
+    assert_eq!(owner.system_mut().writes, 4);
+    let b = value(20, 1);
+    assert_eq!(owner.system_mut().read(&b.key()).unwrap(), Some(b));
+    owner.cleanup().unwrap();
+    assert!(owner.system_mut().values.is_empty());
+    let mut invalid = value(10, 1);
+    if let NetworkValue::Route(route) = &mut invalid {
+        route.interface = 20;
+    }
+    let mut owner = NetworkOwner::fresh(System::default(), Journal::default());
+    assert!(owner.select(Slot::A, vec![invalid]).is_err());
+    assert_eq!(owner.system_mut().writes, 0);
+}
+
 fn bound_rule() -> NetworkValue {
     NetworkValue::BoundRule(BoundRuleValue {
         ipv6: false,

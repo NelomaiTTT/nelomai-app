@@ -1,3 +1,4 @@
+use super::macos_launch::{self, LaunchFailure};
 use super::member_owner::{MemberOwner, MemberTransport, UserspaceIdentity};
 use super::redundancy::ResourceMode;
 use super::{
@@ -91,7 +92,7 @@ impl MacosBackend {
         amneziawg_go: PathBuf,
         root: &Path,
         mode: ResourceMode,
-        member_owner: Option<MemberOwner>,
+        mut member_owner: Option<MemberOwner>,
     ) -> Result<Self, ServiceError> {
         let runtime_directory = mode.runtime_path(root);
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
@@ -102,8 +103,23 @@ impl MacosBackend {
         };
         let mut active_transport = None;
         let mut member_socket = None;
-        let api = if let Some(owner) = &member_owner {
+        let api = if let Some(owner) = &mut member_owner {
             let boot = boot_identity()?;
+            owner
+                .retire_starting_after_boot(&boot)
+                .map_err(backend_error)?;
+            if let Some(receipt) = owner.receipt() {
+                let proof =
+                    macos_launch::prove(&runtime_directory, receipt).map_err(backend_error)?;
+                // Interrupted launch may only be reclaimed for cleanup. Never
+                // restore its configuration or adopt a live role from its name.
+                let captured = owner.capture_proven(proof, true);
+                if owner.identity().is_none() {
+                    captured.map_err(backend_error)?;
+                }
+                // If disk capture failed, retain the verified in-memory owner
+                // in a cleanup-only backend instead of dropping its authority.
+            }
             if let Some(transport) = owner
                 .recover(&boot, |saved| inspect_member(saved, &boot))
                 .map_err(backend_error)?
@@ -114,7 +130,11 @@ impl MacosBackend {
                     MemberTransport::WireGuard => TunnelTransport::WireGuard,
                     MemberTransport::AmneziaWg3 => TunnelTransport::AmneziaWg3,
                 });
-                Some(WGApi::<Userspace>::new(&identity.interface).map_err(backend_error)?)
+                if owner.stopping() {
+                    None
+                } else {
+                    Some(WGApi::<Userspace>::new(&identity.interface).map_err(backend_error)?)
+                }
             } else {
                 // A legacy/name-only remnant is not evidence of ownership.
                 if owner.identity().is_none()
@@ -200,25 +220,43 @@ impl MacosBackend {
         validate_runtime_directory(&self.runtime_directory)?;
 
         let mut native = build_backend_configuration(configuration)?;
-        if let Some(owner) = &mut self.member_owner {
-            owner
-                .begin(match configuration.transport {
-                    TunnelTransport::WireGuard => MemberTransport::WireGuard,
-                    TunnelTransport::AmneziaWg3 => MemberTransport::AmneziaWg3,
-                })
-                .map_err(backend_error)?;
-        }
         if self.mode.owns_network() {
             self.routes.apply(options)?;
             self.capture_dns()?;
         } else {
             native.interface.port = 0;
         }
-        let ifname = match launch_userspace_tunnel(
-            &executable,
-            &self.runtime_directory,
-            configuration.transport,
-        ) {
+        let launched = if let Some(owner) = &mut self.member_owner {
+            let receipt = macos_launch::new_receipt(
+                match configuration.transport {
+                    TunnelTransport::WireGuard => MemberTransport::WireGuard,
+                    TunnelTransport::AmneziaWg3 => MemberTransport::AmneziaWg3,
+                },
+                &executable,
+            )
+            .map_err(backend_error)?;
+            // Fresh begin and any no-child retirement are one live invocation;
+            // a loaded Starting receipt can never enter this path again.
+            owner
+                .launch_attempt(receipt, |receipt| {
+                    launch_userspace_tunnel(
+                        &receipt.executable,
+                        &self.runtime_directory,
+                        configuration.transport,
+                        Some(receipt),
+                    )
+                })
+                .map_err(backend_error)?
+        } else {
+            launch_userspace_tunnel(
+                &executable,
+                &self.runtime_directory,
+                configuration.transport,
+                None,
+            )
+            .map_err(LaunchFailure::into_error)
+        };
+        let ifname = match launched {
             Ok(ifname) => ifname,
             Err(error) => {
                 let _ = self.stop_inner();
@@ -238,12 +276,19 @@ impl MacosBackend {
         self.api = Some(api);
         if !self.mode.owns_network() {
             self.member_socket = Some(super::redundancy::capture_userspace_member(&ifname)?);
-            let identity = capture_member(&ifname, &boot_identity()?).map_err(backend_error)?;
-            self.member_owner
-                .as_mut()
-                .expect("member has owner")
-                .capture(identity)
-                .map_err(backend_error)?;
+            let owner = self.member_owner.as_mut().expect("member has owner");
+            let proof = macos_launch::prove(
+                &self.runtime_directory,
+                owner.receipt().expect("launch receipt"),
+            )
+            .map_err(backend_error)?;
+            owner.capture_proven(proof, false).map_err(backend_error)?;
+            if owner
+                .identity()
+                .is_none_or(|identity| identity.interface != ifname)
+            {
+                return Err(ServiceError::Backend("member_launch_unproven".into()));
+            }
         }
         if let Err(error) = save_endpoints(
             &self.runtime_directory.join(ENDPOINTS_STATE_FILE),
@@ -303,17 +348,20 @@ impl MacosBackend {
 
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
         if let Some(owner) = &mut self.member_owner {
-            // Capture may have failed on disk after native launch. The in-memory
-            // socket identity is still required before retrying that write.
-            if owner.interrupted_launch() {
-                let name = read_interface_name(&self.runtime_directory.join(INTERFACE_STATE_FILE))?;
-                let identity = capture_member(&name, &boot_identity()?).map_err(backend_error)?;
-                if self.member_socket != Some(identity.socket) {
-                    return Err(ServiceError::Backend("slot_recovery_requires_owner".into()));
-                }
-                owner.capture(identity).map_err(backend_error)?;
-            }
             let boot = boot_identity()?;
+            owner
+                .retire_starting_after_boot(&boot)
+                .map_err(backend_error)?;
+            if let Some(receipt) = owner.receipt() {
+                let proof =
+                    macos_launch::prove(&self.runtime_directory, receipt).map_err(backend_error)?;
+                // Failed persistence retains in-memory cleanup authority;
+                // stop_owned must still try native removal on that exact proof.
+                let captured = owner.capture_proven(proof, true);
+                if owner.identity().is_none() {
+                    return captured.map_err(backend_error);
+                }
+            }
             owner
                 .stop_owned(
                     &boot,
@@ -754,19 +802,30 @@ fn launch_userspace_tunnel(
     executable: &Path,
     runtime_directory: &Path,
     transport: TunnelTransport,
-) -> Result<String, ServiceError> {
+    receipt: Option<&macos_launch::LaunchReceipt>,
+) -> Result<String, LaunchFailure<ServiceError>> {
     let state_file = runtime_directory.join(INTERFACE_STATE_FILE);
-    remove_regular_file_if_present(&state_file).map_err(backend_error)?;
+    remove_regular_file_if_present(&state_file)
+        .map_err(|error| LaunchFailure::NotSpawned(backend_error(error)))?;
 
-    let status = status_with_timeout(
-        &mut userspace_tunnel_command(executable, &state_file, runtime_directory),
-        COMMAND_TIMEOUT,
-    )
-    .map_err(backend_error)?;
-    if !status.success() {
-        return Err(ServiceError::Backend(
-            userspace_start_error(transport, false).to_string(),
-        ));
+    let mut command = userspace_tunnel_command(executable, &state_file, runtime_directory);
+    if let Some(receipt) = receipt {
+        command.env(macos_launch::NONCE_ENV, &receipt.launch_nonce);
+        macos_launch::command_status(
+            &mut command,
+            COMMAND_TIMEOUT,
+            userspace_start_error(transport, false),
+        )
+        .map_err(|failure| failure.map(backend_error))?;
+    } else {
+        // Single backend keeps the original runner and exact error mapping.
+        let status = status_with_timeout(&mut command, COMMAND_TIMEOUT)
+            .map_err(|error| LaunchFailure::SpawnedOrUnknown(backend_error(error)))?;
+        if !status.success() {
+            return Err(LaunchFailure::SpawnedOrUnknown(ServiceError::Backend(
+                userspace_start_error(transport, false).to_string(),
+            )));
+        }
     }
 
     let started = Instant::now();
@@ -779,9 +838,9 @@ fn launch_userspace_tunnel(
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Err(ServiceError::Backend(
+    Err(LaunchFailure::SpawnedOrUnknown(ServiceError::Backend(
         userspace_start_error(transport, true).to_string(),
-    ))
+    )))
 }
 
 fn userspace_start_error(transport: TunnelTransport, timed_out: bool) -> &'static str {
@@ -878,7 +937,7 @@ pub(crate) fn boot_identity() -> Result<String, ServiceError> {
     }
     Ok(value.to_owned())
 }
-fn capture_member(name: &str, boot: &str) -> std::io::Result<UserspaceIdentity> {
+pub(super) fn capture_member(name: &str, boot: &str) -> std::io::Result<UserspaceIdentity> {
     let cname = std::ffi::CString::new(name).map_err(std::io::Error::other)?;
     let index = unsafe { libc::if_nametoindex(cname.as_ptr()) };
     if index == 0 {

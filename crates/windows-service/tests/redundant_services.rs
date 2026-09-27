@@ -34,7 +34,7 @@ impl SlotServiceControl for Services {
 }
 
 #[test]
-fn starting_b_only_replaces_b_services_never_a_or_global_resources() {
+fn starting_b_only_starts_b_never_stops_existing_services_or_sibling() {
     let mut services = Services::default();
     execute_slot_primitive(
         &mut services,
@@ -45,16 +45,12 @@ fn starting_b_only_replaces_b_services_never_a_or_global_resources() {
     .unwrap();
     assert_eq!(
         services.events,
-        vec![
-            ("stop".into(), TunnelSlot::B, TunnelTransport::WireGuard),
-            ("stop".into(), TunnelSlot::B, TunnelTransport::AmneziaWg3),
-            ("start".into(), TunnelSlot::B, TunnelTransport::AmneziaWg3),
-        ]
+        vec![("start".into(), TunnelSlot::B, TunnelTransport::AmneziaWg3),]
     );
 }
 
 #[test]
-fn failed_slot_cleanup_prevents_new_service_creation() {
+fn start_primitive_never_performs_implicit_cleanup() {
     let mut services = Services {
         fail_stop: true,
         ..Services::default()
@@ -65,7 +61,7 @@ fn failed_slot_cleanup_prevents_new_service_creation() {
             slot: TunnelSlot::A
         }
     )
-    .is_err());
+    .is_ok());
     assert_eq!(services.events.len(), 1);
 }
 

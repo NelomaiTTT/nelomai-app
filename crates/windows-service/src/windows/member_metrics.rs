@@ -121,6 +121,8 @@ pub struct MemberObservation {
     pub transport: TunnelMetrics,
     pub interface_received_bytes: u64,
     pub interface_sent_bytes: u64,
+    pub received_unicast_packets: u64,
+    pub sent_unicast_packets: u64,
 }
 
 pub struct MemberMetrics {
@@ -130,6 +132,7 @@ pub struct MemberMetrics {
     created: u64,
     index: u32,
     luid: u64,
+    guid: [u8; 16],
     peer: [u8; 32],
     started: u64,
 }
@@ -157,11 +160,31 @@ impl MemberMetrics {
             created,
             index,
             luid: unsafe { row.InterfaceLuid.Value },
+            guid: guid_bytes(&row),
             peer,
             started,
         };
         result.verify()?;
         Ok(result)
+    }
+
+    pub(crate) fn capture_owned(
+        slot: TunnelSlot,
+        transport: TunnelTransport,
+        proof: crate::member_owner::NativeProof,
+        peer: [u8; 32],
+        started: u64,
+    ) -> io::Result<Self> {
+        let value = Self::capture(
+            slot,
+            transport,
+            proof.process.pid,
+            proof.interface.index,
+            peer,
+            started,
+        )?;
+        owned_packet_counts(&value.verify()?, value.pid, value.created, &proof)?;
+        Ok(value)
     }
 
     fn verify(&self) -> io::Result<MIB_IF_ROW2> {
@@ -171,7 +194,7 @@ impl MemberMetrics {
             return Err(rejected());
         }
         let row = interface(self.index, member_name(self.slot, self.transport))?;
-        if unsafe { row.InterfaceLuid.Value } != self.luid {
+        if unsafe { row.InterfaceLuid.Value } != self.luid || guid_bytes(&row) != self.guid {
             return Err(rejected());
         }
         Ok(row)
@@ -207,8 +230,36 @@ impl MemberMetrics {
             transport,
             interface_received_bytes: row.InOctets,
             interface_sent_bytes: row.OutOctets,
+            received_unicast_packets: row.InUcastPkts,
+            sent_unicast_packets: row.OutUcastPkts,
         })
     }
+}
+
+fn guid_bytes(row: &MIB_IF_ROW2) -> [u8; 16] {
+    let g = row.InterfaceGuid;
+    let mut bytes = [0; 16];
+    bytes[..4].copy_from_slice(&g.data1.to_be_bytes());
+    bytes[4..6].copy_from_slice(&g.data2.to_be_bytes());
+    bytes[6..8].copy_from_slice(&g.data3.to_be_bytes());
+    bytes[8..].copy_from_slice(&g.data4);
+    bytes
+}
+fn owned_packet_counts(
+    row: &MIB_IF_ROW2,
+    pid: u32,
+    created: u64,
+    p: &crate::member_owner::NativeProof,
+) -> io::Result<(u64, u64)> {
+    if pid != p.process.pid
+        || created != p.process.creation_time
+        || row.InterfaceIndex != p.interface.index
+        || unsafe { row.InterfaceLuid.Value } != p.interface.luid
+        || guid_bytes(row) != p.interface.guid
+    {
+        return Err(rejected());
+    }
+    Ok((row.OutUcastPkts, row.InUcastPkts))
 }
 
 fn epoch_millis() -> io::Result<u64> {
@@ -340,6 +391,36 @@ impl NtAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sample_counts_only_unicast_packets_and_checks_full_retained_identity() {
+        let mut row = MIB_IF_ROW2 {
+            InterfaceIndex: 7,
+            ..Default::default()
+        };
+        row.InterfaceLuid.Value = 9;
+        row.InterfaceGuid = windows_sys::core::GUID::from_u128(0x11111111222233334444555555555555);
+        row.InUcastPkts = 11;
+        row.OutUcastPkts = 13;
+        row.InOctets = 999;
+        row.OutOctets = 888;
+        row.InNUcastPkts = 55;
+        row.OutNUcastPkts = 66;
+        let p = crate::member_owner::NativeProof {
+            process: crate::member_owner::ProcessProof {
+                pid: 3,
+                creation_time: 5,
+            },
+            interface: crate::member_owner::InterfaceProof {
+                index: 7,
+                luid: 9,
+                guid: 0x11111111222233334444555555555555u128.to_be_bytes(),
+            },
+        };
+        assert_eq!(owned_packet_counts(&row, 3, 5, &p).unwrap(), (13, 11));
+        assert!(owned_packet_counts(&row, 3, 6, &p).is_err());
+        row.InterfaceGuid = windows_sys::core::GUID::from_u128(0);
+        assert!(owned_packet_counts(&row, 3, 5, &p).is_err());
+    }
     fn send<T: Send>(_: T) {}
     // The helper's Tokio owner needs an independently cancellable task. A native
     // HANDLE/library guard must never be retained across a pipe await.

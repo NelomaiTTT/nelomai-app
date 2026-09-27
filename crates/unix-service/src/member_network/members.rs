@@ -88,6 +88,21 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
         self.views[index(slot)].as_ref()
     }
 
+    pub fn scope(&self) -> &SessionScope {
+        &self.scope
+    }
+
+    pub fn data_counters(
+        &self,
+        scope: &SessionScope,
+        slot: Slot,
+    ) -> Result<super::counters::DataCounters, ServiceError> {
+        self.check_live(scope, slot)?;
+        let counters = self.backends[index(slot)].member_data_counters()?;
+        self.check_live(scope, slot)?;
+        Ok(counters)
+    }
+
     pub fn start(
         &mut self,
         scope: &SessionScope,
@@ -221,7 +236,44 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
 
     pub fn metrics(&self, scope: &SessionScope, slot: Slot) -> Result<TunnelMetrics, ServiceError> {
         self.check_live(scope, slot)?;
-        self.backends[index(slot)].metrics(false)
+        let result = self.backends[index(slot)].metrics(false);
+        self.check_live(scope, slot)?;
+        result
+    }
+
+    /// The existing Unix provider hashes physical default egress and addresses
+    /// on that physical NIC, not the pair's /1, probe or endpoint bypass routes.
+    /// Linux member defaults are in private tables; macOS excludes utun defaults.
+    /// Keep the frontend's existing IPv4 fingerprint semantics. Never use the
+    /// unrelated single backend or manufacture an empty fingerprint on failure.
+    pub fn physical_network_fingerprint(
+        &self,
+        scope: &SessionScope,
+        slot: Slot,
+    ) -> Result<String, ServiceError> {
+        self.check_live(scope, slot)?;
+        for member in [Slot::A, Slot::B] {
+            if self.view(member).is_some() {
+                self.check_live(scope, member)?;
+            }
+        }
+        let result = self.backends[index(slot)].physical_network_fingerprint();
+        for member in [Slot::A, Slot::B] {
+            if self.view(member).is_some() {
+                self.check_live(scope, member)?;
+            }
+        }
+        let fingerprint = result?;
+        if fingerprint.len() != 64
+            || !fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(ServiceError::Backend(
+                "physical_network_fingerprint_invalid".into(),
+            ));
+        }
+        Ok(fingerprint)
     }
 
     pub fn open_probe(

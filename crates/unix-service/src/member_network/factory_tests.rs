@@ -75,3 +75,94 @@ fn missing_network_journal_cannot_silently_forget_routes_of_previously_started_m
         "utun42"
     );
 }
+
+#[test]
+fn a_new_boot_retires_only_ephemeral_authority_without_opening_native_members() {
+    use nelomai_client_tunnel::redundancy::network::*;
+    struct NoNative;
+    impl NetworkSystem for NoNative {
+        fn read(&mut self, _: &ResourceKey) -> std::io::Result<Option<NetworkValue>> {
+            panic!("no native read across boots")
+        }
+        fn compare_exchange(
+            &mut self,
+            _: &ResourceKey,
+            _: Option<&NetworkValue>,
+            _: Option<&NetworkValue>,
+        ) -> std::io::Result<()> {
+            panic!("no native write across boots")
+        }
+    }
+    let dir = root();
+    let uid = unsafe { libc::geteuid() };
+    let mut saved = SessionDirectory::open(dir.path(), scope(), "boot-one", uid).unwrap();
+    let journal:NetworkJournal=serde_json::from_value(serde_json::json!({
+        "owned":[{"original":null,"current":{"Route":{"destination":"0.0.0.0/1","scope":"Global","interface":42,"gateway":null,"metric":0}}}],
+        "active":"A","pending":null,"stopping":false
+    })).unwrap();
+    saved.network.save(&journal).unwrap();
+    fs::write(dir.path().join("slot-a/interface-name"), "utun42").unwrap();
+    assert!(
+        !super::factory::cleanup_previous_boot(dir.path(), scope(), "boot-one", uid, NoNative)
+            .unwrap()
+    );
+    assert!(
+        super::factory::cleanup_previous_boot(dir.path(), scope(), "boot-two", uid, NoNative)
+            .unwrap()
+    );
+    assert!(
+        super::factory::cleanup_previous_boot(dir.path(), scope(), "boot-two", uid, NoNative)
+            .unwrap()
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("slot-a/interface-name")).unwrap(),
+        "utun42"
+    );
+    assert!(super::factory::cleanup_previous_boot(dir.path(), scope(), "", uid, NoNative).is_err());
+    assert!(
+        SessionDirectory::open(dir.path(), scope(), "boot-two", uid).is_err(),
+        "reboot grants cleanup only, never old Start"
+    );
+}
+
+#[test]
+fn reboot_during_bootstrap_requires_empty_private_slots_before_retirement() {
+    use nelomai_client_tunnel::redundancy::network::*;
+    struct NoNative;
+    impl NetworkSystem for NoNative {
+        fn read(&mut self, _: &ResourceKey) -> std::io::Result<Option<NetworkValue>> {
+            panic!("bootstrap never owns native resources")
+        }
+        fn compare_exchange(
+            &mut self,
+            _: &ResourceKey,
+            _: Option<&NetworkValue>,
+            _: Option<&NetworkValue>,
+        ) -> std::io::Result<()> {
+            panic!("bootstrap never owns native resources")
+        }
+    }
+    let uid = unsafe { libc::geteuid() };
+    for populated in [false, true] {
+        let dir = root();
+        SessionDirectory::open(dir.path(), scope(), "boot-one", uid).unwrap();
+        // Simulate a crash after the seal/slot directories, before the initial
+        // empty network journal. No member may start before that write.
+        fs::remove_file(dir.path().join("redundant-network.json")).unwrap();
+        if populated {
+            fs::write(dir.path().join("slot-a/owner"), b"retained").unwrap();
+        }
+        let result =
+            super::factory::cleanup_previous_boot(dir.path(), scope(), "boot-two", uid, NoNative);
+        assert_eq!(result.is_ok(), !populated);
+        if populated {
+            assert_eq!(
+                fs::read(dir.path().join("slot-a/owner")).unwrap(),
+                b"retained"
+            );
+        } else {
+            assert!(result.unwrap());
+            assert!(dir.path().join("redundant-session.json").exists());
+        }
+    }
+}

@@ -12,6 +12,11 @@ pub use config::{
     parse_configuration, Awg3Parameters, ConfigurationError, Endpoint, ParsedConfiguration,
     ParsedPeer, SecretKey,
 };
+use nelomai_client_tunnel::redundancy::{
+    engine_channel,
+    protocol::{Command, Snapshot},
+    session::SessionPhase,
+};
 use nelomai_client_tunnel::{
     DesktopTunnelOptions, TunnelCapabilities, TunnelController, TunnelError, TunnelMetrics,
     TunnelPlatform, TunnelStartRequest, TunnelStatus,
@@ -31,8 +36,9 @@ pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_SOCKET_PATH: &str = "/var/run/nelomai/tunnel.sock";
 pub const DISPATCHER_SOCKET_PATH: &str = "/var/run/nelomai/dispatcher.sock";
 
-/// The engine owns product behavior; the dispatcher owns sockets and process
-/// lifecycle. EOF is a cleanup request, not permission to leave a tunnel alive.
+/// Compatibility loop for borrowed readers. Production uses
+/// `run_timed_engine_channel` so idle control input cannot suspend health ticks.
+/// EOF is a cleanup request, not permission to leave a tunnel alive.
 pub fn run_engine_channel<B: ServiceTunnelBackend>(
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
@@ -43,9 +49,9 @@ pub fn run_engine_channel<B: ServiceTunnelBackend>(
         let frame = match d::read_frame(reader, MAX_FRAME_SIZE) {
             Ok(frame) => frame,
             Err(error) => {
-                let _ = handler.handle(Request::stop());
+                let cleanup = handler.shutdown().map_err(std::io::Error::other);
                 return if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                    Ok(())
+                    cleanup
                 } else {
                     Err(error)
                 };
@@ -60,10 +66,10 @@ pub fn run_engine_channel<B: ServiceTunnelBackend>(
         {
             Some("ready") => d::encode_frame(&serde_json::json!({"engine_ready":true}))?,
             Some("stop") => {
-                let response = handler.handle(Request::stop());
-                d::encode_frame(
-                    &serde_json::json!({"engine_stopped": response.ok && response.state == Some(ServiceTunnelState::Stopped)}),
-                )?
+                // Dispatcher process teardown has explicit force-shutdown
+                // authority; an ordinary product Stop does not.
+                let stopped = handler.shutdown().is_ok();
+                d::encode_frame(&serde_json::json!({"engine_stopped": stopped}))?
             }
             _ => {
                 let response = decode_request(&frame)
@@ -75,6 +81,18 @@ pub fn run_engine_channel<B: ServiceTunnelBackend>(
         writer.write_all(&output)?;
         writer.flush()?;
     }
+}
+
+/// Run the existing engine process with a single owned control-input reader.
+/// The caller must exit the process after return: the shared channel's detached
+/// reader may still be blocked on its process-owned pipe. This is Unix-only
+/// integration; Windows primitive replies require separate single-reader routing.
+pub fn run_timed_engine_channel<B: ServiceTunnelBackend, R: std::io::Read + Send + 'static>(
+    reader: R,
+    writer: &mut impl std::io::Write,
+    handler: &mut TunnelRequestHandler<B>,
+) -> std::io::Result<()> {
+    engine_channel::run_engine_channel(reader, writer, handler)
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -95,12 +113,16 @@ pub struct Response {
     pub ok: bool,
     pub state: Option<ServiceTunnelState>,
     pub service_version: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub desktop_redundancy_v1: bool,
     #[serde(default)]
     pub physical_network_fingerprint: Option<String>,
     #[serde(default)]
     pub metrics: Option<TunnelMetrics>,
     #[serde(default)]
     pub diagnostics: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<Snapshot>,
     pub error_code: Option<String>,
 }
 
@@ -111,9 +133,11 @@ impl Response {
             ok: true,
             state,
             service_version: None,
+            desktop_redundancy_v1: false,
             physical_network_fingerprint: None,
             metrics: None,
             diagnostics: None,
+            redundancy: None,
             error_code: None,
         }
     }
@@ -124,15 +148,21 @@ impl Response {
             ok: false,
             state: None,
             service_version: None,
+            desktop_redundancy_v1: false,
             physical_network_fingerprint: None,
             metrics: None,
             diagnostics: None,
+            redundancy: None,
             error_code: Some(error_code.into()),
         }
     }
 }
 
 pub enum Request {
+    Redundant {
+        protocol_version: u16,
+        request: Command,
+    },
     Start {
         protocol_version: u16,
         configuration: Zeroizing<String>,
@@ -220,6 +250,9 @@ impl Request {
 
     pub fn protocol_version(&self) -> u16 {
         match self {
+            Self::Redundant {
+                protocol_version, ..
+            } => *protocol_version,
             Self::Start {
                 protocol_version, ..
             }
@@ -239,6 +272,13 @@ impl Request {
 impl fmt::Debug for Request {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Redundant {
+                protocol_version, ..
+            } => formatter
+                .debug_struct("Redundant")
+                .field("protocol_version", protocol_version)
+                .field("request", &"<redacted>")
+                .finish(),
             Self::Start {
                 protocol_version,
                 options,
@@ -288,6 +328,11 @@ impl fmt::Debug for Request {
 #[derive(Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum RequestRef<'a> {
+    Redundant {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+        request: &'a Command,
+    },
     Start {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
@@ -331,6 +376,13 @@ impl Serialize for Request {
         S: serde::Serializer,
     {
         match self {
+            Self::Redundant {
+                protocol_version,
+                request,
+            } => RequestRef::Redundant {
+                protocol_version: *protocol_version,
+                request,
+            },
             Self::Start {
                 protocol_version,
                 configuration,
@@ -375,6 +427,11 @@ impl Serialize for Request {
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 enum RequestOwned {
+    Redundant {
+        #[serde(rename = "protocolVersion")]
+        protocol_version: u16,
+        request: Command,
+    },
     Start {
         #[serde(rename = "protocolVersion")]
         protocol_version: u16,
@@ -419,6 +476,13 @@ impl<'de> Deserialize<'de> for Request {
         D: serde::Deserializer<'de>,
     {
         Ok(match RequestOwned::deserialize(deserializer)? {
+            RequestOwned::Redundant {
+                protocol_version,
+                request,
+            } => Self::Redundant {
+                protocol_version,
+                request,
+            },
             RequestOwned::Start {
                 protocol_version,
                 configuration,
@@ -550,6 +614,30 @@ pub fn authorize_peer(
 }
 
 pub trait ServiceTunnelBackend {
+    fn supports_redundancy(&self) -> bool {
+        false
+    }
+    fn current_redundancy_snapshot(&self) -> Option<Snapshot> {
+        None
+    }
+    /// Additive protocol support does not enable native redundancy by default.
+    /// Implementations must check the command against their actual runtime and
+    /// current session ownership before any mutation.
+    fn redundant(&mut self, _request: Command) -> Result<Snapshot, ServiceError> {
+        Err(ServiceError::Backend("redundancy_unsupported".into()))
+    }
+    fn tick(&mut self, _now_ms: u64) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Dispatcher process teardown only. Ordinary unscoped Stop continues to
+    /// use stop(), allowing a composite backend to fence it independently.
+    fn shutdown(&mut self) -> Result<(), ServiceError> {
+        if self.stop()? == ServiceTunnelState::Stopped {
+            Ok(())
+        } else {
+            Err(ServiceError::Backend("shutdown_incomplete".into()))
+        }
+    }
     /// Present only when a native adapter has verified durable session ownership.
     fn member_recovery_scope(&self) -> Option<nelomai_client_tunnel::redundancy::SessionScope> {
         None
@@ -564,6 +652,15 @@ pub trait ServiceTunnelBackend {
     /// backends and older/fake implementations do not gain this capability.
     fn member_interface_index(&self) -> Result<u32, ServiceError> {
         Err(ServiceError::Backend("member_interface_unavailable".into()))
+    }
+    fn member_data_counters(&self) -> Result<member_network::counters::DataCounters, ServiceError> {
+        let index = self.member_interface_index()?;
+        member_network::counters::read_owned(
+            index,
+            || self.member_interface_index().map_err(std::io::Error::other),
+            member_network::counters::native,
+        )
+        .map_err(|_| ServiceError::Backend("member_counters_unavailable".into()))
     }
     fn start(
         &mut self,
@@ -591,6 +688,8 @@ pub trait ServiceTunnelBackend {
 pub struct TunnelRequestHandler<B> {
     backend: B,
     service_version: String,
+    shutdown_requested: bool,
+    shutdown_complete: bool,
 }
 
 impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
@@ -598,6 +697,8 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
         Self {
             backend,
             service_version: service_version.into(),
+            shutdown_requested: false,
+            shutdown_complete: false,
         }
     }
 
@@ -605,12 +706,59 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
         &self.backend
     }
 
+    pub fn tick(&mut self, now_ms: u64) -> Result<(), ServiceError> {
+        if self.shutdown_requested {
+            return Ok(());
+        }
+        self.backend.tick(now_ms)
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), ServiceError> {
+        self.shutdown_requested = true;
+        if self.shutdown_complete {
+            return Ok(());
+        }
+        self.backend.shutdown()?;
+        self.shutdown_complete = true;
+        Ok(())
+    }
+
     pub fn handle(&mut self, request: Request) -> Response {
+        if self.shutdown_requested {
+            return Response::failure("engine_stopping");
+        }
         if request.protocol_version() != PROTOCOL_VERSION {
             return Response::failure(ServiceError::UnsupportedProtocol.code());
         }
 
         let result = match request {
+            Request::Redundant { request, .. } => {
+                // Validate the wire structure using its declared runtime. This
+                // is not runtime authorization: only the native owner knows
+                // the installed runtime and can compare it with this scope.
+                request
+                    .validate(request.scope().runtime)
+                    .map_err(|_| ServiceError::InvalidRequest)
+                    .and_then(|_| self.backend.redundant(request))
+                    .map(|snapshot| {
+                        let state = if snapshot.cleanup_pending {
+                            ServiceTunnelState::Stopping
+                        } else {
+                            match snapshot.session.phase {
+                                SessionPhase::Starting => ServiceTunnelState::Starting,
+                                SessionPhase::Running if snapshot.primary_ready => {
+                                    ServiceTunnelState::Running
+                                }
+                                SessionPhase::Running => ServiceTunnelState::Starting,
+                                SessionPhase::Stopping => ServiceTunnelState::Stopping,
+                                SessionPhase::Stopped => ServiceTunnelState::Stopped,
+                            }
+                        };
+                        let mut response = Response::success(Some(state));
+                        response.redundancy = Some(snapshot);
+                        response
+                    })
+            }
             Request::Start {
                 configuration,
                 options,
@@ -628,13 +776,15 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
                 .backend
                 .stop()
                 .map(|state| Response::success(Some(state))),
-            Request::Status { .. } => self
-                .backend
-                .status()
-                .map(|state| Response::success(Some(state))),
+            Request::Status { .. } => self.backend.status().map(|state| {
+                let mut response = Response::success(Some(state));
+                response.redundancy = self.backend.current_redundancy_snapshot();
+                response
+            }),
             Request::Version { .. } => {
                 let mut response = Response::success(None);
                 response.service_version = Some(self.service_version.clone());
+                response.desktop_redundancy_v1 = self.backend.supports_redundancy();
                 Ok(response)
             }
             Request::PhysicalNetworkFingerprint { .. } => self
@@ -665,6 +815,56 @@ impl<B: ServiceTunnelBackend> TunnelRequestHandler<B> {
     }
 }
 
+impl<B: ServiceTunnelBackend> engine_channel::Handler for TunnelRequestHandler<B> {
+    fn handle(&mut self, frame: &[u8]) -> std::io::Result<Vec<u8>> {
+        let body = dispatcher::frame_body(frame, MAX_FRAME_SIZE)?;
+        let control = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| value.get("dispatcher_control")?.as_str().map(str::to_owned));
+
+        // The dispatcher expects this explicit acknowledgement before removing
+        // its ownership marker/closing the child. Failed cleanup may be retried;
+        // neither outcome authorizes another Start in this process.
+        if control.as_deref() == Some("stop") {
+            let stopped = self.shutdown().is_ok();
+            return dispatcher::encode_frame(&serde_json::json!({"engine_stopped": stopped}));
+        }
+        if self.shutdown_requested {
+            return encode_response(&Response::failure("engine_stopping"))
+                .map_err(engine_service_error);
+        }
+        if control.as_deref() == Some("ready") {
+            return dispatcher::encode_frame(&serde_json::json!({"engine_ready": true}));
+        }
+
+        let response = match decode_request(frame) {
+            Ok(request) => self.handle(request),
+            Err(error) => {
+                // Preserve the private protocol's bounded failure response, but
+                // retire native ownership before sending it. Never surface a
+                // serde error (which may contain configuration/input details).
+                if self.shutdown().is_err() {
+                    return Err(engine_service_error(error));
+                }
+                Response::failure(error.code())
+            }
+        };
+        encode_response(&response).map_err(engine_service_error)
+    }
+
+    fn tick(&mut self, now_ms: u64) -> std::io::Result<()> {
+        TunnelRequestHandler::tick(self, now_ms).map_err(engine_service_error)
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        TunnelRequestHandler::shutdown(self).map_err(engine_service_error)
+    }
+}
+
+fn engine_service_error(error: ServiceError) -> std::io::Error {
+    std::io::Error::other(error.code().to_owned())
+}
+
 #[async_trait]
 pub trait ServiceTransport: Send + Sync {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError>;
@@ -685,6 +885,21 @@ impl<T> UnixTunnelController<T> {
 }
 
 impl<T: ServiceTransport> UnixTunnelController<T> {
+    /// Always ask the authenticated helper at command time. A GUI-cached scope
+    /// is not authority to stop/rebind a possibly replaced native session.
+    async fn current_redundancy_snapshot(&self) -> Result<Option<Snapshot>, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::status())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        if response.state.is_none() {
+            return Err(TunnelError::Backend("missing_tunnel_service_state".into()));
+        }
+        Ok(response.redundancy)
+    }
+
     pub async fn service_version(&self) -> Result<String, TunnelError> {
         let response = self
             .transport
@@ -712,6 +927,52 @@ impl<T: ServiceTransport> UnixTunnelController<T> {
 
 #[async_trait]
 impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
+    async fn desktop_redundancy_absent(&self) -> Result<bool, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::status())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        let state = response
+            .state
+            .ok_or_else(|| TunnelError::Backend("missing_tunnel_service_state".into()))?;
+        Ok(state == ServiceTunnelState::Stopped && response.redundancy.is_none())
+    }
+
+    async fn desktop_redundancy_supported(&self) -> Result<bool, TunnelError> {
+        let response = self
+            .transport
+            .exchange(Request::version())
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        Ok(response.desktop_redundancy_v1)
+    }
+
+    async fn desktop_redundancy_command(&self, command: Command) -> Result<Snapshot, TunnelError> {
+        command
+            .validate(command.scope().runtime)
+            .map_err(|_| TunnelError::Backend("invalid_redundant_command".into()))?;
+        let scope = command.scope().clone();
+        let response = self
+            .transport
+            .exchange(Request::Redundant {
+                protocol_version: PROTOCOL_VERSION,
+                request: command,
+            })
+            .await
+            .map_err(to_tunnel_error)?;
+        validate_response(&response)?;
+        let snapshot = response
+            .redundancy
+            .ok_or_else(|| TunnelError::Backend("missing_redundancy_snapshot".into()))?;
+        if snapshot.session.scope != scope {
+            return Err(TunnelError::Backend("redundancy_scope_mismatch".into()));
+        }
+        Ok(snapshot)
+    }
+
     async fn start(&self, mut request: TunnelStartRequest) -> Result<(), TunnelError> {
         request
             .options
@@ -735,6 +996,29 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
     }
 
     async fn stop(&self) -> Result<(), TunnelError> {
+        if let Some(snapshot) = self.current_redundancy_snapshot().await? {
+            let stopped = self
+                .desktop_redundancy_command(Command::Stop {
+                    scope: snapshot.session.scope,
+                })
+                .await?;
+            return if stopped.session.phase == SessionPhase::Stopped && !stopped.cleanup_pending {
+                Ok(())
+            } else {
+                Err(TunnelError::Backend("redundancy_cleanup_pending".into()))
+            };
+        }
+        let response = self
+            .transport
+            .exchange(Request::stop())
+            .await
+            .map_err(to_tunnel_error)?;
+        require_state(response, ServiceTunnelState::Stopped)
+    }
+
+    async fn stop_if_unowned(&self) -> Result<(), TunnelError> {
+        // Unlike an explicit user/auth Stop, stale single-session cleanup must
+        // not acquire the currently running pair's scope from a fresh Status.
         let response = self
             .transport
             .exchange(Request::stop())
@@ -795,6 +1079,18 @@ impl<T: ServiceTransport> TunnelController for UnixTunnelController<T> {
     }
 
     async fn rebind_udp(&self) -> Result<bool, TunnelError> {
+        if let Some(snapshot) = self.current_redundancy_snapshot().await? {
+            let rebound = self
+                .desktop_redundancy_command(Command::NetworkChanged {
+                    scope: snapshot.session.scope,
+                })
+                .await?;
+            return if rebound.session.phase == SessionPhase::Running && !rebound.cleanup_pending {
+                Ok(true)
+            } else {
+                Err(TunnelError::Backend("redundancy_rebind_incomplete".into()))
+            };
+        }
         let response = self
             .transport
             .exchange(Request::rebind_udp())

@@ -450,6 +450,23 @@ pub enum TunnelError {
 
 #[async_trait]
 pub trait TunnelController: Send + Sync {
+    /// Positive, authenticated proof that desktop cleanup left no pair and the
+    /// helper is stopped. Unknown/unsupported is never absence or Stop authority.
+    async fn desktop_redundancy_absent(&self) -> Result<bool, TunnelError> {
+        Ok(false)
+    }
+    /// Private desktop protocol support, separate from public split-tunnel capabilities.
+    async fn desktop_redundancy_supported(&self) -> Result<bool, TunnelError> {
+        Ok(false)
+    }
+    async fn desktop_redundancy_command(
+        &self,
+        _command: redundancy::protocol::Command,
+    ) -> Result<redundancy::protocol::Snapshot, TunnelError> {
+        Err(TunnelError::Backend(
+            "desktop_redundancy_unsupported".into(),
+        ))
+    }
     async fn start(&self, request: TunnelStartRequest) -> Result<(), TunnelError>;
     async fn stop(&self) -> Result<(), TunnelError>;
     /// Core cleanup must not cancel an independent native session. Native

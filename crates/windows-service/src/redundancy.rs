@@ -103,8 +103,10 @@ pub trait SlotServiceControl {
 }
 
 /// Returns false for legacy primitives so the original path handles them.
-/// Creation requires both previous services of THIS slot gone; Stop attempts
-/// both even if one fails. No operation restores global DNS or stops its sibling.
+/// Start never performs implicit cleanup: the scoped owner checks both transport
+/// names absent and journals Prepared first; native create fails if one exists.
+/// Explicit StopSlot is owner-only cleanup after exact evidence validation; it
+/// attempts both transports even if one fails. Never touches the sibling slot.
 pub fn execute_slot_primitive<C: SlotServiceControl>(
     control: &mut C,
     action: EnginePrimitive,
@@ -112,8 +114,6 @@ pub fn execute_slot_primitive<C: SlotServiceControl>(
     use EnginePrimitive::*;
     match action {
         StartWireguardSlot { slot } | StartAmneziawgSlot { slot } => {
-            control.stop(slot, TunnelTransport::WireGuard)?;
-            control.stop(slot, TunnelTransport::AmneziaWg3)?;
             control.start(
                 slot,
                 if matches!(action, StartWireguardSlot { .. }) {

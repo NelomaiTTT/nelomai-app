@@ -17,6 +17,9 @@ pub struct MacNetwork<C> {
 
 impl<C: MacNetworkCommands> NetworkSystem for MacNetwork<C> {
     fn read(&mut self, key: &ResourceKey) -> io::Result<Option<NetworkValue>> {
+        if matches!(key, ResourceKey::Route(_, RouteScope::WindowsInterface(_))) {
+            return Err(invalid());
+        }
         match key {
             ResourceKey::BoundRule { .. }
             | ResourceKey::LinkDns(_)

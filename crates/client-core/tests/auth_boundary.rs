@@ -23,6 +23,7 @@ impl RuntimeStateStore for ReadOnlyRuntime {
             runtime_version: "0.2.16".into(),
             cleanup_only: false,
             auth_scope: None,
+            desktop_redundancy: None,
             saved_connection: None,
             pinned_connection: None,
             pending_start: None,

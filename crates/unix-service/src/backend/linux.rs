@@ -1,3 +1,4 @@
+use super::linux_owner::{LinuxIdentity, LinuxOwner, MemberTransport, NativeProof};
 use super::redundancy::ResourceMode;
 use super::{
     append_userspace_log, apply_and_verify_awg3_configuration, build_backend_configuration,
@@ -9,6 +10,7 @@ use crate::process::{status_with_timeout, COMMAND_TIMEOUT};
 use crate::routes::{LinuxUserspaceRouteManager, RouteManager, SystemRouteBackend, AWG_FWMARK};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use defguard_wireguard_rs::{host::Host, Kernel, Userspace, WGApi, WireguardInterfaceApi};
+use nelomai_client_tunnel::redundancy::SessionScope;
 use nelomai_client_tunnel::{DesktopTunnelOptions, TunnelMetrics, TunnelTransport};
 use nelomai_contracts::dispatcher::TunnelSlot;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -22,8 +24,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct LinuxBackend {
     mode: ResourceMode,
-    member_socket: Option<super::redundancy::SocketIdentity>,
-    member_kernel: Option<u32>,
+    member_owner: Option<LinuxOwner>,
     wireguard_api: WGApi<Kernel>,
     amneziawg_api: WGApi<Userspace>,
     amneziawg_go: PathBuf,
@@ -45,6 +46,7 @@ impl LinuxBackend {
             amneziawg_go.into(),
             runtime_directory.as_ref(),
             ResourceMode::Single,
+            None,
         )
     }
 
@@ -54,11 +56,19 @@ impl LinuxBackend {
         amneziawg_go: impl Into<PathBuf>,
         runtime_directory: &Path,
         slot: TunnelSlot,
+        scope: SessionScope,
     ) -> Result<Self, ServiceError> {
+        let owner = LinuxOwner::open_root(
+            &ResourceMode::Member(slot).runtime_path(runtime_directory),
+            scope,
+            slot,
+        )
+        .map_err(backend_error)?;
         Self::with_mode(
             amneziawg_go.into(),
             runtime_directory,
             ResourceMode::Member(slot),
+            Some(owner),
         )
     }
 
@@ -66,6 +76,7 @@ impl LinuxBackend {
         amneziawg_go: PathBuf,
         root: &Path,
         mode: ResourceMode,
+        member_owner: Option<LinuxOwner>,
     ) -> Result<Self, ServiceError> {
         let runtime_directory = mode.runtime_path(root);
         let wireguard_api = WGApi::<Kernel>::new(mode.linux_interface(TunnelTransport::WireGuard))
@@ -75,13 +86,20 @@ impl LinuxBackend {
                 .map_err(backend_error)?;
         let mut amneziawg_routes = LinuxUserspaceRouteManager::new(&runtime_directory)?;
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
-        let wireguard_host = wireguard_api.read_interface_data().ok();
-        let amneziawg_host = amneziawg_api.read_interface_data().ok();
+        // Reopened members expose cleanup only. Never adopt or configure a
+        // resource by name, and never reconstruct a running session from disk.
+        let wireguard_host = if mode.owns_network() {
+            wireguard_api.read_interface_data().ok()
+        } else {
+            None
+        };
+        let amneziawg_host = if mode.owns_network() {
+            amneziawg_api.read_interface_data().ok()
+        } else {
+            None
+        };
         let wireguard_running = wireguard_host.is_some();
         let amneziawg_running = amneziawg_host.is_some();
-        if (wireguard_running || amneziawg_running) && !mode.owns_network() {
-            return Err(ServiceError::Backend("slot_recovery_requires_owner".into()));
-        }
         if wireguard_running && amneziawg_running {
             return Err(ServiceError::Backend(
                 "multiple_tunnel_interfaces_detected".to_string(),
@@ -98,7 +116,12 @@ impl LinuxBackend {
             }
             None
         };
-        let state = if active_transport.is_some() {
+        let state = if member_owner
+            .as_ref()
+            .is_some_and(LinuxOwner::cleanup_pending)
+        {
+            ServiceTunnelState::Stopping
+        } else if active_transport.is_some() {
             ServiceTunnelState::Running
         } else {
             ServiceTunnelState::Stopped
@@ -118,8 +141,7 @@ impl LinuxBackend {
         );
         Ok(Self {
             mode,
-            member_socket: None,
-            member_kernel: None,
+            member_owner,
             wireguard_api,
             amneziawg_api,
             amneziawg_go,
@@ -158,27 +180,44 @@ impl LinuxBackend {
             native.interface.port = 0;
         }
 
-        match configuration.transport {
-            TunnelTransport::WireGuard => {
-                self.wireguard_api
-                    .create_interface()
-                    .map_err(backend_error)?;
-            }
-            TunnelTransport::AmneziaWg3 => {
-                validate_root_owned_binary(&self.amneziawg_go)?;
-                launch_amneziawg_go(&self.amneziawg_go, interface_name, &self.runtime_directory)?;
+        if let Some(owner) = &mut self.member_owner {
+            let boot = boot_identity()?;
+            let transport = match configuration.transport {
+                TunnelTransport::WireGuard => MemberTransport::WireGuard,
+                TunnelTransport::AmneziaWg3 => MemberTransport::AmneziaWg3,
+            };
+            owner
+                .launch(transport, &boot, |alias| {
+                    launch_member_native(
+                        &self.amneziawg_go,
+                        &self.runtime_directory,
+                        interface_name,
+                        transport,
+                        &boot,
+                        alias,
+                    )
+                })
+                .map_err(backend_error)?;
+        } else {
+            match configuration.transport {
+                TunnelTransport::WireGuard => {
+                    self.wireguard_api
+                        .create_interface()
+                        .map_err(backend_error)?;
+                }
+                TunnelTransport::AmneziaWg3 => {
+                    validate_root_owned_binary(&self.amneziawg_go)?;
+                    launch_amneziawg_go(
+                        &self.amneziawg_go,
+                        interface_name,
+                        &self.runtime_directory,
+                    )?;
+                }
             }
         }
         self.active_transport = Some(configuration.transport);
-        if !self.mode.owns_network() && configuration.transport == TunnelTransport::WireGuard {
-            let index = kernel_interface_index(interface_name)?;
-            if index == 0 {
-                return Err(ServiceError::Backend("slot_interface_missing".into()));
-            }
-            self.member_kernel = Some(index);
-        }
-        if !self.mode.owns_network() && configuration.transport == TunnelTransport::AmneziaWg3 {
-            self.member_socket = Some(super::redundancy::capture_userspace_member(interface_name)?);
+        if self.member_owner.is_some() {
+            self.member_interface_index()?;
         }
 
         let configured = configure_interface_after_awg3(
@@ -233,6 +272,15 @@ impl LinuxBackend {
     }
 
     fn stop_inner(&mut self) -> Result<(), ServiceError> {
+        if let Some(owner) = &mut self.member_owner {
+            let boot = boot_identity()?;
+            owner
+                .stop_owned(&boot, inspect_member, remove_member)
+                .map_err(backend_error)?;
+            self.active_transport = None;
+            self.rebind_peers.clear();
+            return Ok(());
+        }
         let transport = if self.mode.owns_network() {
             self.active_transport.take()
         } else {
@@ -247,33 +295,8 @@ impl LinuxBackend {
             first_error.get_or_insert(error);
         }
         let interface_result = match transport {
-            Some(TunnelTransport::WireGuard) if !self.mode.owns_network() => {
-                super::redundancy::remove_kernel_member(
-                    &mut self.member_kernel,
-                    &mut NativeKernelMember {
-                        interface: self.mode.linux_interface(TunnelTransport::WireGuard),
-                    },
-                )
-            }
             Some(TunnelTransport::WireGuard) => {
                 self.wireguard_api.remove_interface().map_err(backend_error)
-            }
-            Some(TunnelTransport::AmneziaWg3) if !self.mode.owns_network() => {
-                let result = self
-                    .member_socket
-                    .ok_or_else(|| {
-                        ServiceError::Backend("slot_socket_ownership_unavailable".into())
-                    })
-                    .and_then(|identity| {
-                        super::redundancy::remove_userspace_member(
-                            self.mode.linux_interface(TunnelTransport::AmneziaWg3),
-                            identity,
-                        )
-                    });
-                if result.is_ok() {
-                    self.member_socket = None;
-                }
-                result
             }
             Some(TunnelTransport::AmneziaWg3) => {
                 self.amneziawg_api.remove_interface().map_err(backend_error)
@@ -297,6 +320,9 @@ impl LinuxBackend {
     }
 
     fn read_active_interface(&self) -> Result<Host, ServiceError> {
+        if self.member_owner.is_some() {
+            self.member_interface_index()?;
+        }
         match self.active_transport {
             Some(TunnelTransport::WireGuard) => self
                 .wireguard_api
@@ -337,24 +363,186 @@ fn kernel_interface_index(interface: &str) -> Result<u32, ServiceError> {
     Ok(unsafe { libc::if_nametoindex(name.as_ptr()) })
 }
 
-struct NativeKernelMember {
-    interface: &'static str,
+pub(crate) fn boot_identity() -> Result<String, ServiceError> {
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(backend_error)?;
+    let boot = boot.trim();
+    if boot.len() != 36
+        || !boot.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(backend_error("boot_identity_unavailable"));
+    }
+    Ok(boot.into())
 }
-impl super::redundancy::KernelMemberControl for NativeKernelMember {
+
+fn ip_command() -> std::io::Result<&'static str> {
+    ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"]
+        .into_iter()
+        .find(|p| {
+            std::fs::symlink_metadata(p).is_ok_and(|metadata| {
+                super::linux_owner::trusted_ip_file(
+                    metadata.is_file(),
+                    metadata.uid(),
+                    metadata.mode(),
+                )
+            })
+        })
+        .ok_or_else(|| std::io::Error::other("ip_command_unavailable"))
+}
+
+fn launch_member_native(
+    executable: &Path,
+    runtime: &Path,
+    interface: &str,
+    transport: MemberTransport,
+    boot: &str,
+    alias: &str,
+) -> std::io::Result<LinuxIdentity> {
+    use std::io::{Error, ErrorKind};
+    if boot_identity().map_err(Error::other)? != boot
+        || kernel_interface_index(interface).map_err(Error::other)? != 0
+    {
+        return Err(Error::other("slot_interface_already_exists"));
+    }
+    // Reject stale sockets (including symlinks), rather than adopting them.
+    match std::fs::symlink_metadata(userspace_socket_path(interface)) {
+        Err(e) if e.kind() == ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+        Ok(_) => return Err(Error::other("slot_socket_already_exists")),
+    }
+    match transport {
+        MemberTransport::WireGuard => {
+            // The vendor's create_interface swallows EEXIST. `ip link add`
+            // fails on collisions and installs the alias in the SAME RTM_NEWLINK
+            // request as exclusive creation; never set an alias on an old link.
+            let status = status_with_timeout(
+                &mut super::linux_owner::kernel_create_command(ip_command()?, interface, alias),
+                COMMAND_TIMEOUT,
+            )?;
+            if !status.success() {
+                return Err(Error::other("slot_interface_create_failed"));
+            }
+        }
+        MemberTransport::AmneziaWg3 => {
+            validate_root_owned_binary(executable).map_err(Error::other)?;
+            launch_amneziawg_go(executable, interface, runtime).map_err(Error::other)?;
+        }
+    }
+    capture_member(interface, transport, boot)
+}
+
+fn capture_member(
+    interface: &str,
+    transport: MemberTransport,
+    boot: &str,
+) -> std::io::Result<LinuxIdentity> {
+    use std::io::Error;
+    if boot_identity().map_err(Error::other)? != boot {
+        return Err(Error::other("slot_boot_changed"));
+    }
+    let index = kernel_interface_index(interface).map_err(Error::other)?;
+    if index == 0 {
+        return Err(Error::other("slot_interface_missing"));
+    }
+    let proof = match transport {
+        MemberTransport::WireGuard => NativeProof::Kernel {
+            alias: std::fs::read_to_string(
+                Path::new("/sys/class/net").join(interface).join("ifalias"),
+            )?
+            .trim_end_matches('\n')
+            .into(),
+        },
+        MemberTransport::AmneziaWg3 => NativeProof::Userspace(
+            super::redundancy::capture_userspace_member(interface).map_err(Error::other)?,
+        ),
+    };
+    if kernel_interface_index(interface).map_err(Error::other)? != index
+        || boot_identity().map_err(Error::other)? != boot
+    {
+        return Err(Error::other("slot_interface_identity_changed"));
+    }
+    Ok(LinuxIdentity {
+        boot: boot.into(),
+        interface: interface.into(),
+        index,
+        proof,
+    })
+}
+
+fn inspect_member(saved: &LinuxIdentity) -> std::io::Result<Option<LinuxIdentity>> {
+    use std::io::{Error, ErrorKind};
+    let boot = boot_identity().map_err(Error::other)?;
+    if boot != saved.boot {
+        return Err(Error::other("slot_boot_changed"));
+    }
+    let index = kernel_interface_index(&saved.interface).map_err(Error::other)?;
+    let transport = match saved.proof {
+        NativeProof::Kernel { .. } => {
+            if index == 0 {
+                return Ok(None);
+            }
+            MemberTransport::WireGuard
+        }
+        NativeProof::Userspace(_) => {
+            // A missing socket alone can mean removal is still in progress.
+            // Only absence of BOTH resources acknowledges cleanup.
+            match std::fs::symlink_metadata(userspace_socket_path(&saved.interface)) {
+                Err(e) if e.kind() == ErrorKind::NotFound && index == 0 => return Ok(None),
+                Err(e) => return Err(e),
+                Ok(_) => (),
+            }
+            MemberTransport::AmneziaWg3
+        }
+    };
+    capture_member(&saved.interface, transport, &boot).map(Some)
+}
+
+fn verify_member(saved: &LinuxIdentity) -> std::io::Result<()> {
+    if inspect_member(saved)?.as_ref() != Some(saved) {
+        return Err(std::io::Error::other("slot_interface_identity_changed"));
+    }
+    Ok(())
+}
+
+fn remove_member(saved: &LinuxIdentity) -> std::io::Result<()> {
+    verify_member(saved)?;
+    match saved.proof {
+        NativeProof::Kernel { .. } => super::redundancy::remove_kernel_member(
+            &mut Some(saved.index),
+            &mut NativeKernelMember { identity: saved },
+        ),
+        NativeProof::Userspace(socket) => {
+            super::redundancy::remove_userspace_member(&saved.interface, socket)
+        }
+    }
+    .map_err(std::io::Error::other)
+}
+
+struct NativeKernelMember<'a> {
+    identity: &'a LinuxIdentity,
+}
+impl super::redundancy::KernelMemberControl for NativeKernelMember<'_> {
     fn index(&mut self) -> Result<u32, ServiceError> {
-        kernel_interface_index(self.interface)
+        match inspect_member(self.identity).map_err(backend_error)? {
+            Some(actual) if actual == *self.identity => Ok(actual.index),
+            None => Ok(0),
+            _ => Err(backend_error("slot_interface_identity_changed")),
+        }
     }
     fn delete(&mut self) -> Result<(), ServiceError> {
+        verify_member(self.identity).map_err(backend_error)?;
         // Members never installed DNS/fwmark policy. The vendor combined
         // remove_interface() clears DNS after deleting the link and can fail
         // there, leaving retries unable to distinguish success from failure.
-        let ip = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip"]
-            .into_iter()
-            .find(|p| Path::new(p).is_file())
-            .ok_or_else(|| ServiceError::Backend("ip_command_unavailable".into()))?;
+        let ip = ip_command().map_err(backend_error)?;
         let status = status_with_timeout(
             Command::new(ip)
-                .args(["link", "delete", "dev", self.interface])
+                .args(["link", "delete", "dev", &self.identity.interface])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null()),
@@ -372,6 +560,14 @@ impl super::redundancy::KernelMemberControl for NativeKernelMember {
 }
 
 impl ServiceTunnelBackend for LinuxBackend {
+    fn member_recovery_scope(&self) -> Option<SessionScope> {
+        self.member_owner.as_ref().map(|owner| owner.scope.clone())
+    }
+    fn member_cleanup_pending(&self) -> bool {
+        self.member_owner
+            .as_ref()
+            .is_some_and(LinuxOwner::cleanup_pending)
+    }
     fn member_slot(&self) -> Option<TunnelSlot> {
         match self.mode {
             ResourceMode::Single => None,
@@ -382,30 +578,31 @@ impl ServiceTunnelBackend for LinuxBackend {
         if self.mode.owns_network() {
             return Err(ServiceError::Backend("member_interface_unavailable".into()));
         }
-        let transport = self
-            .active_transport
-            .ok_or_else(|| ServiceError::Backend("member_not_running".into()))?;
-        let name = self.mode.linux_interface(transport);
-        let index = kernel_interface_index(name)?;
-        let owned = match transport {
-            TunnelTransport::WireGuard => self.member_kernel == Some(index),
-            TunnelTransport::AmneziaWg3 => {
-                self.member_socket == Some(super::redundancy::capture_userspace_member(name)?)
-            }
-        };
-        if index == 0 || !owned {
-            Err(ServiceError::Backend(
-                "slot_interface_identity_changed".into(),
-            ))
-        } else {
-            Ok(index)
+        let owner = self
+            .member_owner
+            .as_ref()
+            .ok_or(ServiceError::InvalidRequest)?;
+        if self.active_transport.is_none() || owner.stopping() {
+            return Err(backend_error("member_not_running"));
         }
+        let identity = owner
+            .identity()
+            .ok_or_else(|| backend_error("member_not_running"))?;
+        let actual = inspect_member(identity)
+            .map_err(backend_error)?
+            .ok_or_else(|| backend_error("member_interface_unavailable"))?;
+        owner.owned(&actual).map_err(backend_error)?;
+        Ok(actual.index)
     }
     fn start(
         &mut self,
         configuration: &ParsedConfiguration,
         options: &DesktopTunnelOptions,
     ) -> Result<ServiceTunnelState, ServiceError> {
+        // Reject before failure cleanup: duplicate Start must not stop a member.
+        if let Some(owner) = &self.member_owner {
+            owner.ensure_fresh().map_err(backend_error)?;
+        }
         self.state = ServiceTunnelState::Starting;
         self.diagnostics.record(
             "start_begin",
@@ -451,6 +648,9 @@ impl ServiceTunnelBackend for LinuxBackend {
     }
 
     fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.member_cleanup_pending() && self.active_transport.is_none() {
+            return Ok(ServiceTunnelState::Stopping);
+        }
         if self.active_transport.is_some() && self.read_active_interface().is_ok() {
             Ok(ServiceTunnelState::Running)
         } else if self.active_transport.is_none()
@@ -508,6 +708,9 @@ impl ServiceTunnelBackend for LinuxBackend {
     }
 
     fn rebind_udp(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+        if self.member_owner.is_some() {
+            self.member_interface_index()?;
+        }
         if !self.mode.owns_network() && self.active_transport == Some(TunnelTransport::WireGuard) {
             let index = self.member_interface_index()?;
             super::kernel_rebind::reset_kernel_port(index).map_err(backend_error)?;

@@ -830,6 +830,57 @@ where
         self.core.connection_metrics_context().await
     }
 
+    #[cfg(not(target_os = "android"))]
+    pub async fn desktop_redundancy_status(
+        &self,
+    ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, ApplicationError>
+    {
+        self.core
+            .desktop_redundancy_status()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Freeze an exact stalled helper owner and journal a cold stop. Panel cleanup
+    /// remains on the existing worker. An unjournaled freeze failure belongs to
+    /// the exact intent retry, not the worker's ordinary Stop path.
+    #[cfg(not(target_os = "android"))]
+    pub async fn prepare_desktop_recovery(
+        &self,
+        snapshot: &nelomai_client_tunnel::redundancy::protocol::Snapshot,
+    ) -> Result<bool, ApplicationError> {
+        let _lifecycle_guard = self.lifecycle_gate.lock().await;
+        let result = self.core.prepare_desktop_recovery(snapshot).await;
+        if matches!(result, Ok(true)) || self.core.has_pending_stop_cleanup().unwrap_or(false) {
+            self.pending_stop_wake.notify_one();
+        }
+        result.map_err(Into::into)
+    }
+
+    /// One coordination step, not a native health loop. Reuse only the scoped
+    /// cache; healthy ticks never initiate HTTP probe refreshes.
+    #[cfg(not(target_os = "android"))]
+    pub async fn desktop_redundancy_tick(
+        &self,
+        now_unix: i64,
+    ) -> Result<Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>, ApplicationError>
+    {
+        let probes = self
+            .core
+            .state()
+            .await
+            .connection
+            .and_then(|connection| {
+                self.cached_probes(connection.layer, connection.egress_mode, now_unix)
+            })
+            .map(|cached| cached.probes)
+            .unwrap_or_default();
+        self.core
+            .desktop_redundancy_tick(probes)
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn record_tunnel_unavailable(&self, kind: &'static str, code: String) {
         self.core.record_tunnel_unavailable(kind, code);
     }
@@ -1001,8 +1052,20 @@ where
     #[cfg(not(target_os = "android"))]
     pub async fn connection_intent_attempt_guarded(
         &self,
+        options: ConnectOptions,
+        now_unix: i64,
+        allowed: impl Fn() -> bool + Send + Sync,
+    ) -> Result<Connection, ApplicationError> {
+        self.desktop_connection_intent_attempt_guarded(options, now_unix, false, allowed)
+            .await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub async fn desktop_connection_intent_attempt_guarded(
+        &self,
         mut options: ConnectOptions,
         now_unix: i64,
+        reserve: bool,
         allowed: impl Fn() -> bool + Send + Sync,
     ) -> Result<Connection, ApplicationError> {
         self.start_preflight.before_tunnel_start().await?;
@@ -1028,7 +1091,12 @@ where
         };
         let result = if allowed() {
             self.core
-                .connection_intent_attempt_with_cancellation_epoch(options, now_unix, cancel_epoch)
+                .desktop_connection_intent_attempt_with_cancellation_epoch(
+                    options.clone(),
+                    now_unix,
+                    reserve && options.tic_connection_mode == TicConnectionMode::Dynamic,
+                    cancel_epoch,
+                )
                 .await
                 .map_err(Into::into)
         } else {

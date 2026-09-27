@@ -320,6 +320,7 @@ impl RecordingTransport {
 impl ServiceTransport for RecordingTransport {
     async fn exchange(&self, request: Request) -> Result<Response, ServiceError> {
         let summary = match request {
+            Request::Redundant { .. } => "redundant",
             Request::Start { configuration, .. } => {
                 assert_eq!(configuration.as_str(), "PrivateKey = client-only");
                 "start"
@@ -356,7 +357,7 @@ async fn controller_maps_service_response_to_shared_tunnel_contract() {
 
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
-        ["start", "status", "rebind_udp"]
+        ["start", "status", "status", "rebind_udp"]
     );
 }
 

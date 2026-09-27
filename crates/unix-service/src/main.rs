@@ -2,7 +2,7 @@ use nelomai_contracts::dispatcher::{
     Installation, MutationGuard, ProcessDispatcher, RealInstallIo,
 };
 use nelomai_unix_service::{
-    bind_listener, prepare_runtime_directory, run_engine_channel, serve_dispatcher_one,
+    bind_listener, prepare_runtime_directory, run_timed_engine_channel, serve_dispatcher_one,
     PlatformBackend, TunnelRequestHandler, DEFAULT_SOCKET_PATH, DISPATCHER_SOCKET_PATH,
 };
 use std::{
@@ -134,8 +134,31 @@ fn run_engine(root: &Path) -> std::io::Result<()> {
         "/var/run/nelomai",
     );
     let backend = backend.map_err(|_| nelomai_contracts::dispatcher::blocked())?;
-    run_engine_channel(
-        &mut std::io::stdin().lock(),
+    // Persistent privileged state, never selected by a product request. DNS
+    // service changes survive reboot, so their rollback journal must too. Do
+    // not chmod an existing directory: the factory rejects foreign/insecure
+    // state instead of adopting it. The existing engine-owner lock serializes
+    // both ordinary and pair ownership through this composite backend.
+    use std::os::unix::fs::DirBuilderExt;
+    let pair_root = root.join("redundancy");
+    match std::fs::DirBuilder::new().mode(0o700).create(&pair_root) {
+        Ok(()) => std::fs::File::open(root)?.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error),
+    }
+    let factory = nelomai_unix_service::member_network::runtime::NativePairFactory::new(
+        &pair_root,
+        layout.identity.slot,
+        &directory,
+    )?;
+    let backend = nelomai_unix_service::member_network::actor::CompositeBackend::new(
+        layout.identity.slot,
+        backend,
+        factory,
+    )
+    .map_err(|_| nelomai_contracts::dispatcher::blocked())?;
+    run_timed_engine_channel(
+        std::io::stdin(),
         &mut std::io::stdout().lock(),
         &mut TunnelRequestHandler::new(backend, layout.identity.runtime_version),
     )

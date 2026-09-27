@@ -6,9 +6,13 @@ use nelomai_client_tunnel::redundancy::network::*;
 use serde_json::{Map, Value};
 use std::{io, net::IpAddr};
 
+pub mod bindings;
 mod dns;
 mod physical;
 pub use physical::PhysicalRoutes;
+
+#[cfg(test)]
+mod allocator_tests;
 
 pub trait LinuxNetworkCommands {
     fn ip(&mut self, args: &[String]) -> io::Result<String>;
@@ -32,6 +36,8 @@ pub struct MemberTable {
 pub struct LinuxNetwork<C> {
     pub commands: C,
     members: Vec<MemberTable>,
+    allocator: Option<bindings::BindingAllocator>,
+    closing: bool,
 }
 
 impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
@@ -55,10 +61,26 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
         let mut result = Self {
             commands,
             members: Vec::new(),
+            allocator: None,
+            closing: false,
         };
         for member in members {
             result.register_member(member)?;
         }
+        Ok(result)
+    }
+    pub fn with_allocator(commands: C, allocator: bindings::BindingAllocator) -> io::Result<Self> {
+        let mut result = Self::new(
+            commands,
+            allocator.bindings().iter().map(|b| MemberTable {
+                interface: b.index,
+                name: b.name.clone(),
+                table: b.table,
+                priority: b.priority,
+            }),
+        )?;
+        result.closing = allocator.is_recovering();
+        result.allocator = Some(allocator);
         Ok(result)
     }
     /// Register only after the privileged factory has persisted a freshly
@@ -66,6 +88,12 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
     /// commands here; empty/primary-only construction never waits for standby.
     /// Replacing a live binding is deliberately not an adoption/recovery path.
     pub fn register_member(&mut self, member: MemberTable) -> io::Result<()> {
+        if self.allocator.is_some() || self.closing {
+            return Err(invalid());
+        }
+        self.insert_member(member)
+    }
+    fn insert_member(&mut self, member: MemberTable) -> io::Result<()> {
         if self.members.len() >= 2
             || member.interface == 0
             || !valid_name(&member.name)
@@ -102,6 +130,7 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
         match scope {
             RouteScope::Global => Ok(254),
             RouteScope::Member(i) => Ok(self.member(i)?.table),
+            RouteScope::WindowsInterface(_) => Err(invalid()),
         }
     }
     fn name(&self, interface: u32) -> io::Result<String> {
@@ -363,6 +392,142 @@ impl<C: LinuxNetworkCommands> LinuxNetwork<C> {
 }
 
 impl<C: LinuxNetworkCommands> NetworkSystem for LinuxNetwork<C> {
+    fn member_started(
+        &mut self,
+        slot: nelomai_client_tunnel::redundancy::Slot,
+        interface: u32,
+    ) -> io::Result<()> {
+        if self.closing || self.allocator.as_ref().is_some_and(|a| a.is_recovering()) {
+            return Err(invalid());
+        }
+        if self.allocator.is_none() {
+            return self.member(interface).map(|_| ());
+        }
+        let name = self.name(interface)?;
+        let slot = match slot {
+            nelomai_client_tunnel::redundancy::Slot::A => {
+                nelomai_contracts::dispatcher::TunnelSlot::A
+            }
+            nelomai_client_tunnel::redundancy::Slot::B => {
+                nelomai_contracts::dispatcher::TunnelSlot::B
+            }
+        };
+        if self
+            .allocator
+            .as_ref()
+            .ok_or_else(invalid)?
+            .bindings()
+            .iter()
+            .any(|b| b.slot == slot)
+        {
+            // This slot already has its durable reservation. Revalidate the
+            // exact identity/journal without querying unrelated native tables.
+            let occupied = bindings::Occupancy::parse("[]", "[]", "[]", "[]")?;
+            let b = self
+                .allocator
+                .as_mut()
+                .ok_or_else(invalid)?
+                .reserve(slot, interface, &name, &occupied)?;
+            let m = self.member(interface)?;
+            return if m.name == b.name && m.table == b.table && m.priority == b.priority {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        let mut dumps = Vec::with_capacity(4);
+        for kind in ["route", "rule"] {
+            for family in ["-4", "-6"] {
+                let mut args = vec![
+                    "-j".into(),
+                    "-N".into(),
+                    family.into(),
+                    kind.into(),
+                    "show".into(),
+                ];
+                if kind == "route" {
+                    args.extend(["table".into(), "all".into()]);
+                }
+                dumps.push(self.commands.ip(&args)?);
+            }
+        }
+        let occupied = bindings::Occupancy::parse(&dumps[0], &dumps[1], &dumps[2], &dumps[3])?;
+        // Occupancy queries can be slow. Do not bind an identity replaced while
+        // they ran; the native adapter will also recheck before each mutation.
+        if self.name(interface)? != name {
+            return Err(invalid());
+        }
+        let b = self
+            .allocator
+            .as_mut()
+            .ok_or_else(invalid)?
+            .reserve(slot, interface, &name, &occupied)?;
+        if self.members.iter().any(|m| m.interface == interface) {
+            let m = self.member(interface)?;
+            if m.name != b.name || m.table != b.table || m.priority != b.priority {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
+        self.insert_member(MemberTable {
+            interface,
+            name: b.name,
+            table: b.table,
+            priority: b.priority,
+        })
+    }
+    fn member_stopped(
+        &mut self,
+        slot: nelomai_client_tunnel::redundancy::Slot,
+        interface: u32,
+    ) -> io::Result<()> {
+        if interface == 0 {
+            return Err(invalid());
+        }
+        if let Some(allocator) = &mut self.allocator {
+            let slot = match slot {
+                nelomai_client_tunnel::redundancy::Slot::A => {
+                    nelomai_contracts::dispatcher::TunnelSlot::A
+                }
+                nelomai_client_tunnel::redundancy::Slot::B => {
+                    nelomai_contracts::dispatcher::TunnelSlot::B
+                }
+            };
+            let binding = allocator
+                .bindings()
+                .iter()
+                .find(|b| b.slot == slot)
+                .cloned();
+            let Some(binding) = binding else {
+                // Retried acknowledgement of an already released member is
+                // harmless, but must not alias the surviving member's index.
+                return if self.members.iter().any(|m| m.interface == interface) {
+                    Err(invalid())
+                } else {
+                    Ok(())
+                };
+            };
+            if binding.index != interface {
+                return Err(invalid());
+            }
+            // The caller confirmed exact native stop and route/rule/DNS
+            // absence. Do not remove the published mapping before durable ack.
+            allocator.release(&binding)?;
+        }
+        self.members.retain(|m| m.interface != interface);
+        Ok(())
+    }
+    fn session_closed(&mut self) -> io::Result<()> {
+        self.closing = true;
+        if let Some(allocator) = &mut self.allocator {
+            for binding in allocator.bindings().to_vec() {
+                allocator.release(&binding)?;
+                self.members.retain(|m| m.interface != binding.index);
+            }
+        }
+        self.members.clear();
+        Ok(())
+    }
     fn dns_resources(
         &self,
         interface: u32,

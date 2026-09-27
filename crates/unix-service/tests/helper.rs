@@ -336,6 +336,7 @@ impl ServiceTransport for RecordingTransport {
             Request::Metrics { .. } => "metrics",
             Request::Diagnostics { .. } => "diagnostics",
             Request::RebindUdp { .. } => "rebind_udp",
+            Request::Redundant { .. } => "redundant",
         };
         self.requests.lock().unwrap().push(command);
         Ok(self.response.clone())
@@ -381,7 +382,7 @@ async fn controller_maps_helper_responses_to_shared_tunnel_contract() {
     assert!(controller.rebind_udp().await.expect("rebind UDP"));
     assert_eq!(
         controller.transport().requests.lock().unwrap().as_slice(),
-        ["start", "status", "rebind_udp"]
+        ["start", "status", "status", "rebind_udp"]
     );
 }
 

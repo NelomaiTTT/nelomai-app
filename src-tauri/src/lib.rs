@@ -662,6 +662,88 @@ fn start_pending_stop_scheduler(application: Arc<NativeApplication>) {
     });
 }
 
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct DesktopCoordinationSchedule {
+    retry_at_unix: i64,
+}
+
+#[cfg(not(target_os = "android"))]
+struct DesktopPairObservation {
+    // Unknown status continues to block singleton repair, but grants no stop authority.
+    owns_tunnel: bool,
+    snapshot: Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
+}
+
+#[cfg(not(target_os = "android"))]
+async fn coordinate_desktop_redundancy<T, S, TF, SF>(
+    schedule: &mut DesktopCoordinationSchedule,
+    now: i64,
+    tick: T,
+    status: S,
+) -> DesktopPairObservation
+where
+    T: FnOnce() -> TF,
+    S: FnOnce() -> SF,
+    TF: std::future::Future<
+        Output = Result<
+            Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
+            nelomai_client_application::ApplicationError,
+        >,
+    >,
+    SF: std::future::Future<
+        Output = Result<
+            Option<nelomai_client_tunnel::redundancy::protocol::Snapshot>,
+            nelomai_client_application::ApplicationError,
+        >,
+    >,
+{
+    use nelomai_client_application::ApplicationError;
+    use nelomai_client_core::{CoreApiError, CoreError};
+    let step = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        if now >= schedule.retry_at_unix {
+            if let Err(error) = tick().await {
+                let retry = match error {
+                    ApplicationError::Api(CoreApiError::Rejected {
+                        retry_after_seconds,
+                        ..
+                    })
+                    | ApplicationError::Core(CoreError::Api(CoreApiError::Rejected {
+                        retry_after_seconds,
+                        ..
+                    })) => retry_after_seconds,
+                    _ => None,
+                }
+                .unwrap_or(15)
+                .max(1);
+                schedule.retry_at_unix =
+                    now.saturating_add(i64::try_from(retry).unwrap_or(i64::MAX));
+            }
+        }
+        // This fresh scoped read, not GUI state or a tick's optional result,
+        // decides whether legacy repair can touch the tunnel.
+        status().await
+    })
+    .await;
+    match step {
+        Ok(Ok(snapshot)) => DesktopPairObservation {
+            owns_tunnel: snapshot.is_some(),
+            snapshot,
+        },
+        Ok(Err(_)) => DesktopPairObservation {
+            owns_tunnel: true,
+            snapshot: None,
+        },
+        Err(_) => {
+            schedule.retry_at_unix = schedule.retry_at_unix.max(now.saturating_add(15));
+            DesktopPairObservation {
+                owns_tunnel: true,
+                snapshot: None,
+            }
+        }
+    }
+}
+
 fn start_connection_metrics_scheduler(
     _app: tauri::AppHandle,
     application: Arc<NativeApplication>,
@@ -680,6 +762,8 @@ fn start_connection_metrics_scheduler(
         let mut last_diagnostics_sample = None;
         let mut last_incident_sample = None;
         let mut skipped_probe_session: Option<String> = None;
+        #[cfg(not(target_os = "android"))]
+        let mut desktop_coordination = DesktopCoordinationSchedule::default();
         #[cfg(any(target_os = "macos", windows))]
         let mut stall_recovery_limiter = connection_metrics::StallRecoveryLimiter::default();
         #[cfg(target_os = "macos")]
@@ -698,6 +782,10 @@ fn start_connection_metrics_scheduler(
                 last_diagnostics_sample = None;
                 last_incident_sample = None;
                 skipped_probe_session = None;
+                #[cfg(not(target_os = "android"))]
+                {
+                    desktop_coordination = DesktopCoordinationSchedule::default();
+                }
                 #[cfg(any(target_os = "macos", windows))]
                 stall_recovery_limiter.reset();
                 #[cfg(target_os = "macos")]
@@ -706,6 +794,27 @@ fn start_connection_metrics_scheduler(
                 windows_service_recovery.reset();
                 continue;
             };
+            #[cfg(not(target_os = "android"))]
+            let pair_observation = coordinate_desktop_redundancy(
+                &mut desktop_coordination,
+                current_unix_time(),
+                || application.desktop_redundancy_tick(current_unix_time()),
+                || application.desktop_redundancy_status(),
+            )
+            .await;
+            #[cfg(not(target_os = "android"))]
+            let pair_owns_tunnel = pair_observation.owns_tunnel;
+            #[cfg(not(target_os = "android"))]
+            if let Some(snapshot) = pair_observation
+                .snapshot
+                .filter(|snapshot| snapshot.stalled)
+            {
+                tauri::Manager::state::<Arc<connection_intent::DesktopConnectionIntent>>(&_app)
+                    .handle_redundant_stall(snapshot)
+                    .await;
+            }
+            #[cfg(not(any(target_os = "macos", windows, target_os = "android")))]
+            let _ = pair_owns_tunnel;
             let observed = tracker.is_observed().await;
             #[cfg(target_os = "macos")]
             {
@@ -795,7 +904,7 @@ fn start_connection_metrics_scheduler(
                     let _ = incident_observation;
                     last_incident_sample = Some(sample.clone());
                     #[cfg(target_os = "macos")]
-                    if context.layer == nelomai_contracts::Layer::Stray {
+                    if !pair_owns_tunnel && context.layer == nelomai_contracts::Layer::Stray {
                         if let Some(observation) = incident_observation {
                             if macos_stall_recovery.should_attempt(
                                 &context.session_id,
@@ -864,10 +973,11 @@ fn start_connection_metrics_scheduler(
                     }
                     #[cfg(windows)]
                     {
-                        let recovery_relevant = should_attempt_windows_service_recovery(
-                            &error,
-                            windows_service_recovery.is_active(),
-                        );
+                        let recovery_relevant = !pair_owns_tunnel
+                            && should_attempt_windows_service_recovery(
+                                &error,
+                                windows_service_recovery.is_active(),
+                            );
                         let recovery_now = current_unix_time();
                         if windows_service_recovery.should_poll(recovery_relevant, recovery_now) {
                             let first_outage = windows_service_recovery.first_outage();
@@ -1621,6 +1731,143 @@ fn connection_metrics_poll_required(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_coordination_throttles_panel_errors_and_fences_legacy_repair_when_status_unknown(
+    ) {
+        use nelomai_client_application::ApplicationError;
+        use nelomai_client_core::{CoreApiError, CoreError};
+        use std::cell::Cell;
+        let tick_calls = Cell::new(0);
+        let status_calls = Cell::new(0);
+        let mut schedule = DesktopCoordinationSchedule::default();
+        assert!(
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                10,
+                || async {
+                    tick_calls.set(tick_calls.get() + 1);
+                    Err(ApplicationError::Core(CoreError::Api(
+                        CoreApiError::Rejected {
+                            code: "rate_limited".into(),
+                            message: "private".into(),
+                            retry_after_seconds: Some(45),
+                        },
+                    )))
+                },
+                || async {
+                    status_calls.set(status_calls.get() + 1);
+                    Err(ApplicationError::Storage)
+                }
+            )
+            .await
+            .owns_tunnel
+        );
+        assert_eq!(schedule.retry_at_unix, 55);
+        assert!(
+            coordinate_desktop_redundancy(
+                &mut schedule,
+                11,
+                || async { panic!("no retry before panel delay") },
+                || async {
+                    status_calls.set(status_calls.get() + 1);
+                    Err(ApplicationError::Storage)
+                }
+            )
+            .await
+            .owns_tunnel
+        );
+        assert_eq!(tick_calls.get(), 1);
+        assert_eq!(status_calls.get(), 2);
+        assert!(
+            !coordinate_desktop_redundancy(
+                &mut schedule,
+                55,
+                || async {
+                    tick_calls.set(tick_calls.get() + 1);
+                    Ok(None)
+                },
+                || async { Ok(None) }
+            )
+            .await
+            .owns_tunnel
+        );
+        assert_eq!(tick_calls.get(), 2);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_coordination_timeout_blocks_legacy_repair_and_defaults_to_15_seconds() {
+        let mut schedule = DesktopCoordinationSchedule::default();
+        assert!(
+            coordinate_desktop_redundancy(&mut schedule, 100, std::future::pending, || async {
+                panic!("timed-out step must end")
+            })
+            .await
+            .owns_tunnel
+        );
+        assert_eq!(schedule.retry_at_unix, 115);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn desktop_coordination_pair_status_blocks_single_repair_even_when_tick_returns_none() {
+        use nelomai_client_tunnel::redundancy::{
+            protocol::Snapshot, session::SessionState, SessionScope, Slot,
+        };
+        let scope = SessionScope {
+            runtime: nelomai_contracts::RuntimeSlot::Latest,
+            runtime_generation: 1,
+            connection_generation: 1,
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        let mut state = SessionState::new(scope.clone(), Slot::A, 0, 0).unwrap();
+        state.primary_started(&scope).unwrap();
+        let snapshot = Snapshot {
+            session: state.snapshot(),
+            leases: [Some("a".into()), None],
+            current_leases: [Some("a".into()), None],
+            standby_failed: false,
+            stalled: false,
+            primary_ready: true,
+            standby_ready: false,
+            cleanup_pending: false,
+            warm_stop_v1: false,
+        };
+        let mut schedule = DesktopCoordinationSchedule::default();
+        let observation = coordinate_desktop_redundancy(
+            &mut schedule,
+            10,
+            || async { Ok(None) },
+            || async { Ok(Some(snapshot.clone())) },
+        )
+        .await;
+        assert!(observation.owns_tunnel);
+        assert_eq!(observation.snapshot, Some(snapshot.clone()));
+        let mut stale = snapshot.clone();
+        stale.stalled = true;
+        stale.primary_ready = false;
+        let fresh = coordinate_desktop_redundancy(
+            &mut schedule,
+            11,
+            || async { Ok(Some(stale)) },
+            || async { Ok(Some(snapshot.clone())) },
+        )
+        .await;
+        assert_eq!(fresh.snapshot, Some(snapshot));
+        assert!(
+            !coordinate_desktop_redundancy(
+                &mut schedule,
+                11,
+                || async { Ok(None) },
+                || async { Ok(None) }
+            )
+            .await
+            .owns_tunnel
+        );
+        assert_eq!(schedule.retry_at_unix, 0);
+    }
 
     #[derive(Default)]
     struct PushAuthMemory(std::sync::Mutex<Option<nelomai_client_storage::AuthStoreV1>>);

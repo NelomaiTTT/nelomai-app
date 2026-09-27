@@ -14,11 +14,12 @@ use nelomai_client_core::StallRecoveryPlan;
 use nelomai_client_core::{
     classify_recovery, ConnectOptions, ConnectionIntentCoordinator, ConnectionIntentStatus,
     CoreApiError, CoreError, CoreState, IntentGeneration, Phase, RecoveryDecision,
-    RecoveryPolicyContext, StartDisposition,
+    RecoveryPolicyContext, RecoveryTransport, StallTrigger, StartDisposition,
 };
 #[cfg(target_os = "macos")]
-use nelomai_client_core::{
-    RecoveryTransport, StallTrigger, StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome,
+use nelomai_client_core::{StalledDataPlaneRecovery, StalledDataPlaneRecoveryOutcome};
+use nelomai_client_tunnel::redundancy::{
+    protocol::Snapshot as PairSnapshot, session::SessionPhase,
 };
 use nelomai_contracts::{
     allows_new_connection_intent_operation, BindPeerRequest, Connection,
@@ -47,6 +48,7 @@ impl Default for ConnectionIntentSnapshot {
 
 struct RuntimeState {
     coordinator: ConnectionIntentCoordinator,
+    reserve_requested: bool,
     options: Option<ConnectOptions>,
     policy: RecoveryPolicyContext,
     next_retry_at_unix: Option<i64>,
@@ -60,6 +62,17 @@ struct RuntimeState {
     retry_count: u32,
     owned_lease_id: Option<String>,
     initial_preflight: Option<InitialDesktopPreflight>,
+    pending_redundant_recovery: Option<PendingRedundantRecovery>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingRedundantRecovery {
+    generation: IntentGeneration,
+    lease_id: String,
+    snapshot: PairSnapshot,
+    // A failed save can follow a successful native freeze/close. Only a frozen
+    // snapshot of this exact scope can refresh the fences for that retry.
+    retry_frozen: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +112,7 @@ impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             coordinator: ConnectionIntentCoordinator::default(),
+            reserve_requested: false,
             options: None,
             policy: RecoveryPolicyContext::default(),
             next_retry_at_unix: None,
@@ -112,6 +126,7 @@ impl Default for RuntimeState {
             retry_count: 0,
             owned_lease_id: None,
             initial_preflight: None,
+            pending_redundant_recovery: None,
         }
     }
 }
@@ -242,6 +257,11 @@ impl DesktopConnectionIntent {
         initial_preflight: Option<InitialDesktopPreflight>,
     ) -> Result<StartCommandResponse, CommandError> {
         let core_state = self.application.state().await;
+        let reserve_requested = self
+            .app
+            .state::<Arc<AppPreferenceStore>>()
+            .get()
+            .use_reserve_connection;
         let action = {
             let mut state = self.state.lock().await;
             let previous_generation = state.coordinator.generation();
@@ -273,7 +293,13 @@ impl DesktopConnectionIntent {
                             "Не удалось начать новое подключение",
                         ));
                     };
-                    initialize_episode(&mut state, options, generation, now_unix);
+                    initialize_episode(
+                        &mut state,
+                        options,
+                        generation,
+                        now_unix,
+                        reserve_requested,
+                    );
                     state.initial_preflight = initial_preflight;
                     StartRuntimeAction::Run(generation)
                 }
@@ -287,7 +313,13 @@ impl DesktopConnectionIntent {
                         state.next_retry_at_unix,
                     );
                     if action == StartRuntimeAction::Run(generation) {
-                        initialize_episode(&mut state, options, generation, now_unix);
+                        initialize_episode(
+                            &mut state,
+                            options,
+                            generation,
+                            now_unix,
+                            reserve_requested,
+                        );
                         state.initial_preflight = initial_preflight;
                     }
                     action
@@ -312,6 +344,7 @@ impl DesktopConnectionIntent {
             let cancelled = state.coordinator.cancel_intent(generation);
             if cancelled {
                 state.options = None;
+                state.reserve_requested = false;
                 state.policy = RecoveryPolicyContext::default();
                 state.next_retry_at_unix = None;
                 state.retry_not_before_unix = None;
@@ -324,6 +357,7 @@ impl DesktopConnectionIntent {
                 state.retry_count = 0;
                 state.owned_lease_id = None;
                 state.initial_preflight = None;
+                state.pending_redundant_recovery = None;
             }
             cancelled
         };
@@ -346,6 +380,25 @@ impl DesktopConnectionIntent {
             self.wake.notify_one();
         }
         woke
+    }
+
+    /// Queue only local work here: the metrics loop never waits for panel cleanup.
+    pub(crate) async fn handle_redundant_stall(&self, snapshot: PairSnapshot) -> bool {
+        let generation = self.state.lock().await.coordinator.generation();
+        let Some(current) = self.application.state().await.connection else {
+            return false;
+        };
+        let queued = queue_redundant_recovery(
+            &mut *self.state.lock().await,
+            generation,
+            &current,
+            snapshot,
+            crate::current_unix_time(),
+        );
+        if queued {
+            self.wake.notify_one();
+        }
+        queued
     }
 
     #[cfg(target_os = "macos")]
@@ -511,7 +564,10 @@ impl DesktopConnectionIntent {
                         Some(retry_at_after_wakeup(state.retry_not_before_unix, now));
                 }
                 match (state.coordinator.status(), state.next_retry_at_unix) {
-                    (ConnectionIntentStatus::Recovering, Some(next)) => {
+                    (status, Some(next))
+                        if status == ConnectionIntentStatus::Recovering
+                            || state.pending_redundant_recovery.is_some() =>
+                    {
                         Some(next.saturating_sub(crate::current_unix_time()).max(0) as u64)
                     }
                     _ => None,
@@ -526,6 +582,21 @@ impl DesktopConnectionIntent {
                     _ = tokio::time::sleep(Duration::from_secs(sleep_seconds)) => {}
                     _ = self.wake.notified() => { continue; }
                 }
+            }
+            let pending_redundant = self.state.lock().await.pending_redundant_recovery.is_some();
+            if pending_redundant {
+                let application = &self.application;
+                let generation = advance_redundant_recovery(
+                    &self.state,
+                    crate::current_unix_time(),
+                    || self.application.desktop_redundancy_status(),
+                    |snapshot| async move { application.prepare_desktop_recovery(&snapshot).await },
+                )
+                .await;
+                if let Some(generation) = generation {
+                    let _ = self.run_attempt(generation, true).await;
+                }
+                continue;
             }
             let generation = {
                 let state = self.state.lock().await;
@@ -563,6 +634,7 @@ impl DesktopConnectionIntent {
             attempt_kind,
             refresh_capability_before_attempt,
             initial_preflight,
+            reserve_requested,
         ) = {
             let mut state = self.state.lock().await;
             let options = state.options.clone().ok_or_else(|| {
@@ -584,11 +656,14 @@ impl DesktopConnectionIntent {
             state.retry_not_before_unix = None;
             (
                 options,
-                std::mem::take(&mut state.reconcile_before_attempt),
+                // Keep this obligation through capability/preflight failures.
+                // Only successful reconciliation may consume a cold-stop receipt.
+                state.reconcile_before_attempt,
                 std::mem::take(&mut state.repair_before_attempt),
                 state.attempt_kind,
                 state.refresh_capability_before_attempt,
                 state.initial_preflight.clone(),
+                state.reserve_requested,
             )
         };
         if let Some(initial_preflight) = initial_preflight {
@@ -622,6 +697,13 @@ impl DesktopConnectionIntent {
             let preflight = self
                 .run_initial_desktop_preflight(&options, &initial_preflight)
                 .await;
+            // An explicit eligible reserve request cannot fall through to an
+            // ordinary Start merely because an old capability chose Legacy.
+            let start_mode = if desktop_reserve_eligible(&options, reserve_requested) {
+                InitialDesktopStartMode::Recovery
+            } else {
+                start_mode
+            };
             match initial_desktop_preflight_action(start_mode, preflight.is_ok()) {
                 InitialDesktopPreflightAction::RetryIntent => {
                     return self
@@ -682,7 +764,11 @@ impl DesktopConnectionIntent {
                 .reconcile_pending_operation_for_retry()
                 .await
             {
-                self.state.lock().await.reconcile_before_attempt = true;
+                let mut state = self.state.lock().await;
+                if state.coordinator.generation() == generation {
+                    state.reconcile_before_attempt = true;
+                }
+                drop(state);
                 return self.complete_error(generation, error).await;
             }
             let mut state = self.state.lock().await;
@@ -692,6 +778,7 @@ impl DesktopConnectionIntent {
                     "Подключение отменено",
                 ));
             }
+            state.reconcile_before_attempt = false;
         }
         if repair_before_attempt {
             self.wait_for_recovery_power(generation, automatic).await?;
@@ -711,9 +798,10 @@ impl DesktopConnectionIntent {
         let result = match attempt_kind {
             AttemptKind::Start => {
                 self.application
-                    .connection_intent_attempt_guarded(
+                    .desktop_connection_intent_attempt_guarded(
                         options,
                         crate::current_unix_time(),
+                        reserve_requested,
                         recovery_allowed,
                     )
                     .await
@@ -897,6 +985,7 @@ impl DesktopConnectionIntent {
         state.attempt_kind = AttemptKind::Start;
         state.retry_count = 0;
         state.owned_lease_id = None;
+        state.pending_redundant_recovery = None;
         Ok(())
     }
 
@@ -922,6 +1011,7 @@ impl DesktopConnectionIntent {
                 state.retry_count = 0;
                 state.owned_lease_id = Some(connection.lease_id.clone());
                 state.initial_preflight = None;
+                state.pending_redundant_recovery = None;
             }
             (decision, recovered)
         };
@@ -1158,12 +1248,161 @@ impl DesktopConnectionIntent {
     }
 }
 
+fn stalled_pair(snapshot: &PairSnapshot) -> bool {
+    snapshot.stalled
+        && !snapshot.primary_ready
+        && matches!(
+            snapshot.session.phase,
+            SessionPhase::Running | SessionPhase::Stopping | SessionPhase::Stopped
+        )
+}
+
+fn queue_redundant_recovery(
+    state: &mut RuntimeState,
+    generation: IntentGeneration,
+    current: &Connection,
+    snapshot: PairSnapshot,
+    now: i64,
+) -> bool {
+    if state.coordinator.generation() != generation
+        || !can_begin_stall_recovery(state.coordinator.status(), state.armed)
+        || state.options.is_none()
+        || state.pending_redundant_recovery.is_some()
+        || state.owned_lease_id.as_deref() != Some(current.lease_id.as_str())
+        || current.session_id.as_deref() != Some(snapshot.session.scope.session_id.as_str())
+        || !stalled_pair(&snapshot)
+    {
+        return false;
+    }
+    state.pending_redundant_recovery = Some(PendingRedundantRecovery {
+        generation,
+        lease_id: current.lease_id.clone(),
+        snapshot,
+        retry_frozen: false,
+    });
+    state.next_retry_at_unix = Some(now);
+    true
+}
+
+fn redundant_recovery_is_current(state: &RuntimeState, pending: &PendingRedundantRecovery) -> bool {
+    state.coordinator.generation() == pending.generation
+        && can_begin_stall_recovery(state.coordinator.status(), state.armed)
+        && state.options.is_some()
+        && state.owned_lease_id.as_deref() == Some(pending.lease_id.as_str())
+        && state.pending_redundant_recovery.as_ref() == Some(pending)
+}
+
+/// The scheduler owns this step. Injected boundaries are helper Status and Core's
+/// exact cold-stop preparation, not a second native/server lifecycle implementation.
+async fn advance_redundant_recovery<S, SF, P, PF>(
+    state: &Mutex<RuntimeState>,
+    now: i64,
+    status: S,
+    prepare: P,
+) -> Option<IntentGeneration>
+where
+    S: FnOnce() -> SF,
+    SF: std::future::Future<Output = Result<Option<PairSnapshot>, ApplicationError>>,
+    P: FnOnce(PairSnapshot) -> PF,
+    PF: std::future::Future<Output = Result<bool, ApplicationError>>,
+{
+    let pending = {
+        let mut state = state.lock().await;
+        let pending = state.pending_redundant_recovery.clone()?;
+        if !redundant_recovery_is_current(&state, &pending) {
+            state.pending_redundant_recovery = None;
+            return None;
+        }
+        if state.next_retry_at_unix.is_some_and(|next| next > now) {
+            return None;
+        }
+        pending
+    };
+    let fresh = status().await;
+    let snapshot = {
+        let mut state = state.lock().await;
+        if !redundant_recovery_is_current(&state, &pending) {
+            return None;
+        }
+        let snapshot = match fresh {
+            Ok(Some(snapshot)) => snapshot,
+            // Unknown/absent is not authority to restart. Retain the same intent.
+            _ => {
+                state.next_retry_at_unix = Some(now.saturating_add(15));
+                return None;
+            }
+        };
+        let frozen_retry = pending.retry_frozen
+            && matches!(
+                snapshot.session.phase,
+                SessionPhase::Stopping | SessionPhase::Stopped
+            );
+        if snapshot.session.scope != pending.snapshot.session.scope
+            || !stalled_pair(&snapshot)
+            || (!frozen_retry
+                && (snapshot.session.local_revision != pending.snapshot.session.local_revision
+                    || snapshot.session.network_epoch != pending.snapshot.session.network_epoch))
+        {
+            state.pending_redundant_recovery = None;
+            state.next_retry_at_unix = None;
+            return None;
+        }
+        snapshot
+    };
+    let result = prepare(snapshot).await;
+    let mut state = state.lock().await;
+    if !redundant_recovery_is_current(&state, &pending) {
+        return None;
+    }
+    match result {
+        Err(_) => {
+            // Freeze may already have closed traffic. Never arm Start on a lost
+            // protected-store ACK: retry the same scope via a fresh frozen status.
+            state.pending_redundant_recovery.as_mut()?.retry_frozen = true;
+            state.next_retry_at_unix = Some(now.saturating_add(15));
+            None
+        }
+        Ok(false) => {
+            state.pending_redundant_recovery = None;
+            state.next_retry_at_unix = None;
+            None
+        }
+        Ok(true) => {
+            let options = state.options.clone()?;
+            state
+                .coordinator
+                .handle_stall(
+                    pending.generation,
+                    StallTrigger {
+                        options,
+                        pinned: false,
+                        transport: RecoveryTransport::Other,
+                    },
+                )
+                .ok()?;
+            state.pending_redundant_recovery = None;
+            state.attempt_kind = AttemptKind::Start;
+            state.reconcile_before_attempt = true;
+            state.repair_before_attempt = false;
+            state.refresh_capability_before_attempt = true;
+            state.initial_preflight = None;
+            state.next_retry_at_unix = None;
+            state.retry_not_before_unix = None;
+            consume_immediate_retry_slot(&mut state.coordinator, pending.generation, now);
+            Some(pending.generation)
+        }
+    }
+}
+
 fn initialize_episode(
     state: &mut RuntimeState,
     options: ConnectOptions,
     generation: IntentGeneration,
     now_unix: i64,
+    reserve_requested: bool,
 ) {
+    state.pending_redundant_recovery = None;
+    state.reserve_requested = reserve_requested;
     state.options = Some(options.normalized_for_layer());
     state.policy = RecoveryPolicyContext::default();
     state.next_retry_at_unix = None;
@@ -1176,6 +1415,12 @@ fn initialize_episode(
         state.attempt_kind = AttemptKind::Start;
     }
     consume_immediate_retry_slot(&mut state.coordinator, generation, now_unix);
+}
+
+fn desktop_reserve_eligible(options: &ConnectOptions, requested: bool) -> bool {
+    requested
+        && options.clone().normalized_for_layer().tic_connection_mode
+            == nelomai_contracts::TicConnectionMode::Dynamic
 }
 
 fn retry_at_after_wakeup(retry_not_before_unix: Option<i64>, now_unix: i64) -> i64 {
@@ -1212,7 +1457,6 @@ fn connection_matches_core_state(state: &CoreState, connection: &Connection) -> 
             .is_some_and(|current| current.lease_id == connection.lease_id)
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn can_begin_stall_recovery(status: ConnectionIntentStatus, armed: bool) -> bool {
     armed && status == ConnectionIntentStatus::None
 }
@@ -1409,7 +1653,12 @@ fn error_retry_after_seconds(error: &ApplicationError) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[path = "connection_intent_recovery_tests.rs"]
+mod recovery_integration;
+
+#[cfg(test)]
 mod tests {
+    use super::{advance_redundant_recovery, queue_redundant_recovery};
     use super::{
         attempt_is_current_after_async_boundary, attempt_kind_for_stall_plan,
         attempt_reports_recovery, can_begin_stall_recovery, connection_matches_core_state,
@@ -1421,6 +1670,7 @@ mod tests {
         InitialDesktopPreflightAction, InitialDesktopStartMode, SlowRecoveryNotifier,
         StartRuntimeAction,
     };
+    use super::{desktop_reserve_eligible, initialize_episode, RuntimeState};
     use crate::{diagnostics::AppDiagnostics, resource_usage::ResourceSnapshot};
     use nelomai_client_application::ApplicationError;
     use nelomai_client_core::{
@@ -1428,12 +1678,385 @@ mod tests {
         CoreState, IntentGeneration, Phase, RecoveryDecision, RecoveryPolicyContext,
         StartDisposition,
     };
+    use nelomai_client_tunnel::redundancy::{
+        protocol::Snapshot as PairSnapshot,
+        session::{SessionPhase, SessionState},
+        SessionScope, Slot,
+    };
     use nelomai_contracts::{
         Connection, ConnectionIntentCapability, EgressMode, Layer, LeaseStatus, RouteMode,
         TicConnectionMode,
     };
+    use tokio::sync::Mutex;
 
     struct CountingNotifier(std::sync::atomic::AtomicUsize);
+
+    fn redundant_fixture() -> (RuntimeState, Connection, PairSnapshot) {
+        let mut state = RuntimeState::default();
+        let options = quick_toggle_placeholder_options();
+        let StartDisposition::Recovering { generation, .. } = state
+            .coordinator
+            .start_or_resume(options.clone(), 10)
+            .unwrap()
+        else {
+            panic!("new intent")
+        };
+        initialize_episode(&mut state, options, generation, 10, true);
+        let mut current = connection("lease-a");
+        current.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        assert!(state.coordinator.begin_attempt(generation));
+        assert_eq!(
+            state
+                .coordinator
+                .mark_connected(generation, current.clone()),
+            RecoveryDecision::Accept
+        );
+        state.armed = true;
+        state.owned_lease_id = Some(current.lease_id.clone());
+        let scope = SessionScope {
+            runtime: nelomai_contracts::RuntimeSlot::Latest,
+            runtime_generation: 1,
+            connection_generation: 1,
+            session_id: current.session_id.clone().unwrap(),
+        };
+        let mut session = SessionState::new(scope.clone(), Slot::A, 0, 0).unwrap();
+        session.primary_started(&scope).unwrap();
+        session
+            .standby_installed(session.install_ticket(&scope, Slot::B).unwrap(), 0)
+            .unwrap();
+        let snapshot = PairSnapshot {
+            session: session.snapshot(),
+            leases: [Some("lease-a".into()), Some("lease-b".into())],
+            current_leases: [Some("lease-a".into()), Some("lease-b".into())],
+            primary_ready: false,
+            standby_ready: false,
+            standby_failed: true,
+            stalled: true,
+            cleanup_pending: false,
+            warm_stop_v1: true,
+        };
+        (state, current, snapshot)
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_cold_cleanup_arms_reserve_v2_start_not_single_replacement() {
+        let (mut state, current, snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        let options = state.options.clone();
+        assert!(queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        assert_eq!(
+            state.coordinator.status(),
+            nelomai_client_core::ConnectionIntentStatus::None
+        );
+        let state = Mutex::new(state);
+        let expected = snapshot.clone();
+        let run = advance_redundant_recovery(
+            &state,
+            20,
+            || async { Ok(Some(snapshot.clone())) },
+            |observed| async move {
+                assert_eq!(observed, expected);
+                Ok(true)
+            },
+        )
+        .await;
+        assert_eq!(run, Some(generation));
+        let mut state = state.lock().await;
+        assert_eq!(state.attempt_kind, AttemptKind::Start);
+        assert!(state.reconcile_before_attempt);
+        assert!(state.reserve_requested);
+        assert_eq!(state.options, options);
+        assert!(state.coordinator.begin_attempt(generation));
+        assert!(desktop_reserve_eligible(
+            state.options.as_ref().unwrap(),
+            state.reserve_requested
+        ));
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_save_error_retains_intent_and_retries_frozen_stopped_snapshot() {
+        let (mut state, current, snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        assert!(queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        let state = Mutex::new(state);
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                20,
+                || async { Ok(Some(snapshot.clone())) },
+                |_| async { Err(ApplicationError::Storage) }
+            )
+            .await,
+            None
+        );
+        {
+            let state = state.lock().await;
+            assert!(state.pending_redundant_recovery.is_some());
+            assert_eq!(
+                state.coordinator.status(),
+                nelomai_client_core::ConnectionIntentStatus::None
+            );
+            assert!(!state.reconcile_before_attempt);
+            assert_eq!(state.next_retry_at_unix, Some(35));
+        }
+        let mut frozen = snapshot;
+        frozen.session.phase = SessionPhase::Stopped;
+        frozen.session.local_revision += 2;
+        let expected = frozen.clone();
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                35,
+                || async { Ok(Some(frozen)) },
+                |observed| async move {
+                    assert_eq!(observed, expected);
+                    Ok(true)
+                }
+            )
+            .await,
+            Some(generation)
+        );
+        assert!(state.lock().await.reconcile_before_attempt);
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_cancel_during_cold_prepare_never_restarts() {
+        let (mut state, current, snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        assert!(queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        let state = Mutex::new(state);
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                20,
+                || async { Ok(Some(snapshot)) },
+                |_| async {
+                    assert!(state.lock().await.coordinator.cancel_intent(generation));
+                    Ok(true)
+                }
+            )
+            .await,
+            None
+        );
+        assert!(!state.lock().await.reconcile_before_attempt);
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_fresh_health_foreign_scope_or_revision_prevents_cold_prepare() {
+        for change in 0..4 {
+            let (mut state, current, snapshot) = redundant_fixture();
+            let generation = state.coordinator.generation();
+            assert!(queue_redundant_recovery(
+                &mut state,
+                generation,
+                &current,
+                snapshot.clone(),
+                20
+            ));
+            let mut fresh = snapshot;
+            match change {
+                0 => fresh.primary_ready = true,
+                1 => fresh.session.scope.connection_generation += 1,
+                2 => fresh.session.local_revision += 1,
+                _ => fresh.session.network_epoch += 1,
+            }
+            assert_eq!(
+                advance_redundant_recovery(
+                    &Mutex::new(state),
+                    20,
+                    || async { Ok(Some(fresh)) },
+                    |_| async { panic!("stale observation cannot authorize a stop") }
+                )
+                .await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_cancel_while_reading_status_prevents_prepare() {
+        let (mut state, current, snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        assert!(queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        let state = Mutex::new(state);
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                20,
+                || async {
+                    state.lock().await.coordinator.cancel_intent(generation);
+                    Ok(Some(snapshot))
+                },
+                |_| async { panic!("cancelled intent") }
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_unknown_status_retains_retry_without_start_authority() {
+        let (mut state, current, snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        assert!(queue_redundant_recovery(
+            &mut state, generation, &current, snapshot, 20
+        ));
+        let state = Mutex::new(state);
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                20,
+                || async { Err(ApplicationError::Storage) },
+                |_| async { panic!("unknown cannot stop") }
+            )
+            .await,
+            None
+        );
+        assert!(state.lock().await.pending_redundant_recovery.is_some());
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                21,
+                || async { panic!("retry delay") },
+                |_| async { panic!("retry delay") }
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                35,
+                || async { Ok(None) },
+                |_| async { panic!("absence cannot stop") }
+            )
+            .await,
+            None
+        );
+        assert!(!state.lock().await.reconcile_before_attempt);
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_atomic_rejection_never_arms_start() {
+        let (mut state, current, snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        assert!(queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        let state = Mutex::new(state);
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                20,
+                || async { Ok(Some(snapshot)) },
+                |_| async { Ok(false) }
+            )
+            .await,
+            None
+        );
+        let state = state.lock().await;
+        assert!(state.pending_redundant_recovery.is_none());
+        assert!(!state.reconcile_before_attempt);
+        assert_eq!(
+            state.coordinator.status(),
+            nelomai_client_core::ConnectionIntentStatus::None
+        );
+    }
+
+    #[tokio::test]
+    async fn redundant_stall_native_active_b_keeps_original_intent_lease_and_options() {
+        let (mut state, current, mut snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        snapshot.session.active = Slot::B;
+        snapshot.session.role_confirmed = false;
+        snapshot.session.local_revision += 1;
+        // CURRENT A may have been replaced while the intent's original lease
+        // still identifies its UI connection. Core validates the canonical map.
+        snapshot.leases[0] = Some("replacement-a".into());
+        snapshot.current_leases[0] = Some("replacement-a".into());
+        snapshot.session.membership_generation += 1;
+        assert!(queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        let state = Mutex::new(state);
+        assert_eq!(
+            advance_redundant_recovery(
+                &state,
+                20,
+                || async { Ok(Some(snapshot)) },
+                |observed| async move {
+                    assert_eq!(observed.session.active, Slot::B);
+                    Ok(true)
+                }
+            )
+            .await,
+            Some(generation)
+        );
+        assert_eq!(
+            state.lock().await.owned_lease_id.as_deref(),
+            Some("lease-a")
+        );
+    }
+
+    #[test]
+    fn redundant_stall_queue_rejects_late_owner_and_accepts_frozen_retry() {
+        let (mut state, mut current, mut snapshot) = redundant_fixture();
+        let generation = state.coordinator.generation();
+        current.session_id = Some("different-session".into());
+        assert!(!queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        current.session_id = Some(snapshot.session.scope.session_id.clone());
+        current.lease_id = "old-lease".into();
+        assert!(!queue_redundant_recovery(
+            &mut state,
+            generation,
+            &current,
+            snapshot.clone(),
+            20
+        ));
+        current.lease_id = "lease-a".into();
+        snapshot.session.phase = SessionPhase::Stopping;
+        assert!(queue_redundant_recovery(
+            &mut state, generation, &current, snapshot, 20
+        ));
+    }
 
     impl SlowRecoveryNotifier for CountingNotifier {
         fn show(&self, title: &str, body: &str) -> Result<(), String> {
@@ -1450,6 +2073,61 @@ mod tests {
         let notifier = CountingNotifier(std::sync::atomic::AtomicUsize::new(0));
         show_slow_recovery_notification(&notifier).unwrap();
         assert_eq!(notifier.0.load(std::sync::atomic::Ordering::SeqCst), 1,);
+    }
+
+    #[test]
+    fn desktop_reserve_is_frozen_for_an_episode_and_changes_only_on_new_intent() {
+        let mut state = RuntimeState::default();
+        let options = quick_toggle_placeholder_options();
+        let StartDisposition::Recovering { generation, .. } = state
+            .coordinator
+            .start_or_resume(options.clone(), 10)
+            .unwrap()
+        else {
+            panic!("new intent");
+        };
+        initialize_episode(&mut state, options.clone(), generation, 10, true);
+        assert!(state.reserve_requested);
+        let StartDisposition::Recovering {
+            generation: retry, ..
+        } = state
+            .coordinator
+            .start_or_resume(options.clone(), 11)
+            .unwrap()
+        else {
+            panic!("same intent");
+        };
+        assert_eq!(
+            recovering_action(generation, retry, Some(20)),
+            StartRuntimeAction::Wait(Some(20))
+        );
+        assert!(
+            state.reserve_requested,
+            "retry must not re-read an off preference"
+        );
+        assert!(state.coordinator.cancel_intent(generation));
+        let StartDisposition::Recovering {
+            generation: next, ..
+        } = state
+            .coordinator
+            .start_or_resume(options.clone(), 30)
+            .unwrap()
+        else {
+            panic!("new intent");
+        };
+        initialize_episode(&mut state, options, next, 30, false);
+        assert!(!state.reserve_requested);
+    }
+
+    #[test]
+    fn desktop_reserve_uses_dynamic_only_after_quick_toggle_options_resolve() {
+        let options = quick_toggle_placeholder_options();
+        assert!(desktop_reserve_eligible(&options, true));
+        assert!(!desktop_reserve_eligible(&options, false));
+        assert!(!desktop_reserve_eligible(
+            &ConnectOptions::android_default(),
+            true
+        ));
     }
 
     fn connection(lease_id: &str) -> Connection {

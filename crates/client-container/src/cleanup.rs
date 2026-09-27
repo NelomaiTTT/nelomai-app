@@ -81,7 +81,7 @@ impl CleanupEnvelopeV1 {
         let envelope = Self {
             cleanup_contract_version: 1,
             lease_ids: snapshot.lease_ids.clone(),
-            redundant_session_ids: Vec::new(),
+            redundant_session_ids: snapshot.redundant_session_ids.clone(),
             operations,
             engine_role,
             background_reference,
@@ -98,7 +98,8 @@ impl CleanupEnvelopeV1 {
         engine_role: CleanupEngineRoleV1,
         background_reference: Option<String>,
     ) -> Result<Self, CleanupEnvelopeError> {
-        let mut lease_ids = Vec::new();
+        let pair_snapshot = state.cleanup_snapshot();
+        let mut lease_ids = pair_snapshot.lease_ids;
         for lease_id in state
             .saved_connection
             .as_ref()
@@ -167,10 +168,27 @@ impl CleanupEnvelopeV1 {
                 CleanupOperationProvenanceV1::LegacyUnknown,
             );
         }
+        if let Some(pair) = &state.desktop_redundancy {
+            push_operation(
+                &mut operations,
+                &pair.start_operation_id,
+                CleanupOperationProvenanceV1::Verified {
+                    request_fingerprint: pair.request_fingerprint.clone(),
+                    contract_version: 2,
+                },
+            );
+            if let Some(stop) = &pair.stop {
+                push_operation(
+                    &mut operations,
+                    &stop.operation_id,
+                    CleanupOperationProvenanceV1::LegacyUnknown,
+                );
+            }
+        }
         let envelope = Self {
             cleanup_contract_version: 1,
             lease_ids,
-            redundant_session_ids: Vec::new(),
+            redundant_session_ids: pair_snapshot.redundant_session_ids,
             operations,
             engine_role,
             background_reference,

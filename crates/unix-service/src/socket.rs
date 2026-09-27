@@ -132,6 +132,13 @@ impl UnixSocketTransport {
         if request.protocol_version() != crate::PROTOCOL_VERSION {
             return Err(ServiceError::UnsupportedProtocol);
         }
+        if let Request::Redundant { request, .. } = &request {
+            // Reject malformed Start before giving it lifecycle authority. The
+            // native session owner still authenticates the actual runtime.
+            request
+                .validate(request.scope().runtime)
+                .map_err(|_| ServiceError::InvalidRequest)?;
+        }
         if let Some(dispatcher_path) = &self.dispatcher_path {
             use nelomai_contracts::dispatcher as d;
             let dispatcher_exchange =
@@ -166,7 +173,16 @@ impl UnixSocketTransport {
                     Err(ServiceError::Backend("dispatcher_stop_failed".into()))
                 };
             }
-            if !matches!(request, Request::Start { .. }) {
+            // Version may bring up a verified engine to discover its private
+            // capabilities, but never starts a tunnel. Unbound Common queries
+            // retain their passive pre-auth behavior; only a bound runtime may
+            // acquire lifecycle authority. Status/Stop/Attach remain passive.
+            let starts_engine = matches!(&request, Request::Start { .. })
+                || matches!(&request, Request::Redundant { request, .. } if request.is_start())
+                || (matches!(&request, Request::Version { .. })
+                    && !version.running
+                    && (self.common.is_none() || expected.is_some()));
+            if !starts_engine {
                 if !version.running {
                     match request {
                         Request::Status { .. } => {

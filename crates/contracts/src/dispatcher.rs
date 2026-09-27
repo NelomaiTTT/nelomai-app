@@ -1097,6 +1097,7 @@ pub struct ProcessDispatcher {
     #[cfg(unix)]
     tree_owner: Option<std::os::unix::net::UnixStream>,
     channel_failed: bool,
+    supports_idle_tick: bool,
     broker_authorization: BrokerAuthorizationCache,
 }
 impl ProcessDispatcher {
@@ -1120,6 +1121,7 @@ impl ProcessDispatcher {
             #[cfg(unix)]
             tree_owner: None,
             channel_failed: false,
+            supports_idle_tick: false,
             broker_authorization: BrokerAuthorizationCache::default(),
         })
     }
@@ -1202,6 +1204,7 @@ impl ProcessDispatcher {
         &mut self,
         primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
     ) -> io::Result<()> {
+        self.supports_idle_tick = false;
         let verified = self.installation.load_slot(self.layout.identity.slot)?;
         verified.authorize(&self.layout.identity)?;
         let marker = self.installation.root.join(ACTIVE_ENGINE_NAME);
@@ -1265,6 +1268,10 @@ impl ProcessDispatcher {
         if response.get("engine_ready") != Some(&serde_json::Value::Bool(true)) {
             return Err(blocked());
         }
+        // Old engines omit this field. Only an explicit true enables a broker
+        // wakeup; capability/runtime availability is otherwise unchanged.
+        self.supports_idle_tick =
+            response.get("supports_idle_tick") == Some(&serde_json::Value::Bool(true));
         Ok(())
     }
     fn stop(
@@ -1340,6 +1347,45 @@ impl ProcessDispatcher {
         fs::remove_file(marker)?;
         Ok(())
     }
+    pub fn supports_idle_tick(&self) -> bool {
+        self.child.is_some() && self.supports_idle_tick && !self.channel_failed
+    }
+
+    /// An opt-in engine may request SCM cleanup from its idle timer. Exchange a
+    /// private tick so exchange_inner continues servicing its inherited-pipe
+    /// primitives even without GUI traffic. Call under the same owner mutex and
+    /// process watchdog as relay/handle. Never launch or recover a child here.
+    pub fn idle_tick(
+        &mut self,
+        primitive: &mut impl FnMut(EnginePrimitive, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.child.is_none() || !self.supports_idle_tick {
+            return Ok(());
+        }
+        if self.channel_failed {
+            return Err(blocked());
+        }
+        let _guard = MutationGuard::acquire(&self.installation.root)?;
+        let response = self.exchange(
+            &encode_frame(&serde_json::json!({"dispatcher_control":"tick"}))?,
+            primitive,
+        )?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TickAck {
+            engine_tick: bool,
+        }
+        let valid = frame_body(&response, MAX_ENGINE_FRAME)
+            .ok()
+            .and_then(|body| serde_json::from_slice::<TickAck>(body).ok())
+            .is_some_and(|ack| ack.engine_tick);
+        if !valid {
+            self.channel_failed = true;
+            return Err(blocked());
+        }
+        Ok(())
+    }
+
     pub fn relay(
         &mut self,
         frame: &[u8],
@@ -1347,7 +1393,7 @@ impl ProcessDispatcher {
     ) -> io::Result<Vec<u8>> {
         frame_body(frame, MAX_ENGINE_FRAME)?;
         let _guard = MutationGuard::acquire(&self.installation.root)?;
-        if self.child.is_none() {
+        if self.child.is_none() || self.channel_failed {
             return Err(blocked());
         }
         self.exchange(frame, primitive)
