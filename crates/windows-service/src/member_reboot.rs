@@ -131,7 +131,7 @@ mod tests {
                 },
                 slot: TunnelSlot::A,
                 transport: TunnelTransport::WireGuard,
-                engine: "/trusted/old-engine".into(),
+                engine: crate::test_engine_path("old-engine"),
                 config_sha256: [1; 32],
             },
             phase: Phase::Running,

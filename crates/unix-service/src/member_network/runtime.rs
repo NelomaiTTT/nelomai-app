@@ -131,7 +131,7 @@ mod tests {
     fn unauthenticated_runtime_and_nonstart_never_create_pair_files() {
         let root = tempfile::Builder::new()
             .prefix("native-factory-")
-            .tempdir_in(std::env::var_os("TMPDIR").unwrap())
+            .tempdir()
             .unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let directory =

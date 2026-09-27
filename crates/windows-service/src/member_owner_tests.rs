@@ -199,7 +199,7 @@ fn owner(s: Shared) -> MemberOwner<Disk, Io> {
         scope(),
         TunnelSlot::B,
         TunnelTransport::WireGuard,
-        PathBuf::from("/trusted/engine.exe"),
+        crate::test_engine_path("engine.exe"),
         CONFIG,
         Disk(s.clone()),
         Io(s),
@@ -236,9 +236,13 @@ fn setup() -> (MemberOwner<Disk, Io>, Shared) {
 }
 
 fn replacement(s: Shared, scope: SessionScope) -> MemberOwner<Disk, Io> {
-    replacement_engine(s, scope, "/trusted/engine.exe")
+    replacement_engine(s, scope, &crate::test_engine_path("engine.exe"))
 }
-fn replacement_engine(s: Shared, scope: SessionScope, engine: &str) -> MemberOwner<Disk, Io> {
+fn replacement_engine(
+    s: Shared,
+    scope: SessionScope,
+    engine: &std::path::Path,
+) -> MemberOwner<Disk, Io> {
     MemberOwner::from_trusted_engine(
         scope,
         TunnelSlot::B,
@@ -254,9 +258,15 @@ fn replacement_engine(s: Shared, scope: SessionScope, engine: &str) -> MemberOwn
 #[test]
 fn reincarnation_stopped_predecessor_allows_new_engine_and_runtime_only_when_absent() {
     for (engine, runtime) in [
-        ("/trusted/new-engine.exe", RuntimeSlot::Stable),
-        ("/trusted/engine.exe", RuntimeSlot::Latest),
-        ("/trusted/new-engine.exe", RuntimeSlot::Latest),
+        (
+            crate::test_engine_path("new-engine.exe"),
+            RuntimeSlot::Stable,
+        ),
+        (crate::test_engine_path("engine.exe"), RuntimeSlot::Latest),
+        (
+            crate::test_engine_path("new-engine.exe"),
+            RuntimeSlot::Latest,
+        ),
     ] {
         let (mut old, s) = setup();
         let running = old.start().unwrap();
@@ -268,10 +278,10 @@ fn reincarnation_stopped_predecessor_allows_new_engine_and_runtime_only_when_abs
             ..scope()
         };
         s.borrow_mut().next_proof.process.creation_time += 1;
-        let mut next = replacement_engine(s.clone(), next_scope.clone(), engine);
+        let mut next = replacement_engine(s.clone(), next_scope.clone(), &engine);
         assert_eq!(next.prior_stopped().unwrap(), Some(prior.clone()));
         let current = next.start_with_prior(Some(&prior)).unwrap();
-        assert_eq!(current.intent.engine, PathBuf::from(engine));
+        assert_eq!(current.intent.engine, engine);
         assert_eq!(current.intent.scope, next_scope);
         assert_eq!(current.retired_proof, prior.retired_proof);
         assert_eq!(s.borrow().record.as_ref(), Some(&current));
@@ -331,7 +341,11 @@ fn reincarnation_cross_runtime_still_rejects_live_foreign_stale_and_nonstopped_p
             connection_generation: 4,
             ..scope()
         };
-        let mut next = replacement_engine(s.clone(), next_scope, "/trusted/new-engine.exe");
+        let mut next = replacement_engine(
+            s.clone(),
+            next_scope,
+            &crate::test_engine_path("new-engine.exe"),
+        );
         // Bind the observed predecessor as a pair would. A changed journal
         // after capturing prior is never accepted merely because it is Stopped.
         let bound_prior = if matches!(mutation, 5 | 6) {
@@ -630,7 +644,7 @@ fn recover(saved: &Record, s: Shared) -> Result<MemberOwner<Disk, Io>> {
         scope(),
         TunnelSlot::B,
         TunnelTransport::WireGuard,
-        PathBuf::from("/trusted/engine.exe"),
+        crate::test_engine_path("engine.exe"),
         saved.clone(),
         Disk(s.clone()),
         Io(s),
@@ -657,7 +671,7 @@ fn recovery_rejects_changed_saved_scope_engine_and_journal_record() {
         let mut changed = saved.clone();
         match field {
             0 => changed.intent.scope.connection_generation += 1,
-            1 => changed.intent.engine = "/other/engine.exe".into(),
+            1 => changed.intent.engine = crate::test_engine_path("other-engine.exe"),
             _ => changed.proof.as_mut().unwrap().process.creation_time += 1,
         }
         assert!(recover(&changed, shared.clone()).is_err());
@@ -1064,7 +1078,7 @@ fn wrong_journal_identity_and_malformed_proof_fail_before_native_inspection() {
         match mode {
             0 => r.intent.scope.runtime_generation += 1,
             1 => r.intent.slot = TunnelSlot::A,
-            2 => r.intent.engine = PathBuf::from("/foreign/engine.exe"),
+            2 => r.intent.engine = crate::test_engine_path("foreign-engine.exe"),
             3 => r.intent.config_sha256 = [7; 32],
             _ => r.proof.as_mut().unwrap().interface.index = 0,
         };
