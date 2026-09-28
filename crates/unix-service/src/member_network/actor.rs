@@ -1,5 +1,6 @@
 //! Local serialized owner. Construction alone does not enable redundancy or
 //! wire a native factory into the dispatcher.
+use super::diagnostic::{context, PairFailure, Stage};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use nelomai_client_tunnel::{
     redundancy::{
@@ -12,6 +13,46 @@ use nelomai_client_tunnel::{
 };
 use nelomai_contracts::RuntimeSlot;
 use std::io;
+
+#[derive(serde::Serialize)]
+struct OperationDiagnostic {
+    operation_id: u64,
+    operation: Stage,
+    scope: nelomai_client_tunnel::redundancy::SessionScope,
+    failure: Option<PairFailure>,
+}
+
+fn record_tick_failure(
+    report: &mut Option<OperationDiagnostic>,
+    operation_id: &mut u64,
+    scope: nelomai_client_tunnel::redundancy::SessionScope,
+    error: io::Error,
+) {
+    *operation_id = operation_id.saturating_add(1);
+    *report = Some(OperationDiagnostic {
+        operation_id: *operation_id,
+        operation: Stage::Tick,
+        scope,
+        failure: Some(PairFailure::io(Stage::Tick, error)),
+    });
+}
+
+fn command_stage(command: &Command) -> Stage {
+    match command {
+        Command::Start { .. } => Stage::Start,
+        Command::Stop { .. } => Stage::Stop,
+        Command::Status { .. } => Stage::Status,
+        Command::PrepareStop { .. } => Stage::PrepareStop,
+        Command::PrepareRecoveryStop { .. } => Stage::PrepareRecoveryStop,
+        Command::Attach { .. } => Stage::Attach,
+        Command::StageCandidate { .. } => Stage::CandidateStaging,
+        Command::RetireInactive { .. } => Stage::RetireInactive,
+        Command::RemoveStandby { .. } => Stage::RemoveStandby,
+        Command::CommitCandidate { .. } => Stage::CommitCandidate,
+        Command::ConfirmRole { .. } => Stage::ConfirmRole,
+        Command::NetworkChanged { .. } => Stage::NetworkChanged,
+    }
+}
 
 const PHYSICAL_SAMPLE_MS: u64 = 2_000;
 
@@ -42,6 +83,8 @@ pub struct CompositeBackend<B, F: PairFactory> {
     now: u64,
     physical_fingerprint: Option<String>,
     next_physical_sample: u64,
+    operation_id: u64,
+    diagnostic: Option<OperationDiagnostic>,
 }
 
 impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
@@ -56,6 +99,8 @@ impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
             now: 0,
             physical_fingerprint: None,
             next_physical_sample: 0,
+            operation_id: 0,
+            diagnostic: None,
         })
     }
 
@@ -116,9 +161,15 @@ impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
                 // unsupported platform/fake behavior, not a lost working provider.
                 Ok(())
             }
-            Err(_) => {
+            Err(error) => {
                 // Only discovery errors enter here, never DNS probe outcomes.
                 // Repeated failures keep the same invalid epoch until retry.
+                record_tick_failure(
+                    &mut self.diagnostic,
+                    &mut self.operation_id,
+                    snapshot.session.scope.clone(),
+                    context(Stage::Fingerprint, error),
+                );
                 if pair.network_validated() {
                     pair.invalidate_network(&snapshot.session.scope, now)?;
                 }
@@ -132,7 +183,7 @@ impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
                 if changed || !pair.network_validated() {
                     let result = pair.execute(
                         Command::NetworkChanged {
-                            scope: snapshot.session.scope,
+                            scope: snapshot.session.scope.clone(),
                         },
                         now,
                     );
@@ -146,6 +197,12 @@ impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
                         {
                             return Err(error);
                         }
+                        record_tick_failure(
+                            &mut self.diagnostic,
+                            &mut self.operation_id,
+                            snapshot.session.scope.clone(),
+                            context(Stage::NetworkChanged, error),
+                        );
                         return Ok(());
                     }
                     if !pair.network_validated() {
@@ -170,44 +227,72 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
         command
             .validate(self.runtime)
             .map_err(|_| ServiceError::InvalidRequest)?;
+        let stage = command_stage(&command);
+        let scope = command.scope().clone();
+        // Read-only Status must not erase the failure it is observing.
+        if stage != Stage::Status {
+            self.operation_id = self.operation_id.saturating_add(1);
+            self.diagnostic = Some(OperationDiagnostic {
+                operation_id: self.operation_id,
+                operation: stage,
+                scope: scope.clone(),
+                failure: None,
+            });
+        }
         self.refresh();
-        let result = if let Command::Start {
-            primary, options, ..
-        } = &command
-        {
-            if self
-                .snapshot
-                .as_ref()
-                .is_some_and(|s| !terminal(s) || &s.session.scope == command.scope())
+        let mut preflight_error = None;
+        let result: io::Result<Snapshot> = (|| {
+            if let Command::Start {
+                primary, options, ..
+            } = &command
             {
-                return Err(failed());
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| !terminal(s) || &s.session.scope == command.scope())
+                {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "start_fenced"));
+                }
+                if self.single.status().map_err(|e| {
+                    let safe = PairFailure::service(Stage::Prepare, &e).into_io(stage);
+                    preflight_error = Some(e);
+                    safe
+                })? != ServiceTunnelState::Stopped
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "single_running",
+                    ));
+                }
+                let pair = self
+                    .factory
+                    .prepare(&command, self.now)
+                    .map_err(|e| context(Stage::Prepare, e))?;
+                // Retain ownership even if native Start fails after allocation.
+                self.pair = Some(pair);
+                self.physical_fingerprint = None;
+                self.next_physical_sample = self.now;
+                self.pair
+                    .as_mut()
+                    .expect("prepared pair")
+                    .start_primary(primary, options)
+            } else {
+                self.pair
+                    .as_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing_pair"))?
+                    .execute(command, self.now)
             }
-            if self.single.status()? != ServiceTunnelState::Stopped {
-                return Err(failed());
-            }
-            let pair = self
-                .factory
-                .prepare(&command, self.now)
-                .map_err(|_| failed())?;
-            // Start may create resources and then fail. Ownership must already
-            // be reachable by scoped Stop and dispatcher shutdown in that case.
-            self.pair = Some(pair);
-            self.physical_fingerprint = None;
-            self.next_physical_sample = self.now;
-            self.pair
-                .as_mut()
-                .ok_or_else(failed)?
-                .start_primary(primary, options)
-        } else {
-            self.pair
-                .as_mut()
-                .ok_or_else(failed)?
-                .execute(command, self.now)
-        };
-        // Cache even failed transitions: status(&self) cannot query the mutable
-        // control, and must never fall back to an unrelated single backend.
+        })();
         self.refresh();
-        result.map_err(|_| failed())
+        result.map_err(|error| {
+            if stage != Stage::Status {
+                self.diagnostic
+                    .as_mut()
+                    .expect("operation initialized")
+                    .failure = Some(PairFailure::io(stage, error));
+            }
+            preflight_error.unwrap_or_else(failed)
+        })
     }
     fn tick(&mut self, now: u64) -> Result<(), ServiceError> {
         let backwards = now < self.now;
@@ -225,7 +310,18 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
                     .tick(now)
             })();
             self.refresh();
-            result.map(|_| ()).map_err(|_| failed())
+            result.map(|_| ()).map_err(|error| {
+                if let Some(snapshot) = &self.snapshot {
+                    self.operation_id = self.operation_id.saturating_add(1);
+                    self.diagnostic = Some(OperationDiagnostic {
+                        operation_id: self.operation_id,
+                        operation: Stage::Tick,
+                        scope: snapshot.session.scope.clone(),
+                        failure: Some(PairFailure::io(Stage::Tick, error)),
+                    });
+                }
+                failed()
+            })
         } else {
             self.single.tick(now)
         }
@@ -257,6 +353,7 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
         // status before Start so a partial single Start is still single-owned.
         self.pair = None;
         self.snapshot = None;
+        self.diagnostic = None;
         self.physical_fingerprint = None;
         self.next_physical_sample = self.now;
         self.single.start(config, options)
@@ -294,8 +391,8 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
         self.single.metrics(probe)
     }
     fn diagnostics(&self) -> Result<String, ServiceError> {
-        if self.pair.is_some() {
-            return Err(unsupported());
+        if let Some(report) = &self.diagnostic {
+            return serde_json::to_string(report).map_err(|_| failed());
         }
         self.single.diagnostics()
     }
@@ -344,6 +441,7 @@ mod tests {
         events: Vec<String>,
         single: ServiceTunnelState,
         fail_status: bool,
+        status_error: Option<ServiceError>,
         fail_prepare: bool,
         fail_recover: bool,
         fail_start: bool,
@@ -383,6 +481,9 @@ mod tests {
         fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
             let mut w = self.0.borrow_mut();
             w.events.push("single status".into());
+            if let Some(error) = &w.status_error {
+                return Err(error.clone());
+            }
             if w.fail_status {
                 Err(failed())
             } else {
@@ -605,6 +706,65 @@ mod tests {
             connection_generation: 7,
         }
     }
+
+    #[test]
+    fn pair_diagnostics_survive_failed_prepare_start_stop_and_reset_for_retry() {
+        let (mut actor, w) = setup();
+        w.borrow_mut().fail_prepare = true;
+        let error = actor.redundant(start()).unwrap_err();
+        assert_eq!(error, failed());
+        assert_eq!(error.code(), "service_unavailable");
+        let report: serde_json::Value =
+            serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+        assert_eq!(report["failure"]["stage"], "start");
+        assert_eq!(report["failure"]["origin"], "prepare");
+        assert_eq!(report["scope"]["connection_generation"], 7);
+        assert!(!report.to_string().contains("private"));
+        w.borrow_mut().fail_prepare = false;
+        w.borrow_mut().fail_start = true;
+        w.borrow_mut().fail_close = true;
+        assert_eq!(actor.redundant(start()).unwrap_err(), failed());
+        actor.redundant(Command::Status { scope: scope() }).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+        assert_eq!(report["failure"]["stage"], "start");
+        assert_eq!(report["operation_id"], 2);
+        assert!(!report.to_string().contains("secret"));
+        assert_eq!(
+            actor
+                .redundant(Command::Stop { scope: scope() })
+                .unwrap_err(),
+            failed()
+        );
+        let report: serde_json::Value =
+            serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+        assert_eq!(report["failure"]["stage"], "stop");
+        assert_eq!(report["operation_id"], 3);
+        w.borrow_mut().fail_close = false;
+        actor.redundant(Command::Stop { scope: scope() }).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+        assert!(report["failure"].is_null());
+        let mut next = scope();
+        next.connection_generation += 1;
+        w.borrow_mut().fail_start = false;
+        actor.redundant(start_at(next)).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+        assert_eq!(report["scope"]["connection_generation"], 8);
+        assert!(report["failure"].is_null());
+        assert!(!w.borrow().events.iter().any(|e| e == "single diagnostics"));
+    }
+
+    #[test]
+    fn single_status_preflight_retains_its_existing_public_error() {
+        let (mut actor, w) = setup();
+        w.borrow_mut().status_error = Some(ServiceError::Backend("route_conflict".into()));
+        let error = actor.redundant(start()).unwrap_err();
+        assert_eq!(error.code(), "route_conflict");
+        assert_eq!(error, ServiceError::Backend("route_conflict".into()));
+        assert!(actor.diagnostics().unwrap().contains("prepare"));
+    }
     fn config() -> ParsedConfiguration {
         parse_configuration("[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=\nAddress = 10.8.0.2/32\n[Peer]\nPublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAI=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 192.0.2.1:51820\n").unwrap()
     }
@@ -807,7 +967,7 @@ mod tests {
         assert!(actor.stop().is_err());
         assert!(actor.rebind_udp().is_err());
         assert_eq!(actor.metrics(false).unwrap().received_bytes, 123);
-        assert!(actor.diagnostics().is_err());
+        assert!(actor.diagnostics().is_ok());
         assert_eq!(
             actor.physical_network_fingerprint().unwrap(),
             "ab".repeat(32)
@@ -912,6 +1072,12 @@ mod tests {
             w.borrow_mut().fingerprint = invalid;
             w.borrow_mut().events.clear();
             actor.tick(2000).unwrap();
+            let report: serde_json::Value =
+                serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+            assert_eq!(report["failure"]["stage"], "tick");
+            assert_eq!(report["failure"]["origin"], "fingerprint");
+            assert_eq!(report["scope"]["connection_generation"], 7);
+            assert!(!report.to_string().contains("private"));
             assert_eq!(status(&mut actor).session.network_epoch, epoch + 1);
             assert!(!status(&mut actor).primary_ready);
             assert!(w.borrow().events.iter().any(|e| e == "cancel probe"));
@@ -921,6 +1087,10 @@ mod tests {
             )));
             w.borrow_mut().events.clear();
             actor.tick(3999).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actor.diagnostics().unwrap()).unwrap(),
+                report
+            );
             assert!(w.borrow().events.is_empty());
             actor.tick(4000).unwrap();
             assert_eq!(status(&mut actor).session.network_epoch, epoch + 1);
@@ -949,6 +1119,13 @@ mod tests {
             w.borrow_mut().unvalidated_rebind = !failed_rebind;
             w.borrow_mut().events.clear();
             actor.tick(2000).unwrap();
+            if failed_rebind {
+                let report: serde_json::Value =
+                    serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+                assert_eq!(report["failure"]["stage"], "tick");
+                assert_eq!(report["failure"]["origin"], "network_changed");
+                assert!(!report.to_string().contains("private"));
+            }
             assert!(!w
                 .borrow()
                 .events
@@ -980,12 +1157,20 @@ mod tests {
         actor.tick(0).unwrap();
         let epoch = status(&mut actor).session.network_epoch;
         assert!(w.borrow().events.iter().any(|e| e == "sample"));
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&actor.diagnostics().unwrap()).unwrap()
+                ["failure"]
+                .is_null()
+        );
         assert!(w.borrow().rebind_scopes.is_empty());
         w.borrow_mut().fingerprint_unsupported = false;
         actor.tick(2000).unwrap();
         w.borrow_mut().fingerprint_unsupported = true;
         w.borrow_mut().events.clear();
         actor.tick(4000).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+        assert_eq!(report["failure"]["cause"], "unsupported");
         assert_eq!(status(&mut actor).session.network_epoch, epoch + 1);
         assert!(!w
             .borrow()

@@ -900,7 +900,6 @@ internal object TunnelRuntime {
                 }
                 NelomaiVpnService.setPhysicalNetworks(
                     physicalState.networks,
-                    physicalState.validated,
                 )
                 AndroidSplitTunnel.replaceVpnRoutes(
                     AndroidSplitTunnel.mergeExcludedRoutes(
@@ -1021,7 +1020,6 @@ internal object TunnelRuntime {
                 if (state == Tunnel.State.UP) {
                     NelomaiVpnService.setPhysicalNetworks(
                         physicalState.networks,
-                        physicalState.validated,
                     )
                 }
                 logStage("start.backend_state_up", backendStartedAt)
@@ -1841,7 +1839,7 @@ internal object TunnelRuntime {
             if (!physicalState.available) {
                 session.networkWasUnavailable = true
                 session.observedNetworkFingerprint = physicalState.fingerprint
-                NelomaiVpnService.setPhysicalNetworks(emptyList(), validated = false)
+                NelomaiVpnService.setPhysicalNetworks(emptyList())
                 TunnelLog.info("tunnel.network_unavailable")
                 logDataPlaneSnapshot(session, "physical_network_unavailable")
                 return@execute
@@ -1859,7 +1857,6 @@ internal object TunnelRuntime {
             }
             NelomaiVpnService.setPhysicalNetworks(
                 physicalState.networks,
-                physicalState.validated,
             )
             val recoveredAfterLoss = session.networkWasUnavailable
             session.observedNetworkFingerprint = fingerprint
@@ -2320,7 +2317,7 @@ internal object TunnelRuntime {
                         throw TunnelOperationException("awg3_profile_apply_failed")
                     }
                     session.monitor?.snapshotState()?.let { physical ->
-                        NelomaiVpnService.setPhysicalNetworks(physical.networks, physical.validated)
+                        NelomaiVpnService.setPhysicalNetworks(physical.networks)
                     }
                 },
             )

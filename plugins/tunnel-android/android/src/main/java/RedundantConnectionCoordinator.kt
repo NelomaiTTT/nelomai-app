@@ -18,7 +18,7 @@ internal interface RedundantConnectionNative {
     fun stop(): Boolean
     fun closeForStop(): Boolean = stop()
     fun isUsable(leaseId: String): Boolean
-    fun setNetworkValidated(validated: Boolean) = Unit
+    fun setNetworkAvailable(available: Boolean) = Unit
     fun setProbeSourceIpv4(sourceIpv4: String) = Unit
     fun rebind(leaseId: String): Boolean = false
     fun healthObservations(
@@ -139,7 +139,7 @@ internal interface RedundantVpnProcessOwner {
     fun closeLocal(): Boolean = true
     fun closeDataplaneForStop(): Boolean = closeLocal()
     fun notifyStop() = Unit
-    fun onUnderlyingNetworkChanged(validated: Boolean): Boolean = false
+    fun onUnderlyingNetworkChanged(available: Boolean): Boolean = false
     fun tick(): Boolean = false
     fun isRunning(): Boolean = false
     fun metrics(includeProbeTarget: Boolean): RedundantVpnMetrics? = null
@@ -195,12 +195,12 @@ internal fun routeVpnStickyRestart(
 internal fun routeVpnProcessNetworkChange(
     recovery: RecoveryStoreResult<AndroidRecoveryEnvelope>,
     owner: RedundantVpnProcessOwner?,
-    validated: Boolean,
+    available: Boolean,
     legacyNetworkChange: () -> Unit,
 ): Boolean = when (recovery) {
     is RecoveryStoreResult.Failure -> false
     is RecoveryStoreResult.Success -> if (recovery.value.redundantTransaction != null) {
-        owner?.onUnderlyingNetworkChanged(validated) ?: false
+        owner?.onUnderlyingNetworkChanged(available) ?: false
     } else {
         legacyNetworkChange()
         true
@@ -1014,15 +1014,15 @@ internal class RedundantConnectionCoordinator(
         drainPendingWorkLocked(observations)
     }
 
-    override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean = synchronized(gate) {
+    override fun onUnderlyingNetworkChanged(available: Boolean): Boolean = synchronized(gate) {
         if (totalLossCommandEmitted) return@synchronized false
         val transaction = status() ?: return@synchronized false
         if (!transaction.desiredActive || transaction.retry.stopState != RedundantStopState.NONE) {
             return@synchronized false
         }
         if (!mutateNative(transaction) {
-                healthMonitor.onUnderlyingNetworkChanged(elapsedNow(), validated)
-                native.setNetworkValidated(validated)
+                healthMonitor.onUnderlyingNetworkChanged(elapsedNow(), available)
+                native.setNetworkAvailable(available)
                 true
             }
         ) return@synchronized false

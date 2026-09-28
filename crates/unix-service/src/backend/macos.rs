@@ -32,6 +32,10 @@ const DNS_STATE_FILE: &str = "dns-state.json";
 const ENDPOINTS_STATE_FILE: &str = "endpoints-state.json";
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 
+mod ordinary_routes;
+use crate::member_network::macos::NativeMacCommands;
+use ordinary_routes::OrdinaryRoutes;
+
 pub struct MacosBackend {
     mode: ResourceMode,
     member_socket: Option<super::redundancy::SocketIdentity>,
@@ -45,6 +49,7 @@ pub struct MacosBackend {
     endpoints: Vec<SocketAddr>,
     dns_snapshot: Option<DnsSnapshot>,
     routes: RouteManager<SystemRouteBackend>,
+    ordinary_routes: Option<OrdinaryRoutes<NativeMacCommands>>,
     state: ServiceTunnelState,
     diagnostics: DiagnosticJournal,
 }
@@ -96,6 +101,14 @@ impl MacosBackend {
     ) -> Result<Self, ServiceError> {
         let runtime_directory = mode.runtime_path(root);
         let mut routes = RouteManager::new(&runtime_directory, SystemRouteBackend::new()?)?;
+        let mut ordinary_routes = if mode.owns_network() {
+            Some(
+                OrdinaryRoutes::open(&runtime_directory, &boot_identity()?, 0, NativeMacCommands)
+                    .map_err(backend_error)?,
+            )
+        } else {
+            None
+        };
         let dns_snapshot = if mode.owns_network() {
             load_dns_snapshot(&runtime_directory.join(DNS_STATE_FILE))?
         } else {
@@ -155,6 +168,11 @@ impl MacosBackend {
             .map(rebind_peers_from_host)
             .unwrap_or_default();
         if api.is_none() && mode.owns_network() {
+            ordinary_routes
+                .as_mut()
+                .expect("ordinary route owner")
+                .cleanup()
+                .map_err(backend_error)?;
             routes.cleanup()?;
         }
         let endpoints = if api.is_some() {
@@ -166,7 +184,11 @@ impl MacosBackend {
         } else {
             Vec::new()
         };
-        let state = if member_owner.as_ref().is_some_and(MemberOwner::stopping) {
+        let state = if member_owner.as_ref().is_some_and(MemberOwner::stopping)
+            || ordinary_routes
+                .as_ref()
+                .is_some_and(OrdinaryRoutes::has_resources)
+        {
             ServiceTunnelState::Stopping
         } else if api.is_some() {
             ServiceTunnelState::Running
@@ -195,6 +217,7 @@ impl MacosBackend {
             endpoints,
             dns_snapshot,
             routes,
+            ordinary_routes,
             state,
             diagnostics,
         };
@@ -209,7 +232,14 @@ impl MacosBackend {
         configuration: &ParsedConfiguration,
         options: &DesktopTunnelOptions,
     ) -> Result<(), ServiceError> {
-        if self.api.is_some() || self.dns_snapshot.is_some() || self.routes.has_routes() {
+        if self.api.is_some()
+            || self.dns_snapshot.is_some()
+            || self.routes.has_routes()
+            || self
+                .ordinary_routes
+                .as_ref()
+                .is_some_and(OrdinaryRoutes::has_resources)
+        {
             self.stop_inner()?;
         }
         let executable = match configuration.transport {
@@ -315,11 +345,21 @@ impl MacosBackend {
             return Err(error);
         }
         if self.mode.owns_network() {
+            let allowed = configuration
+                .peers
+                .iter()
+                .flat_map(|peer| peer.allowed_ips.iter().copied())
+                .collect::<Vec<_>>();
+            let endpoints = self
+                .endpoints
+                .iter()
+                .map(SocketAddr::ip)
+                .collect::<Vec<_>>();
             if let Err(error) = self
-                .api
-                .as_ref()
-                .expect("WireGuard API assigned")
-                .configure_peer_routing(&native.interface.peers)
+                .ordinary_routes
+                .as_mut()
+                .expect("ordinary route owner")
+                .install(&ifname, &allowed, &endpoints)
             {
                 let _ = self.stop_inner();
                 return Err(backend_error(error));
@@ -408,16 +448,21 @@ impl MacosBackend {
                     return Err(backend_error(error));
                 }
             }
-            if self.mode.owns_network() {
-                for endpoint in self.endpoints.drain(..) {
-                    if let Err(error) = api.remove_endpoint_routing(&endpoint.to_string()) {
-                        first_error.get_or_insert_with(|| backend_error(error));
-                    }
-                }
-            }
         }
         self.member_socket = None;
-        self.endpoints.clear();
+        // Endpoint lists from older helpers are metadata, never ownership
+        // proof. Only the new write-ahead journal authorizes route deletion.
+        let ordinary_clean = if let Some(routes) = &mut self.ordinary_routes {
+            match routes.cleanup() {
+                Ok(()) => true,
+                Err(error) => {
+                    first_error.get_or_insert_with(|| backend_error(error));
+                    false
+                }
+            }
+        } else {
+            true
+        };
         if let Err(error) = if self.mode.owns_network() {
             self.restore_dns()
         } else {
@@ -429,10 +474,14 @@ impl MacosBackend {
         if let Err(error) = remove_regular_file_if_present(&state_file) {
             first_error.get_or_insert_with(|| backend_error(error));
         }
-        if let Err(error) =
-            remove_regular_file_if_present(&self.runtime_directory.join(ENDPOINTS_STATE_FILE))
-        {
-            first_error.get_or_insert_with(|| backend_error(error));
+        if ordinary_clean {
+            if let Err(error) =
+                remove_regular_file_if_present(&self.runtime_directory.join(ENDPOINTS_STATE_FILE))
+            {
+                first_error.get_or_insert_with(|| backend_error(error));
+            } else {
+                self.endpoints.clear();
+            }
         }
         if let Err(error) = if self.mode.owns_network() {
             self.routes.cleanup()
@@ -472,7 +521,11 @@ impl MacosBackend {
         let mut snapshot = format!(
             "state={}\ntransport={transport}\nroutes_active={}\ndns_snapshot_active={}\n{}",
             state_name(self.state),
-            self.routes.has_routes(),
+            self.routes.has_routes()
+                || self
+                    .ordinary_routes
+                    .as_ref()
+                    .is_some_and(OrdinaryRoutes::has_resources),
             self.dns_snapshot.is_some(),
             endpoint_route_summary(&self.endpoints),
         );
@@ -588,7 +641,13 @@ impl ServiceTunnelBackend for MacosBackend {
                 return Ok(ServiceTunnelState::Failed);
             }
         }
-        if self.api.is_none() && self.routes.has_routes() {
+        if self.api.is_none()
+            && (self.routes.has_routes()
+                || self
+                    .ordinary_routes
+                    .as_ref()
+                    .is_some_and(OrdinaryRoutes::has_resources))
+        {
             return Ok(ServiceTunnelState::Failed);
         }
         Ok(self.state)

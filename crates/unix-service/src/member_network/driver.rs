@@ -1,4 +1,5 @@
 //! Scoped bridge from Unix member/network ownership to the shared helper driver.
+use super::diagnostic::{context, PairFailure, Stage};
 use super::journal::ScopedJournal;
 use super::session::SessionNetwork;
 use crate::ServiceTunnelBackend;
@@ -44,6 +45,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         Ok(&mut self.network)
     }
     fn check_scope(&self, scope: &SessionScope) -> io::Result<()> {
+        self.network.begin_operation();
         if !self.scope.validate()
             || scope != &self.scope
             || self.network.members().scope() != &self.scope
@@ -90,17 +92,18 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         let members = self.network.members();
         members
             .check_live(&self.scope, slot)
-            .map_err(|_| failed())?;
+            .map_err(|e| self.network.operation_error(Stage::Probe, e))?;
         let query_name = members
             .view(slot)
             .ok_or_else(failed)?
             .probe
             .query_name
             .clone();
-        let socket = open(members, &self.scope, slot).map_err(|_| failed())?;
+        let socket = open(members, &self.scope, slot)
+            .map_err(|e| self.network.operation_error(Stage::Probe, e))?;
         members
             .check_live(&self.scope, slot)
-            .map_err(|_| failed())?;
+            .map_err(|e| self.network.operation_error(Stage::Probe, e))?;
         Ok((socket, query_name))
     }
 }
@@ -116,7 +119,7 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
         self.network
             .members()
             .metrics(&self.scope, slot)
-            .map_err(|_| failed())
+            .map_err(|e| self.network.operation_error(Stage::Metrics, e))
     }
     fn physical_network_fingerprint(&self) -> io::Result<String> {
         self.check_scope(&self.scope)?;
@@ -124,7 +127,7 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
         self.network
             .members()
             .physical_network_fingerprint(&self.scope, active)
-            .map_err(|_| failed())
+            .map_err(|e| self.network.operation_error(Stage::Fingerprint, e))
     }
     fn start_primary(
         &mut self,
@@ -133,24 +136,34 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
         options: &nelomai_client_tunnel::DesktopTunnelOptions,
     ) -> io::Result<()> {
         self.check_scope(scope)?;
-        member.validate()?;
-        options.validate().map_err(|_| failed())?;
+        member
+            .validate()
+            .map_err(|e| context(Stage::Configuration, e))?;
+        options.validate().map_err(|_| {
+            PairFailure::service(Stage::Configuration, &crate::ServiceError::InvalidRequest)
+                .into_io(Stage::Start)
+        })?;
         if self.options.is_some() {
             return Err(failed());
         }
-        let config =
-            crate::parse_configuration(member.configuration.expose()).map_err(|_| failed())?;
+        let config = crate::parse_configuration(member.configuration.expose()).map_err(|_| {
+            PairFailure::service(
+                Stage::Configuration,
+                &crate::ServiceError::InvalidConfiguration,
+            )
+            .into_io(Stage::Start)
+        })?;
         let endpoint = member_endpoint(&config)?;
         let policy = self
             .network
             .resolve_primary_policy(scope, options, endpoint)
-            .map_err(|_| failed())?;
+            .map_err(|e| self.network.operation_error(Stage::Start, e))?;
         // Preserve the options on a partially failed native Start for cleanup;
         // the enclosing control owner must not retry Start over these resources.
         self.options = Some(options.clone());
         self.network
             .start_primary(scope, member.slot, &config, member.probe.clone(), policy)
-            .map_err(|_| failed())
+            .map_err(|e| self.network.operation_error(Stage::Start, e))
     }
     fn attach(
         &mut self,
@@ -158,15 +171,22 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
         member: &nelomai_client_tunnel::redundancy::protocol::Member,
     ) -> io::Result<()> {
         self.check_scope(scope)?;
-        member.validate()?;
+        member
+            .validate()
+            .map_err(|e| context(Stage::Configuration, e))?;
         let options = self.options.as_ref().ok_or_else(failed)?;
-        let config =
-            crate::parse_configuration(member.configuration.expose()).map_err(|_| failed())?;
+        let config = crate::parse_configuration(member.configuration.expose()).map_err(|_| {
+            PairFailure::service(
+                Stage::Configuration,
+                &crate::ServiceError::InvalidConfiguration,
+            )
+            .into_io(Stage::Attach)
+        })?;
         let endpoint = member_endpoint(&config)?;
         let policy = self
             .network
             .resolve_updated_policy(scope, options, Some(endpoint))
-            .map_err(|_| failed())?;
+            .map_err(|e| self.network.operation_error(Stage::Attach, e))?;
         let bypass = policy
             .bypasses
             .iter()
@@ -176,13 +196,13 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
             .ok_or_else(failed)?;
         self.network
             .add_standby(scope, member.slot, &config, member.probe.clone(), bypass)
-            .map_err(|_| failed())
+            .map_err(|e| self.network.operation_error(Stage::Attach, e))
     }
     fn remove_standby(&mut self, scope: &SessionScope, slot: Slot) -> io::Result<()> {
         self.check_scope(scope)?;
         self.network
             .remove_standby(scope, slot)
-            .map_err(|_| failed())
+            .map_err(|e| self.network.operation_error(Stage::RemoveStandby, e))
     }
     fn rebind_pair(&mut self, scope: &SessionScope) -> io::Result<bool> {
         self.check_scope(scope)?;
@@ -190,16 +210,16 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
         let policy = self
             .network
             .resolve_updated_policy(scope, options, None)
-            .map_err(|_| failed())?;
+            .map_err(|e| self.network.operation_error(Stage::NetworkChanged, e))?;
         self.network
             .network_changed(scope, policy)
-            .map_err(|_| failed())?;
+            .map_err(|e| self.network.operation_error(Stage::NetworkChanged, e))?;
         for slot in [Slot::A, Slot::B] {
             if self.network.members().view(slot).is_some() {
                 self.network
                     .members()
                     .check_live(scope, slot)
-                    .map_err(|_| failed())?;
+                    .map_err(|e| self.network.operation_error(Stage::NetworkChanged, e))?;
             }
         }
         Ok(self.network.active().is_some())
@@ -238,11 +258,13 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> NativePa
         self.check_scope(scope)?;
         self.network
             .select_active(scope, slot)
-            .map_err(|_| failed())
+            .map_err(|e| self.network.operation_error(Stage::Network, e))
     }
     fn close(&mut self, scope: &SessionScope) -> io::Result<()> {
         self.check_scope(scope)?;
-        self.network.close(scope).map_err(|_| failed())
+        self.network
+            .close(scope)
+            .map_err(|e| self.network.operation_error(Stage::Stop, e))
     }
 }
 
@@ -274,11 +296,16 @@ fn open_session_store_for_owner(
     }
     let mut store =
         ScopedJournal::<SessionSnapshot>::open_named(root, scope.clone(), uid, SESSION_FILE)
-            .map_err(|_| journal_failed())?;
-    match store.load().map_err(|_| journal_failed())? {
+            .map_err(|e| context(Stage::SessionJournal, e))?;
+    match store
+        .load()
+        .map_err(|e| context(Stage::SessionJournal, e))?
+    {
         Some(saved) if saved.scope != scope => return Err(journal_failed()),
         Some(_) => (),
-        None => store.save_state(initial).map_err(|_| journal_failed())?,
+        None => store
+            .save_state(initial)
+            .map_err(|e| context(Stage::SessionJournal, e))?,
     }
     Ok(store)
 }
@@ -290,17 +317,21 @@ impl SessionStore for ScopedJournal<SessionSnapshot> {
         // scope, nor recreate a missing journal from its supplied snapshot.
         let previous = self
             .load()
-            .map_err(|_| journal_failed())?
+            .map_err(|e| context(Stage::SessionJournal, e))?
             .ok_or_else(journal_failed)?;
         if !snapshot.scope.validate() || snapshot.scope != previous.scope {
             return Err(journal_failed());
         }
-        self.save_state(snapshot).map_err(|_| journal_failed())
+        self.save_state(snapshot)
+            .map_err(|e| context(Stage::SessionJournal, e))
     }
 }
 
 fn journal_failed() -> io::Error {
-    io::Error::other("member_session_journal_failed")
+    context(
+        Stage::SessionJournal,
+        io::Error::new(io::ErrorKind::InvalidData, "journal_invalid"),
+    )
 }
 
 #[cfg(test)]
@@ -321,6 +352,8 @@ mod tests {
     const NOW: u64 = 1_000_000;
     #[derive(Default)]
     struct State {
+        failure: Option<&'static str>,
+        stop_incomplete_a: bool,
         calls: Vec<&'static str>,
         bad_identity: bool,
         bad_identity_slot: Option<TunnelSlot>,
@@ -416,11 +449,17 @@ mod tests {
             _: &DesktopTunnelOptions,
         ) -> Result<ServiceTunnelState, ServiceError> {
             self.state.borrow_mut().calls.push("start");
+            if self.state.borrow().failure == Some("native") {
+                return Err(ServiceError::Backend("wireguard_go_start_timeout".into()));
+            }
             Ok(ServiceTunnelState::Running)
         }
         fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
             let mut s = self.state.borrow_mut();
             s.calls.push("stop");
+            if s.stop_incomplete_a && self.slot == TunnelSlot::A {
+                return Ok(ServiceTunnelState::Stopping);
+            }
             // Model the backend's exact ownership fence, including safe cleanup
             // of an absent owned member, but never a replacement interface.
             if s.bad_identity || s.bad_identity_slot == Some(self.slot) {
@@ -460,6 +499,14 @@ mod tests {
         ) -> io::Result<()> {
             let mut s = self.0.borrow_mut();
             s.calls.push("write network");
+            let origin = if matches!(key, ResourceKey::Dns(_)) {
+                "dns"
+            } else {
+                "route"
+            };
+            if s.failure == Some(origin) {
+                return Err(io::Error::from_raw_os_error(13));
+            }
             if s.values.get(key) != before {
                 return Err(io::Error::other("foreign route"));
             }
@@ -479,6 +526,12 @@ mod tests {
             _: &[ipnet::IpNet],
         ) -> io::Result<NetworkPolicy> {
             self.0.borrow_mut().calls.push("resolve");
+            if self.0.borrow().failure == Some("policy") {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "PrivateKey=secret /private/path 192.0.2.1",
+                ));
+            }
             Ok(NetworkPolicy {
                 bypasses: endpoints
                     .iter()
@@ -488,7 +541,7 @@ mod tests {
                     })
                     .collect(),
                 retained_routes: vec![],
-                dns_services: vec![],
+                dns_services: vec!["private service".into()],
                 metric: 10,
             })
         }
@@ -498,6 +551,239 @@ mod tests {
         fn save(&mut self, _: &NetworkJournal) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct DiagnosticStore(Rc<RefCell<State>>);
+    impl NetworkJournalStore for DiagnosticStore {
+        fn save(&mut self, _: &NetworkJournal) -> io::Result<()> {
+            if self.0.borrow().failure == Some("journal") {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "PrivateKey=secret /private/path",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    type DiagnosticPair = SessionNativePair<Backend, Network, DiagnosticStore>;
+    fn diagnostic_pair(state: &Rc<RefCell<State>>) -> DiagnosticPair {
+        let backends = [TunnelSlot::A, TunnelSlot::B].map(|slot| Backend {
+            slot,
+            state: state.clone(),
+        });
+        let network = SessionNetwork::new(
+            scope(),
+            backends,
+            Network(state.clone()),
+            DiagnosticStore(state.clone()),
+        )
+        .unwrap();
+        SessionNativePair::new(scope(), network).unwrap()
+    }
+    struct DiagnosticFactory {
+        pair: Option<DiagnosticPair>,
+        store: Option<ScopedJournal<SessionSnapshot>>,
+    }
+    impl super::super::actor::PairFactory for DiagnosticFactory {
+        type Native = DiagnosticPair;
+        type Store = ScopedJournal<SessionSnapshot>;
+        fn recover(&mut self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        fn prepare(
+            &mut self,
+            command: &nelomai_client_tunnel::redundancy::protocol::Command,
+            now: u64,
+        ) -> io::Result<
+            nelomai_client_tunnel::redundancy::control::SessionControl<Self::Native, Self::Store>,
+        > {
+            nelomai_client_tunnel::redundancy::control::SessionControl::prepare(
+                RuntimeSlot::Latest,
+                command,
+                self.pair.take().unwrap(),
+                self.store.take().unwrap(),
+                now,
+            )
+        }
+    }
+    struct Idle;
+    impl ServiceTunnelBackend for Idle {
+        fn start(
+            &mut self,
+            _: &ParsedConfiguration,
+            _: &DesktopTunnelOptions,
+        ) -> Result<ServiceTunnelState, ServiceError> {
+            panic!("pair must not start ordinary backend")
+        }
+        fn stop(&mut self) -> Result<ServiceTunnelState, ServiceError> {
+            panic!("pair must not stop ordinary backend")
+        }
+        fn status(&self) -> Result<ServiceTunnelState, ServiceError> {
+            Ok(ServiceTunnelState::Stopped)
+        }
+    }
+
+    #[test]
+    fn diagnostic_propagation_distinguishes_native_policy_route_dns_and_journal() {
+        for (injected, origin, cause, kind) in [
+            (
+                "native",
+                "native_start",
+                "native_timeout",
+                io::ErrorKind::TimedOut,
+            ),
+            (
+                "policy",
+                "policy",
+                "unsupported",
+                io::ErrorKind::Unsupported,
+            ),
+            (
+                "route",
+                "route_apply",
+                "permission_denied",
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                "dns",
+                "dns_apply",
+                "permission_denied",
+                io::ErrorKind::PermissionDenied,
+            ),
+            (
+                "journal",
+                "network_journal",
+                "write_zero",
+                io::ErrorKind::WriteZero,
+            ),
+        ] {
+            let state = Rc::new(RefCell::new(State {
+                failure: Some(injected),
+                ..Default::default()
+            }));
+            let mut pair = diagnostic_pair(&state);
+            let member = Member {
+                slot: Slot::A,
+                lease_id: "aaaaaaaa-0000-4000-8000-000000000001".into(),
+                configuration: nelomai_client_tunnel::TunnelConfiguration::new("[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE=\nAddress = 10.8.0.2/32\nDNS = 1.1.1.1\n[Peer]\nPublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAI=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.1:51820\n".into()),
+                probe: probe(),
+            };
+            let error = pair
+                .start_primary(&scope(), &member, &DesktopTunnelOptions::default())
+                .unwrap_err();
+            assert_eq!(error.kind(), kind, "{injected}");
+            let text = error.to_string();
+            assert!(
+                text.contains(&format!("origin={origin}")),
+                "{injected}: {text}"
+            );
+            assert!(
+                text.contains(&format!("cause={cause}")),
+                "{injected}: {text}"
+            );
+            if matches!(injected, "route" | "dns") {
+                assert!(text.contains("native_status=Some(13)"), "{text}");
+            }
+            for secret in [
+                "PrivateKey",
+                "secret",
+                "/private",
+                "192.0.2",
+                "private service",
+            ] {
+                assert!(!text.contains(secret), "{text}");
+            }
+            // A new operation must not inherit policy/native/network context.
+            let mut wrong = scope();
+            wrong.connection_generation += 1;
+            let error = pair.select_active(&wrong, Slot::A).unwrap_err();
+            assert!(!error.to_string().contains(&format!("origin={origin}")));
+            state.borrow_mut().failure = None;
+            pair.close(&scope()).unwrap();
+            assert!(!pair.cleanup_pending());
+            assert!(state.borrow().values.is_empty());
+
+            // Repeat through the real shared coordinator and public actor, so
+            // automatic cleanup cannot replace the initiating typed failure.
+            use nelomai_client_tunnel::redundancy::protocol::Command;
+            let state = Rc::new(RefCell::new(State {
+                failure: Some(injected),
+                ..Default::default()
+            }));
+            let dir = directory();
+            let store = open_session_store_for_owner(dir.path(), scope(), &snapshot(), unsafe {
+                libc::geteuid()
+            })
+            .unwrap();
+            let factory = DiagnosticFactory {
+                pair: Some(diagnostic_pair(&state)),
+                store: Some(store),
+            };
+            let mut actor =
+                super::super::actor::CompositeBackend::new(RuntimeSlot::Latest, Idle, factory)
+                    .unwrap();
+            let command = Command::Start {
+                scope: scope(),
+                primary: member,
+                options: DesktopTunnelOptions::default(),
+                role_generation: 1,
+                membership_generation: 1,
+                warm_stop_v1: true,
+            };
+            let error = actor.redundant(command).unwrap_err();
+            assert_eq!(
+                error,
+                ServiceError::Backend("redundant_actor_failed".into())
+            );
+            assert_eq!(error.code(), "service_unavailable");
+            let report: serde_json::Value =
+                serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+            assert_eq!(report["failure"]["stage"], "start");
+            assert_eq!(report["failure"]["origin"], origin);
+            assert_eq!(report["failure"]["cause"], cause);
+            assert_eq!(report["scope"]["connection_generation"], 3);
+            assert!(report.to_string().len() < 1024);
+            state.borrow_mut().failure = None;
+            actor.redundant(Command::Stop { scope: scope() }).unwrap();
+            let report: serde_json::Value =
+                serde_json::from_str(&actor.diagnostics().unwrap()).unwrap();
+            assert!(report["failure"].is_null());
+            assert!(state.borrow().values.is_empty());
+        }
+    }
+
+    #[test]
+    fn cleanup_diagnostic_uses_returned_failure_and_never_leaks_into_next_operation() {
+        let (mut pair, state) = setup();
+        pair.network_mut(&scope())
+            .unwrap()
+            .add_standby(&scope(), Slot::B, &config(), probe(), bypass())
+            .unwrap();
+        state.borrow_mut().stop_incomplete_a = true;
+        state.borrow_mut().bad_identity_slot = Some(TunnelSlot::B);
+        state.borrow_mut().failure = Some("route");
+        let error = pair.close(&scope()).unwrap_err().to_string();
+        assert!(error.contains("origin=native_stop"), "{error}");
+        assert!(error.contains("cause=native_incomplete"), "{error}");
+        // The secondary cleanup error must be discarded, not reused for retry.
+        state.borrow_mut().stop_incomplete_a = false;
+        state.borrow_mut().bad_identity_slot = None;
+        state.borrow_mut().failure = Some("route");
+        let error = pair.close(&scope()).unwrap_err().to_string();
+        assert!(error.contains("origin=route_apply"), "{error}");
+        assert!(error.contains("native_status=Some(13)"), "{error}");
+        state.borrow_mut().failure = None;
+        pair.close(&scope()).unwrap();
+        assert!(!pair.cleanup_pending());
+        let error = pair
+            .select_active(&scope(), Slot::A)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("route_apply") && !error.contains("native_stop"),
+            "{error}"
+        );
     }
     type Pair = SessionNativePair<Backend, Network, Store>;
     fn scope() -> SessionScope {
@@ -941,6 +1227,26 @@ mod tests {
         assert!(!error.to_string().contains("secret"));
     }
 
+    #[test]
+    fn probe_io_failure_keeps_errno_kind_and_existing_service_error() {
+        let (pair, _) = setup();
+        let error = pair
+            .open_probe_with::<()>(Slot::A, |members, _, _| {
+                let error = members.probe_error(io::Error::from_raw_os_error(13));
+                assert_eq!(
+                    error,
+                    ServiceError::Backend("member_probe_socket_failed".into())
+                );
+                assert_eq!(error.code(), "service_unavailable");
+                Err(error)
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let report = error.to_string();
+        assert!(report.contains("origin=probe"), "{report}");
+        assert!(report.contains("native_status=Some(13)"), "{report}");
+    }
+
     fn snapshot() -> SessionSnapshot {
         use nelomai_client_tunnel::redundancy::session::{SessionPhase, SessionState};
         let mut state = SessionState::new(scope(), Slot::A, 1, 1).unwrap();
@@ -1064,6 +1370,12 @@ mod tests {
             Ok(_) => panic!("missing root accepted"),
             Err(error) => error,
         };
-        assert_eq!(error.to_string(), "member_session_journal_failed");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let report = error.to_string();
+        assert!(report.contains("origin=session_journal"));
+        assert!(report.contains("cause=not_found"));
+        assert!(
+            !report.contains("secret-path") && !report.contains(&dir.path().display().to_string())
+        );
     }
 }

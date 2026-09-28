@@ -146,7 +146,7 @@ internal class ServiceRedundantConnectionNative(
     private val establishTun: (Config) -> Int?,
     private val prepare: (ByteArray) -> PreparedRedundantConfiguration,
     probeSourceIpv4: String,
-    initialNetworkValidated: Boolean = true,
+    initialNetworkAvailable: Boolean = true,
     private val epochNowMs: () -> Long = System::currentTimeMillis,
     private val elapsedNowMs: () -> Long = {
         TimeUnit.NANOSECONDS.toMillis(System.nanoTime())
@@ -192,7 +192,7 @@ internal class ServiceRedundantConnectionNative(
     private var closedForStop = false
     private val slots = mutableMapOf<RedundantSlot, SlotRuntime>()
     private var activeSlot: RedundantSlot? = null
-    private var networkValidated = initialNetworkValidated
+    private var networkAvailable = initialNetworkAvailable
     private var probeSourceIpv4 = probeSourceIpv4
     private var standbyCheckStartedAtMs: Long? = null
     private var standbyCheckFirstProbeAtMs: Long? = null
@@ -307,10 +307,10 @@ internal class ServiceRedundantConnectionNative(
         slots.values.any { it.leaseId == leaseId }
     }
 
-    override fun setNetworkValidated(validated: Boolean) = synchronized(gate) {
-        networkValidated = validated
-        if (!validated) clearStandbyCheckLocked()
-        if (!validated) slots.values.forEach { runtime ->
+    override fun setNetworkAvailable(available: Boolean) = synchronized(gate) {
+        networkAvailable = available
+        if (!available) clearStandbyCheckLocked()
+        if (!available) slots.values.forEach { runtime ->
             cancelProbeLocked(runtime)
             clearUrgentFailureLocked(runtime)
             runtime.probeFailed = false
@@ -344,7 +344,7 @@ internal class ServiceRedundantConnectionNative(
                 runtime.probeBaselineRxPackets = null
                 clearUrgentFailureLocked(runtime)
             }
-            if (!rebound && networkValidated) runtime.hardFailure = true
+            if (!rebound && networkAvailable) runtime.hardFailure = true
         }
     }
 
@@ -417,7 +417,7 @@ internal class ServiceRedundantConnectionNative(
                 (standbyCheckStartedAtMs != null ||
                     slotReady(it, metricsBySlot.getValue(it.slot.index), epochNow, elapsedNow))
         }
-        if (networkValidated && active != null &&
+        if (networkAvailable && active != null &&
             (activeSuspected || initialColdFallback) && canStartStandbyCheck
         ) {
             if (standbyCheckStartedAtMs == null) {
@@ -560,7 +560,7 @@ internal class ServiceRedundantConnectionNative(
         currentRxPackets: Long,
         holdCompletedStandby: Boolean = false,
     ) {
-        if (!networkValidated) return
+        if (!networkAvailable) return
         val checkStarted = standbyCheckStartedAtMs.takeIf { runtime.slot != activeSlot }
         if (checkStarted != null && standbyCheckExpired(elapsedNow)) {
             cancelProbeLocked(runtime)

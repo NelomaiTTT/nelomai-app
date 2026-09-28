@@ -1728,8 +1728,8 @@ class NelomaiVpnServiceTest {
         assertFalse(dispatcher.tick { ticks += 100 })
         assertTrue(dispatcher.resume { resumes += 1 })
         assertFalse(dispatcher.resume { resumes += 100 })
-        assertTrue(dispatcher.network(validated = false, networks::add))
-        assertFalse(dispatcher.network(validated = true, networks::add))
+        assertTrue(dispatcher.network(available = false, networks::add))
+        assertFalse(dispatcher.network(available = true, networks::add))
         assertEquals(3, queued.size)
 
         queued.removeFirst().run()
@@ -1838,15 +1838,15 @@ class NelomaiVpnServiceTest {
         assertTrue(routeVpnProcessNetworkChange(
             RecoveryStoreResult.Success(serviceV2Envelope()),
             owner,
-            validated = true,
+            available = true,
         ) { legacyCalls += 1 })
-        assertEquals(listOf(true), owner.validatedNetworks)
+        assertEquals(listOf(true), owner.availableNetworks)
         assertEquals(0, legacyCalls)
 
         assertTrue(routeVpnProcessNetworkChange(
             RecoveryStoreResult.Success(serviceV1Envelope()),
             owner,
-            validated = true,
+            available = true,
         ) { legacyCalls += 1 })
         assertEquals(1, legacyCalls)
     }
@@ -1859,9 +1859,9 @@ class NelomaiVpnServiceTest {
         assertFalse(routeVpnProcessNetworkChange(
             RecoveryStoreResult.Failure("recovery_record_corrupt"),
             owner,
-            validated = true,
+            available = true,
         ) { legacyCalls += 1 })
-        assertTrue(owner.validatedNetworks.isEmpty())
+        assertTrue(owner.availableNetworks.isEmpty())
         assertEquals(0, legacyCalls)
     }
 
@@ -7319,7 +7319,7 @@ private fun serviceV2Envelope() = serviceV1Envelope().copy(
 private class ServiceRedundantOwner(
     private val closeResults: ArrayDeque<Boolean?> = ArrayDeque(),
 ) : RedundantVpnProcessOwner {
-    val validatedNetworks = mutableListOf<Boolean>()
+    val availableNetworks = mutableListOf<Boolean>()
     var closeCalls = 0
     var revokeCalls = 0
     override fun recover(): Boolean = true
@@ -7334,8 +7334,8 @@ private class ServiceRedundantOwner(
         return closeResults.removeFirst()
             ?: throw IllegalStateException("close_failed")
     }
-    override fun onUnderlyingNetworkChanged(validated: Boolean): Boolean {
-        validatedNetworks += validated
+    override fun onUnderlyingNetworkChanged(available: Boolean): Boolean {
+        availableNetworks += available
         return true
     }
 }

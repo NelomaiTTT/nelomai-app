@@ -1,6 +1,8 @@
 //! Native session composition. The health coordinator, not this route owner,
 //! decides when a member is healthy. No GUI or IPC capability is enabled here.
+use super::diagnostic::{DiagnosticJournal, DiagnosticNetwork, FailureSlot, PairFailure, Stage};
 use super::members::SessionMembers;
+use super::policy::PhysicalPolicyProvider;
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend};
 use nelomai_client_tunnel::redundancy::{
     network::*, route_plan::member_route_plan, SessionScope, Slot,
@@ -22,7 +24,8 @@ pub struct NetworkPolicy {
 pub struct SessionNetwork<B, N, S> {
     scope: SessionScope,
     members: SessionMembers<B>,
-    network: NetworkOwner<N, S>,
+    network: NetworkOwner<DiagnosticNetwork<N>, DiagnosticJournal<S>>,
+    failure: FailureSlot,
     policy: Option<NetworkPolicy>,
     dns: [Vec<IpAddr>; 2],
     endpoints: [Option<IpAddr>; 2],
@@ -41,7 +44,8 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         Ok(Self {
             members: SessionMembers::new(scope.clone(), backends)?,
             scope,
-            network: NetworkOwner::fresh(system, store),
+            network: NetworkOwner::fresh(DiagnosticNetwork(system), DiagnosticJournal(store)),
+            failure: FailureSlot::default(),
             policy: None,
             dns: [Vec::new(), Vec::new()],
             endpoints: [None, None],
@@ -49,6 +53,19 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             closing_incomplete: false,
             retired_interfaces: [None, None],
         })
+    }
+    pub(crate) fn begin_operation(&self) {
+        self.failure.clear();
+        self.members.failure.clear();
+    }
+    pub(crate) fn operation_error(&self, stage: Stage, error: ServiceError) -> std::io::Error {
+        // close() returns the native failure first if both cleanup paths fail.
+        let native = self.members.failure.take();
+        let network = self.failure.take();
+        native
+            .or(network)
+            .unwrap_or_else(|| PairFailure::service(stage, &error))
+            .into_io(stage)
     }
     pub fn active(&self) -> Option<Slot> {
         if self.closing {
@@ -69,7 +86,13 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         Ok(Self {
             members: SessionMembers::recover_for_cleanup(scope.clone(), backends)?,
             scope,
-            network: NetworkOwner::recover(system, store, journal).map_err(network_error)?,
+            network: NetworkOwner::recover(
+                DiagnosticNetwork(system),
+                DiagnosticJournal(store),
+                journal,
+            )
+            .map_err(network_error)?,
+            failure: FailureSlot::default(),
             policy: None,
             dns: [Vec::new(), Vec::new()],
             endpoints: [None, None],
@@ -118,7 +141,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
                     .map(NetworkValue::Route)
                     .collect(),
             )
-            .map_err(network_error)?;
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         // Retain the policy even on partial native start. Only scoped Stop can
         // dispose of those resources; a new Start must not adopt their remnants.
         self.policy = Some(policy);
@@ -128,7 +151,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         self.network
             .system_mut()
             .member_started(slot, view.routes.interface)
-            .map_err(network_error)?;
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         self.select_active(scope, slot)
     }
 
@@ -164,14 +187,14 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
                 .network
                 .system_mut()
                 .verify_retained_route(&endpoint_bypass)
-                .map_err(network_error)?
+                .map_err(|e| self.failure.network(Stage::Network, e))?
             {
                 next.retained_routes.push(endpoint_bypass);
             } else if self
                 .network
                 .system_mut()
                 .read(&value.key())
-                .map_err(network_error)?
+                .map_err(|e| self.failure.network(Stage::Network, e))?
                 .is_none()
             {
                 next.bypasses.push(endpoint_bypass);
@@ -181,7 +204,9 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         }
         validate_policy(&next)?;
         let values = self.values(active, &next)?;
-        self.network.select(active, values).map_err(network_error)?;
+        self.network
+            .select(active, values)
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         self.policy = Some(next);
         self.dns[index(slot)] = config.dns.clone();
         self.endpoints[index(slot)] = Some(endpoint);
@@ -189,7 +214,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         self.network
             .system_mut()
             .member_started(slot, view.routes.interface)
-            .map_err(network_error)?;
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         // Same active and DNS: adding B only installs B's scoped probe route.
         self.select_active(scope, active)
     }
@@ -200,7 +225,9 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         self.members.check_live(scope, slot)?;
         let policy = self.policy.clone().ok_or_else(fenced)?;
         let values = self.values(slot, &policy)?;
-        self.network.select(slot, values).map_err(network_error)
+        self.network
+            .select(slot, values)
+            .map_err(|e| self.failure.network(Stage::Network, e))
     }
 
     /// A failed reserve does not tear down a working primary. Remove only the
@@ -222,12 +249,14 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         self.endpoints[i] = None;
         let policy = self.policy.clone().ok_or_else(fenced)?;
         let values = self.values(active, &policy)?;
-        self.network.select(active, values).map_err(network_error)?;
+        self.network
+            .select(active, values)
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         if let Some(interface) = self.retired_interfaces[i] {
             self.network
                 .system_mut()
                 .member_stopped(slot, interface)
-                .map_err(network_error)?;
+                .map_err(|e| self.failure.network(Stage::Network, e))?;
             self.retired_interfaces[i] = None;
         }
         Ok(())
@@ -250,7 +279,9 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         }
         let active = self.active().ok_or_else(fenced)?;
         let values = self.values(active, &policy)?;
-        self.network.select(active, values).map_err(network_error)?;
+        self.network
+            .select(active, values)
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         self.policy = Some(policy);
         self.members.rebind(scope)
     }
@@ -264,12 +295,15 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
         // Cut native traffic before potentially slow DNS/route cleanup. Still
         // attempt both paths on failure and retain their independent journals.
         let members = self.members.close(scope);
-        let network = self.network.cleanup().map_err(network_error);
+        let network = self
+            .network
+            .cleanup()
+            .map_err(|e| self.failure.network(Stage::Network, e));
         members.and(network)?;
         self.network
             .system_mut()
             .session_closed()
-            .map_err(network_error)?;
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         self.closing_incomplete = false;
         self.retired_interfaces = [None, None];
         Ok(())
@@ -306,7 +340,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
             .map(|r| r.destination)
             .collect::<Vec<_>>();
         let routes = member_route_plan(active, &members, &exclusions, policy.metric)
-            .map_err(network_error)?;
+            .map_err(|e| self.failure.network(Stage::Network, e))?;
         let mut values = policy
             .bypasses
             .iter()
@@ -318,7 +352,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
                 self.network
                     .system_mut()
                     .route_resources(route)
-                    .map_err(network_error)?,
+                    .map_err(|e| self.failure.network(Stage::Network, e))?,
             );
         }
         if !self.dns[index(active)].is_empty() {
@@ -332,7 +366,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
                 self.network
                     .system_mut()
                     .dns_resources(interface, &self.dns[index(active)], &policy.dns_services)
-                    .map_err(network_error)?,
+                    .map_err(|e| self.failure.network(Stage::Network, e))?,
             );
         }
         Ok(values)
@@ -343,7 +377,7 @@ impl<B: ServiceTunnelBackend, N: NetworkSystem, S: NetworkJournalStore> SessionN
                 .network
                 .system_mut()
                 .verify_retained_route(route)
-                .map_err(network_error)?
+                .map_err(|e| self.failure.network(Stage::Network, e))?
             {
                 return Err(ServiceError::Backend("physical_route_changed".into()));
             }
@@ -417,7 +451,7 @@ impl<B: ServiceTunnelBackend, N: super::policy::PhysicalPolicyProvider, S: Netwo
         self.network
             .system_mut()
             .resolve_policy(options, endpoints, &owned)
-            .map_err(network_error)
+            .map_err(|e| self.failure.network(Stage::Network, e))
     }
 }
 

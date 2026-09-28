@@ -38,9 +38,11 @@ internal data class FailoverDecision(
 internal class RedundantHealthMonitor(
     private val softFailureConfirmationMs: Long = DEFAULT_SOFT_FAILURE_CONFIRMATION_MS,
     private val rebindStabilizationMs: Long = DEFAULT_REBIND_STABILIZATION_MS,
-    initialNetworkValidated: Boolean = true,
+    // Android's VALIDATED bit describes its own connectivity check, not this VPN.
+    // Readiness is established by our handshake and tunneled probes below.
+    initialNetworkAvailable: Boolean = true,
 ) {
-    private var networkValidated = initialNetworkValidated
+    private var networkAvailable = initialNetworkAvailable
     private var suppressFailoverUntilMs = Long.MIN_VALUE
     private var sessionStalledEmitted = false
 
@@ -49,9 +51,9 @@ internal class RedundantHealthMonitor(
         require(rebindStabilizationMs >= 0)
     }
 
-    fun onUnderlyingNetworkChanged(nowMs: Long, validated: Boolean) {
-        networkValidated = validated
-        suppressFailoverUntilMs = if (validated) {
+    fun onUnderlyingNetworkChanged(nowMs: Long, available: Boolean) {
+        networkAvailable = available
+        suppressFailoverUntilMs = if (available) {
             saturatingAdd(nowMs, rebindStabilizationMs)
         } else {
             Long.MAX_VALUE
@@ -59,7 +61,7 @@ internal class RedundantHealthMonitor(
     }
 
     fun evaluateHealth(nowMs: Long, slots: List<SlotObservation>): FailoverDecision {
-        if (sessionStalledEmitted || !networkValidated || nowMs < suppressFailoverUntilMs) {
+        if (sessionStalledEmitted || !networkAvailable || nowMs < suppressFailoverUntilMs) {
             return NONE
         }
         if (slots.size !in 1..MAX_SLOT_COUNT || slots.any { it.index !in 0..1 } ||
@@ -93,7 +95,7 @@ internal class RedundantHealthMonitor(
         classify(nowMs, observation)
 
     fun networkReady(nowMs: Long): Boolean =
-        networkValidated && nowMs >= suppressFailoverUntilMs
+        networkAvailable && nowMs >= suppressFailoverUntilMs
 
     fun ready(nowMs: Long, observation: SlotObservation): Boolean =
         networkReady(nowMs) &&

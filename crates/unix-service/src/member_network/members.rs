@@ -1,3 +1,4 @@
+use super::diagnostic::{FailureSlot, Stage};
 use crate::{ParsedConfiguration, ServiceError, ServiceTunnelBackend, ServiceTunnelState};
 use nelomai_client_tunnel::{
     redundancy::{route_plan::MemberRoutes, NativeProbeSocket, SessionScope, Slot},
@@ -23,6 +24,7 @@ pub struct SessionMembers<B> {
     needs_cleanup: [bool; 2],
     views: [Option<MemberView>; 2],
     closing: bool,
+    pub(crate) failure: FailureSlot,
 }
 impl<B: ServiceTunnelBackend> SessionMembers<B> {
     pub fn new(scope: SessionScope, backends: [B; 2]) -> Result<Self, ServiceError> {
@@ -79,6 +81,7 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
             needs_cleanup,
             views: [None, None],
             closing,
+            failure: FailureSlot::default(),
         })
     }
     pub fn cleanup_needed(&self, slot: Slot) -> bool {
@@ -113,12 +116,19 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
         let (source, addresses) = self.validate_start(scope, slot, config, &probe)?;
         let i = index(slot);
         self.needs_cleanup[i] = true; // Native start can fail after allocating an interface.
-        if self.backends[i].start(config, &DesktopTunnelOptions::default())?
+        if self.backends[i]
+            .start(config, &DesktopTunnelOptions::default())
+            .map_err(|e| self.failure.service(Stage::NativeStart, e))?
             != ServiceTunnelState::Running
         {
-            return Err(ServiceError::Backend("member_start_incomplete".into()));
+            return Err(self.failure.service(
+                Stage::NativeStart,
+                ServiceError::Backend("member_start_incomplete".into()),
+            ));
         }
-        let interface = self.backends[i].member_interface_index()?;
+        let interface = self.backends[i]
+            .member_interface_index()
+            .map_err(|e| self.failure.service(Stage::NativeIdentity, e))?;
         if interface == 0
             || self
                 .views
@@ -214,8 +224,15 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
         if !self.needs_cleanup[i] {
             return Ok(());
         }
-        if self.backends[i].stop()? != ServiceTunnelState::Stopped {
-            return Err(ServiceError::Backend("member_stop_pending".into()));
+        if self.backends[i]
+            .stop()
+            .map_err(|e| self.failure.service(Stage::NativeStop, e))?
+            != ServiceTunnelState::Stopped
+        {
+            return Err(self.failure.service(
+                Stage::NativeStop,
+                ServiceError::Backend("member_stop_pending".into()),
+            ));
         }
         self.needs_cleanup[i] = false;
         self.views[i] = None;
@@ -281,7 +298,12 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
         self.check_live(scope, slot)?;
         let view = self.view(slot).ok_or(ServiceError::InvalidRequest)?;
         NativeProbeSocket::open(view.routes.interface, view.source, view.probe.target_ipv4)
-            .map_err(|_| ServiceError::Backend("member_probe_socket_failed".into()))
+            .map_err(|error| self.probe_error(error))
+    }
+
+    pub(super) fn probe_error(&self, error: std::io::Error) -> ServiceError {
+        self.failure.io(Stage::Probe, error);
+        ServiceError::Backend("member_probe_socket_failed".into())
     }
 
     pub fn rebind(&mut self, scope: &SessionScope) -> Result<(), ServiceError> {
@@ -301,7 +323,8 @@ impl<B: ServiceTunnelBackend> SessionMembers<B> {
                         } else {
                             Err(ServiceError::Backend("member_rebind_incomplete".into()))
                         }
-                    });
+                    })
+                    .map_err(|e| self.failure.service(Stage::NativeRebind, e));
                 if let Err(e) = result {
                     first.get_or_insert(e);
                 }

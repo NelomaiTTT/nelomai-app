@@ -2,6 +2,7 @@
 //! This module does not start tunnels or activate the feature on its own.
 pub mod actor;
 pub mod counters;
+mod diagnostic;
 pub mod driver;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub mod factory;
