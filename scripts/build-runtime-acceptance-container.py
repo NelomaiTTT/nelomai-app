@@ -210,7 +210,18 @@ def verify_packaged_tree(extracted, staged, public_key, platform, architecture):
     installed_dispatcher = runtime.parent / (service if platform == "windows" else "dispatcher/1/" + service)
     if verifier.digest(installed_dispatcher) != verifier.digest(staged / "dispatcher/1" / service):
         raise ValueError("packaged dispatcher identity changed")
+    if platform == "windows":
+        verify_windows_update_helper(extracted, staged)
     return runtime
+
+
+def verify_windows_update_helper(extracted, staged):
+    """The preinstall helper must be the same authenticated new dispatcher."""
+    helpers = list(extracted.rglob("nelomai-update-helper.exe"))
+    expected = staged / "dispatcher/1/nelomai-windows-service.exe"
+    if (len(helpers) != 1 or helpers[0].is_symlink() or not helpers[0].is_file()
+            or verifier.digest(helpers[0]) != verifier.digest(expected)):
+        raise ValueError("packaged Windows update helper differs from signed dispatcher")
 
 
 def restore_linux_signed_payload(extracted, staged, public_key, architecture):
@@ -277,6 +288,13 @@ def package_desktop(staged, output, public_key, platform, architecture, *, root=
     environment = (environment or os.environ).copy()
     # Build-only/test trust and release trust must use separate output/cache roots.
     environment["CARGO_TARGET_DIR"] = str(output / "target")
+    if platform == "windows":
+        # NSIS needs the NEW recovery code before it overwrites installed files.
+        # Never inherit a caller-selected helper or execute the broken old binary.
+        helper = staged / "dispatcher/1/nelomai-windows-service.exe"
+        if helper.is_symlink() or not helper.is_file():
+            raise ValueError("staged Windows update helper is missing or linked")
+        environment["NELOMAI_WINDOWS_UPDATE_HELPER"] = str(helper.resolve())
     if platform == "linux":
         # Keep the exact output plugin used by Tauri in a known private cache.
         environment["XDG_CACHE_HOME"] = str(output / "tools-cache")

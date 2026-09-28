@@ -8,6 +8,11 @@ Var NelomaiDefenderExclusionPath
 
 !define NelomaiRegistryKey "SOFTWARE\Nelomai\Client"
 !define NelomaiDefenderScript "${__FILEDIR__}\..\..\crates\windows-service\install\defender-exclusions.ps1"
+!if "$%NELOMAI_WINDOWS_UPDATE_HELPER%" == ""
+  !define NelomaiUpdateHelper "${__FILEDIR__}\..\platform-runtime\desktop-bundle\dispatcher\1\nelomai-windows-service.exe"
+!else
+  !define NelomaiUpdateHelper "$%NELOMAI_WINDOWS_UPDATE_HELPER%"
+!endif
 
 ; One exact-path ownership implementation is shared with privileged runtime
 ; copying and repair. Embed it in both installer and uninstaller, never load
@@ -113,9 +118,16 @@ Var NelomaiDefenderExclusionPath
 
   IfFileExists "$INSTDIR\nelomai-windows-service.exe" 0 nelomai_preinstall_done
     DetailPrint "Stopping the previous Nelomai tunnel service"
-    ExecWait '"$INSTDIR\nelomai-windows-service.exe" uninstall' $0
+    ; Recover the old, authenticated owned lifetime with the NEW implementation.
+    ; A broken installed helper must not prevent delivery of its own repair.
+    ; The signed staging/packaging gates bind these embedded bytes to the new
+    ; dispatcher. Its existing uninstall command still fails closed on unknown
+    ; ownership or incomplete cleanup; no journal is manually discarded here.
+    InitPluginsDir
+    File "/oname=$PLUGINSDIR\nelomai-update-helper.exe" "${NelomaiUpdateHelper}"
+    ExecWait '"$PLUGINSDIR\nelomai-update-helper.exe" uninstall' $0
     ${If} $0 <> 0
-      MessageBox MB_ICONSTOP "Не удалось остановить предыдущую службу подключения Nelomai."
+      MessageBox MB_ICONSTOP "Не удалось остановить предыдущую службу подключения Nelomai." /SD IDOK
       Abort
     ${EndIf}
   nelomai_preinstall_done:
@@ -131,7 +143,7 @@ Var NelomaiDefenderExclusionPath
   DetailPrint "Installing the Nelomai tunnel service"
   ExecWait '"$INSTDIR\nelomai-windows-service.exe" install --owner-sid "$NelomaiOwnerSid" --client-path "$INSTDIR\${MAINBINARYNAME}.exe"' $0
   ${If} $0 <> 0
-    MessageBox MB_ICONSTOP "Не удалось установить службу подключения Nelomai."
+    MessageBox MB_ICONSTOP "Не удалось установить службу подключения Nelomai." /SD IDOK
     Abort
   ${EndIf}
 
