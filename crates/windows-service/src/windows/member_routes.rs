@@ -18,9 +18,9 @@ use windows_sys::Win32::{
     Foundation::{ERROR_NOT_FOUND, NO_ERROR},
     NetworkManagement::{
         IpHelper::{
-            CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetIpForwardTable2,
-            InitializeIpForwardEntry, SetIpForwardEntry2, IP_ADDRESS_PREFIX, MIB_IPFORWARD_ROW2,
-            MIB_IPFORWARD_TABLE2,
+            CreateIpForwardEntry2, DeleteIpForwardEntry2, FreeMibTable, GetBestRoute2,
+            GetIpForwardTable2, InitializeIpForwardEntry, SetIpForwardEntry2, IP_ADDRESS_PREFIX,
+            MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
         },
         Ndis::NET_LUID_LH,
     },
@@ -33,6 +33,26 @@ use windows_sys::Win32::{
 /// Use only inside MemberRoutes with the owning member's live IdentityCheck.
 /// The caller holds the privileged mutation lock across read/CAS/readback.
 pub struct NativeRowIo;
+
+/// Unbound route selection, as used by a member's outer UDP socket. Constraining
+/// the interface here would conceal a competing route/loop through a VPN NIC.
+pub(crate) fn best_route(address: IpAddr) -> io::Result<Row> {
+    let destination = encode_address(address, 0);
+    let mut route = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    status(unsafe {
+        GetBestRoute2(
+            ptr::null(),
+            0,
+            ptr::null(),
+            &destination,
+            0,
+            &mut route,
+            &mut source,
+        )
+    })?;
+    decode_row(&route, decode_prefix(&route)?)
+}
 
 impl RowIo for NativeRowIo {
     fn read(&mut self, destination: IpNet, index: u32) -> io::Result<Vec<Row>> {

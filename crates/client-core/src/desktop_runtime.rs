@@ -557,6 +557,29 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
         &self,
         stored: nelomai_client_storage::RuntimeStateV1,
     ) -> Result<Connection, CoreError> {
+        if let Some(pair) = stored.desktop_redundancy.as_ref() {
+            if let Some(pending) = stored
+                .pending_compensation_stop
+                .as_ref()
+                .filter(|_| pair.stop.is_none())
+            {
+                // Failed Start already sealed a cold cleanup identity. Manual
+                // retry must not replace it with a new, retaining Stop intent.
+                if pending.recovery_contract_version != Some(2)
+                    || pending.redundant_session_id.as_deref()
+                        != Some(pair.session.session_id.as_str())
+                    || pending.lease_id != pair.connection.lease_id
+                {
+                    return Err(CoreError::Storage);
+                }
+                self.set_phase(Phase::Stopping).await;
+                *self.active_recovery_episode.lock().await = None;
+                self.close_desktop_pair(desktop_redundancy::scope(pair, stored.slot)?)
+                    .await?;
+                self.state.lock().await.connection = Some(pair.connection.clone());
+                return Ok(pair.connection.clone());
+            }
+        }
         self.stop_desktop_with_frozen(stored, None, true).await
     }
 

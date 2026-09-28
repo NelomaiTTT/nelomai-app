@@ -5,6 +5,26 @@ use nelomai_client_tunnel::TunnelTransport;
 use nelomai_contracts::dispatcher::{EnginePrimitive, TunnelSlot};
 use std::path::Path;
 
+// Ordinary AWG owns routes-state.json. The authenticated pair engine owns the
+// member services' scoped routes and health instead; never attach the ordinary
+// watchdog to those members. Only exact compiled service names can opt out.
+#[cfg(any(windows, test))]
+pub(crate) fn prepare_awg_route_supervision(
+    service_name: &str,
+    legacy: impl FnOnce() -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    if service_name == crate::AMNEZIAWG_TUNNEL_SERVICE_NAME {
+        legacy()
+    } else if [TunnelSlot::A, TunnelSlot::B]
+        .into_iter()
+        .any(|slot| service_name == slot_service_name(slot, TunnelTransport::AmneziaWg3))
+    {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidRequest)
+    }
+}
+
 /// Rendering only; the native parser still validates keys, addresses and AWG
 /// parameters. A member must not independently change machine routes or DNS.
 /// Secret-bearing output is zeroized, and errors never contain input lines.
@@ -141,4 +161,39 @@ pub fn execute_slot_primitive<C: SlotServiceControl>(
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod route_supervision_tests {
+    use super::*;
+    #[test]
+    fn member_start_does_not_require_legacy_route_journal() {
+        for slot in [TunnelSlot::A, TunnelSlot::B] {
+            prepare_awg_route_supervision(
+                slot_service_name(slot, TunnelTransport::AmneziaWg3),
+                || Err(ServiceError::Backend("endpoint_route_lost".into())),
+            )
+            .unwrap();
+        }
+    }
+    #[test]
+    fn ordinary_start_keeps_legacy_watchdog_failure() {
+        let result = prepare_awg_route_supervision(crate::AMNEZIAWG_TUNNEL_SERVICE_NAME, || {
+            Err(ServiceError::Backend("endpoint_route_lost".into()))
+        });
+        assert!(
+            matches!(result, Err(ServiceError::Backend(ref code)) if code == "endpoint_route_lost")
+        );
+    }
+    #[test]
+    fn unknown_service_cannot_opt_out_of_supervision() {
+        for name in [
+            "foreign",
+            "NelomaiAmneziaWg3A-other",
+            "nelomaiamneziawg3a",
+            "WireGuardTunnel$nelomai-a",
+        ] {
+            assert!(prepare_awg_route_supervision(name, || Ok(())).is_err());
+        }
+    }
 }

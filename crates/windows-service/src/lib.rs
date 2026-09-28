@@ -8,6 +8,8 @@ pub use nelomai_contracts::dispatcher;
 #[cfg(any(windows, test))]
 mod install_recovery;
 pub mod member_actor;
+mod member_diagnostic;
+pub use member_diagnostic::PairFailure;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_boot.rs"]
 mod member_boot;
@@ -1143,6 +1145,8 @@ pub enum ServiceError {
     UnsupportedProtocol,
     #[error("Windows tunnel backend failed: {0}")]
     Backend(String),
+    #[error("Windows redundant operation failed: {0}")]
+    PairOperation(PairFailure),
 }
 
 impl ServiceError {
@@ -1155,6 +1159,7 @@ impl ServiceError {
             Self::UnsafePath => "unsafe_path",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::Backend(code) => stable_route_error_code(code).unwrap_or("service_unavailable"),
+            Self::PairOperation(_) => "redundant_actor_failed",
         }
     }
 }

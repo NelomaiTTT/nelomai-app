@@ -283,7 +283,7 @@ impl GuardStore for NativeGuard {
         SplitEngines::snapshot(self)
     }
 
-    fn compare_exchange(&mut self, expected: &Model, desired: &Model) -> Result<()> {
+    fn compare_exchange(&mut self, expected: &Model, desired: &Model) -> Result<Model> {
         validate_exchange(&self.base.scope, expected, desired)?;
         if self.failed {
             return Err(GuardError::Conflict);
@@ -305,7 +305,7 @@ impl SplitEngines for NativeGuard {
         self.base
             .transaction(FWPM_TXN_READ_ONLY, |engine| engine.read_locked())
     }
-    fn exchange(&mut self, kind: SessionKind, expected: &Model, desired: &Model) -> Result<()> {
+    fn exchange(&mut self, kind: SessionKind, expected: &Model, desired: &Model) -> Result<Model> {
         if self.failed {
             return Err(GuardError::Conflict);
         }

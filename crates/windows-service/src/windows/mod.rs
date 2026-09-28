@@ -20,6 +20,7 @@ mod service;
 
 pub use defender::configure_exclusion;
 pub use elevation::{repair_defender_exclusion, repair_installation, RepairError};
+pub(crate) use install::record_service_diagnostic;
 pub use install::{install, uninstall, InstallOptions};
 pub use ipc::{dispatcher_exchange, NamedPipeTransport};
 pub use service::{

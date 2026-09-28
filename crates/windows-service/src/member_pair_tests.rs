@@ -330,12 +330,17 @@ struct State {
     owners: [Option<OwnerRecord>; 2],
     route_active: Option<Slot>,
     fail_routes: bool,
+    endpoint_lost: bool,
     fail_save: bool,
     lost_pair_save: bool,
     fail_guard: bool,
     fail_guard_read: bool,
+    assigned_weight: Option<u16>,
+    fail_guard_ack_save: bool,
     guard_observation: Option<crate::member_guard::Snapshot>,
     fail_permit_close: bool,
+    fail_save_on_permit_close: bool,
+    guard_observation_on_permit_close: Option<crate::member_guard::Snapshot>,
     fail_cleanup_routes: bool,
     owner_saves: usize,
     fail_owner_save: Option<usize>,
@@ -378,6 +383,30 @@ impl PairSocket for Socket {
     }
 }
 struct Io(Shared);
+#[test]
+fn scoped_endpoint_loss_rejects_health_and_new_probes_but_allows_cleanup() {
+    let (mut p, s) = pair();
+    p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    p.attach(&scope(), &member(Slot::B)).unwrap();
+    s.borrow_mut().endpoint_lost = true;
+    assert!(p.sample(Slot::A).is_none());
+    assert!(p.open_probe(Slot::A).is_err());
+    p.close(&scope()).unwrap();
+    assert!(!p.cleanup_pending());
+}
+#[test]
+fn endpoint_failure_during_activation_never_opens_data_permits() {
+    let (mut p, s) = pair();
+    s.borrow_mut().endpoint_lost = true;
+    assert!(p
+        .start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+        .is_err());
+    assert!(s.borrow().guard.as_ref().unwrap().active.is_none());
+    assert!(p.sample(Slot::A).is_none());
+    p.close(&scope()).unwrap();
+    assert!(!p.cleanup_pending());
+}
 impl PairIo for Io {
     type Socket = Socket;
     fn prepare_member(&mut self, scope: &SessionScope, m: &Member) -> io::Result<MemberRecord> {
@@ -445,6 +474,14 @@ impl PairIo for Io {
                 }),
         )
     }
+    fn verify_endpoint(&mut self, m: &MemberRecord) -> io::Result<()> {
+        self.verify(m)?;
+        if self.0.borrow().endpoint_lost {
+            Err(failed())
+        } else {
+            Ok(())
+        }
+    }
     fn stop(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
         self.verify(m)?;
         let mut r = m.owner.clone();
@@ -496,7 +533,7 @@ impl PairIo for Io {
         }
         Ok(self.0.borrow().guard.as_ref().unwrap().expected.clone())
     }
-    fn guard_exchange(&mut self, p: &ExchangePlan) -> io::Result<()> {
+    fn guard_exchange(&mut self, p: &ExchangePlan) -> io::Result<Model> {
         let mut s = self.0.borrow_mut();
         assert!(s.saved.as_ref().unwrap().pending_guard.is_some());
         assert_eq!(s.guard.as_ref().unwrap().expected, p.expected.expected);
@@ -504,8 +541,21 @@ impl PairIo for Io {
             return Err(failed());
         }
         s.events.push(format!("guard:{:?}", p.desired.active));
-        s.guard = Some(p.desired.clone());
-        Ok(())
+        let mut actual = p.desired.expected.clone();
+        if !p.expected.installed && p.desired.installed {
+            if let Some(weight) = s.assigned_weight {
+                actual.sublayer.as_mut().unwrap().weight = weight;
+            }
+        }
+        let committed = p
+            .desired
+            .readback_after(&p.expected, &actual)
+            .map_err(|_| failed())?;
+        s.guard = Some(committed.clone());
+        if s.fail_guard_ack_save {
+            s.fail_save = true;
+        }
+        Ok(committed)
     }
     fn close_permits(&mut self) -> io::Result<()> {
         let mut s = self.0.borrow_mut();
@@ -514,6 +564,12 @@ impl PairIo for Io {
             return Err(failed());
         }
         s.guard = Some(s.guard.as_ref().unwrap().without_probes().unwrap());
+        if s.fail_save_on_permit_close {
+            s.fail_save = true;
+        }
+        if let Some(observation) = s.guard_observation_on_permit_close.take() {
+            s.guard_observation = Some(observation);
+        }
         Ok(())
     }
     fn select_routes(
@@ -784,6 +840,167 @@ fn unconfirmed_permit_removal_keeps_exclusive_socket_reserved_on_drop() {
     assert!(!s.borrow().events.contains(&"socket_drop".into()));
 }
 #[test]
+fn assigned_sublayer_weight_failed_pin_save_cannot_relearn_changed_weight() {
+    let (mut p, s) = pair();
+    s.borrow_mut().assigned_weight = Some(32771);
+    s.borrow_mut().fail_guard_ack_save = true;
+    let desired = Model::new(
+        scope(),
+        [
+            Some(crate::member_guard::Member {
+                interface: crate::member_guard::Interface {
+                    index: 73,
+                    luid: 14918723538255872,
+                },
+                probes: vec![],
+            }),
+            None,
+        ],
+        None,
+    )
+    .unwrap();
+    assert!(p.guard(desired).is_err());
+    assert!(s.borrow().saved.as_ref().unwrap().pending_guard.is_some());
+    assert!(
+        p.cleanup_pending(),
+        "an unacknowledged pin is still pending work"
+    );
+    s.borrow_mut().fail_save = false;
+    let mut changed = s.borrow().guard.as_ref().unwrap().expected.clone();
+    changed.sublayer.as_mut().unwrap().weight = 32772;
+    s.borrow_mut().guard_observation = Some(changed);
+    assert!(
+        p.reconcile_guard().is_err(),
+        "a failed durable save must not forget the observed assignment"
+    );
+}
+
+#[test]
+fn assigned_sublayer_weight_survives_roles_and_restart_cleanup() {
+    let (mut p, s) = pair();
+    s.borrow_mut().assigned_weight = Some(32771);
+    p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    p.attach(&scope(), &member(Slot::B)).unwrap();
+    p.select_active(&scope(), Slot::B).unwrap();
+    let record: PairRecord =
+        serde_json::from_slice(&serde_json::to_vec(s.borrow().saved.as_ref().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(record.guard.assigned_sublayer_weight, Some(32771));
+    assert_eq!(
+        record.guard.expected.sublayer.as_ref().unwrap().weight,
+        32771
+    );
+    record.guard.validate().unwrap();
+    drop(p);
+    let mut recovered =
+        SessionNativePair::recover_for_cleanup(scope(), Io(s.clone()), Disk(s.clone()), record)
+            .unwrap();
+    recovered.close(&scope()).unwrap();
+    let saved = s.borrow().saved.clone().unwrap();
+    assert!(!saved.guard.installed);
+    assert_eq!(saved.guard.assigned_sublayer_weight, None);
+    assert!(saved.pending_guard.is_none());
+}
+
+#[test]
+fn guard_acknowledges_desired_members_even_when_native_snapshot_is_unchanged() {
+    let (mut p, _) = pair();
+    p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    // Active members have no guard filters. Removing this member from the
+    // policy must still acknowledge its new model, even with identical WFP rows.
+    let desired = Model::new(scope(), [None, None], None).unwrap();
+    p.guard(desired).unwrap();
+    assert!(p.record.guard.members.iter().all(Option::is_none));
+    assert_eq!(p.record.guard.active, None);
+}
+
+#[test]
+fn assigned_sublayer_weight_legacy_committed_pending_is_recovered_and_saved() {
+    let (mut p, s) = pair();
+    let desired = Model::new(
+        scope(),
+        [
+            Some(crate::member_guard::Member {
+                interface: crate::member_guard::Interface {
+                    index: 73,
+                    luid: 14918723538255872,
+                },
+                probes: vec![],
+            }),
+            None,
+        ],
+        None,
+    )
+    .unwrap();
+    p.record.pending_guard = Some(ExchangePlan::new(&p.record.guard, &desired).unwrap());
+    p.save().unwrap();
+    let legacy = serde_json::to_value(&p.record).unwrap();
+    for model in [
+        &legacy["guard"],
+        &legacy["pending_guard"]["expected"],
+        &legacy["pending_guard"]["withdrawn"],
+        &legacy["pending_guard"]["base"],
+        &legacy["pending_guard"]["desired"],
+    ] {
+        assert!(model
+            .as_object()
+            .unwrap()
+            .get("assigned_sublayer_weight")
+            .is_none());
+    }
+    let record: PairRecord = serde_json::from_value(legacy).unwrap();
+    drop(p);
+    let mut actual = desired.expected.clone();
+    actual.sublayer.as_mut().unwrap().weight = 32771;
+    s.borrow_mut().guard_observation = Some(actual.clone());
+    let mut recovered =
+        SessionNativePair::recover_for_cleanup(scope(), Io(s.clone()), Disk(s.clone()), record)
+            .unwrap();
+    recovered.reconcile_guard().unwrap();
+    let saved = s.borrow().saved.clone().unwrap();
+    assert!(saved.pending_guard.is_none());
+    assert_eq!(saved.guard.expected, actual);
+    saved.guard.validate().unwrap();
+    assert_eq!(saved.guard.assigned_sublayer_weight, Some(32771));
+    let pinned: PairRecord = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    let mut forged = pinned.clone();
+    forged.pending_guard =
+        Some(ExchangePlan::new(&Model::empty(scope()).unwrap(), &desired).unwrap());
+    assert!(SessionNativePair::recover_for_cleanup(
+        scope(),
+        Io(s.clone()),
+        Disk(s.clone()),
+        forged
+    )
+    .is_err());
+    s.borrow_mut().guard = Some(saved.guard);
+    s.borrow_mut().guard_observation = None;
+    drop(recovered);
+    let mut restarted =
+        SessionNativePair::recover_for_cleanup(scope(), Io(s.clone()), Disk(s.clone()), pinned)
+            .unwrap();
+    let mut changed = actual.clone();
+    changed.sublayer.as_mut().unwrap().weight = 32772;
+    s.borrow_mut().guard_observation = Some(changed);
+    assert!(restarted.reconcile_guard().is_err());
+    s.borrow_mut().guard_observation = None;
+    restarted.close(&scope()).unwrap();
+    let final_record = s.borrow().saved.clone().unwrap();
+    assert_eq!(final_record.guard, Model::empty(scope()).unwrap());
+    assert!(final_record.pending_guard.is_none());
+    assert!(s
+        .borrow()
+        .guard
+        .as_ref()
+        .unwrap()
+        .expected
+        .filters
+        .is_empty());
+}
+
+#[test]
 fn recovery_accepts_only_exact_dynamic_withdrawal_and_is_cleanup_only() {
     let (mut p, s) = pair();
     p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
@@ -805,6 +1022,125 @@ fn recovery_accepts_only_exact_dynamic_withdrawal_and_is_cleanup_only() {
         crate::member_owner::Phase::Stopped
     );
 }
+
+fn pair_after_failed_guard_ack_stop() -> (SessionNativePair<Io, Disk>, Shared) {
+    let (mut p, s) = pair();
+    s.borrow_mut().assigned_weight = Some(32771);
+    p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    p.attach(&scope(), &member(Slot::B)).unwrap();
+    p.fence().unwrap();
+    s.borrow_mut().fail_guard_ack_save = true;
+    assert!(p.guard(p.model(Some(Slot::A), true).unwrap()).is_err());
+    assert!(p.guard_save_pending);
+    assert_eq!(
+        p.close(&scope()).unwrap_err().kind(),
+        io::ErrorKind::WriteZero
+    );
+    assert!(p.cleanup_pending());
+    s.borrow_mut().fail_save = false;
+    s.borrow_mut().fail_guard_ack_save = false;
+    (p, s)
+}
+
+#[test]
+fn stop_retry_after_guard_ack_save_failure_completes_without_restart() {
+    let (mut p, s) = pair_after_failed_guard_ack_stop();
+    p.close(&scope()).unwrap();
+    assert!(!p.cleanup_pending());
+    assert!(s
+        .borrow()
+        .saved
+        .as_ref()
+        .unwrap()
+        .members
+        .iter()
+        .all(Option::is_none));
+    assert_eq!(
+        s.borrow().saved.as_ref().unwrap().guard,
+        Model::empty(scope()).unwrap()
+    );
+    assert_eq!(s.borrow().route_active, None);
+    assert!(s
+        .borrow()
+        .owners
+        .iter()
+        .flatten()
+        .all(|m| m.phase == crate::member_owner::Phase::Stopped));
+    p.close(&scope()).unwrap();
+}
+
+#[test]
+fn stop_retry_rejects_changed_withdrawn_guard_until_exact_snapshot_returns() {
+    let (mut p, s) = pair_after_failed_guard_ack_stop();
+    let mut changed = s.borrow().guard.as_ref().unwrap().expected.clone();
+    changed.sublayer.as_mut().unwrap().weight = 32772;
+    s.borrow_mut().guard_observation = Some(changed);
+    s.borrow_mut().events.clear();
+    assert!(p.close(&scope()).is_err());
+    assert!(p.cleanup_pending());
+    assert!(!s.borrow().events.iter().any(|e| e.starts_with("guard:")));
+    s.borrow_mut().guard_observation = None;
+    p.close(&scope()).unwrap();
+    assert!(!p.cleanup_pending());
+}
+
+#[test]
+fn stop_retry_requires_confirmed_own_dynamic_session_close() {
+    let (mut p, s) = pair_after_failed_guard_ack_stop();
+    s.borrow_mut().fail_permit_close = true;
+    assert!(p.close(&scope()).is_err());
+    assert!(p.cleanup_pending());
+    s.borrow_mut().fail_permit_close = false;
+    p.close(&scope()).unwrap();
+    assert!(!p.cleanup_pending());
+}
+
+#[test]
+fn active_pair_does_not_adopt_exact_dynamic_withdrawal() {
+    let (mut p, s) = pair();
+    p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    p.attach(&scope(), &member(Slot::B)).unwrap();
+    Io(s.clone()).close_permits().unwrap();
+    assert!(p.reconcile_guard().is_err());
+    assert!(p.open_probe(Slot::A).is_err());
+    assert!(p.sample(Slot::A).is_none());
+}
+
+#[test]
+fn stop_retry_rereads_exact_guard_after_own_session_close() {
+    let (mut p, s) = pair_after_failed_guard_ack_stop();
+    let mut changed = s.borrow().guard.as_ref().unwrap().expected.clone();
+    changed.sublayer.as_mut().unwrap().weight = 32772;
+    s.borrow_mut().guard_observation_on_permit_close = Some(changed);
+    s.borrow_mut().events.clear();
+    assert!(p.close(&scope()).is_err());
+    assert!(p.cleanup_pending());
+    assert!(!s.borrow().events.iter().any(|e| e.starts_with("guard:")));
+    s.borrow_mut().guard_observation = None;
+    p.close(&scope()).unwrap();
+    assert!(!p.cleanup_pending());
+}
+
+#[test]
+fn stop_retry_persists_withdrawal_before_further_guard_changes() {
+    let (mut p, s) = pair_after_failed_guard_ack_stop();
+    s.borrow_mut().fail_save_on_permit_close = true;
+    s.borrow_mut().events.clear();
+    assert_eq!(
+        p.close(&scope()).unwrap_err().kind(),
+        io::ErrorKind::WriteZero
+    );
+    assert!(p.cleanup_pending());
+    assert!(p.guard_save_pending);
+    assert!(!s.borrow().events.iter().any(|e| e.starts_with("guard:")));
+    s.borrow_mut().fail_save_on_permit_close = false;
+    s.borrow_mut().fail_save = false;
+    p.close(&scope()).unwrap();
+    assert!(!p.cleanup_pending());
+}
+
 #[test]
 fn diagnostics_follow_promoted_active_and_stopping_rejects_reads() {
     let (mut p, s) = pair();
@@ -1785,6 +2121,9 @@ mod retained_owner_seam {
                 .confirm_absent(&m.owner)
                 .map_err(io::Error::other)
         }
+        fn verify_endpoint(&mut self, m: &MemberRecord) -> io::Result<()> {
+            self.base.verify_endpoint(m)
+        }
         fn confirm_inactive_for_discovery(&mut self, m: &MemberRecord) -> io::Result<bool> {
             self.owner(m)
                 .confirm_inactive_for_discovery(&m.owner)
@@ -1828,7 +2167,7 @@ mod retained_owner_seam {
         fn guard_snapshot(&mut self) -> io::Result<crate::member_guard::Snapshot> {
             self.base.guard_snapshot()
         }
-        fn guard_exchange(&mut self, p: &ExchangePlan) -> io::Result<()> {
+        fn guard_exchange(&mut self, p: &ExchangePlan) -> io::Result<Model> {
             self.base.guard_exchange(p)
         }
         fn close_permits(&mut self) -> io::Result<()> {

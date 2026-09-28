@@ -45,7 +45,10 @@ pub struct CompositeBackend<B, F: PairFactory> {
 }
 impl<B: ServiceTunnelBackend, F: PairFactory> CompositeBackend<B, F> {
     pub fn new(runtime: RuntimeSlot, single: B, mut factory: F) -> Result<Self, ServiceError> {
-        factory.recover(runtime).map_err(|_| failed())?;
+        factory.recover(runtime).map_err(|error| match error {
+            ServiceError::PairOperation(_) => error,
+            _ => failed(),
+        })?;
         Ok(Self {
             single,
             factory,
@@ -167,6 +170,20 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
             .validate(self.runtime)
             .map_err(|_| ServiceError::InvalidRequest)?;
         self.refresh();
+        let stage = match &command {
+            Command::Start { .. } => "start",
+            Command::Attach { .. } => "attach",
+            Command::StageCandidate { .. } => "stage_candidate",
+            Command::RemoveStandby { .. } => "remove_standby",
+            Command::RetireInactive { .. } => "retire_inactive",
+            Command::CommitCandidate { .. } => "commit_candidate",
+            Command::Status { .. } => "status",
+            Command::PrepareStop { .. } => "prepare_stop",
+            Command::PrepareRecoveryStop { .. } => "prepare_recovery_stop",
+            Command::Stop { .. } => "stop",
+            Command::NetworkChanged { .. } => "network_changed",
+            Command::ConfirmRole { .. } => "confirm_role",
+        };
         let result = if let Command::Start {
             primary, options, ..
         } = &command
@@ -184,7 +201,7 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
             let pair = self
                 .factory
                 .prepare(self.runtime, &command, self.now)
-                .map_err(|_| failed())?;
+                .map_err(|e| operation_failed("prepare", e))?;
             // A partially failed native Start remains reachable by scoped Stop
             // and shutdown. Never lose the owner by starting a local temporary.
             self.pair = Some(pair);
@@ -202,7 +219,7 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
         };
         // Refresh on failures too: no stale Running status or legacy fallback.
         self.refresh();
-        result.map_err(|_| failed())
+        result.map_err(|e| operation_failed(stage, e))
     }
     fn tick(&mut self, now: u64) -> Result<(), ServiceError> {
         let backwards = now < self.now;
@@ -222,7 +239,7 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
                     .tick(now)
             })();
             self.refresh();
-            result.map_err(|_| failed())?;
+            result.map_err(|e| operation_failed("tick", e))?;
             if backwards {
                 return Err(failed());
             }
@@ -291,13 +308,15 @@ impl<B: ServiceTunnelBackend, F: PairFactory> ServiceTunnelBackend for Composite
     fn metrics(&mut self, probe: bool) -> Result<TunnelMetrics, ServiceError> {
         if let Some(pair) = &self.pair {
             // Pair probes are exclusively driven by helper tick, never UI polls.
-            return pair.metrics().map_err(|_| failed());
+            return pair.metrics().map_err(|e| operation_failed("metrics", e));
         }
         self.single.metrics(probe)
     }
     fn physical_network_fingerprint(&self) -> Result<String, ServiceError> {
         if let Some(pair) = &self.pair {
-            return pair.physical_network_fingerprint().map_err(|_| failed());
+            return pair
+                .physical_network_fingerprint()
+                .map_err(|e| operation_failed("physical_network", e));
         }
         self.single.physical_network_fingerprint()
     }
@@ -325,6 +344,12 @@ fn unsupported() -> ServiceError {
 }
 fn failed() -> ServiceError {
     ServiceError::Backend("redundant_actor_failed".into())
+}
+pub(crate) fn operation_failed(stage: &'static str, error: io::Error) -> ServiceError {
+    let failure = ServiceError::PairOperation(crate::PairFailure::io(stage, error));
+    #[cfg(windows)]
+    crate::windows::record_service_diagnostic("redundant operation", &failure);
+    failure
 }
 
 #[cfg(test)]
@@ -783,6 +808,26 @@ mod tests {
         w.borrow_mut().fail_status = true;
         assert!(a.redundant(start(scope())).is_err());
         assert_eq!(w.borrow().events, ["single status"]);
+    }
+    #[test]
+    fn native_failures_keep_safe_stage_without_private_error_text() {
+        let (mut actor, world) = setup();
+        world.borrow_mut().fail_prepare = true;
+        let error = actor.redundant(start(scope())).unwrap_err().to_string();
+        assert!(error.contains("stage=prepare"), "{error}");
+        assert!(!error.contains("private"), "{error}");
+        world.borrow_mut().fail_prepare = false;
+        world.borrow_mut().fail_start = true;
+        let error = actor.redundant(start(scope())).unwrap_err().to_string();
+        assert!(error.contains("stage=start"), "{error}");
+        assert!(!error.contains("private"), "{error}");
+        world.borrow_mut().fail_close = true;
+        let error = actor
+            .redundant(Command::Stop { scope: scope() })
+            .unwrap_err();
+        assert_eq!(error.code(), "redundant_actor_failed");
+        assert!(error.to_string().contains("stage=stop"));
+        assert!(!error.to_string().contains("private"));
     }
     #[test]
     fn failed_native_start_retains_owner_and_exact_shutdown_retry() {

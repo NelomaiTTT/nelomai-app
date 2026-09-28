@@ -135,6 +135,18 @@ pub fn member_route_plan(
             return Err(PlanError::MissingExclusion(*exclusion));
         }
     }
+    // Native discovery may supply a physical /32 for every probe. Keep it only
+    // when unbound traffic actually belongs outside the active tunnel. Otherwise
+    // it competes with the active probe /32 on effective interface+route metric.
+    // Explicit exclusions (including peer endpoints) always take precedence.
+    for member in members {
+        let address = IpAddr::V4(member.probe);
+        if active_member.allowed.iter().any(|n| n.contains(&address))
+            && !physical_exclusions.iter().any(|n| n.contains(&address))
+        {
+            physical.remove(&IpNet::from(address));
+        }
+    }
     let mut routes = BTreeMap::new();
     for mut route in common.into_iter().filter(|r| r.scope == RouteScope::Global) {
         route.scope = RouteScope::WindowsInterface(active_member.interface);
@@ -206,6 +218,48 @@ fn interface_metric(
         .get(&(interface, ipv6))
         .copied()
         .ok_or(PlanError::MissingMetric { interface, ipv6 })
+}
+
+/// Existing physical host rows are not ours to remove. Validate their metric
+/// competition separately from proposed bypasses before any native mutation.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn validate_retained_probe_routes(
+    plan: &Plan,
+    members: &[MemberRoutes],
+    retained: &[RouteValue],
+    verified_metrics: &[InterfaceMetric],
+) -> Result<(), PlanError> {
+    let metrics = verified_metrics
+        .iter()
+        .map(|m| ((m.interface, m.ipv6), m.metric))
+        .collect();
+    for route in retained.iter().filter(|r| {
+        members
+            .iter()
+            .any(|m| r.destination == IpNet::from(IpAddr::V4(m.probe)))
+    }) {
+        let weight = effective_metric(&metrics, route)?;
+        let candidates = plan
+            .routes
+            .iter()
+            .filter(|r| r.destination == route.destination)
+            .collect::<Vec<_>>();
+        // An identical retained exclusion is valid; neither adopt nor delete it.
+        if candidates.contains(&route) {
+            continue;
+        }
+        let best = candidates
+            .iter()
+            .map(|r| effective_metric(&metrics, r))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min()
+            .ok_or(PlanError::Invalid)?;
+        if weight <= best {
+            return Err(PlanError::UnsupportedMetric(route.destination));
+        }
+    }
+    Ok(())
 }
 fn effective_metric(
     metrics: &BTreeMap<(u32, bool), u32>,
@@ -332,6 +386,44 @@ mod tests {
             .filter(|r| r.destination.prefix_len() == prefix && weight(r) == best)
             .map(|r| r.interface)
             .collect()
+    }
+    #[test]
+    fn covered_probe_does_not_compete_with_unneeded_physical_bypass() {
+        let ms = members();
+        for metric in [25, 50] {
+            let mut im = physical_metrics();
+            for m in &mut im {
+                m.metric = if m.interface == 30 { 25 } else { metric };
+            }
+            let plan = member_route_plan(
+                Slot::A,
+                &ms,
+                &[],
+                &[physical("9.9.9.9/32"), physical("1.1.1.1/32")],
+                &im,
+                0,
+            )
+            .unwrap();
+            assert_eq!(lookup(&plan, "9.9.9.9", &im), [10]);
+            assert_eq!(lookup(&plan, "1.1.1.1", &im), [10]);
+            assert!(!plan.routes.iter().any(|r| r.interface == 30));
+        }
+    }
+    #[test]
+    fn preexisting_probe_host_route_is_not_an_artificial_competitor() {
+        let ms = members();
+        let mut retained = physical("9.9.9.9/32");
+        retained.scope = RouteScope::WindowsInterface(30);
+        retained.metric = 0;
+        let im = physical_metrics();
+        let plan = member_route_plan(Slot::A, &ms, &[], &[retained.clone()], &im, 0).unwrap();
+        assert!(matches!(
+            validate_retained_probe_routes(&plan, &ms, &[retained.clone()], &im),
+            Err(PlanError::UnsupportedMetric(_))
+        ));
+        // A strictly lower-priority foreign route need not be touched.
+        retained.metric = 200;
+        validate_retained_probe_routes(&plan, &ms, &[retained], &im).unwrap();
     }
     #[test]
     fn role_swap_same_probe_keeps_two_stable_keys_and_swaps_metrics() {

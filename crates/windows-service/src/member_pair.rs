@@ -269,6 +269,9 @@ pub(crate) trait PairIo {
         Ok(false)
     }
     fn verify(&mut self, member: &MemberRecord) -> io::Result<()>;
+    /// Read-only scoped endpoint check; never consult the singleton journal.
+    /// Called after route activation and before admitting health/probe work.
+    fn verify_endpoint(&mut self, member: &MemberRecord) -> io::Result<()>;
     fn confirm_absent(&mut self, member: &MemberRecord) -> io::Result<bool>;
     /// Read-only only: a platform may additionally attest its exact stopped
     /// service with no process/interface. Cleanup still uses confirm_absent.
@@ -282,7 +285,7 @@ pub(crate) trait PairIo {
     fn fingerprint(&mut self, members: &[Option<MemberRecord>; 2]) -> io::Result<String>;
     fn open_base(&mut self, member: &MemberRecord) -> io::Result<(Self::Socket, ProbeTuple)>;
     fn guard_snapshot(&mut self) -> io::Result<crate::member_guard::Snapshot>;
-    fn guard_exchange(&mut self, plan: &ExchangePlan) -> io::Result<()>;
+    fn guard_exchange(&mut self, plan: &ExchangePlan) -> io::Result<Model>;
     fn close_permits(&mut self) -> io::Result<()>;
     /// Uses the existing NetworkOwner: durable intent, exact row CAS and
     /// readback/rollback. No preexisting route adoption; no physical metric edits.
@@ -348,6 +351,9 @@ pub(crate) struct SessionNativePair<I: PairIo, J: PairStore> {
     // A synchronous rebind failed. Before discovery can retry it, the existing
     // tick must reconcile the guard and prove that the owners are still usable.
     rebind_pending: bool,
+    // Retain an observed assignment even if its durable acknowledgement fails.
+    // Retry that exact record before any further guard reconciliation/effects.
+    guard_save_pending: bool,
     // Sticky for this owned process. Never repair/adopt a vanished guard or
     // resume health after integrity loss; retain journals for exact cleanup.
     integrity_fault: Option<io::Error>,
@@ -381,6 +387,7 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             recovery: false,
             closed: false,
             rebind_pending: false,
+            guard_save_pending: false,
             integrity_fault: None,
         })
     }
@@ -409,7 +416,8 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             }
         }
         if let Some(p) = &record.pending_guard {
-            if p.expected.scope != scope
+            if p.expected != record.guard
+                || p.expected.scope != scope
                 || *p != ExchangePlan::new(&p.expected, &p.desired).map_err(|_| failed())?
             {
                 return Err(failed());
@@ -425,6 +433,7 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             closed: false,
             integrity_fault: None,
             rebind_pending: false,
+            guard_save_pending: false,
         })
     }
     fn check(&self, scope: &SessionScope) -> io::Result<()> {
@@ -435,11 +444,14 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
         }
     }
     fn save(&mut self) -> io::Result<()> {
-        self.store.save(&self.record)
+        self.store
+            .save(&self.record)
+            .map_err(|e| crate::member_diagnostic::context("pair_journal", e))
     }
     fn live(&self, slot: Slot) -> io::Result<&MemberRecord> {
         if self.recovery
             || self.record.closing
+            || self.guard_save_pending
             || self.record.pending_guard.is_some()
             || self.record.active.is_none()
         {
@@ -454,6 +466,10 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             .as_ref()
             .ok_or_else(failed)?;
         self.io.borrow_mut().verify(m)?;
+        self.io
+            .borrow_mut()
+            .verify_endpoint(m)
+            .map_err(|e| crate::member_diagnostic::context("endpoint_verify", e))?;
         Ok(m)
     }
     fn model(&self, active: Option<Slot>, probes: bool) -> io::Result<Model> {
@@ -478,10 +494,16 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
         if members.iter().all(Option::is_none) {
             Model::empty(self.record.scope.clone()).map_err(|_| failed())
         } else {
-            Model::new(self.record.scope.clone(), members, active).map_err(|_| failed())
+            Model::new(self.record.scope.clone(), members, active)
+                .and_then(|m| m.inherit_sublayer_weight(&self.record.guard))
+                .map_err(|_| failed())
         }
     }
     fn reconcile_guard(&mut self) -> io::Result<()> {
+        if self.guard_save_pending {
+            self.save()?;
+            self.guard_save_pending = false;
+        }
         let actual = self.io.borrow_mut().guard_snapshot()?;
         let empty = Model::empty(self.record.scope.clone()).map_err(|_| failed())?;
         if (self.record.closing || self.recovery) && actual == empty.expected {
@@ -501,51 +523,70 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             return Ok(());
         }
         if let Some(p) = &self.record.pending_guard {
-            let mut candidates = vec![
-                p.expected.clone(),
-                p.withdrawn.clone(),
-                p.base.clone(),
-                p.desired.clone(),
-            ];
-            candidates.extend(
-                [p.expected.without_probes(), p.desired.without_probes()]
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| failed())?,
-            );
-            self.record.guard = candidates
-                .into_iter()
-                .find(|m| m.expected == actual)
-                .ok_or_else(failed)?;
-            self.record.pending_guard = None;
-            self.save()?;
-        } else if actual != self.record.guard.expected {
-            // A crashed helper's dynamic session vanished; only that exact
-            // withdrawal is accepted, never similarly named WFP resources.
-            let withdrawn = self.record.guard.without_probes().map_err(|_| failed())?;
-            if !self.recovery || actual != withdrawn.expected {
+            if p.expected != self.record.guard {
                 return Err(failed());
             }
-            self.record.guard = withdrawn;
-            self.save()?;
+            let reconciled = p
+                .resolve(&actual)
+                .map_err(|e| crate::PairFailure::guard("guard_reconcile", e))?;
+            // The observed assignment must be durable before cleanup or any
+            // later exchange can use it as its exact CAS precondition.
+            self.acknowledge_guard(reconciled)?;
+        } else if actual != self.record.guard.expected {
+            // Recovery or a previous failed Stop may have closed our dynamic
+            // session. Accept only its exact withdrawal, including the pinned
+            // sublayer and all static filters; never adopt it on a live pair.
+            let withdrawn = self.record.guard.without_probes().map_err(|_| failed())?;
+            if !(self.recovery || self.record.closing) || actual != withdrawn.expected {
+                return Err(failed());
+            }
+            if !self.recovery {
+                // In-process cleanup must also confirm that THIS dynamic
+                // session is closed. Re-read after closing: a concurrent foreign
+                // change must not become the precondition of the next exchange.
+                self.io.borrow_mut().close_permits()?;
+                if self.io.borrow_mut().guard_snapshot()? != withdrawn.expected {
+                    return Err(failed());
+                }
+            }
+            self.acknowledge_guard(withdrawn)?;
         }
         Ok(())
     }
     fn guard(&mut self, desired: Model) -> io::Result<()> {
         self.reconcile_guard()?;
+        let desired = desired
+            .inherit_sublayer_weight(&self.record.guard)
+            .map_err(|e| crate::PairFailure::guard("guard_plan", e))?;
         if self.record.guard == desired {
             return Ok(());
         }
-        let plan = ExchangePlan::new(&self.record.guard, &desired).map_err(|_| failed())?;
+        let plan = ExchangePlan::new(&self.record.guard, &desired)
+            .map_err(|e| crate::PairFailure::guard("guard_plan", e))?;
         self.record.pending_guard = Some(plan.clone());
         self.save()?;
-        self.io.borrow_mut().guard_exchange(&plan)?;
-        if self.io.borrow_mut().guard_snapshot()? != desired.expected {
-            return Err(failed());
+        let committed = self.io.borrow_mut().guard_exchange(&plan)?;
+        let actual = self.io.borrow_mut().guard_snapshot()?;
+        if actual != committed.expected
+            || desired
+                .readback_after(&plan.expected, &actual)
+                .map_err(|e| crate::PairFailure::guard("guard_readback", e))?
+                != committed
+        {
+            return Err(crate::member_diagnostic::context(
+                "guard_readback",
+                failed(),
+            ));
         }
-        self.record.guard = desired;
+        self.acknowledge_guard(committed)
+    }
+    fn acknowledge_guard(&mut self, committed: Model) -> io::Result<()> {
+        self.record.guard = committed;
         self.record.pending_guard = None;
-        self.save()
+        self.guard_save_pending = true;
+        self.save()?;
+        self.guard_save_pending = false;
+        Ok(())
     }
     fn fence(&mut self) -> io::Result<()> {
         self.guard(self.model(None, false)?)
@@ -560,6 +601,7 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
         if self.recovery
             || self.record.closing
             || self.integrity_fault.is_some()
+            || self.guard_save_pending
             || self.record.pending_guard.is_some()
             || self.record.active.is_none()
             || (self.record.guard.active != self.record.active && !fenced)
@@ -601,7 +643,11 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             return Err(failed());
         }
         m.validate()?;
-        let prepared = self.io.borrow_mut().prepare_member(&self.record.scope, m)?;
+        let prepared = self
+            .io
+            .borrow_mut()
+            .prepare_member(&self.record.scope, m)
+            .map_err(|e| crate::member_diagnostic::context("member_prepare", e))?;
         if prepared.owner.intent.scope != self.record.scope
             || prepared.owner.intent.slot != slot_native(m.slot)
         {
@@ -609,7 +655,11 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
         }
         self.record.members[m.slot.idx()] = Some(prepared.clone());
         self.save()?;
-        let result = self.io.borrow_mut().start(&prepared);
+        let result = self
+            .io
+            .borrow_mut()
+            .start(&prepared)
+            .map_err(|e| crate::member_diagnostic::context("member_start", e));
         if result.is_err() && self.io.borrow_mut().abandon_unstarted(&prepared)? {
             // Retain the exact Pair intent until explicit cleanup saves removal.
             return result.map(|_| ());
@@ -621,7 +671,11 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
         let member = self.record.members[m.slot.idx()]
             .as_ref()
             .ok_or_else(failed)?;
-        let (socket, tuple) = self.io.borrow_mut().open_base(member)?;
+        let (socket, tuple) = self
+            .io
+            .borrow_mut()
+            .open_base(member)
+            .map_err(|e| crate::member_diagnostic::context("probe_socket", e))?;
         self.sockets[m.slot.idx()] = Some(socket);
         self.tuples[m.slot.idx()] = Some(tuple);
         Ok(())
@@ -672,7 +726,7 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
                 self.io.borrow_mut().exchange_dns(&actual, &desired)?;
             }
             if self.io.borrow_mut().read_dns(&member)? != desired {
-                return Err(failed());
+                return Err(crate::member_diagnostic::context("dns_readback", failed()));
             }
             let saved = self.record.dns[slot.idx()].as_mut().unwrap();
             saved.current = desired;
@@ -686,7 +740,15 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
             slot,
             &self.record.members,
             self.record.options.as_ref().ok_or_else(failed)?,
-        )
+        )?;
+        let live = live_route_members(&mut *self.io.borrow_mut(), slot, &self.record.members)?;
+        for member in live.iter().flatten() {
+            self.io
+                .borrow_mut()
+                .verify_endpoint(member)
+                .map_err(|e| crate::member_diagnostic::context("endpoint_verify", e))?;
+        }
+        Ok(())
     }
     // Caller must fence dynamic permits before retiring native or releasing
     // sockets. Keep the stopped owner until route/DNS cleanup has acknowledged
@@ -1080,6 +1142,7 @@ impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
     }
     fn cleanup_pending(&self) -> bool {
         self.record.closing
+            || self.guard_save_pending
             || self.record.pending_guard.is_some()
             || self
                 .record

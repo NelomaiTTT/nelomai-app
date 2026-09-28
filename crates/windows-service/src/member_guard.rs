@@ -110,6 +110,12 @@ pub(crate) struct Model {
     pub members: [Option<Member>; 2],
     pub active: Option<Slot>,
     pub installed: bool,
+    /// BFE chooses the closest available sublayer weight on creation. Once
+    /// observed, persist it and require exact equality for this object's life.
+    /// Absent in legacy journals (which requested 0x8000).
+    /// https://learn.microsoft.com/en-us/windows/win32/fwp/installing-a-provider
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_sublayer_weight: Option<u16>,
     pub expected: Snapshot,
 }
 
@@ -133,7 +139,7 @@ pub(crate) type Result<T> = std::result::Result<T, GuardError>;
 /// A coherent snapshot resolves which base committed after a lost acknowledgement.
 pub(crate) trait GuardStore {
     fn snapshot(&mut self, scope: &SessionScope) -> Result<Snapshot>;
-    fn compare_exchange(&mut self, expected: &Model, desired: &Model) -> Result<()>;
+    fn compare_exchange(&mut self, expected: &Model, desired: &Model) -> Result<Model>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,34 +167,56 @@ impl ExchangePlan {
             desired: desired.clone(),
         })
     }
+
+    /// Only a journaled creation from an empty key universe can learn a weight.
+    /// All candidate filter sets and the remaining sublayer fields stay exact.
+    pub(crate) fn resolve(&self, actual: &Snapshot) -> Result<Model> {
+        if *self != Self::new(&self.expected, &self.desired)? {
+            return Err(GuardError::Invalid);
+        }
+        for candidate in [&self.expected, &self.withdrawn, &self.base, &self.desired] {
+            if !self.expected.installed && candidate.installed {
+                if let Ok(model) = candidate.created_readback(actual) {
+                    return Ok(model);
+                }
+            } else if candidate.expected == *actual {
+                return Ok(candidate.clone());
+            }
+        }
+        Err(GuardError::Conflict)
+    }
 }
 
 pub(crate) trait SplitEngines {
     fn scope(&self) -> &SessionScope;
     fn snapshot(&mut self) -> Result<Snapshot>;
-    fn exchange(&mut self, kind: SessionKind, expected: &Model, desired: &Model) -> Result<()>;
+    fn exchange(&mut self, kind: SessionKind, expected: &Model, desired: &Model) -> Result<Model>;
     /// Close THIS dynamic session, never enumerate/delete foreign objects. No
     /// further writes after failure; socket release requires confirmed removal.
     fn close_permits(&mut self) -> Result<()>;
 }
 
-pub(crate) fn apply_split(engines: &mut impl SplitEngines, plan: &ExchangePlan) -> Result<()> {
+pub(crate) fn apply_split(engines: &mut impl SplitEngines, plan: &ExchangePlan) -> Result<Model> {
     validate_exchange(engines.scope(), &plan.expected, &plan.desired)?;
     if *plan != ExchangePlan::new(&plan.expected, &plan.desired)? {
         return Err(GuardError::Invalid);
     }
-    let apply = |engines: &mut dyn SplitEngines| -> Result<()> {
-        for (kind, before, after) in [
-            (SessionKind::DynamicPermits, &plan.expected, &plan.withdrawn),
-            (SessionKind::StaticBase, &plan.withdrawn, &plan.base),
-            (SessionKind::DynamicPermits, &plan.base, &plan.desired),
+    let apply = |engines: &mut dyn SplitEngines| -> Result<Model> {
+        let mut before = plan.expected.clone();
+        for (kind, after) in [
+            (SessionKind::DynamicPermits, &plan.withdrawn),
+            (SessionKind::StaticBase, &plan.base),
+            (SessionKind::DynamicPermits, &plan.desired),
         ] {
-            engines.exchange(kind, before, after)?;
-            require_snapshot(&engines.snapshot()?, &after.expected)?;
+            let after = after.inherit_sublayer_weight(&before)?;
+            let committed = engines.exchange(kind, &before, &after)?;
+            require_snapshot(&engines.snapshot()?, &committed.expected)?;
+            before = committed;
         }
-        Ok(())
+        Ok(before)
     };
-    if let Err(error) = apply(engines) {
+    let result = apply(engines);
+    if let Err(error) = result {
         // Also covers lost install ACK: closing the owning dynamic session drops
         // any committed permits without guessing which transaction succeeded.
         // No base rollback. Initial installation failure may still mean no base;
@@ -214,7 +242,7 @@ pub(crate) fn apply_split(engines: &mut impl SplitEngines, plan: &ExchangePlan) 
         }
         return Err(error);
     }
-    Ok(())
+    result
 }
 
 fn require_snapshot(actual: &Snapshot, expected: &Snapshot) -> Result<()> {
@@ -233,7 +261,7 @@ pub(crate) fn stage_session_exchange(
     expected: &Model,
     desired: &Model,
     kind: SessionKind,
-) -> Result<()> {
+) -> Result<Model> {
     validate_exchange(scope, expected, desired)?;
     match kind {
         SessionKind::StaticBase
@@ -253,7 +281,11 @@ pub(crate) fn stage_session_exchange(
         }
         _ => {}
     }
-    stage_exchange(scope, transaction, expected, desired)
+    stage_exchange(scope, transaction, expected, desired)?;
+    // Capture BFE's assignment while the creating transaction still holds the
+    // lock. Post-commit readback must match this value, not learn another one.
+    let actual = transaction.read()?;
+    desired.readback_after(expected, &actual)
 }
 
 /// Operations inside an already-open transaction. The owner MUST abort on any
@@ -305,6 +337,53 @@ fn stage_exchange(
 }
 
 impl Model {
+    pub(crate) fn readback_after(&self, previous: &Self, actual: &Snapshot) -> Result<Self> {
+        validate_exchange(&self.scope, previous, self)?;
+        if !previous.installed && self.installed {
+            self.created_readback(actual)
+        } else {
+            require_snapshot(actual, &self.expected)?;
+            Ok(self.clone())
+        }
+    }
+
+    pub(crate) fn inherit_sublayer_weight(&self, previous: &Self) -> Result<Self> {
+        self.validate()?;
+        previous.validate()?;
+        if self.scope != previous.scope {
+            return Err(GuardError::Conflict);
+        }
+        let mut model = self.clone();
+        if model.installed && previous.installed {
+            if model.assigned_sublayer_weight.is_some()
+                && model.assigned_sublayer_weight != previous.assigned_sublayer_weight
+            {
+                return Err(GuardError::Conflict);
+            }
+            model.assigned_sublayer_weight = previous.assigned_sublayer_weight;
+            model.expected.sublayer.as_mut().unwrap().weight =
+                previous.expected.sublayer.as_ref().unwrap().weight;
+        }
+        Ok(model)
+    }
+
+    fn created_readback(&self, actual: &Snapshot) -> Result<Self> {
+        self.validate()?;
+        if !self.installed || self.assigned_sublayer_weight.is_some() {
+            return Err(GuardError::Invalid);
+        }
+        let weight = actual
+            .sublayer
+            .as_ref()
+            .ok_or(GuardError::EpochLost)?
+            .weight;
+        let mut model = self.clone();
+        model.assigned_sublayer_weight = Some(weight);
+        model.expected.sublayer.as_mut().unwrap().weight = weight;
+        require_snapshot(actual, &model.expected)?;
+        Ok(model)
+    }
+
     pub(crate) fn without_probes(&self) -> Result<Self> {
         self.validate()?;
         let mut members = self.members.clone();
@@ -312,7 +391,7 @@ impl Model {
             member.probes.clear();
         }
         if self.installed {
-            Self::new(self.scope.clone(), members, self.active)
+            Self::new(self.scope.clone(), members, self.active)?.inherit_sublayer_weight(self)
         } else {
             Self::empty(self.scope.clone())
         }
@@ -328,6 +407,7 @@ impl Model {
             members,
             active,
             installed: true,
+            assigned_sublayer_weight: None,
             expected,
         })
     }
@@ -338,11 +418,20 @@ impl Model {
             members: [None, None],
             active: None,
             installed: false,
+            assigned_sublayer_weight: None,
             expected,
         })
     }
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.expected != build(&self.scope, &self.members, self.active, self.installed)? {
+        let mut expected = build(&self.scope, &self.members, self.active, self.installed)?;
+        if let Some(weight) = self.assigned_sublayer_weight {
+            expected
+                .sublayer
+                .as_mut()
+                .ok_or(GuardError::Invalid)?
+                .weight = weight;
+        }
+        if self.expected != expected {
             return Err(GuardError::Invalid);
         }
         Ok(())
@@ -522,7 +611,15 @@ pub(crate) fn validate_exchange(
         return Err(GuardError::Conflict);
     }
     expected.validate()?;
-    desired.validate()
+    desired.validate()?;
+    if desired.installed
+        && ((!expected.installed && desired.assigned_sublayer_weight.is_some())
+            || (expected.installed
+                && expected.assigned_sublayer_weight != desired.assigned_sublayer_weight))
+    {
+        return Err(GuardError::Invalid);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -599,10 +696,11 @@ mod tests {
             }
             Ok(self.state.clone())
         }
-        fn compare_exchange(&mut self, expected: &Model, desired: &Model) -> Result<()> {
+        fn compare_exchange(&mut self, expected: &Model, desired: &Model) -> Result<Model> {
             validate_exchange(&self.scope, expected, desired)?;
             let mut pending = Pending {
                 state: self.state.clone(),
+                assigned_weight: None,
                 foreign: &self.foreign,
                 fail_at: self.fail_at,
                 writes: 0,
@@ -619,13 +717,14 @@ mod tests {
             if self.lose_ack {
                 Err(GuardError::Native(2))
             } else {
-                Ok(())
+                Ok(desired.clone())
             }
         }
     }
 
     struct Pending<'a> {
         state: Snapshot,
+        assigned_weight: Option<u16>,
         foreign: &'a [Filter],
         fail_at: Option<usize>,
         writes: usize,
@@ -642,6 +741,7 @@ mod tests {
     }
     impl GuardTransaction for Pending<'_> {
         fn read(&mut self) -> Result<Snapshot> {
+            self.state.filters.sort_by_key(|f| f.key);
             Ok(self.state.clone())
         }
         fn add_sublayer(&mut self, layer: &Sublayer) -> Result<()> {
@@ -650,6 +750,9 @@ mod tests {
                 return Err(GuardError::Conflict);
             }
             self.state.sublayer = Some(layer.clone());
+            if let Some(weight) = self.assigned_weight {
+                self.state.sublayer.as_mut().unwrap().weight = weight;
+            }
             Ok(())
         }
         fn add_filter(&mut self, filter: &Filter) -> Result<()> {
@@ -1029,6 +1132,8 @@ mod tests {
 
     struct SplitFake {
         store: Fake,
+        assigned_weight: Option<u16>,
+        change_weight_after_commit: bool,
         dynamic_keys: Vec<Key>,
         calls: Vec<SessionKind>,
         fail: Option<usize>,
@@ -1044,6 +1149,8 @@ mod tests {
             store.state = model.expected.clone();
             Self {
                 store,
+                assigned_weight: None,
+                change_weight_after_commit: false,
                 dynamic_keys: model
                     .expected
                     .filters
@@ -1073,17 +1180,24 @@ mod tests {
             }
             Ok(self.store.state.clone())
         }
-        fn exchange(&mut self, kind: SessionKind, expected: &Model, desired: &Model) -> Result<()> {
+        fn exchange(
+            &mut self,
+            kind: SessionKind,
+            expected: &Model,
+            desired: &Model,
+        ) -> Result<Model> {
             let step = self.calls.len();
             self.calls.push(kind);
             let mut pending = Pending {
                 state: self.store.state.clone(),
+                assigned_weight: self.assigned_weight,
                 foreign: &[],
                 fail_at: None,
                 writes: 0,
                 filter_writes: vec![],
             };
-            stage_session_exchange(&scope(), &mut pending, expected, desired, kind)?;
+            let committed =
+                stage_session_exchange(&scope(), &mut pending, expected, desired, kind)?;
             // Mirror WFP's dynamic-session ownership check, not merely GUID
             // equality: another session's or legacy static permit is foreign.
             if kind == SessionKind::DynamicPermits
@@ -1099,6 +1213,9 @@ mod tests {
             }
             pending.state.filters.sort_by_key(|f| f.key);
             self.store.state = pending.state;
+            if self.change_weight_after_commit && !expected.installed && desired.installed {
+                self.store.state.sublayer.as_mut().unwrap().weight += 1;
+            }
             if kind == SessionKind::DynamicPermits {
                 self.dynamic_keys = desired
                     .expected
@@ -1112,7 +1229,7 @@ mod tests {
             if self.lost_ack == Some(step) {
                 return Err(GuardError::Native(2));
             }
-            Ok(())
+            Ok(committed)
         }
         fn close_permits(&mut self) -> Result<()> {
             if self.fail_close {
@@ -1125,6 +1242,130 @@ mod tests {
             self.dynamic_keys.clear();
             self.closed = true;
             Ok(())
+        }
+    }
+
+    #[test]
+    fn assigned_sublayer_weight_readback_allows_initial_split_install() {
+        let empty = Model::empty(scope()).unwrap();
+        let desired = pair(None);
+        let mut fake = SplitFake::installed(&empty);
+        fake.assigned_weight = Some(32771);
+        let committed =
+            apply_split(&mut fake, &ExchangePlan::new(&empty, &desired).unwrap()).unwrap();
+        assert_eq!(committed.assigned_sublayer_weight, Some(32771));
+        committed.validate().unwrap();
+        assert_eq!(fake.store.state.sublayer.as_ref().unwrap().weight, 32771);
+        assert_eq!(fake.store.state.filters, desired.expected.filters);
+        assert!(!fake.closed);
+    }
+
+    #[test]
+    fn assigned_sublayer_weight_change_after_creating_transaction_is_rejected() {
+        let empty = Model::empty(scope()).unwrap();
+        let mut fake = SplitFake::installed(&empty);
+        fake.assigned_weight = Some(32771);
+        fake.change_weight_after_commit = true;
+        assert_eq!(
+            apply_split(&mut fake, &ExchangePlan::new(&empty, &pair(None)).unwrap()),
+            Err(GuardError::Conflict)
+        );
+        assert_eq!(fake.calls.len(), 2);
+        assert!(fake.closed);
+        assert!(fake
+            .store
+            .state
+            .filters
+            .iter()
+            .all(|f| f.action == Action::Block));
+    }
+
+    #[test]
+    fn assigned_sublayer_weight_readback_and_recovery_preserve_all_other_snapshot_checks() {
+        let empty = Model::empty(scope()).unwrap();
+        let desired = pair(None).without_probes().unwrap();
+        let plan = ExchangePlan::new(&empty, &desired).unwrap();
+        for mutation in 0..13 {
+            let mut actual = desired.expected.clone();
+            actual.sublayer.as_mut().unwrap().weight = 32771;
+            match mutation {
+                0 => actual.scope.connection_generation += 1,
+                1 => actual.sublayer.as_mut().unwrap().key.0[0] ^= 1,
+                2 => actual.sublayer.as_mut().unwrap().flags = 1,
+                3 => actual.filters[0].key.0[0] ^= 1,
+                4 => actual.filters[0].sublayer.0[0] ^= 1,
+                5 => actual.filters[0].flags = 1,
+                6 => actual.filters[0].weight = 2,
+                7 => actual.filters[0].action = Action::Permit,
+                8 => actual.filters[0].conditions.clear(),
+                9 => {
+                    actual.filters[0].layer = match actual.filters[0].layer {
+                        Layer::TransportV4 => Layer::TransportV6,
+                        _ => Layer::TransportV4,
+                    }
+                }
+                10 => {
+                    actual.filters.pop();
+                }
+                11 => actual.filters.push(actual.filters[0].clone()),
+                _ => actual.sublayer = None,
+            }
+            assert!(
+                desired.readback_after(&empty, &actual).is_err(),
+                "install mutation {mutation}"
+            );
+            assert!(
+                plan.resolve(&actual).is_err(),
+                "recovery mutation {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn assigned_sublayer_weight_is_not_relearned_by_existing_or_pinned_exchanges() {
+        let empty = Model::empty(scope()).unwrap();
+        let desired = pair(None);
+        let mut actual = desired.expected.clone();
+        actual.sublayer.as_mut().unwrap().weight = 32771;
+        let pinned = desired.readback_after(&empty, &actual).unwrap();
+        let pinned: Model = serde_json::from_slice(&serde_json::to_vec(&pinned).unwrap()).unwrap();
+        for previous in [&desired, &pinned] {
+            let mut changed = previous.expected.clone();
+            changed.sublayer.as_mut().unwrap().weight += 1;
+            let plan = ExchangePlan::new(previous, &previous.without_probes().unwrap()).unwrap();
+            assert!(plan.resolve(&changed).is_err());
+            let mut fake = SplitFake::installed(previous);
+            fake.store.state = changed;
+            assert!(apply_split(&mut fake, &plan).is_err());
+            assert!(fake.store.published.is_empty());
+        }
+        let mut forged = pinned.clone();
+        forged.expected.filters[0].weight += 1;
+        assert_eq!(forged.validate(), Err(GuardError::Invalid));
+        let mut forged = pinned.clone();
+        forged.expected.sublayer.as_mut().unwrap().weight += 1;
+        assert_eq!(forged.validate(), Err(GuardError::Invalid));
+        assert!(ExchangePlan::new(&empty, &pinned).is_err());
+        assert!(ExchangePlan::new(&pinned, &desired).is_err());
+    }
+
+    #[test]
+    fn assigned_sublayer_weight_lost_commit_ack_resolves_only_journaled_states() {
+        let empty = Model::empty(scope()).unwrap();
+        let plan = ExchangePlan::new(&empty, &pair(None)).unwrap();
+        for step in [1, 2] {
+            let mut fake = SplitFake::installed(&empty);
+            fake.assigned_weight = Some(32771);
+            fake.lost_ack = Some(step);
+            assert!(apply_split(&mut fake, &plan).is_err());
+            let recovered = plan.resolve(&fake.store.state).unwrap();
+            assert_eq!(recovered.assigned_sublayer_weight, Some(32771));
+            assert!(recovered
+                .expected
+                .filters
+                .iter()
+                .all(|f| f.action == Action::Block));
+            recovered.validate().unwrap();
         }
     }
 
@@ -1197,6 +1438,7 @@ mod tests {
         ] {
             let mut pending = Pending {
                 state: before.expected.clone(),
+                assigned_weight: None,
                 foreign: &[],
                 fail_at: None,
                 writes: 0,

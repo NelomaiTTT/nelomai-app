@@ -7,13 +7,14 @@ use super::{
 };
 use crate::{
     member_actor::PairFactory,
+    member_diagnostic::{context, PairFailure},
     member_dns::{self, Identity, Ownership},
-    member_guard::{ExchangePlan, GuardStore, ProbeTuple, SplitEngines},
+    member_guard::{ExchangePlan, GuardStore, Model, ProbeTuple, SplitEngines},
     member_owner::{Journal, MemberOwner, Phase, Record as OwnerRecord},
     member_pair::*,
     member_physical::{Family, InterfaceIdentity, PhysicalProof, PhysicalRoute, PhysicalSnapshot},
     member_plan::{member_route_plan, InterfaceMetric},
-    member_routes::{IdentityCheck, MemberRoutes, NativeProof},
+    member_routes::{IdentityCheck, MemberRoutes, NativeProof, Row, RowIo},
 };
 use nelomai_client_tunnel::{
     detect_configuration_transport,
@@ -200,7 +201,8 @@ impl<F: SessionFiles> WindowsPairIo<F> {
             },
             saved.journal,
         )?;
-        let guard = NativeGuard::open(scope.clone()).map_err(|_| failed())?;
+        let guard =
+            NativeGuard::open(scope.clone()).map_err(|e| PairFailure::guard("guard_open", e))?;
         let mut value = Self {
             scope,
             engine,
@@ -387,7 +389,7 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
     fn start(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
         self.owner(m)?
             .start_with_prior(m.prior_stopped.as_ref())
-            .map_err(|_| failed())
+            .map_err(|e| PairFailure::owner("member_start", e))
     }
     fn abandon_unstarted(&mut self, m: &MemberRecord) -> io::Result<bool> {
         if m.owner.intent.scope != self.scope || m.owner.intent.engine != self.engine {
@@ -443,7 +445,73 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
         Ok(current)
     }
     fn verify(&mut self, m: &MemberRecord) -> io::Result<()> {
-        self.owner(m)?.verify_live(&m.owner).map_err(|_| failed())
+        self.owner(m)?
+            .verify_live(&m.owner)
+            .map_err(|e| PairFailure::owner("member_verify", e))
+    }
+    fn verify_endpoint(&mut self, m: &MemberRecord) -> io::Result<()> {
+        self.verify(m)?;
+        if m.owner.intent.scope != self.scope {
+            return Err(failed());
+        }
+        let routes = self.routes.as_ref().ok_or_else(failed)?;
+        if routes.cleanup_pending() || routes.active().is_none() {
+            return Err(failed());
+        }
+        let destination = ipnet::IpNet::from(m.endpoint);
+        let mut expected = Vec::new();
+        let physical = self.proofs.0.borrow().physical.clone();
+        for route in routes
+            .excluded_routes()
+            .into_iter()
+            .filter(|r| r.destination == destination)
+        {
+            // An endpoint exclusion must belong to an attested physical NIC,
+            // never to either member. Native metadata is checked, not adopted.
+            if let Some(p) = physical.iter().find(|p| p.interface == route.interface) {
+                let row = Row::static_route(
+                    route,
+                    NativeProof {
+                        index: p.interface,
+                        luid: p.luid,
+                    },
+                );
+                if !expected.contains(&row) {
+                    expected.push(row);
+                }
+            }
+        }
+        if expected.is_empty() {
+            // A preexisting exact physical host route is retained, never owned
+            // or deleted. Its complete saved row remains the read-only proof.
+            for p in physical
+                .iter()
+                .filter(|p| p.route.destination == destination)
+            {
+                let row = p.restore().row;
+                if !expected.contains(&row) {
+                    expected.push(row);
+                }
+            }
+        }
+        if expected.len() != 1 {
+            return Err(failed());
+        }
+        let expected = &expected[0];
+        let identity = self.proofs.verify(expected.route.interface)?;
+        if identity.luid != expected.luid
+            || NativeRowIo.read(destination, expected.route.interface)? != [expected.clone()]
+        {
+            return Err(failed());
+        }
+        let best = super::member_routes::best_route(m.endpoint)?;
+        if best.route != expected.route
+            || best.luid != expected.luid
+            || self.proofs.verify(expected.route.interface)? != identity
+        {
+            return Err(failed());
+        }
+        self.verify(m)
     }
     fn confirm_absent(&mut self, m: &MemberRecord) -> io::Result<bool> {
         self.owner(m)?
@@ -461,10 +529,14 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
         if current.intent != m.owner.intent {
             return Err(failed());
         }
-        owner.stop_best_effort(&current).map_err(|_| failed())
+        owner
+            .stop_best_effort(&current)
+            .map_err(|e| PairFailure::owner("member_stop", e))
     }
     fn rebind(&mut self, m: &MemberRecord) -> io::Result<OwnerRecord> {
-        self.owner(m)?.rebind(&m.owner).map_err(|_| failed())
+        self.owner(m)?
+            .rebind(&m.owner)
+            .map_err(|e| PairFailure::owner("member_rebind", e))
     }
     fn observe(&mut self, m: &MemberRecord) -> io::Result<(TunnelMetrics, NativeHealthSample)> {
         self.verify(m)?;
@@ -565,23 +637,30 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
             // The first failure was already returned to the pair's sticky
             // fail-stop latch. A fresh read handle can prove cleanup after BFE
             // restarts; it never recreates filters or resumes the old pair.
-            self.guard = NativeGuard::open(self.scope.clone()).map_err(|_| failed())?;
+            self.guard = NativeGuard::open(self.scope.clone())
+                .map_err(|e| PairFailure::guard("guard_reopen", e))?;
             self.guard_read_failed = false;
             self.guard_reopen = false;
         }
-        let result = GuardStore::snapshot(&mut self.guard, &self.scope).map_err(|_| failed());
+        let result = GuardStore::snapshot(&mut self.guard, &self.scope)
+            .map_err(|e| PairFailure::guard("guard_read", e));
         if result.is_err() {
             self.guard_read_failed = true;
         }
         result
     }
-    fn guard_exchange(&mut self, p: &ExchangePlan) -> io::Result<()> {
-        if *p != ExchangePlan::new(&p.expected, &p.desired).map_err(|_| failed())? {
+    fn guard_exchange(&mut self, p: &ExchangePlan) -> io::Result<Model> {
+        if *p
+            != ExchangePlan::new(&p.expected, &p.desired)
+                .map_err(|e| PairFailure::guard("guard_plan", e))?
+        {
             return Err(failed());
         }
         if self.guard_reopen {
-            let mut replacement = NativeGuard::open(self.scope.clone()).map_err(|_| failed())?;
-            if GuardStore::snapshot(&mut replacement, &self.scope).map_err(|_| failed())?
+            let mut replacement = NativeGuard::open(self.scope.clone())
+                .map_err(|e| PairFailure::guard("guard_reopen", e))?;
+            if GuardStore::snapshot(&mut replacement, &self.scope)
+                .map_err(|e| PairFailure::guard("guard_read", e))?
                 != p.expected.expected
             {
                 return Err(failed());
@@ -589,10 +668,12 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
             self.guard = replacement;
             self.guard_reopen = false;
         }
-        GuardStore::compare_exchange(&mut self.guard, &p.expected, &p.desired).map_err(|_| failed())
+        GuardStore::compare_exchange(&mut self.guard, &p.expected, &p.desired)
+            .map_err(|e| PairFailure::guard("guard_apply", e))
     }
     fn close_permits(&mut self) -> io::Result<()> {
-        SplitEngines::close_permits(&mut self.guard).map_err(|_| failed())?;
+        SplitEngines::close_permits(&mut self.guard)
+            .map_err(|e| PairFailure::guard("guard_close", e))?;
         self.guard_reopen = true;
         Ok(())
     }
@@ -603,8 +684,11 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
         options: &DesktopTunnelOptions,
     ) -> io::Result<()> {
         let live = live_route_members(self, active, members)?;
-        let snapshot = self.physical_snapshot(members)?;
-        let (routes, physical) = plan(&snapshot, active, &live, options)?;
+        let snapshot = self
+            .physical_snapshot(members)
+            .map_err(|e| context("physical_discovery", e))?;
+        let (routes, physical) =
+            plan(&snapshot, active, &live, options).map_err(|e| context("route_plan", e))?;
         self.sync_proofs(members);
         // Keep old physical identities too: removals/rollback must validate the
         // original interface, never authorize index reuse from a fresh discovery.
@@ -629,18 +713,29 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
         // existence of the old gateway/default. New selection is independently
         // revalidated before any owned route additions below.
         for p in &physical {
-            super::member_physical::verify(&p.restore(), &owned(members))?;
+            super::member_physical::verify(&p.restore(), &owned(members))
+                .map_err(|e| context("physical_verify", e))?;
         }
-        self.routes.as_mut().ok_or_else(failed)?.select(
-            active,
-            routes.into_iter().map(NetworkValue::Route).collect(),
-        )?;
-        live_route_members(self, active, members)?;
+        self.routes
+            .as_mut()
+            .ok_or_else(failed)?
+            .select(
+                active,
+                routes.into_iter().map(NetworkValue::Route).collect(),
+            )
+            .map_err(|e| context("route_apply", e))?;
+        let verified = live_route_members(self, active, members)?;
+        // Also covers direct selections during standby retirement, not only
+        // the common activate/rollback path in SessionNativePair::routes.
+        for member in verified.iter().flatten() {
+            self.verify_endpoint(member)
+                .map_err(|e| context("endpoint_verify", e))?;
+        }
         Ok(())
     }
     fn cleanup_routes(&mut self) -> io::Result<()> {
         let routes = self.routes.as_mut().ok_or_else(failed)?;
-        routes.cleanup()?;
+        routes.cleanup().map_err(|e| context("route_cleanup", e))?;
         // Cleanup is terminal for one NetworkOwner transaction lifetime. A
         // validated rebind may start another empty lifetime under the SAME
         // protected store, only after complete exact cleanup succeeded.
@@ -653,9 +748,9 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
     fn read_dns(&mut self, m: &MemberRecord) -> io::Result<member_dns::Snapshot> {
         let interface = dns_interface(m)?;
         super::member_dns::owned(interface, OwnedIdentity(m.clone()))
-            .map_err(|_| failed())?
+            .map_err(|e| PairFailure::dns("dns_open", e))?
             .snapshot()
-            .map_err(|_| failed())
+            .map_err(|e| PairFailure::dns("dns_read", e))
     }
     fn exchange_dns(
         &mut self,
@@ -681,9 +776,9 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
             return Err(failed());
         }
         super::member_dns::owned(interface, OwnedIdentity(m))
-            .map_err(|_| failed())?
+            .map_err(|e| PairFailure::dns("dns_open", e))?
             .compare_exchange(before, after)
-            .map_err(|_| failed())?;
+            .map_err(|e| PairFailure::dns("dns_apply", e))?;
         Ok(())
     }
 }
@@ -1062,7 +1157,7 @@ impl<F: SessionFiles> PairFactory for NativePairFactory<F> {
             }
             self.retire_completed_members()
         })()
-        .map_err(|_| crate::ServiceError::Backend("owned_pair_recovery_failed".into()))
+        .map_err(|e| crate::member_actor::operation_failed("recovery", e))
     }
     fn prepare(
         &mut self,
@@ -1078,7 +1173,10 @@ impl<F: SessionFiles> PairFactory for NativePairFactory<F> {
             return Err(failed());
         };
         MemberParameters::parse(primary.configuration.expose())?;
-        self.recover(runtime).map_err(|_| failed())?;
+        self.recover(runtime).map_err(|error| match error {
+            crate::ServiceError::PairOperation(failure) => io::Error::other(failure),
+            _ => context("recovery", failed()),
+        })?;
         self.files.claim(scope)?;
         let (pair_store, old) =
             WindowsPairStore::open(self.files.clone(), scope.clone(), RecordKind::Pair)?;
@@ -1308,7 +1406,9 @@ fn plan(
         });
     }
     let plan = member_route_plan(active, &routes, &exclusions, &bypasses, &metrics, 0)
-        .map_err(|_| failed())?;
+        .map_err(PairFailure::plan)?;
+    crate::member_plan::validate_retained_probe_routes(&plan, &routes, &retained, &metrics)
+        .map_err(PairFailure::plan)?;
     let routes = plan
         .routes
         .into_iter()

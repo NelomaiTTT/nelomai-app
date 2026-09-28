@@ -1200,6 +1200,8 @@ struct DesktopPairTunnel {
     scopes: Mutex<Vec<nelomai_client_tunnel::redundancy::SessionScope>>,
     fail_absence: AtomicBool,
     fail_pair_close: AtomicBool,
+    fail_primary_after_install: AtomicBool,
+    stopped_after_primary_failure: AtomicBool,
 }
 #[async_trait]
 impl TunnelController for DesktopPairTunnel {
@@ -1263,6 +1265,12 @@ impl TunnelController for DesktopPairTunnel {
                     cleanup_pending: false,
                     warm_stop_v1,
                 });
+                if self.fail_primary_after_install.load(Ordering::SeqCst) {
+                    if self.stopped_after_primary_failure.load(Ordering::SeqCst) {
+                        *self.legacy.status.lock().unwrap() = TunnelStatus::Stopped;
+                    }
+                    return Err(TunnelError::Backend("redundant_actor_failed".into()));
+                }
             }
             Command::Status { scope } => {
                 self.commands.lock().unwrap().push("status".into());
@@ -1451,6 +1459,182 @@ struct PairRuntime {
     value: Mutex<nelomai_client_storage::RuntimeStateV1>,
     reject_next_save: AtomicBool,
     lose_next_save_ack: AtomicBool,
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_failed_start_stop_retries_exact_cold_cleanup_without_legacy_stop() {
+    for (reported_stopped, reconstruct) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let api = Arc::new(MockApi::new(0));
+        api.redundant_start.store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(DesktopPairTunnel::default());
+        tunnel
+            .fail_primary_after_install
+            .store(true, Ordering::SeqCst);
+        tunnel
+            .stopped_after_primary_failure
+            .store(reported_stopped, Ordering::SeqCst);
+        tunnel.fail_pair_close.store(true, Ordering::SeqCst);
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let owner = Arc::new(support::TestOwner::new(
+            api.clone(),
+            Arc::new(MemoryStore::new(auth())),
+            local.clone(),
+        ));
+        let access = support::snapshot("access");
+        let paths = nelomai_client_storage::RuntimePaths::new(
+            "/synthetic-no-filesystem-access",
+            access.identity().slot,
+            &access.identity().runtime_version,
+        )
+        .unwrap();
+        let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+        value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        });
+        let store = Arc::new(PairRuntime {
+            paths,
+            value: Mutex::new(value),
+            reject_next_save: AtomicBool::new(false),
+            lose_next_save_ack: AtomicBool::new(false),
+        });
+        let core = nelomai_client_core::ClientCore::new(
+            api.clone(),
+            store.clone(),
+            owner.clone(),
+            local.clone(),
+            Arc::new(MemoryLogger::default()),
+        )
+        .with_retry_policy(RetryPolicy::new(Vec::new()));
+        let epoch = core.begin_start_attempt();
+        assert!(core
+            .desktop_connection_intent_attempt_with_cancellation_epoch(
+                options(),
+                1_700_000_000,
+                true,
+                epoch,
+            )
+            .await
+            .is_err());
+        core.finish_start_attempt();
+        assert_eq!(
+            tunnel.legacy.stops.load(Ordering::SeqCst),
+            0,
+            "failed desktop Start must close the persisted scope, not a freshly discovered owner"
+        );
+        assert_eq!(core.state().await.phase, Phase::Stopping);
+        let stored = store.value.lock().unwrap().clone();
+        let pending = stored
+            .pending_compensation_stop
+            .clone()
+            .expect("native cleanup still pending");
+        let scope = tunnel
+            .pair
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .session
+            .scope
+            .clone();
+        assert!(stored.desktop_redundancy.as_ref().unwrap().stop.is_none());
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+
+        let core = if reconstruct {
+            nelomai_client_core::ClientCore::new(
+                api.clone(),
+                store.clone(),
+                owner,
+                local,
+                Arc::new(MemoryLogger::default()),
+            )
+            .with_retry_policy(RetryPolicy::new(Vec::new()))
+        } else {
+            core
+        };
+
+        // A retry while native cleanup fails keeps the exact durable request.
+        assert!(core.stop_locally().await.is_err());
+        assert_eq!(
+            store
+                .value
+                .lock()
+                .unwrap()
+                .pending_compensation_stop
+                .as_ref(),
+            Some(&pending)
+        );
+        // Once cleanup becomes available, the same Stop must be accepted and
+        // handed to the background worker, not rejected as a new WARM intent.
+        tunnel.fail_pair_close.store(false, Ordering::SeqCst);
+        for mismatch in ["lease", "session", "contract"] {
+            let mut wrong = pending.clone();
+            match mismatch {
+                "lease" => wrong.lease_id = "foreign-lease".into(),
+                "session" => wrong.redundant_session_id = Some("foreign-session".into()),
+                _ => wrong.recovery_contract_version = None,
+            }
+            store.value.lock().unwrap().pending_compensation_stop = Some(wrong);
+            let before = tunnel.commands.lock().unwrap().len();
+            assert!(matches!(core.stop_locally().await, Err(CoreError::Storage)));
+            assert_eq!(tunnel.commands.lock().unwrap().len(), before);
+        }
+        store.value.lock().unwrap().pending_compensation_stop = Some(pending.clone());
+        // Discovery of a different native owner must not redirect this cleanup.
+        tunnel
+            .pair
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .session
+            .scope
+            .session_id = "foreign-session".into();
+        assert!(core.stop_locally().await.is_err());
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
+        tunnel.pair.lock().unwrap().as_mut().unwrap().session.scope = scope.clone();
+        core.stop_locally().await.unwrap();
+        assert_eq!(
+            store
+                .value
+                .lock()
+                .unwrap()
+                .pending_compensation_stop
+                .as_ref(),
+            Some(&pending)
+        );
+        assert!(core.local_stop_pending_cleanup().await);
+        api.redundant_stop_responses
+            .lock()
+            .unwrap()
+            .push_back(Err(CoreApiError::Retryable));
+        assert!(core.stop().await.is_err());
+        assert_eq!(
+            store
+                .value
+                .lock()
+                .unwrap()
+                .pending_compensation_stop
+                .as_ref(),
+            Some(&pending)
+        );
+        core.stop().await.unwrap();
+        assert_eq!(core.state().await.phase, Phase::Ready);
+        assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+        assert!(!core.has_pending_stop_cleanup().unwrap());
+        assert!(tunnel.scopes.lock().unwrap().iter().all(|s| s == &scope));
+        let requests = api.redundant_stop_requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests
+            .iter()
+            .all(|r| r.operation_id == pending.operation_id
+                && r.lease_id == pending.lease_id
+                && r.session_id == scope.session_id
+                && !r.retain_active_peer));
+    }
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

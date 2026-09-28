@@ -5191,10 +5191,32 @@ where
                 return Err(storage_error);
             }
         };
-        if stage.local_start_may_be_incomplete()
-            && !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped))
-        {
-            if let Err(cleanup_error) = self.tunnel.stop().await.map_err(CoreError::from) {
+        if stage.local_start_may_be_incomplete() {
+            let local_cleanup = async {
+                #[cfg(not(target_os = "android"))]
+                if redundant_session_id.is_some() {
+                    let stored = self.load_runtime()?;
+                    if let Some(pair) = stored.desktop_redundancy.as_ref() {
+                        if redundant_session_id != Some(pair.session.session_id.as_str())
+                            || connection.lease_id != pair.connection.lease_id
+                        {
+                            return Err(CoreError::Storage);
+                        }
+                        // A stopped dataplane is not proof that native guard,
+                        // route and DNS cleanup has finished. Close only the
+                        // scope persisted before this Start, even on a lost ACK.
+                        return self
+                            .close_desktop_pair(desktop_redundancy::scope(pair, stored.slot)?)
+                            .await;
+                    }
+                }
+                if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
+                    self.tunnel.stop().await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(cleanup_error) = local_cleanup {
                 *self.state.lock().await = CoreState {
                     phase: Phase::Stopping,
                     connection: Some(connection.clone()),

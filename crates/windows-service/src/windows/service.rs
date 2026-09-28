@@ -587,7 +587,9 @@ fn run_named_amneziawg_service(
     let endpoint = resolve_endpoint(configuration_text.as_str())
         .filter(std::net::IpAddr::is_ipv4)
         .ok_or_else(|| ServiceError::Backend("endpoint_route_unavailable".to_string()))?;
-    start_amneziawg_endpoint_route_watchdog(endpoint)?;
+    crate::redundancy::prepare_awg_route_supervision(service_name, || {
+        start_amneziawg_endpoint_route_watchdog(endpoint)
+    })?;
     let tunnel_dll = std::env::current_exe()
         .map_err(|error| platform_error("resolve tunnel service executable", error))?
         .with_file_name("amneziawg-tunnel.dll");
