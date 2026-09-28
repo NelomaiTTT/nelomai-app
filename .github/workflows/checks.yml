@@ -100,6 +100,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
+          targets: aarch64-linux-android
       - uses: android-actions/setup-android@v3
         with:
           packages: ''
@@ -119,6 +120,12 @@ jobs:
             "$GITHUB_WORKSPACE/vendor/amneziawg-go"
       - name: Установить Android SDK и NDK
         run: sdkmanager "platforms;android-36" "build-tools;30.0.3" "build-tools;36.0.0" "ndk;28.2.13676358"
+      - name: Проверить Rust-контейнер Android
+        run: |
+          ndk_bin="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$ndk_bin/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$ndk_bin/llvm-ar"
+          cargo check --locked -p nelomai-android-container --target aarch64-linux-android
       - name: Проверить Android tunnel plugin
         run: |
           chmod +x src-tauri/gen/android/gradlew

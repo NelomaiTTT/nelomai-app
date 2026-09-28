@@ -3,10 +3,11 @@ use nelomai_client_api::{
     AccessSnapshot, BackgroundTokenResponse, ClientApi, ClientApiError, RuntimeAuthState,
     RuntimeLogin,
 };
+#[cfg(not(target_os = "android"))]
+use nelomai_client_storage::StoredPendingStalledStop;
 use nelomai_client_storage::{
     MemorySplitTunnelStore, RuntimeStateStore, SplitTunnelStore, StoredCompatibility,
-    StoredConnection, StoredConnectionKind, StoredPendingCompensationStop,
-    StoredPendingStalledStop, StoredPendingStart,
+    StoredConnection, StoredConnectionKind, StoredPendingCompensationStop, StoredPendingStart,
 };
 use nelomai_client_tunnel::{
     QuickConnection, QuickReconnect, RedundantTunnelMemberStart, RedundantTunnelStandbyStart,
@@ -5192,7 +5193,7 @@ where
             }
         };
         if stage.local_start_may_be_incomplete() {
-            let local_cleanup = async {
+            let local_cleanup: Result<(), CoreError> = async {
                 #[cfg(not(target_os = "android"))]
                 if redundant_session_id.is_some() {
                     let stored = self.load_runtime()?;
