@@ -580,6 +580,7 @@ struct MockApi {
     awg3_start: AtomicBool,
     warm_start: AtomicBool,
     redundant_start: AtomicBool,
+    desktop_endpoint_override: Mutex<Option<String>>,
     mismatched_egress: AtomicBool,
     start_lease_override: Mutex<Option<String>>,
     bootstrap_connection: Mutex<Option<Connection>>,
@@ -642,6 +643,7 @@ impl MockApi {
             awg3_start: AtomicBool::new(false),
             warm_start: AtomicBool::new(false),
             redundant_start: AtomicBool::new(false),
+            desktop_endpoint_override: Mutex::new(None),
             mismatched_egress: AtomicBool::new(false),
             start_lease_override: Mutex::new(None),
             bootstrap_connection: Mutex::new(None),
@@ -807,14 +809,20 @@ impl CoreApi for MockApi {
             .unwrap();
             // The shared wire fixture omits native AWG markers. Desktop also
             // validates that the advertised transport matches the configuration.
-            let awg = "HeaderProtectionKey = synthetic\nContentPaddingAddition = 1\n";
-            response.configuration.push_str(awg);
+            let endpoint = self
+                .desktop_endpoint_override
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "192.0.2.4:20004".into());
+            let awg = format!("HeaderProtectionKey = synthetic\nContentPaddingAddition = 1\n[Peer]\nPublicKey = synthetic\nEndpoint = {endpoint}\nAllowedIPs = 0.0.0.0/0\n");
+            response.configuration.push_str(&awg);
             if let Some(standby) = response
                 .redundancy
                 .as_mut()
                 .and_then(|r| r.standby.as_mut())
             {
-                standby.configuration.push_str(awg);
+                standby.configuration.push_str(&awg);
             }
         }
         Ok(response)
@@ -1935,12 +1943,11 @@ async fn desktop_primary_becomes_connected_without_waiting_for_or_starting_reser
 
 type PairCore =
     nelomai_client_core::ClientCore<MockApi, PairRuntime, DesktopPairTunnel, MemoryLogger>;
-async fn missing_desktop_reserve() -> (
+fn desktop_pair_fixture() -> (
     PairCore,
     Arc<MockApi>,
     Arc<PairRuntime>,
     Arc<DesktopPairTunnel>,
-    nelomai_contracts::RedundancyMember,
 ) {
     let api = Arc::new(MockApi::new(0));
     api.redundant_start.store(true, Ordering::SeqCst);
@@ -1977,6 +1984,17 @@ async fn missing_desktop_reserve() -> (
         local,
         Arc::new(MemoryLogger::default()),
     );
+    (core, api, store, tunnel)
+}
+
+async fn missing_desktop_reserve() -> (
+    PairCore,
+    Arc<MockApi>,
+    Arc<PairRuntime>,
+    Arc<DesktopPairTunnel>,
+    nelomai_contracts::RedundancyMember,
+) {
+    let (core, api, store, tunnel) = desktop_pair_fixture();
     let epoch = core.begin_start_attempt();
     core.desktop_connection_intent_attempt_with_cancellation_epoch(
         options(),
@@ -1993,6 +2011,97 @@ async fn missing_desktop_reserve() -> (
         pair.session.standby.take().unwrap()
     };
     (core, api, store, tunnel, member)
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_primary_invalid_endpoint_is_rejected_before_native_start_and_compensated() {
+    let (core, api, store, tunnel) = desktop_pair_fixture();
+    *api.desktop_endpoint_override.lock().unwrap() = Some("invalid/name:20004".into());
+    let epoch = core.begin_start_attempt();
+    assert!(core
+        .desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .is_err());
+    assert!(!tunnel
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c == "primary"));
+    assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+    assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_initial_reserve_invalid_endpoint_never_reaches_native_or_stops_primary() {
+    let (core, _, store, tunnel, mut member) = missing_desktop_reserve().await;
+    member.configuration = member
+        .configuration
+        .replace("192.0.2.4:20004", "invalid/name:20004");
+    store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_mut()
+        .unwrap()
+        .session
+        .standby = Some(member);
+    let result = core.desktop_redundancy_tick(Vec::new()).await;
+    assert!(matches!(result, Err(CoreError::Tunnel(code)) if code == "endpoint_invalid"));
+    assert!(!tunnel
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c == "attach" || c == "stop"));
+    assert_eq!(*tunnel.legacy.status.lock().unwrap(), TunnelStatus::Running);
+}
+
+#[tokio::test(start_paused = true)]
+async fn desktop_replacement_invalid_endpoint_preserves_candidate_for_cleanup_without_staging() {
+    let (core, api, store, tunnel, member) = missing_desktop_reserve().await;
+    api.desktop_acquire_responses.lock().unwrap().push_back(
+        nelomai_contracts::RedundantStandbyAcquireResponse {
+            api_version: ApiVersion::V1,
+            request_id: "candidate".into(),
+            session: canonical_pair_role(&tunnel).session,
+            candidate_lease_id: member.connection.lease_id.clone(),
+            candidate_slot: nelomai_contracts::RedundancyMemberSlot::B,
+            connection: member.connection,
+            configuration: member
+                .configuration
+                .replace("192.0.2.4:20004", "invalid/name:20004"),
+            health_probe: member.health_probe,
+            reused: false,
+        },
+    );
+    core.desktop_redundancy_tick(reserve_probe("fresh"))
+        .await
+        .unwrap();
+    let result = core.desktop_redundancy_tick(Vec::new()).await;
+    assert!(matches!(result, Err(CoreError::Tunnel(code)) if code == "endpoint_invalid"));
+    assert!(!tunnel
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c == "stage" || c == "stop"));
+    assert!(store
+        .value
+        .lock()
+        .unwrap()
+        .desktop_redundancy
+        .as_ref()
+        .unwrap()
+        .candidate
+        .is_some());
+    assert_eq!(*tunnel.legacy.status.lock().unwrap(), TunnelStatus::Running);
 }
 fn canonical_pair_role(tunnel: &DesktopPairTunnel) -> nelomai_contracts::RedundantRoleResponse {
     let guard = tunnel.pair.lock().unwrap();

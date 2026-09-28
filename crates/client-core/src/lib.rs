@@ -36,6 +36,8 @@ use uuid::Uuid;
 
 mod connection_intent;
 #[cfg(not(target_os = "android"))]
+mod desktop_endpoint;
+#[cfg(not(target_os = "android"))]
 mod desktop_redundancy;
 #[cfg(not(target_os = "android"))]
 mod desktop_runtime;

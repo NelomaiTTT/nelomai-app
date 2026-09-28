@@ -82,6 +82,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
         let Ok(_sync) = self.desktop_sync_gate.try_lock() else {
             return Ok(None);
         };
+        let cancel_epoch = StartCancellationEpoch(self.start_cancel_epoch.load(Ordering::SeqCst));
         let (stored, pair, snapshot, access) = {
             let _writer = self.connection_gate.lock().await;
             let mut stored = self.load_runtime()?;
@@ -126,11 +127,9 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             {
                 let command = desktop_redundancy::attach_command(&pair, stored.slot, &snapshot)?;
                 return self
-                    .tunnel
-                    .desktop_redundancy_command(command)
+                    .send_desktop_member(command, cancel_epoch)
                     .await
-                    .map(Some)
-                    .map_err(Into::into);
+                    .map(Some);
             }
             if pair.primary_reported && snapshot.session.role_confirmed && snapshot.primary_ready {
                 let inactive =
@@ -170,11 +169,9 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                             candidate,
                         )?;
                         return self
-                            .tunnel
-                            .desktop_redundancy_command(command)
+                            .send_desktop_member(command, cancel_epoch)
                             .await
-                            .map(Some)
-                            .map_err(Into::into);
+                            .map(Some);
                     }
                 } else if snapshot.leases[inactive].is_none()
                     && pair.session.standby_desired
@@ -858,7 +855,7 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
         stored.desktop_redundancy = Some(pair.clone());
         self.store.save(&stored).map_err(|_| CoreError::Storage)?;
         self.ensure_start_not_cancelled(epoch)?;
-        let mut snapshot = self.tunnel.desktop_redundancy_command(command).await?;
+        let mut snapshot = self.send_desktop_member(command, epoch).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             self.ensure_start_not_cancelled(epoch)?;
@@ -883,6 +880,25 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
                 })
                 .await?;
         }
+    }
+
+    async fn send_desktop_member(
+        &self,
+        command: Command,
+        epoch: StartCancellationEpoch,
+    ) -> Result<nelomai_client_tunnel::redundancy::protocol::Snapshot, CoreError> {
+        // Stop signals cancellation before acquiring the writer gate. DNS must
+        // release that gate promptly and must never submit a late member start.
+        let command = self
+            .await_with_start_cancellation(
+                Some(epoch),
+                super::desktop_endpoint::pin_command(command),
+            )
+            .await??;
+        self.tunnel
+            .desktop_redundancy_command(command)
+            .await
+            .map_err(Into::into)
     }
 }
 
