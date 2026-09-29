@@ -1637,6 +1637,161 @@ async fn desktop_failed_start_stop_retries_exact_cold_cleanup_without_legacy_sto
     }
 }
 
+// Models the authenticated IPC boundary: dropping an in-flight access request
+// closes its channel (client-container::ipc::transport::RequestLifetime).
+// Keep that fail-closed property; local Stop must not cancel access issuance.
+struct DropSensitiveAuth {
+    inner: Arc<dyn nelomai_client_core::RuntimeAuthProvider>,
+    blocked: AtomicBool,
+    closed: AtomicBool,
+}
+struct CancelAccessOnDrop<'a>(&'a AtomicBool);
+impl Drop for CancelAccessOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl nelomai_client_core::RuntimeAuthProvider for DropSensitiveAuth {
+    async fn state(&self) -> Result<nelomai_client_api::RuntimeAuthState, CoreError> {
+        self.inner.state().await
+    }
+    async fn login(
+        &self,
+        request: nelomai_client_api::RuntimeLogin,
+    ) -> Result<AccessSnapshot, CoreError> {
+        self.inner.login(request).await
+    }
+    async fn logout(&self) -> Result<(), CoreError> {
+        self.inner.logout().await
+    }
+    async fn access(&self, stale: Option<&AccessSnapshot>) -> Result<AccessSnapshot, CoreError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::StartCancelled);
+        }
+        if self.blocked.load(Ordering::SeqCst) {
+            let _request = CancelAccessOnDrop(&self.closed);
+            std::future::pending::<()>().await;
+        }
+        self.inner.access(stale).await
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn desktop_local_stop_does_not_cancel_auth_needed_for_cleanup_replay() {
+    for cold in [false, true] {
+        let api = Arc::new(MockApi::new(0));
+        api.redundant_start.store(true, Ordering::SeqCst);
+        let tunnel = Arc::new(DesktopPairTunnel::default());
+        let local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
+        let owner = Arc::new(DropSensitiveAuth {
+            inner: Arc::new(support::TestOwner::new(
+                api.clone(),
+                Arc::new(MemoryStore::new(auth())),
+                local.clone(),
+            )),
+            blocked: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        });
+        let access = support::snapshot("access");
+        let paths = nelomai_client_storage::RuntimePaths::new(
+            "/synthetic-no-filesystem-access",
+            access.identity().slot,
+            &access.identity().runtime_version,
+        )
+        .unwrap();
+        let mut value = nelomai_client_storage::RuntimeStateV1::empty(&paths, false);
+        value.auth_scope = Some(nelomai_client_storage::RuntimeAuthScope {
+            auth_epoch: access.auth_epoch(),
+            family: access.family().into(),
+            identity: access.identity().clone(),
+        });
+        let store = Arc::new(PairRuntime {
+            paths,
+            value: Mutex::new(value),
+            reject_next_save: AtomicBool::new(false),
+            lose_next_save_ack: AtomicBool::new(false),
+        });
+        let core = nelomai_client_core::ClientCore::new(
+            api.clone(),
+            store.clone(),
+            owner.clone(),
+            local,
+            Arc::new(MemoryLogger::default()),
+        );
+        let epoch = core.begin_start_attempt();
+        core.desktop_connection_intent_attempt_with_cancellation_epoch(
+            options(),
+            1_700_000_000,
+            true,
+            epoch,
+        )
+        .await
+        .unwrap();
+        core.finish_start_attempt();
+        store
+            .value
+            .lock()
+            .unwrap()
+            .desktop_redundancy
+            .as_mut()
+            .unwrap()
+            .session
+            .warm_stop_v1 = true;
+        tunnel.pair.lock().unwrap().as_mut().unwrap().warm_stop_v1 = true;
+        owner.blocked.store(true, Ordering::SeqCst);
+        let stop = async {
+            if cold {
+                let observed = {
+                    let mut guard = tunnel.pair.lock().unwrap();
+                    let pair = guard.as_mut().unwrap();
+                    pair.stalled = true;
+                    pair.primary_ready = false;
+                    pair.session.local_revision += 1;
+                    pair.clone()
+                };
+                assert!(core.prepare_desktop_recovery(&observed).await.unwrap());
+            } else {
+                core.stop_locally().await.unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), stop)
+            .await
+            .expect("local cleanup must not wait for auth");
+        assert_eq!(
+            tunnel.pair.lock().unwrap().as_ref().unwrap().session.phase,
+            nelomai_client_tunnel::redundancy::session::SessionPhase::Stopped
+        );
+        let pending = store
+            .value
+            .lock()
+            .unwrap()
+            .pending_compensation_stop
+            .clone()
+            .unwrap();
+        assert_eq!(pending.accept_warm, !cold);
+        owner.blocked.store(false, Ordering::SeqCst);
+        core.stop()
+            .await
+            .expect("local Stop must preserve access for the exact durable cleanup replay");
+        assert_eq!(core.state().await.phase, Phase::Ready);
+        assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
+        assert!(store
+            .value
+            .lock()
+            .unwrap()
+            .pending_compensation_stop
+            .is_none());
+        let requests = api.redundant_stop_requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(requests
+            .iter()
+            .all(|r| r.operation_id == pending.operation_id
+                && r.lease_id == pending.lease_id
+                && r.retain_active_peer != cold));
+    }
+}
+
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn desktop_total_loss_cleanup_is_cold_scoped_and_rejects_stale_observation() {
     for (fail_journal, lose_ack) in [(true, false), (false, false), (false, true)] {
@@ -2822,7 +2977,9 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
             tunnel.scopes.lock().unwrap().as_slice(),
             [scope.clone(), scope.clone()]
         );
-        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+        // Local Stop does not race an auth request; only the durable worker
+        // contacts the panel after native cleanup/absence is confirmed.
+        assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
         if reconstruct {
             let replay_local = nelomai_client_core::CoreLocalStop::new(tunnel.clone());
             let replay_owner = Arc::new(support::TestOwner::new(
@@ -2841,7 +2998,7 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
             // Even a sealed cold replay must fail closed on an unknown status.
             tunnel.fail_absence.store(true, Ordering::SeqCst);
             assert!(replay.stop().await.is_err());
-            assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
             assert!(store
                 .value
                 .lock()
@@ -2854,7 +3011,7 @@ async fn desktop_helper_restart_absence_seals_cold_stop_and_replays_exact_sessio
             *tunnel.pair.lock().unwrap() = Some(foreign.clone());
             assert!(replay.stop().await.is_err());
             assert_eq!(tunnel.pair.lock().unwrap().as_ref(), Some(&foreign));
-            assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(api.redundant_stop_calls.load(Ordering::SeqCst), 0);
             *tunnel.pair.lock().unwrap() = None;
             replay.stop().await.unwrap();
         } else {

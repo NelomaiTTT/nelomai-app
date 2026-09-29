@@ -22,6 +22,34 @@ async fn poll_pending<T>(future: std::pin::Pin<&mut impl std::future::Future<Out
     .await;
 }
 
+#[tokio::test]
+async fn dropping_inflight_access_closes_real_auth_channel_but_completed_access_does_not() {
+    for cancel in [false, true] {
+        let fixture = Fixture::new(ClientApi::new("http://127.0.0.1:9").unwrap(), true);
+        fixture
+            .parent
+            .admit_empty_current(&fixture.broker)
+            .await
+            .unwrap();
+        fixture.client.access(None).await.unwrap();
+        let held = crate::auth_broker::hold_test_issuance(&fixture.broker).await;
+        let mut access = Box::pin(fixture.client.access(None));
+        poll_pending(access.as_mut()).await;
+        if cancel {
+            drop(access);
+            drop(held);
+            assert!(matches!(
+                fixture.client.access(None).await,
+                Err(nelomai_client_core::CoreError::StartCancelled)
+            ));
+        } else {
+            drop(held);
+            access.await.unwrap();
+            fixture.client.access(None).await.unwrap();
+        }
+    }
+}
+
 async fn queued_remote_issuance_is_cancelled(login: bool, expire: bool) {
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();

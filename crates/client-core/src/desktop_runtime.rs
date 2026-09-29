@@ -700,39 +700,11 @@ impl<A: CoreApi, S: RuntimeStateStore, T: TunnelController, L: CoreLogger> Clien
             Ok::<_, CoreError>((current, stop))
         }
         .await;
-        let close_result = {
-            let first_request = async {
-                if let Ok((_, stop)) = &journal {
-                    // An unreported native promotion needs role reconciliation
-                    // first. Closing locally never waits for that round trip.
-                    if !stop.retain_active_peer || stop.role_confirmed {
-                        if let Ok(access) = self.access_snapshot().await {
-                            let _ = self
-                                .api
-                                .stop_redundant_connection(
-                                    &access,
-                                    &RedundantStopRequest {
-                                        operation_id: stop.operation_id.clone(),
-                                        lease_id: stop.active_lease_id.clone(),
-                                        session_id: pair.session.session_id.clone(),
-                                        recovery_contract_version: RecoveryContractV2,
-                                        retain_active_peer: stop.retain_active_peer,
-                                    },
-                                )
-                                .await;
-                        }
-                    }
-                }
-            };
-            tokio::pin!(first_request);
-            let close = self.close_desktop_pair(scope);
-            tokio::pin!(close);
-            tokio::select! {
-                biased;
-                _=&mut first_request=>close.await,
-                result=&mut close=>result,
-            }
-        };
+        // Local Stop must neither wait for credentials/network nor cancel a
+        // pending access request: the private auth channel fails closed when
+        // such a request is dropped. The durable intent above is replayed by
+        // the existing stop worker, including any required role reconciliation.
+        let close_result = self.close_desktop_pair(scope).await;
         if !ordinary {
             if journal.is_err() {
                 // No durable cleanup was accepted: the intent retains this
