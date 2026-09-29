@@ -1075,10 +1075,11 @@ impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
                 Ok::<_, io::Error>(())
             })();
             if restored.is_err() {
+                // close owns both the retryable failure state and the durable
+                // terminal ACK. Do not reopen a successfully closed record:
+                // subsequent idempotent close would then leave closing=true
+                // forever and prevent the session completion tombstone.
                 let _ = self.close(scope);
-                self.record.closing = true;
-                self.record.active = None;
-                let _ = self.save();
             }
             return Err(error);
         }

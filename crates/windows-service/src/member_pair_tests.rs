@@ -1819,6 +1819,47 @@ mod retained_owner_seam {
             assert_eq!(native.borrow().starts, [1, 1]);
         }
     }
+    #[test]
+    fn failed_standby_start_does_not_reopen_successfully_closed_pair() {
+        for cleanup_fails in [false, true] {
+            let s = Rc::new(RefCell::new(State::default()));
+            let native = Rc::new(RefCell::new(Native::default()));
+            s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
+            let mut p = SessionNativePair::new(
+                scope(),
+                RetainedIo::new(s.clone(), native.clone()),
+                Disk(s.clone()),
+            )
+            .unwrap();
+            p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+                .unwrap();
+            // SCM created the reserve, but native address setup failed before
+            // the owner could capture a running interface/process proof.
+            native.borrow_mut().fail_start = true;
+            assert!(p.attach(&scope(), &member(Slot::B)).is_err());
+            s.borrow_mut().fail_cleanup_routes = cleanup_fails;
+            assert!(p.remove_standby(&scope(), Slot::B).is_err());
+            assert_eq!(native.borrow().live, [None, None]);
+            assert_eq!(p.cleanup_pending(), cleanup_fails);
+            assert_eq!(s.borrow().saved.as_ref().unwrap().closing, cleanup_fails);
+            if cleanup_fails {
+                assert!(!p.closed);
+                s.borrow_mut().fail_cleanup_routes = false;
+            }
+            // Explicit Stop retries must durably acknowledge completion,
+            // rather than returning Ok while leaving closing=true on disk.
+            p.close(&scope()).unwrap();
+            assert!(p.closed);
+            assert!(!p.cleanup_pending());
+            let saved = s.borrow().saved.clone().unwrap();
+            assert!(!saved.closing);
+            assert!(saved.members.iter().all(Option::is_none));
+            assert!(saved.dns.iter().all(Option::is_none));
+            assert_eq!(saved.guard, Model::empty(scope()).unwrap());
+            assert_eq!(native.borrow().starts, [1, 1]);
+        }
+    }
+
     #[derive(Default)]
     struct Native {
         configs: [Option<[u8; 32]>; 2],
@@ -1830,6 +1871,7 @@ mod retained_owner_seam {
         dns_enabled: bool,
         dns: [Option<DnsSnapshot>; 2],
         starts: [u64; 2],
+        fail_start: bool,
         fail_config: bool,
         lost_config: bool,
         fail_inspect: bool,
@@ -1982,6 +2024,10 @@ mod retained_owner_seam {
             assert!(s.live[i].is_none());
             assert_eq!(s.configs[i], Some(intent.config_sha256));
             s.starts[i] += 1;
+            if s.fail_start {
+                s.stopped_service[i] = true;
+                return Err(owner::OwnerError::Native);
+            }
             s.live[i] = Some(owner::NativeProof {
                 process: owner::ProcessProof {
                     pid: 20 + i as u32,
