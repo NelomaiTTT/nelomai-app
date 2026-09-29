@@ -668,6 +668,11 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
         result?;
         // No probe or globally visible inactive route exists before this fence.
         self.fence()?;
+        // IP_UNICAST_IF connect requires a route on the bound interface. Add
+        // the new member's probe route while BOTH members remain fenced; keep
+        // the existing primary selected on attach. No permit is admitted until
+        // activate has also established DNS and checked exact endpoint identity.
+        self.routes(self.record.active.unwrap_or(m.slot))?;
         let member = self.record.members[m.slot.idx()]
             .as_ref()
             .ok_or_else(failed)?;
@@ -686,6 +691,12 @@ impl<I: PairIo, J: PairStore> SessionNativePair<I, J> {
                 continue;
             };
             if member.dns.is_empty() {
+                continue;
+            }
+            // All DNS writes are preceded by a durable baseline. If activation
+            // never reached that point, cleanup has no DNS mutation to undo.
+            // Do not invent a baseline/read from an already failing interface.
+            if active != Some(slot) && self.record.dns[slot.idx()].is_none() {
                 continue;
             }
             if active != Some(slot)
@@ -1125,6 +1136,9 @@ impl<I: PairIo, J: PairStore> PairControl for SessionNativePair<I, J> {
             self.fence()?;
             let live =
                 live_route_members(&mut *self.io.borrow_mut(), active, &self.record.members)?;
+            // Rebind removed the old routes above. Restore owned probe routes
+            // under the fence before connecting the replacement base sockets.
+            self.routes(active)?;
             for slot in [Slot::A, Slot::B] {
                 if let Some(m) = &live[slot.idx()] {
                     let (socket, tuple) = self.io.borrow_mut().open_base(m)?;

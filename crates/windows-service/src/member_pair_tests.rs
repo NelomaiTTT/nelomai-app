@@ -329,6 +329,7 @@ struct State {
     guard: Option<Model>,
     owners: [Option<OwnerRecord>; 2],
     route_active: Option<Slot>,
+    routed_members: [bool; 2],
     fail_routes: bool,
     endpoint_lost: bool,
     fail_save: bool,
@@ -513,6 +514,11 @@ impl PairIo for Io {
     }
     fn open_base(&mut self, m: &MemberRecord) -> io::Result<(Socket, ProbeTuple)> {
         self.verify(m)?;
+        // WinSock connect on IP_UNICAST_IF requires a route on that member,
+        // even though bind and interface ownership already succeeded.
+        if !self.0.borrow().routed_members[slot_shared(m.owner.intent.slot).idx()] {
+            return Err(io::Error::from_raw_os_error(10051));
+        }
         Ok((
             Socket(self.0.clone()),
             ProbeTuple {
@@ -575,7 +581,7 @@ impl PairIo for Io {
     fn select_routes(
         &mut self,
         active: Slot,
-        _: &[Option<MemberRecord>; 2],
+        members: &[Option<MemberRecord>; 2],
         _: &DesktopTunnelOptions,
     ) -> io::Result<()> {
         let mut s = self.0.borrow_mut();
@@ -587,6 +593,7 @@ impl PairIo for Io {
             return Err(failed());
         }
         s.route_active = Some(active);
+        s.routed_members = members.each_ref().map(Option::is_some);
         Ok(())
     }
     fn cleanup_routes(&mut self) -> io::Result<()> {
@@ -596,6 +603,7 @@ impl PairIo for Io {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         s.route_active = None;
+        s.routed_members = [false; 2];
         Ok(())
     }
     fn read_dns(&mut self, _: &MemberRecord) -> io::Result<DnsSnapshot> {
@@ -610,6 +618,44 @@ fn pair() -> (SessionNativePair<Io, Disk>, Shared) {
     s.borrow_mut().guard = Some(Model::empty(scope()).unwrap());
     let p = SessionNativePair::new(scope(), Io(s.clone()), Disk(s.clone())).unwrap();
     (p, s)
+}
+
+#[test]
+fn primary_attach_and_rebind_route_before_connecting_probe_sockets() {
+    let (mut p, s) = pair();
+    p.start_primary(&scope(), &member(Slot::A), &DesktopTunnelOptions::default())
+        .unwrap();
+    p.attach(&scope(), &member(Slot::B)).unwrap();
+    assert_eq!(p.record.active, Some(Slot::A));
+    assert!(p.sockets.iter().all(Option::is_some));
+    p.rebind_pair(&scope()).unwrap();
+    assert_eq!(p.record.active, Some(Slot::A));
+    assert!(p.sockets.iter().all(Option::is_some));
+    p.close(&scope()).unwrap();
+    assert!(p.closed);
+    assert_eq!(s.borrow().routed_members, [false; 2]);
+    assert!(!s.borrow().guard.as_ref().unwrap().installed);
+}
+
+#[test]
+fn abort_before_dns_activation_never_reads_or_writes_unmodified_dns() {
+    let (mut p, s) = pair();
+    let m = member(Slot::A);
+    let mut prepared = p.io.borrow_mut().prepare_member(&scope(), &m).unwrap();
+    prepared.dns = vec!["9.9.9.9".parse().unwrap()];
+    p.record.members[0] = Some(prepared.clone());
+    p.save().unwrap();
+    p.io.borrow_mut().start(&prepared).unwrap();
+    p.refresh(Slot::A).unwrap();
+    p.fence().unwrap();
+    // No DNS baseline or write happened before a probe-socket failure. This
+    // fake rejects DNS access; closing must still stop the owned interface.
+    p.close(&scope()).unwrap();
+    assert!(p.closed);
+    assert_eq!(
+        s.borrow().owners[0].as_ref().unwrap().phase,
+        crate::member_owner::Phase::Stopped
+    );
 }
 
 #[test]
@@ -1184,11 +1230,35 @@ fn route_or_dns_cleanup_error_never_prevents_both_native_stops() {
             .unwrap();
         p.attach(&scope(), &member(Slot::B)).unwrap();
         if dns {
-            p.record.members[0]
-                .as_mut()
-                .unwrap()
-                .dns
-                .push("9.9.9.9".parse().unwrap());
+            let m = p.record.members[0].as_mut().unwrap();
+            m.dns.push("9.9.9.9".parse().unwrap());
+            let interface = m.owner.proof.unwrap().interface;
+            let baseline = DnsSnapshot {
+                interface: crate::member_dns::OwnedInterface {
+                    scope: scope(),
+                    guid: interface.guid,
+                    luid: interface.luid,
+                    index: interface.index,
+                },
+                settings: crate::member_dns::Settings {
+                    version: 1,
+                    flags: 0,
+                    domain: None,
+                    name_server: None,
+                    search_list: None,
+                    registration_enabled: 0,
+                    register_adapter_name: 0,
+                    enable_llmnr: 0,
+                    query_adapter_name: 0,
+                    profile_name_server: None,
+                },
+            };
+            // Restoration is required only after a baseline was journaled.
+            p.record.dns[0] = Some(DnsRecord {
+                current: baseline.with_servers(&m.dns).unwrap(),
+                baseline,
+                pending: None,
+            });
         } else {
             s.borrow_mut().fail_cleanup_routes = true;
         }
