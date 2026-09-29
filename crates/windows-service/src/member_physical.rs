@@ -214,6 +214,37 @@ impl PhysicalSnapshot {
         self.select(family, |row| row.route.destination.prefix_len() == 0)
     }
 
+    /// Resolve a physical bypass prefix, retaining the complete native evidence.
+    /// An exact on-link LAN row is already scoped by Windows; unlike an endpoint,
+    /// it can be multicast, broadcast or IPv6 link-local. Never invent a gateway
+    /// or a zone for such a prefix. Endpoint callers must still use resolve_host.
+    pub(crate) fn resolve_bypass(&self, destination: ipnet::IpNet) -> Result<PhysicalRoute> {
+        if destination != destination.trunc() {
+            return Err(DiscoveryError::Invalid);
+        }
+        let path = if destination.prefix_len() == 0 {
+            self.default_route(Family::of(destination.addr()))?
+                .ok_or(DiscoveryError::NoRoute)?
+        } else {
+            match self.resolve_host(destination.addr()) {
+                Ok(host) => host.path,
+                // Only non-host prefixes take this path. In particular, do not
+                // hide ambiguous unicast routes or prefer on-link over a better
+                // routed path. These rows will be retained, not newly installed.
+                Err(DiscoveryError::Invalid) => self
+                    .select(Family::of(destination.addr()), |row| {
+                        row.route.destination == destination && row.route.gateway.is_none()
+                    })?
+                    .ok_or(DiscoveryError::Invalid)?,
+                Err(error) => return Err(error),
+            }
+        };
+        if !path.row.route.destination.contains(&destination) {
+            return Err(DiscoveryError::Invalid);
+        }
+        Ok(path)
+    }
+
     pub(crate) fn resolve_host(&self, destination: IpAddr) -> Result<ResolvedHost> {
         let invalid = destination.is_unspecified()
             || destination.is_multicast()

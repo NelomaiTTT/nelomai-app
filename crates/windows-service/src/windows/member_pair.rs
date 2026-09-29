@@ -1331,6 +1331,9 @@ fn plan(
         }
     }
     for m in members.iter().flatten() {
+        // Endpoint hosts are not LAN prefixes: retain the stricter unicast /
+        // explicit-zone requirement even when an exact on-link row exists.
+        snapshot.resolve_host(m.endpoint).map_err(|_| failed())?;
         exclusions.push(ipnet::IpNet::from(m.endpoint));
     }
     exclusions.sort();
@@ -1349,20 +1352,7 @@ fn plan(
         )
         .collect::<Vec<_>>();
     for destination in destinations {
-        let path = if destination.prefix_len() == 0 {
-            snapshot
-                .default_route(Family::of(destination.addr()))
-                .map_err(|_| failed())?
-                .ok_or_else(failed)?
-        } else {
-            snapshot
-                .resolve_host(destination.addr())
-                .map_err(|_| failed())?
-                .path
-        };
-        if !path.row.route.destination.contains(&destination) {
-            return Err(failed());
-        }
+        let path = snapshot.resolve_bypass(destination).map_err(|_| failed())?;
         let route = RouteValue {
             destination,
             scope: RouteScope::WindowsInterface(path.proof.identity.index),

@@ -48,6 +48,96 @@ fn ip(value: &str) -> IpAddr {
 }
 
 #[test]
+fn windows_lan_rows_are_retained_without_treating_them_as_remote_hosts() {
+    // Observed physical Ethernet table on the Windows acceptance device.
+    let prefixes = [
+        "192.168.3.0/24",
+        "192.168.3.166/32",
+        "192.168.3.255/32",
+        "224.0.0.0/4",
+        "255.255.255.255/32",
+        "fe80::/64",
+        "fe80::4d76:53b2:9dde:bc19/128",
+        "ff00::/8",
+    ];
+    let mut rows = prefixes
+        .iter()
+        .map(|p| row(p, 26, None, 256))
+        .collect::<Vec<_>>();
+    rows.push(row("0.0.0.0/0", 26, Some("192.168.3.1"), 0));
+    let snapshot = capture(
+        rows.clone(),
+        vec![interface(26, Family::V4, 25), interface(26, Family::V6, 25)],
+    );
+    let mut retained = Vec::new();
+    for original in &rows[..prefixes.len()] {
+        let resolved = snapshot.resolve_bypass(original.route.destination).unwrap();
+        assert_eq!(resolved.row, *original);
+        snapshot.verify(&resolved).unwrap();
+        retained.push(resolved.row.route);
+    }
+    // Exercise the actual downstream pair planner too: native LAN rows must
+    // never become owned mutations, while both tunnels still receive probes.
+    use nelomai_client_tunnel::redundancy::{route_plan::MemberRoutes, Slot};
+    use nelomai_windows_service::member_plan::{member_route_plan, InterfaceMetric};
+    let members = [Slot::A, Slot::B]
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| MemberRoutes {
+            slot,
+            interface: 40 + i as u32,
+            allowed: vec!["0.0.0.0/0".parse().unwrap()],
+            probe: if i == 0 { "1.1.1.1" } else { "8.8.8.8" }.parse().unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let exclusions = prefixes.map(|p| p.parse().unwrap());
+    let metrics = [
+        InterfaceMetric {
+            interface: 26,
+            ipv6: false,
+            metric: 25,
+        },
+        InterfaceMetric {
+            interface: 26,
+            ipv6: true,
+            metric: 25,
+        },
+        InterfaceMetric {
+            interface: 40,
+            ipv6: false,
+            metric: 5,
+        },
+        InterfaceMetric {
+            interface: 41,
+            ipv6: false,
+            metric: 5,
+        },
+    ];
+    let plan = member_route_plan(Slot::A, &members, &exclusions, &retained, &metrics, 0).unwrap();
+    let writes = plan
+        .routes
+        .iter()
+        .filter(|r| !retained.contains(r))
+        .collect::<Vec<_>>();
+    assert!(writes
+        .iter()
+        .all(|r| r.interface == 40 || r.interface == 41));
+    assert!(writes
+        .iter()
+        .any(|r| r.destination.to_string() == "0.0.0.0/1" && r.interface == 40));
+    assert!(writes
+        .iter()
+        .any(|r| r.destination.to_string() == "8.8.8.8/32" && r.interface == 41));
+    // Resolving an endpoint is still a different, strictly unicast operation.
+    for host in ["224.0.0.1", "255.255.255.255", "fe80::1", "ff02::1"] {
+        assert_eq!(
+            snapshot.resolve_host(ip(host)).unwrap_err(),
+            DiscoveryError::Invalid
+        );
+    }
+}
+
+#[test]
 fn exact_owned_host_shadow_is_removed_before_selecting_underlying_gateway() {
     let shadow = row("10.0.0.1/32", 7, Some("192.0.2.99"), 0);
     let base = row("0.0.0.0/0", 7, Some("192.0.2.1"), 10);
@@ -62,6 +152,106 @@ fn exact_owned_host_shadow_is_removed_before_selecting_underlying_gateway() {
     );
     assert_eq!(filtered.proofs(), snapshot.proofs());
     assert_eq!(snapshot.rows().len(), 2);
+}
+
+#[test]
+fn special_lan_bypass_needs_exact_live_physical_evidence_and_unambiguous_scope() {
+    for prefix in ["224.0.0.0/4", "255.255.255.255/32", "fe80::/64", "ff00::/8"] {
+        let net: ipnet::IpNet = prefix.parse().unwrap();
+        let family = Family::of(net.addr());
+        let good = row(prefix, 7, None, 256);
+        let record = interface(7, family, 25);
+        let before = capture(vec![good.clone()], vec![record.clone()]);
+        let retained = before.resolve_bypass(net).unwrap();
+        for mutation in 0..6 {
+            let mut changed = good.clone();
+            let mut record = record.clone();
+            match mutation {
+                0 => changed.valid_lifetime = 0,
+                1 => changed.flags[0] = 1,
+                2 => record.oper_status = 2,
+                3 => record.status_flags = 0,
+                4 => {
+                    changed.route.gateway = Some(if family == Family::V4 {
+                        ip("192.0.2.1")
+                    } else {
+                        ip("fe80::1")
+                    })
+                }
+                _ => {
+                    changed.route.destination = if family == Family::V4 {
+                        "0.0.0.0/0"
+                    } else {
+                        "::/0"
+                    }
+                    .parse()
+                    .unwrap()
+                }
+            }
+            let after = capture(vec![changed], vec![record]);
+            assert!(
+                after.resolve_bypass(net).is_err(),
+                "{prefix} mutation {mutation}"
+            );
+            assert!(after.verify(&retained).is_err());
+        }
+        let ambiguous = capture(
+            vec![good, row(prefix, 8, None, 256)],
+            vec![record, interface(8, family, 25)],
+        );
+        assert_eq!(
+            ambiguous.resolve_bypass(net).unwrap_err(),
+            DiscoveryError::Ambiguous
+        );
+    }
+}
+
+#[test]
+fn bypass_keeps_host_and_default_selection_and_whole_prefix_checks() {
+    let default = row("0.0.0.0/0", 7, Some("192.0.2.1"), 10);
+    let narrow = row("192.168.0.0/24", 7, None, 1);
+    let snapshot = capture(
+        vec![default.clone(), narrow],
+        vec![interface(7, Family::V4, 25)],
+    );
+    for prefix in ["0.0.0.0/0", "203.0.113.1/32"] {
+        assert_eq!(
+            snapshot
+                .resolve_bypass(prefix.parse().unwrap())
+                .unwrap()
+                .row,
+            default
+        );
+    }
+    assert!(snapshot
+        .resolve_bypass("192.168.0.0/16".parse().unwrap())
+        .is_err());
+    assert!(snapshot
+        .resolve_bypass("192.168.0.1/24".parse().unwrap())
+        .is_err());
+    assert_eq!(
+        snapshot
+            .resolve_bypass("::/0".parse().unwrap())
+            .unwrap_err(),
+        DiscoveryError::NoRoute
+    );
+}
+
+#[test]
+fn lan_bypass_does_not_override_a_better_unicast_route_or_hide_a_tie() {
+    let on_link = row("192.168.3.0/24", 7, None, 256);
+    let routed = row("192.168.3.0/24", 8, Some("192.0.2.1"), 10);
+    let destination = on_link.route.destination;
+    let records = vec![interface(7, Family::V4, 25), interface(8, Family::V4, 25)];
+    let snapshot = capture(vec![on_link.clone(), routed.clone()], records.clone());
+    assert_eq!(snapshot.resolve_bypass(destination).unwrap().row, routed);
+    let mut tied = routed;
+    tied.route.metric = 256;
+    let snapshot = capture(vec![on_link, tied], records);
+    assert_eq!(
+        snapshot.resolve_bypass(destination).unwrap_err(),
+        DiscoveryError::Ambiguous
+    );
 }
 #[test]
 fn foreign_equal_prefix_on_other_interface_is_not_excluded() {
