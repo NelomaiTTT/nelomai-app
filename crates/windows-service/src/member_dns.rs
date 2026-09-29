@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::{fmt, net::IpAddr};
 
 pub(crate) const MAX_STRING_UNITS: usize = 4096;
-const NAMESERVER: u64 = 2;
 // Version1 fields that can be exactly retained. IPV6, HOSTNAME (no matching
 // Version1 member), profile DNS, DoH/DDR and future flags are unsupported.
 const SUPPORTED_FLAGS: u64 = 0x1be;
@@ -125,7 +124,9 @@ impl Snapshot {
         validate_servers(&text)?;
         let mut desired = self.clone();
         desired.settings.name_server = Some(text);
-        desired.settings.flags |= NAMESERVER;
+        // Get flags are observed metadata, not Set's field-selection mask.
+        // Windows may return zero with a populated NameServer. Preserve every
+        // observed bit; only NativeDnsIo constructs DNS_SETTING_NAMESERVER.
         Ok(desired)
     }
 }
@@ -158,7 +159,6 @@ impl<I: Identity, A: DnsIo> OwnedDns<I, A> {
         desired.settings.validate(Ownership::NewlyCreated)?;
         let mut allowed = expected.settings.clone();
         allowed.name_server = desired.settings.name_server.clone();
-        allowed.flags = (allowed.flags & !NAMESERVER) | (desired.settings.flags & NAMESERVER);
         if allowed != desired.settings {
             return Err(DnsError::Unsupported);
         }
@@ -260,13 +260,7 @@ impl Settings {
         match self.name_server.as_deref() {
             None | Some("") if ownership == Ownership::NewlyCreated => Ok(()),
             None | Some("") => Err(DnsError::Unsupported),
-            Some(text) => {
-                validate_servers(text)?;
-                if self.flags & NAMESERVER == 0 {
-                    return Err(DnsError::Unsupported);
-                }
-                Ok(())
-            }
+            Some(text) => validate_servers(text),
         }
     }
 }
@@ -415,11 +409,7 @@ mod tests {
             s.events.push("write");
             s.writes += 1;
             s.settings.name_server = value.map(str::to_owned);
-            if value.is_some_and(|v| !v.is_empty()) {
-                s.settings.flags |= 2;
-            } else {
-                s.settings.flags &= !2;
-            }
+            // Get does not echo Set's NameServer field selector.
             if s.foreign_readback {
                 s.settings.search_list = Some("foreign.invalid".into());
             }
@@ -451,6 +441,51 @@ mod tests {
             OwnedDns::new(interface(), Owner(s.clone()), Api(s.clone())).unwrap(),
             s,
         )
+    }
+
+    #[test]
+    fn native_zero_flags_readback_can_activate_and_restore_owned_dns() {
+        // Windows Get returns Flags=0 even after a successful NameServer Set.
+        // Captured on the owned test interface; Set flags are input selectors,
+        // not a promise that Get will echo them as configuration state.
+        for empty in [None, Some(String::new())] {
+            let (mut adapter, state) = adapter();
+            {
+                let mut s = state.borrow_mut();
+                s.ownership = Ownership::NewlyCreated;
+                s.settings.flags = 0;
+                s.settings.name_server = empty;
+                s.after_write = Some(|s| s.flags = 0);
+            }
+            let baseline = adapter.snapshot().unwrap();
+            let desired = baseline
+                .with_servers(&["8.8.8.8".parse().unwrap()])
+                .unwrap();
+            assert_eq!(
+                adapter.compare_exchange(&baseline, &desired),
+                Ok(desired.clone())
+            );
+            assert_eq!(desired.settings.flags, 0);
+            assert_eq!(adapter.snapshot().unwrap(), desired);
+            assert_eq!(
+                adapter.compare_exchange(&desired, &baseline),
+                Ok(baseline.clone())
+            );
+            assert_eq!(adapter.snapshot().unwrap(), baseline);
+            assert_eq!(state.borrow().writes, 2);
+        }
+    }
+
+    #[test]
+    fn nameserver_selection_flag_is_not_required_in_native_snapshot() {
+        let (mut adapter, state) = adapter();
+        state.borrow_mut().settings.flags = 0;
+        let observed = Snapshot {
+            interface: interface(),
+            settings: state.borrow().settings.clone(),
+        };
+        assert_eq!(adapter.snapshot(), Ok(observed));
+        assert_eq!(state.borrow().writes, 0);
     }
 
     #[test]
@@ -517,6 +552,7 @@ mod tests {
     fn foreign_replacement_of_any_snapshot_field_prevents_write() {
         let mutations: &[fn(&mut Settings)] = &[
             |s| s.version = 2,
+            |s| s.flags ^= 2,
             |s| s.flags ^= 8,
             |s| s.domain = Some("other.invalid".into()),
             |s| s.name_server = Some("1.1.1.1".into()),
@@ -571,7 +607,6 @@ mod tests {
             |s| s.name_server = Some("resolver.invalid".into()),
             |s| s.name_server = Some("9.9.9.9,,1.1.1.1".into()),
             |s| s.name_server = Some("9.9.9.9;1.1.1.1".into()),
-            |s| s.flags &= !2,
             |s| s.domain = Some("x".repeat(4097)),
             |s| s.search_list = Some("a\0b".into()),
             |s| s.registration_enabled = 2,
@@ -592,6 +627,12 @@ mod tests {
         assert_eq!(
             adapter.compare_exchange(&wrong, &wrong),
             Err(DnsError::Ownership)
+        );
+        let mut changed = snap();
+        changed.settings.flags ^= 2;
+        assert_eq!(
+            adapter.compare_exchange(&snap(), &changed),
+            Err(DnsError::Unsupported)
         );
         let mut changed = snap();
         changed.settings.domain = None;
@@ -727,6 +768,7 @@ mod tests {
     fn readback_compares_every_field_including_profile_and_policy_flags() {
         let mutations: &[fn(&mut Settings)] = &[
             |s| s.version = 2,
+            |s| s.flags ^= 2,
             |s| s.flags ^= 8,
             |s| s.domain = Some("foreign.invalid".into()),
             |s| s.name_server = Some("1.1.1.1".into()),
