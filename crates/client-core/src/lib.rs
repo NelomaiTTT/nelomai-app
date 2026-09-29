@@ -2922,55 +2922,12 @@ where
         *self.active_recovery_episode.lock().await = None;
         self.set_phase(Phase::Stopping).await;
         if !matches!(self.tunnel.status().await, Ok(TunnelStatus::Stopped)) {
-            let pending = journal_result
-                .as_ref()
-                .ok()
-                .and_then(|_| self.load_runtime().ok())
-                .and_then(|stored| stored.pending_compensation_stop);
-            // Initiate the durable request before closing the tunnel, but never
-            // wait for its response. Losing it while routes change is expected;
-            // the post-close worker replays the exact same operation.
-            let initial_request = async {
-                if let Some(pending) = pending {
-                    if let Ok(access) = self.access_snapshot().await {
-                        if let Some(session_id) = pending.redundant_session_id {
-                            let _ = self
-                                .api
-                                .stop_redundant_connection(
-                                    &access,
-                                    &RedundantStopRequest {
-                                        retain_active_peer: false,
-                                        operation_id: pending.operation_id,
-                                        lease_id: pending.lease_id,
-                                        recovery_contract_version: RecoveryContractV2,
-                                        session_id,
-                                    },
-                                )
-                                .await;
-                        } else {
-                            let _ = self
-                                .api
-                                .stop_connection(
-                                    &access,
-                                    &ConnectionOperationRequest {
-                                        operation_id: pending.operation_id,
-                                        lease_id: pending.lease_id,
-                                        failure_code: pending.failure_code,
-                                    },
-                                )
-                                .await;
-                        }
-                    }
-                }
-            };
-            tokio::pin!(initial_request);
-            let local_stop = self.tunnel.stop();
-            tokio::pin!(local_stop);
-            tokio::select! {
-                biased;
-                _ = &mut initial_request => { local_stop.await?; }
-                result = &mut local_stop => { result?; }
-            }
+            // Never race an access request against native close. Cancelling
+            // an in-flight credential grant closes the authenticated IPC
+            // channel and prevents the durable worker from replaying Stop.
+            // Persist the exact cleanup identity above, close locally, then
+            // let the existing worker obtain auth and send the same operation.
+            self.tunnel.stop().await?;
         }
         // Storage failure must not leave the user's local tunnel running.
         // No panel request is sent until a cleanup identity has been persisted.
