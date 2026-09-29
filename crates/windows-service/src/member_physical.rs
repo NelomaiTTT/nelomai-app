@@ -155,6 +155,25 @@ impl PhysicalSnapshot {
     pub(crate) fn rows(&self) -> &[Row] {
         &self.rows
     }
+    /// Only live forwarding rows can supply automatic LAN bypasses. Windows
+    /// marks local-address and broadcast delivery as Loopback even on Ethernet;
+    /// leave those native rows untouched rather than trying to route through them.
+    pub(crate) fn lan_prefixes(&self) -> Vec<ipnet::IpNet> {
+        self.rows()
+            .iter()
+            .filter(|row| {
+                row.route.gateway.is_none()
+                    && row.route.destination.prefix_len() > 0
+                    && row.flags[0] == 0
+                    && row.valid_lifetime != 0
+                    && self.proofs.contains_key(&(
+                        Family::of(row.route.destination.addr()),
+                        row.route.interface,
+                    ))
+            })
+            .map(|row| row.route.destination)
+            .collect()
+    }
     /// Exclude only exact rows backed by the enclosing owner's committed or
     /// pending journal. A foreign replacement at the same native key is an
     /// error, not an exclusion. Different interfaces retain independent rows.

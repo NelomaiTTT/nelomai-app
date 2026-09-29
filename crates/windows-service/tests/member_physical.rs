@@ -138,6 +138,62 @@ fn windows_lan_rows_are_retained_without_treating_them_as_remote_hosts() {
 }
 
 #[test]
+fn native_local_delivery_rows_are_not_turned_into_physical_bypasses() {
+    // Actual GetIpForwardTable2 flags: Windows marks local addresses and both
+    // directed/limited broadcast as Loopback even on the physical Ethernet NIC.
+    let values = [
+        ("192.168.3.0/24", 0),
+        ("192.168.3.166/32", 1),
+        ("192.168.3.255/32", 1),
+        ("224.0.0.0/4", 0),
+        ("255.255.255.255/32", 1),
+        ("fe80::/64", 0),
+        ("fe80::4d76:53b2:9dde:bc19/128", 1),
+        ("ff00::/8", 0),
+    ];
+    let mut rows = values
+        .iter()
+        .map(|(prefix, loopback)| {
+            let mut row = row(prefix, 26, None, 256);
+            row.flags = [*loopback, 1, 0, 0];
+            row
+        })
+        .collect::<Vec<_>>();
+    let mut expired = row("198.51.100.0/24", 26, None, 256);
+    expired.valid_lifetime = 0;
+    rows.push(expired);
+    rows.push(row("203.0.113.0/24", 29, None, 0));
+    let mut virtual_interface = interface(29, Family::V4, 1);
+    virtual_interface.status_flags = 0;
+    let snapshot = capture(
+        rows.clone(),
+        vec![
+            interface(26, Family::V4, 25),
+            interface(26, Family::V6, 25),
+            virtual_interface,
+        ],
+    );
+    let mut actual = snapshot.lan_prefixes();
+    actual.sort();
+    let mut expected = ["192.168.3.0/24", "224.0.0.0/4", "fe80::/64", "ff00::/8"]
+        .map(|p| p.parse::<ipnet::IpNet>().unwrap());
+    expected.sort();
+    assert_eq!(actual, expected);
+    for prefix in actual {
+        let retained = snapshot.resolve_bypass(prefix).unwrap();
+        assert_eq!(retained.row.route.destination, prefix);
+        assert_eq!(retained.row.flags[0], 0);
+        snapshot.verify(&retained).unwrap();
+    }
+    // Discovery does not remove, adopt or rewrite the native local-delivery rows.
+    assert_eq!(snapshot.rows(), rows);
+    assert!(snapshot.resolve_host(ip("255.255.255.255")).is_err());
+    assert!(snapshot
+        .resolve_host(ip("fe80::4d76:53b2:9dde:bc19"))
+        .is_err());
+}
+
+#[test]
 fn exact_owned_host_shadow_is_removed_before_selecting_underlying_gateway() {
     let shadow = row("10.0.0.1/32", 7, Some("192.0.2.99"), 0);
     let base = row("0.0.0.0/0", 7, Some("192.0.2.1"), 10);

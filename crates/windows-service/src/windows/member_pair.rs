@@ -1318,17 +1318,7 @@ fn plan(
         .map(|s| s.parse::<ipnet::IpNet>().map_err(|_| failed()))
         .collect::<io::Result<Vec<_>>>()?;
     if options.exclude_local_networks {
-        for row in snapshot.rows() {
-            if row.route.gateway.is_none()
-                && row.route.destination.prefix_len() > 0
-                && snapshot.proofs().contains_key(&(
-                    Family::of(row.route.destination.addr()),
-                    row.route.interface,
-                ))
-            {
-                exclusions.push(row.route.destination);
-            }
-        }
+        exclusions.extend(snapshot.lan_prefixes());
     }
     for m in members.iter().flatten() {
         // Endpoint hosts are not LAN prefixes: retain the stricter unicast /
