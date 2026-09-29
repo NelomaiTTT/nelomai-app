@@ -1771,10 +1771,20 @@ async fn desktop_local_stop_does_not_cancel_auth_needed_for_cleanup_replay() {
             .unwrap();
         assert_eq!(pending.accept_warm, !cold);
         owner.blocked.store(false, Ordering::SeqCst);
-        core.stop()
+        let stopped = core
+            .stop()
             .await
             .expect("local Stop must preserve access for the exact durable cleanup replay");
-        assert_eq!(core.state().await.phase, Phase::Ready);
+        let ready = core.state().await;
+        assert_eq!(ready.phase, Phase::Ready);
+        assert_eq!(ready.connection.as_ref(), Some(&stopped));
+        assert_eq!(stopped.lease_id, pending.lease_id);
+        // A completed panel Stop no longer exposes the retired session member.
+        assert!(stopped.session_id.is_none());
+        assert!(matches!(
+            stopped.status,
+            LeaseStatus::Released | LeaseStatus::Warm
+        ));
         assert!(store.value.lock().unwrap().desktop_redundancy.is_none());
         assert!(store
             .value

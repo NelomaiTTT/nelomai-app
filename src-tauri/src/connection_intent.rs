@@ -1478,11 +1478,23 @@ fn start_after_core_observation(
     // Read the completed identity before awaiting core state; revalidate it here
     // so an old Ready observation cannot retire a newer or in-flight intent.
     if core.phase == Phase::Ready
-        && core.connection.is_none()
         && state.pending_redundant_recovery.is_none()
         && observed.is_some_and(|(generation, connection)| {
             *generation == state.coordinator.generation()
                 && state.coordinator.completed_connection() == Some(connection)
+                // Core retains the confirmed Stop response for UI/lease metadata.
+                // A fully retired session is omitted by the panel Stop view.
+                // Require this same lease and reject any explicit foreign session
+                // before retiring the completed intent observed before the await.
+                && core.connection.as_ref().is_none_or(|stopped| {
+                    stopped.lease_id == connection.lease_id
+                        && (stopped.session_id.is_none()
+                            || stopped.session_id == connection.session_id)
+                        && matches!(
+                            stopped.status,
+                            LeaseStatus::Released | LeaseStatus::Failed | LeaseStatus::Warm
+                        )
+                })
         })
     {
         let generation = state.coordinator.generation();
@@ -2351,6 +2363,90 @@ mod tests {
         assert!(!state.armed);
         assert!(state.owned_lease_id.is_none());
         assert_eq!(state.attempt_kind, AttemptKind::Start);
+    }
+
+    #[test]
+    fn completed_stop_record_allows_protocol_switch_without_losing_identity_guards() {
+        for status in [
+            LeaseStatus::Released,
+            LeaseStatus::Failed,
+            LeaseStatus::Warm,
+        ] {
+            for keep_session_metadata in [false, true] {
+                let (mut state, current, _) = redundant_fixture();
+                let generation = state.coordinator.generation();
+                let observed = (generation, current.clone());
+                let mut stopped = current;
+                stopped.status = status;
+                if !keep_session_metadata {
+                    stopped.session_id = None;
+                }
+                let mut options = state.options.clone().unwrap();
+                options.layer = Layer::Tic;
+                assert_ne!(options.layer, state.options.as_ref().unwrap().layer);
+                let result = super::start_after_core_observation(
+                    &mut state,
+                    Some(&observed),
+                    &CoreState {
+                        phase: Phase::Ready,
+                        connection: Some(stopped),
+                    },
+                    options,
+                    20,
+                )
+                .expect("Core retains the confirmed Stop response, not an empty connection");
+                assert!(
+                    matches!(result, StartDisposition::Recovering { generation: next, .. } if next.value() > generation.value())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stopped_record_does_not_authorize_retiring_another_or_live_intent() {
+        for case in 0..7 {
+            let (mut state, current, _) = redundant_fixture();
+            let generation = state.coordinator.generation();
+            let observed = (generation, current.clone());
+            let mut stopped = current.clone();
+            stopped.status = LeaseStatus::Released;
+            let mut phase = Phase::Ready;
+            match case {
+                0 => stopped.lease_id = "foreign".into(),
+                1 => stopped.session_id = Some("foreign-session".into()),
+                2 => {
+                    stopped.lease_id = "foreign".into();
+                    stopped.session_id = None;
+                }
+                3 => stopped.status = LeaseStatus::Connected,
+                4 => stopped.status = LeaseStatus::Issued,
+                5 => stopped.status = LeaseStatus::Allocating,
+                6 => phase = Phase::Stopping,
+                _ => unreachable!(),
+            }
+            let mut options = state.options.clone().unwrap();
+            options.layer = Layer::Tic;
+            assert_eq!(
+                super::start_after_core_observation(
+                    &mut state,
+                    Some(&observed),
+                    &CoreState {
+                        phase,
+                        connection: Some(stopped)
+                    },
+                    options,
+                    20,
+                ),
+                Err(nelomai_client_core::ConnectionIntentError::DifferentIntentActive),
+                "case {case}"
+            );
+            assert_eq!(state.coordinator.generation(), generation);
+            assert!(state.armed);
+            assert_eq!(
+                state.owned_lease_id.as_deref(),
+                Some(current.lease_id.as_str())
+            );
+        }
     }
 
     #[test]
