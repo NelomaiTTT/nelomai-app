@@ -562,7 +562,18 @@ fn validate_cleanup_pair(old: Option<&PairRecord>, next: &PairRecord) -> io::Res
             p.desired.without_probes().map_err(|_| failed())?,
         ]);
     }
-    if !retained.contains(&next.guard) && !fence(&next.guard) {
+    // A pending creation can have received a BFE-assigned sublayer weight before
+    // its ACK was saved. Use the SAME exact readback validation as native recovery,
+    // not the pre-creation requested weight. This only acknowledges the retained
+    // plan and grants no new exchange or native ownership authority.
+    let reconciled = next.pending_guard.is_none()
+        && old.pending_guard.as_ref().is_some_and(|plan| {
+            plan.expected == old.guard
+                && plan
+                    .resolve(&next.guard.expected)
+                    .is_ok_and(|model| model == next.guard)
+        });
+    if !retained.contains(&next.guard) && !reconciled && !fence(&next.guard) {
         return Err(failed());
     }
     if let Some(p) = &next.pending_guard {
@@ -1942,6 +1953,104 @@ mod tests {
         resurrected.closing = true;
         assert!(store.save(&resurrected).is_err());
     }
+    #[test]
+    fn cleanup_store_accepts_creation_readback_with_assigned_weight() {
+        use crate::member_guard::{ExchangePlan, Interface, Member, Model};
+        use crate::member_owner::{InterfaceProof, NativeProof, Phase, ProcessProof};
+        let disk = Disk::default();
+        let mut f = files(&disk);
+        save_initial(&mut f);
+        let mut pair = prepared_pair();
+        pair.closing = true;
+        let owner = &mut pair.members[0].as_mut().unwrap().owner;
+        owner.phase = Phase::Stopped;
+        owner.previous_config_sha256 = None;
+        owner.retired_proof = Some(NativeProof {
+            process: ProcessProof {
+                pid: 12,
+                creation_time: 42,
+            },
+            interface: InterfaceProof {
+                index: 73,
+                luid: 14918723538255872,
+                guid: [5; 16],
+            },
+        });
+        let base = Model::new(
+            scope(),
+            [
+                Some(Member {
+                    interface: Interface {
+                        index: 73,
+                        luid: 14918723538255872,
+                    },
+                    probes: vec![],
+                }),
+                None,
+            ],
+            None,
+        )
+        .unwrap();
+        let pending = ExchangePlan::new(&pair.guard, &base).unwrap();
+        pair.pending_guard = Some(pending.clone());
+        let (mut store, _) = WindowsPairStore::open(f.clone(), scope(), RecordKind::Pair).unwrap();
+        store.save(&pair).unwrap();
+        let (view, _) = f.recovery_view(RuntimeSlot::Stable).unwrap().unwrap();
+        let (mut store, _) =
+            WindowsPairStore::open(view.clone(), scope(), RecordKind::Pair).unwrap();
+        let mut observed = base.expected.clone();
+        observed.sublayer.as_mut().unwrap().weight = 32771;
+        pair.guard = pending.resolve(&observed).unwrap();
+        pair.pending_guard = None;
+        // Unknown keys/filter contents, scope, and a changed member identity are
+        // not legitimized by acknowledging a native assignment.
+        let before = disk.0.borrow().bytes.clone();
+        for mutation in 0..5 {
+            let mut bad = pair.clone();
+            match mutation {
+                0 => bad.guard.expected.filters[0].weight += 1,
+                1 => bad.guard.expected.sublayer.as_mut().unwrap().key.0[0] ^= 1,
+                2 => bad.guard.scope.connection_generation += 1,
+                3 => {
+                    bad.guard.members[0].as_mut().unwrap().interface.index += 1;
+                }
+                4 => bad.members[0].as_mut().unwrap().owner.intent.config_sha256 = [99; 32],
+                _ => unreachable!(),
+            }
+            assert!(store.save(&bad).is_err(), "mutation {mutation}");
+            assert_eq!(disk.0.borrow().bytes, before);
+        }
+        store
+            .save(&pair)
+            .expect("native creation readback must remain saveable in cleanup view");
+        let (_, saved) = WindowsPairStore::open(view.clone(), scope(), RecordKind::Pair).unwrap();
+        assert_eq!(
+            saved.unwrap().guard.expected.sublayer.unwrap().weight,
+            32771
+        );
+        // Once acknowledged, the same valid shape at a different weight is no
+        // longer a creation readback. It must not become a new CAS precondition.
+        let mut changed = pair.clone();
+        changed.guard.assigned_sublayer_weight = Some(32772);
+        changed.guard.expected.sublayer.as_mut().unwrap().weight = 32772;
+        changed.guard.validate().unwrap();
+        assert!(store.save(&changed).is_err());
+        // The retained stopped owner can then withdraw its exact pinned guard.
+        let empty = Model::empty(scope()).unwrap();
+        pair.pending_guard = Some(ExchangePlan::new(&pair.guard, &empty).unwrap());
+        store.save(&pair).unwrap();
+        pair.guard = empty;
+        pair.pending_guard = None;
+        store.save(&pair).unwrap();
+        pair.members = [None, None];
+        pair.closing = false;
+        store.save(&pair).unwrap();
+        let mut view = view;
+        clean(&mut view);
+        view.complete(&scope()).unwrap();
+        assert!(view.scopes(RuntimeSlot::Stable).unwrap().is_empty());
+    }
+
     fn pair_with_predecessor() -> PairRecord {
         use crate::member_owner::{InterfaceProof, NativeProof, Phase, ProcessProof};
         let mut pair = prepared_pair();
