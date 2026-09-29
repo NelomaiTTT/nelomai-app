@@ -25,6 +25,7 @@ mod member_physical;
 pub mod member_plan;
 mod member_reboot;
 pub mod member_routes;
+mod member_source;
 pub mod redundancy;
 #[cfg(any(windows, test))]
 mod service_lifecycle;

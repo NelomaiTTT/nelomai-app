@@ -39,7 +39,7 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
 
@@ -613,7 +613,23 @@ impl<F: SessionFiles> PairIo for WindowsPairIo<F> {
     fn open_base(&mut self, m: &MemberRecord) -> io::Result<(Self::Socket, ProbeTuple)> {
         self.verify(m)?;
         let proof = m.owner.proof.ok_or_else(failed)?;
-        verify_source(m)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        crate::member_source::wait_until_preferred(
+            || {
+                if Instant::now() >= deadline {
+                    return Err(io::ErrorKind::TimedOut.into());
+                }
+                self.verify(m)?;
+                source_readiness(m)
+            },
+            || {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(io::ErrorKind::TimedOut)?;
+                std::thread::sleep(remaining.min(Duration::from_millis(50)));
+                Ok(())
+            },
+        )?;
         let socket = NativeProbeSocket::open(proof.interface.index, m.source, m.probe.target_ipv4)?;
         self.verify(m)?;
         verify_source(m)?;
@@ -846,6 +862,12 @@ fn dns_interface(m: &MemberRecord) -> io::Result<member_dns::OwnedInterface> {
     })
 }
 fn verify_source(m: &MemberRecord) -> io::Result<()> {
+    match source_readiness(m)? {
+        crate::member_source::Readiness::Preferred => Ok(()),
+        crate::member_source::Readiness::Tentative => Err(failed()),
+    }
+}
+fn source_readiness(m: &MemberRecord) -> io::Result<crate::member_source::Readiness> {
     let p = m.owner.proof.ok_or_else(failed)?;
     let mut row = MIB_UNICASTIPADDRESS_ROW::default();
     unsafe { InitializeUnicastIpAddressEntry(&mut row) };
@@ -861,14 +883,14 @@ fn verify_source(m: &MemberRecord) -> io::Result<()> {
         },
         sin_zero: [0; 8],
     };
-    if unsafe { GetUnicastIpAddressEntry(&mut row) } != 0
-        || row.InterfaceIndex != p.interface.index
-        || unsafe { row.InterfaceLuid.Value } != p.interface.luid
-        || row.DadState != 4
-    {
+    if unsafe { GetUnicastIpAddressEntry(&mut row) } != 0 {
         return Err(failed());
     }
-    Ok(())
+    crate::member_source::classify(
+        (p.interface.index, p.interface.luid),
+        (row.InterfaceIndex, unsafe { row.InterfaceLuid.Value }),
+        row.DadState,
+    )
 }
 
 pub(crate) type NativeWindowsPair<F> = SessionNativePair<WindowsPairIo<F>, WindowsPairStore<F>>;
