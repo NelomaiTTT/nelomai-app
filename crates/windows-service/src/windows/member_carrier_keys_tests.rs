@@ -77,6 +77,7 @@ struct State {
     nic: bool,
     lock_valid: bool,
     panic_after_write: bool,
+    effect_denied: bool,
 }
 type Shared = Rc<RefCell<State>>;
 struct Kernel(Shared);
@@ -88,6 +89,20 @@ impl NativeAuthority for Authority {
             Ok(())
         } else {
             Err(Error::Conflict)
+        }
+    }
+    fn authorize_effect(
+        &mut self,
+        lock: &mut bool,
+        pending: &Record,
+        _: &Binding,
+        _: Effect,
+    ) -> Result<()> {
+        self.verify(lock, &pending.context)?;
+        if self.0.borrow().effect_denied {
+            Err(Error::Conflict)
+        } else {
+            Ok(())
         }
     }
     fn nic_absence(
@@ -195,6 +210,112 @@ fn setup() -> (Keys<Kernel, Authority>, Shared) {
         Keys::new(Kernel(shared.clone()), Authority(shared.clone()), context()),
         shared,
     )
+}
+
+#[test]
+fn observation_permission_does_not_authorize_native_key_creation() {
+    let (mut io, s) = setup();
+    let r = pending();
+    let b = r.context.bindings[0].clone();
+    let f = io.inspect(&mut true, &r, &b, None, 1).unwrap();
+    s.borrow_mut().effect_denied = true;
+    assert!(io.create_new_key(&mut true, &r, &b, &f).is_err());
+    assert!(s.borrow().path.is_none());
+}
+
+#[test]
+fn observation_permission_does_not_authorize_native_value_write() {
+    let (mut io, s) = setup();
+    let mut r = pending();
+    let b = r.context.bindings[0].clone();
+    let f = io.inspect(&mut true, &r, &b, None, 1).unwrap();
+    let ack = io.create_new_key(&mut true, &r, &b, &f).unwrap();
+    r.keys[0].new_key_ack = true;
+    r.keys[0].phase = KeyPhase::DisablePending;
+    r.keys[0].pending = Some(Value::DwordZero);
+    let f = io.inspect(&mut true, &r, &b, Some(&ack), 2).unwrap();
+    s.borrow_mut().effect_denied = true;
+    assert!(io
+        .compare_exchange_value(
+            &mut true,
+            &r,
+            &b,
+            &ack,
+            &f,
+            ValueCas {
+                expected: Value::Absent,
+                desired: Value::DwordZero,
+                value_name: VALUE
+            }
+        )
+        .is_err());
+    assert_eq!(s.borrow().writes, 0);
+    assert_eq!(s.borrow().values.get(&11), Some(&NativeValue::Absent));
+}
+
+#[test]
+fn reopened_preparing_receipt_cannot_authorize_creation_or_disable() {
+    let mut r = pending();
+    let b = r.context.bindings[0].clone();
+    assert!(effect_matches_storage(&r, &b, Effect::Create, &r, true).is_ok());
+    assert!(effect_matches_storage(&r, &b, Effect::Create, &r, false).is_err());
+    r.keys[0].new_key_ack = true;
+    r.keys[0].phase = KeyPhase::DisablePending;
+    r.keys[0].pending = Some(Value::DwordZero);
+    let effect = Effect::Value(ValueCas {
+        expected: Value::Absent,
+        desired: Value::DwordZero,
+        value_name: VALUE,
+    });
+    assert!(effect_matches_storage(&r, &b, effect, &r, true).is_ok());
+    assert!(effect_matches_storage(&r, &b, effect, &r, false).is_err());
+}
+
+#[test]
+fn only_the_exact_persisted_pending_receipt_can_authorize_an_effect() {
+    let r = pending();
+    let b = r.context.bindings[0].clone();
+    for mode in 0..4 {
+        let mut actual = r.clone();
+        match mode {
+            0 => actual.generation += 1,
+            1 => actual.context.provenance.network_epoch += 1,
+            2 => actual.context.intent.scope.connection_generation += 1,
+            _ => actual.keys[0].phase = KeyPhase::Unstarted,
+        }
+        assert!(effect_matches_storage(&r, &b, Effect::Create, &actual, true).is_err());
+    }
+    let foreign = r.context.bindings[1].clone();
+    assert!(effect_matches_storage(&r, &foreign, Effect::Create, &r, true).is_err());
+    let mut unsupported = r.clone();
+    unsupported.version = 999;
+    assert!(effect_matches_storage(&unsupported, &b, Effect::Create, &unsupported, true).is_err());
+}
+
+#[test]
+fn cleanup_authorizes_only_exact_owned_value_restoration_not_key_deletion() {
+    let mut r = pending();
+    let b = r.context.bindings[0].clone();
+    r.phase = Phase::Closing;
+    r.keys[0].new_key_ack = true;
+    r.keys[0].phase = KeyPhase::RestorePending;
+    r.keys[0].current = Value::DwordZero;
+    r.keys[0].pending = Some(Value::Absent);
+    let effect = Effect::Value(ValueCas {
+        expected: Value::DwordZero,
+        desired: Value::Absent,
+        value_name: VALUE,
+    });
+    assert!(effect_matches_storage(&r, &b, effect, &r, false).is_ok());
+    assert!(effect_matches_storage(&r, &b, Effect::Create, &r, true).is_err());
+    let wrong = Effect::Value(ValueCas {
+        expected: Value::DwordZero,
+        desired: Value::Absent,
+        value_name: "ForeignValue",
+    });
+    assert!(effect_matches_storage(&r, &b, wrong, &r, false).is_err());
+    r.keys[0].new_key_ack = false;
+    assert!(effect_matches_storage(&r, &b, effect, &r, false).is_err());
 }
 fn name_bytes(name: &str) -> Vec<u8> {
     let b: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();

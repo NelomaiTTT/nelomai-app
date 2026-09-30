@@ -31,12 +31,88 @@ pub(crate) fn decode_value(kind: u32, bytes: &[u8]) -> Result<NativeValue> {
 pub(crate) trait NativeAuthority {
     type Lock;
     fn verify(&mut self, lock: &mut Self::Lock, context: &Context) -> Result<()>;
+    /// Separate native-effect authorization from read-only context/lock checks.
+    /// Must re-read the protected pending record and actual fresh/cleanup claim.
+    fn authorize_effect(
+        &mut self,
+        lock: &mut Self::Lock,
+        pending: &Record,
+        binding: &Binding,
+        effect: Effect,
+    ) -> Result<()>;
     fn nic_absence(
         &mut self,
         lock: &mut Self::Lock,
         context: &Context,
         binding: &Binding,
     ) -> Result<(bool, bool, bool)>;
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Effect {
+    Create,
+    Value(ValueCas),
+}
+
+/// The storage snapshot is independently authenticated by SessionFiles, not
+/// supplied by the caller. This pure policy does not attest native ownership.
+pub(crate) fn effect_matches_storage(
+    pending: &Record,
+    binding: &Binding,
+    effect: Effect,
+    actual: &Record,
+    fresh: bool,
+) -> Result<()> {
+    receipt::validate_record(pending)?;
+    if actual != pending {
+        return Err(Error::Conflict);
+    }
+    let index = pending
+        .context
+        .bindings
+        .iter()
+        .position(|b| b == binding)
+        .ok_or(Error::Conflict)?;
+    let key = &pending.keys[index];
+    let allowed = match effect {
+        Effect::Create => {
+            fresh
+                && pending.phase == Phase::Preparing
+                && key.phase == KeyPhase::CreatePending
+                && !key.new_key_ack
+                && key.baseline == Value::Absent
+                && key.current == Value::Absent
+                && key.pending.is_none()
+        }
+        Effect::Value(value) => {
+            value.value_name == VALUE
+                && key.new_key_ack
+                && key.current == value.expected
+                && key.pending == Some(value.desired)
+                && (matches!(
+                    (pending.phase, key.phase, value.expected, value.desired),
+                    (
+                        Phase::Closing,
+                        KeyPhase::RestorePending,
+                        Value::DwordZero,
+                        Value::Absent
+                    )
+                ) || fresh
+                    && matches!(
+                        (pending.phase, key.phase, value.expected, value.desired),
+                        (
+                            Phase::Preparing,
+                            KeyPhase::DisablePending,
+                            Value::Absent,
+                            Value::DwordZero
+                        )
+                    ))
+        }
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::Conflict)
+    }
 }
 pub(crate) trait RegistryKernel {
     type Handle;
@@ -277,6 +353,8 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
         let (parent, parent_name) = self.parent()?;
         let child = Self::child(binding)?.to_owned();
         self.assert_serialized_lock(lock, &pending.context)?;
+        self.authority
+            .authorize_effect(lock, pending, binding, Effect::Create)?;
         self.poisoned = true;
         let (handle, disposition) = self
             .kernel
@@ -363,6 +441,8 @@ impl<K: RegistryKernel, A: NativeAuthority> NativeKeyIo for Keys<K, A> {
             return Err(Error::Conflict);
         }
         self.assert_serialized_lock(lock, &pending.context)?;
+        self.authority
+            .authorize_effect(lock, pending, binding, Effect::Value(mutation))?;
         // Windows offers no registry value CAS. Serialization is independently
         // mandatory; only our captured handle is written, never an opened path.
         self.poisoned = true;
