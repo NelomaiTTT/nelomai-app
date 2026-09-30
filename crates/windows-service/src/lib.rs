@@ -8,6 +8,7 @@ pub use nelomai_contracts::dispatcher;
 #[cfg(any(windows, test))]
 mod install_recovery;
 pub mod member_actor;
+mod member_carrier;
 mod member_diagnostic;
 pub use member_diagnostic::PairFailure;
 #[cfg(all(test, not(windows)))]
