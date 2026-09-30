@@ -72,6 +72,148 @@ pub fn slot_configuration(input: &str) -> Result<zeroize::Zeroizing<String>, Ser
     Ok(output)
 }
 
+/// Logical network intent is kept separate from addressless pair transports.
+pub struct PairConfiguration {
+    pub native: zeroize::Zeroizing<String>,
+    pub addresses: Vec<ipnet::IpNet>,
+    pub dns: Vec<std::net::IpAddr>,
+}
+
+impl PairConfiguration {
+    pub fn matches_network(&self, other: &Self) -> bool {
+        self.addresses == other.addresses && self.dns == other.dns
+    }
+}
+
+/// Validates carrier network intent and renders one addressless member.
+/// Native key/AWG value validation is still required before engine effects.
+/// This does not enable a carrier factory or change the ordinary renderer.
+pub fn pair_configuration(input: &str) -> Result<PairConfiguration, ServiceError> {
+    let rendered = slot_configuration(input)?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut section = 0;
+    // Inspect logical fields before the member renderer discards DNS/Table.
+    // Duplicate/unknown fields cannot acquire a different meaning on C/A/B.
+    for raw in input.lines() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            section = if line.eq_ignore_ascii_case("[Interface]") {
+                1
+            } else {
+                2
+            };
+            continue;
+        }
+        let (key, _) = line.split_once('=').ok_or(ServiceError::InvalidRequest)?;
+        let key = key.trim().to_ascii_lowercase();
+        let supported = if section == 1 {
+            matches!(
+                key.as_str(),
+                "privatekey"
+                    | "address"
+                    | "dns"
+                    | "mtu"
+                    | "table"
+                    | "listenport"
+                    | "headerprotectionkey"
+                    | "contentpaddingaddition"
+                    | "jc"
+                    | "jmin"
+                    | "jmax"
+                    | "s1"
+                    | "s2"
+                    | "s3"
+                    | "s4"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "i1"
+                    | "i2"
+                    | "i3"
+                    | "i4"
+                    | "i5"
+                    | "rekeyaftertime"
+                    | "rekeytimeout"
+                    | "rejectaftertime"
+                    | "keepalivetimeout"
+                    | "maxhandshakeattempts"
+            )
+        } else {
+            matches!(
+                key.as_str(),
+                "publickey" | "presharedkey" | "allowedips" | "endpoint" | "persistentkeepalive"
+            )
+        };
+        if !supported || !seen.insert((section, key)) {
+            return Err(ServiceError::InvalidRequest);
+        }
+    }
+    let parameters = crate::member_pair::MemberParameters::parse(input)
+        .map_err(|_| ServiceError::InvalidRequest)?;
+    let mut native = zeroize::Zeroizing::new(String::new());
+    let mut addresses = Vec::new();
+    let mut interface = false;
+    for line in rendered.lines() {
+        if line.starts_with('[') {
+            interface = line.eq_ignore_ascii_case("[Interface]");
+        }
+        if interface {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("address") {
+                    addresses = value
+                        .split(',')
+                        .map(|part| {
+                            part.trim()
+                                .parse()
+                                .map_err(|_| ServiceError::InvalidRequest)
+                        })
+                        .collect::<Result<Vec<ipnet::IpNet>, _>>()?;
+                    continue;
+                }
+            }
+        }
+        native.push_str(line);
+        native.push('\n');
+    }
+    // IPv6 support is explicit and gated on the native carrier implementation;
+    // rendering must not silently discard unsupported logical addresses.
+    if addresses.len() != 1
+        || !matches!(addresses[0], ipnet::IpNet::V4(a) if a.prefix_len() == 32 && usable_pair_v4(a.addr()))
+        || parameters
+            .dns
+            .iter()
+            .any(|a| !matches!(a, std::net::IpAddr::V4(a) if usable_pair_v4(*a)))
+        || parameters
+            .dns
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != parameters.dns.len()
+    {
+        return Err(ServiceError::InvalidRequest);
+    }
+    Ok(PairConfiguration {
+        native,
+        addresses,
+        dns: parameters.dns,
+    })
+}
+
+fn usable_pair_v4(a: std::net::Ipv4Addr) -> bool {
+    !a.is_unspecified()
+        && !a.is_loopback()
+        && !a.is_multicast()
+        && !a.is_broadcast()
+        && !a.is_link_local()
+        && a.octets()[0] != 0
+        && a.octets()[0] < 240
+}
+
 pub fn slot_config_filename(slot: TunnelSlot) -> &'static str {
     match slot {
         TunnelSlot::A => "nelomai-a.conf",
