@@ -503,6 +503,41 @@ fn driver_detail_ids_respect_offset_length_not_assumed_double_nul() {
     }
 }
 #[test]
+fn actual_setupapi_empty_id_reply_is_shorter_than_padded_sdk_structure() {
+    // DESKTOP-1DGFU8K 30Sep11:01:35: required1578, offsetof HardwareID1576,
+    // sizeof SDK structure1584, CompatIDsOffset/Length0. Only one WCHAR NUL,
+    // not the six bytes of C tail padding, belongs to this variable response.
+    assert_eq!(driver_detail_words(1578, 1576, 65536), Ok(1));
+    assert_eq!(driver_ids(&[0], 0, 0).unwrap(), Vec::<String>::new());
+    assert_eq!(driver_detail_words(1590, 1576, 65536), Ok(7));
+    assert_eq!(
+        driver_ids(&words("Wintun\0"), 7, 0).unwrap(),
+        vec!["Wintun"]
+    );
+}
+#[test]
+fn variable_driver_reply_rejects_prefix_truncation_odd_tail_and_overflow() {
+    for (required, offset, capacity) in [
+        (1576, 1576, 65536),
+        (1577, 1576, 65536),
+        (1579, 1576, 65536),
+        (65538, 1576, 65536),
+        (1578, 1576, 1577),
+        (1578, usize::MAX, 65536),
+        (usize::MAX, 1576, 65536),
+    ] {
+        assert!(driver_detail_words(required, offset, capacity).is_err());
+    }
+}
+#[test]
+fn actual_scm_query_buffer_respects_documented_eight_kib_rpc_limit() {
+    let buffer = service_query_buffer();
+    // QueryServiceConfigW documents maximum8192 BYTES, not SetupAPI's64KiB.
+    assert_eq!(std::mem::size_of_val(buffer.as_slice()), 8192);
+    assert_eq!(buffer.as_ptr() as usize % std::mem::align_of::<u64>(), 0);
+    assert!(buffer.iter().all(|word| *word == 0));
+}
+#[test]
 fn native_classification_catches_stub_legacy_service_and_compatible_ids() {
     for instance in ["SWD\\Wintun\\stub", "ROOT\\WINTUN\\old"] {
         assert!(related_device(instance, &[], None));

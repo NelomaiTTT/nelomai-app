@@ -500,6 +500,23 @@ fn multi_sz(words: &[u16]) -> Result<Vec<String>> {
     }
     Ok(result)
 }
+fn driver_detail_words(required: usize, id_offset: usize, capacity: usize) -> Result<usize> {
+    // RequiredSize ends at the variable HardwareID buffer, not C tail padding.
+    // Actual Win32 empty-ID replies are offsetof(HardwareID)+one WCHAR NUL.
+    // cbSize supplied TO SetupAPI remains the FULL sizeof SDK structure.
+    let tail = required
+        .checked_sub(id_offset)
+        .ok_or(Error::Invalid("driver detail prefix"))?;
+    if required > capacity || tail < 2 || tail % 2 != 0 {
+        return Err(Error::Invalid("driver detail bound"));
+    }
+    Ok(tail / 2)
+}
+fn service_query_buffer() -> Vec<u64> {
+    // QueryServiceConfigW's RPC contract caps this array at8192 bytes; the
+    // 64KiB SetupAPI/registry buffer is NOT legal for this different API.
+    vec![0; 8 * 1024 / std::mem::size_of::<u64>()]
+}
 fn driver_ids(words: &[u16], offset: usize, length: usize) -> Result<Vec<String>> {
     if words.len() > 32768 || offset > words.len() {
         return Err(Error::Invalid("driver IDs bound"));
@@ -977,16 +994,18 @@ pub(crate) mod native {
                 return Err(last("SetupDiGetDriverInfoDetailW"));
             }
             let id_offset = offset_of!(SP_DRVINFO_DETAIL_DATA_W, HardwareID);
-            if required as usize > BUFFER
-                || (required as usize) < size_of::<SP_DRVINFO_DETAIL_DATA_W>()
-            {
-                return Err(Error::Invalid("driver detail bound"));
-            }
+            let word_count = driver_detail_words(required as usize, id_offset, BUFFER)?;
+            // Backing allocation is initialized and larger than the FULL SDK
+            // struct. Read all static fields but never count its C tail padding
+            // as returned ID data or require Windows to include that padding.
             let info = unsafe { ptr::read(detail) };
+            if info.cbSize != size_of::<SP_DRVINFO_DETAIL_DATA_W>() as u32 {
+                return Err(Error::Invalid("driver detail cbSize"));
+            }
             let words = unsafe {
                 std::slice::from_raw_parts(
                     storage.as_ptr().cast::<u8>().add(id_offset).cast::<u16>(),
-                    (required as usize - id_offset) / 2,
+                    word_count,
                 )
             };
             let ids = driver_ids(
@@ -1198,20 +1217,21 @@ pub(crate) mod native {
         if service.0.is_null() {
             return Err(last("OpenServiceW Wintun"));
         }
-        let mut storage = vec![0u64; BUFFER / 8];
+        let mut storage = service_query_buffer();
+        let capacity = std::mem::size_of_val(storage.as_slice());
         let config = storage.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>();
         let mut needed = 0;
-        if unsafe { QueryServiceConfigW(service.0, config, BUFFER as u32, &mut needed) } == 0 {
+        if unsafe { QueryServiceConfigW(service.0, config, capacity as u32, &mut needed) } == 0 {
             return Err(last("QueryServiceConfigW"));
         }
         let config = unsafe { ptr::read(config) };
         let base = storage.as_ptr() as usize;
         let address = config.lpBinaryPathName as usize;
-        if address < base || address >= base + BUFFER || address % 2 != 0 {
+        if address < base || address >= base + capacity || address % 2 != 0 {
             return Err(Error::Invalid("service binary pointer"));
         }
         let words = unsafe {
-            std::slice::from_raw_parts(config.lpBinaryPathName, (base + BUFFER - address) / 2)
+            std::slice::from_raw_parts(config.lpBinaryPathName, (base + capacity - address) / 2)
         };
         let binary = wide_z(words)?;
         let binary = binary
@@ -1398,6 +1418,13 @@ pub(crate) mod native {
             if kind != REG_MULTI_SZ || length as usize > bytes.len() || length % 2 != 0 {
                 return Err(Error::Invalid("pending rename type/bound"));
             }
+            #[cfg(test)]
+            println!(
+                "WINTUN_PACKAGE_PENDING type={} bytes={} nonzero_bytes={}",
+                kind,
+                length,
+                bytes[..length as usize].iter().filter(|b| **b != 0).count()
+            );
             // A deletion uses an empty destination, unlike ordinary MULTI_SZ.
             // Do not project away that obligation. ANY nonempty queue is denied,
             // even an unrelated rename; no unknown string is normalized to safe.
@@ -1502,6 +1529,105 @@ pub(crate) mod native {
             checked,
             not_send: std::marker::PhantomData,
         })
+    }
+
+    #[cfg(test)]
+    mod installed_data_tests {
+        use super::*;
+
+        /// Explicit diagnostic: raw native query/parser/trust coverage ONLY.
+        /// Does not construct CheckedExistingPackage/ModuleRuntimeAuthority and
+        /// does NOT authenticate this test process as the installed runtime.
+        /// No Wintun executable loading, exports or package/device writes.
+        #[test]
+        #[ignore = "requires separately authorized DESKTOP-1DGFU8K data-only hardware gate"]
+        fn installed_cold_package_data_readback() {
+            assert_eq!(
+                std::env::var("COMPUTERNAME").as_deref(),
+                Ok("DESKTOP-1DGFU8K")
+            );
+            // Independent child deadline: this diagnostic performs reads only,
+            // so abort releases its own file/query/trust handles, no adoption or
+            // compensating driver/device cleanup. Outer retained process also
+            // supervises it. Never use this pattern around mutating native calls.
+            let _deadline = std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                std::process::abort();
+            });
+            println!("WINTUN_PACKAGE_BEGIN data_only=true deadline_seconds=30");
+            let source = Pin::open(Path::new(
+                "C:\\Program Files\\Nelomai\\runtime\\engines\\latest\\0.3.3\\wintun.dll",
+            ))
+            .expect("retain installed data-only source");
+            let inventory = Native {
+                source: &source.file,
+            }
+            .inventory()
+            .expect("read cold inventory before validation");
+            println!(
+                "WINTUN_PACKAGE_INVENTORY candidates={} devices={} service_type={} service_start={} service_state={} pending_maintenance={}",
+                inventory.candidates.len(), inventory.devices.len(),
+                inventory.service_type, inventory.service_start, inventory.service_state,
+                inventory.pending_maintenance,
+            );
+            for candidate in &inventory.candidates {
+                println!(
+                    "WINTUN_PACKAGE_CANDIDATE date={} version={} provider_matches={}",
+                    candidate.date,
+                    candidate.version,
+                    candidate.provider == "WireGuard LLC"
+                );
+            }
+            for device in &inventory.devices {
+                println!(
+                    "WINTUN_PACKAGE_DEVICE status={} problem={}",
+                    device.status, device.problem
+                );
+            }
+            let mut observed = check(Native {
+                source: &source.file,
+            })
+            .expect("actual cold package data observations");
+            observed
+                .reattest()
+                .expect("repeat exact native data observations");
+            assert_eq!(observed.inventory.candidates.len(), 1);
+            assert!(observed.inventory.devices.is_empty());
+            println!(
+                "WINTUN_PACKAGE_READBACK source_sha256={} candidate_date={} candidate_version={} service_type={} service_start={} service_state={} pending_maintenance={} devices={}",
+                hex(&hash(&observed.source.bytes)),
+                observed.inventory.candidates[0].date,
+                observed.inventory.candidates[0].version,
+                observed.inventory.service_type,
+                observed.inventory.service_start,
+                observed.inventory.service_state,
+                observed.inventory.pending_maintenance,
+                observed.inventory.devices.len(),
+            );
+            for (role, file) in [
+                "published-inf",
+                "store-inf",
+                "store-cat",
+                "store-sys",
+                "system-sys",
+            ]
+            .into_iter()
+            .zip(&observed.files)
+            {
+                println!(
+                    "WINTUN_PACKAGE_FILE role={} sha256={} volume={} id={} bytes={}",
+                    role,
+                    hex(&hash(&file.bytes)),
+                    file.stamp.volume,
+                    file.stamp.id,
+                    file.stamp.size
+                );
+            }
+            println!("WINTUN_PACKAGE_SCOPE data_only=true runtime_authority=false executable_load=false device_effects=false");
+        }
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
     }
 }
 
