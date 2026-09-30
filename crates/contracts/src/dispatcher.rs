@@ -357,14 +357,38 @@ impl BrokerPolicy {
 }
 
 /// The file is held for the entire operation, including private-engine IPC.
-pub struct MutationGuard(File);
+pub struct MutationGuard {
+    file: File,
+    path: PathBuf,
+    identity: BrokerFileIdentity,
+}
 impl MutationGuard {
+    /// Reattest the retained mutation-lock capability before a native effect.
+    /// The private file cannot be cloned/unlocked through this API. Matching
+    /// a path string alone is insufficient: both the still-held file and a
+    /// fresh no-follow open must match the original captured file identity.
+    /// This is lock continuity, NOT authentication of the enclosing runtime,
+    /// directory ACL, boot, lifecycle generation or authority over a NIC.
+    pub fn verify_at(&self, path: &Path) -> io::Result<()> {
+        if std::path::absolute(path)? != self.path
+            || mutation_lock_identity(&self.file)? != self.identity
+        {
+            return Err(blocked());
+        }
+        reject_link(&self.path)?;
+        let current = open_regular(&self.path)?;
+        if mutation_lock_identity(&current)? != self.identity {
+            return Err(blocked());
+        }
+        Ok(())
+    }
     pub fn acquire(root: &Path) -> io::Result<Self> {
         Self::at(&root.join("mutation.lock"))
     }
     pub fn at(path: &Path) -> io::Result<Self> {
+        let path = std::path::absolute(path)?;
         if path.exists() {
-            reject_link(path)?;
+            reject_link(&path)?;
         }
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -375,22 +399,65 @@ impl MutationGuard {
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
-        let file = options.open(path)?;
-        if !file.metadata()?.is_file() {
-            return Err(blocked());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
         }
+        let file = options.open(&path)?;
+        // Reject aliases before even changing permissions on this file.
+        mutation_lock_identity(&file)?;
+        // A rejected contender must not chmod the retained owner's file and
+        // thereby alter its captured identity before it acquires the lock.
+        file.try_lock_exclusive()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
-        file.try_lock_exclusive()?;
-        Ok(Self(file))
+        let identity = mutation_lock_identity(&file)?;
+        let guard = Self {
+            file,
+            path,
+            identity,
+        };
+        guard.verify_at(&guard.path)?;
+        Ok(guard)
     }
+}
+fn mutation_lock_identity(file: &File) -> io::Result<BrokerFileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(blocked());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(blocked());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if info.nNumberOfLinks != 1 || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(blocked());
+        }
+    }
+    broker_file_identity(file)
 }
 impl Drop for MutationGuard {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 

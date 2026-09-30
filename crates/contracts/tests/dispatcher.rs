@@ -312,6 +312,99 @@ fn mutation_lock_rejects_concurrent_owners() {
 }
 
 #[test]
+fn mutation_lock_verifies_only_the_exact_retained_file_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.lock");
+    let second = directory.path().join("second.lock");
+    let guard = MutationGuard::at(&first).unwrap();
+    let other = MutationGuard::at(&second).unwrap();
+    assert!(guard.verify_at(&first).is_ok());
+    assert!(guard.verify_at(&second).is_err());
+    assert!(other.verify_at(&first).is_err());
+    assert!(MutationGuard::at(&first).is_err());
+    assert!(
+        guard.verify_at(&first).is_ok(),
+        "a rejected competing acquisition must not invalidate the owner"
+    );
+    drop(guard);
+    assert!(MutationGuard::at(&first).is_ok());
+}
+
+#[test]
+fn mutation_lock_cannot_attest_a_same_path_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owner.lock");
+    let retained = directory.path().join("retained.lock");
+    let guard = MutationGuard::at(&path).unwrap();
+    fs::rename(&path, &retained).unwrap();
+    fs::write(&path, b"").unwrap();
+    assert!(guard.verify_at(&path).is_err());
+    assert!(guard.verify_at(&retained).is_err());
+    assert!(MutationGuard::at(&retained).is_err());
+}
+
+#[test]
+fn mutation_lock_rejects_hardlink_alias_at_creation_and_attestation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owner.lock");
+    let alias = directory.path().join("alias.lock");
+    let guard = MutationGuard::at(&path).unwrap();
+    fs::hard_link(&path, &alias).unwrap();
+    assert!(guard.verify_at(&path).is_err());
+    assert!(guard.verify_at(&alias).is_err());
+    drop(guard);
+    assert!(MutationGuard::at(&path).is_err());
+    assert!(MutationGuard::at(&alias).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn mutation_lock_rejects_symlink_replacement_without_following_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owner.lock");
+    let retained = directory.path().join("retained.lock");
+    let guard = MutationGuard::at(&path).unwrap();
+    fs::rename(&path, &retained).unwrap();
+    std::os::unix::fs::symlink(&retained, &path).unwrap();
+    assert!(guard.verify_at(&path).is_err());
+    assert!(MutationGuard::at(&path).is_err());
+}
+
+#[test]
+fn mutation_lock_rejects_changed_file_contents_and_missing_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owner.lock");
+    let guard = MutationGuard::at(&path).unwrap();
+    assert!(guard.verify_at(&path).is_ok());
+    // Windows may deny a write into the locked range; that is also safe.
+    if fs::write(&path, b"changed outside owner").is_ok() {
+        assert!(guard.verify_at(&path).is_err());
+    }
+    drop(guard);
+    let guard = MutationGuard::at(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(guard.verify_at(&path).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn mutation_lock_refuses_hardlink_without_changing_target_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("owner.lock");
+    let alias = directory.path().join("alias.lock");
+    fs::write(&path, b"unrelated").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::hard_link(&path, &alias).unwrap();
+    assert!(MutationGuard::at(&alias).is_err());
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"unrelated");
+}
+
+#[test]
 fn broker_policy_rejects_same_hash_at_another_kernel_path_and_changed_installed_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let broker = directory.path().join("broker");
