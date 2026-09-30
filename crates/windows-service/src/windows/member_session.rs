@@ -5,6 +5,7 @@
 #[cfg(windows)]
 use super::member_files::{previous_config_valid, PrivateFile, PrivateRecords, SessionFileIo};
 use crate::member_carrier::{self as carrier, CarrierJournal, CarrierKey, Record as CarrierRecord};
+use crate::member_carrier_native_ownership::{self as native_receipt, NativeJournal};
 #[cfg(not(windows))]
 use crate::member_files::{previous_config_valid, PrivateFile, PrivateRecords, SessionFileIo};
 use crate::member_pair::{failed, PairRecord, PairStore};
@@ -25,6 +26,7 @@ pub(crate) enum RecordKind {
     Pair,
     Network,
     Carrier,
+    NativeCarrierReceipts,
 }
 /// All calls run under the existing serialized engine owner. The implementation
 /// authenticates runtime, private root/ancestors/handles and envelope scope;
@@ -34,6 +36,15 @@ pub(crate) trait SessionFiles: Clone {
     /// Authenticated storage context, not native authority. Default denial
     /// prevents adapters exposing bare JSON from becoming carrier stores.
     fn carrier_access(&mut self, _scope: &SessionScope) -> io::Result<CarrierAccess> {
+        Err(failed())
+    }
+    /// Independent protected permission, never inferred from receipt bytes.
+    fn native_carrier_access(&mut self, _scope: &SessionScope) -> io::Result<CarrierAccess> {
+        Err(failed())
+    }
+    /// Revoke the shared fresh claim after an unconfirmed receipt mutation.
+    /// Required even when a false success left the receipt file absent.
+    fn revoke_native_carrier_access(&mut self, _scope: &SessionScope) -> io::Result<()> {
         Err(failed())
     }
     /// Read-only completion/boot fact, not native ownership or cleanup authority.
@@ -95,7 +106,7 @@ struct SessionIndex {
     version: u32,
     active: Option<SessionIdentity>,
     // Only identities still represented by the fixed owned record files.
-    // Never the replay authority. Partial overwrites can leave four owners.
+    // Never the replay authority. Partial overwrites can leave five owners.
     completed: Vec<SessionIdentity>,
 }
 #[derive(Serialize, Deserialize)]
@@ -171,6 +182,18 @@ impl<I: SessionFileIo> ProtectedSessionFiles<I> {
     }
 }
 impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
+    fn native_carrier_access(&mut self, scope: &SessionScope) -> io::Result<CarrierAccess> {
+        self.carrier_access(scope)
+    }
+    fn revoke_native_carrier_access(&mut self, scope: &SessionScope) -> io::Result<()> {
+        self.identity(scope)?;
+        let mut backend = self.backend.lock().map_err(|_| failed())?;
+        // In-memory permission only; durable active/terminal claims remain intact.
+        if backend.fresh.as_ref() == Some(scope) {
+            backend.fresh = None;
+        }
+        Ok(())
+    }
     fn carrier_access(&mut self, scope: &SessionScope) -> io::Result<CarrierAccess> {
         let identity = self.identity(scope)?;
         let mut backend = self.backend.lock().map_err(|_| failed())?;
@@ -226,6 +249,7 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                         if self.cleanup_only && self.identity(&id.scope)? != *id {
                             return Err(failed());
                         }
+                        require_native_obligation(files, &index, id)?;
                         Ok(Some(id.clone()))
                     }
                     Some(_) => Err(failed()),
@@ -262,6 +286,7 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                 let (_, index) = load_index(files)?;
                 match &index.active {
                     Some(id) if self.identity(&id.scope).as_ref().is_ok_and(|own| own == id) => {
+                        require_native_obligation(files, &index, id)?;
                         Ok(vec![id.scope.clone()])
                     }
                     Some(_) => Err(failed()), // Retain old journals; never pass old LUIDs to cleanup.
@@ -394,6 +419,25 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                     // Cleanup keeps the retained envelope epoch, rather than
                     // migrating old carrier provenance to today's session epoch.
                     next.provenance.network_epoch
+                } else if kind == RecordKind::NativeCarrierReceipts {
+                    let next = native_payload(scope, desired)?;
+                    let old = current
+                        .as_ref()
+                        .map(|r| native_payload(scope, r.data.as_bytes()))
+                        .transpose()?;
+                    native_receipt::validate_transition(old.as_ref(), &next, !fresh)
+                        .map_err(|_| failed())?;
+                    let epoch = current_epoch(files, &index, &identity)?;
+                    let retained = next.context.provenance.network_epoch;
+                    if retained > epoch
+                        || (fresh
+                            && next.phase == native_receipt::Phase::Preparing
+                            && retained != epoch)
+                    {
+                        return Err(failed());
+                    }
+                    authenticate_native(&next, &identity, retained)?;
+                    retained
                 } else {
                     current_epoch(files, &index, &identity)?
                 };
@@ -476,6 +520,14 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                         return Err(failed());
                     }
                 }
+                let (_, native) =
+                    load_record(files, &index, &identity, RecordKind::NativeCarrierReceipts)?;
+                if let Some(native) = native {
+                    require_stopped_native(&native)?;
+                    if native.network_epoch > session.network_epoch {
+                        return Err(failed());
+                    }
+                }
                 finish_completion(files, raw.as_deref(), &mut index, &identity)
             })
             .map_err(|_| failed())?;
@@ -494,7 +546,7 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                     return Ok(());
                 }
                 require_active(&index, &identity)?;
-                for kind in RecordKind::ALL {
+                for kind in RecordKind::OWNED {
                     if load_record(files, &index, &identity, kind)?.1.is_some() {
                         return Err(failed());
                     }
@@ -507,13 +559,23 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
     }
 }
 impl RecordKind {
+    // Legacy fixture inventory; production fencing always uses OWNED.
+    #[cfg(test)]
     const ALL: [Self; 4] = [Self::Session, Self::Pair, Self::Network, Self::Carrier];
+    const OWNED: [Self; 5] = [
+        Self::Session,
+        Self::Pair,
+        Self::Network,
+        Self::Carrier,
+        Self::NativeCarrierReceipts,
+    ];
     fn file(self) -> PrivateFile {
         match self {
             Self::Session => PrivateFile::Session,
             Self::Pair => PrivateFile::Pair,
             Self::Network => PrivateFile::Network,
             Self::Carrier => PrivateFile::Carrier,
+            Self::NativeCarrierReceipts => PrivateFile::NativeCarrierReceipts,
         }
     }
 }
@@ -692,7 +754,7 @@ fn load_index(files: &mut dyn PrivateRecords) -> io::Result<(Option<Vec<u8>>, Se
         }
     };
     if index.version != PRIVATE_VERSION
-        || index.completed.len() > RecordKind::ALL.len()
+        || index.completed.len() > RecordKind::OWNED.len()
         || index
             .active
             .iter()
@@ -715,6 +777,19 @@ fn load_index(files: &mut dyn PrivateRecords) -> io::Result<(Option<Vec<u8>>, Se
     if let Some(active) = &index.active {
         if read_completed(files, &active.scope)?.is_some_and(|saved| saved != *active) {
             return Err(failed());
+        }
+    }
+    // A closed maximal index must actually represent all five bounded files.
+    // With an active claim, partial overwrites may temporarily hide old owners.
+    if index.active.is_none() && index.completed.len() == RecordKind::OWNED.len() {
+        let mut represented = vec![];
+        for kind in RecordKind::OWNED {
+            let raw = files.read(kind.file())?.ok_or_else(failed)?;
+            let saved = parse_record(kind, &raw)?;
+            if !index.completed.contains(&saved.identity) || represented.contains(&saved.identity) {
+                return Err(failed());
+            }
+            represented.push(saved.identity);
         }
     }
     Ok((bytes, index))
@@ -777,7 +852,13 @@ fn write_completed(files: &mut dyn PrivateRecords, id: &SessionIdentity) -> io::
     if bytes.len() > file.limit() {
         return Err(failed());
     }
-    files.compare_exchange(file, None, &bytes)
+    files.compare_exchange(file, None, &bytes)?;
+    // A success ACK without the exact durable marker cannot release a claim.
+    // Failed/lost ACK still returns failure; it never reacquires fresh access.
+    if files.read(file)?.as_deref() != Some(bytes.as_slice()) {
+        return Err(failed());
+    }
+    Ok(())
 }
 fn already_completed(
     files: &mut dyn PrivateRecords,
@@ -804,9 +885,12 @@ fn finish_completion(
     // revalidates the records and exact marker, never resumes native effects.
     write_completed(files, id)?;
     let mut residual = vec![];
-    for kind in RecordKind::ALL {
+    for kind in RecordKind::OWNED {
         if let Some(raw) = files.read(kind.file())? {
             let saved = parse_record(kind, &raw)?;
+            if kind == RecordKind::NativeCarrierReceipts {
+                require_stopped_native(&saved)?;
+            }
             if saved.identity != *id && !index.completed.contains(&saved.identity) {
                 return Err(failed());
             }
@@ -831,7 +915,11 @@ fn save_index(
     if bytes.len() > PrivateFile::Index.limit() {
         return Err(failed());
     }
-    files.compare_exchange(PrivateFile::Index, expected, &bytes)
+    files.compare_exchange(PrivateFile::Index, expected, &bytes)?;
+    if files.read(PrivateFile::Index)?.as_deref() != Some(bytes.as_slice()) {
+        return Err(failed());
+    }
+    Ok(())
 }
 fn require_active(index: &SessionIndex, identity: &SessionIdentity) -> io::Result<()> {
     if index.active.as_ref() != Some(identity) {
@@ -841,7 +929,7 @@ fn require_active(index: &SessionIndex, identity: &SessionIdentity) -> io::Resul
     }
 }
 fn require_retired_records(files: &mut dyn PrivateRecords, index: &SessionIndex) -> io::Result<()> {
-    for kind in RecordKind::ALL {
+    for kind in RecordKind::OWNED {
         if let Some(raw) = files.read(kind.file())? {
             let old = parse_record(kind, &raw)?;
             if !index.completed.contains(&old.identity) {
@@ -849,6 +937,9 @@ fn require_retired_records(files: &mut dyn PrivateRecords, index: &SessionIndex)
             }
             if kind == RecordKind::Carrier {
                 require_stopped_carrier(&old)?;
+            }
+            if kind == RecordKind::NativeCarrierReceipts {
+                require_stopped_native(&old)?;
             }
         }
     }
@@ -880,6 +971,13 @@ fn parse_record(kind: RecordKind, raw: &[u8]) -> io::Result<SavedRecord> {
             record.network_epoch,
         )?;
     }
+    if kind == RecordKind::NativeCarrierReceipts {
+        authenticate_native(
+            &native_payload(&record.identity.scope, record.data.as_bytes())?,
+            &record.identity,
+            record.network_epoch,
+        )?;
+    }
     Ok(record)
 }
 fn load_record(
@@ -895,6 +993,9 @@ fn load_record(
         Some(r) if index.completed.contains(&r.identity) => {
             if kind == RecordKind::Carrier {
                 require_stopped_carrier(&r)?;
+            }
+            if kind == RecordKind::NativeCarrierReceipts {
+                require_stopped_native(&r)?;
             }
             None
         }
@@ -913,6 +1014,12 @@ fn current_epoch(
 }
 fn validate_payload(scope: &SessionScope, kind: RecordKind, bytes: &[u8]) -> io::Result<()> {
     match kind {
+        RecordKind::NativeCarrierReceipts => {
+            let record = native_receipt::Record::decode(bytes).map_err(|_| failed())?;
+            if record.context.intent.scope != *scope {
+                return Err(failed());
+            }
+        }
         RecordKind::Carrier => {
             carrier_payload(scope, bytes)?;
         }
@@ -1462,6 +1569,238 @@ impl<F: SessionFiles> NetworkJournalStore for WindowsNetworkStore<F> {
 #[cfg(test)]
 #[path = "member_carrier_store_tests.rs"]
 mod carrier_store_tests;
+
+/// Storage-only v2 journal under the caller's serialized engine mutation lock.
+/// SessionFileIo holds its protected lifecycle file lock for each transaction;
+/// that is NOT a native registry/NIC ownership lock or proof. The trusted
+/// caller supplies the complete independent Context, never one read from JSON.
+/// Reopening is cleanup-only. No record can reconstruct a retained HKEY ACK,
+/// attest native absence, bind full native rows, or authorize adapter creation.
+#[allow(dead_code)] // Native IO/full-row/factory integration remains disabled.
+pub(crate) struct WindowsNativeCarrierReceiptStore<F> {
+    files: F,
+    context: native_receipt::Context,
+    cleanup_only: bool,
+    revoked: bool,
+}
+#[allow(dead_code)]
+impl<F: SessionFiles> WindowsNativeCarrierReceiptStore<F> {
+    pub(crate) fn open(
+        mut files: F,
+        context: native_receipt::Context,
+    ) -> io::Result<(Self, Option<native_receipt::Record>)> {
+        validate_native_context(&context)?;
+        let (access, _, current) = native_snapshot(&mut files, &context)?;
+        let cleanup_only = current.is_some() || !access.fresh;
+        if !cleanup_only && context.provenance.network_epoch != access.provenance.network_epoch {
+            return Err(failed());
+        }
+        Ok((
+            Self {
+                files,
+                context,
+                cleanup_only,
+                revoked: false,
+            },
+            current,
+        ))
+    }
+    fn require_context(&self, context: &native_receipt::Context) -> carrier::Result<()> {
+        if *context != self.context {
+            return Err(carrier::CarrierError::Conflict);
+        }
+        if self.revoked {
+            return Err(carrier::CarrierError::Journal);
+        }
+        Ok(())
+    }
+    fn revoke_live(&mut self) {
+        if !self.cleanup_only {
+            self.revoked = true;
+            // Denial is permanent for this instance even if revocation itself
+            // fails. The concrete authenticated adapter shares it with clones.
+            let _ = self
+                .files
+                .revoke_native_carrier_access(&self.context.intent.scope);
+        }
+    }
+}
+impl<F: SessionFiles> NativeJournal for WindowsNativeCarrierReceiptStore<F> {
+    fn load(
+        &mut self,
+        context: &native_receipt::Context,
+    ) -> carrier::Result<Option<native_receipt::Record>> {
+        self.require_context(context)?;
+        let (access, _, current) = native_snapshot(&mut self.files, context)
+            .map_err(|_| carrier::CarrierError::Journal)?;
+        if !self.cleanup_only
+            && (!access.fresh
+                || access.provenance.network_epoch != context.provenance.network_epoch)
+        {
+            return Err(carrier::CarrierError::Journal);
+        }
+        Ok(current)
+    }
+    fn compare_exchange(
+        &mut self,
+        context: &native_receipt::Context,
+        expected: Option<&native_receipt::Record>,
+        desired: &native_receipt::Record,
+    ) -> carrier::Result<()> {
+        self.require_context(context)?;
+        if desired.context != *context {
+            return Err(carrier::CarrierError::Conflict);
+        }
+        let bytes = desired.encode()?;
+        let (access, raw, current) = native_snapshot(&mut self.files, context)
+            .map_err(|_| carrier::CarrierError::Journal)?;
+        if !self.cleanup_only
+            && (!access.fresh
+                || access.provenance.network_epoch != context.provenance.network_epoch)
+        {
+            return Err(carrier::CarrierError::Journal);
+        }
+        if current.as_ref() != expected {
+            return Err(carrier::CarrierError::Conflict);
+        }
+        native_receipt::validate_transition(current.as_ref(), desired, self.cleanup_only)?;
+        let result = self.files.compare_exchange(
+            &context.intent.scope,
+            RecordKind::NativeCarrierReceipts,
+            raw.as_deref(),
+            &bytes,
+        );
+        if result.is_err() {
+            self.revoke_live();
+        }
+        // Exact typed readback is necessary even after a success ACK. Snapshot
+        // validates every byte's full context; private CAS used original bytes.
+        let (actual_raw, actual) = match native_snapshot(&mut self.files, context) {
+            Ok((_, actual_raw, actual)) => (actual_raw, actual),
+            Err(_) => {
+                self.revoke_live();
+                return Err(carrier::CarrierError::Journal);
+            }
+        };
+        if actual.as_ref() == Some(desired) && actual_raw.as_deref() == Some(bytes.as_slice()) {
+            // Only cleanup may reconcile committed lost ACK. A fresh instance
+            // must reopen cleanup-only even after an exact successful reread.
+            return if self.revoked {
+                Err(carrier::CarrierError::Journal)
+            } else {
+                Ok(())
+            };
+        }
+        self.revoke_live();
+        if actual.as_ref() != expected {
+            return Err(carrier::CarrierError::Conflict);
+        }
+        Err(carrier::CarrierError::Journal)
+    }
+}
+
+fn validate_native_context(context: &native_receipt::Context) -> io::Result<()> {
+    // Semantic reconstruction uses the same strict v2 validator. This template
+    // is never stored and confers neither a new-key ACK nor native authority.
+    let record = native_receipt::Record {
+        version: 2,
+        context: context.clone(),
+        generation: 1,
+        phase: native_receipt::Phase::Preparing,
+        keys: [
+            native_receipt::Role::RoleCarrier,
+            native_receipt::Role::MemberA,
+            native_receipt::Role::MemberB,
+        ]
+        .map(|role| native_receipt::KeyReceipt {
+            role,
+            phase: native_receipt::KeyPhase::Unstarted,
+            new_key_ack: false,
+            baseline: native_receipt::Value::Absent,
+            current: native_receipt::Value::Absent,
+            pending: None,
+        }),
+        native_rows: native_receipt::FullNativeRows::Unbound,
+    };
+    native_receipt::validate_record(&record).map_err(|_| failed())
+}
+fn native_payload(scope: &SessionScope, bytes: &[u8]) -> io::Result<native_receipt::Record> {
+    let record = native_receipt::Record::decode(bytes).map_err(|_| failed())?;
+    if record.context.intent.scope != *scope {
+        return Err(failed());
+    }
+    Ok(record)
+}
+fn authenticate_native(
+    record: &native_receipt::Record,
+    identity: &SessionIdentity,
+    epoch: u64,
+) -> io::Result<()> {
+    if record.context.intent.scope != identity.scope
+        || record.context.provenance.boot_id != identity.boot_id
+        || record.context.provenance.runtime != identity.runtime
+        || record.context.provenance.network_epoch != epoch
+    {
+        return Err(failed());
+    }
+    Ok(())
+}
+fn require_stopped_native(saved: &SavedRecord) -> io::Result<()> {
+    if native_payload(&saved.identity.scope, saved.data.as_bytes())?.phase
+        != native_receipt::Phase::Stopped
+    {
+        return Err(failed());
+    }
+    Ok(())
+}
+fn require_native_obligation(
+    files: &mut dyn PrivateRecords,
+    index: &SessionIndex,
+    identity: &SessionIdentity,
+) -> io::Result<()> {
+    let (_, saved) = load_record(files, index, identity, RecordKind::NativeCarrierReceipts)?;
+    if let Some(saved) = saved {
+        if saved.network_epoch > current_epoch(files, index, identity)? {
+            return Err(failed());
+        }
+    }
+    Ok(())
+}
+type NativeSnapshot = (
+    CarrierAccess,
+    Option<Vec<u8>>,
+    Option<native_receipt::Record>,
+);
+fn native_snapshot<F: SessionFiles>(
+    files: &mut F,
+    context: &native_receipt::Context,
+) -> io::Result<NativeSnapshot> {
+    let access = files.native_carrier_access(&context.intent.scope)?;
+    if access.scope != context.intent.scope
+        || access.provenance.boot_id != context.provenance.boot_id
+        || access.provenance.runtime != context.provenance.runtime
+        || context.provenance.network_epoch == 0
+        || context.provenance.network_epoch > access.provenance.network_epoch
+    {
+        return Err(failed());
+    }
+    let raw = files.read(&context.intent.scope, RecordKind::NativeCarrierReceipts)?;
+    let current = raw
+        .as_ref()
+        .map(|b| native_payload(&context.intent.scope, b))
+        .transpose()?;
+    if current
+        .as_ref()
+        .is_some_and(|record| record.context != *context)
+    {
+        return Err(failed());
+    }
+    Ok((access, raw, current))
+}
+
+#[cfg(test)]
+#[path = "member_carrier_native_store_tests.rs"]
+mod native_carrier_store_tests;
 
 #[cfg(test)]
 mod tests {
