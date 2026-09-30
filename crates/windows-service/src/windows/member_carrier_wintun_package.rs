@@ -420,7 +420,13 @@ struct Inventory {
     service_start: u32,
     service_state: u32,
     pending_maintenance: bool,
+    pending: PendingSnapshot,
     system_sys: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct PendingSnapshot {
+    queues: [Option<Vec<u8>>; 2],
+    files: Vec<(String, Stamp)>,
 }
 
 // Private native boundary. No successful defaults, metadata-to-authority constructors,
@@ -499,6 +505,147 @@ fn multi_sz(words: &[u16]) -> Result<Vec<String>> {
         return Err(Error::Invalid("MULTI_SZ length"));
     }
     Ok(result)
+}
+fn pending_deletions(
+    bytes: &[u8],
+    protected: &[String],
+    audited_star_flags: bool,
+    mut prove_file: impl FnMut(&str) -> Result<()>,
+) -> Result<bool> {
+    if bytes.len() < 4 || bytes.len() > 65536 || bytes.len() % 2 != 0 {
+        return Err(Error::Invalid("pending rename length"));
+    }
+    let words = bytes
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect::<Vec<_>>();
+    if words == [0, 0] {
+        return Ok(false);
+    }
+    let mut pos = 0;
+    let mut pairs = 0;
+    while pos < words.len() {
+        // Windows deletion pairs already end in two NULs. An additional
+        // MULTI_SZ sentinel is accepted, but empty sources/trailing data aren't.
+        if pos == words.len() - 1 && words[pos] == 0 {
+            break;
+        }
+        let mut next = || -> Result<String> {
+            let end = words[pos..]
+                .iter()
+                .position(|w| *w == 0)
+                .ok_or(Error::Invalid("pending rename termination"))?;
+            let item = String::from_utf16(&words[pos..pos + end])
+                .map_err(|_| Error::Invalid("pending rename UTF16"))?;
+            pos += end + 1;
+            Ok(item)
+        };
+        let source = next()?;
+        if pos == words.len() {
+            return Err(Error::Invalid("pending rename orphan source"));
+        }
+        // Don't use ordinary MULTI_SZ parsing: it discards empty destinations.
+        let end = words[pos..]
+            .iter()
+            .position(|w| *w == 0)
+            .ok_or(Error::Invalid("pending destination termination"))?;
+        let destination = String::from_utf16(&words[pos..pos + end])
+            .map_err(|_| Error::Invalid("pending destination UTF16"))?;
+        pos += end + 1;
+        pairs += 1;
+        if pairs > 128 || source.is_empty() {
+            return Err(Error::Invalid("pending pair bound/source"));
+        }
+        // All renames/replacements remain maintenance: no destination/ancestor
+        // normalization or assumption about an as-yet nonexistent target.
+        if !destination.is_empty() {
+            return Ok(true);
+        }
+        if source.starts_with('*') && !audited_star_flags {
+            return Ok(true);
+        }
+        let Some(path) = pending_retired_path(&source) else {
+            return Ok(true);
+        };
+        let lower = path.to_ascii_lowercase();
+        if lower.contains("wintun")
+            || lower.contains("nelomai")
+            || protected.iter().any(|p| {
+                let p = p.to_ascii_lowercase();
+                lower == p || lower.strip_prefix(&p).is_some_and(|s| s.starts_with('\\'))
+            })
+            || prove_file(path).is_err()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn pending_retired_path(source: &str) -> Option<&str> {
+    // On the audited installed SMSS, '*' plus one flag WCHAR is removed
+    // before opening a pending source. Accept ONLY observed flags 0/1, not
+    // arbitrary '*X' prefixes or a general NT-path-to-DOS conversion.
+    let source = source
+        .strip_prefix("*0")
+        .or_else(|| source.strip_prefix("*1"))
+        .unwrap_or(source);
+    let path = source.strip_prefix(r"\??\")?;
+    let b = path.as_bytes();
+    if !path.is_ascii() || b.len() < 4 || !b[0].is_ascii_alphabetic() || b[1..3] != *b":\\" {
+        return None;
+    }
+    for component in path[3..].split('\\') {
+        if component.is_empty()
+            || component.ends_with(['.', ' '])
+            || !component
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._- ()".contains(&b))
+            || matches!(
+                component.split('.').next()?.to_ascii_lowercase().as_str(),
+                "con"
+                    | "prn"
+                    | "aux"
+                    | "nul"
+                    | "com1"
+                    | "com2"
+                    | "com3"
+                    | "com4"
+                    | "com5"
+                    | "com6"
+                    | "com7"
+                    | "com8"
+                    | "com9"
+                    | "lpt1"
+                    | "lpt2"
+                    | "lpt3"
+                    | "lpt4"
+                    | "lpt5"
+                    | "lpt6"
+                    | "lpt7"
+                    | "lpt8"
+                    | "lpt9"
+            )
+        {
+            return None;
+        }
+    }
+    let name = path.rsplit('\\').next()?.to_ascii_lowercase();
+    let retired_dll = name.rsplit_once(".dll.").is_some_and(|(base, n)| {
+        !base.is_empty() && !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit())
+    });
+    (name.ends_with(".tmp") || retired_dll).then_some(path)
+}
+fn pending_installation_root(source: &str) -> Option<&str> {
+    let suffix = r"\runtime\engines\latest\0.3.3\wintun.dll";
+    source
+        .len()
+        .checked_sub(suffix.len())
+        .filter(|n| {
+            source
+                .get(*n..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+        })
+        .map(|n| &source[..n])
 }
 fn driver_detail_words(required: usize, id_offset: usize, capacity: usize) -> Result<usize> {
     // RequiredSize ends at the variable HardwareID buffer, not C tail padding.
@@ -1377,7 +1524,53 @@ pub(crate) mod native {
             unsafe { RegCloseKey(self.0) };
         }
     }
-    fn pending_maintenance() -> Result<bool> {
+    fn audited_smss_flags(path: &Path) -> Result<bool> {
+        // DATA ONLY, never executable/module/creator authority. Windows keeps
+        // this exact image hardlinked to WinSxS, unlike our single-link payload
+        // pins. Do NOT weaken Pin/stamp for packages or unrelated deletion proof.
+        clean_absolute(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|e| io("read SMSS format data", e))?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(last("SMSS data metadata"));
+        }
+        if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+            || info.nFileSizeHigh != 0
+            || info.nFileSizeLow != 245176
+            || info.nNumberOfLinks != 2
+            || !same_path(&final_path(&file)?, path)
+        {
+            return Ok(false);
+        }
+        let mut bytes = vec![0; info.nFileSizeLow as usize];
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let n = file
+                .seek_read(&mut bytes[pos..], pos as u64)
+                .map_err(|e| io("SMSS data read", e))?;
+            if n == 0 {
+                return Err(Error::Changed);
+            }
+            pos += n;
+        }
+        Ok(hash(&bytes)
+            == [
+                0x0d, 0x05, 0xe8, 0x1c, 0x57, 0x1a, 0xa0, 0x3f, 0x1d, 0xde, 0x5e, 0x8f, 0xa4, 0x0c,
+                0xef, 0x98, 0xb7, 0x7e, 0x8e, 0xca, 0x64, 0x82, 0x1a, 0xe4, 0xef, 0xab, 0x12, 0x19,
+                0x83, 0xd8, 0x1d, 0xe6,
+            ])
+    }
+    fn pending_maintenance(
+        source: &File,
+        root: &Path,
+        system: &Path,
+        candidates: &[Candidate],
+    ) -> Result<(bool, PendingSnapshot)> {
         let mut handle = ptr::null_mut();
         let status = unsafe {
             RegOpenKeyExW(
@@ -1393,10 +1586,14 @@ pub(crate) mod native {
         }
         let key = RegistryKey(handle);
         let mut pending = false;
-        for name in [
+        let mut snapshot = PendingSnapshot::default();
+        for (index, name) in [
             w!("PendingFileRenameOperations"),
             w!("PendingFileRenameOperations2"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let mut bytes = vec![0u8; BUFFER];
             let (mut kind, mut length) = (0, bytes.len() as u32);
             let status = unsafe {
@@ -1425,14 +1622,68 @@ pub(crate) mod native {
                 length,
                 bytes[..length as usize].iter().filter(|b| **b != 0).count()
             );
-            // A deletion uses an empty destination, unlike ordinary MULTI_SZ.
-            // Do not project away that obligation. ANY nonempty queue is denied,
-            // even an unrelated rename; no unknown string is normalized to safe.
-            if length != 4 || bytes[..4] != [0, 0, 0, 0] {
-                pending = true;
+            bytes.truncate(length as usize);
+            if bytes != [0, 0, 0, 0] {
+                // This narrowed policy is valid only for the independently
+                // audited installed 0.3.3 layout; unknown layouts remain denied.
+                let source_path = final_path(source)?;
+                let source_text = source_path
+                    .to_str()
+                    .ok_or(Error::Invalid("source layout"))?;
+                let install = pending_installation_root(source_text);
+                if let Some(install) = install {
+                    let mut protected = vec![install.to_owned()];
+                    for path in [
+                        root.join("INF"),
+                        system.join("drivers"),
+                        system.join("DriverStore"),
+                        system.join("CatRoot"),
+                        system.join("CatRoot2"),
+                        system.join("config"),
+                        root.join("WinSxS"),
+                        root.join("servicing"),
+                    ] {
+                        clean_absolute(&path)?;
+                        protected.push(
+                            path.to_str()
+                                .ok_or(Error::Invalid("protected path"))?
+                                .to_owned(),
+                        );
+                    }
+                    for c in candidates {
+                        for path in [&c.published_inf, &c.store_inf, &c.store_cat, &c.store_sys] {
+                            let path = Path::new(path);
+                            clean_absolute(path)?;
+                            protected.push(
+                                path.parent()
+                                    .ok_or(Error::Invalid("package parent"))?
+                                    .to_str()
+                                    .ok_or(Error::Invalid("package path"))?
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    // Undocumented '*' flags are accepted ONLY on the exact
+                    // SMSS data image whose source stripping was inspected.
+                    // An OS update defaults to maintenance, never a guessed format.
+                    let audited_flags =
+                        audited_smss_flags(&system.join("smss.exe")).unwrap_or(false);
+                    pending |= pending_deletions(&bytes, &protected, audited_flags, |path| {
+                        // Actual existing regular SINGLE-link file, canonical DOS
+                        // path and every non-reparse ancestor, NOT a basename or
+                        // metadata assertion. Missing/denied/alias/directory fail.
+                        let pin = Pin::open(Path::new(path))?;
+                        let stamp = stamp(&pin.file, false)?;
+                        snapshot.files.push((path.to_owned(), stamp));
+                        Ok(())
+                    })?;
+                } else {
+                    pending = true;
+                }
             }
+            snapshot.queues[index] = Some(bytes);
         }
-        Ok(pending)
+        Ok((pending, snapshot))
     }
     impl Kernel for Native<'_> {
         type Pin = Pin;
@@ -1449,11 +1700,13 @@ pub(crate) mod native {
                 return Err(Error::Unsupported("native platform"));
             }
             let root = os_directory(false)?;
-            let system = os_directory(true)?.join("drivers").join("wintun.sys");
+            let system_root = os_directory(true)?;
+            let system = system_root.join("drivers").join("wintun.sys");
             let candidates = candidates(&root)?;
             let devices = devices()?;
             let (service_type, service_start, service_state) = service(&system, &root)?;
-            let pending_maintenance = pending_maintenance()?;
+            let (pending_maintenance, pending) =
+                pending_maintenance(self.source, &root, &system_root, &candidates)?;
             Ok(Inventory {
                 native_amd64_win10_plus,
                 candidates,
@@ -1462,6 +1715,7 @@ pub(crate) mod native {
                 service_start,
                 service_state,
                 pending_maintenance,
+                pending,
                 system_sys: system
                     .to_str()
                     .ok_or(Error::Invalid("system path"))?

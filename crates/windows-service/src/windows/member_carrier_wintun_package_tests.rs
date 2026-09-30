@@ -6,6 +6,195 @@ use std::collections::BTreeMap;
 const FIXTURE_DATE: u64 = 132785568000000000;
 const FIXTURE_VERSION: u64 = 60129542144;
 
+fn pending_bytes(strings: &[&str]) -> Vec<u8> {
+    strings
+        .iter()
+        .flat_map(|s| s.encode_utf16().chain([0]))
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+fn protected_paths() -> Vec<String> {
+    [
+        r"C:\Program Files\Nelomai",
+        r"C:\Windows\System32\drivers",
+        r"C:\Windows\System32\DriverStore",
+        r"C:\Windows\INF",
+    ]
+    .map(str::to_owned)
+    .to_vec()
+}
+#[test]
+fn pending_unrelated_retired_deletions_do_not_require_driver_maintenance() {
+    // Native queue observed after the reboot, including EMPTY destinations.
+    let bytes = pending_bytes(&[
+        r"*1\??\C:\Windows\System32\gamingservicesproxy_13.dll.0",
+        "",
+        r"*1\??\C:\WRP8983.tmp",
+        "",
+    ]);
+    let mut proven = vec![];
+    assert_eq!(
+        pending_deletions(&bytes, &protected_paths(), true, |path| {
+            proven.push(path.to_owned());
+            Ok(())
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        proven,
+        [
+            r"C:\Windows\System32\gamingservicesproxy_13.dll.0",
+            r"C:\WRP8983.tmp"
+        ]
+    );
+}
+#[test]
+fn pending_deletions_keep_related_ambiguous_and_rename_obligations() {
+    for (source, destination) in [
+        (r"\??\C:\Windows\System32\drivers\wintun.sys", ""),
+        (r"\??\C:\Elsewhere\Wintun.dll.0", ""),
+        (r"\??\C:\Program Files\Nelomai\data.tmp", ""),
+        (r"\??\c:\WINDOWS\INF\oem10.inf.tmp", ""),
+        (r"\??\C:\Windows\System32\DriverStore\temp.tmp", ""),
+        (r"\??\C:\Windows\System32\kernel32.dll", ""),
+        (
+            r"\??\C:\temp.tmp",
+            r"!\??\C:\Windows\System32\drivers\wintun.sys",
+        ),
+        (r"\??\C:\Program Files", r"\??\C:\old"),
+        (r"*9\??\C:\foo.tmp", ""),
+        (r"*1*1\??\C:\foo.tmp", ""),
+        (r"C:\foo.tmp", ""),
+        (r"\??\UNC\server\foo.tmp", ""),
+        (r"\??\C:\temp\..\foo.tmp", ""),
+        (r"\??\C:\temp.\foo.tmp", ""),
+        (r"\??\C:\temp \foo.tmp", ""),
+        (r"\??\C:\PROGRA~1\foo.tmp", ""),
+        (r"\??\C:\nul.tmp", ""),
+        (r"\??\C:\foo:bar.tmp", ""),
+        (r"\??\C:\foo.dll.abc", ""),
+    ] {
+        assert_eq!(
+            pending_deletions(
+                &pending_bytes(&[source, destination]),
+                &protected_paths(),
+                true,
+                |_| panic!("unproven path must not reach native file proof")
+            ),
+            Ok(true),
+            "{source} -> {destination}"
+        );
+    }
+}
+#[test]
+fn pending_ambiguous_file_proof_is_still_maintenance() {
+    let bytes = pending_bytes(&[r"*1\??\C:\missing.tmp", ""]);
+    for reason in [
+        Error::Changed,
+        Error::Invalid("directory/reparse/hardlink"),
+        Error::Native("access denied/missing", 5),
+    ] {
+        assert_eq!(
+            pending_deletions(&bytes, &protected_paths(), true, |_| Err(reason.clone())),
+            Ok(true)
+        );
+    }
+}
+#[test]
+fn pending_pairs_preserve_empty_destinations_and_reject_malformed_data() {
+    assert_eq!(
+        pending_deletions(&[0, 0, 0, 0], &protected_paths(), true, |_| panic!()),
+        Ok(false)
+    );
+    let mut no_extra_sentinel = pending_bytes(&[r"\??\C:\file.tmp", ""]);
+    no_extra_sentinel.truncate(no_extra_sentinel.len() - 2);
+    assert_eq!(
+        pending_deletions(&no_extra_sentinel, &protected_paths(), true, |_| Ok(())),
+        Ok(false)
+    );
+    for bytes in [
+        vec![],
+        vec![0],
+        vec![0, 0],
+        vec![0, 0, 0, 0, 0, 0],
+        r"\??\C:\file.tmp"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect(),
+        pending_bytes(&["", r"\??\C:\file.tmp"]),
+        vec![0x00, 0xd8, 0, 0, 0, 0, 0, 0],
+        vec![1; 65538],
+    ] {
+        assert!(pending_deletions(&bytes, &protected_paths(), true, |_| Ok(())).is_err());
+    }
+    let bytes = pending_bytes(&[
+        r"\??\C:\file.tmp",
+        "",
+        r"\??\C:\Windows\System32\drivers\other.tmp",
+        "",
+    ]);
+    let mut count = 0;
+    assert_eq!(
+        pending_deletions(&bytes, &protected_paths(), true, |_| {
+            count += 1;
+            Ok(())
+        }),
+        Ok(true)
+    );
+    assert_eq!(count, 1); // First unrelated deletion must not conceal later driver work.
+}
+#[test]
+fn pending_star_source_flags_need_exact_audited_smss_not_any_windows_version() {
+    let bytes = pending_bytes(&[r"*1\??\C:\file.tmp", ""]);
+    assert_eq!(
+        pending_deletions(&bytes, &protected_paths(), false, |_| Ok(())),
+        Ok(true)
+    );
+    let bytes = pending_bytes(&[r"\??\C:\file.tmp", ""]);
+    assert_eq!(
+        pending_deletions(&bytes, &protected_paths(), false, |_| Ok(())),
+        Ok(false)
+    );
+}
+#[test]
+fn pending_install_layout_is_exact_and_unknown_unicode_cannot_panic() {
+    assert_eq!(
+        pending_installation_root(r"D:\custom\runtime\engines\latest\0.3.3\wintun.dll"),
+        Some(r"D:\custom")
+    );
+    for source in [
+        "界".repeat(51),
+        "😀".repeat(21),
+        r"C:\wrong\wintun.dll".into(),
+    ] {
+        assert_eq!(pending_installation_root(&source), None);
+    }
+}
+#[test]
+fn pending_snapshot_drift_revokes_even_if_queue_stays_classified_unrelated() {
+    for change_file in [false, true] {
+        let mut f = Fake::good();
+        f.inventory.pending.queues[0] = Some(pending_bytes(&[r"\??\C:\retired.tmp", ""]));
+        f.inventory
+            .pending
+            .files
+            .push((r"C:\retired.tmp".into(), observed(vec![1], 100).stamp));
+        let mut checked = check(f).unwrap();
+        let before = checked.kernel.inventory.pending.clone();
+        if change_file {
+            checked.kernel.inventory.pending.files[0].1.id += 1;
+        } else {
+            checked.kernel.inventory.pending.queues[1] =
+                Some(pending_bytes(&[r"\??\C:\other.tmp", ""]));
+        }
+        assert_eq!(checked.reattest(), Err(Error::Changed));
+        checked.kernel.inventory.pending = before;
+        assert_eq!(checked.reattest(), Err(Error::Changed));
+    }
+}
+
 // Independent expected metadata of the audited, stamped amd64 INF. Synthetic
 // PE/resources below exercise parsing, NOT Authenticode or cold native acceptance.
 const INF: &str = r#"[Version]
@@ -196,6 +385,7 @@ impl Fake {
                 service_start: 3,
                 service_state: 1,
                 pending_maintenance: false,
+                pending: PendingSnapshot::default(),
                 system_sys: "system".into(),
             },
         }
