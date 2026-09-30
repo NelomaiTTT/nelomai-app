@@ -72,8 +72,13 @@ mod member_carrier_rows;
 mod native;
 #[cfg(windows)]
 use super::*;
+#[cfg(windows)]
+use crate::windows::{member_files as private_files, member_session as protected};
+#[cfg(not(windows))]
+use crate::{member_files as private_files, readiness_session as protected};
 #[cfg(not(windows))]
 use native::*;
+use protected::SessionFiles;
 #[cfg(not(windows))]
 use windows_sys::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
 #[test]
@@ -595,7 +600,16 @@ struct State {
     journal_writes: usize,
     journal_at: Option<(usize, Fault)>,
     drift_on_confirmation: bool,
+    private_bytes: std::collections::BTreeMap<private_files::PrivateFile, Vec<u8>>,
+    private_reads: usize,
+    private_fail: Option<private_files::PrivateFile>,
+    private_fault: Fault,
+    read_hook: Option<ReadHook>,
+    create_hook: Option<ReadHook>,
+    address_error: bool,
+    identity_error: bool,
 }
+type ReadHook = Box<dyn FnMut(&mut State)>;
 #[derive(Clone)]
 struct Fake(Rc<RefCell<State>>);
 impl Fake {
@@ -628,6 +642,14 @@ impl Fake {
             journal_writes: 0,
             journal_at: None,
             drift_on_confirmation: false,
+            private_bytes: Default::default(),
+            private_reads: 0,
+            private_fail: None,
+            private_fault: Fault::None,
+            read_hook: None,
+            create_hook: None,
+            address_error: false,
+            identity_error: false,
         })))
     }
     fn assert_lock(&self) {
@@ -714,6 +736,9 @@ impl OriginalCreator for Fake {
 impl Kernel for Fake {
     fn identity(&mut self, _k: RowKey) -> Result<NativeIdentity> {
         self.assert_lock();
+        if self.0.borrow().identity_error {
+            return Err(Error::Native);
+        }
         Ok(self.0.borrow().identity.clone())
     }
     fn interface(&mut self, _k: RowKey) -> Result<MIB_IPINTERFACE_ROW> {
@@ -735,6 +760,12 @@ impl Kernel for Fake {
         if s.drift_on_address {
             s.binding.network_epoch += 1;
             s.drift_on_address = false;
+        }
+        if let Some(mut hook) = s.read_hook.take() {
+            hook(&mut s);
+        }
+        if s.address_error {
+            return Err(Error::Native);
         }
         Ok(s.address)
     }
@@ -806,6 +837,9 @@ impl Kernel for Fake {
         next.DadState = 1;
         next.CreationTimeStamp = 123456789;
         s.address = Some(next);
+        if let Some(mut hook) = s.create_hook.take() {
+            hook(&mut s);
+        }
         if matches!(fault, Fault::LostAck) {
             Err(Error::Native)
         } else {
@@ -884,6 +918,839 @@ fn weak() -> InterfacePolicy {
 }
 fn address_policy() -> AddressPolicy {
     decode_address(&address_raw()).unwrap().policy
+}
+
+// Only the private-file IO is fake. Claim/permission/envelope/replay/codec/CAS
+// policy below is the actual ProtectedSessionFiles + WindowsCarrierRowsStore.
+#[derive(Clone)]
+struct ReceiptDisk(Fake);
+impl private_files::PrivateRecords for ReceiptDisk {
+    fn read(&mut self, file: private_files::PrivateFile) -> std::io::Result<Option<Vec<u8>>> {
+        let mut s = self.0 .0.borrow_mut();
+        s.private_reads += 1;
+        if s.private_fail == Some(file) {
+            return Err(std::io::Error::other("private read fault"));
+        }
+        Ok(s.private_bytes.get(&file).cloned())
+    }
+    fn compare_exchange(
+        &mut self,
+        file: private_files::PrivateFile,
+        expected: Option<&[u8]>,
+        desired: &[u8],
+    ) -> std::io::Result<()> {
+        let mut s = self.0 .0.borrow_mut();
+        if s.private_bytes.get(&file).map(Vec::as_slice) != expected || desired.len() > file.limit()
+        {
+            return Err(std::io::Error::other("exact private CAS"));
+        }
+        let row = matches!(
+            file,
+            private_files::PrivateFile::CarrierRows
+                | private_files::PrivateFile::MemberARows
+                | private_files::PrivateFile::MemberBRows
+        );
+        let fault = if row {
+            std::mem::take(&mut s.private_fault)
+        } else {
+            Fault::None
+        };
+        if matches!(fault, Fault::Unapplied) {
+            return Err(std::io::Error::other("private unapplied CAS"));
+        }
+        if matches!(fault, Fault::FalseAck) {
+            return Ok(());
+        }
+        s.private_bytes.insert(file, desired.to_vec());
+        if row {
+            let envelope: serde_json::Value = serde_json::from_slice(desired).unwrap();
+            s.saved = Some(Record::decode(envelope["data"].as_str().unwrap().as_bytes()).unwrap());
+        }
+        if matches!(fault, Fault::LostAck) {
+            Err(std::io::Error::other("private committed lost ACK"))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl private_files::SessionFileIo for ReceiptDisk {
+    fn transaction<T>(
+        &mut self,
+        action: impl FnOnce(&mut dyn private_files::PrivateRecords) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        action(self)
+    }
+}
+type ProtectedFiles = protected::ProtectedSessionFiles<ReceiptDisk>;
+type ProtectedOwner = RowOwner<Fake, Fake, protected::WindowsCarrierRowsStore<ProtectedFiles>>;
+fn protected_owner(fake: &Fake, role: Role) -> (ProtectedOwner, ProtectedFiles) {
+    let mut b = binding();
+    b.network_epoch = 1;
+    b.role = role;
+    fake.0.borrow_mut().binding = b.clone();
+    let mut files =
+        ProtectedFiles::new(ReceiptDisk(fake.clone()), b.runtime.clone(), b.boot_id).unwrap();
+    files.claim(&b.scope).unwrap();
+    let (store, old) = protected::WindowsCarrierRowsStore::open(files.clone(), b.clone()).unwrap();
+    assert!(old.is_none());
+    let owner = RowOwner::capture(b, fake.clone(), fake.clone(), store).unwrap();
+    (owner, files)
+}
+fn retained_created(fake: &Fake) -> (ProtectedOwner, ProtectedFiles) {
+    let (mut owner, files) = protected_owner(fake, Role::Carrier);
+    owner.create_address(address_policy()).unwrap();
+    (owner, files)
+}
+fn assert_cleanup_only(owner: &mut ProtectedOwner, fake: &Fake) {
+    let effects = fake.0.borrow().effects;
+    assert_eq!(owner.change_interface(weak()), Err(Error::Retired));
+    assert_eq!(owner.create_address(address_policy()), Err(Error::Retired));
+    assert!(owner
+        .wait_address_ready_with(
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut TestClock::new(fake)
+        )
+        .is_err());
+    assert_eq!(fake.0.borrow().effects, effects);
+}
+
+struct TestClock {
+    fake: Fake,
+    start: std::time::Instant,
+    elapsed: Rc<std::cell::Cell<std::time::Duration>>,
+    sleeps: usize,
+    after_sleep: SleepHook,
+}
+type SleepHook = Box<dyn FnMut(&Fake, usize, &std::sync::atomic::AtomicBool)>;
+impl TestClock {
+    fn new(fake: &Fake) -> Self {
+        Self {
+            fake: fake.clone(),
+            start: std::time::Instant::now(),
+            elapsed: Rc::new(std::cell::Cell::new(std::time::Duration::ZERO)),
+            sleeps: 0,
+            after_sleep: Box::new(|_, _, _| {}),
+        }
+    }
+}
+impl ReadinessClock for TestClock {
+    fn now(&mut self) -> std::time::Instant {
+        self.start + self.elapsed.get()
+    }
+    fn sleep(&mut self, duration: std::time::Duration, cancelled: &std::sync::atomic::AtomicBool) {
+        assert!(
+            !self.fake.0.borrow().locked,
+            "never hold the privileged lock asleep"
+        );
+        assert!(duration <= std::time::Duration::from_millis(25));
+        self.elapsed.set(self.elapsed.get() + duration);
+        self.sleeps += 1;
+        (self.after_sleep)(&self.fake, self.sleeps, cancelled);
+    }
+}
+#[test]
+fn readiness_requires_actual_created_receipt_then_observes_tentative_to_preferred() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let before = fake.0.borrow().private_bytes.clone();
+    let queries = fake.0.borrow().queries;
+    let mut clock = TestClock::new(&fake);
+    clock.after_sleep = Box::new(|fake, sleeps, _| {
+        if sleeps == 2 {
+            fake.0.borrow_mut().address.as_mut().unwrap().DadState = 4;
+        }
+    });
+    let ready = owner
+        .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+        .unwrap();
+    assert_eq!(ready.observed.dad_state, 4);
+    assert_eq!(ready.observed.creation_timestamp, 123456789);
+    assert_eq!(clock.sleeps, 2);
+    assert_eq!(
+        fake.0.borrow().queries - queries,
+        6,
+        "fresh before/after creator proof on each poll"
+    );
+    assert_eq!(fake.0.borrow().effects, 1, "readiness is not a mutation");
+    assert_eq!(
+        fake.0.borrow().private_bytes,
+        before,
+        "DAD is a volatile observation, not a writable journal update"
+    );
+    owner.change_interface(weak()).unwrap();
+    owner.stop().unwrap();
+}
+#[test]
+fn readiness_immediate_preferred_is_observed_not_written() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    fake.0.borrow_mut().address.as_mut().unwrap().DadState = 4;
+    let mut clock = TestClock::new(&fake);
+    assert_eq!(
+        owner
+            .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+            .unwrap()
+            .observed
+            .dad_state,
+        4
+    );
+    assert_eq!(clock.sleeps, 0);
+    assert_eq!(fake.0.borrow().effects, 1);
+}
+#[test]
+fn readiness_production_monotonic_entry_observes_owned_preferred_without_sleep() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    fake.0.borrow_mut().address.as_mut().unwrap().DadState = 4;
+    assert_eq!(
+        owner
+            .wait_address_ready(&std::sync::atomic::AtomicBool::new(false))
+            .unwrap()
+            .observed
+            .dad_state,
+        4
+    );
+    assert_eq!(fake.0.borrow().effects, 1);
+    owner.stop().unwrap();
+}
+
+#[test]
+fn readiness_timeout_permanently_revokes_live_mutations_but_retains_exact_cleanup() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let before = fake.0.borrow().private_bytes.clone();
+    let queries = fake.0.borrow().queries;
+    let mut clock = TestClock::new(&fake);
+    assert_eq!(
+        owner.wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock),
+        Err(Error::Retired)
+    );
+    assert_eq!(clock.elapsed.get(), std::time::Duration::from_secs(5));
+    assert_eq!(clock.sleeps, 200);
+    assert_eq!(fake.0.borrow().queries - queries, 400);
+    assert_eq!(fake.0.borrow().private_bytes, before);
+    fake.0.borrow_mut().address.as_mut().unwrap().DadState = 4;
+    assert_cleanup_only(&mut owner, &fake);
+    owner.stop().unwrap();
+    assert_eq!(
+        fake.0.borrow().saved.as_ref().unwrap().phase,
+        Phase::Stopped
+    );
+    assert!(fake.0.borrow().address.is_none());
+    assert_eq!(fake.0.borrow().effects, 2);
+}
+#[test]
+fn readiness_cancel_before_read_and_between_polls_is_not_retryable() {
+    for before_read in [true, false] {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        let queries = fake.0.borrow().queries;
+        let cancelled = std::sync::atomic::AtomicBool::new(before_read);
+        let mut clock = TestClock::new(&fake);
+        clock.after_sleep =
+            Box::new(|_, _, cancelled| cancelled.store(true, std::sync::atomic::Ordering::Release));
+        let result = if before_read {
+            // Production entry point; already-cancelled means no actual sleep.
+            owner.wait_address_ready(&cancelled)
+        } else {
+            owner.wait_address_ready_with(&cancelled, &mut clock)
+        };
+        assert_eq!(result, Err(Error::Retired));
+        assert_eq!(
+            fake.0.borrow().queries - queries,
+            if before_read { 0 } else { 2 }
+        );
+        cancelled.store(false, std::sync::atomic::Ordering::Release);
+        assert_cleanup_only(&mut owner, &fake);
+        assert!(fake.0.borrow().saved.as_ref().unwrap().creation.is_some());
+        owner.stop().unwrap();
+    }
+}
+#[test]
+fn readiness_cancel_during_actual_preferred_read_denies_late_success() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = cancelled.clone();
+    fake.0.borrow_mut().read_hook = Some(Box::new(move |s| {
+        s.address.as_mut().unwrap().DadState = 4;
+        signal.store(true, std::sync::atomic::Ordering::Release);
+    }));
+    assert_eq!(
+        owner.wait_address_ready_with(&cancelled, &mut TestClock::new(&fake)),
+        Err(Error::Retired)
+    );
+    assert_cleanup_only(&mut owner, &fake);
+    owner.stop().unwrap();
+}
+#[test]
+fn readiness_native_call_returning_preferred_at_or_after_deadline_is_denied() {
+    for millis in [5000, 5001, 60000] {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        let mut clock = TestClock::new(&fake);
+        let elapsed = clock.elapsed.clone();
+        fake.0.borrow_mut().read_hook = Some(Box::new(move |s| {
+            s.address.as_mut().unwrap().DadState = 4;
+            // Fake only the native latency/clock boundary, not RowOwner policy.
+            elapsed.set(std::time::Duration::from_millis(millis));
+        }));
+        assert_eq!(
+            owner.wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock),
+            Err(Error::Retired)
+        );
+        assert_eq!(clock.sleeps, 0);
+        assert_cleanup_only(&mut owner, &fake);
+        owner.stop().unwrap();
+    }
+}
+#[test]
+fn readiness_preferred_just_before_deadline_passes_but_sleep_cannot_extend_budget() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let mut clock = TestClock::new(&fake);
+    let elapsed = clock.elapsed.clone();
+    fake.0.borrow_mut().read_hook = Some(Box::new(move |s| {
+        s.address.as_mut().unwrap().DadState = 4;
+        elapsed.set(std::time::Duration::from_millis(4999));
+    }));
+    assert!(owner
+        .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+        .is_ok());
+
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let mut clock = TestClock::new(&fake);
+    let elapsed = clock.elapsed.clone();
+    clock.after_sleep = Box::new(move |fake, _, _| {
+        fake.0.borrow_mut().address.as_mut().unwrap().DadState = 4;
+        elapsed.set(std::time::Duration::from_secs(5));
+    });
+    assert_eq!(
+        owner.wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock),
+        Err(Error::Retired)
+    );
+    assert_eq!(clock.sleeps, 1);
+    assert_cleanup_only(&mut owner, &fake);
+}
+#[test]
+fn readiness_frozen_or_regressing_clock_is_finite_and_cleanup_only() {
+    for regress in [false, true] {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        let mut clock = TestClock::new(&fake);
+        let elapsed = clock.elapsed.clone();
+        clock.after_sleep = Box::new(move |_, n, _| {
+            elapsed.set(if regress && n == 1 {
+                std::time::Duration::from_millis(20)
+            } else {
+                std::time::Duration::ZERO
+            });
+        });
+        assert_eq!(
+            owner.wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock),
+            Err(Error::Retired)
+        );
+        assert!(clock.sleeps <= 200);
+        assert_cleanup_only(&mut owner, &fake);
+        owner.stop().unwrap();
+    }
+}
+#[test]
+fn readiness_sleep_unwind_revokes_owner_without_losing_cleanup_obligation() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let mut clock = TestClock::new(&fake);
+    clock.after_sleep = Box::new(|_, _, _| panic!("clock boundary unwind"));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+    }))
+    .is_err());
+    assert!(!fake.0.borrow().locked);
+    assert_cleanup_only(&mut owner, &fake);
+    owner.stop().unwrap();
+}
+#[test]
+fn readiness_denies_all_nonusable_dad_states_immediately_on_every_poll() {
+    for dad in [0, 2, 3, -1, 5, i32::MAX] {
+        for later in [false, true] {
+            let fake = Fake::new();
+            let (mut owner, _) = retained_created(&fake);
+            let mut clock = TestClock::new(&fake);
+            if later {
+                clock.after_sleep = Box::new(move |fake, _, _| {
+                    fake.0.borrow_mut().address.as_mut().unwrap().DadState = dad
+                });
+            } else {
+                fake.0.borrow_mut().address.as_mut().unwrap().DadState = dad;
+            }
+            assert!(
+                owner
+                    .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+                    .is_err(),
+                "dad {dad}"
+            );
+            assert_eq!(clock.sleeps, usize::from(later));
+            assert_cleanup_only(&mut owner, &fake);
+            assert_eq!(fake.0.borrow().effects, 1);
+        }
+    }
+}
+#[test]
+fn readiness_never_adopts_foreign_preferred_or_journal_creation_without_live_ack() {
+    let fake = Fake::new();
+    let (mut owner, _) = protected_owner(&fake, Role::Carrier);
+    fake.0.borrow_mut().address = Some(address_raw());
+    assert_eq!(
+        owner.wait_address_ready_with(
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut TestClock::new(&fake)
+        ),
+        Err(Error::Pending)
+    );
+    assert_cleanup_only(&mut owner, &fake);
+    assert!(owner.stop().is_err());
+    assert_eq!(fake.0.borrow().effects, 0);
+
+    for fault in [Fault::LostAck, Fault::FalseAck, Fault::Unapplied] {
+        let fake = Fake::new();
+        let (mut owner, _) = protected_owner(&fake, Role::Carrier);
+        fake.0.borrow_mut().kernel_fault = fault;
+        assert!(owner.create_address(address_policy()).is_err());
+        if let Some(row) = fake.0.borrow_mut().address.as_mut() {
+            row.DadState = 4;
+        }
+        assert_cleanup_only(&mut owner, &fake);
+        assert!(owner.stop().is_err());
+        assert!(fake.0.borrow().saved.as_ref().unwrap().pending.is_some());
+        assert_eq!(fake.0.borrow().effects, 1);
+    }
+}
+#[test]
+fn readiness_member_closing_stopped_and_previously_failed_owners_never_resume() {
+    for role in [Role::MemberA, Role::MemberB] {
+        let fake = Fake::new();
+        let (mut owner, _) = protected_owner(&fake, role);
+        assert_eq!(
+            owner.wait_address_ready_with(
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut TestClock::new(&fake)
+            ),
+            Err(Error::Retired)
+        );
+        assert_cleanup_only(&mut owner, &fake);
+        owner.stop().unwrap();
+        assert_eq!(fake.0.borrow().effects, 0);
+    }
+    for state in 0..3 {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        match state {
+            0 => {
+                owner.stop().unwrap();
+            }
+            1 => {
+                fake.0.borrow_mut().kernel_fault = Fault::Unapplied;
+                assert!(owner.stop().is_err());
+                assert_eq!(
+                    fake.0.borrow().saved.as_ref().unwrap().phase,
+                    Phase::Closing
+                );
+            }
+            _ => {
+                fake.0.borrow_mut().api_error = true;
+                assert!(owner.snapshot().is_err());
+                fake.0.borrow_mut().api_error = false;
+            }
+        }
+        if let Some(row) = fake.0.borrow_mut().address.as_mut() {
+            row.DadState = 4;
+        }
+        assert_cleanup_only(&mut owner, &fake);
+        owner.stop().unwrap();
+    }
+}
+#[test]
+fn readiness_reopened_protected_store_is_cleanup_only_not_a_creator() {
+    let fake = Fake::new();
+    let (mut original, files) = retained_created(&fake);
+    fake.0.borrow_mut().address.as_mut().unwrap().DadState = 4;
+    let b = fake.0.borrow().binding.clone();
+    let (store, old) = protected::WindowsCarrierRowsStore::open(files, b.clone()).unwrap();
+    assert!(old.unwrap().creation.is_some());
+    assert!(matches!(
+        RowOwner::capture(b, fake.clone(), fake.clone(), store),
+        Err(Error::Retired)
+    ));
+    // The original acknowledged owner remains distinct from a reopened record.
+    assert!(original
+        .wait_address_ready_with(
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut TestClock::new(&fake)
+        )
+        .is_ok());
+    assert_eq!(fake.0.borrow().effects, 1);
+}
+#[test]
+fn readiness_full_context_identity_creator_and_each_api_fault_are_rechecked_each_poll() {
+    let faults: [fn(&mut State); 28] = [
+        |s| s.binding.scope.runtime_generation += 1,
+        |s| s.binding.scope.connection_generation += 1,
+        |s| s.binding.scope.session_id = "11234567-89ab-cdef-0123-456789abcdef".into(),
+        |s| s.binding.scope.runtime = RuntimeSlot::Latest,
+        |s| s.binding.boot_id[0] += 1,
+        |s| s.binding.runtime.runtime_version = "0.3.4".into(),
+        |s| s.binding.runtime.runtime_contract_version += 1,
+        |s| s.binding.runtime.container_version = "0.3.4".into(),
+        |s| s.binding.runtime.manifest_sha256 = "b".repeat(64),
+        |s| s.binding.runtime.slot = RuntimeSlot::Latest,
+        |s| s.binding.network_epoch += 1,
+        |s| s.binding.role = Role::MemberA,
+        |s| s.binding.address[3] += 1,
+        |s| s.binding.guid[0] += 1,
+        |s| s.binding.name.push('X'),
+        |s| s.binding.key.luid += 1,
+        |s| s.binding.key.index += 1,
+        |s| s.identity.guid[0] += 1,
+        |s| s.identity.name.push('X'),
+        |s| s.identity.key.luid += 1,
+        |s| s.identity.key.index += 1,
+        |s| s.identity.if_type = 6,
+        |s| s.identity.hardware = true,
+        |s| s.creator_alive = false,
+        |s| s.replay = true,
+        |s| s.identity_error = true,
+        |s| s.api_error = true,
+        |s| s.address_error = true,
+    ];
+    for (i, fault) in faults.into_iter().enumerate() {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        let mut clock = TestClock::new(&fake);
+        clock.after_sleep = Box::new(move |fake, _, _| fault(&mut fake.0.borrow_mut()));
+        assert!(
+            owner
+                .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+                .is_err(),
+            "fault {i}"
+        );
+        assert_eq!(clock.sleeps, 1, "immediate deny fault {i}");
+        assert_cleanup_only(&mut owner, &fake);
+    }
+}
+#[test]
+fn readiness_creator_and_identity_drift_during_actual_row_read_is_not_stale_proof() {
+    for identity in [false, true] {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        fake.0.borrow_mut().read_hook = Some(Box::new(move |s| {
+            s.address.as_mut().unwrap().DadState = 4;
+            if identity {
+                s.identity.guid[0] += 1;
+            } else {
+                s.binding.network_epoch += 1;
+            }
+        }));
+        let mut clock = TestClock::new(&fake);
+        assert!(owner
+            .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+            .is_err());
+        assert_eq!(clock.sleeps, 0);
+        assert_cleanup_only(&mut owner, &fake);
+    }
+}
+#[test]
+fn readiness_full_address_policy_and_stable_row_identity_cannot_drift_between_polls() {
+    let mutations: [fn(&mut MIB_UNICASTIPADDRESS_ROW); 12] = [
+        |r| r.PrefixOrigin = 3,
+        |r| r.SuffixOrigin = 3,
+        |r| r.ValidLifetime -= 1,
+        |r| r.PreferredLifetime -= 1,
+        |r| r.OnLinkPrefixLength = 24,
+        |r| r.SkipAsSource = true,
+        |r| r.ScopeId.Anonymous.Value = 1,
+        |r| r.CreationTimeStamp += 1,
+        |r| unsafe { r.InterfaceLuid.Value += 1 },
+        |r| r.InterfaceIndex += 1,
+        |r| r.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes([10, 240, 3, 3]),
+        |r| r.Address.si_family = AF_INET6,
+    ];
+    for (i, mutate) in mutations.into_iter().enumerate() {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        let mut clock = TestClock::new(&fake);
+        clock.after_sleep = Box::new(move |fake, _, _| {
+            let mut s = fake.0.borrow_mut();
+            let row = s.address.as_mut().unwrap();
+            row.DadState = 4;
+            mutate(row);
+        });
+        assert!(
+            owner
+                .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+                .is_err(),
+            "address field {i}"
+        );
+        assert_eq!(clock.sleeps, 1);
+        assert_cleanup_only(&mut owner, &fake);
+        assert!(
+            owner.stop().is_err(),
+            "no delete against a replaced/foreign row {i}"
+        );
+        assert_eq!(fake.0.borrow().effects, 1);
+    }
+}
+#[test]
+fn readiness_full_interface_policy_is_reconstructed_not_a_logical_weak_host_projection() {
+    let mutations: [fn(&mut MIB_IPINTERFACE_ROW); 25] = [
+        |r| r.AdvertisingEnabled = !r.AdvertisingEnabled,
+        |r| r.ForwardingEnabled = !r.ForwardingEnabled,
+        |r| r.WeakHostSend = !r.WeakHostSend,
+        |r| r.WeakHostReceive = !r.WeakHostReceive,
+        |r| r.UseAutomaticMetric = !r.UseAutomaticMetric,
+        |r| r.UseNeighborUnreachabilityDetection = !r.UseNeighborUnreachabilityDetection,
+        |r| r.ManagedAddressConfigurationSupported = !r.ManagedAddressConfigurationSupported,
+        |r| r.OtherStatefulConfigurationSupported = !r.OtherStatefulConfigurationSupported,
+        |r| r.AdvertiseDefaultRoute = !r.AdvertiseDefaultRoute,
+        |r| r.RouterDiscoveryBehavior = 1,
+        |r| r.DadTransmits += 1,
+        |r| r.BaseReachableTime += 1,
+        |r| r.RetransmitTime += 1,
+        |r| r.PathMtuDiscoveryTimeout += 1,
+        |r| r.LinkLocalAddressBehavior = 1,
+        |r| r.LinkLocalAddressTimeout += 1,
+        |r| r.ZoneIndices[15] += 1,
+        |r| r.SitePrefixLength = 1,
+        |r| r.Metric += 1,
+        |r| r.NlMtu += 1,
+        |r| r.DisableDefaultRoutes = !r.DisableDefaultRoutes,
+        |r| unsafe { r.InterfaceLuid.Value += 1 },
+        |r| r.InterfaceIndex += 1,
+        |r| r.Family = AF_INET6,
+        |r| r.MaxReassemblySize = 1,
+    ];
+    for (i, mutate) in mutations.into_iter().enumerate() {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        let mut clock = TestClock::new(&fake);
+        clock.after_sleep = Box::new(move |fake, _, _| {
+            let mut s = fake.0.borrow_mut();
+            s.address.as_mut().unwrap().DadState = 4;
+            mutate(&mut s.ip);
+        });
+        assert!(
+            owner
+                .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+                .is_err(),
+            "interface field {i}"
+        );
+        assert_eq!(clock.sleeps, 1);
+        assert_cleanup_only(&mut owner, &fake);
+        assert!(
+            owner.stop().is_err(),
+            "foreign policy is not overwritten {i}"
+        );
+        assert_eq!(fake.0.borrow().effects, 1);
+    }
+}
+#[test]
+fn readiness_preserves_volatile_native_observations_without_granting_write_permission() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let bytes = fake.0.borrow().private_bytes.clone();
+    let mut clock = TestClock::new(&fake);
+    clock.after_sleep = Box::new(|fake, _, _| {
+        let mut s = fake.0.borrow_mut();
+        s.address.as_mut().unwrap().DadState = 4;
+        s.ip.MinRouterAdvertisementInterval += 1;
+        s.ip.MaxRouterAdvertisementInterval += 1;
+        s.ip.Connected = false;
+        s.ip.SupportsWakeUpPatterns = !s.ip.SupportsWakeUpPatterns;
+        s.ip.SupportsNeighborDiscovery = false;
+        s.ip.SupportsRouterDiscovery = !s.ip.SupportsRouterDiscovery;
+        s.ip.ReachableTime += 1;
+        s.ip.TransmitOffload._bitfield ^= 1;
+        s.ip.ReceiveOffload._bitfield ^= 1;
+    });
+    assert!(owner
+        .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+        .is_ok());
+    assert_eq!(fake.0.borrow().private_bytes, bytes);
+    assert_eq!(fake.0.borrow().effects, 1);
+    let row = owner.snapshot().unwrap().interface;
+    assert!(!row.observed.connected);
+    assert_eq!(row.observed.reachable_time, 32124);
+    owner.stop().unwrap();
+}
+#[test]
+fn readiness_missing_created_native_address_is_not_pending_dad_or_absence_authority() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    let mut clock = TestClock::new(&fake);
+    clock.after_sleep = Box::new(|fake, _, _| fake.0.borrow_mut().address = None);
+    assert_eq!(
+        owner.wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock),
+        Err(Error::Conflict)
+    );
+    assert_eq!(clock.sleeps, 1);
+    assert_cleanup_only(&mut owner, &fake);
+    assert!(fake.0.borrow().saved.as_ref().unwrap().creation.is_some());
+    assert!(owner.stop().is_err());
+    assert_eq!(fake.0.borrow().effects, 1);
+}
+#[test]
+fn readiness_pending_interface_or_partial_restore_cannot_be_promoted_by_preferred() {
+    for fault in [Fault::Unapplied, Fault::FalseAck, Fault::Partial] {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        fake.0.borrow_mut().kernel_fault = fault;
+        assert!(owner.change_interface(weak()).is_err());
+        fake.0.borrow_mut().address.as_mut().unwrap().DadState = 4;
+        assert!(fake.0.borrow().saved.as_ref().unwrap().pending.is_some());
+        assert_cleanup_only(&mut owner, &fake);
+        if matches!(fault, Fault::Partial) {
+            assert!(owner.stop().is_err());
+            assert_eq!(fake.0.borrow().effects, 2);
+        } else {
+            owner.stop().unwrap();
+            assert!(fake.0.borrow().address.is_none());
+        }
+    }
+}
+#[test]
+fn readiness_protected_journal_fault_corruption_context_and_reconstruction_deny_each_poll() {
+    for case in 0..13 {
+        let fake = Fake::new();
+        let (mut owner, _) = retained_created(&fake);
+        let mut clock = TestClock::new(&fake);
+        clock.after_sleep = Box::new(move |fake, _, _| {
+            let mut s = fake.0.borrow_mut();
+            s.address.as_mut().unwrap().DadState = 4;
+            let file = private_files::PrivateFile::CarrierRows;
+            match case {
+                0 => {
+                    s.private_fail = Some(file);
+                }
+                1 => {
+                    s.private_fail = Some(private_files::PrivateFile::Index);
+                }
+                2 => {
+                    s.private_bytes.insert(file, b"{".to_vec());
+                }
+                3 => {
+                    s.private_bytes.insert(file, vec![b' '; file.limit() + 1]);
+                }
+                4 => {
+                    s.private_bytes.remove(&file);
+                }
+                _ => {
+                    let mut envelope: serde_json::Value =
+                        serde_json::from_slice(&s.private_bytes[&file]).unwrap();
+                    let mut row: serde_json::Value =
+                        serde_json::from_str(envelope["data"].as_str().unwrap()).unwrap();
+                    match case {
+                        5 => row["version"] = 99.into(),
+                        6 => row["unknown"] = true.into(),
+                        7 => row["binding"]["network_epoch"] = 2.into(),
+                        8 => row["binding"]["boot_id"][0] = 99.into(),
+                        9 => row["revision"] = 100.into(),
+                        10 => {
+                            row.as_object_mut().unwrap().remove("creation");
+                        }
+                        11 => envelope["identity"]["runtime"]["runtime_version"] = "0.3.4".into(),
+                        _ => envelope["identity"]["scope"]["connection_generation"] = 100.into(),
+                    }
+                    envelope["data"] = serde_json::to_string(&row).unwrap().into();
+                    s.private_bytes
+                        .insert(file, serde_json::to_vec(&envelope).unwrap());
+                }
+            }
+        });
+        assert!(
+            owner
+                .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+                .is_err(),
+            "journal case {case}"
+        );
+        assert_eq!(clock.sleeps, 1);
+        assert_cleanup_only(&mut owner, &fake);
+        assert_eq!(fake.0.borrow().effects, 1);
+        assert!(
+            fake.0.borrow().address.is_some(),
+            "obligation retained {case}"
+        );
+    }
+}
+#[test]
+fn readiness_protected_journal_is_rechecked_after_native_preferred_read() {
+    let fake = Fake::new();
+    let (mut owner, _) = retained_created(&fake);
+    fake.0.borrow_mut().read_hook = Some(Box::new(|s| {
+        s.address.as_mut().unwrap().DadState = 4;
+        s.private_bytes
+            .insert(private_files::PrivateFile::CarrierRows, b"{}".to_vec());
+    }));
+    let mut clock = TestClock::new(&fake);
+    assert!(owner
+        .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+        .is_err());
+    assert_eq!(clock.sleeps, 0);
+    assert_cleanup_only(&mut owner, &fake);
+}
+#[test]
+fn readiness_fresh_protected_permission_revocation_during_native_read_is_permanent() {
+    let fake = Fake::new();
+    let (mut owner, mut files) = retained_created(&fake);
+    let mut clock = TestClock::new(&fake);
+    let b = fake.0.borrow().binding.clone();
+    fake.0.borrow_mut().read_hook = Some(Box::new(move |s| {
+        s.address.as_mut().unwrap().DadState = 4;
+        files.revoke_native_carrier_access(&b.scope).unwrap();
+    }));
+    assert!(owner
+        .wait_address_ready_with(&std::sync::atomic::AtomicBool::new(false), &mut clock)
+        .is_err());
+    assert_eq!(clock.sleeps, 0);
+    assert_cleanup_only(&mut owner, &fake);
+    assert!(
+        owner.stop().is_err(),
+        "revoked store requires explicit cleanup-only reopen; readiness must not upgrade it"
+    );
+    assert_eq!(fake.0.borrow().effects, 1);
+}
+#[test]
+fn readiness_store_ack_failure_is_not_redeemed_by_exact_bytes_or_created_receipt() {
+    for confirm in [false, true] {
+        for fault in [Fault::LostAck, Fault::FalseAck, Fault::Unapplied] {
+            let fake = Fake::new();
+            let (mut owner, mut files) = protected_owner(&fake, Role::Carrier);
+            if confirm {
+                fake.0.borrow_mut().create_hook = Some(Box::new(move |s| s.private_fault = fault));
+            } else {
+                fake.0.borrow_mut().private_fault = fault;
+            }
+            assert!(owner.create_address(address_policy()).is_err());
+            let b = fake.0.borrow().binding.clone();
+            assert!(!files.native_carrier_access(&b.scope).unwrap().is_fresh());
+            if let Some(row) = fake.0.borrow_mut().address.as_mut() {
+                row.DadState = 4;
+            }
+            assert_cleanup_only(&mut owner, &fake);
+            let effects = fake.0.borrow().effects;
+            assert_eq!(effects, usize::from(confirm));
+            let (mut reopened, saved) =
+                protected::WindowsCarrierRowsStore::open(files, b.clone()).unwrap();
+            assert_eq!(reopened.load(&b).unwrap(), saved);
+            assert!(matches!(
+                RowOwner::capture(b, fake.clone(), fake.clone(), reopened),
+                Err(Error::Retired)
+            ));
+            assert_eq!(fake.0.borrow().effects, effects);
+            if confirm {
+                assert!(fake.0.borrow().address.is_some());
+            }
+        }
+    }
 }
 #[test]
 fn durable_owner_captures_full_baseline_then_exact_weak_address_and_cleanup() {

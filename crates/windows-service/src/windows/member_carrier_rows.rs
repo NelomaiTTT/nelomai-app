@@ -2,7 +2,29 @@
 #![allow(dead_code)]
 pub(crate) use crate::member_carrier_rows::*;
 use nelomai_client_tunnel::redundancy::SessionScope;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 use windows_sys::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
+
+/// Timing only: implementations confer no creator, journal or native authority.
+pub(crate) trait ReadinessClock {
+    fn now(&mut self) -> Instant;
+    fn sleep(&mut self, duration: Duration, cancelled: &AtomicBool);
+}
+
+struct MonotonicClock;
+impl ReadinessClock for MonotonicClock {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&mut self, duration: Duration, cancelled: &AtomicBool) {
+        if !cancelled.load(Ordering::Acquire) {
+            std::thread::sleep(duration);
+        }
+    }
+}
 pub(crate) fn address_status(status: u32) -> Result<bool> {
     match status {
         0 => Ok(true),
@@ -263,7 +285,7 @@ pub(crate) trait Kernel {
     fn create_address(&mut self, row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()>;
     fn delete_address(&mut self, row: &MIB_UNICASTIPADDRESS_ROW) -> Result<()>;
 }
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 static CHALLENGE: AtomicU64 = AtomicU64::new(1);
 fn challenge() -> Result<u64> {
     CHALLENGE
@@ -410,6 +432,80 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
             Ok(live)
         })
     }
+    /// Observe DAD only for this live owner's acknowledged creation. This result
+    /// is an observation, not a replacement creator handle or mutation permit.
+    /// Native calls are synchronous: the deadline rejects late results but is
+    /// NOT a hard timeout/preemption guarantee for a blocked Windows API call.
+    pub(crate) fn wait_address_ready(&mut self, cancelled: &AtomicBool) -> Result<AddressRow> {
+        self.wait_address_ready_with(cancelled, &mut MonotonicClock)
+    }
+    /// The same policy with a timing boundary; neither the budget nor ownership
+    /// checks can be configured away by the clock. Sleep never holds our lock.
+    pub(crate) fn wait_address_ready_with<C: ReadinessClock>(
+        &mut self,
+        cancelled: &AtomicBool,
+        clock: &mut C,
+    ) -> Result<AddressRow> {
+        let was_failed = self.state.failed;
+        // Cover cancellation, timeout, errors AND unwinding during read/sleep.
+        // Only successful readiness of an originally live owner clears this.
+        self.state.failed = true;
+        if was_failed {
+            return Err(Error::Retired);
+        }
+        let result = (|| {
+            let mut last = clock.now();
+            let deadline = last
+                .checked_add(Duration::from_secs(5))
+                .ok_or(Error::Retired)?;
+            // Independent finite poll bound also denies a defective/frozen
+            // injected clock; production uses the monotonic Instant below.
+            for _ in 0..200 {
+                readiness_budget(clock, cancelled, deadline, &mut last)?;
+                let state = &mut self.state;
+                let row = self.authority.locked(|creator| {
+                    if state.binding.role != Role::Carrier || state.record.phase != Phase::Captured
+                    {
+                        return Err(Error::Retired);
+                    }
+                    if state.record.pending.is_some() {
+                        return Err(Error::Pending);
+                    }
+                    state.require_durable()?;
+                    state.require_receipt()?;
+                    // Full native rows plus original creator/runtime and IFROW2
+                    // identity are queried before AND after every native snapshot.
+                    let live = read(creator, &mut state.kernel, &state.binding)?;
+                    if !same_owned(&live, &state.record.current) {
+                        return Err(Error::Conflict);
+                    }
+                    let row = live.address.ok_or(Error::Conflict)?;
+                    let receipt = state.creation.as_ref().ok_or(Error::Pending)?;
+                    if !same_address(&row, &receipt.row) {
+                        return Err(Error::Conflict);
+                    }
+                    // A late revoked/changed protected journal is not redeemed
+                    // by Preferred or by exact native data.
+                    state.require_durable()?;
+                    state.require_receipt()?;
+                    match row.observed.dad_state {
+                        1 | 4 => Ok(row), // Tentative or Preferred, read-only DAD
+                        _ => Err(Error::Conflict),
+                    }
+                })?;
+                let remaining = readiness_budget(clock, cancelled, deadline, &mut last)?;
+                if row.observed.dad_state == 4 {
+                    return Ok(row);
+                }
+                clock.sleep(remaining.min(Duration::from_millis(25)), cancelled);
+            }
+            Err(Error::Retired)
+        })();
+        if result.is_ok() {
+            self.state.failed = false;
+        }
+        result
+    }
     pub(crate) fn change_interface(&mut self, desired: InterfacePolicy) -> Result<()> {
         if self.state.failed || self.state.record.phase != Phase::Captured {
             return Err(Error::Retired);
@@ -479,6 +575,19 @@ impl<A: Authority, K: Kernel, J: Journal> RowOwner<A, K, J> {
             Ok(())
         })
     }
+}
+fn readiness_budget<C: ReadinessClock>(
+    clock: &mut C,
+    cancelled: &AtomicBool,
+    deadline: Instant,
+    last: &mut Instant,
+) -> Result<Duration> {
+    let now = clock.now();
+    if cancelled.load(Ordering::Acquire) || now < *last || now >= deadline {
+        return Err(Error::Retired);
+    }
+    *last = now;
+    Ok(deadline.duration_since(now))
 }
 impl<K: Kernel, J: Journal> OwnedRows<K, J> {
     fn require_durable(&mut self) -> Result<()> {
