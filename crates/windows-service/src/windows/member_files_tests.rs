@@ -57,6 +57,70 @@ fn private_files_never_accept_world_read_or_inherited_acl() {
 }
 
 #[test]
+fn executable_payload_allows_inherited_read_but_never_foreign_mutation() {
+    let mut acl = private(false);
+    acl.owner = TRUSTED_INSTALLER.into();
+    acl.control = 0;
+    for ace in &mut acl.aces {
+        ace.flags = 0x10;
+    }
+    acl.aces.push(Ace {
+        kind: 0,
+        flags: 0x10,
+        mask: 0x1200a9,
+        sid: "S-1-1-0".into(),
+    });
+    assert!(acl_allowed(&acl, Protection::Payload));
+    for mask in [
+        2, 4, 16, 256, 0x10000, 0x40000, 0x80000, 0x10000000, 0x20000000, 0x40000000,
+    ] {
+        let mut bad = acl.clone();
+        bad.aces.last_mut().unwrap().mask |= mask;
+        assert!(
+            !acl_allowed(&bad, Protection::Payload),
+            "foreign mask={mask:x}"
+        );
+    }
+    for mutation in 0..4 {
+        let mut bad = acl.clone();
+        match mutation {
+            0 => bad.owner = "S-1-1-0".into(),
+            1 => bad.aces.last_mut().unwrap().kind = 5,
+            2 => bad.aces.last_mut().unwrap().flags |= 0x80,
+            _ => bad.aces.clear(),
+        }
+        assert!(!acl_allowed(&bad, Protection::Payload));
+    }
+    assert!(!acl_allowed(&acl, Protection::File)); // secrets not loosened
+}
+
+#[test]
+fn pinned_payload_read_requires_exact_signed_size_and_digest() {
+    // Literal SHA256("abc"), independently published test vector.
+    let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    assert!(verify_payload_bytes(&b"abc"[..], 3, hash).is_ok());
+    for (bytes, size) in [
+        (&b"abd"[..], 3),
+        (&b"ab"[..], 3),
+        (&b"abcd"[..], 3),
+        (&b"abc"[..], 2),
+        (&b""[..], 0),
+        (&b"abc"[..], 16 * 1024 * 1024 + 1),
+    ] {
+        assert!(verify_payload_bytes(bytes, size, hash).is_err());
+    }
+    assert!(verify_payload_bytes(&b"abc"[..], 3, &hash.to_uppercase()).is_err());
+    assert!(verify_payload_bytes(&b"abc"[..], 3, "untrusted").is_err());
+    struct Broken;
+    impl io::Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("read failure"))
+        }
+    }
+    assert!(verify_payload_bytes(Broken, 3, hash).is_err());
+}
+
+#[test]
 fn recovery_marker_accepts_only_private_acl_inherited_from_pinned_private_root() {
     let mut inherited = private(false);
     inherited.control = 0;

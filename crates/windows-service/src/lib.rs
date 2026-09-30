@@ -17,6 +17,9 @@ pub use member_diagnostic::PairFailure;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_boot.rs"]
 mod member_boot;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_payload.rs"]
+mod member_carrier_payload;
 mod member_dns;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_files.rs"]

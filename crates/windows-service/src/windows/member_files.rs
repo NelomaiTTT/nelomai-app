@@ -110,6 +110,7 @@ enum Protection {
     Ancestor,
     Directory,
     File,
+    Payload,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Facts {
@@ -136,6 +137,9 @@ fn ancestor_ace_allowed(ace: &Ace) -> bool {
             || ace.mask & 0xf00d_0040 == 0)
 }
 fn acl_allowed(acl: &Acl, protection: Protection) -> bool {
+    if protection == Protection::Payload {
+        return payload_acl_allowed(acl);
+    }
     if protection == Protection::Ancestor {
         return privileged(&acl.owner) && acl.aces.iter().all(ancestor_ace_allowed);
     }
@@ -159,6 +163,37 @@ fn acl_allowed(acl: &Acl, protection: Protection) -> bool {
                 .count()
                 == 1
         })
+}
+fn payload_acl_allowed(acl: &Acl) -> bool {
+    // Payload bytes are non-secret, so inherited READ/EXECUTE is compatible.
+    // No unprivileged data/EA/attribute write, delete, owner/DACL change or
+    // generic mutation right. Unknown ACE types/flags fail closed.
+    privileged(&acl.owner)
+        && !acl.aces.is_empty()
+        && acl.aces.iter().all(|ace| {
+            matches!(ace.kind, 0 | 1)
+                && ace.flags & !0x1f == 0
+                && (ace.flags & 8 != 0
+                    || ace.kind == 1
+                    || privileged(&ace.sid)
+                    || ace.mask & !0x8012_00a9 == 0)
+        })
+}
+fn verify_payload_bytes(reader: impl Read, size: u64, sha256: &str) -> Result<()> {
+    if size == 0
+        || size > 16 * 1024 * 1024
+        || sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|c| c.is_ascii_digit() || matches!(c, b'a'..=b'f'))
+    {
+        return Err(OwnerError::Conflict);
+    }
+    let bytes = bounded_read(reader, size as usize)?;
+    if bytes.len() as u64 != size || format!("{:x}", Sha256::digest(&*bytes)) != sha256 {
+        return Err(OwnerError::Conflict);
+    }
+    Ok(())
 }
 fn recovery_marker_acl_allowed(acl: &Acl) -> bool {
     // The dispatcher writes this non-secret identity file under a pinned
@@ -363,7 +398,9 @@ fn exact_config_slot(
 }
 
 #[cfg(windows)]
-pub(crate) use native::{pin_private_directory, pin_recovery_marker, MemberFiles};
+pub(crate) use native::{
+    pin_private_directory, pin_recovery_marker, pin_runtime_payload, MemberFiles, PinnedPayload,
+};
 
 #[cfg(windows)]
 mod native {
@@ -373,7 +410,7 @@ mod native {
     use std::{
         ffi::c_void,
         fs::File,
-        io::Write,
+        io::{Seek, SeekFrom, Write},
         os::windows::{
             ffi::OsStrExt,
             io::{AsRawHandle, FromRawHandle},
@@ -645,6 +682,9 @@ mod native {
         }
     }
     pub(crate) fn pin_private_directory(root: &Path) -> Result<PinnedDirectory> {
+        pin_directory_chain(root, Protection::Directory)
+    }
+    fn pin_directory_chain(root: &Path, leaf: Protection) -> Result<PinnedDirectory> {
         let paths: Vec<_> = root.ancestors().map(Path::to_path_buf).collect();
         let drive = wide(paths.last().ok_or(OwnerError::Invalid)?)?;
         if unsafe { GetDriveTypeW(drive.as_ptr()) } != 3 {
@@ -655,7 +695,7 @@ mod native {
             pinned.verify()?;
             let file = open_directory(path).map_err(|_| OwnerError::Native)?;
             let protection = if depth == 0 {
-                Protection::Directory
+                leaf
             } else {
                 Protection::Ancestor
             };
@@ -672,6 +712,79 @@ mod native {
             pinned.0.push(directory);
         }
         Ok(pinned)
+    }
+
+    /// Read-only source capability, not executable-load/effect permission.
+    /// Caller must independently authenticate the expected signed manifest and
+    /// runtime. The same original File/ancestors survive all borrowed uses.
+    /// Never creates a file or changes its ACL. No write or delete sharing.
+    pub(crate) struct PinnedPayload {
+        path: PathBuf,
+        file: File,
+        parents: PinnedDirectory,
+        stamp: Stamp,
+        acl: Acl,
+        size: u64,
+        sha256: String,
+    }
+    impl PinnedPayload {
+        pub(crate) fn verify(&self) -> Result<()> {
+            self.parents.verify()?;
+            let by_path = open_payload(&self.path)?;
+            for file in [&self.file, &by_path] {
+                if stamp(file, false, 16 * 1024 * 1024)? != self.stamp
+                    || acl(file, Protection::Payload)? != self.acl
+                {
+                    return Err(OwnerError::Conflict);
+                }
+                let mut read = file.try_clone().map_err(|_| OwnerError::Native)?;
+                read.seek(SeekFrom::Start(0))
+                    .map_err(|_| OwnerError::Native)?;
+                verify_payload_bytes(&mut read, self.size, &self.sha256)?;
+            }
+            self.parents.verify()
+        }
+        pub(crate) fn file(&self) -> &File {
+            &self.file
+        }
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+    fn open_payload(path: &Path) -> Result<File> {
+        open(
+            path,
+            GENERIC_READ | READ_CONTROL,
+            FILE_SHARE_READ,
+            OPEN_EXISTING,
+            false,
+            None,
+        )
+        .map_err(|_| OwnerError::Native)
+    }
+    pub(crate) fn pin_runtime_payload(
+        path: &Path,
+        size: u64,
+        sha256: &str,
+    ) -> Result<PinnedPayload> {
+        let parents = pin_directory_chain(
+            path.parent().ok_or(OwnerError::Invalid)?,
+            Protection::Ancestor,
+        )?;
+        let file = open_payload(path)?;
+        let stamp = stamp(&file, false, 16 * 1024 * 1024)?;
+        let acl = acl(&file, Protection::Payload)?;
+        let pin = PinnedPayload {
+            path: path.into(),
+            file,
+            parents,
+            stamp,
+            acl,
+            size,
+            sha256: sha256.into(),
+        };
+        pin.verify()?;
+        Ok(pin)
     }
 
     /// Caller holds PinnedDirectory for the protected installation root.
@@ -1111,6 +1224,34 @@ mod native {
                 Ok(Sha256::digest(&file.bytes).into())
             })
             .transpose()
+        }
+    }
+    #[cfg(test)]
+    mod payload_native_tests {
+        use super::*;
+        // Own temp resources only. These are real Win32 sharing/identity tests,
+        // not host fake evidence. Main cross-compiles them; native CI must RUN.
+        #[test]
+        fn retained_payload_handle_prevents_write_rename_and_delete() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.dll");
+            std::fs::write(&path, b"abc").unwrap();
+            let retained = open_payload(&path).unwrap();
+            assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+            assert!(std::fs::rename(&path, dir.path().join("other.dll")).is_err());
+            assert!(std::fs::remove_file(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+            drop(retained);
+            std::fs::write(&path, b"new").unwrap();
+        }
+        #[test]
+        fn native_payload_stamp_rejects_actual_hardlink_alias() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.dll");
+            std::fs::write(&path, b"abc").unwrap();
+            std::fs::hard_link(&path, dir.path().join("alias.dll")).unwrap();
+            let retained = open_payload(&path).unwrap();
+            assert!(stamp(&retained, false, 16 * 1024 * 1024).is_err());
         }
     }
 }

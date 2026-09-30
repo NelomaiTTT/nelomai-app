@@ -8,6 +8,7 @@ pub(crate) mod member_boot;
 mod member_carrier_guard;
 mod member_carrier_key_authority;
 mod member_carrier_keys;
+mod member_carrier_payload;
 mod member_carrier_rows;
 mod member_carrier_wintun;
 mod member_dns;
