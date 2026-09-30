@@ -5,6 +5,7 @@ mod elevation;
 mod install;
 mod ipc;
 pub(crate) mod member_boot;
+mod member_carrier_guard;
 mod member_dns;
 mod member_files;
 mod member_guard;
