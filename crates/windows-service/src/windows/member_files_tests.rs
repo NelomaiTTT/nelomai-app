@@ -467,6 +467,7 @@ fn session_fixed_files_require_exact_cas_and_bound_both_sides() {
         PrivateFile::Session,
         PrivateFile::Pair,
         PrivateFile::Network,
+        PrivateFile::Carrier,
     ] {
         assert!(private_replace_allowed(file, None, None, b"new"));
         assert!(private_replace_allowed(
@@ -497,6 +498,42 @@ fn session_fixed_files_require_exact_cas_and_bound_both_sides() {
         Some(&large),
         b"new"
     ));
+}
+
+#[test]
+fn carrier_file_is_distinct_and_bounded_at_64k_before_publication_or_read() {
+    let carrier = PrivateFile::Carrier;
+    assert_eq!(carrier.name(), "nelomai-redundant-carrier.json");
+    assert_eq!(carrier.limit(), 64 * 1024);
+    for other in [
+        PrivateFile::Index,
+        PrivateFile::Session,
+        PrivateFile::Pair,
+        PrivateFile::Network,
+        PrivateFile::Completed([1; 32]),
+    ] {
+        assert_ne!(carrier.name(), other.name());
+    }
+    let at_limit = vec![b' '; 64 * 1024];
+    let over = vec![b' '; 64 * 1024 + 1];
+    assert!(private_replace_allowed(carrier, None, None, &at_limit));
+    assert!(!private_replace_allowed(carrier, None, None, &over));
+    assert!(!private_replace_allowed(
+        carrier,
+        Some(&over),
+        Some(&over),
+        b"small"
+    ));
+    assert!(!facts_allowed(
+        Facts {
+            attributes: 0,
+            links: 1,
+            size: over.len() as u64
+        },
+        false,
+        carrier.limit()
+    ));
+    assert!(bounded_read(over.as_slice(), carrier.limit()).is_err());
 }
 
 #[test]
