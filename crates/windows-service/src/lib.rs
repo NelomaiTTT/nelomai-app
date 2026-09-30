@@ -20,6 +20,12 @@ mod member_boot;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_payload.rs"]
 mod member_carrier_payload;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_preload.rs"]
+mod member_carrier_preload;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_wintun_package.rs"]
+mod member_carrier_wintun_package;
 mod member_dns;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_files.rs"]
