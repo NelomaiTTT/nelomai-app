@@ -1026,7 +1026,7 @@ fn retired_nonterminal_corrupt_or_unmarked_receipts_are_never_hidden_from_a_new_
 }
 
 #[test]
-fn all_five_fixed_record_owners_survive_retirement_and_partial_overwrite_without_replay() {
+fn all_eight_fixed_record_owners_survive_retirement_and_partial_overwrite_without_replay() {
     let disk = Disk::default();
     let mut identities = vec![];
     for (i, kind) in RecordKind::OWNED.into_iter().enumerate() {
@@ -1082,6 +1082,97 @@ fn all_five_fixed_record_owners_survive_retirement_and_partial_overwrite_without
                 previous = Some(record);
             }
         }
+        let row_role = match kind {
+            RecordKind::CarrierRows => Some(rows::Role::Carrier),
+            RecordKind::MemberARows => Some(rows::Role::MemberA),
+            RecordKind::MemberBRows => Some(rows::Role::MemberB),
+            _ => None,
+        };
+        if let Some(role) = row_role {
+            use rows::Journal;
+            let key = rows::RowKey {
+                luid: 3000 + i as u64,
+                index: 30 + i as u32,
+            };
+            let baseline = rows::Snapshot {
+                interface: rows::InterfaceRow {
+                    key,
+                    policy: rows::InterfacePolicy {
+                        advertising: false,
+                        forwarding: false,
+                        weak_host_send: false,
+                        weak_host_receive: false,
+                        automatic_metric: false,
+                        neighbor_unreachability: true,
+                        managed_address_configuration: false,
+                        other_stateful_configuration: false,
+                        advertise_default_route: false,
+                        router_discovery: 0,
+                        dad_transmits: 3,
+                        base_reachable_time: 30000,
+                        retransmit_time: 1000,
+                        path_mtu_discovery_timeout: 600000,
+                        link_local_behavior: 0,
+                        link_local_timeout: 6500,
+                        zone_indices: [0; 16],
+                        site_prefix_length: 0,
+                        metric: 19,
+                        mtu: 1420,
+                        disable_default_routes: true,
+                    },
+                    observed: rows::InterfaceObserved {
+                        max_reassembly_size: 0,
+                        interface_identifier: 0,
+                        min_router_advertisement_interval: 200,
+                        max_router_advertisement_interval: 600,
+                        connected: true,
+                        supports_wake_up_patterns: false,
+                        supports_neighbor_discovery: true,
+                        supports_router_discovery: false,
+                        reachable_time: 45678,
+                        transmit_offload: 0,
+                        receive_offload: 0,
+                    },
+                },
+                address: None,
+            };
+            let mut record = rows::Record {
+                version: 1,
+                domain: "carrier-native-ipv4-rows-v1".into(),
+                binding: rows::Binding {
+                    scope: own.clone(),
+                    boot_id: [7; 16],
+                    runtime: runtime(),
+                    network_epoch: 1,
+                    role,
+                    guid: [i as u8 + 1; 16],
+                    name: format!("owned-row-{i}"),
+                    key,
+                    address: [10, 7, 0, 2],
+                },
+                revision: 1,
+                phase: rows::Phase::Captured,
+                current: baseline.clone(),
+                baseline,
+                pending: None,
+                creation: None,
+            };
+            let mut store = WindowsCarrierRowsStore::open(f.clone(), record.binding.clone())
+                .unwrap()
+                .0;
+            store
+                .compare_exchange(&record.binding, None, &record)
+                .unwrap();
+            for phase in [rows::Phase::Closing, rows::Phase::Stopped] {
+                let mut desired = record.clone();
+                desired.revision += 1;
+                desired.phase = phase;
+                store
+                    .compare_exchange(&record.binding, Some(&record), &desired)
+                    .unwrap();
+                record = desired;
+            }
+        }
         f.complete(&own).unwrap();
         let identity = SessionIdentity {
             boot_id: [7; 16],
@@ -1135,7 +1226,7 @@ fn all_five_fixed_record_owners_survive_retirement_and_partial_overwrite_without
     }
     f.complete(&own).unwrap();
     let (_, index) = load_index(&mut disk.clone()).unwrap();
-    assert_eq!(index.completed.len(), 3);
+    assert_eq!(index.completed.len(), 6);
     for id in &identities {
         assert!(f.claim(&id.scope).is_err());
     } // compacted identities still permanently fenced

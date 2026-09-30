@@ -11,6 +11,7 @@ pub mod member_actor;
 mod member_carrier;
 mod member_carrier_guard;
 mod member_carrier_native_ownership;
+mod member_carrier_rows;
 mod member_diagnostic;
 pub use member_diagnostic::PairFailure;
 #[cfg(all(test, not(windows)))]

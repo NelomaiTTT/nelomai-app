@@ -65,6 +65,9 @@ const _: () = {
     assert!(std::mem::size_of::<SOCKADDR_INET>() == 28);
 };
 #[cfg(not(windows))]
+#[path = "../member_carrier_rows.rs"]
+mod member_carrier_rows;
+#[cfg(not(windows))]
 #[path = "member_carrier_rows.rs"]
 mod native;
 #[cfg(windows)]

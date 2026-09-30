@@ -6,6 +6,7 @@
 use super::member_files::{previous_config_valid, PrivateFile, PrivateRecords, SessionFileIo};
 use crate::member_carrier::{self as carrier, CarrierJournal, CarrierKey, Record as CarrierRecord};
 use crate::member_carrier_native_ownership::{self as native_receipt, NativeJournal};
+use crate::member_carrier_rows as rows;
 #[cfg(not(windows))]
 use crate::member_files::{previous_config_valid, PrivateFile, PrivateRecords, SessionFileIo};
 use crate::member_pair::{failed, PairRecord, PairStore};
@@ -27,6 +28,9 @@ pub(crate) enum RecordKind {
     Network,
     Carrier,
     NativeCarrierReceipts,
+    CarrierRows,
+    MemberARows,
+    MemberBRows,
 }
 /// All calls run under the existing serialized engine owner. The implementation
 /// authenticates runtime, private root/ancestors/handles and envelope scope;
@@ -87,6 +91,24 @@ pub(crate) struct CarrierAccess {
     provenance: carrier::Provenance,
     fresh: bool,
 }
+impl CarrierAccess {
+    /// Storage-only exact context comparison. This does NOT attest the Context's
+    /// GUID/name/native bindings, creator capability, absence or mutation lock.
+    /// Cleanup callers must explicitly supply the retained authenticated epoch.
+    pub(crate) fn require_native_context(
+        &self,
+        context: &native_receipt::Context,
+    ) -> io::Result<()> {
+        if self.scope != context.intent.scope || self.provenance != context.provenance {
+            Err(failed())
+        } else {
+            Ok(())
+        }
+    }
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.fresh
+    }
+}
 
 const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 // Unpublished v1 is intentionally rejected, NOT migrated or truncated. Permanent
@@ -106,7 +128,7 @@ struct SessionIndex {
     version: u32,
     active: Option<SessionIdentity>,
     // Only identities still represented by the fixed owned record files.
-    // Never the replay authority. Partial overwrites can leave five owners.
+    // Never the replay authority. Partial overwrites can leave OWNED.len() owners.
     completed: Vec<SessionIdentity>,
 }
 #[derive(Serialize, Deserialize)]
@@ -349,8 +371,13 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
         desired: &[u8],
     ) -> io::Result<()> {
         let identity = self.identity(scope)?;
-        validate_payload(scope, kind, desired)?;
         let mut backend = self.backend.lock().map_err(|_| failed())?;
+        if let Err(e) = validate_payload(scope, kind, desired) {
+            if kind.row_role().is_some() {
+                backend.fresh = None;
+            }
+            return Err(e);
+        }
         let fresh = !self.cleanup_only && backend.fresh.as_ref() == Some(scope);
         let result = backend
             .io
@@ -438,6 +465,34 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                     }
                     authenticate_native(&next, &identity, retained)?;
                     retained
+                } else if kind.row_role().is_some() {
+                    let next = rows_payload(kind, scope, desired)?;
+                    let old = current
+                        .as_ref()
+                        .map(|r| rows_payload(kind, scope, r.data.as_bytes()))
+                        .transpose()?;
+                    rows::validate_transition(old.as_ref(), &next, !fresh).map_err(|_| failed())?;
+                    let epoch = current_epoch(files, &index, &identity)?;
+                    let retained = next.binding.network_epoch;
+                    if retained > epoch
+                        || (fresh && next.phase == rows::Phase::Captured && retained != epoch)
+                    {
+                        return Err(failed());
+                    }
+                    authenticate_rows(&next, &identity, retained)?;
+                    require_rows_obligations(files, &index, &identity)?;
+                    for other in RecordKind::ROWS {
+                        if other == kind {
+                            continue;
+                        }
+                        if let Some(saved) = load_record(files, &index, &identity, other)?.1 {
+                            let record = rows_payload(other, scope, saved.data.as_bytes())?;
+                            if duplicate_rows_binding(&record.binding, &next.binding) {
+                                return Err(failed());
+                            }
+                        }
+                    }
+                    retained
                 } else {
                     current_epoch(files, &index, &identity)?
                 };
@@ -455,7 +510,13 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                 if bytes.len() > kind.file().limit() {
                     return Err(failed());
                 }
-                files.compare_exchange(kind.file(), raw.as_deref(), &bytes)
+                files.compare_exchange(kind.file(), raw.as_deref(), &bytes)?;
+                if kind.row_role().is_some()
+                    && files.read(kind.file())?.as_deref() != Some(bytes.as_slice())
+                {
+                    return Err(failed());
+                }
+                Ok(())
             })
             .map_err(|_| failed());
         if result.is_err() {
@@ -528,6 +589,15 @@ impl<I: SessionFileIo> SessionFiles for ProtectedSessionFiles<I> {
                         return Err(failed());
                     }
                 }
+                require_rows_obligations(files, &index, &identity)?;
+                for kind in RecordKind::ROWS {
+                    if let Some(saved) = load_record(files, &index, &identity, kind)?.1 {
+                        require_stopped_rows(kind, &saved)?;
+                        if saved.network_epoch > session.network_epoch {
+                            return Err(failed());
+                        }
+                    }
+                }
                 finish_completion(files, raw.as_deref(), &mut index, &identity)
             })
             .map_err(|_| failed())?;
@@ -562,12 +632,16 @@ impl RecordKind {
     // Legacy fixture inventory; production fencing always uses OWNED.
     #[cfg(test)]
     const ALL: [Self; 4] = [Self::Session, Self::Pair, Self::Network, Self::Carrier];
-    const OWNED: [Self; 5] = [
+    const ROWS: [Self; 3] = [Self::CarrierRows, Self::MemberARows, Self::MemberBRows];
+    const OWNED: [Self; 8] = [
         Self::Session,
         Self::Pair,
         Self::Network,
         Self::Carrier,
         Self::NativeCarrierReceipts,
+        Self::CarrierRows,
+        Self::MemberARows,
+        Self::MemberBRows,
     ];
     fn file(self) -> PrivateFile {
         match self {
@@ -576,6 +650,17 @@ impl RecordKind {
             Self::Network => PrivateFile::Network,
             Self::Carrier => PrivateFile::Carrier,
             Self::NativeCarrierReceipts => PrivateFile::NativeCarrierReceipts,
+            Self::CarrierRows => PrivateFile::CarrierRows,
+            Self::MemberARows => PrivateFile::MemberARows,
+            Self::MemberBRows => PrivateFile::MemberBRows,
+        }
+    }
+    fn row_role(self) -> Option<rows::Role> {
+        match self {
+            Self::CarrierRows => Some(rows::Role::Carrier),
+            Self::MemberARows => Some(rows::Role::MemberA),
+            Self::MemberBRows => Some(rows::Role::MemberB),
+            _ => None,
         }
     }
 }
@@ -779,17 +864,24 @@ fn load_index(files: &mut dyn PrivateRecords) -> io::Result<(Option<Vec<u8>>, Se
             return Err(failed());
         }
     }
-    // A closed maximal index must actually represent all five bounded files.
+    // Every retired identity must actually be represented in the bounded files.
     // With an active claim, partial overwrites may temporarily hide old owners.
-    if index.active.is_none() && index.completed.len() == RecordKind::OWNED.len() {
+    if index.active.is_none() {
         let mut represented = vec![];
         for kind in RecordKind::OWNED {
-            let raw = files.read(kind.file())?.ok_or_else(failed)?;
+            let Some(raw) = files.read(kind.file())? else {
+                continue;
+            };
             let saved = parse_record(kind, &raw)?;
-            if !index.completed.contains(&saved.identity) || represented.contains(&saved.identity) {
+            if !index.completed.contains(&saved.identity) {
                 return Err(failed());
             }
-            represented.push(saved.identity);
+            if !represented.contains(&saved.identity) {
+                represented.push(saved.identity);
+            }
+        }
+        if represented.len() != index.completed.len() {
+            return Err(failed());
         }
     }
     Ok((bytes, index))
@@ -891,6 +983,9 @@ fn finish_completion(
             if kind == RecordKind::NativeCarrierReceipts {
                 require_stopped_native(&saved)?;
             }
+            if kind.row_role().is_some() {
+                require_stopped_rows(kind, &saved)?;
+            }
             if saved.identity != *id && !index.completed.contains(&saved.identity) {
                 return Err(failed());
             }
@@ -941,6 +1036,9 @@ fn require_retired_records(files: &mut dyn PrivateRecords, index: &SessionIndex)
             if kind == RecordKind::NativeCarrierReceipts {
                 require_stopped_native(&old)?;
             }
+            if kind.row_role().is_some() {
+                require_stopped_rows(kind, &old)?;
+            }
         }
     }
     Ok(())
@@ -978,6 +1076,13 @@ fn parse_record(kind: RecordKind, raw: &[u8]) -> io::Result<SavedRecord> {
             record.network_epoch,
         )?;
     }
+    if kind.row_role().is_some() {
+        authenticate_rows(
+            &rows_payload(kind, &record.identity.scope, record.data.as_bytes())?,
+            &record.identity,
+            record.network_epoch,
+        )?;
+    }
     Ok(record)
 }
 fn load_record(
@@ -997,6 +1102,9 @@ fn load_record(
             if kind == RecordKind::NativeCarrierReceipts {
                 require_stopped_native(&r)?;
             }
+            if kind.row_role().is_some() {
+                require_stopped_rows(kind, &r)?;
+            }
             None
         }
         Some(_) => return Err(failed()),
@@ -1014,6 +1122,9 @@ fn current_epoch(
 }
 fn validate_payload(scope: &SessionScope, kind: RecordKind, bytes: &[u8]) -> io::Result<()> {
     match kind {
+        RecordKind::CarrierRows | RecordKind::MemberARows | RecordKind::MemberBRows => {
+            rows_payload(kind, scope, bytes)?;
+        }
         RecordKind::NativeCarrierReceipts => {
             let record = native_receipt::Record::decode(bytes).map_err(|_| failed())?;
             if record.context.intent.scope != *scope {
@@ -1592,8 +1703,8 @@ impl<F: SessionFiles> WindowsNativeCarrierReceiptStore<F> {
         validate_native_context(&context)?;
         let (access, _, current) = native_snapshot(&mut files, &context)?;
         let cleanup_only = current.is_some() || !access.fresh;
-        if !cleanup_only && context.provenance.network_epoch != access.provenance.network_epoch {
-            return Err(failed());
+        if !cleanup_only {
+            access.require_native_context(&context)?;
         }
         Ok((
             Self {
@@ -1758,6 +1869,7 @@ fn require_native_obligation(
     index: &SessionIndex,
     identity: &SessionIdentity,
 ) -> io::Result<()> {
+    require_rows_obligations(files, index, identity)?;
     let (_, saved) = load_record(files, index, identity, RecordKind::NativeCarrierReceipts)?;
     if let Some(saved) = saved {
         if saved.network_epoch > current_epoch(files, index, identity)? {
@@ -1801,6 +1913,241 @@ fn native_snapshot<F: SessionFiles>(
 #[cfg(test)]
 #[path = "member_carrier_native_store_tests.rs"]
 mod native_carrier_store_tests;
+
+/// Storage only. The caller supplies independently established FULL Binding;
+/// opening/loading never constructs an OriginalCreator or address-create receipt.
+/// File transactions do not substitute for the actual native-owner lock.
+#[allow(dead_code)] // Deliberately disconnected native factory; exercised by host store tests.
+pub(crate) struct WindowsCarrierRowsStore<F> {
+    files: F,
+    binding: rows::Binding,
+    cleanup_only: bool,
+    revoked: bool,
+}
+#[allow(dead_code)] // Opening is explicit; no production selection in this task.
+impl<F: SessionFiles> WindowsCarrierRowsStore<F> {
+    pub(crate) fn open(
+        mut files: F,
+        binding: rows::Binding,
+    ) -> io::Result<(Self, Option<rows::Record>)> {
+        binding.validate().map_err(|_| failed())?;
+        let (access, _, current) = rows_snapshot(&mut files, &binding)?;
+        let cleanup_only = current.is_some() || !access.is_fresh();
+        if !cleanup_only && binding.network_epoch != access.provenance.network_epoch {
+            return Err(failed());
+        }
+        if cleanup_only {
+            // Downgrade this private file view too: the raw boundary must
+            // independently reject resume even if another clone is still fresh.
+            files = files
+                .recovery_view(binding.scope.runtime)?
+                .ok_or_else(failed)?
+                .0;
+            let (access, _, again) = rows_snapshot(&mut files, &binding)?;
+            if access.fresh || again != current {
+                return Err(failed());
+            }
+        }
+        Ok((
+            Self {
+                files,
+                binding,
+                cleanup_only,
+                revoked: false,
+            },
+            current,
+        ))
+    }
+    fn require_binding(&self, binding: &rows::Binding) -> rows::Result<()> {
+        if *binding != self.binding {
+            return Err(rows::Error::Conflict);
+        }
+        if self.revoked {
+            return Err(rows::Error::Journal);
+        }
+        Ok(())
+    }
+    fn revoke(&mut self) {
+        if !self.cleanup_only {
+            self.revoked = true;
+        }
+        let _ = self.files.revoke_native_carrier_access(&self.binding.scope);
+    }
+    fn exchange(
+        &mut self,
+        binding: &rows::Binding,
+        expected: Option<&rows::Record>,
+        desired: &rows::Record,
+    ) -> rows::Result<()> {
+        self.require_binding(binding)?;
+        if desired.binding != *binding {
+            return Err(rows::Error::Conflict);
+        }
+        let bytes = desired.encode()?;
+        let (access, raw, current) =
+            rows_snapshot(&mut self.files, binding).map_err(|_| rows::Error::Journal)?;
+        if !self.cleanup_only
+            && (!access.fresh || binding.network_epoch != access.provenance.network_epoch)
+        {
+            return Err(rows::Error::Journal);
+        }
+        if current.as_ref() != expected {
+            return Err(rows::Error::Conflict);
+        }
+        rows::validate_transition(current.as_ref(), desired, self.cleanup_only)?;
+        // Actual original payload bytes; do NOT reserialize expected.
+        let result = self.files.compare_exchange(
+            &binding.scope,
+            rows_kind(binding.role),
+            raw.as_deref(),
+            &bytes,
+        );
+        if result.is_err() {
+            self.revoke();
+        }
+        let (_, actual_raw, actual) =
+            rows_snapshot(&mut self.files, binding).map_err(|_| rows::Error::Journal)?;
+        if actual.as_ref() == Some(desired) && actual_raw.as_deref() == Some(bytes.as_slice()) {
+            return if self.revoked {
+                Err(rows::Error::Journal)
+            } else {
+                Ok(())
+            };
+        }
+        if actual.as_ref() != expected {
+            return Err(rows::Error::Conflict);
+        }
+        Err(rows::Error::Journal)
+    }
+}
+impl<F: SessionFiles> rows::Journal for WindowsCarrierRowsStore<F> {
+    fn load(&mut self, binding: &rows::Binding) -> rows::Result<Option<rows::Record>> {
+        self.require_binding(binding)?;
+        let (access, _, current) =
+            rows_snapshot(&mut self.files, binding).map_err(|_| rows::Error::Journal)?;
+        if !self.cleanup_only
+            && (!access.fresh || binding.network_epoch != access.provenance.network_epoch)
+        {
+            return Err(rows::Error::Journal);
+        }
+        Ok(current)
+    }
+    fn compare_exchange(
+        &mut self,
+        binding: &rows::Binding,
+        expected: Option<&rows::Record>,
+        desired: &rows::Record,
+    ) -> rows::Result<()> {
+        let result = self.exchange(binding, expected, desired);
+        // EVERY failed/unconfirmed CAS, including preflight/schema/context/CAS
+        // mismatch, revokes shared fresh permission, even if no file was written.
+        if result.is_err() {
+            self.revoke();
+        }
+        result
+    }
+}
+#[allow(dead_code)] // Typed factory constructor remains unwired.
+fn rows_kind(role: rows::Role) -> RecordKind {
+    match role {
+        rows::Role::Carrier => RecordKind::CarrierRows,
+        rows::Role::MemberA => RecordKind::MemberARows,
+        rows::Role::MemberB => RecordKind::MemberBRows,
+    }
+}
+fn rows_payload(kind: RecordKind, scope: &SessionScope, bytes: &[u8]) -> io::Result<rows::Record> {
+    let record = rows::Record::decode(bytes).map_err(|_| failed())?;
+    if record.binding.scope != *scope || kind.row_role() != Some(record.binding.role) {
+        return Err(failed());
+    }
+    Ok(record)
+}
+fn authenticate_rows(
+    record: &rows::Record,
+    identity: &SessionIdentity,
+    epoch: u64,
+) -> io::Result<()> {
+    let b = &record.binding;
+    if b.scope != identity.scope
+        || b.boot_id != identity.boot_id
+        || b.runtime != identity.runtime
+        || b.network_epoch != epoch
+    {
+        return Err(failed());
+    }
+    Ok(())
+}
+fn require_stopped_rows(kind: RecordKind, saved: &SavedRecord) -> io::Result<()> {
+    if rows_payload(kind, &saved.identity.scope, saved.data.as_bytes())?.phase
+        != rows::Phase::Stopped
+    {
+        return Err(failed());
+    }
+    Ok(())
+}
+fn duplicate_rows_binding(a: &rows::Binding, b: &rows::Binding) -> bool {
+    a.guid == b.guid
+        || a.key.luid == b.key.luid
+        || a.key.index == b.key.index
+        || a.name.eq_ignore_ascii_case(&b.name)
+}
+fn require_rows_obligations(
+    files: &mut dyn PrivateRecords,
+    index: &SessionIndex,
+    identity: &SessionIdentity,
+) -> io::Result<()> {
+    let epoch = current_epoch(files, index, identity)?;
+    let mut bindings = Vec::new();
+    for kind in RecordKind::ROWS {
+        if let Some(saved) = load_record(files, index, identity, kind)?.1 {
+            if saved.network_epoch > epoch {
+                return Err(failed());
+            }
+            let record = rows_payload(kind, &identity.scope, saved.data.as_bytes())?;
+            if bindings
+                .iter()
+                .any(|other| duplicate_rows_binding(other, &record.binding))
+            {
+                return Err(failed());
+            }
+            bindings.push(record.binding);
+        }
+    }
+    Ok(())
+}
+#[allow(dead_code)] // Typed factory constructor remains unwired.
+type RowsSnapshot = (CarrierAccess, Option<Vec<u8>>, Option<rows::Record>);
+#[allow(dead_code)] // Typed factory constructor remains unwired.
+fn rows_snapshot<F: SessionFiles>(
+    files: &mut F,
+    binding: &rows::Binding,
+) -> io::Result<RowsSnapshot> {
+    let access = files.native_carrier_access(&binding.scope)?;
+    if access.scope != binding.scope
+        || access.provenance.boot_id != binding.boot_id
+        || access.provenance.runtime != binding.runtime
+        || binding.network_epoch == 0
+        || binding.network_epoch > access.provenance.network_epoch
+    {
+        return Err(failed());
+    }
+    let raw = files.read(&binding.scope, rows_kind(binding.role))?;
+    let current = raw
+        .as_ref()
+        .map(|b| rows_payload(rows_kind(binding.role), &binding.scope, b))
+        .transpose()?;
+    if current.as_ref().is_some_and(|r| r.binding != *binding) {
+        return Err(failed());
+    }
+    Ok((access, raw, current))
+}
+#[cfg(test)]
+fn rows_file(role: rows::Role) -> PrivateFile {
+    rows_kind(role).file()
+}
+#[cfg(test)]
+#[path = "member_carrier_rows_store_tests.rs"]
+mod rows_store_tests;
 
 #[cfg(test)]
 mod tests {

@@ -26,6 +26,9 @@ pub(crate) enum PrivateFile {
     Network,
     Carrier,
     NativeCarrierReceipts,
+    CarrierRows,
+    MemberARows,
+    MemberBRows,
     /// SHA256 of the canonical SessionScope, computed by the trusted adapter.
     /// Never accepts a path component or text from IPC.
     Completed([u8; 32]),
@@ -39,6 +42,9 @@ impl PrivateFile {
             Self::Network => "nelomai-redundant-network.json".into(),
             Self::Carrier => "nelomai-redundant-carrier.json".into(),
             Self::NativeCarrierReceipts => "nelomai-redundant-native-carrier-receipts.json".into(),
+            Self::CarrierRows => "nelomai-redundant-carrier-rows.json".into(),
+            Self::MemberARows => "nelomai-redundant-member-a-rows.json".into(),
+            Self::MemberBRows => "nelomai-redundant-member-b-rows.json".into(),
             Self::Completed(hash) => format!(
                 "nelomai-redundant-completed-{}.json",
                 hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
@@ -49,7 +55,11 @@ impl PrivateFile {
         match self {
             Self::Index => 8192,
             Self::Completed(_) => 4096,
-            Self::Carrier | Self::NativeCarrierReceipts => 64 * 1024,
+            Self::Carrier
+            | Self::NativeCarrierReceipts
+            | Self::CarrierRows
+            | Self::MemberARows
+            | Self::MemberBRows => 64 * 1024,
             _ => 32 * 1024 * 1024 + 8192,
         }
     }

@@ -1,0 +1,1284 @@
+use super::*;
+use crate::member_carrier_rows::{self as rows, *};
+use nelomai_client_tunnel::redundancy::{
+    session::{SessionPhase, SessionState},
+    Slot,
+};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    Fail,
+    Lost,
+    False,
+    Unreadable,
+    Foreign,
+    Equivalent,
+}
+#[derive(Default)]
+struct State {
+    bytes: BTreeMap<PrivateFile, Vec<u8>>,
+    fault: Option<Fault>,
+    unreadable: Option<PrivateFile>,
+    race: Option<Vec<u8>>,
+    attempts: usize,
+}
+#[derive(Clone, Default)]
+struct Disk(Rc<RefCell<State>>);
+impl PrivateRecords for Disk {
+    fn read(&mut self, file: PrivateFile) -> io::Result<Option<Vec<u8>>> {
+        let s = self.0.borrow();
+        if s.unreadable == Some(file) {
+            return Err(io::Error::other("SECRET read"));
+        }
+        Ok(s.bytes.get(&file).cloned())
+    }
+    fn compare_exchange(
+        &mut self,
+        file: PrivateFile,
+        expected: Option<&[u8]>,
+        desired: &[u8],
+    ) -> io::Result<()> {
+        let mut s = self.0.borrow_mut();
+        let row = matches!(
+            file,
+            PrivateFile::CarrierRows | PrivateFile::MemberARows | PrivateFile::MemberBRows
+        );
+        if row {
+            s.attempts += 1;
+            if let Some(race) = s.race.take() {
+                s.bytes.insert(file, race);
+            }
+        }
+        if s.bytes.get(&file).map(Vec::as_slice) != expected || desired.len() > file.limit() {
+            return Err(io::Error::other("SECRET CAS"));
+        }
+        let fault = if row { s.fault.take() } else { None };
+        if fault == Some(Fault::Fail) {
+            return Err(io::Error::other("SECRET uncommitted"));
+        }
+        if fault == Some(Fault::False) {
+            return Ok(());
+        }
+        let mut raw = desired.to_vec();
+        if matches!(fault, Some(Fault::Foreign | Fault::Equivalent)) {
+            let mut outer: SavedRecord = serde_json::from_slice(&raw).unwrap();
+            let mut record = Record::decode(outer.data.as_bytes()).unwrap();
+            if fault == Some(Fault::Foreign) {
+                record.revision += 100;
+                outer.data = String::from_utf8(record.encode().unwrap()).unwrap();
+            } else {
+                outer.data = serde_json::to_string_pretty(&record).unwrap();
+            }
+            raw = serde_json::to_vec(&outer).unwrap();
+        }
+        s.bytes.insert(file, raw);
+        if fault == Some(Fault::Unreadable) {
+            s.unreadable = Some(file);
+        }
+        if matches!(fault, Some(Fault::Lost | Fault::Equivalent)) {
+            Err(io::Error::other("SECRET lost"))
+        } else {
+            Ok(())
+        }
+    }
+}
+impl SessionFileIo for Disk {
+    fn transaction<T>(
+        &mut self,
+        action: impl FnOnce(&mut dyn PrivateRecords) -> io::Result<T>,
+    ) -> io::Result<T> {
+        action(self)
+    }
+}
+fn scope() -> SessionScope {
+    SessionScope {
+        runtime: RuntimeSlot::Stable,
+        runtime_generation: 1,
+        session_id: "11111111-1111-4111-8111-111111111111".into(),
+        connection_generation: 2,
+    }
+}
+fn runtime() -> EngineIdentity {
+    EngineIdentity {
+        slot: RuntimeSlot::Stable,
+        runtime_version: "1.0.0".into(),
+        runtime_contract_version: 1,
+        container_version: "1.0.0".into(),
+        manifest_sha256: "a".repeat(64),
+    }
+}
+fn binding(role: Role) -> Binding {
+    let n = match role {
+        Role::Carrier => 1,
+        Role::MemberA => 2,
+        Role::MemberB => 3,
+    };
+    Binding {
+        scope: scope(),
+        boot_id: [7; 16],
+        runtime: runtime(),
+        network_epoch: 1,
+        role,
+        guid: [n as u8; 16],
+        name: format!("owned-{n}"),
+        key: RowKey {
+            luid: 3000 + n,
+            index: 30 + n as u32,
+        },
+        address: [10, 7, 0, 2],
+    }
+}
+fn initial(role: Role) -> Record {
+    let b = binding(role);
+    let policy = InterfacePolicy {
+        advertising: false,
+        forwarding: false,
+        weak_host_send: false,
+        weak_host_receive: false,
+        automatic_metric: false,
+        neighbor_unreachability: true,
+        managed_address_configuration: false,
+        other_stateful_configuration: true,
+        advertise_default_route: false,
+        router_discovery: 0,
+        dad_transmits: 3,
+        base_reachable_time: 30000,
+        retransmit_time: 1000,
+        path_mtu_discovery_timeout: 600000,
+        link_local_behavior: 0,
+        link_local_timeout: 6500,
+        zone_indices: [17; 16],
+        site_prefix_length: 0,
+        metric: 19,
+        mtu: 1420,
+        disable_default_routes: true,
+    };
+    let observed = InterfaceObserved {
+        max_reassembly_size: 0,
+        interface_identifier: 0,
+        min_router_advertisement_interval: 200,
+        max_router_advertisement_interval: 600,
+        connected: true,
+        supports_wake_up_patterns: false,
+        supports_neighbor_discovery: true,
+        supports_router_discovery: false,
+        reachable_time: 45678,
+        transmit_offload: 0xa5,
+        receive_offload: 0x5a,
+    };
+    let baseline = Snapshot {
+        interface: InterfaceRow {
+            key: b.key,
+            policy,
+            observed,
+        },
+        address: None,
+    };
+    Record {
+        version: 1,
+        domain: "carrier-native-ipv4-rows-v1".into(),
+        binding: b,
+        revision: 1,
+        phase: Phase::Captured,
+        current: baseline.clone(),
+        baseline,
+        pending: None,
+        creation: None,
+    }
+}
+fn bump(r: &Record) -> Record {
+    let mut n = r.clone();
+    n.revision += 1;
+    n
+}
+fn sequence(role: Role) -> Vec<Record> {
+    let mut r = initial(role);
+    let mut seq = vec![r.clone()];
+    let mut weak = r.current.interface.policy.clone();
+    weak.weak_host_send = true;
+    weak.weak_host_receive = true;
+    r = bump(&r);
+    r.pending = Some(Pending {
+        before: r.current.clone(),
+        target: Target::Interface(weak.clone()),
+    });
+    seq.push(r.clone());
+    r = bump(&r);
+    r.current.interface.policy = weak;
+    r.current.interface.observed.reachable_time += 1;
+    r.pending = None;
+    seq.push(r.clone());
+    if role == Role::Carrier {
+        let p = AddressPolicy {
+            address: r.binding.address,
+            prefix_origin: 1,
+            suffix_origin: 1,
+            valid_lifetime: u32::MAX,
+            preferred_lifetime: u32::MAX,
+            on_link_prefix_length: 32,
+            skip_as_source: false,
+        };
+        r = bump(&r);
+        r.pending = Some(Pending {
+            before: r.current.clone(),
+            target: Target::Create(p.clone()),
+        });
+        seq.push(r.clone());
+        r = bump(&r);
+        let a = AddressRow {
+            key: r.binding.key,
+            policy: p,
+            observed: AddressObserved {
+                dad_state: 4,
+                scope_id: 0,
+                creation_timestamp: 123456789,
+            },
+        };
+        r.current.address = Some(a.clone());
+        r.creation = Some(a);
+        r.pending = None;
+        seq.push(r.clone());
+    }
+    r = bump(&r);
+    r.phase = Phase::Closing;
+    seq.push(r.clone());
+    r = bump(&r);
+    r.pending = Some(Pending {
+        before: r.current.clone(),
+        target: Target::Interface(r.baseline.interface.policy.clone()),
+    });
+    seq.push(r.clone());
+    r = bump(&r);
+    r.current.interface.policy = r.baseline.interface.policy.clone();
+    r.pending = None;
+    seq.push(r.clone());
+    if role == Role::Carrier {
+        r = bump(&r);
+        r.pending = Some(Pending {
+            before: r.current.clone(),
+            target: Target::Delete,
+        });
+        seq.push(r.clone());
+        r = bump(&r);
+        r.current.address = None;
+        r.pending = None;
+        seq.push(r.clone());
+    }
+    r = bump(&r);
+    r.phase = Phase::Stopped;
+    seq.push(r);
+    seq
+}
+fn files(d: &Disk) -> ProtectedSessionFiles<Disk> {
+    ProtectedSessionFiles::new(d.clone(), runtime(), [7; 16]).unwrap()
+}
+fn claimed(d: &Disk) -> ProtectedSessionFiles<Disk> {
+    let mut f = files(d);
+    f.claim(&scope()).unwrap();
+    f
+}
+fn publish(f: &mut ProtectedSessionFiles<Disk>, records: &[Record]) {
+    let (mut store, old) =
+        WindowsCarrierRowsStore::open(f.clone(), records[0].binding.clone()).unwrap();
+    assert!(old.is_none());
+    let mut previous = None;
+    for r in records {
+        store
+            .compare_exchange(&r.binding, previous.as_ref(), r)
+            .unwrap();
+        assert_eq!(store.load(&r.binding).unwrap().as_ref(), Some(r));
+        previous = Some(r.clone());
+    }
+}
+fn close_legacy(f: &mut ProtectedSessionFiles<Disk>) {
+    let mut s = SessionState::new(scope(), Slot::A, 0, 0)
+        .unwrap()
+        .snapshot();
+    s.phase = SessionPhase::Stopped;
+    let (mut store, _) =
+        WindowsSessionStore::open(f.clone(), scope(), RecordKind::Session).unwrap();
+    store.save(&s).unwrap();
+    let pair = PairRecord {
+        scope: scope(),
+        members: [None, None],
+        active: None,
+        guard: crate::member_guard::Model::empty(scope()).unwrap(),
+        pending_guard: None,
+        dns: [None, None],
+        options: None,
+        closing: false,
+    };
+    let (mut p, _) = WindowsPairStore::open(f.clone(), scope(), RecordKind::Pair).unwrap();
+    p.save(&pair).unwrap();
+}
+#[test]
+fn rows_full_metadata_survives_actual_protected_three_role_journals() {
+    let d = Disk::default();
+    let mut f = claimed(&d);
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        let seq = sequence(role);
+        publish(&mut f, &seq);
+        let raw = d.0.borrow().bytes[&rows_file(role)].clone();
+        let saved: SavedRecord = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(saved.network_epoch, 1);
+        assert_eq!(
+            Record::decode(saved.data.as_bytes()).unwrap(),
+            *seq.last().unwrap()
+        );
+    }
+    close_legacy(&mut f);
+    f.complete(&scope()).unwrap();
+    assert!(files(&d).claim(&scope()).is_err());
+}
+#[test]
+fn rows_transition_firewall_rejects_unjournaled_two_effects_and_cleanup_create() {
+    let seq = sequence(Role::Carrier);
+    let mut n = bump(&seq[0]);
+    n.current.interface.policy.weak_host_send = true;
+    assert!(rows::validate_transition(Some(&seq[0]), &n, false).is_err());
+    assert!(rows::validate_transition(Some(&seq[3]), &seq[4], true).is_err());
+    assert!(rows::validate_transition(None, &seq[0], true).is_err());
+    for (i, r) in seq.iter().enumerate() {
+        rows::validate_transition(i.checked_sub(1).map(|j| &seq[j]), r, false).unwrap();
+    }
+}
+#[test]
+fn rows_all_present_nonstopped_roles_block_completion_and_empty() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        let seq = sequence(role);
+        for stop in 1..seq.len() {
+            let d = Disk::default();
+            let mut f = claimed(&d);
+            publish(&mut f, &seq[..stop]);
+            close_legacy(&mut f);
+            assert!(f.complete(&scope()).is_err());
+            assert!(f.complete_empty(&scope()).is_err());
+        }
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        publish(&mut f, &seq);
+        assert!(f.complete_empty(&scope()).is_err());
+        close_legacy(&mut f);
+        f.complete(&scope()).unwrap();
+    }
+}
+#[test]
+fn rows_each_fresh_revision_ack_fault_revokes_live_shared_and_absent_reopen() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        let seq = sequence(role);
+        for i in 0..seq.len() {
+            for fault in [
+                Fault::Fail,
+                Fault::Lost,
+                Fault::False,
+                Fault::Unreadable,
+                Fault::Foreign,
+                Fault::Equivalent,
+            ] {
+                let d = Disk::default();
+                let f = claimed(&d);
+                let (mut store, _) =
+                    WindowsCarrierRowsStore::open(f.clone(), binding(role)).unwrap();
+                for j in 0..i {
+                    store
+                        .compare_exchange(
+                            &binding(role),
+                            j.checked_sub(1).map(|k| &seq[k]),
+                            &seq[j],
+                        )
+                        .unwrap();
+                }
+                d.0.borrow_mut().fault = Some(fault);
+                assert!(
+                    store
+                        .compare_exchange(
+                            &binding(role),
+                            i.checked_sub(1).map(|j| &seq[j]),
+                            &seq[i]
+                        )
+                        .is_err(),
+                    "{role:?}/{i}/{fault:?}"
+                );
+                assert!(store.load(&binding(role)).is_err());
+                d.0.borrow_mut().unreadable = None;
+                assert!(!f.clone().native_carrier_access(&scope()).unwrap().fresh);
+                if let Ok((mut cleanup, current)) =
+                    WindowsCarrierRowsStore::open(f.clone(), binding(role))
+                {
+                    if current.is_none() {
+                        assert!(cleanup
+                            .compare_exchange(&binding(role), None, &seq[0])
+                            .is_err());
+                    } else if i < 3 {
+                        let old = current.unwrap();
+                        let mut start = bump(&old);
+                        start.pending = Some(Pending {
+                            before: old.current.clone(),
+                            target: Target::Interface(seq[2].current.interface.policy.clone()),
+                        });
+                        assert!(cleanup
+                            .compare_exchange(&binding(role), Some(&old), &start)
+                            .is_err());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn inject(d: &Disk, r: &Record) {
+    let saved = SavedRecord {
+        version: PRIVATE_VERSION,
+        identity: SessionIdentity {
+            boot_id: r.binding.boot_id,
+            runtime: r.binding.runtime.clone(),
+            scope: r.binding.scope.clone(),
+        },
+        kind: rows_kind(r.binding.role),
+        network_epoch: r.binding.network_epoch,
+        data: String::from_utf8(r.encode().unwrap()).unwrap(),
+    };
+    d.0.borrow_mut().bytes.insert(
+        rows_file(r.binding.role),
+        serde_json::to_vec(&saved).unwrap(),
+    );
+}
+#[test]
+fn rows_cleanup_open_downgrades_its_raw_files_not_the_other_live_reader() {
+    let d = Disk::default();
+    let mut f = claimed(&d);
+    let r = initial(Role::Carrier);
+    publish(&mut f, &[r.clone()]);
+    let (mut cleanup, _) = WindowsCarrierRowsStore::open(f.clone(), r.binding.clone()).unwrap();
+    assert!(!cleanup.files.native_carrier_access(&scope()).unwrap().fresh);
+    assert!(f.native_carrier_access(&scope()).unwrap().fresh);
+    let desired = &sequence(Role::Carrier)[1];
+    assert!(cleanup
+        .files
+        .compare_exchange(
+            &scope(),
+            rows_kind(Role::Carrier),
+            Some(&r.encode().unwrap()),
+            &desired.encode().unwrap()
+        )
+        .is_err());
+    assert!(!f.native_carrier_access(&scope()).unwrap().fresh);
+}
+#[test]
+fn rows_invalid_preflight_cas_revokes_shared_claim_without_writing() {
+    for fault in 0..4 {
+        let d = Disk::default();
+        let f = claimed(&d);
+        let r = initial(Role::Carrier);
+        let (mut store, _) = WindowsCarrierRowsStore::open(f.clone(), r.binding.clone()).unwrap();
+        let mut desired = r.clone();
+        let mut caller = r.binding.clone();
+        match fault {
+            0 => desired.domain = "unknown".into(),
+            1 => desired.binding.name = "foreign".into(),
+            2 => caller.guid = [99; 16],
+            _ => desired.revision = 99,
+        };
+        assert!(store.compare_exchange(&caller, None, &desired).is_err());
+        assert!(store.load(&r.binding).is_err());
+        assert_eq!(d.0.borrow().attempts, 0);
+        assert!(!f.clone().native_carrier_access(&scope()).unwrap().fresh);
+        let (mut reopened, old) = WindowsCarrierRowsStore::open(f, r.binding.clone()).unwrap();
+        assert!(old.is_none());
+        assert!(reopened.compare_exchange(&r.binding, None, &r).is_err());
+    }
+}
+#[test]
+fn rows_raw_cleanup_cannot_resume_capture_new_history_or_erase_pending() {
+    let seq = sequence(Role::Carrier);
+    for (old, next) in [(&seq[0], &seq[1]), (&seq[3], &seq[4]), (&seq[4], &seq[5])] {
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        inject(&d, old);
+        let mut v = f.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0;
+        let allowed = next.phase == Phase::Closing;
+        assert_eq!(
+            v.compare_exchange(
+                &scope(),
+                rows_kind(Role::Carrier),
+                Some(&old.encode().unwrap()),
+                &next.encode().unwrap()
+            )
+            .is_ok(),
+            allowed
+        );
+    }
+}
+#[test]
+fn rows_cleanup_all_noncreate_pending_confirmations_and_ack_faults() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        let seq = sequence(role);
+        let mut pairs = Vec::new();
+        for old in &seq {
+            if old.phase == Phase::Stopped {
+                continue;
+            }
+            if old
+                .pending
+                .as_ref()
+                .is_some_and(|p| matches!(p.target, Target::Create(_)))
+            {
+                continue;
+            }
+            let mut fence = bump(old);
+            fence.phase = Phase::Closing;
+            if let Some(p) = &old.pending {
+                fence.pending = None;
+                match &p.target {
+                    Target::Interface(target) => fence.current.interface.policy = target.clone(),
+                    Target::Delete => fence.current.address = None,
+                    Target::Create(_) => unreachable!(),
+                }
+            }
+            if old.phase == Phase::Captured || old.pending.is_some() {
+                pairs.push((old.clone(), fence));
+            }
+        }
+        for pair in seq.windows(2) {
+            if pair[0].phase == Phase::Closing {
+                pairs.push((pair[0].clone(), pair[1].clone()));
+            }
+        }
+        for (old, next) in pairs {
+            rows::validate_transition(Some(&old), &next, true).unwrap();
+            for fault in [
+                None,
+                Some(Fault::Fail),
+                Some(Fault::Lost),
+                Some(Fault::False),
+                Some(Fault::Unreadable),
+                Some(Fault::Foreign),
+                Some(Fault::Equivalent),
+            ] {
+                let d = Disk::default();
+                let f = claimed(&d);
+                inject(&d, &old);
+                let (mut store, loaded) =
+                    WindowsCarrierRowsStore::open(f, old.binding.clone()).unwrap();
+                assert_eq!(loaded, Some(old.clone()));
+                d.0.borrow_mut().fault = fault;
+                let ok = store
+                    .compare_exchange(&old.binding, Some(&old), &next)
+                    .is_ok();
+                assert_eq!(
+                    ok,
+                    matches!(fault, None | Some(Fault::Lost)),
+                    "{role:?} revision{} {fault:?}",
+                    old.revision
+                );
+                d.0.borrow_mut().unreadable = None;
+                let current = store.load(&old.binding);
+                if matches!(fault, None | Some(Fault::Lost | Fault::Unreadable)) {
+                    assert_eq!(current.unwrap(), Some(next.clone()));
+                }
+            }
+        }
+    }
+}
+#[test]
+fn rows_inventory_corruption_orphan_and_future_epoch_blocks_all_claim_paths() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        for corrupt in 0..5 {
+            let d = Disk::default();
+            let mut f = claimed(&d);
+            let mut r = initial(role);
+            if corrupt == 0 {
+                r.binding.network_epoch = 2;
+            }
+            inject(&d, &r);
+            if corrupt > 0 {
+                let raw = d.0.borrow().bytes[&rows_file(role)].clone();
+                let mut outer: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+                match corrupt {
+                    1 => outer["data"] = "{}".into(),
+                    2 => outer["identity"]["boot_id"] = serde_json::to_value([8u8; 16]).unwrap(),
+                    3 => outer["network_epoch"] = 2.into(),
+                    _ => outer["kind"] = "Session".into(),
+                };
+                d.0.borrow_mut()
+                    .bytes
+                    .insert(rows_file(role), serde_json::to_vec(&outer).unwrap());
+            }
+            assert!(f.scopes(RuntimeSlot::Stable).is_err());
+            assert!(f.recovery_view(RuntimeSlot::Stable).is_err());
+            assert!(f.complete_empty(&scope()).is_err());
+            assert!(f.complete(&scope()).is_err());
+            d.0.borrow_mut().bytes.remove(&PrivateFile::Index);
+            assert!(files(&d).claim(&scope()).is_err());
+        }
+    }
+}
+#[test]
+fn rows_full_binding_caller_is_independent_and_cannot_be_copied_from_foreign_json() {
+    let cases: [fn(&mut Binding); 12] = [
+        |b| b.boot_id = [8; 16],
+        |b| b.runtime.runtime_version = "2".into(),
+        |b| b.runtime.container_version = "2".into(),
+        |b| b.runtime.manifest_sha256 = "b".repeat(64),
+        |b| b.runtime.runtime_contract_version = 2,
+        |b| b.scope.runtime_generation += 1,
+        |b| b.scope.connection_generation += 1,
+        |b| b.name = "foreign".into(),
+        |b| b.guid = [9; 16],
+        |b| b.key.index += 1,
+        |b| b.key.luid += 1,
+        |b| b.address[3] += 1,
+    ];
+    for change in cases {
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        let r = initial(Role::Carrier);
+        publish(&mut f, &[r.clone()]);
+        let mut b = r.binding;
+        change(&mut b);
+        assert!(WindowsCarrierRowsStore::open(f, b).is_err());
+    }
+}
+#[test]
+fn rows_payload_and_envelope_epoch_context_are_authenticated_independently() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        for change in 0..6 {
+            let d = Disk::default();
+            let mut f = claimed(&d);
+            let r = initial(role);
+            inject(&d, &r);
+            let raw = d.0.borrow().bytes[&rows_file(role)].clone();
+            let mut saved: SavedRecord = serde_json::from_slice(&raw).unwrap();
+            let mut inner = Record::decode(saved.data.as_bytes()).unwrap();
+            match change {
+                0 => inner.binding.boot_id = [8; 16],
+                1 => inner.binding.runtime.runtime_version = "2".into(),
+                2 => inner.binding.network_epoch = 2,
+                3 => saved.network_epoch = 2,
+                4 => inner.binding.scope.connection_generation += 1,
+                _ => {
+                    inner.binding.role = if role == Role::Carrier {
+                        Role::MemberA
+                    } else {
+                        Role::Carrier
+                    }
+                }
+            };
+            saved.data = String::from_utf8(inner.encode().unwrap()).unwrap();
+            d.0.borrow_mut()
+                .bytes
+                .insert(rows_file(role), serde_json::to_vec(&saved).unwrap());
+            assert!(f.read(&scope(), rows_kind(role)).is_err());
+            assert!(f.scopes(RuntimeSlot::Stable).is_err());
+        }
+    }
+}
+#[test]
+fn rows_strict_unknown_nested_fields_required_nullable_and_versions() {
+    let r = sequence(Role::Carrier)[3].clone();
+    let base = serde_json::to_value(&r).unwrap();
+    for path in [
+        "",
+        "/binding",
+        "/binding/scope",
+        "/binding/runtime",
+        "/baseline",
+        "/baseline/interface",
+        "/baseline/interface/key",
+        "/baseline/interface/policy",
+        "/baseline/interface/observed",
+        "/current",
+        "/pending",
+        "/pending/before",
+        "/pending/target/value",
+    ] {
+        let mut v = base.clone();
+        let target = if path.is_empty() {
+            &mut v
+        } else {
+            v.pointer_mut(path).unwrap()
+        };
+        target
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), true.into());
+        assert!(
+            Record::decode(&serde_json::to_vec(&v).unwrap()).is_err(),
+            "{path}"
+        );
+    }
+    for path in ["pending", "creation"] {
+        let mut v = base.clone();
+        v.as_object_mut().unwrap().remove(path);
+        assert!(Record::decode(&serde_json::to_vec(&v).unwrap()).is_err());
+    }
+    for version in [0, 2, u32::MAX] {
+        let mut v = base.clone();
+        v["version"] = version.into();
+        assert!(Record::decode(&serde_json::to_vec(&v).unwrap()).is_err());
+    }
+    for key in ["baseline", "current"] {
+        let mut v = base.clone();
+        v[key].as_object_mut().unwrap().remove("address");
+        assert!(Record::decode(&serde_json::to_vec(&v).unwrap()).is_err());
+    }
+}
+#[test]
+fn rows_transition_immutables_pending_and_terminal_matrix() {
+    let seq = sequence(Role::Carrier);
+    for i in 1..seq.len() {
+        let old = &seq[i - 1];
+        let good = &seq[i];
+        rows::validate_transition(Some(old), good, false).unwrap();
+        let mut variants = Vec::new();
+        let mut n = good.clone();
+        n.revision += 1;
+        variants.push(n);
+        let mut n = good.clone();
+        n.baseline.interface.observed.reachable_time += 1;
+        variants.push(n);
+        let mut n = good.clone();
+        n.binding.guid = [77; 16];
+        variants.push(n);
+        let mut n = good.clone();
+        n.current.interface.policy.metric += 1;
+        variants.push(n);
+        for bad in variants {
+            assert!(rows::validate_transition(Some(old), &bad, false).is_err());
+        }
+    }
+    for r in &seq {
+        rows::validate_transition(Some(r), r, true).unwrap();
+    }
+    let stopped = seq.last().unwrap();
+    let changed = bump(stopped);
+    assert!(rows::validate_transition(Some(stopped), &changed, true).is_err());
+    let mut nointent = bump(&seq[0]);
+    nointent.creation = seq[4].creation.clone();
+    nointent.current.address = seq[4].current.address.clone();
+    assert!(rows::validate_transition(Some(&seq[0]), &nointent, false).is_err());
+    let mut twoeffects = seq[4].clone();
+    twoeffects.current.interface.policy.weak_host_send = false;
+    assert!(rows::validate_transition(Some(&seq[3]), &twoeffects, false).is_err());
+}
+#[test]
+fn rows_initial_and_outer_bounds_fail_before_effect_and_shared_access_is_revoked() {
+    let d = Disk::default();
+    let f = claimed(&d);
+    let mut r = initial(Role::Carrier);
+    r.binding.runtime.runtime_version = "x".repeat(70000);
+    let (mut store, _) = WindowsCarrierRowsStore::open(f.clone(), binding(Role::Carrier)).unwrap();
+    assert!(store
+        .compare_exchange(&binding(Role::Carrier), None, &r)
+        .is_err());
+    assert_eq!(d.0.borrow().attempts, 0);
+    assert!(!f.clone().native_carrier_access(&scope()).unwrap().fresh);
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        assert_eq!(rows_file(role).limit(), 65536);
+    }
+}
+#[test]
+fn rows_exact_old_noncanonical_bytes_and_changed_private_cas() {
+    for race in [false, true] {
+        let d = Disk::default();
+        let f = claimed(&d);
+        let r = initial(Role::Carrier);
+        inject(&d, &r);
+        let raw = d.0.borrow().bytes[&rows_file(Role::Carrier)].clone();
+        let mut outer: SavedRecord = serde_json::from_slice(&raw).unwrap();
+        outer.data = serde_json::to_string_pretty(&r).unwrap();
+        let old = serde_json::to_vec_pretty(&outer).unwrap();
+        d.0.borrow_mut().bytes.insert(rows_file(Role::Carrier), old);
+        let (mut store, _) = WindowsCarrierRowsStore::open(f.clone(), r.binding.clone()).unwrap();
+        let mut close = bump(&r);
+        close.phase = Phase::Closing;
+        if race {
+            let mut replacement = outer;
+            replacement.data = serde_json::to_string(&bump(&r)).unwrap();
+            d.0.borrow_mut().race = Some(serde_json::to_vec(&replacement).unwrap());
+        }
+        assert_eq!(
+            store.compare_exchange(&r.binding, Some(&r), &close).is_ok(),
+            !race
+        );
+    }
+}
+#[test]
+fn rows_cross_role_guid_name_luid_index_aliases_reject_without_overwrite() {
+    for change in 0..4 {
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        let a = initial(Role::Carrier);
+        publish(&mut f, &[a.clone()]);
+        let mut b = initial(Role::MemberA);
+        match change {
+            0 => b.binding.guid = a.binding.guid,
+            1 => b.binding.name = a.binding.name.to_uppercase(),
+            2 => {
+                b.binding.key.luid = a.binding.key.luid;
+                b.baseline.interface.key = b.binding.key;
+                b.current = b.baseline.clone();
+            }
+            _ => {
+                b.binding.key.index = a.binding.key.index;
+                b.baseline.interface.key = b.binding.key;
+                b.current = b.baseline.clone();
+            }
+        }
+        let (mut store, _) = WindowsCarrierRowsStore::open(f, b.binding.clone()).unwrap();
+        assert!(store.compare_exchange(&b.binding, None, &b).is_err());
+        assert!(!d.0.borrow().bytes.contains_key(&rows_file(Role::MemberA)));
+    }
+}
+
+#[test]
+fn rows_whole_envelope_bound_and_raw_false_ack_are_not_inner_codec_success() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        let r = initial(role);
+        let mut bytes = r.encode().unwrap();
+        bytes.resize(65400, b' ');
+        assert!(Record::decode(&bytes).is_ok());
+        assert!(f
+            .compare_exchange(&scope(), rows_kind(role), None, &bytes)
+            .is_err());
+        assert_eq!(d.0.borrow().attempts, 0);
+        assert!(!f.native_carrier_access(&scope()).unwrap().fresh);
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        d.0.borrow_mut().fault = Some(Fault::False);
+        assert!(f
+            .compare_exchange(&scope(), rows_kind(role), None, &r.encode().unwrap())
+            .is_err());
+        assert!(!f.native_carrier_access(&scope()).unwrap().fresh);
+        assert!(f.complete_empty(&scope()).is_ok()); // trusted absence call; no row bytes exist
+    }
+}
+#[test]
+fn rows_epoch_advance_forces_live_failure_but_cleanup_retains_original_context() {
+    let d = Disk::default();
+    let mut f = claimed(&d);
+    let seq = sequence(Role::Carrier);
+    let (mut live, _) = WindowsCarrierRowsStore::open(f.clone(), binding(Role::Carrier)).unwrap();
+    live.compare_exchange(&binding(Role::Carrier), None, &seq[0])
+        .unwrap();
+    let mut s = SessionState::new(scope(), Slot::A, 0, 0)
+        .unwrap()
+        .snapshot();
+    s.network_epoch = 2;
+    WindowsSessionStore::open(f.clone(), scope(), RecordKind::Session)
+        .unwrap()
+        .0
+        .save(&s)
+        .unwrap();
+    assert!(live.load(&binding(Role::Carrier)).is_err());
+    assert!(live
+        .compare_exchange(&binding(Role::Carrier), Some(&seq[0]), &seq[1])
+        .is_err());
+    let (mut cleanup, _) =
+        WindowsCarrierRowsStore::open(f.clone(), binding(Role::Carrier)).unwrap();
+    let mut closing = bump(&seq[0]);
+    closing.phase = Phase::Closing;
+    cleanup
+        .compare_exchange(&binding(Role::Carrier), Some(&seq[0]), &closing)
+        .unwrap();
+    let mut stopped = bump(&closing);
+    stopped.phase = Phase::Stopped;
+    cleanup
+        .compare_exchange(&binding(Role::Carrier), Some(&closing), &stopped)
+        .unwrap();
+    let raw = d.0.borrow().bytes[&rows_file(Role::Carrier)].clone();
+    let saved: SavedRecord = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(saved.network_epoch, 1);
+    s.phase = SessionPhase::Stopped;
+    WindowsSessionStore::open(f.clone(), scope(), RecordKind::Session)
+        .unwrap()
+        .0
+        .save(&s)
+        .unwrap();
+    let pair = PairRecord {
+        scope: scope(),
+        members: [None, None],
+        active: None,
+        guard: crate::member_guard::Model::empty(scope()).unwrap(),
+        pending_guard: None,
+        dns: [None, None],
+        options: None,
+        closing: false,
+    };
+    WindowsPairStore::open(f.clone(), scope(), RecordKind::Pair)
+        .unwrap()
+        .0
+        .save(&pair)
+        .unwrap();
+    f.complete(&scope()).unwrap();
+}
+#[test]
+fn rows_previous_boot_runtime_cleanup_uses_only_retained_authenticated_identity() {
+    let d = Disk::default();
+    let mut f = claimed(&d);
+    let r = initial(Role::Carrier);
+    publish(&mut f, &[r.clone()]);
+    let mut new_runtime = runtime();
+    new_runtime.runtime_version = "2".into();
+    let mut reboot = ProtectedSessionFiles::new(d.clone(), new_runtime, [8; 16]).unwrap();
+    assert!(WindowsCarrierRowsStore::open(reboot.clone(), r.binding.clone()).is_err());
+    let (view, changed) = reboot.recovery_view(RuntimeSlot::Stable).unwrap().unwrap();
+    assert!(changed);
+    let (mut cleanup, _) = WindowsCarrierRowsStore::open(view, r.binding.clone()).unwrap();
+    let mut closing = bump(&r);
+    closing.phase = Phase::Closing;
+    cleanup
+        .compare_exchange(&r.binding, Some(&r), &closing)
+        .unwrap();
+    let mut invented = r.binding.clone();
+    invented.boot_id = [8; 16];
+    assert!(cleanup.load(&invented).is_err());
+}
+#[test]
+fn rows_missing_legacy_compatible_partial_inventory_and_reappearance_not_completion() {
+    let d = Disk::default();
+    let mut f = claimed(&d);
+    close_legacy(&mut f);
+    f.complete(&scope()).unwrap();
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        publish(&mut f, &sequence(role));
+        close_legacy(&mut f);
+        f.complete(&scope()).unwrap();
+        assert!(f.complete(&scope()).is_ok());
+        inject(&d, &initial(role)); // terminal identity alone cannot hide a revived obligation
+        assert!(f.complete(&scope()).is_err());
+        assert!(f.scopes(RuntimeSlot::Stable).is_err());
+        let mut other = scope();
+        other.connection_generation += 1;
+        assert!(f.claim(&other).is_err());
+    }
+}
+#[test]
+fn rows_no_pending_intent_can_be_replaced_or_unconfirmed_create_erased() {
+    let seq = sequence(Role::Carrier);
+    let old = &seq[3];
+    let mut erased = bump(old);
+    erased.pending = None;
+    assert!(rows::validate_transition(Some(old), &erased, false).is_err());
+    assert!(rows::validate_transition(Some(old), &erased, true).is_err());
+    let mut closing = bump(old);
+    closing.phase = Phase::Closing;
+    rows::validate_transition(Some(old), &closing, true).unwrap();
+    let mut erase = bump(&closing);
+    erase.pending = None;
+    assert!(rows::validate_transition(Some(&closing), &erase, true).is_err());
+    let mut replacement = bump(&seq[1]);
+    replacement.pending.as_mut().unwrap().target = seq[3].pending.as_ref().unwrap().target.clone();
+    // replace an existing weak intent with another intent, no native confirmation
+    assert!(rows::validate_transition(Some(&seq[1]), &replacement, false).is_err());
+}
+
+fn empty_pair(own: &SessionScope) -> PairRecord {
+    PairRecord {
+        scope: own.clone(),
+        members: [None, None],
+        active: None,
+        guard: crate::member_guard::Model::empty(own.clone()).unwrap(),
+        pending_guard: None,
+        dns: [None, None],
+        options: None,
+        closing: false,
+    }
+}
+fn terminal_payload(kind: RecordKind, own: &SessionScope) -> Vec<u8> {
+    if let Some(role) = kind.row_role() {
+        let mut r = initial(role);
+        r.binding.scope = own.clone();
+        r.revision = 3;
+        r.phase = Phase::Stopped;
+        return r.encode().unwrap();
+    }
+    match kind {
+        RecordKind::Session => {
+            let mut s = SessionState::new(own.clone(), Slot::A, 0, 0)
+                .unwrap()
+                .snapshot();
+            s.phase = SessionPhase::Stopped;
+            serde_json::to_vec(&Envelope {
+                version: 1,
+                scope: own.clone(),
+                payload: s,
+            })
+            .unwrap()
+        }
+        RecordKind::Pair => serde_json::to_vec(&Envelope {
+            version: 1,
+            scope: own.clone(),
+            payload: empty_pair(own),
+        })
+        .unwrap(),
+        RecordKind::Network => serde_json::to_vec(&Envelope {
+            version: 1,
+            scope: own.clone(),
+            payload: NetworkJournal::default(),
+        })
+        .unwrap(),
+        RecordKind::Carrier => serde_json::to_vec(&Envelope {
+            version: 1,
+            scope: own.clone(),
+            payload: carrier::Record {
+                version: 1,
+                intent: carrier::Intent {
+                    scope: own.clone(),
+                    addresses: vec!["10.7.0.2/32".parse().unwrap()],
+                },
+                provenance: carrier::Provenance {
+                    boot_id: [7; 16],
+                    runtime: runtime(),
+                    network_epoch: 1,
+                },
+                generation: 3,
+                phase: carrier::Phase::Stopped,
+                proof: None,
+                rows: None,
+            },
+        })
+        .unwrap(),
+        RecordKind::NativeCarrierReceipts => {
+            let roles = [
+                native_receipt::Role::RoleCarrier,
+                native_receipt::Role::MemberA,
+                native_receipt::Role::MemberB,
+            ];
+            let record=native_receipt::Record{version:2,context:native_receipt::Context{intent:carrier::Intent{scope:own.clone(),addresses:vec!["10.7.0.2/32".parse().unwrap()]},provenance:carrier::Provenance{boot_id:[7;16],runtime:runtime(),network_epoch:1},bindings:roles.map(|role|{
+    let (n,name)=match role{native_receipt::Role::RoleCarrier=>(1,"c"),native_receipt::Role::MemberA=>(2,"a"),native_receipt::Role::MemberB=>(3,"b")};
+    let byte=format!("{n:02x}");let guid=format!("{}-{}-{}-{}-{}",byte.repeat(4),byte.repeat(2),byte.repeat(2),byte.repeat(2),byte.repeat(6));
+    native_receipt::Binding{role,guid:[n;16],name:name.into(),registry_path:format!(r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{{{guid}}}")}
+   })},generation:3,phase:native_receipt::Phase::Stopped,keys:roles.map(|role|native_receipt::KeyReceipt{role,phase:native_receipt::KeyPhase::Clean,new_key_ack:false,baseline:native_receipt::Value::Absent,current:native_receipt::Value::Absent,pending:None}),native_rows:native_receipt::FullNativeRows::Unbound};
+            record.encode().unwrap()
+        }
+        _ => unreachable!(),
+    }
+}
+#[test]
+fn rows_all_eight_physical_namespaces_have_bounded_retired_owners_and_partial_rewrite() {
+    let d = Disk::default();
+    let mut identities = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for (i, kind) in RecordKind::OWNED.iter().copied().enumerate() {
+        assert!(names.insert(kind.file().name()));
+        let mut own = scope();
+        own.connection_generation = i as u64 + 10;
+        let identity = SessionIdentity {
+            boot_id: [7; 16],
+            runtime: runtime(),
+            scope: own.clone(),
+        };
+        let saved = SavedRecord {
+            version: PRIVATE_VERSION,
+            identity: identity.clone(),
+            kind,
+            network_epoch: 1,
+            data: String::from_utf8(terminal_payload(kind, &own)).unwrap(),
+        };
+        let raw = serde_json::to_vec(&saved).unwrap();
+        parse_record(kind, &raw).unwrap();
+        d.0.borrow_mut().bytes.insert(kind.file(), raw);
+        d.0.borrow_mut().bytes.insert(
+            completed_file(&own).unwrap(),
+            serde_json::to_vec(&CompletedRecord {
+                version: PRIVATE_VERSION,
+                identity: identity.clone(),
+            })
+            .unwrap(),
+        );
+        identities.push(identity);
+    }
+    assert_eq!(names.len(), 8);
+    d.0.borrow_mut().bytes.insert(
+        PrivateFile::Index,
+        serde_json::to_vec(&SessionIndex {
+            version: PRIVATE_VERSION,
+            active: None,
+            completed: identities.clone(),
+        })
+        .unwrap(),
+    );
+    let mut f = files(&d);
+    assert!(f.scopes(RuntimeSlot::Stable).unwrap().is_empty());
+    f.claim(&scope()).unwrap();
+    let mut records = sequence(Role::Carrier);
+    publish(&mut f, &records);
+    let own_member = initial(Role::MemberA);
+    publish(&mut f, &[own_member]); // retain a nonterminal role until later cleanup
+    assert!(f.complete_empty(&scope()).is_err());
+    close_legacy(&mut f);
+    assert!(f.complete(&scope()).is_err());
+    let mut member = initial(Role::MemberA);
+    let (mut cleanup, _) =
+        WindowsCarrierRowsStore::open(f.clone(), member.binding.clone()).unwrap();
+    let old = member.clone();
+    member.revision += 1;
+    member.phase = Phase::Closing;
+    cleanup
+        .compare_exchange(&member.binding, Some(&old), &member)
+        .unwrap();
+    let old = member.clone();
+    member.revision += 1;
+    member.phase = Phase::Stopped;
+    cleanup
+        .compare_exchange(&member.binding, Some(&old), &member)
+        .unwrap();
+    f.complete(&scope()).unwrap();
+    for id in &identities {
+        assert!(f.claim(&id.scope).is_err());
+    }
+    assert!(f.complete(&scope()).is_ok());
+    // Explicit retired corruption cannot be hidden by a valid permanent marker.
+    records.last_mut().unwrap().phase = Phase::Closing;
+    inject(&d, records.last().unwrap());
+    assert!(f.scopes(RuntimeSlot::Stable).is_err());
+}
+
+#[test]
+fn carrier_access_exact_storage_context_rejects_each_provenance_mismatch() {
+    let d = Disk::default();
+    let mut f = claimed(&d);
+    let raw = terminal_payload(RecordKind::NativeCarrierReceipts, &scope());
+    let context = native_receipt::Record::decode(&raw).unwrap().context;
+    let access = f.native_carrier_access(&scope()).unwrap();
+    access.require_native_context(&context).unwrap();
+    assert!(access.is_fresh());
+    for change in 0..9 {
+        let mut bad = context.clone();
+        match change {
+            0 => bad.intent.scope.connection_generation += 1,
+            1 => bad.intent.scope.runtime_generation += 1,
+            2 => bad.provenance.boot_id = [8; 16],
+            3 => bad.provenance.runtime.runtime_version = "2".into(),
+            4 => bad.provenance.runtime.container_version = "2".into(),
+            5 => bad.provenance.runtime.runtime_contract_version += 1,
+            6 => bad.provenance.runtime.manifest_sha256 = "b".repeat(64),
+            7 => bad.provenance.network_epoch += 1,
+            _ => bad.intent.scope.runtime = RuntimeSlot::Latest,
+        };
+        assert!(access.require_native_context(&bad).is_err());
+    }
+    let view = f.recovery_view(RuntimeSlot::Stable).unwrap().unwrap().0;
+    let retained = view.clone().native_carrier_access(&scope()).unwrap();
+    retained.require_native_context(&context).unwrap();
+    assert!(!retained.is_fresh());
+    // Storage comparison deliberately cannot attest native GUID/name/ownership.
+    let mut not_native = context;
+    not_native.bindings[0].name = "foreign".into();
+    retained.require_native_context(&not_native).unwrap();
+}
+#[test]
+fn rows_two_fresh_store_cas_race_revokes_winner_without_duplicate_effects() {
+    let d = Disk::default();
+    let f = claimed(&d);
+    let r = initial(Role::Carrier);
+    let (mut a, _) = WindowsCarrierRowsStore::open(f.clone(), r.binding.clone()).unwrap();
+    let (mut b, _) = WindowsCarrierRowsStore::open(f.clone(), r.binding.clone()).unwrap();
+    a.compare_exchange(&r.binding, None, &r).unwrap();
+    assert!(b.compare_exchange(&r.binding, None, &r).is_err());
+    assert!(a.load(&r.binding).is_err());
+    assert_eq!(d.0.borrow().attempts, 1);
+}
+#[test]
+fn rows_raw_schema_error_revokes_all_roles_before_any_private_write() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        assert!(f
+            .compare_exchange(&scope(), rows_kind(role), None, b"{}")
+            .is_err());
+        assert!(!f.native_carrier_access(&scope()).unwrap().is_fresh());
+        assert_eq!(d.0.borrow().attempts, 0);
+    }
+}
+
+#[test]
+fn rows_actual_protected_reads_reject_unknown_nullable_schema_and_outer_fields() {
+    for role in [Role::Carrier, Role::MemberA, Role::MemberB] {
+        for corrupt in 0..11 {
+            let d = Disk::default();
+            let mut f = claimed(&d);
+            let r = initial(role);
+            inject(&d, &r);
+            let raw = d.0.borrow().bytes[&rows_file(role)].clone();
+            let mut outer: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            let mut inner: serde_json::Value =
+                serde_json::from_str(outer["data"].as_str().unwrap()).unwrap();
+            match corrupt {
+                0 => {
+                    inner["extra"] = true.into();
+                }
+                1 => {
+                    inner["baseline"]["interface"]["observed"]["extra"] = true.into();
+                }
+                2 => {
+                    inner["current"]["interface"]["policy"]["extra"] = true.into();
+                }
+                3 => {
+                    inner["binding"]["key"]["extra"] = true.into();
+                }
+                4 => {
+                    inner.as_object_mut().unwrap().remove("creation");
+                }
+                5 => {
+                    inner["current"].as_object_mut().unwrap().remove("address");
+                }
+                6 => {
+                    inner["version"] = 2.into();
+                }
+                7 => {
+                    outer["extra"] = true.into();
+                }
+                8 => {
+                    outer["identity"]["extra"] = true.into();
+                }
+                9 => {
+                    outer["version"] = 3.into();
+                }
+                _ => {
+                    inner["baseline"]["interface"]["observed"]["interface_identifier"] = 123.into();
+                }
+            }
+            outer["data"] = serde_json::to_string(&inner).unwrap().into();
+            d.0.borrow_mut()
+                .bytes
+                .insert(rows_file(role), serde_json::to_vec(&outer).unwrap());
+            assert!(WindowsCarrierRowsStore::open(f.clone(), r.binding).is_err());
+            assert!(f.read(&scope(), rows_kind(role)).is_err());
+            assert!(f.recovery_view(RuntimeSlot::Stable).is_err());
+        }
+    }
+    let r = sequence(Role::Carrier)[4].clone();
+    for path in [
+        "/creation",
+        "/creation/policy",
+        "/creation/observed",
+        "/creation/key",
+        "/current/address",
+        "/current/address/policy",
+        "/current/address/observed",
+    ] {
+        let mut v = serde_json::to_value(&r).unwrap();
+        v.pointer_mut(path)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("extra".into(), true.into());
+        let d = Disk::default();
+        let mut f = claimed(&d);
+        inject(&d, &r);
+        let raw = d.0.borrow().bytes[&rows_file(Role::Carrier)].clone();
+        let mut outer: SavedRecord = serde_json::from_slice(&raw).unwrap();
+        outer.data = serde_json::to_string(&v).unwrap();
+        d.0.borrow_mut().bytes.insert(
+            rows_file(Role::Carrier),
+            serde_json::to_vec(&outer).unwrap(),
+        );
+        assert!(f.read(&scope(), RecordKind::CarrierRows).is_err(), "{path}");
+    }
+}
