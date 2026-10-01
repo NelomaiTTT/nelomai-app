@@ -43,6 +43,7 @@ struct State {
     lost_save_number: Option<usize>,
     fail_config: bool,
     lost_config_ack: bool,
+    written_config: Option<zeroize::Zeroizing<String>>,
 }
 type Shared = Rc<RefCell<State>>;
 struct Disk(Shared);
@@ -123,6 +124,7 @@ impl MemberIo for Io {
             return Err(OwnerError::Native);
         }
         s.observation.config_sha256 = Some(intent.config_sha256);
+        s.written_config = Some(zeroize::Zeroizing::new(canonical.to_owned()));
         if s.lost_config_ack {
             return Err(OwnerError::Native);
         }
@@ -231,12 +233,243 @@ fn setup() -> (MemberOwner<Disk, Io>, Shared) {
         lost_save_number: None,
         fail_config: false,
         lost_config_ack: false,
+        written_config: None,
     }));
     (owner(s.clone()), s)
 }
 
 fn replacement(s: Shared, scope: SessionScope) -> MemberOwner<Disk, Io> {
     replacement_engine(s, scope, &crate::test_engine_path("engine.exe"))
+}
+
+const CARRIER_CONFIG: &str = "[Interface]\nPrivateKey = PRIVATE-TEST-KEY\nAddress = 10.240.5.2/32\nDNS = 9.9.9.9\nTable = auto\n[Peer]\nPublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.1:51820\nPersistentKeepalive = 25\n";
+const CARRIER_NATIVE: &str = "[Interface]\nTable = off\nPrivateKey = PRIVATE-TEST-KEY\n[Peer]\nPublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\nAllowedIPs = 0.0.0.0/0\nEndpoint = 192.0.2.1:51820\nPersistentKeepalive = 25\n";
+
+fn carrier_intent() -> crate::member_carrier::Intent {
+    crate::member_carrier::Intent {
+        scope: scope(),
+        addresses: vec!["10.240.5.2/32".parse().unwrap()],
+    }
+}
+
+#[test]
+fn carrier_member_start_publishes_and_hashes_only_addressless_native_configuration() {
+    for (transport, extra) in [
+        (TunnelTransport::WireGuard, ""),
+        (
+            TunnelTransport::AmneziaWg3,
+            "Jc = 4\nJmin = 40\nJmax = 70\nHeaderProtectionKey = synthetic-header\nContentPaddingAddition = 1\n",
+        ),
+    ] {
+        let (_, s) = setup();
+        let logical = CARRIER_CONFIG.replace("[Peer]", &format!("{extra}[Peer]"));
+        let expected = CARRIER_NATIVE.replace("[Peer]", &format!("{extra}[Peer]"));
+        let mut owner = MemberOwner::from_trusted_carrier_engine(
+            &carrier_intent(),
+            TunnelSlot::B,
+            transport,
+            crate::test_engine_path("engine.exe"),
+            &logical,
+            Disk(s.clone()),
+            Io(s.clone()),
+        )
+        .unwrap();
+        // Construction cannot claim/start/configure anything; only the existing
+        // durable Prepared→config CAS→native Start→Running path can do so.
+        assert!(s.borrow().events.is_empty());
+        let running = owner.start_with_prior(None).unwrap();
+        assert_eq!(running.intent.scope, scope());
+        assert_eq!(running.intent.transport, transport);
+        assert_eq!(
+            running.intent.config_sha256,
+            <[u8; 32]>::from(Sha256::digest(expected.as_bytes()))
+        );
+        assert_ne!(
+            running.intent.config_sha256,
+            <[u8; 32]>::from(Sha256::digest(logical.as_bytes()))
+        );
+        assert_eq!(
+            s.borrow().written_config.as_deref().map(|s| s.as_str()),
+            Some(expected.as_str())
+        );
+        assert_eq!(running.proof, Some(proof()));
+        assert_eq!(owner.stop(&running).unwrap().phase, Phase::Stopped);
+    }
+}
+
+#[test]
+fn carrier_member_rejects_mismatched_network_before_any_journal_or_native_call() {
+    for addresses in [
+        vec![],
+        vec!["10.240.5.3/32".parse().unwrap()],
+        vec!["10.240.5.2/24".parse().unwrap()],
+        vec!["fd00::2/128".parse().unwrap()],
+        vec![
+            "10.240.5.2/32".parse().unwrap(),
+            "10.240.5.3/32".parse().unwrap(),
+        ],
+    ] {
+        let (_, s) = setup();
+        let intent = crate::member_carrier::Intent {
+            addresses,
+            ..carrier_intent()
+        };
+        assert!(matches!(
+            MemberOwner::from_trusted_carrier_engine(
+                &intent,
+                TunnelSlot::B,
+                TunnelTransport::WireGuard,
+                crate::test_engine_path("engine.exe"),
+                CARRIER_CONFIG,
+                Disk(s.clone()),
+                Io(s.clone()),
+            ),
+            Err(OwnerError::Conflict)
+        ));
+        assert!(s.borrow().events.is_empty());
+        assert!(s.borrow().record.is_none());
+    }
+}
+
+#[test]
+fn carrier_member_never_accepts_unvalidated_native_input_or_wrong_transport() {
+    let cases = [
+        (CARRIER_NATIVE.to_owned(), TunnelTransport::WireGuard),
+        (
+            CARRIER_CONFIG.replace("10.240.5.2/32", "10.240.5.2/24"),
+            TunnelTransport::WireGuard,
+        ),
+        (
+            CARRIER_CONFIG.replace("10.240.5.2/32", "fd00::2/128"),
+            TunnelTransport::WireGuard,
+        ),
+        (
+            CARRIER_CONFIG.replace("[Peer]", "PostUp = do-not-run\n[Peer]"),
+            TunnelTransport::WireGuard,
+        ),
+        (
+            CARRIER_CONFIG.replace("[Peer]", "ForeignOption = 1\n[Peer]"),
+            TunnelTransport::WireGuard,
+        ),
+        (
+            CARRIER_CONFIG.replace(
+                "PublicKey = AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "PublicKey = invalid",
+            ),
+            TunnelTransport::WireGuard,
+        ),
+        (CARRIER_CONFIG.to_owned(), TunnelTransport::AmneziaWg3),
+        (
+            CARRIER_CONFIG.replace("[Peer]", "Jc = 4\nJmin = 40\nJmax = 70\nHeaderProtectionKey = synthetic-header\nContentPaddingAddition = 1\n[Peer]"),
+            TunnelTransport::WireGuard,
+        ),
+    ];
+    for (logical, transport) in cases {
+        let (_, s) = setup();
+        assert!(matches!(
+            MemberOwner::from_trusted_carrier_engine(
+                &carrier_intent(),
+                TunnelSlot::B,
+                transport,
+                crate::test_engine_path("engine.exe"),
+                &logical,
+                Disk(s.clone()),
+                Io(s.clone()),
+            ),
+            Err(OwnerError::Invalid)
+        ));
+        assert!(s.borrow().events.is_empty());
+    }
+}
+
+#[test]
+fn carrier_member_construction_keeps_actual_scope_and_engine_validation() {
+    for (scope, engine) in [
+        (
+            SessionScope {
+                connection_generation: 0,
+                ..scope()
+            },
+            crate::test_engine_path("engine.exe"),
+        ),
+        (
+            SessionScope {
+                session_id: "foreign".into(),
+                ..scope()
+            },
+            crate::test_engine_path("engine.exe"),
+        ),
+        (scope(), PathBuf::from("relative.exe")),
+        (scope(), crate::test_engine_path("../engine.exe")),
+    ] {
+        let (_, s) = setup();
+        let intent = crate::member_carrier::Intent {
+            scope,
+            ..carrier_intent()
+        };
+        assert!(matches!(
+            MemberOwner::from_trusted_carrier_engine(
+                &intent,
+                TunnelSlot::B,
+                TunnelTransport::WireGuard,
+                engine,
+                CARRIER_CONFIG,
+                Disk(s.clone()),
+                Io(s.clone()),
+            ),
+            Err(OwnerError::Invalid)
+        ));
+        assert!(s.borrow().events.is_empty());
+    }
+}
+
+#[test]
+fn ordinary_member_keeps_address_and_does_not_use_carrier_renderer() {
+    let (_, s) = setup();
+    let mut owner = MemberOwner::from_trusted_engine(
+        scope(),
+        TunnelSlot::B,
+        TunnelTransport::WireGuard,
+        crate::test_engine_path("engine.exe"),
+        CARRIER_CONFIG,
+        Disk(s.clone()),
+        Io(s.clone()),
+    )
+    .unwrap();
+    let running = owner.start_with_prior(None).unwrap();
+    let expected = CARRIER_NATIVE.replace(
+        "PrivateKey = PRIVATE-TEST-KEY\n",
+        "PrivateKey = PRIVATE-TEST-KEY\nAddress = 10.240.5.2/32\n",
+    );
+    assert_eq!(
+        s.borrow().written_config.as_deref().map(|s| s.as_str()),
+        Some(expected.as_str())
+    );
+    assert_eq!(
+        running.intent.config_sha256,
+        <[u8; 32]>::from(Sha256::digest(expected.as_bytes()))
+    );
+}
+
+#[test]
+fn carrier_member_lost_prepare_ack_never_writes_config_or_starts() {
+    let (_, s) = setup();
+    s.borrow_mut().lost_save_ack = Some(Phase::Prepared);
+    let mut owner = MemberOwner::from_trusted_carrier_engine(
+        &carrier_intent(),
+        TunnelSlot::B,
+        TunnelTransport::WireGuard,
+        crate::test_engine_path("engine.exe"),
+        CARRIER_CONFIG,
+        Disk(s.clone()),
+        Io(s.clone()),
+    )
+    .unwrap();
+    assert_eq!(owner.start_with_prior(None), Err(OwnerError::Journal));
+    assert!(s.borrow().written_config.is_none());
+    assert!(!s.borrow().events.contains(&"start"));
+    assert_eq!(owner.start_with_prior(None), Err(OwnerError::Retired));
+    assert_eq!(s.borrow().record.as_ref().unwrap().phase, Phase::Prepared);
 }
 fn replacement_engine(
     s: Shared,

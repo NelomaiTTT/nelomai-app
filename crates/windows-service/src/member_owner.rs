@@ -155,6 +155,35 @@ pub(crate) struct MemberOwner<J, I> {
     start_consumed: bool,
 }
 impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
+    /// Render the existing server profile for an addressless member of the
+    /// separately owned carrier. The native owner hashes/publishes only those
+    /// rendered bytes. This does not attest C or authorize native creation:
+    /// the enclosing factory still supplies real carrier/row/key/WFP guards.
+    #[allow(dead_code)] // New factory remains gated on native integration.
+    pub(crate) fn from_trusted_carrier_engine(
+        carrier: &crate::member_carrier::Intent,
+        slot: TunnelSlot,
+        transport: TunnelTransport,
+        engine: PathBuf,
+        logical_configuration: &str,
+        journal: J,
+        io: I,
+    ) -> Result<Self> {
+        let rendered = crate::redundancy::pair_configuration(logical_configuration)
+            .map_err(|_| OwnerError::Invalid)?;
+        if rendered.addresses != carrier.addresses {
+            return Err(OwnerError::Conflict);
+        }
+        Self::from_rendered(
+            carrier.scope.clone(),
+            slot,
+            transport,
+            engine,
+            rendered.native,
+            journal,
+            io,
+        )
+    }
     /// Factory-only: engine is canonical and authenticated by the trusted layout,
     /// never a native path supplied by the app. No production factory is wired.
     pub(crate) fn from_trusted_engine(
@@ -163,6 +192,21 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
         transport: TunnelTransport,
         engine: PathBuf,
         configuration: &str,
+        journal: J,
+        io: I,
+    ) -> Result<Self> {
+        let configuration = crate::redundancy::slot_configuration(configuration)
+            .map_err(|_| OwnerError::Invalid)?;
+        Self::from_rendered(scope, slot, transport, engine, configuration, journal, io)
+    }
+    /// Both renderers keep their own validation semantics. Never run the
+    /// ordinary Address-preserving renderer on a carrier member's native bytes.
+    fn from_rendered(
+        scope: SessionScope,
+        slot: TunnelSlot,
+        transport: TunnelTransport,
+        engine: PathBuf,
+        configuration: zeroize::Zeroizing<String>,
         journal: J,
         io: I,
     ) -> Result<Self> {
@@ -178,8 +222,6 @@ impl<J: Journal, I: MemberIo> MemberOwner<J, I> {
         {
             return Err(OwnerError::Invalid);
         }
-        let configuration = crate::redundancy::slot_configuration(configuration)
-            .map_err(|_| OwnerError::Invalid)?;
         if nelomai_client_tunnel::detect_configuration_transport(&configuration) != transport {
             return Err(OwnerError::Invalid);
         }
