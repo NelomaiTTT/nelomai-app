@@ -436,6 +436,9 @@ trait Kernel {
     fn source(&mut self) -> Result<Observed>;
     fn inventory(&mut self) -> Result<Inventory>;
     fn open(&mut self, path: &str) -> Result<Self::Pin>;
+    fn open_driver_pair(&mut self, paths: [&str; 2]) -> Result<[Self::Pin; 2]> {
+        Ok([self.open(paths[0])?, self.open(paths[1])?])
+    }
     fn read(&mut self, pin: &Self::Pin) -> Result<Observed>;
     fn signatures(&mut self, pins: &[Self::Pin; 5]) -> Result<()>;
 }
@@ -647,6 +650,35 @@ fn pending_installation_root(source: &str) -> Option<&str> {
         })
         .map(|n| &source[..n])
 }
+fn package_link_set(
+    path: &str,
+    allowed: &[String; 2],
+    reported: &[String],
+    count: u32,
+) -> Result<()> {
+    if !matches!(count, 1 | 2)
+        || count as usize != reported.len()
+        || allowed[0].eq_ignore_ascii_case(&allowed[1])
+        || !allowed.iter().any(|p| p.eq_ignore_ascii_case(path))
+    {
+        return Err(Error::Invalid("package link count/scope"));
+    }
+    let mut actual = reported
+        .iter()
+        .map(|p| p.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    actual.sort();
+    let mut expected = if count == 1 {
+        vec![path.to_ascii_lowercase()]
+    } else {
+        allowed.iter().map(|p| p.to_ascii_lowercase()).collect()
+    };
+    expected.sort();
+    if actual != expected {
+        return Err(Error::Invalid("foreign/missing/duplicate package link"));
+    }
+    Ok(())
+}
 fn driver_detail_words(required: usize, id_offset: usize, capacity: usize) -> Result<usize> {
     // RequiredSize ends at the variable HardwareID buffer, not C tail padding.
     // Actual Win32 empty-ID replies are offsetof(HardwareID)+one WCHAR NUL.
@@ -708,6 +740,22 @@ fn trust_status(code: i32) -> Result<()> {
         Err(Error::Native("WinVerifyTrust", code as u32))
     }
 }
+fn catalog_hash_profile(cat_sha256: &[u8; 32]) -> Result<(&'static str, u32)> {
+    // The independently pinned 0.14.1 DLL contains this exact SHA256-signed
+    // catalog, whose INF/SYS member identifiers are SHA1 (measured ASN.1/native
+    // readback). This is NOT a generic weaker-algorithm fallback. All raw CAT,
+    // INF and both SYS bytes already match the audited source package exactly;
+    // their SHA256 identities and embedded CAT/SYS trust remain mandatory.
+    const AUDITED_CAT: [u8; 32] = [
+        0x83, 0x41, 0x39, 0x2f, 0xf3, 0xee, 0x58, 0x95, 0xc5, 0x6e, 0xc9, 0x00, 0xd5, 0x6b, 0x1e,
+        0x7e, 0xbd, 0xfe, 0xf4, 0xa1, 0xfa, 0xfd, 0xd9, 0x26, 0x58, 0x70, 0xb1, 0xe6, 0xe3, 0x7c,
+        0x79, 0x46,
+    ];
+    if cat_sha256 != &AUDITED_CAT {
+        return Err(Error::Unsupported("uninspected catalog member algorithm"));
+    }
+    Ok(("SHA1", 20))
+}
 #[derive(Debug, PartialEq, Eq)]
 struct SharePolicy {
     read: bool,
@@ -726,13 +774,13 @@ fn check<K: Kernel>(mut kernel: K) -> Result<Checked<K>> {
     let package = extract_package(&source.bytes)?;
     let inventory = kernel.inventory()?;
     let c = validate_inventory(&inventory)?;
-    let pins = [
+    let [published, inf, cat] = [
         kernel.open(&c.published_inf)?,
         kernel.open(&c.store_inf)?,
         kernel.open(&c.store_cat)?,
-        kernel.open(&c.store_sys)?,
-        kernel.open(&inventory.system_sys)?,
     ];
+    let [store_sys, system_sys] = kernel.open_driver_pair([&c.store_sys, &inventory.system_sys])?;
+    let pins = [published, inf, cat, store_sys, system_sys];
     let files = [
         kernel.read(&pins[0])?,
         kernel.read(&pins[1])?,
@@ -818,8 +866,8 @@ pub(crate) mod native {
         Win32::{
             Devices::DeviceAndDriverInstallation::*,
             Foundation::{
-                GetLastError, ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS,
-                FILETIME,
+                GetLastError, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_DATA,
+                ERROR_NO_MORE_ITEMS, FILETIME, INVALID_HANDLE_VALUE,
             },
             Security::{Cryptography::Catalog::*, WinTrust::*},
             Storage::FileSystem::*,
@@ -945,13 +993,16 @@ pub(crate) mod native {
         Ok(path)
     }
     fn stamp(file: &File, directory: bool) -> Result<Stamp> {
+        stamp_links(file, directory, 1)
+    }
+    fn stamp_links(file: &File, directory: bool, links: u32) -> Result<Stamp> {
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
             return Err(last("GetFileInformationByHandle"));
         }
         if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
-            || (!directory && info.nNumberOfLinks != 1)
+            || (!directory && (info.nNumberOfLinks != links || !matches!(links, 1 | 2)))
         {
             return Err(Error::Invalid("reparse/type/link count"));
         }
@@ -963,6 +1014,9 @@ pub(crate) mod native {
         })
     }
     fn readonly_open(path: &Path, directory: bool) -> Result<File> {
+        readonly_open_links(path, directory, 1)
+    }
+    fn readonly_open_links(path: &Path, directory: bool, links: u32) -> Result<File> {
         clean_absolute(path)?;
         let flags = FILE_FLAG_OPEN_REPARSE_POINT
             | if directory {
@@ -988,7 +1042,7 @@ pub(crate) mod native {
             .custom_flags(flags)
             .open(path)
             .map_err(|e| io("open readonly pin", e))?;
-        stamp(&file, directory)?;
+        stamp_links(&file, directory, links)?;
         if !same_path(&final_path(&file)?, path) {
             return Err(Error::Changed);
         }
@@ -998,9 +1052,72 @@ pub(crate) mod native {
         file: File,
         path: PathBuf,
         parents: Vec<(File, PathBuf, Stamp)>,
+        driver_links: Option<([String; 2], Vec<String>)>,
+    }
+    fn hardlink_names(path: &Path) -> Result<Vec<String>> {
+        clean_absolute(path)?;
+        let text = path.to_str().ok_or(Error::Invalid("link path"))?;
+        let volume = text.get(..2).ok_or(Error::Invalid("link volume"))?;
+        let path = wide(text)?;
+        let mut buffer = vec![0u16; 32768];
+        let mut length = buffer.len() as u32;
+        let raw = unsafe { FindFirstFileNameW(path.as_ptr(), 0, &mut length, buffer.as_mut_ptr()) };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(last("FindFirstFileNameW"));
+        }
+        struct Search(windows_sys::Win32::Foundation::HANDLE);
+        impl Drop for Search {
+            fn drop(&mut self) {
+                unsafe { FindClose(self.0) };
+            }
+        }
+        let search = Search(raw);
+        let mut result = vec![];
+        loop {
+            if length as usize > buffer.len() {
+                return Err(Error::Invalid("hardlink buffer"));
+            }
+            let name = wide_z(&buffer)?;
+            if !name.starts_with('\\') || name.starts_with(r"\\") {
+                return Err(Error::Invalid("hardlink rooted path"));
+            }
+            let full = format!("{volume}{name}");
+            clean_absolute(Path::new(&full))?;
+            result.push(full.to_ascii_lowercase());
+            if result.len() > 2 {
+                return Err(Error::Invalid("unexpected third package link"));
+            }
+            buffer.fill(0);
+            length = buffer.len() as u32;
+            if unsafe { FindNextFileNameW(search.0, &mut length, buffer.as_mut_ptr()) } == 0 {
+                if unsafe { GetLastError() } != ERROR_HANDLE_EOF {
+                    return Err(last("FindNextFileNameW"));
+                }
+                result.sort();
+                return Ok(result);
+            }
+        }
     }
     impl Pin {
         fn open(path: &Path) -> Result<Self> {
+            Self::open_inner(path, None)
+        }
+        fn open_driver(path: &Path, allowed: [String; 2]) -> Result<Self> {
+            let reported = hardlink_names(path)?;
+            package_link_set(
+                path.to_str().ok_or(Error::Invalid("driver link path"))?,
+                &allowed,
+                &reported,
+                reported.len() as u32,
+            )?;
+            let pin = Self::open_inner(path, Some((allowed, reported)))?;
+            pin.verify_links()?;
+            Ok(pin)
+        }
+        fn open_inner(
+            path: &Path,
+            driver_links: Option<([String; 2], Vec<String>)>,
+        ) -> Result<Self> {
             clean_absolute(path)?;
             let mut ancestors = path.ancestors().skip(1).collect::<Vec<_>>();
             ancestors.reverse();
@@ -1010,14 +1127,39 @@ pub(crate) mod native {
                 let observed = stamp(&file, true)?;
                 parents.push((file, path.to_owned(), observed));
             }
-            let file = readonly_open(path, false)?;
+            let count = driver_links
+                .as_ref()
+                .map_or(1, |(_, paths)| paths.len() as u32);
+            let file = readonly_open_links(path, false, count)?;
             Ok(Self {
                 file,
                 path: path.to_owned(),
                 parents,
+                driver_links,
             })
         }
+        fn link_count(&self) -> u32 {
+            self.driver_links
+                .as_ref()
+                .map_or(1, |(_, p)| p.len() as u32)
+        }
+        fn verify_links(&self) -> Result<()> {
+            if let Some((allowed, expected)) = &self.driver_links {
+                let reported = hardlink_names(&self.path)?;
+                package_link_set(
+                    self.path.to_str().ok_or(Error::Invalid("driver path"))?,
+                    allowed,
+                    &reported,
+                    self.link_count(),
+                )?;
+                if &reported != expected {
+                    return Err(Error::Changed);
+                }
+            }
+            Ok(())
+        }
         fn observe(&self) -> Result<Observed> {
+            self.verify_links()?;
             for (file, path, expected) in &self.parents {
                 // Directory size/mtime changes from unrelated OS activity are not
                 // identity replacement. Reparse/type/identity remain mandatory.
@@ -1032,15 +1174,22 @@ pub(crate) mod native {
                     return Err(Error::Changed);
                 }
             }
-            let current = readonly_open(&self.path, false)?;
-            if stamp(&current, false)? != stamp(&self.file, false)? {
+            let current = readonly_open_links(&self.path, false, self.link_count())?;
+            if stamp_links(&current, false, self.link_count())?
+                != stamp_links(&self.file, false, self.link_count())?
+            {
                 return Err(Error::Changed);
             }
-            observe(&self.file)
+            let observed = observe_links(&self.file, self.link_count())?;
+            self.verify_links()?;
+            Ok(observed)
         }
     }
     fn observe(file: &File) -> Result<Observed> {
-        let before = stamp(file, false)?;
+        observe_links(file, 1)
+    }
+    fn observe_links(file: &File, links: u32) -> Result<Observed> {
+        let before = stamp_links(file, false, links)?;
         let length = usize::try_from(before.size).map_err(|_| Error::Invalid("file size"))?;
         if length == 0 || length > MAX_SOURCE {
             return Err(Error::Invalid("file bound"));
@@ -1056,7 +1205,7 @@ pub(crate) mod native {
             }
             offset += count;
         }
-        if stamp(file, false)? != before {
+        if stamp_links(file, false, links)? != before {
             return Err(Error::Changed);
         }
         Ok(Observed {
@@ -1468,7 +1617,12 @@ pub(crate) mod native {
         };
         wintrust(&mut data)
     }
-    fn catalog_member(cat: &Pin, member: &Pin, context: &CatalogContext) -> Result<()> {
+    fn catalog_member(
+        cat: &Pin,
+        member: &Pin,
+        context: &CatalogContext,
+        expected_length: u32,
+    ) -> Result<()> {
         let mut digest = [0u8; 64];
         let mut length = digest.len() as u32;
         if unsafe {
@@ -1483,8 +1637,8 @@ pub(crate) mod native {
         {
             return Err(last("CryptCATAdminCalcHashFromFileHandle2"));
         }
-        if length != 32 {
-            return Err(Error::Unsupported("catalog SHA256 hash required"));
+        if length != expected_length {
+            return Err(Error::Unsupported("catalog hash length"));
         }
         let tag = digest[..length as usize]
             .iter()
@@ -1725,6 +1879,25 @@ pub(crate) mod native {
         fn open(&mut self, path: &str) -> Result<Pin> {
             Pin::open(Path::new(path))
         }
+        fn open_driver_pair(&mut self, paths: [&str; 2]) -> Result<[Pin; 2]> {
+            let allowed = paths.map(str::to_owned);
+            let pins = [
+                Pin::open_driver(Path::new(paths[0]), allowed.clone())?,
+                Pin::open_driver(Path::new(paths[1]), allowed)?,
+            ];
+            if pins.iter().any(|p| p.link_count() == 2) {
+                let a = stamp_links(&pins[0].file, false, pins[0].link_count())?;
+                let b = stamp_links(&pins[1].file, false, pins[1].link_count())?;
+                if pins[0].link_count() != 2
+                    || pins[1].link_count() != 2
+                    || a.volume != b.volume
+                    || a.id != b.id
+                {
+                    return Err(Error::Changed);
+                }
+            }
+            Ok(pins)
+        }
         fn read(&mut self, pin: &Pin) -> Result<Observed> {
             pin.observe()
         }
@@ -1733,16 +1906,25 @@ pub(crate) mod native {
             // never GetAuthenticodeSignature text/JSON or a caller success flag.
             signed_file(&pins[2])?;
             signed_file(&pins[4])?;
+            let (algorithm, expected_length) =
+                catalog_hash_profile(&hash(&pins[2].observe()?.bytes))?;
+            let algorithm = wide(algorithm)?;
             let mut raw = 0;
             if unsafe {
-                CryptCATAdminAcquireContext2(&mut raw, ptr::null(), w!("SHA256"), ptr::null(), 0)
+                CryptCATAdminAcquireContext2(
+                    &mut raw,
+                    ptr::null(),
+                    algorithm.as_ptr(),
+                    ptr::null(),
+                    0,
+                )
             } == 0
             {
                 return Err(last("CryptCATAdminAcquireContext2"));
             }
             let context = CatalogContext(raw);
             for index in [0, 1, 3, 4] {
-                catalog_member(&pins[2], &pins[index], &context)?;
+                catalog_member(&pins[2], &pins[index], &context, expected_length)?;
             }
             Ok(())
         }

@@ -194,6 +194,65 @@ fn pending_snapshot_drift_revokes_even_if_queue_stays_classified_unrelated() {
         assert_eq!(checked.reattest(), Err(Error::Changed));
     }
 }
+#[test]
+fn driver_store_and_installed_sys_may_be_exactly_one_closed_hardlink_pair() {
+    let pair: [String; 2] = [
+        r"C:\Windows\System32\DriverStore\FileRepository\wintun.inf_amd64_x\wintun.sys".into(),
+        r"C:\Windows\System32\drivers\wintun.sys".into(),
+    ];
+    for path in &pair {
+        assert_eq!(package_link_set(path, &pair, &pair, 2), Ok(()));
+        assert_eq!(
+            package_link_set(path, &pair, std::slice::from_ref(path), 1),
+            Ok(())
+        );
+    }
+}
+#[test]
+fn driver_hardlinks_reject_foreign_missing_duplicate_or_count_drift() {
+    let pair: [String; 2] = [
+        r"C:\store\wintun.sys".into(),
+        r"C:\drivers\wintun.sys".into(),
+    ];
+    for (reported, count) in [
+        (vec![], 0),
+        (pair.to_vec(), 1),
+        (vec![pair[0].clone()], 2),
+        (vec![pair[1].clone()], 1),
+        (vec![pair[0].clone(), pair[0].clone()], 2),
+        (vec![pair[0].clone(), r"C:\foreign\wintun.sys".into()], 2),
+        (
+            vec![
+                pair[0].clone(),
+                pair[1].clone(),
+                r"C:\third\wintun.sys".into(),
+            ],
+            3,
+        ),
+    ] {
+        assert!(package_link_set(&pair[0], &pair, &reported, count).is_err());
+    }
+    assert!(package_link_set(r"C:\foreign\wintun.sys", &pair, &pair, 2).is_err());
+    assert!(package_link_set(&pair[0], &[pair[0].clone(), pair[0].clone()], &pair, 2).is_err());
+    let swapped = [pair[1].to_uppercase(), pair[0].to_uppercase()];
+    assert_eq!(package_link_set(&pair[0], &pair, &swapped, 2), Ok(()));
+}
+#[test]
+fn audited_catalog_member_tags_use_the_catalogs_algorithm_not_its_signature_algorithm() {
+    // Independently hashed installed CAT; its signed content has SHA1 SYS/INF
+    // member tags, although the catalog's signature uses SHA256.
+    let digest = [
+        0x83, 0x41, 0x39, 0x2f, 0xf3, 0xee, 0x58, 0x95, 0xc5, 0x6e, 0xc9, 0x00, 0xd5, 0x6b, 0x1e,
+        0x7e, 0xbd, 0xfe, 0xf4, 0xa1, 0xfa, 0xfd, 0xd9, 0x26, 0x58, 0x70, 0xb1, 0xe6, 0xe3, 0x7c,
+        0x79, 0x46,
+    ];
+    assert_eq!(catalog_hash_profile(&digest), Ok(("SHA1", 20)));
+    for index in 0..32 {
+        let mut foreign = digest;
+        foreign[index] ^= 1;
+        assert!(catalog_hash_profile(&foreign).is_err());
+    }
+}
 
 // Independent expected metadata of the audited, stamped amd64 INF. Synthetic
 // PE/resources below exercise parsing, NOT Authenticode or cold native acceptance.
