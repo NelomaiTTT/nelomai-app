@@ -18,11 +18,17 @@ pub use member_diagnostic::PairFailure;
 #[path = "windows/member_boot.rs"]
 mod member_boot;
 #[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_module.rs"]
+mod member_carrier_module;
+#[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_payload.rs"]
 mod member_carrier_payload;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_preload.rs"]
 mod member_carrier_preload;
+#[cfg(all(test, not(windows)))]
+#[path = "windows/member_carrier_wintun_lock.rs"]
+mod member_carrier_wintun_lock;
 #[cfg(all(test, not(windows)))]
 #[path = "windows/member_carrier_wintun_package.rs"]
 mod member_carrier_wintun_package;

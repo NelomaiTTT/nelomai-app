@@ -113,6 +113,14 @@ pub(crate) mod native {
                 .verify_at(&self.installation.root.join("engine-owner.lock"))
                 .map_err(|_| Error::Conflict)
         }
+        /// The module actor must retain the SAME original privileged lease,
+        /// not another correctly named lock or a deserialized runtime identity.
+        pub(in crate::windows) fn verify_owner(&self, owner: &Arc<MutationGuard>) -> Result<()> {
+            if !Arc::ptr_eq(&self.owner, owner) {
+                return Err(Error::Conflict);
+            }
+            self.verify()
+        }
         pub(crate) fn file(&self) -> Result<&File> {
             self.verify()?;
             Ok(self.payload.file())

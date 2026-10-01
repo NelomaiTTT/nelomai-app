@@ -34,6 +34,14 @@ pub(crate) struct KeyLock {
     // inspections/effects and the before_adapter_create receipt borrow.
     _serialized: MutexGuard<'static, ()>,
 }
+impl KeyLock {
+    pub(super) fn verify_source(
+        &self,
+        source: &super::member_carrier_payload::native::WintunSource,
+    ) -> Result<()> {
+        source.verify_owner(&self.owner)
+    }
+}
 pub(crate) struct KeyAuthority<I> {
     context: Context,
     identity: EngineIdentity,
