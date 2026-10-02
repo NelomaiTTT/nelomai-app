@@ -389,6 +389,38 @@ impl NativeDeadline {
             },
         )
     }
+    /// SDK-free selection of the original module-only lineage under an exact
+    /// Closing9/10/12 or Stopped12 Pair ACK. No native receipt absence, resource
+    /// SDK read/effect, unload or DATA retirement is authorized by this runner.
+    ///
+    /// # Safety
+    /// Callback retains ONLY actual no-constructor Startup/Assembly/loader
+    /// originals. It must not query resource SDKs or perform storage/native effects.
+    pub(crate) unsafe fn run_module_only_read_selection<T>(
+        &self,
+        context: &Context,
+        intent: &super::member_carrier_pair_store::native_store::NativePairIntentRead,
+        expected: &crate::member_carrier_pair::Record,
+        call: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.run_authenticated_cleanup(
+            context,
+            || {
+                self.verify_cleanup_runtime_entry(&self.runtime, context)?;
+                intent
+                    .verify_module_only_read_entry(&self.runtime, context, expected)
+                    .map_err(|_| CarrierError::Conflict)?;
+                self.verify_cleanup_runtime_entry(&self.runtime, context)
+            },
+            || {
+                let pin = self.read_pin()?;
+                pin.verify_call(self, context)?;
+                let result = call();
+                pin.verify_call(self, context)?;
+                result
+            },
+        )
+    }
     /// Bounded factual read for an actual acknowledged module-only attempt.
     /// SAME owning Startup/candidate/loader ACK and current original Pair are
     /// authenticated, not NativeReceipt absence or the Never-effect ledger.

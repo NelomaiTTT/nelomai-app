@@ -193,7 +193,7 @@ pub(crate) mod native {
         member_carrier::{CarrierError as Error, Result},
         member_carrier_guard::{Model, Snapshot},
         member_carrier_native_ownership::{self as receipt, Context},
-        member_carrier_pair::{Phase, Record},
+        member_carrier_pair::Record,
         windows::{
             member_carrier_assembly::native::NativeAssemblyModuleOnlyRead,
             member_carrier_bootstrap::native::NativeBootstrapModuleOnlyRead,
@@ -428,20 +428,13 @@ pub(crate) mod native {
             let record = &root.expected;
             boundary(receipt::validate_context(input.context))?;
             record.validate().map_err(|_| ReadError::Changed)?;
-            if record.phase != Phase::Stopped
-                || record.stop_stage != 12
-                || record.pending.is_some()
-                || record.operation.is_some()
-                || record.pending_guard.is_some()
-                || record.carrier.is_some()
-                || record.members.iter().any(Option::is_some)
-                || record.network.is_some()
-                || record.active.is_some()
-                || record.scope != input.context.intent.scope
-                || record.provenance != input.context.provenance
-                || record.addresses != input.context.intent.addresses
-                || record.options.is_none()
-                || !input.runtime.matches_lock(self.lock)
+            boundary(
+                crate::windows::member_carrier_startup::compare_module_only_read_record(
+                    input.context,
+                    record,
+                ),
+            )?;
+            if !input.runtime.matches_lock(self.lock)
                 || !root.pair.same_store_origin(input.original_intent)
                 || !root.load.matches_runtime(input.runtime)
                 || !root.load.matches_source(input.source)
@@ -461,7 +454,12 @@ pub(crate) mod native {
             ))?;
             boundary(input.deadline.verify_call(input.supervisor, input.context))?;
             root.pair
-                .verify_terminal_bracket(input.runtime, input.supervisor, input.context, record)
+                .verify_module_only_read_bracket(
+                    input.runtime,
+                    input.supervisor,
+                    input.context,
+                    record,
+                )
                 .map_err(|_| ReadError::Boundary)?;
             root.load
                 .verify_cleanup_read(input.runtime, input.cancelled)
@@ -511,7 +509,11 @@ pub(crate) mod native {
             }
             // Original ACK/J + authenticated canonical cleanup view, never a
             // decode-only match or reconstructed initialized journal.
-            boundary(bootstrap.verify_current_initial(bytes))
+            boundary(bootstrap.verify_current_initial(
+                &self.original.pair,
+                &self.original.expected,
+                bytes,
+            ))
         }
         fn verify_creator(&mut self, bytes: &[u8]) -> ReadResult<()> {
             let bootstrap = self.bootstrap()?;

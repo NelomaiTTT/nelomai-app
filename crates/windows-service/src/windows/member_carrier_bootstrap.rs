@@ -771,9 +771,19 @@ pub(crate) mod native {
         /// Actual SAME initial-J ACK under its explicit original cleanup view.
         /// Called only inside original finite Calling/Pair bracket. This is
         /// SDK-free bookkeeping/read authentication, never native permission.
-        pub(crate) fn verify_current_initial(&self, observed: &[u8]) -> Result<()> {
+        pub(crate) fn verify_current_initial(
+            &self,
+            pair: &NativePairIntentRead,
+            expected: &PairRecord,
+            observed: &[u8],
+        ) -> Result<()> {
             let input = &self.inputs;
             let check = || -> Result<()> {
+                crate::windows::member_carrier_startup::compare_module_only_read_progress(
+                    &input.context,
+                    &self.expected,
+                    expected,
+                )?;
                 if observed != input.native_bytes.as_slice() {
                     return Err(Error::Conflict);
                 }
@@ -786,14 +796,16 @@ pub(crate) mod native {
                 input
                     .deadline
                     .verify_call(&input.supervisor, &input.context)?;
-                self.pair
-                    .verify_terminal_bracket(
-                        &input.runtime,
-                        &input.supervisor,
-                        &input.context,
-                        &self.expected,
-                    )
-                    .map_err(|_| Error::Conflict)?;
+                if !pair.same_store_origin(&self.pair) {
+                    return Err(Error::Conflict);
+                }
+                pair.verify_module_only_read_bracket(
+                    &input.runtime,
+                    &input.supervisor,
+                    &input.context,
+                    expected,
+                )
+                .map_err(|_| Error::Conflict)?;
                 input.runtime.verify_source(&input.source)?;
                 input
                     .runtime
@@ -912,7 +924,7 @@ pub(crate) mod native {
                     {
                         return Err(Error::Conflict);
                     }
-                    pair.verify_terminal_bracket(
+                    pair.verify_module_only_read_bracket(
                         &input.runtime,
                         &input.supervisor,
                         &input.context,
@@ -940,11 +952,15 @@ pub(crate) mod native {
                     .inputs
                     .as_ref()
                     .is_none_or(|input| !Rc::ptr_eq(input, &original.inputs))
-                || !Rc::ptr_eq(pair, &original.pair)
-                || expected != &original.expected
+                || !pair.same_store_origin(&original.pair)
             {
                 return Err(Error::Conflict);
             }
+            crate::windows::member_carrier_startup::compare_module_only_read_progress(
+                &original.inputs.context,
+                &original.expected,
+                expected,
+            )?;
             self.module
                 .verify_module_only_read(
                     original

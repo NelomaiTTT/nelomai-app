@@ -94,6 +94,25 @@ fn run_module_only_read_call(
         .map_err(|_| Error::Retired)
 }
 
+fn run_repeated_module_only_read_call(
+    history: &std::cell::RefCell<Vec<std::rc::Rc<TerminalCallState>>>,
+    authenticate: impl Fn() -> Result<()>,
+    bounded_read: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let state = std::rc::Rc::new(TerminalCallState::new());
+    {
+        let mut retained = history.try_borrow_mut().map_err(|_| Error::Conflict)?;
+        if retained.len() >= 32 {
+            return Err(Error::Pending);
+        }
+        for previous in retained.iter() {
+            previous.verify().map_err(|_| Error::Retired)?;
+        }
+        retained.push(state.clone()); // retain BEFORE preflight/native read/postflight
+    }
+    run_module_only_read_call(&state, authenticate, bounded_read)
+}
+
 /// Caller retains this destination. This is ownership registration only, not
 /// a journal/creator ACK, native absence or failed-constructor disposal grant.
 fn retain_claim_startup<S>(
@@ -182,12 +201,66 @@ fn compare_module_only_candidate_frame(
     context: &Context,
     expected: &crate::member_carrier_pair::Record,
 ) -> Result<()> {
-    if !invocation.attempted(create, attach)?
-        || !create
-        || attach
-        || graph
-        || compare_zero_effect_terminal_record(context, expected)?
-            != NoCarrierConfiguration::Configured
+    if !invocation.attempted(create, attach)? || !create || attach || graph {
+        return Err(Error::Conflict);
+    }
+    compare_module_only_read_record(context, expected)
+}
+
+/// Factual read stage only. Original no-constructor/load lineage and actual
+/// current Pair publication/Calling remain mandatory in native consumers.
+pub(crate) fn compare_module_only_read_record(
+    context: &Context,
+    expected: &crate::member_carrier_pair::Record,
+) -> Result<()> {
+    use crate::member_carrier_pair::{Effect, Phase};
+    expected.validate().map_err(|_| Error::Conflict)?;
+    crate::member_carrier_native_ownership::validate_context(context)?;
+    if expected.scope != context.intent.scope
+        || expected.provenance != context.provenance
+        || expected.addresses != context.intent.addresses
+        || expected.options.is_none()
+        || expected.carrier.is_some()
+        || expected.members.iter().flatten().any(|m| {
+            m.owner.phase != crate::member_owner::Phase::Prepared
+                || m.owner.proof.is_some()
+                || m.owner.retired_proof.is_some()
+                || m.owner.previous_config_sha256.is_some()
+        })
+        || expected.network.is_some()
+        || expected.operation.is_some()
+        || expected.active.is_some()
+        || expected.pending_guard.is_some()
+        || expected.guard
+            != crate::member_carrier_guard::Model::empty(expected.scope.clone())
+                .map_err(|_| Error::Conflict)?
+        || !matches!(
+            (expected.phase, expected.stop_stage, expected.pending),
+            (Phase::Closing, 9, Some(Effect::NativeEmpty))
+                | (Phase::Closing, 10, Some(Effect::Guard))
+                | (Phase::Closing, 12, Some(Effect::FullEmpty))
+                | (Phase::Stopped, 12, None)
+        )
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(())
+}
+pub(crate) fn compare_module_only_read_progress(
+    context: &Context,
+    original: &crate::member_carrier_pair::Record,
+    current: &crate::member_carrier_pair::Record,
+) -> Result<()> {
+    compare_module_only_read_record(context, original)?;
+    compare_module_only_read_record(context, current)?;
+    if current.revision < original.revision
+        || current.stop_stage < original.stop_stage
+        || current.dns != original.dns
+        || current.options != original.options
+        || (current.phase != crate::member_carrier_pair::Phase::Stopped
+            && current.members != original.members)
+        || (original.phase == crate::member_carrier_pair::Phase::Stopped
+            && current.phase != crate::member_carrier_pair::Phase::Stopped)
     {
         return Err(Error::Conflict);
     }
@@ -752,8 +825,10 @@ pub(crate) mod native {
         module_only_candidate: Option<Rc<NativeStartupModuleOnlyCandidate>>,
         module_only_selection: Rc<TerminalCallState>,
         module_only_read_call: Rc<TerminalCallState>,
+        module_only_cleanup_read_calls: [RefCell<Vec<Rc<TerminalCallState>>>; 3],
         module_only_load_read: RefCell<Option<Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>>>,
         module_only_native_read: RefCell<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>,
+        module_only_cleanup_native_reads: RefCell<[Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>; 3]>,
     }
     /// Original lineage/caller-retention aperture, NOT native load ACK or SDK
     /// permission. OtherAttempted remains denied by the existing finisher.
@@ -1825,6 +1900,91 @@ pub(crate) mod native {
         }
     }
     impl NativeStartupRoot {
+        fn module_only_read_origins(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<(
+            Rc<NativeStartupModuleOnlyCandidate>,
+            Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>,
+        )> {
+            let candidate = if let Some(candidate) = self.module_only_candidate.as_ref() {
+                candidate.clone()
+            } else {
+                let mut retained = None;
+                self.retain_module_only_candidate_into(original, expected, &mut retained)?;
+                retained.ok_or(Error::Pending)?
+            };
+            self.verify_module_only_candidate(&candidate, original, expected)?;
+            if self
+                .module_only_load_read
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .is_none()
+            {
+                self.retain_module_only_load_read_into(
+                    &candidate,
+                    original,
+                    expected,
+                    &mut *self
+                        .module_only_load_read
+                        .try_borrow_mut()
+                        .map_err(|_| Error::Conflict)?,
+                )?;
+            }
+            let load = self
+                .module_only_load_read
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .cloned()
+                .ok_or(Error::Pending)?;
+            self.verify_module_only_load_read(&candidate, original, expected, &load)?;
+            Ok((candidate, load))
+        }
+        /// No-constructor lineage, not empty carrier slots, is verified by the
+        /// original Assembly/loader. Full SDK, protected records, all private
+        /// paths/services/keys and two WFP reads stay mandatory. Read only:
+        /// this cannot close a handle, unload the DLL or retire initial DATA.
+        fn read_module_only_cleanup_root(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<crate::member_carrier_guard::Snapshot> {
+            compare_module_only_read_record(&self.context, expected)?;
+            let index = match (expected.phase, expected.stop_stage) {
+                (pair::Phase::Closing, 9) => 0,
+                (pair::Phase::Closing, 10) => 1,
+                (pair::Phase::Closing, 12) => 2,
+                _ => return Err(Error::Conflict),
+            };
+            let (candidate, load) = self.module_only_read_origins(original, expected)?;
+            let mut observed = None;
+            let inspect = |facts: &crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalFacts<'_>| {
+                if !facts.same_original(&candidate, &load, original) { return Err(Error::Conflict); }
+                observed = Some(facts.snapshot().clone());
+                Ok(())
+            };
+            let mut readers = self
+                .module_only_cleanup_native_reads
+                .try_borrow_mut()
+                .map_err(|_| Error::Conflict)?;
+            if let Some(reader) = readers[index].as_ref() {
+                self.read_module_only_terminal(
+                    &candidate, &load, original, expected, reader, inspect,
+                )?;
+            } else {
+                self.retain_and_read_module_only_terminal(
+                    &candidate,
+                    &load,
+                    original,
+                    expected,
+                    &mut readers[index],
+                    inspect,
+                )?;
+            }
+            observed.ok_or(Error::Pending)
+        }
         /// SDK-free selection of SAME already-retained attempted originals.
         /// Caller retains destination before invoking. This neither performs
         /// unload nor substitutes Never/Retired/SourceRead or EMPTY JSON for G.
@@ -1870,7 +2030,7 @@ pub(crate) mod native {
                     // authenticated outer protected Pair frame bracket the facts;
                     // no resource SDK operation or unload is hidden here.
                     unsafe {
-                        self.supervisor.run_terminal_selection(
+                        self.supervisor.run_module_only_read_selection(
                             &self.context,
                             pair,
                             expected,
@@ -1916,8 +2076,7 @@ pub(crate) mod native {
                     .module_only_candidate
                     .as_ref()
                     .is_none_or(|r| !Rc::ptr_eq(r, original))
-                || !Rc::ptr_eq(pair, &original.pair)
-                || expected != &original.expected
+                || !pair.same_store_origin(&original.pair)
                 || !Rc::ptr_eq(&self.invocation, &original.invocation)
                 || !Rc::ptr_eq(&self.runtime, &original.runtime)
                 || !Rc::ptr_eq(&self.source, &original.source)
@@ -1926,6 +2085,7 @@ pub(crate) mod native {
             {
                 return Err(Error::Conflict);
             }
+            compare_module_only_read_progress(&self.context, &original.expected, expected)?;
             compare_module_only_candidate_frame(
                 &self.invocation,
                 self.create_attempted,
@@ -2036,7 +2196,7 @@ pub(crate) mod native {
             self.runtime
                 .verify_same_session_files(&self.context, &self.files)?;
             self.runtime.verify_source(&self.source)?;
-            pair.verify_terminal_entry(&self.runtime, &self.context, expected)
+            pair.verify_module_only_read_entry(&self.runtime, &self.context, expected)
                 .map_err(|_| Error::Conflict)?;
             self.verify_module_only_load_read(original, pair, expected, load)
         }
@@ -2051,8 +2211,13 @@ pub(crate) mod native {
             observed: &[u8],
         ) -> Result<()> {
             self.verify_module_only_candidate(original, pair, expected)?;
-            pair.verify_terminal_bracket(&self.runtime, &self.supervisor, &self.context, expected)
-                .map_err(|_| Error::Conflict)?;
+            pair.verify_module_only_read_bracket(
+                &self.runtime,
+                &self.supervisor,
+                &self.context,
+                expected,
+            )
+            .map_err(|_| Error::Conflict)?;
             let creator = self.creator.as_ref().ok_or(Error::Pending)?;
             // The store and captured publication are retained from from_claim;
             // current bytes come from this original Runtime's canonical view.
@@ -2068,8 +2233,13 @@ pub(crate) mod native {
             creator
                 .verify_published_read(&self.runtime, &self.context, observed)
                 .map_err(|_| Error::Conflict)?;
-            pair.verify_terminal_bracket(&self.runtime, &self.supervisor, &self.context, expected)
-                .map_err(|_| Error::Conflict)?;
+            pair.verify_module_only_read_bracket(
+                &self.runtime,
+                &self.supervisor,
+                &self.context,
+                expected,
+            )
+            .map_err(|_| Error::Conflict)?;
             if self
                 .runtime
                 .record(&self.context, RecordKind::NativeCreator)?
@@ -2099,44 +2269,57 @@ pub(crate) mod native {
                 pair,
                 expected,
             };
-            run_module_only_read_call(
-                &self.module_only_read_call,
-                || {
-                    if !reader.matches_original(original, load, pair, expected) {
-                        return Err(Error::Conflict);
-                    }
-                    self.verify_module_only_reader_entry(
-                        &self.supervisor,
-                        original,
-                        load,
-                        pair,
-                        expected,
-                    )
-                },
-                || {
-                    // SAFETY: this exact reader only queries native/protected
-                    // observations. No SDK create/close/unload or storage write.
-                    unsafe {
-                        self.supervisor.run_module_only_terminal_read(&entry, || {
-                            pair.inspect(&self.runtime, &self.supervisor, |actual| {
-                                if actual != expected {
-                                    return Err(std::io::Error::other("module_read_pair"));
-                                }
-                                reader
-                                    .read_in_call(
-                                        self,
-                                        self.lock.as_ref().ok_or_else(|| {
-                                            std::io::Error::other("module_read_lock")
-                                        })?,
-                                        inspect,
-                                    )
-                                    .map_err(|_| std::io::Error::other("module_read_native"))
-                            })
-                            .map_err(|_| Error::Conflict)
+            compare_module_only_read_record(&self.context, expected)?;
+            let authenticate = || {
+                if !reader.matches_original(original, load, pair, expected) {
+                    return Err(Error::Conflict);
+                }
+                self.verify_module_only_reader_entry(
+                    &self.supervisor,
+                    original,
+                    load,
+                    pair,
+                    expected,
+                )
+            };
+            let bounded_read = || {
+                // SAFETY: this exact reader only queries native/protected
+                // observations. No SDK create/close/unload or storage write.
+                unsafe {
+                    self.supervisor.run_module_only_terminal_read(&entry, || {
+                        pair.inspect(&self.runtime, &self.supervisor, |actual| {
+                            if actual != expected {
+                                return Err(std::io::Error::other("module_read_pair"));
+                            }
+                            reader
+                                .read_in_call(
+                                    self,
+                                    self.lock
+                                        .as_ref()
+                                        .ok_or_else(|| std::io::Error::other("module_read_lock"))?,
+                                    inspect,
+                                )
+                                .map_err(|_| std::io::Error::other("module_read_native"))
                         })
-                    }
-                },
-            )
+                        .map_err(|_| Error::Conflict)
+                    })
+                }
+            };
+            if expected.phase == pair::Phase::Stopped {
+                run_module_only_read_call(&self.module_only_read_call, authenticate, bounded_read)
+            } else {
+                let index = match expected.stop_stage {
+                    9 => 0,
+                    10 => 1,
+                    12 => 2,
+                    _ => return Err(Error::Conflict),
+                };
+                run_repeated_module_only_read_call(
+                    &self.module_only_cleanup_read_calls[index],
+                    authenticate,
+                    bounded_read,
+                )
+            }
         }
         /// Retain the actual query-only reader in the caller's owning slot
         /// BEFORE authentication/Calling/any observation. Never replace an
@@ -2407,8 +2590,10 @@ pub(crate) mod native {
                 module_only_candidate: None,
                 module_only_selection: Rc::new(TerminalCallState::new()),
                 module_only_read_call: Rc::new(TerminalCallState::new()),
+                module_only_cleanup_read_calls: std::array::from_fn(|_| RefCell::new(Vec::new())),
                 module_only_load_read: RefCell::new(None),
                 module_only_native_read: RefCell::new(None),
+                module_only_cleanup_native_reads: RefCell::new(std::array::from_fn(|_| None)),
             };
             retain_claim_startup(destination, startup, |startup| {
                 // SAME signed Runtime/current-process capture. The capsule and its
@@ -2734,6 +2919,9 @@ pub(crate) mod native {
                     .construction_attempted
                     .get()
             {
+                if expected.carrier.is_none() {
+                    return self.read_module_only_cleanup_root(original, expected);
+                }
                 return self.read_prepublication_full_empty_root(original, expected);
             }
             if !self.create_attempted {
@@ -2972,6 +3160,11 @@ pub(crate) mod native {
                     .construction_attempted
                     .get()
             {
+                if expected.carrier.is_none() {
+                    return self
+                        .read_module_only_cleanup_root(original, expected)
+                        .map(|_| ());
+                }
                 return self
                     .read_prepublication_empty_root(original, expected, true)
                     .map(|_| ());
@@ -3564,39 +3757,7 @@ pub(crate) mod native {
             original: &Rc<NativePairIntentRead>,
             expected: &pair::Record,
         ) -> Result<()> {
-            let candidate = if let Some(candidate) = self.module_only_candidate.as_ref() {
-                candidate.clone()
-            } else {
-                let mut retained = None;
-                self.retain_module_only_candidate_into(original, expected, &mut retained)?;
-                retained.ok_or(Error::Pending)?
-            };
-            self.verify_module_only_candidate(&candidate, original, expected)?;
-            let need_load_read = {
-                let retained = self
-                    .module_only_load_read
-                    .try_borrow()
-                    .map_err(|_| Error::Conflict)?;
-                retained.is_none()
-            };
-            if need_load_read {
-                self.retain_module_only_load_read_into(
-                    &candidate,
-                    original,
-                    expected,
-                    &mut *self
-                        .module_only_load_read
-                        .try_borrow_mut()
-                        .map_err(|_| Error::Conflict)?,
-                )?;
-            }
-            let load = self
-                .module_only_load_read
-                .try_borrow()
-                .map_err(|_| Error::Conflict)?
-                .as_ref()
-                .cloned()
-                .ok_or(Error::Pending)?;
+            let (candidate, load) = self.module_only_read_origins(original, expected)?;
             self.retain_and_read_module_only_terminal(
                 &candidate,
                 &load,

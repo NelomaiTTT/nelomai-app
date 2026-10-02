@@ -6,6 +6,74 @@ use crate::member_carrier_pair::tests::{
 };
 
 #[test]
+fn module_only_cleanup_repeats_fresh_reads_but_never_retries_failed_calls() {
+    use std::{
+        cell::{Cell, RefCell},
+        panic::{catch_unwind, AssertUnwindSafe},
+    };
+    for failure in 0..4 {
+        let history = RefCell::new(Vec::new());
+        let calls = Cell::new(0);
+        for _ in 0..3 {
+            run_repeated_module_only_read_call(
+                &history,
+                || Ok(()),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(calls.get(), 3);
+        let auth = Cell::new(0);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            run_repeated_module_only_read_call(
+                &history,
+                || {
+                    auth.set(auth.get() + 1);
+                    if failure == 0 || failure == 3 && auth.get() == 2 {
+                        return Err(Error::Conflict);
+                    }
+                    Ok(())
+                },
+                || {
+                    if failure == 2 {
+                        panic!("native read unwind");
+                    }
+                    if failure == 1 {
+                        return Err(Error::Native);
+                    }
+                    Ok(())
+                },
+            )
+        }));
+        assert!(!matches!(result, Ok(Ok(()))));
+        assert_eq!(
+            history.borrow().len(),
+            4,
+            "failed original call remains retained"
+        );
+        assert!(run_repeated_module_only_read_call(
+            &history,
+            || panic!("no retry"),
+            || panic!("no read")
+        )
+        .is_err());
+    }
+    let history = RefCell::new(Vec::new());
+    for _ in 0..32 {
+        run_repeated_module_only_read_call(&history, || Ok(()), || Ok(())).unwrap();
+    }
+    assert!(run_repeated_module_only_read_call(
+        &history,
+        || panic!("bounded history"),
+        || panic!("bounded read")
+    )
+    .is_err());
+}
+
+#[test]
 fn module_only_read_completion_waits_for_authenticated_bounded_return() {
     use std::cell::{Cell, RefCell};
     let state = TerminalCallState::new();
@@ -929,6 +997,132 @@ fn bootstrap_fixture() -> (Context, crate::member_carrier_pair::Record) {
     };
     record.validate().unwrap();
     (context, record)
+}
+
+#[test]
+fn module_only_cleanup_reads_are_possible_before_stopped_without_disposal_grant() {
+    use crate::member_carrier_pair::{Effect, Phase};
+    let (context, mut record) = bootstrap_fixture();
+    for (stage, effect) in [
+        (9, Effect::NativeEmpty),
+        (10, Effect::Guard),
+        (12, Effect::FullEmpty),
+    ] {
+        record.stop_stage = stage;
+        record.pending = Some(effect);
+        compare_module_only_read_record(&context, &record).unwrap();
+        assert!(compare_zero_effect_terminal_record(&context, &record).is_err());
+        for fault in 0..6 {
+            let mut bad = record.clone();
+            match fault {
+                0 => bad.phase = Phase::Starting,
+                1 => bad.pending = Some(Effect::CarrierClose),
+                2 => {
+                    bad.carrier = Some(crate::member_owner::InterfaceProof {
+                        index: 1,
+                        luid: 1,
+                        guid: context.bindings[0].guid,
+                    })
+                }
+                3 => bad.addresses.clear(),
+                4 => bad.provenance.network_epoch += 1,
+                _ => bad.guard.permits = true,
+            }
+            assert!(compare_module_only_read_record(&context, &bad).is_err());
+        }
+    }
+    record.phase = Phase::Stopped;
+    record.pending = None;
+    compare_module_only_read_record(&context, &record).unwrap();
+    compare_zero_effect_terminal_record(&context, &record).unwrap();
+}
+
+#[test]
+fn module_only_cleanup_keeps_actual_prepared_member_until_stopped() {
+    use crate::{member_carrier_pair as pair, member_owner as owner};
+    let (context, mut original) = bootstrap_fixture();
+    original.members[0] = Some(pair::MemberState {
+        owner: owner::Record {
+            intent: owner::Intent {
+                scope: original.scope.clone(),
+                slot: TunnelSlot::A,
+                transport: TunnelTransport::WireGuard,
+                engine: crate::test_engine_path("engine.exe"),
+                config_sha256: [3; 32],
+            },
+            phase: owner::Phase::Prepared,
+            proof: None,
+            retired_proof: None,
+            previous_config_sha256: None,
+        },
+        lease_id: "22222222-2222-4222-8222-222222222222".into(),
+        probe: nelomai_contracts::RedundantHealthProbe {
+            kind: nelomai_contracts::HealthProbeKind::DnsA,
+            target_ipv4: "1.1.1.1".parse().unwrap(),
+            query_name: "example.com".into(),
+            timeout_ms: 2000,
+        },
+        endpoint: "192.0.2.11".parse().unwrap(),
+        allowed: vec!["0.0.0.0/0".parse().unwrap()],
+        peer: [2; 32],
+    });
+    original.validate().unwrap();
+    compare_module_only_read_record(&context, &original).unwrap();
+    let mut next = original.clone();
+    next.stop_stage = 10;
+    next.pending = Some(pair::Effect::Guard);
+    next.revision += 1;
+    compare_module_only_read_progress(&context, &original, &next).unwrap();
+    let mut replaced = next.clone();
+    replaced.members[0].as_mut().unwrap().lease_id = "33333333-3333-4333-8333-333333333333".into();
+    assert!(compare_module_only_read_progress(&context, &original, &replaced).is_err());
+    replaced = next.clone();
+    replaced.members = [None, None];
+    assert!(compare_module_only_read_progress(&context, &original, &replaced).is_err());
+    for fault in 0..3 {
+        let mut wrong = original.clone();
+        let owner = &mut wrong.members[0].as_mut().unwrap().owner;
+        match fault {
+            0 => owner.phase = owner::Phase::Stopped,
+            1 => owner.previous_config_sha256 = Some([4; 32]),
+            _ => owner.intent.scope.connection_generation += 1,
+        }
+        assert!(compare_module_only_read_record(&context, &wrong).is_err());
+    }
+    next.phase = pair::Phase::Stopped;
+    next.stop_stage = 12;
+    next.pending = None;
+    next.members = [None, None];
+    compare_module_only_read_progress(&context, &original, &next).unwrap();
+}
+
+#[test]
+fn module_only_read_views_keep_birth_identity_and_never_rewind_cleanup() {
+    use crate::member_carrier_pair::{Effect, Phase};
+    let (context, original) = bootstrap_fixture();
+    for (phase, stage, effect) in [
+        (Phase::Closing, 10, Some(Effect::Guard)),
+        (Phase::Closing, 12, Some(Effect::FullEmpty)),
+        (Phase::Stopped, 12, None),
+    ] {
+        let mut current = original.clone();
+        current.phase = phase;
+        current.stop_stage = stage;
+        current.pending = effect;
+        current.revision += 1;
+        compare_module_only_read_progress(&context, &original, &current).unwrap();
+        assert!(compare_module_only_read_progress(&context, &current, &original).is_err());
+        for fault in 0..4 {
+            let mut wrong = current.clone();
+            match fault {
+                0 => wrong.scope.connection_generation += 1,
+                1 => wrong.provenance.network_epoch += 1,
+                2 => wrong.dns = vec!["8.8.8.8".parse().unwrap()],
+                _ => wrong.revision = original.revision - 1,
+            }
+            assert!(compare_module_only_read_progress(&context, &original, &wrong).is_err());
+        }
+    }
 }
 
 #[test]

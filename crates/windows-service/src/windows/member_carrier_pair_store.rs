@@ -886,6 +886,67 @@ pub(crate) mod native_store {
             }
             result
         }
+        /// Factual module-only read frame, not resource/disposal authority.
+        /// Both paths require SAME original Pair publication and current bytes.
+        pub(crate) fn verify_module_only_read_entry(
+            &self,
+            runtime: &RuntimeRead,
+            context: &Context,
+            expected: &Record,
+        ) -> io::Result<()> {
+            crate::windows::member_carrier_startup::compare_module_only_read_record(
+                context, expected,
+            )
+            .map_err(|_| conflict())?;
+            if expected.phase == Phase::Stopped {
+                self.verify_terminal_entry(runtime, context, expected)
+            } else {
+                self.verify_cleanup_entry_for(runtime, context, expected)
+            }
+        }
+        pub(crate) fn verify_module_only_read_bracket(
+            &self,
+            runtime: &RuntimeRead,
+            supervisor: &crate::windows::member_native_deadline::NativeDeadline,
+            context: &Context,
+            expected: &Record,
+        ) -> io::Result<()> {
+            crate::windows::member_carrier_startup::compare_module_only_read_record(
+                context, expected,
+            )
+            .map_err(|_| conflict())?;
+            if expected.phase == Phase::Stopped {
+                return self.verify_terminal_bracket(runtime, supervisor, context, expected);
+            }
+            let result =
+                PairReadFrame::inspect(&self.read_frame, &self.busy, &self.revoked, |deadline| {
+                    if !self.matches_runtime(runtime) || &self.context != context {
+                        return Err(conflict());
+                    }
+                    deadline
+                        .verify_runtime(supervisor, runtime, context)
+                        .map_err(|_| conflict())?;
+                    deadline
+                        .verify_call(supervisor, context)
+                        .map_err(|_| conflict())?;
+                    self.verify()?;
+                    self.intent.cleanup()?;
+                    if self.intent.record != *expected {
+                        return Err(conflict());
+                    }
+                    self.verify()?;
+                    deadline
+                        .verify_runtime(supervisor, runtime, context)
+                        .map_err(|_| conflict())?;
+                    deadline
+                        .verify_call(supervisor, context)
+                        .map_err(|_| conflict())
+                });
+            if result.is_err() {
+                self.revoked.set(true);
+            }
+            result
+        }
         fn verify(&self) -> io::Result<()> {
             if self.revoked.get() || !self.runtime.matches_pin(&self.lock) {
                 return Err(conflict());
