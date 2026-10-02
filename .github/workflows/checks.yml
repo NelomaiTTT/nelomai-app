@@ -200,6 +200,7 @@ jobs:
           toolchain: 1.88.0
           components: rustfmt, clippy
       - run: cargo check -p nelomai-windows-service --all-targets
+      - run: cargo clippy --locked -p nelomai-windows-service --all-targets -- -D warnings
       - run: cargo check -p nelomai-app
       - run: cargo test -p nelomai-client-updater
       - run: cargo test -p nelomai-windows-service
