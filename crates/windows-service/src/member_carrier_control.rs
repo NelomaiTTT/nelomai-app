@@ -51,6 +51,98 @@ pub(crate) fn continue_pregraph_terminal(selected_pregraph: bool, _actor_release
     selected_pregraph
 }
 
+/// Terminal scheduling only, not resource/disposal authority. Pending layouts
+/// need their SAME intact Startup for a concrete bounded read, not a raw cut.
+pub(crate) fn capture_terminal_originals_for_layout(
+    pending_layout: bool,
+    observe_pending: impl FnOnce() -> io::Result<()>,
+    capture: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    if pending_layout {
+        observe_pending()?;
+        return Err(conflict());
+    }
+    capture()
+}
+
+#[cfg(test)]
+#[test]
+fn pending_terminal_read_keeps_startup_intact_and_never_promotes_observation() {
+    use std::cell::Cell;
+    let drained = Cell::new(false);
+    let observed = Cell::new(false);
+    assert!(capture_terminal_originals_for_layout(
+        true,
+        || {
+            assert!(
+                !drained.get(),
+                "original Startup must precede any raw handoff"
+            );
+            observed.set(true);
+            Ok(())
+        },
+        || {
+            drained.set(true);
+            Ok(())
+        }
+    )
+    .is_err());
+    assert!(observed.get());
+    assert!(!drained.get());
+}
+
+#[cfg(test)]
+#[test]
+fn pending_terminal_errors_never_drain_or_fall_back_to_full_capture() {
+    use std::cell::Cell;
+    for unwind in [false, true] {
+        let captures = Cell::new(0);
+        let observations = Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture_terminal_originals_for_layout(
+                true,
+                || {
+                    observations.set(observations.get() + 1);
+                    if unwind {
+                        panic!("bounded_read_unknown");
+                    }
+                    Err(conflict())
+                },
+                || {
+                    captures.set(captures.get() + 1);
+                    Ok(())
+                },
+            )
+        }));
+        assert!(result.is_err() || result.unwrap().is_err());
+        assert_eq!(observations.get(), 1);
+        assert_eq!(captures.get(), 0);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn acknowledged_terminal_layout_capture_failure_never_selects_pending_reader() {
+    use std::cell::Cell;
+    for fail in [false, true] {
+        let captures = Cell::new(0);
+        let result = capture_terminal_originals_for_layout(
+            false,
+            || panic!("known layout may not select another authority"),
+            || {
+                captures.set(captures.get() + 1);
+                if fail {
+                    Err(conflict())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result.is_ok(), !fail);
+        assert_eq!(captures.get(), 1);
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn pregraph_continuation_survives_actor_release_without_selecting_other_lanes() {

@@ -1,5 +1,6 @@
 //! Staged original startup: readonly member preparation precedes C creation.
-//! This is not a selected factory; effect gates and hardware remain mandatory.
+//! Selected by the retained production factory; native effect gates and
+//! hardware acceptance remain mandatory and separate from software coverage.
 #![allow(dead_code)]
 
 #[cfg(windows)]
@@ -727,6 +728,8 @@ pub(crate) mod native {
         module_only_candidate: Option<Rc<NativeStartupModuleOnlyCandidate>>,
         module_only_selection: Rc<TerminalCallState>,
         module_only_read_call: Rc<TerminalCallState>,
+        module_only_load_read: RefCell<Option<Rc<crate::windows::member_carrier_module::native::NativeOriginalModuleLoadRead>>>,
+        module_only_native_read: RefCell<Option<Rc<crate::windows::member_carrier_module_terminal_read::native::NativeModuleOnlyTerminalRead>>>,
     }
     /// Original lineage/caller-retention aperture, NOT native load ACK or SDK
     /// permission. OtherAttempted remains denied by the existing finisher.
@@ -2380,6 +2383,8 @@ pub(crate) mod native {
                 module_only_candidate: None,
                 module_only_selection: Rc::new(TerminalCallState::new()),
                 module_only_read_call: Rc::new(TerminalCallState::new()),
+                module_only_load_read: RefCell::new(None),
+                module_only_native_read: RefCell::new(None),
             };
             retain_claim_startup(destination, startup, |startup| {
                 // SAME signed Runtime/current-process capture. The capsule and its
@@ -3487,6 +3492,61 @@ pub(crate) mod native {
     // Every method enters the actual supervisor or inherits Assembly's whole
     // Calling; registration is never used as native effect authorization.
     unsafe impl NativeStartup<'static> for NativeStartupRoot {
+        fn observe_attempted_module_only_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> Result<()> {
+            let candidate = if let Some(candidate) = self.module_only_candidate.as_ref() {
+                candidate.clone()
+            } else {
+                let mut retained = None;
+                self.retain_module_only_candidate_into(original, expected, &mut retained)?;
+                retained.ok_or(Error::Pending)?
+            };
+            self.verify_module_only_candidate(&candidate, original, expected)?;
+            let need_load_read = {
+                let retained = self
+                    .module_only_load_read
+                    .try_borrow()
+                    .map_err(|_| Error::Conflict)?;
+                retained.is_none()
+            };
+            if need_load_read {
+                self.retain_module_only_load_read_into(
+                    &candidate,
+                    original,
+                    expected,
+                    &mut *self
+                        .module_only_load_read
+                        .try_borrow_mut()
+                        .map_err(|_| Error::Conflict)?,
+                )?;
+            }
+            let load = self
+                .module_only_load_read
+                .try_borrow()
+                .map_err(|_| Error::Conflict)?
+                .as_ref()
+                .cloned()
+                .ok_or(Error::Pending)?;
+            self.retain_and_read_module_only_terminal(
+                &candidate,
+                &load,
+                original,
+                expected,
+                &mut *self
+                    .module_only_native_read
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)?,
+                |facts| {
+                    if !facts.same_original(&candidate, &load, original) {
+                        return Err(Error::Conflict);
+                    }
+                    Ok(())
+                },
+            )
+        }
         fn select_terminal_branch(
             &mut self,
             original: &Rc<NativePairIntentRead>,

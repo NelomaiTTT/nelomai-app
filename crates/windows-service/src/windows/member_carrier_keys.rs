@@ -1,4 +1,4 @@
-//! Exact retained-key IO for precreation receipts. Factory remains disconnected.
+//! Exact retained-key IO for the production carrier's precreation receipts.
 //! Native effect tests replace only RegistryKernel, never this identity/CAS logic.
 #![allow(dead_code)]
 use crate::member_carrier::{CarrierError as Error, Result};

@@ -1,4 +1,4 @@
-//! Explicit terminal release only. Factory OFF; no Drop-on-unknown authority.
+//! Explicit terminal release only; no Drop-on-unknown authority.
 #![allow(dead_code)]
 use crate::{member_carrier_native_ownership::Context, member_carrier_pair as pair};
 use std::{

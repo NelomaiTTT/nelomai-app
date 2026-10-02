@@ -1,4 +1,5 @@
-//! Actual native terminal composition. Factory selection remains gated.
+//! Actual native terminal composition used by the retained production factory.
+//! Pending original layouts remain owned; observations never grant disposal.
 #![allow(dead_code)]
 
 use crate::{
@@ -288,15 +289,36 @@ impl<'a> CarrierPairFinalizer<NativeCarrierPairIo<'a>, NativePairJournal>
                         Some(actor.attempted_terminal_layout(&stopped, &record, witness)?);
                 }
             }
-            if !self.locals_captured {
-                actor.capture_locals(&stopped, &record, &mut self.locals, |_| Ok(()))?;
-                self.locals_captured = true;
-            }
-            if !self.canonical_captured {
-                actor
-                    .capture_canonical_inputs(&stopped, &record, &mut self.canonical, |_| Ok(()))?;
-                self.canonical_captured = true;
-            }
+            let attempted = match self.branch.as_ref() {
+                Some(NativeActorTerminalBranch::NativeAttempted(witness)) => Some(witness.clone()),
+                _ => None,
+            };
+            crate::member_carrier_control::capture_terminal_originals_for_layout(
+                self.attempted_layout == Some(NativeAttemptedTerminalLayout::OtherAttempted),
+                || {
+                    actor.observe_pending_module_only_terminal(
+                        &stopped,
+                        &record,
+                        attempted.as_ref().ok_or_else(conflict)?,
+                    )
+                },
+                || {
+                    if !self.locals_captured {
+                        actor.capture_locals(&stopped, &record, &mut self.locals, |_| Ok(()))?;
+                        self.locals_captured = true;
+                    }
+                    if !self.canonical_captured {
+                        actor.capture_canonical_inputs(
+                            &stopped,
+                            &record,
+                            &mut self.canonical,
+                            |_| Ok(()),
+                        )?;
+                        self.canonical_captured = true;
+                    }
+                    Ok(())
+                },
+            )?;
             if let Some(NativeActorTerminalBranch::ZeroEffect(outcome)) = self.branch.as_ref() {
                 // Actual private Never/whole native inventory proof, NOT empty
                 // actor fields or failed attempted cleanup. No synthetic C,

@@ -2371,6 +2371,14 @@ pub(crate) mod native {
     /// before baseline capture, then full inputs before registration/postflight.
     /// Errors/unwinds retain originals; registration NEVER grants an effect.
     pub(crate) unsafe trait NativeStartup<'a> {
+        /// Retain/read SAME loader-only originals under the concrete bounded
+        /// Calling/Pair reader. Observations are DATA: no release or completion
+        /// permission. Unknown layouts deny while keeping Startup intact.
+        fn observe_attempted_module_only_terminal(
+            &mut self,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+        ) -> crate::member_carrier::Result<()>;
         /// Sole object-safe branch selection. Authenticate SAME Stopped pin,
         /// Runtime/serial/private invocation ledger before/after selection.
         /// No-attempt: issue the actual whole sealed Never/SDK/BFE proof using
@@ -3380,6 +3388,36 @@ pub(crate) mod native {
                 .map_err(denied)?;
             witness.verify_original(self, original, expected)?;
             Ok(layout)
+        }
+        /// Observe the pending lane BEFORE canonical capture drains Startup.
+        /// A successful read still cannot retire the actor or publish Stopped.
+        pub(crate) fn observe_pending_module_only_terminal(
+            self: &Rc<Self>,
+            original: &Rc<NativePairIntentRead>,
+            expected: &pair::Record,
+            witness: &Rc<NativeActorAttemptedTerminalWitness<'a>>,
+        ) -> io::Result<()> {
+            if self.attempted_terminal_layout(original, expected, witness)?
+                != crate::windows::member_carrier_startup::NativeAttemptedTerminalLayout::OtherAttempted
+            {
+                return Err(conflict());
+            }
+            let (startup, serial) = {
+                let actor = self.originals.actor.try_borrow().map_err(denied)?;
+                (
+                    actor.startup.as_ref().ok_or_else(conflict)?.clone(),
+                    actor.serial.clone(),
+                )
+            };
+            serial.run(true, || {
+                witness.verify_original(self, original, expected)?;
+                startup
+                    .try_borrow_mut()
+                    .map_err(denied)?
+                    .observe_attempted_module_only_terminal(original, expected)
+                    .map_err(denied)?;
+                witness.verify_original(self, original, expected)
+            })
         }
         /// Call while SAME Startup is still in the original actor, before
         /// canonical capture. Caller and actor root retain the outcome FIRST.
