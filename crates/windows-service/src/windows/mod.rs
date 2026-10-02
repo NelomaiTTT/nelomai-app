@@ -39,6 +39,7 @@ mod member_carrier_provider;
 mod member_carrier_ready;
 mod member_carrier_recovery;
 mod member_carrier_recovery_guard;
+mod member_carrier_registry_metadata;
 mod member_carrier_rows;
 mod member_carrier_runtime;
 mod member_carrier_startup;

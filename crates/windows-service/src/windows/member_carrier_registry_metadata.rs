@@ -255,6 +255,7 @@ impl RawBuffer {
         // patterns are valid bytes. This does not dereference a native pointer.
         unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.words.len() * 4) }
     }
+    #[cfg(test)]
     fn bytes_mut(&mut self) -> &mut [u8] {
         unsafe {
             std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), self.words.len() * 4)
@@ -293,11 +294,13 @@ pub(crate) struct Acquired {
     samples: [RawSample; 2],
 }
 impl Acquired {
+    #[cfg(test)]
     pub(crate) fn statuses(&self) -> [[Option<i32>; 3]; 2] {
         self.samples
             .each_ref()
             .map(|s| [s.info.status, s.name.status, s.security.status])
     }
+    #[cfg(test)]
     pub(crate) fn security_output(&self, sample: usize) -> Option<(&[u8], u32)> {
         self.samples
             .get(sample)
@@ -343,6 +346,7 @@ impl RegistryMetadataCapture {
     }
     /// Failure history only. Even raw successful statuses cannot grant root
     /// absence, deletion, close, creation or transaction ownership.
+    #[cfg(test)]
     pub(crate) fn inspect_acquired(&self, inspect: impl FnOnce(&Acquired)) -> Result<()> {
         let raw = self
             .acquired
@@ -487,6 +491,126 @@ fn parse_info(raw: &RawInfo) -> Result<KeyInfo> {
         security_bytes: raw.security_bytes,
         last_write: raw.last_write,
     })
+}
+
+#[cfg(windows)]
+mod native {
+    use super::*;
+    use windows_sys::{
+        Wdk::System::Registry::{KeyNameInformation, NtQueryKey},
+        Win32::{
+            Foundation::{GetLastError, FILETIME},
+            Security::{
+                GetSecurityDescriptorControl, GetSecurityDescriptorLength, IsValidAcl,
+                IsValidSecurityDescriptor, IsValidSid,
+            },
+            System::Registry::{RegGetKeySecurity, RegQueryInfoKeyW, HKEY},
+        },
+    };
+    struct OriginalQueries {
+        handle: HKEY,
+    }
+    impl Queries for OriginalQueries {
+        fn info(&mut self, output: &mut RawInfo) {
+            let mut time = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            output.status = Some(unsafe {
+                RegQueryInfoKeyW(
+                    self.handle,
+                    output.class.as_mut_ptr(),
+                    &mut output.class_len,
+                    std::ptr::null_mut(),
+                    &mut output.subkeys,
+                    &mut output.max_subkey_name,
+                    &mut output.max_subkey_class,
+                    &mut output.values,
+                    &mut output.max_value_name,
+                    &mut output.max_value_data,
+                    &mut output.security_bytes,
+                    &mut time,
+                )
+            } as i32);
+            output.last_write =
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+        }
+        fn name(&mut self, output: &mut RawBuffer) {
+            let capacity = output.words.len() * 4;
+            output.status = Some(unsafe {
+                NtQueryKey(
+                    self.handle,
+                    KeyNameInformation,
+                    output.words.as_mut_ptr().cast(),
+                    capacity as u32,
+                    &mut output.returned,
+                )
+            });
+        }
+        fn security(&mut self, information: u32, output: &mut RawBuffer) {
+            output.status = Some(unsafe {
+                RegGetKeySecurity(
+                    self.handle,
+                    information,
+                    output.words.as_mut_ptr().cast(),
+                    &mut output.returned,
+                )
+            } as i32);
+        }
+        fn descriptor(
+            &mut self,
+            raw: &RawBuffer,
+            layout: &SecurityLayout,
+            output: &mut DescriptorCheck,
+        ) {
+            let descriptor = raw.words.as_ptr().cast_mut().cast();
+            output.valid = Some(unsafe { IsValidSecurityDescriptor(descriptor) } != 0);
+            if output.valid != Some(true) {
+                return;
+            }
+            output.control_ok = Some(
+                unsafe {
+                    GetSecurityDescriptorControl(
+                        descriptor,
+                        &mut output.control,
+                        &mut output.revision,
+                    )
+                } != 0,
+            );
+            if output.control_ok != Some(true) {
+                output.error = Some(unsafe { GetLastError() });
+                return;
+            }
+            output.length = unsafe { GetSecurityDescriptorLength(descriptor) };
+            let base = raw.words.as_ptr().cast::<u8>();
+            // Parser bounds/alignment checks ran first, native descriptor was
+            // validated before length/component calls. No unchecked raw offset.
+            let sid = |component: Component| unsafe {
+                IsValidSid(base.add(component.offset).cast_mut().cast()) != 0
+            };
+            let acl = |component: &Acl| match component {
+                Acl::Absent | Acl::Null => true,
+                Acl::Present(component) => unsafe {
+                    IsValidAcl(base.add(component.offset).cast()) != 0
+                },
+            };
+            output.components_valid = Some(
+                sid(layout.owner) && sid(layout.group) && acl(&layout.sacl) && acl(&layout.dacl),
+            );
+        }
+    }
+    impl RegistryMetadataCapture {
+        /// # Safety
+        /// `original` is a still-open caller-owned HKEY, held for this entire
+        /// synchronous read. No handle adoption/reopen/close, privilege change,
+        /// size-driven allocation, SACL fallback or mutation is performed.
+        pub(in crate::windows) unsafe fn read_original_native(&self, original: HKEY) -> Result<()> {
+            if original.is_null() {
+                return Err(MetadataError::Invalid);
+            }
+            self.read(&mut OriginalQueries { handle: original }, |_| Ok(()))
+        }
+    }
 }
 
 #[cfg(test)]

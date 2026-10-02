@@ -1579,6 +1579,22 @@ fn sdk_deleted_observer_denies_foreign_equal_original_parent_replace_and_non1018
 }
 
 #[test]
+fn present_original_retains_metadata_capture_without_root_disposition() {
+    let mut actual = restore_original_before_nic(Role::RoleCarrier, |_, _| {});
+    let pin = terminal_original_key_obligation(&actual.ack);
+    actual.shared.borrow_mut().original_info_status = Some(0);
+    assert!(pin
+        .observe_sdk_deleted(&actual.ack, &mut actual.io.kernel, || Ok(()))
+        .is_err());
+    assert!(
+        pin.present_metadata_capture().is_some(),
+        "original observation history retained before full-query failure"
+    );
+    assert!(pin.require_root_absent().is_err());
+    assert!(pin.closed_handle_ack().is_err());
+}
+
+#[test]
 fn sdk_deleted_read_cannot_import_foreign_equal_original_or_reset_failed_postflight() {
     let mut left = restore_original_before_nic(Role::RoleCarrier, |_, _| {});
     let mut right = restore_original_before_nic(Role::RoleCarrier, |_, _| {});

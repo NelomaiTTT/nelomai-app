@@ -6,6 +6,10 @@ use crate::member_carrier_native_ownership::{
     self as receipt, Binding, Context, KeyPhase, KeyPresence, NativeFacts, NativeKeyIo,
     NativeValue, NewKeyAck, Phase, Record, Value, ValueCas,
 };
+#[cfg(all(test, not(windows)))]
+use crate::member_carrier_registry_metadata as registry_metadata;
+#[cfg(windows)]
+use crate::windows::member_carrier_registry_metadata as registry_metadata;
 use std::rc::Rc;
 
 // Measurement-only capsule. It is deliberately absent from every production
@@ -594,6 +598,15 @@ pub(crate) trait RegistryKernel {
     fn original_key_info_status(&mut self, _handle: &Self::Handle) -> Result<u32> {
         Err(Error::Pending)
     }
+    /// Read DATA only, into a caller-owned capture. Unsupported full security
+    /// observation denies; neither status nor metadata grants key disposition.
+    fn original_key_metadata(
+        &mut self,
+        _handle: &Self::Handle,
+        _capture: &registry_metadata::RegistryMetadataCapture,
+    ) -> Result<()> {
+        Err(Error::Pending)
+    }
 }
 /// Sealed factual observation, never SDK absence/worker/effect permission.
 pub(crate) struct OriginalSdkDeletedKeyRead {
@@ -674,6 +687,7 @@ pub(crate) struct OriginalKeyRootObligation<H> {
     closed: std::cell::RefCell<Option<Rc<KeyHandleClosed>>>,
     origin: Rc<()>,
     sdk_deleted: std::cell::RefCell<Option<Rc<OriginalSdkDeletedKeyRead>>>,
+    present_metadata: std::cell::RefCell<Option<Rc<registry_metadata::RegistryMetadataCapture>>>,
     observation: OriginalReadState,
     observed_deleted: std::cell::Cell<bool>,
     first_terminal_status: std::cell::Cell<Option<u32>>,
@@ -699,6 +713,7 @@ impl<H> OriginalKeyRootObligation<H> {
             closed: std::cell::RefCell::new(None),
             origin: Rc::new(()),
             sdk_deleted: std::cell::RefCell::new(None),
+            present_metadata: std::cell::RefCell::new(None),
             observation: OriginalReadState::default(),
             observed_deleted: std::cell::Cell::new(false),
             first_terminal_status: std::cell::Cell::new(None),
@@ -718,6 +733,11 @@ impl<H> OriginalKeyRootObligation<H> {
     }
     pub(crate) fn classification(&self) -> KeyRootObligationKind {
         self.kind.get()
+    }
+    pub(crate) fn present_metadata_capture(
+        &self,
+    ) -> Option<Rc<registry_metadata::RegistryMetadataCapture>> {
+        self.present_metadata.try_borrow().ok()?.clone()
     }
     pub(crate) fn verify_original(self: &Rc<Self>, ack: &NewKeyAck<Held<H>>) -> Result<()> {
         if Rc::ptr_eq(self, &ack.retained_handle().handle) {
@@ -825,6 +845,21 @@ impl<H> OriginalKeyRootObligation<H> {
                 status.set(Some(actual));
             }
             self.check_health()?;
+            if actual == 0 {
+                // A surviving original is not SDK-deleted. Retain bounded
+                // full metadata outputs BEFORE any fallible query/postflight.
+                // This is DATA only; no deletion or handle-close permission.
+                let capture = Rc::new(registry_metadata::RegistryMetadataCapture::new());
+                *self
+                    .present_metadata
+                    .try_borrow_mut()
+                    .map_err(|_| Error::Conflict)? = Some(capture.clone());
+                check()?;
+                kernel.original_key_metadata(self.handle(), &capture)?;
+                check()?;
+                self.check_health()?;
+                return Err(Error::Pending);
+            }
             if actual != 1018 {
                 return Err(Error::Pending);
             }
@@ -1707,6 +1742,15 @@ pub(crate) mod win32 {
     }
     impl RegistryKernel for Kernel {
         type Handle = Handle;
+        fn original_key_metadata(
+            &mut self,
+            h: &Handle,
+            capture: &registry_metadata::RegistryMetadataCapture,
+        ) -> Result<()> {
+            // SAFETY: SAME still-open owning original is borrowed for the whole
+            // synchronous query. No raw handle escapes, open/reopen or close.
+            unsafe { capture.read_original_native(h.raw()?) }.map_err(|_| Error::Pending)
+        }
         fn original_key_info_status(&mut self, h: &Handle) -> Result<u32> {
             // Status is factual even on failure; only exact KEY_DELETED from
             // this still-open original can enter the sealed observer protocol.

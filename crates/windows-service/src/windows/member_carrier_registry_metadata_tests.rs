@@ -58,6 +58,54 @@ fn registry_metadata_native_name_is_exact_length_strict_utf16() {
     assert!(parse_name(&bytes, bytes.len() - 1).is_err());
 }
 
+#[cfg(windows)]
+#[test]
+fn native_metadata_reader_keeps_full_security_denial_on_existing_readonly_key() {
+    use windows_sys::Win32::{
+        Foundation::ERROR_SUCCESS,
+        System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE},
+    };
+    // Read-only native CI gate. No key creation/delete, privilege adjustment,
+    // path fallback or driver/user-PC prerequisite. This owns the returned HKEY.
+    let name: Vec<u16> = "Software\0".encode_utf16().collect();
+    let mut original = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                name.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut original,
+            )
+        },
+        ERROR_SUCCESS
+    );
+    struct Held(windows_sys::Win32::System::Registry::HKEY);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            assert_eq!(unsafe { RegCloseKey(self.0) }, ERROR_SUCCESS);
+        }
+    }
+    let held = Held(original);
+    let capture = RegistryMetadataCapture::new();
+    // SAFETY: held is SAME original open for the entire synchronous read.
+    assert_eq!(
+        unsafe { capture.read_original_native(held.0) },
+        Err(MetadataError::Pending(5))
+    );
+    capture
+        .inspect_acquired(|raw| {
+            assert_eq!(raw.statuses()[0], [Some(0), Some(0), Some(5)]);
+            assert_eq!(raw.statuses()[1], [None; 3]);
+        })
+        .unwrap();
+    assert_eq!(
+        unsafe { capture.read_original_native(held.0) },
+        Err(MetadataError::Attempted)
+    );
+}
+
 struct NativeIo {
     fail_security: bool,
     calls: Vec<&'static str>,
